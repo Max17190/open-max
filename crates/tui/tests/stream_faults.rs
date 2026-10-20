@@ -18,7 +18,7 @@
 //! fails at once instead of spending the retry budget.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -157,6 +157,8 @@ enum Step {
     /// SSE headers, a keepalive comment every `every_ms` for `count` times,
     /// then this body.
     Keepalive { every_ms: u64, count: usize, then: String },
+    /// Hold the response until the test sets `open`, then a whole SSE body.
+    Gated { open: Arc<AtomicBool>, then: String },
 }
 
 struct FaultServer {
@@ -209,7 +211,7 @@ impl FaultServer {
                     body: format!(r#"{{"error":{{"message":"unscripted request {n}"}}}}"#),
                 });
                 began.lock().unwrap().push(Instant::now());
-                let hold = serve(&mut stream, step);
+                let hold = serve(&mut stream, step, &stopping);
                 if hold {
                     held.push(stream);
                 }
@@ -240,8 +242,10 @@ impl Drop for FaultServer {
     }
 }
 
-/// Serve one step; true when the connection is to be held open.
-fn serve(stream: &mut TcpStream, step: Step) -> bool {
+/// Serve one step; true when the connection is to be held open. A step that
+/// waits on the test gives up once the server is stopping, so a test that
+/// fails before it opens the gate ends instead of hanging in `Drop`.
+fn serve(stream: &mut TcpStream, step: Step, stopping: &AtomicBool) -> bool {
     // The client may have gone by now; what it saw is what the test checks.
     fn put(stream: &mut TcpStream, bytes: &[u8]) {
         let _ = stream.write_all(bytes);
@@ -280,6 +284,15 @@ fn serve(stream: &mut TcpStream, step: Step) -> bool {
                 put(stream, b": keepalive\n\n");
             }
             put(stream, then.as_bytes());
+        }
+        Step::Gated { open, then } => {
+            while !open.load(Ordering::SeqCst) {
+                if stopping.load(Ordering::SeqCst) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            put(stream, format!("{SSE_HEAD}Content-Length: {}\r\n\r\n{then}", then.len()).as_bytes());
         }
     }
     false
@@ -1605,6 +1618,378 @@ fn a_call_id_repeated_across_iterations_is_answered_in_its_own_run() {
     assert_eq!(messages.last().and_then(|m| m.content.as_deref()), Some(TRUNCATION_STUB), "{log}");
     assert_eq!(messages.last().and_then(|m| m.tool_call_id.as_deref()), Some("dup"), "{log}");
     truncated.resume(&run, &run.after);
+}
+
+/// Drive one `--stdio` turn that is steered mid-flight: send `go`, wait until
+/// `ready` holds, send the `mid` lines (the steer and anything sent with it),
+/// then an unknown command whose `protocol_error` proves every line before it
+/// was read (stdin is handled in order), then `release` the turn and read to
+/// its `done`. Each `steer_accepted` is checked against the disk as it is
+/// read: the save that records the steer is done by then. Every wait is
+/// bounded, so a binary that dies or stalls fails the test instead of hanging
+/// it. Returns every event, the hello first, and the one log line per event
+/// the assertions print.
+fn steered_turn(env: &Env, ready: &dyn Fn() -> bool, mid: &[&str], release: &mut dyn FnMut(&mut std::process::ChildStdin)) -> (Vec<Value>, String) {
+    let mut child = cmd(&env.project, &env.home)
+        .args(["--trust-project", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let log = |events: &[Value]| events.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut events: Vec<Value> = Vec::new();
+    writeln!(stdin, r#"{{"cmd":"user","text":"go"}}"#).unwrap();
+    while !ready() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the turn never reached the point the steer is sent at");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for line in mid {
+        writeln!(stdin, "{line}").unwrap();
+    }
+    writeln!(stdin, r#"{{"cmd":"sync"}}"#).unwrap();
+    for stop in ["protocol_error", "done"] {
+        if stop == "done" {
+            release(&mut stdin);
+        }
+        loop {
+            let Ok(line) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+                let _ = child.kill();
+                panic!("no `{stop}` within 30s, or stdout closed:\n{}", log(&events));
+            };
+            let event: Value = serde_json::from_str(&line).unwrap();
+            if event["type"] == "steer_accepted" {
+                let saved = std::fs::read(env.transcript(events[0]["session_id"].as_str().unwrap())).unwrap();
+                // Whole lines only: the save of a later message may be under way.
+                let whole = &saved[..saved.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1)];
+                let on_disk = transcript_messages(whole, "steer_accepted").iter().any(|m| m.role == "user" && m.content.as_deref() == event["text"].as_str());
+                assert!(on_disk, "steer_accepted came before the save that records it:\n{}", log(&events));
+            }
+            let end = event["type"] == stop && (stop == "done" || event["message"].as_str().is_some_and(|m| m.contains("sync")));
+            events.push(event);
+            if end {
+                break;
+            }
+        }
+    }
+    drop(stdin);
+    let _ = child.wait();
+    let log = log(&events);
+    let refused = events.iter().any(|e| e["type"] == "protocol_error" && e["message"].as_str().is_some_and(|m| m.contains("steer")));
+    assert!(!refused, "a steer is never refused while its turn runs:\n{log}");
+    (events, log)
+}
+
+/// What the model was sent, request by request.
+fn request_messages(env: &Env) -> Vec<Vec<Value>> {
+    env.server.bodies().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["messages"].as_array().unwrap().clone()).collect()
+}
+
+const STEER: &str = r#"{"cmd":"user","text":"use the v2 API"}"#;
+
+/// A message sent while a turn runs reaches the model at the turn's next
+/// iteration boundary, not after the turn: request 2 carries it as a user
+/// message right after the tool result of request 1's call, a
+/// `steer_accepted` event marks that position in the stream ahead of request
+/// 2's `budget`, and the transcript on disk holds it at the same place. Two
+/// steers sent together arrive in the order sent. An empty `user` line sent
+/// with them is refused with a `protocol_error` and no `done` of its own:
+/// the running turn owns the next one. The first reply is held until the
+/// stdio loop has read every line.
+#[test]
+fn a_steer_sent_during_a_turn_reaches_the_next_request() {
+    let open = Arc::new(AtomicBool::new(false));
+    let env = Env::new("steer", "a steer mid-turn", vec![
+        Step::Gated { open: open.clone(), then: sse_call("c1", "1") },
+        Step::Finished(sse_text("steered")),
+    ]);
+    let mid = [STEER, r#"{"cmd":"user","text":"and keep v1 working"}"#, r#"{"cmd":"user","text":" "}"#];
+    let (events, log) = steered_turn(&env, &|| !env.server.arrivals.lock().unwrap().is_empty(), &mid, &mut |_| open.store(true, Ordering::SeqCst));
+
+    let at = |pred: &dyn Fn(&Value) -> bool| events.iter().position(pred).unwrap_or_else(|| panic!("missing event:\n{log}"));
+    let tool_end = at(&|e| e["type"] == "tool_end" && e["call_id"] == "c1");
+    let first = at(&|e| e["type"] == "steer_accepted" && e["text"] == "use the v2 API");
+    let second = at(&|e| e["type"] == "steer_accepted" && e["text"] == "and keep v1 working");
+    let budgets: Vec<usize> = (0..events.len()).filter(|&i| events[i]["type"] == "budget").collect();
+    assert_eq!(budgets.len(), 2, "one budget per request:\n{log}");
+    let answer = at(&|e| e["type"] == "message_done" && e["text"] == "steered");
+    assert!(tool_end < first && first < second && second < budgets[1] && budgets[1] < answer, "the steers are accepted between the tool round and request 2:\n{log}");
+    assert_eq!(events.iter().filter(|e| e["type"] == "protocol_error" && e["message"] == "user text is empty").count(), 1, "{log}");
+    assert_eq!(events.iter().filter(|e| e["type"] == "done").count(), 1, "{log}");
+    assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{log}");
+    assert_eq!(env.ran_log(), "1\n", "{log}");
+
+    let requests = request_messages(&env);
+    assert_eq!(requests.len(), 2, "{log}");
+    assert_eq!(requests[0].last().unwrap()["content"], "go", "{log}");
+    let tail = &requests[1][requests[1].len() - 3..];
+    assert_eq!(tail[0]["role"], "tool", "{tail:?}");
+    assert_eq!(tail[0]["tool_call_id"], "c1", "{tail:?}");
+    assert_eq!((tail[1]["role"].as_str(), tail[1]["content"].as_str()), (Some("user"), Some("use the v2 API")), "{tail:?}");
+    assert_eq!((tail[2]["role"].as_str(), tail[2]["content"].as_str()), (Some("user"), Some("and keep v1 working")), "{tail:?}");
+
+    let sid = events[0]["session_id"].as_str().unwrap();
+    let saved = transcript_messages(&std::fs::read(env.transcript(sid)).unwrap(), "steer transcript");
+    let steer_at = saved.iter().position(|m| m.role == "user" && m.content.as_deref() == Some("use the v2 API")).expect("the steer is saved");
+    assert_eq!(saved[steer_at - 1].tool_call_id.as_deref(), Some("c1"), "{saved:?}");
+    assert_eq!(saved[steer_at + 1].content.as_deref(), Some("and keep v1 working"), "{saved:?}");
+    assert_eq!(saved[steer_at + 2].content.as_deref(), Some("steered"), "{saved:?}");
+}
+
+/// A steer sent while the model writes an answer with no calls is not
+/// answered by it, so the turn sends one more request carrying the answer
+/// and then the steer, and ends on the reply to that. On the turn's last
+/// iteration there is no request left: the turn ends `stop` on the first
+/// answer, as it would have without the steer, and the steer gets no
+/// `steer_accepted`.
+#[test]
+fn a_steer_sent_while_the_model_answers_gets_one_more_request() {
+    for (cap, requests_sent) in [("", 2), (r#","max_agent_iterations":1"#, 1)] {
+        let open = Arc::new(AtomicBool::new(false));
+        let env = Env::with_settings("steer-stop", "a steer during the answer", vec![
+            Step::Gated { open: open.clone(), then: sse_text("first answer") },
+            Step::Finished(sse_text("steered")),
+        ], cap);
+        let (events, log) = steered_turn(&env, &|| !env.server.arrivals.lock().unwrap().is_empty(), &[STEER], &mut |_| open.store(true, Ordering::SeqCst));
+        assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{cap}:\n{log}");
+        let requests = request_messages(&env);
+        assert_eq!(requests.len(), requests_sent, "{cap}:\n{log}");
+        let accepted = events.iter().position(|e| e["type"] == "steer_accepted");
+        if requests_sent == 1 {
+            assert_eq!(accepted, None, "the last iteration takes no steer:\n{log}");
+            continue;
+        }
+        let first = events.iter().position(|e| e["type"] == "message_done" && e["text"] == "first answer").unwrap();
+        let second = events.iter().position(|e| e["type"] == "message_done" && e["text"] == "steered").unwrap();
+        assert!(accepted.is_some_and(|at| first < at && at < second), "{log}");
+        let tail = &requests[1][requests[1].len() - 2..];
+        assert_eq!((tail[0]["role"].as_str(), tail[0]["content"].as_str()), (Some("assistant"), Some("first answer")), "{tail:?}");
+        assert_eq!((tail[1]["role"].as_str(), tail[1]["content"].as_str()), (Some("user"), Some("use the v2 API")), "{tail:?}");
+    }
+}
+
+/// A steer is gated by `user_prompt_submit` like any prompt. Blocked after
+/// the model already answered, it gets a `steer_blocked` carrying its text
+/// and the gate's reason (not a turn `error`), enters nothing, and sends no
+/// request: that answer ends the turn. Cancelled while its gate runs, the
+/// turn ends `cancelled`, which the turn_end consult does not get to judge.
+/// The steer is a `/name args` line: the expansion is what the gate judges
+/// and the `text` that comes back, so a client can match it to what it sent.
+#[test]
+fn a_steer_whose_gate_blocks_or_is_cancelled_sends_no_request() {
+    for (gate, stop_reason) in [("echo 'no v2 here'; exit 1", "stop"), ("touch gate-started; sleep 20", "cancelled")] {
+        let open = Arc::new(AtomicBool::new(false));
+        let env = Env::new("steer-gate", "a gated steer", vec![
+            Step::Gated { open: open.clone(), then: sse_text("first answer") },
+            Step::Finished(sse_text("asked again")),
+        ]);
+        let hooks = env.project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let script = format!("if grep -q 'v2 API'; then {gate}; fi; exit 0");
+        std::fs::write(hooks.join("gate.toml"), format!("event = \"user_prompt_submit\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\n")).unwrap();
+        let prompts = env.project.join(".agents/prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("api.md"), "use the $ARGUMENTS API\n").unwrap();
+        let started = env.project.join("gate-started");
+        let (events, log) = steered_turn(&env, &|| !env.server.arrivals.lock().unwrap().is_empty(), &[r#"{"cmd":"user","text":"/api v2"}"#], &mut |stdin| {
+            open.store(true, Ordering::SeqCst);
+            if stop_reason == "cancelled" {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !started.exists() {
+                    assert!(Instant::now() < deadline, "the steer's gate never ran");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                writeln!(stdin, r#"{{"cmd":"cancel"}}"#).unwrap();
+            }
+        });
+        assert_eq!(events.last().unwrap()["stop_reason"], stop_reason, "{log}");
+        assert_eq!(request_messages(&env).len(), 1, "{log}");
+        assert!(!events.iter().any(|e| e["type"] == "steer_accepted"), "{log}");
+        let blocked = events.iter().any(|e| e["type"] == "steer_blocked" && e["text"] == "use the v2 API\n" && e["reason"] == "no v2 here");
+        assert_eq!(blocked, stop_reason == "stop", "{log}");
+        assert!(!events.iter().any(|e| e["type"] == "error"), "{log}");
+    }
+}
+
+/// A cancel takes no steer. One waiting when the turn is cancelled during a
+/// tool round gets no `steer_accepted` and never enters the transcript, so
+/// the frontend that still holds it can hand it back: with no gate to run,
+/// nothing else would stop the boundary after that round from taking it.
+#[test]
+fn a_cancelled_turn_takes_no_waiting_steer() {
+    let marker = "1' >> ran.log; while [ ! -f gate ]; do sleep 0.01; done; echo '";
+    let env = Env::new("steer-cancel", "a steer waiting at a cancel", vec![
+        Step::Finished(sse_call("c1", marker)),
+        Step::Finished(sse_text("steered")),
+    ]);
+    let gate = env.project.join("gate");
+    let (events, log) = steered_turn(&env, &|| env.ran_log().contains('1'), &[STEER, r#"{"cmd":"cancel"}"#], &mut |_| std::fs::write(&gate, "").unwrap());
+    assert_eq!(events.last().unwrap()["stop_reason"], "cancelled", "{log}");
+    assert!(!events.iter().any(|e| e["type"] == "steer_accepted"), "{log}");
+    let sid = events[0]["session_id"].as_str().unwrap();
+    let saved = transcript_messages(&std::fs::read(env.transcript(sid)).unwrap(), "steer at a cancel");
+    assert!(!saved.iter().any(|m| m.content.as_deref() == Some("use the v2 API")), "{saved:?}");
+}
+
+/// An accepted steer is a saved user message, like the turn's own prompt, so
+/// a turn that ends before the model answers it leaves it for the next turn.
+/// Here the `max_agent_tokens` cap refuses request 2 at admission: the cap is
+/// the window (`context_tokens`), which every admitted request fits under,
+/// and request 1 reports spending all of it, so nothing more fits. The turn
+/// ends `budget_exhausted` with the steer on disk after the tool result, and
+/// the next turn's first request carries it there, ahead of the new prompt,
+/// with no resend.
+#[test]
+fn an_accepted_steer_the_turn_cannot_send_is_carried_by_the_next_turn() {
+    const WINDOW: usize = 16384;
+    let open = Arc::new(AtomicBool::new(false));
+    let spent = data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":WINDOW}}));
+    let env = Env::with_settings("steer-budget", "an accepted steer past the budget", vec![
+        Step::Gated { open: open.clone(), then: format!("{}{}{spent}{DONE}", call("c1", "1"), finish("tool_calls")) },
+        Step::Finished(sse_text("answered")),
+    ], &format!(r#","max_agent_tokens":{WINDOW}"#));
+    let (events, log) = steered_turn(&env, &|| !env.server.arrivals.lock().unwrap().is_empty(), &[STEER], &mut |_| open.store(true, Ordering::SeqCst));
+    assert_eq!(events.last().unwrap()["stop_reason"], "budget_exhausted", "{log}");
+    assert!(events.iter().any(|e| e["type"] == "steer_accepted" && e["text"] == "use the v2 API"), "{log}");
+    assert_eq!(request_messages(&env).len(), 1, "admission refused the request that would carry the steer:\n{log}");
+
+    let next = env.run(&["--continue"], &["go on"], &[], "the turn after a budget stop");
+    assert_eq!(next.stop_reason(), "stop", "{}", next.log());
+    let requests = request_messages(&env);
+    assert_eq!(requests.len(), 2, "{}", next.log());
+    let sent: Vec<(Option<&str>, Option<&str>)> = requests[1].iter().map(|m| (m["role"].as_str(), m["content"].as_str())).collect();
+    let tool = requests[1].iter().position(|m| m["tool_call_id"] == "c1").expect("request 2 carries the tool round");
+    let steer = sent.iter().position(|m| *m == (Some("user"), Some("use the v2 API"))).expect("request 2 carries the steer");
+    let prompt = sent.iter().position(|m| *m == (Some("user"), Some("go on"))).expect("request 2 carries the new prompt");
+    assert!(tool + 1 == steer && steer < prompt, "the steer sits after the tool round, ahead of the new prompt: {sent:?}");
+    assert_eq!(sent.iter().filter(|m| m.1 == Some("use the v2 API")).count(), 1, "{sent:?}");
+}
+
+/// The approval mode in force is read at each boundary before the steers
+/// waiting there are judged, as before every other gate. A mode chosen while
+/// a tool runs therefore picks the hooks that judge a steer sent with it: in
+/// `ask` a project hook no human approved is inert, where `auto` ran it on
+/// the steer's text. The model reads the tool result, the steer, then the new
+/// mode's note, which follows the saved steer as a message of its own, so
+/// the transcript on disk is exactly what request 2 carried, then the reply.
+#[test]
+fn a_steer_sent_with_a_mode_change_is_judged_by_the_new_mode() {
+    let marker = "1' >> ran.log; while [ ! -f gate ]; do sleep 0.01; done; echo '";
+    let env = Env::new("steer-mode", "a steer with a mode change", vec![
+        Step::Finished(sse_call("c1", marker)),
+        Step::Finished(sse_text("steered")),
+    ]);
+    let hooks = env.project.join(".openmax/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let script = "if grep -q 'v2 API'; then touch steer-judged; fi; exit 0";
+    std::fs::write(hooks.join("gate.toml"), format!("event = \"user_prompt_submit\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\n")).unwrap();
+    let gate = env.project.join("gate");
+    let (events, log) = steered_turn(&env, &|| env.ran_log().contains('1'), &[r#"{"cmd":"approval_mode","mode":"ask"}"#, STEER], &mut |_| std::fs::write(&gate, "").unwrap());
+    assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{log}");
+    assert!(!env.project.join("steer-judged").exists(), "an unapproved hook ran on a steer sent after ask was chosen:\n{log}");
+    assert!(events.iter().any(|e| e["type"] == "steer_accepted"), "{log}");
+    let requests = request_messages(&env);
+    assert_eq!(requests.len(), 2, "{log}");
+    let sent: Vec<(Option<&str>, Option<&str>)> = requests[1].iter().map(|m| (m["role"].as_str(), m["content"].as_str())).collect();
+    let tail = &sent[sent.len() - 3..];
+    assert_eq!(tail[0], (Some("tool"), Some("(no output)")), "{sent:?}");
+    assert_eq!(tail[1], (Some("user"), Some("use the v2 API")), "{sent:?}");
+    assert!(tail[2].1.is_some_and(|c| c.starts_with("[execution policy: ask")), "the mode change is narrated after the steer: {sent:?}");
+
+    let sid = events[0]["session_id"].as_str().unwrap();
+    let saved = transcript_messages(&std::fs::read(env.transcript(sid)).unwrap(), "steer with a mode change");
+    let disk: Vec<(Option<&str>, Option<&str>)> = saved.iter().map(|m| (Some(m.role.as_str()), m.content.as_deref())).collect();
+    assert_eq!(disk[..disk.len() - 1], sent[..], "the disk holds what request 2 carried, then the reply");
+    assert_eq!(disk.last().unwrap().1, Some("steered"), "{disk:?}");
+}
+
+/// A mode chosen after a user message was saved, and before the request
+/// carrying it is answered, is narrated after that message, never ahead of
+/// it: a save appends from the persisted length, so a note put ahead of a
+/// saved message writes that message to disk a second time. Two such
+/// messages: a steer, with the mode chosen while the request carrying it is
+/// held, and a `turn_end` refusal, with the mode chosen while the refusing
+/// hook runs. Either way the disk holds the message once: what the last
+/// request carried, then the note when it came after that request, then the
+/// reply.
+#[test]
+fn a_mode_change_after_a_saved_user_message_writes_it_once() {
+    const ASK: &str = r#"{"cmd":"approval_mode","mode":"ask"}"#;
+    for case in ["steer", "refusal"] {
+        let open = Arc::new(AtomicBool::new(false));
+        let marker = "1' >> ran.log; while [ ! -f gate ]; do sleep 0.01; done; echo '";
+        let script = match case {
+            "steer" => vec![Step::Finished(sse_call("c1", marker)), Step::Gated { open: open.clone(), then: sse_text("steered") }],
+            _ => vec![Step::Finished(sse_text("first")), Step::Finished(sse_text("steered"))],
+        };
+        let env = Env::new("steer-saved", "a mode change after a saved message", script);
+        let gate = env.project.join("gate");
+        let trust = env.home.join(".openmax/trust.json");
+        let (events, log) = if case == "steer" {
+            steered_turn(&env, &|| env.ran_log().contains('1'), &[STEER], &mut |stdin| {
+                std::fs::write(&gate, "").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while env.server.arrivals.lock().unwrap().len() < 2 {
+                    assert!(Instant::now() < deadline, "request 2 never went out");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                writeln!(stdin, "{ASK}").unwrap();
+                // Saved and applied under one lock, so on disk is in force.
+                while !std::fs::read_to_string(&trust).unwrap_or_default().contains("\"ask\"") {
+                    assert!(Instant::now() < deadline, "the mode was never saved");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                open.store(true, Ordering::SeqCst);
+            })
+        } else {
+            let hooks = env.project.join(".openmax/hooks");
+            std::fs::create_dir_all(&hooks).unwrap();
+            let refuse = "if [ ! -f refused ]; then touch refused; while [ ! -f gate ]; do sleep 0.01; done; echo 'run the tests'; exit 1; fi; exit 0";
+            std::fs::write(hooks.join("verify.toml"), format!("event = \"turn_end\"\nblocking = true\ncommand = \"/bin/sh\"\nargs = [\"-c\", {refuse:?}]\n")).unwrap();
+            let refused = env.project.join("refused");
+            steered_turn(&env, &|| refused.exists(), &[ASK], &mut |_| std::fs::write(&gate, "").unwrap())
+        };
+        assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{case}:\n{log}");
+        let requests = request_messages(&env);
+        assert_eq!(requests.len(), 2, "{case}:\n{log}");
+        let sent: Vec<(Option<&str>, Option<&str>)> = requests[1].iter().map(|m| (m["role"].as_str(), m["content"].as_str())).collect();
+        let saved_text = if case == "steer" { "use the v2 API" } else { "run the tests" };
+
+        let sid = events[0]["session_id"].as_str().unwrap();
+        let saved = transcript_messages(&std::fs::read(env.transcript(sid)).unwrap(), case);
+        let disk: Vec<(Option<&str>, Option<&str>)> = saved.iter().map(|m| (Some(m.role.as_str()), m.content.as_deref())).collect();
+        assert_eq!(disk.iter().filter(|m| m.1 == Some(saved_text)).count(), 1, "{case}: the saved message is on disk once: {disk:?}");
+        let note = |m: &(Option<&str>, Option<&str>)| m.1.is_some_and(|c| c.starts_with("[execution policy: ask"));
+        let after = &disk[disk.len() - 2..];
+        if case == "steer" {
+            // Chosen while request 2 was held: request 2 ends on the steer,
+            // and the note follows it on disk, ahead of the reply.
+            assert_eq!(sent.last().unwrap().1, Some(saved_text), "{sent:?}");
+            assert_eq!(disk[..disk.len() - 2], sent[..], "{disk:?}");
+            assert!(note(&after[0]), "{disk:?}");
+        } else {
+            // Chosen while the hook ran: request 2 carries the refusal, then
+            // the note.
+            let at = sent.iter().position(|m| m.1 == Some(saved_text)).expect("request 2 carries the refusal");
+            assert!(note(&sent[at + 1]), "{sent:?}");
+            assert_eq!(disk[..disk.len() - 1], sent[..], "{disk:?}");
+        }
+        assert_eq!(after[1].1, Some("steered"), "{case}: {disk:?}");
+    }
 }
 
 /// Parallel calls from a server that sends no `index` and streams them side

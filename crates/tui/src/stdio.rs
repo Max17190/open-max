@@ -4,13 +4,13 @@
 //! speak line-delimited JSON (an editor plugin, an orchestrator, another
 //! openmax) can drive a complete interactive session, approvals included.
 //!
-//! Protocol (`openmax-stdio/7`), one JSON object per line. The normative
+//! Protocol (`openmax-stdio/8`), one JSON object per line. The normative
 //! reference (every field of every line) is `docs/stdio-protocol.md`, kept in
 //! step with `openmax --spec stdio`; `crates/core/src/types.rs` golden tests
 //! pin the event wire.
 //!
 //! stdin commands:
-//!   {"cmd":"user","text":"..."}                      start a turn
+//!   {"cmd":"user","text":"..."}                      start a turn, or steer the running one
 //!   {"cmd":"approve","approval_id":"...","approved":true}
 //!   {"cmd":"approval_mode","mode":"auto|ask|readonly"}
 //!   {"cmd":"reload"}                                 re-freeze tools/skills/prompt
@@ -20,7 +20,7 @@
 //!   {"cmd":"quit"}                                   finish the turn, then exit
 //!
 //! stdout lines:
-//!   {"type":"hello","proto":"openmax-stdio/7","protocol_version":7,"session_id":"...","version":"...","project":"...","continued":false}
+//!   {"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"...","project":"...","continued":false}
 //!   AgentEvent envelopes exactly as `--print --json` emits them
 //!   {"type":"protocol_error","message":"..."}        bad input; session unharmed
 //!   {"type":"forked","session_id":"...","parent_id":"...","message_index":3}
@@ -50,11 +50,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
 use std::time::Instant;
 
-pub const PROTO: &str = "openmax-stdio/7";
+pub const PROTO: &str = "openmax-stdio/8";
 /// Machine-comparable protocol major. A client negotiates on this integer;
 /// `PROTO` embeds the same number as a human-readable id (checked in tests).
 /// Bump on any wire change (event field, command shape, framing line).
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 
 // Unknown `cmd` values are protocol errors; extra fields on a known command
 // are ignored (lenient by design, so clients can annotate lines freely).
@@ -434,13 +434,40 @@ async fn drive_loop<W: Write>(
                     }
                     Some(Ok(Command::User { text })) => {
                         if text.trim().is_empty() {
-                            refuse(out, &session_id, "user text is empty");
+                            // A running turn owns the next `done`, so a
+                            // `refused` one here would report it finished.
+                            if running {
+                                protocol_error(out, "user text is empty");
+                            } else {
+                                refuse(out, &session_id, "user text is empty");
+                            }
                             continue;
                         }
                         if running {
-                            // The in-flight turn owns the next `done`; a second
-                            // one here would tell the client that turn ended.
-                            protocol_error(out, "a turn is in flight; wait for done");
+                            // Steer the in-flight turn: it owns the next
+                            // `done`, and `steer_accepted` marks where the
+                            // text entered its transcript. Expanded like a
+                            // turn's prompt (below, and for the same reason
+                            // bounded by a signal), so a template steers too,
+                            // and the expansion is the `text` that
+                            // `steer_accepted` or `steer_blocked` carries.
+                            // Queued before the next command is read, as every
+                            // command is handled in the order sent: a steer
+                            // read before `done` goes to the turn running when
+                            // it was read, never to the turn a later `user`
+                            // starts. The wait is a path probe and one
+                            // regular-file read for a `/name` line, and none for
+                            // any other text, held like the `approval_mode` save
+                            // above.
+                            let steer = {
+                                let (core, session_id, project) = (core.clone(), session_id.clone(), project.clone());
+                                move || core.steer(&session_id, templates::expand_user_input(&core.data_dir, &project, &text))
+                            };
+                            match crate::until_stopped(&mut quit, stop_by, steer).await {
+                                Some(Ok(())) => {}
+                                Some(Err(e)) => protocol_error(out, &e),
+                                None => return crate::quit_status(),
+                            }
                             continue;
                         }
                         // A `/name args` line expands here exactly as it does
@@ -675,7 +702,7 @@ fn transcript<'a>(
     StdioLine::Transcript { session_id, messages: out, truncated }
 }
 
-/// Validate one JSONL line against the `openmax-stdio/7` contract using the
+/// Validate one JSONL line against the `openmax-stdio/8` contract using the
 /// authoritative types (`Command` for stdin, `AgentEvent` for stdout events),
 /// so there is no second schema to drift. Returns a short label on success
 /// (`cmd user`, `event token`, `hello`) or a human reason on failure.
@@ -907,6 +934,17 @@ mod tests {
             .unwrap(),
             "event done"
         );
+        assert_eq!(
+            validate_line(r#"{"session_id":"s1","type":"steer_accepted","text":"use v2"}"#).unwrap(),
+            "event steer_accepted"
+        );
+        assert_eq!(
+            validate_line(r#"{"session_id":"s1","type":"steer_blocked","text":"use v2","reason":"no v2 here"}"#).unwrap(),
+            "event steer_blocked"
+        );
+        // A blocked steer without its text is the line a frontend cannot
+        // match to the steer it holds, so it is no `steer_blocked`.
+        assert!(validate_line(r#"{"session_id":"s1","type":"steer_blocked","reason":"no v2 here"}"#).is_err());
         assert_eq!(
             validate_line(r#"{"type":"protocol_error","message":"nope"}"#).unwrap(),
             "protocol_error"

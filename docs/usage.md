@@ -156,7 +156,7 @@ for the repair: close every openmax, then move the file aside.
 
 | Input | Action |
 | --- | --- |
-| **Enter** | Send (queues if the agent is busy) |
+| **Enter** | Send; while a turn runs, steer it: the message joins the turn as a user message before its next request, which carries it, or the next turn's first request when the turn ends first (during a compaction it queues for after); one a `user_prompt_submit` hook blocks comes back to the composer |
 | **/** | Slash commands · **Tab** or **Enter** completes |
 | **@** | Mention a project file |
 | Mouse drag | Select transcript or prompt text |

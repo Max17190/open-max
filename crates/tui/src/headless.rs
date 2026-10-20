@@ -382,6 +382,8 @@ async fn run_turn_events(
             | AgentEvent::Budget { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Diff { .. }
+            | AgentEvent::SteerAccepted { .. }
+            | AgentEvent::SteerBlocked { .. }
             | AgentEvent::ApprovalSettled { .. } => {}
         }
     }

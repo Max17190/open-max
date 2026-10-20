@@ -290,6 +290,19 @@ fn insert_startup_note(
     msgs: &mut Vec<ChatMessage>,
     text: String,
 ) {
+    let at = msgs.len().saturating_sub(1);
+    insert_note(core, session_id, msgs, at, text);
+}
+
+/// Insert a harness note as a user message at `at` and emit it on the wire,
+/// as `insert_startup_note` does ahead of the pending prompt.
+fn insert_note(
+    core: &Arc<Core>,
+    session_id: &str,
+    msgs: &mut Vec<ChatMessage>,
+    at: usize,
+    text: String,
+) {
     // The door, not each note. Every turn-start note is one bracketed clause
     // by construction and several are built from author-controlled bytes (an
     // approval record's capability path, a provider name read out of
@@ -297,7 +310,6 @@ fn insert_startup_note(
     // parameter here neutralizes all of them at once, and a note added later
     // inherits the rule instead of reintroducing the class.
     let text = crate::text::one_line(&text);
-    let at = msgs.len().saturating_sub(1);
     msgs.insert(at, ChatMessage::user(text.clone()));
     core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
 }
@@ -1471,6 +1483,7 @@ pub fn start_turn(
             .lock()
             .unwrap()
             .insert(session_id.clone(), cancelled.clone());
+        core.steers.lock().unwrap().insert(session_id.clone(), Vec::new());
         running.insert(session_id.clone());
     }
 
@@ -1527,9 +1540,59 @@ async fn finish_session_work(core: &Core, id: &str, events: Vec<AgentEvent>) {
     let mut state = core.sessions.lock().await;
     let mut running = core.running.lock().unwrap();
     core.cancel_flags.lock().unwrap().remove(id);
+    // Closes the steer queue: a steer the turn never reached is dropped
+    // here, and its frontend, which saw no SteerAccepted for it, still has it.
+    core.steers.lock().unwrap().remove(id);
     running.remove(id);
     sessions::finish_detach(core, id, &mut state);
     for event in events { core.send_agent(id, event); }
+}
+
+/// Append the messages sent to this turn since its last request
+/// (`Core::steer`) as user messages, oldest first, and say whether any
+/// entered. Each passes the user_prompt_submit gate the turn's first prompt
+/// passed, so a steer is never a way around input policy: a blocked one gets
+/// SteerBlocked with its text, at once, and never enters the transcript.
+/// Saved first, then SteerAccepted, as for a turn_end refusal, so the live
+/// view shows a steer where a resume replays it. A save that fails reports
+/// its own error and the steer still goes to the model and still gets its
+/// SteerAccepted: it is the user's input, which a refusal is not, and the
+/// next save that lands writes it. A cancelled turn takes none, whether the
+/// cancel came first or while a gate ran: its frontend, which hears neither
+/// event for them, hands them back.
+async fn accept_steers(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    hooks: &Hooks,
+    cancelled: &Arc<CancelToken>,
+    messages: &mut Vec<ChatMessage>,
+) -> bool {
+    let queued = std::mem::take(core.steers.lock().unwrap().get_mut(session_id).unwrap_or(&mut Vec::new()));
+    let mut accepted = Vec::new();
+    for text in queued {
+        if cancelled.is_cancelled() {
+            return false;
+        }
+        let (submitted, unchecked) = hooks.user_prompt_submit(session_id, &text, project_root, cancelled).await;
+        report_hook_failures(core, session_id, unchecked);
+        match submitted {
+            PreToolResult::Allow => accepted.push(text),
+            PreToolResult::Block { reason } => {
+                core.send_agent(session_id, AgentEvent::SteerBlocked { text, reason });
+            }
+            PreToolResult::Cancelled => {}
+        }
+    }
+    if accepted.is_empty() || cancelled.is_cancelled() {
+        return false;
+    }
+    messages.extend(accepted.iter().cloned().map(ChatMessage::user));
+    save_messages(core, session_id, messages, false).await;
+    for text in accepted {
+        core.send_agent(session_id, AgentEvent::SteerAccepted { text });
+    }
+    true
 }
 
 /// Recover the message a panic carried, for the error event that replaces it.
@@ -2604,6 +2667,27 @@ async fn refresh_approval_policy(
         .await;
 }
 
+/// The first half of a refresh, with no note: read the mode in force into
+/// `mode` and, when it moved, load the hooks and permissions of the new one.
+fn reload_approval_policy(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    canonical_root: &Path,
+    mode: &mut ApprovalMode,
+    hooks: &mut Hooks,
+    permissions: &mut TurnPermissions,
+) {
+    core.refresh_saved_approval_modes();
+    let current = core.approval_mode_canonical(canonical_root);
+    if current != *mode {
+        *mode = current;
+        *hooks = Hooks::discover_for_mode(project_root, &core.data_dir, current);
+        permissions.reload(Permissions::discover_for_mode(project_root, &core.data_dir, current));
+        report_hook_failures(core, session_id, hooks.notices());
+    }
+}
+
 /// The mode is read by `canonical_root`, the turn's one resolution of
 /// `project_root`, so a refresh walks no path: it stats the trust store and
 /// rereads it only when that stamp moved. Hooks and permissions are still
@@ -2621,24 +2705,31 @@ async fn refresh_approval_policy_canonical(
     permissions: &mut TurnPermissions,
     messages: &mut Vec<ChatMessage>,
 ) {
-    core.refresh_saved_approval_modes();
-    let current = core.approval_mode_canonical(canonical_root);
-    if current != *mode {
-        *mode = current;
-        *hooks = Hooks::discover_for_mode(project_root, &core.data_dir, current);
-        permissions.reload(Permissions::discover_for_mode(project_root, &core.data_dir, current));
-        report_hook_failures(core, session_id, hooks.notices());
-    }
+    reload_approval_policy(core, session_id, project_root, canonical_root, mode, hooks, permissions);
+    narrate_approval_policy(core, session_id, *mode, messages).await;
+}
+
+/// The second half of a refresh: tell the model about `current`, the mode
+/// the first half read, once per change the session has not been told of.
+async fn narrate_approval_policy(
+    core: &Arc<Core>,
+    session_id: &str,
+    current: ApprovalMode,
+    messages: &mut Vec<ChatMessage>,
+) {
     // Keep provider tool-call/reply adjacency intact. A mode selected before
     // a batch has any reply is narrated at the next completed reply instead.
     let Some(last_role) = messages.last().map(|m| m.role.as_str()) else { return };
     let on_tool = last_role == "tool";
     if !on_tool && last_role != "user" { return; }
+    let len = messages.len();
+    let mut tail_saved = false;
     let changed = {
         let mut sessions = core.sessions.lock().await;
         sessions.get_mut(session_id).is_some_and(|session| {
             if session.reported_approval_mode == Some(current) { return false; }
             session.reported_approval_mode = Some(current);
+            tail_saved = session.persisted_count == len;
             true
         })
     };
@@ -2647,7 +2738,13 @@ async fn refresh_approval_policy_canonical(
         if on_tool {
             append_and_emit_note(core, session_id, messages, &text);
         } else {
-            insert_startup_note(core, session_id, messages, text);
+            // Ahead of a pending prompt, which reaches disk with the reply. A
+            // user message already saved (a steer, a turn_end refusal: each is
+            // on disk before the request that carries it) is not moved: a save
+            // appends from the persisted length, so a note put ahead of it
+            // would write it to disk twice.
+            let at = if tail_saved { len } else { len - 1 };
+            insert_note(core, session_id, messages, at, text);
         }
     }
 }
@@ -2876,8 +2973,17 @@ async fn run_loop(
     let max_iterations = settings.max_agent_iterations.max(1);
     let mut repeats = RepeatTracker::default();
 
-    'turns: for _ in 0..max_iterations {
-        refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+    'turns: for iteration in 0..max_iterations {
+        // One refresh, split around the steers. The mode in force first, so
+        // a steer is judged by the hooks of a mode chosen while the last
+        // request or tool ran, as every other gate in this loop is. Then the
+        // steers: a message sent while the last request ran is part of what
+        // this request answers, and compaction below must see it. The note
+        // for the mode read above last: a steer is saved by then, so the note
+        // follows it as a message of its own.
+        reload_approval_policy(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions);
+        accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await;
+        narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
         // The tool schemas are re-sent whole on every request, so they are as
         // real as the transcript. Read per iteration: a mid-turn refreeze
         // swaps the wire bytes, and the overhead must follow the current
@@ -3068,6 +3174,23 @@ async fn run_loop(
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
+            // A steer sent while the model wrote its answer is not answered
+            // yet, so this is not the end: take it now and round again for
+            // the model to read it. Taken here, through its gate, so a blocked
+            // steer leaves this answer standing instead of asking again, and
+            // not on the last iteration, which has no request left to carry
+            // it. Before the turn_end consult, which judges an end this is not.
+            if iteration + 1 < max_iterations
+                && accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await
+            {
+                continue 'turns;
+            }
+            // A cancel while a steer's gate ran is the human stopping the
+            // turn, which the consult below is not to overrule.
+            if cancelled.is_cancelled() {
+                stop_reason = "cancelled".into();
+                break 'turns;
+            }
             // The one exit a hook may refuse. The model says it is done, so an
             // approved blocking turn_end gets to check the world before that
             // becomes the turn's answer; the hook verifies what is on disk,

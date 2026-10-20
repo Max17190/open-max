@@ -388,8 +388,9 @@ Gate events (`pre_tool_use`, `user_prompt_submit`): a nonzero exit blocks the
 call or the prompt. The block reason is the hook's stdout (or stderr if stdout
 is empty), capped at 500 chars. A blocked tool call returns to the model as a
 failed tool result carrying the reason; a blocked prompt never reaches the
-model. A gate that times out or cannot start blocks; auto relaxes the second
-case (below).
+model. `user_prompt_submit` also judges each message steered into a running
+turn, with the same payload. A gate that times out or cannot start blocks;
+auto relaxes the second case (below).
 
 Observe events (`post_tool_use`, `session_start`, `compaction`, and `turn_end`
 without `blocking`): exit status is ignored. `session_start` fires on a
@@ -938,18 +939,23 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/7)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/8)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/7","protocol_version":7,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
-- {"cmd":"user","text":"..."} starts a turn.
+- {"cmd":"user","text":"..."} starts a turn. Sent while a turn runs, it
+  steers that turn instead: the text, a `/name args` line expanded as a
+  prompt template first, passes the `user_prompt_submit` gate and becomes a
+  user message at the turn's next iteration boundary, before its next
+  request, and a `steer_accepted` (or `steer_blocked`) event carrying that
+  expanded text answers it.
 - {"cmd":"approve","approval_id":"...","approved":true|false} answers a
   pending approval.
 - {"cmd":"approval_mode","mode":"auto"|"ask"|"readonly"} sets the gate for
@@ -1037,7 +1043,26 @@ prompt, or a blocking `turn_end` gate could not start and the turn ends
 event goes out - and the turn continues, so render it, or the live view shows
 the model finishing and then starting again with no visible cause while a
 replay of the same session from disk shows the injected message; the two
-counters are the numbers the hook's payload carried for this attempt), `done`
+counters are the numbers the hook's payload carried for this attempt),
+`steer_accepted` (text: a `user` line sent while the turn ran entered the
+transcript as a user message here, after the output above it and before the
+next request, which carries it; `text` is the line's text after template
+expansion, so match answers to steers by it, since a `steer_blocked` can go
+out ahead of the `steer_accepted` of a steer sent before it. This event
+follows the save that records the message, or that save's own `error` when
+it fails, and the steer still goes to the model then. A turn that ends
+before the model answers it, even before the request carrying it goes out (a
+cancel, `budget_exhausted` at admission, a failed compaction), leaves it
+saved for the next turn's first request to carry; a model that stopped while
+it waited is sent round again for it, except on the turn's last iteration. A
+steer that gets neither answer before the turn's `done` never reached the
+model and may be sent again after that `done`: one waiting when the turn is
+cancelled, fails, runs out of budget, or reaches its last iteration, and one
+sent after the turn took the model's final answer, while a `turn_end` hook
+judges an answer it lets stand or as the turn saves and settles),
+`steer_blocked` (text, reason: a `user_prompt_submit` gate refused a steer,
+which entered nothing and sends no request; the text comes back so a
+frontend can hand it to the user to edit instead of sending it again), `done`
 (stop_reason), `error` (message).
 
 `approval_request.reason` is `gate` (approval_mode or a permission rule) or
@@ -1062,17 +1087,20 @@ claimed before the handshake and stays owned between turns. An unreadable or
 damaged session index or transcript, or a competing owner, causes a nonzero
 exit before hello.
 
-Every `user` command is answered by exactly one `done`, and `done` is the
-only guaranteed terminator. A command that starts no turn (empty text, an
-untrusted project) still gets one, with stop_reason `refused`, after the
-`protocol_error` that says why. A turn that dies unexpectedly reports
-`error` and then `done` with stop_reason `error`; a provider stream that ends
-mid-answer with no completion signal is resent (each resend announced by a
-`retry`) while no reply text has streamed, and otherwise reports its partial
-`message_done`, then `error`, then `done` with stop_reason `truncated`, and
-no tool call it carried is run. The single exception is a
-`user` sent while a turn is in flight: that is refused with a
-`protocol_error` and no `done`, because the running turn owns the next one.
+Every `user` command sent while no turn runs is answered by exactly one
+`done`, and `done` is the only guaranteed terminator. A command that starts
+no turn (empty text, an untrusted project) still gets one, with stop_reason
+`refused`, after the `protocol_error` that says why. A turn that dies
+unexpectedly reports `error` and then `done` with stop_reason `error`; a
+provider stream that ends mid-answer with no completion signal is resent
+(each resend announced by a `retry`) while no reply text has streamed, and
+otherwise reports its partial `message_done`, then `error`, then `done` with
+stop_reason `truncated`, and no tool call it carried is run. A `user` sent
+while a turn is in flight steers the running turn, which owns the next
+`done`, so it gets none of its own (one with empty text, one that would make
+the steers still waiting for the turn pass 8 MiB together, or one that
+arrives as the turn settles, after it stopped taking steers, gets a
+`protocol_error` instead).
 
 A command line over 8 MiB, or one that is not valid UTF-8, is refused with a
 `protocol_error` and skipped; the session keeps reading.
@@ -1616,6 +1644,8 @@ mod tests {
                 continuation: 0,
                 continuations_left: 0,
             },
+            AgentEvent::SteerAccepted { text: String::new() },
+            AgentEvent::SteerBlocked { text: String::new(), reason: String::new() },
             AgentEvent::Done { stop_reason: String::new() },
             AgentEvent::Error { message: String::new() },
         ];

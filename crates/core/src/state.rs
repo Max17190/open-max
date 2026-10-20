@@ -135,6 +135,12 @@ pub struct Core {
     /// Sessions with an agent turn currently in flight.
     pub running: Mutex<HashSet<String>>,
     pub cancel_flags: Mutex<HashMap<String, Arc<CancelToken>>>,
+    /// Messages sent to a running turn (`steer`), oldest first. An entry
+    /// exists only while a turn is in flight: `start_turn` opens it under the
+    /// `running` hold and settling removes it, so a steer is never queued for
+    /// a turn that already settled (a compaction claims `running` but opens
+    /// none). One still queued when its turn ends is dropped with the entry.
+    pub(crate) steers: Mutex<HashMap<String, Vec<String>>>,
     /// Pending tool-approval prompts awaiting a user decision.
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Serializes this process's session store writes, the index's
@@ -303,6 +309,7 @@ impl Core {
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),
+            steers: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
             session_owners: Default::default(),
@@ -343,6 +350,7 @@ impl Core {
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),
+            steers: Default::default(),
             approvals: Default::default(),
             sessions_lock: Default::default(),
             session_owners: Default::default(),
@@ -409,10 +417,46 @@ impl Core {
         }
     }
 
+    /// Send `text` to the turn running in `session_id`. The turn appends it
+    /// as a user message at its next iteration boundary, before the next
+    /// request is built, and reports it with `AgentEvent::SteerAccepted`; a
+    /// model that stops while a steer waits is sent round again to read it,
+    /// unless the turn is on its last iteration. Errors when no turn is
+    /// running there. Ok means queued, not read: a turn that ends without
+    /// taking the steer (cancelled, failed, out of budget or iterations, or
+    /// already past the model's final answer) drops it, and only
+    /// SteerAccepted says it entered the transcript (SteerBlocked says its
+    /// gate refused it). An accepted steer is saved, so a turn that ends
+    /// before the model answers it (out of budget at the next admission)
+    /// leaves it for the next turn's first request.
+    /// Also errors when the steers already waiting for the turn and `text`
+    /// together pass [`MAX_WAITING_STEER_BYTES`]: a frontend that keeps
+    /// sending while a long request or tool runs is refused, not buffered
+    /// without bound.
+    pub fn steer(&self, session_id: &str, text: String) -> Result<(), String> {
+        match self.steers.lock().unwrap().get_mut(session_id) {
+            Some(queue) => {
+                let waiting: usize = queue.iter().map(String::len).sum();
+                if waiting + text.len() > MAX_WAITING_STEER_BYTES {
+                    return Err(format!(
+                        "the steers waiting for this turn would pass {MAX_WAITING_STEER_BYTES} bytes; send this again after the next steer_accepted, steer_blocked, or done"
+                    ));
+                }
+                queue.push(text);
+                Ok(())
+            }
+            None => Err("no turn is running in this session to steer".into()),
+        }
+    }
+
     pub fn is_running(&self, session_id: &str) -> bool {
         self.running.lock().unwrap().contains(session_id)
     }
 }
+
+/// The most steer text that may wait for one turn at once. What a turn has
+/// not yet taken is held in memory, so it is bounded like any other input.
+pub const MAX_WAITING_STEER_BYTES: usize = 8 * 1024 * 1024;
 
 /// `~/.openmax`, the single place Open Max keeps its state (settings, sessions,
 /// logs).
@@ -426,6 +470,25 @@ pub fn default_data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Steers wait in memory until the turn's next boundary takes them, so
+    /// together they hold at most `MAX_WAITING_STEER_BYTES`: one that would
+    /// pass it is refused and leaves the queue as it was, and once the turn
+    /// takes what waits there is room again.
+    #[test]
+    fn steers_waiting_for_one_turn_are_capped_in_bytes() {
+        let dir = std::env::temp_dir().join(format!("omx-steer-cap-{}", uuid::Uuid::new_v4()));
+        assert_eq!(MAX_WAITING_STEER_BYTES, 8 * 1024 * 1024, "docs/stdio-protocol.md and --spec stdio say 8 MiB");
+        let (core, _) = Core::new(dir.clone()).unwrap();
+        core.steers.lock().unwrap().insert("s".into(), Vec::new());
+        core.steer("s", "x".repeat(MAX_WAITING_STEER_BYTES - 1)).unwrap();
+        core.steer("s", "y".into()).expect("exactly at the cap is taken");
+        assert!(core.steer("s", "z".into()).is_err(), "one byte past the cap is refused");
+        assert_eq!(core.steers.lock().unwrap()["s"].len(), 2, "a refused steer is not queued");
+        std::mem::take(core.steers.lock().unwrap().get_mut("s").unwrap());
+        core.steer("s", "z".into()).expect("taken steers free their room");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn project_mode_is_scoped_and_saved_before_activation() {
