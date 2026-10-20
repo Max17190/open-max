@@ -2248,22 +2248,60 @@ impl App {
                         self.note("already in this session");
                         return;
                     }
-                    if let Err(e) = sessions::attach(&self.core, &id) {
-                        self.error(&e);
-                        return;
-                    }
-                    if !self.reset_for_new_session() {
-                        let _ = sessions::detach(&self.core, &id);
-                        return;
-                    }
-                    // Resumed now, so no longer this app's to discard when
-                    // the turn it was left with settles.
-                    self.left_running.retain(|left| *left != id);
-                    self.session_id = Some(id.clone());
-                    self.replay(&id);
+                    self.switch_to_session(id);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Leave the current session for `id` and replay it: what picking a
+    /// row in /resume does, and where /fork and /rewind land.
+    fn switch_to_session(&mut self, id: String) -> bool {
+        if let Err(e) = sessions::attach(&self.core, &id) {
+            self.error(&e);
+            return false;
+        }
+        if !self.reset_for_new_session() {
+            let _ = sessions::detach(&self.core, &id);
+            return false;
+        }
+        // Resumed now, so no longer this app's to discard when the turn it
+        // was left with settles.
+        self.left_running.retain(|left| *left != id);
+        self.session_id = Some(id.clone());
+        self.replay(&id);
+        true
+    }
+
+    /// /fork (at the end) and /rewind <n> (at the end of turn n): branch
+    /// the current session's persisted history into a new session and
+    /// switch to it. The parent stays as it was, reachable from /resume.
+    fn fork_current(&mut self, turn: Option<&str>) {
+        let Some(parent) = self.session_id.clone() else {
+            self.note("no session yet; nothing to fork");
+            return;
+        };
+        if self.running {
+            self.note("a turn is running; fork once it finishes or Esc cancels it");
+            return;
+        }
+        let at = match turn.map(str::parse) {
+            None => sessions::ForkAt::End,
+            Some(Ok(n)) => sessions::ForkAt::Turn(n),
+            Some(Err(_)) => return self.note("usage: /rewind <turn>"),
+        };
+        match sessions::fork(&self.core, &parent, at) {
+            Ok(child) => {
+                let (id, from) = (child.id, child.forked_from.map_or(0, |f| f.message_index));
+                let short = sessions_ui::short_id(&id).to_string();
+                if self.switch_to_session(id) {
+                    self.note(&format!("forked from {} at message {from}; the original is in /resume", sessions_ui::short_id(&parent)));
+                } else {
+                    self.note(&format!("the branch {short} was made but not opened; it is in /resume"));
+                }
+            }
+            Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
         }
     }
 
@@ -2583,6 +2621,11 @@ impl App {
             "new" => {
                 if self.reset_for_new_session() { self.note("new session"); }
             }
+            "fork" => self.fork_current(None),
+            "rewind" => match rest.first() {
+                Some(turn) => self.fork_current(Some(turn)),
+                None => self.note("usage: /rewind <turn>"),
+            },
             "context" => {
                 // A hydrated session shows its frozen breakdown; before any
                 // turn runs (or with no session), preview what the next new
@@ -4741,6 +4784,64 @@ mod tests {
         })
         .await
         .expect("the turn never settled");
+    }
+
+    /// /rewind <n> and /fork branch the current session into a new one and
+    /// switch to it: the branch replays only the history it was cut at, the
+    /// original keeps every turn and stays resumable, and a turn that does
+    /// not exist is named instead of forked.
+    #[tokio::test]
+    async fn rewind_and_fork_switch_to_a_branch_and_leave_the_original_whole() {
+        use open_max_core::sessions;
+        use open_max_core::types::ChatMessage;
+        let (mut app, dir) = app_fixture();
+        let core = app.core.clone();
+        let parent = sessions::create(&core, dir.display().to_string()).unwrap().id;
+        sessions::attach(&core, &parent).unwrap();
+        let history = vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant(Some("first answer".into()), None),
+            ChatMessage::user("second question"),
+            ChatMessage::assistant(Some("second answer".into()), None),
+        ];
+        assert!(sessions::save_messages(&core, &parent, &history, &mut 0, true));
+        sessions::end_turn(&core, &parent, &history[..3]);
+        sessions::end_turn(&core, &parent, &history);
+        sessions::detach(&core, &parent).unwrap();
+        assert!(app.switch_to_session(parent.clone()));
+
+        app.handle_submit("/rewind 3".into()).await.unwrap();
+        assert_eq!(app.session_id.as_deref(), Some(parent.as_str()), "no turn 3, no fork");
+        assert!(app.transcript.export_text().contains("no turn 3 to rewind to; the session has 2"));
+        app.handle_submit("/rewind one".into()).await.unwrap();
+        assert_eq!(app.session_id.as_deref(), Some(parent.as_str()));
+        assert!(app.transcript.export_text().contains("usage: /rewind <turn>"));
+
+        app.handle_submit("/rewind 1".into()).await.unwrap();
+        let child = app.session_id.clone().unwrap();
+        assert_ne!(child, parent);
+        let from = |parent_id: &str| Some(sessions::ForkedFrom { parent_id: parent_id.to_string(), message_index: 3 });
+        assert_eq!(sessions::meta(&core, &child).unwrap().forked_from, from(&parent));
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("first answer") && !shown.contains("second question"), "{shown}");
+
+        app.handle_submit("/fork".into()).await.unwrap();
+        let grandchild = app.session_id.clone().unwrap();
+        assert_eq!(sessions::meta(&core, &grandchild).unwrap().forked_from, from(&child));
+
+        // Back to the original from /resume, which lists it beside both branches.
+        app.handle_submit("/resume".into()).await.unwrap();
+        let rows: Vec<String> = app.sessions_panel.as_ref().unwrap().items.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        for _ in 0..rows.iter().position(|id| *id == parent).unwrap() {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await.unwrap();
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.session_id.as_deref(), Some(parent.as_str()));
+        assert!(app.transcript.export_text().contains("second answer"), "the original keeps every turn");
+        assert_eq!(sessions::load_messages(&core, &parent).unwrap().unwrap().len(), history.len());
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// The app creates its session on the first submit, so a first prompt

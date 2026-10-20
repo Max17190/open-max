@@ -1409,8 +1409,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/6");
-    assert_eq!(hello["protocol_version"], 6);
+    assert_eq!(hello["proto"], "openmax-stdio/7");
+    assert_eq!(hello["protocol_version"], 7);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -1969,7 +1969,7 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
     assert_eq!(
         framed[0],
         format!(
-            r#"{{"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            r#"{{"type":"hello","proto":"openmax-stdio/7","protocol_version":7,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
             env!("CARGO_PKG_VERSION"),
             hello["project"],
         )
@@ -2015,6 +2015,241 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
             r#"{"session_id":"S","type":"done","stop_reason":"refused"}"#.to_string(),
         ]
     );
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Drive one `--stdio` process, started with `args` as well, a step at a
+/// time: send a command, then read stdout through the line that settles it
+/// (`done` for a turn, `forked` for a branch), so no turn is refused for
+/// overlapping the one before it. Every line read comes back parsed, `hello`
+/// first.
+fn stdio_steps(project: &Path, home: &Path, args: &[&str], commands: &[&str]) -> Vec<serde_json::Value> {
+    let mut child = cmd(project, home)
+        .args(["--trust-project", "--stdio"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut lines: Vec<serde_json::Value> = Vec::new();
+    let mut next = |lines: &mut Vec<serde_json::Value>| {
+        let mut line = String::new();
+        assert!(stdout.read_line(&mut line).unwrap() > 0, "stdio ended early after {lines:#?}");
+        lines.push(serde_json::from_str(&line).unwrap());
+        lines.last().unwrap()["type"].as_str().unwrap_or("").to_string()
+    };
+    next(&mut lines);
+    for command in commands {
+        writeln!(stdin, "{command}").unwrap();
+        while !matches!(next(&mut lines).as_str(), "done" | "forked" | "protocol_error") {}
+    }
+    drop(stdin);
+    let out = finish_with_deadline(child);
+    assert_eq!(out.status.code(), Some(0), "{lines:#?}{}", String::from_utf8_lossy(&out.stderr));
+    lines
+}
+
+/// The user and assistant text of a message list, in order: what a request
+/// body or a transcript carries once the system prompt, tool traffic, and
+/// the bracketed notes the harness writes ahead of a prompt are set aside.
+fn conversation(messages: &[serde_json::Value]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m["role"] == "user" || m["role"] == "assistant")
+        .map(|m| m["content"].as_str().unwrap_or("").to_string())
+        .filter(|text| !text.starts_with('['))
+        .collect()
+}
+
+fn transcript_on_disk(home: &Path, id: &str) -> Vec<serde_json::Value> {
+    let path = home.join(".openmax").join("sessions").join(format!("{id}.messages.json"));
+    std::fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+/// `rewind` branches a session at the end of a turn and `fork` at its end,
+/// and each new session's next request carries exactly the history it was
+/// branched with. The session left behind keeps every byte of its
+/// transcript, so the two agree up to the fork point and differ only after
+/// it. The rewind runs in a later sitting (`--continue`), so the original
+/// was saved by one process and branched by another.
+#[test]
+fn rewind_and_fork_branch_a_session_and_the_next_request_carries_only_the_branch() {
+    let (project, home) = fresh_dirs("fork-rewind");
+    let record = project.parent().unwrap().join("requests.jsonl");
+    let replies = ["r1", "r2", "r3", "r4", "r5"].map(sse_text).to_vec();
+    let (base_url, _server) = spawn_recording_server(replies, record.clone());
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let mut lines = stdio_steps(&project, &home, &[], &[
+        r#"{"cmd":"user","text":"one"}"#,
+        r#"{"cmd":"user","text":"two"}"#,
+        r#"{"cmd":"user","text":"three"}"#,
+    ]);
+    let parent = lines[0]["session_id"].as_str().unwrap().to_string();
+    let transcript_path = home.join(".openmax").join("sessions").join(format!("{parent}.messages.json"));
+    let saved = std::fs::read(&transcript_path).unwrap();
+    lines.extend(stdio_steps(&project, &home, &["--continue"], &[
+        r#"{"cmd":"rewind","turn":1}"#,
+        r#"{"cmd":"user","text":"four"}"#,
+        r#"{"cmd":"fork"}"#,
+        r#"{"cmd":"user","text":"five"}"#,
+    ]));
+    assert_eq!(std::fs::read(&transcript_path).unwrap(), saved, "the original keeps every byte");
+    let forks: Vec<&serde_json::Value> = lines.iter().filter(|l| l["type"] == "forked").collect();
+    assert_eq!(forks.len(), 2, "{lines:#?}");
+    let rewound = forks[0]["session_id"].as_str().unwrap().to_string();
+    let forked = forks[1]["session_id"].as_str().unwrap().to_string();
+    assert_eq!(forks[0]["parent_id"], parent.as_str());
+    assert_eq!(forks[1]["parent_id"], rewound.as_str());
+    let done_ids: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["type"] == "done")
+        .map(|l| l["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(done_ids, [&parent, &parent, &parent, &rewound, &forked].map(String::as_str));
+
+    let requests: Vec<Vec<String>> = std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(|body| conversation(serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"].as_array().unwrap()))
+        .collect();
+    assert_eq!(requests.len(), 5, "{requests:#?}");
+    assert_eq!(requests[3], ["one", "r1", "four"], "a rewind to turn 1 sends only turn 1");
+    assert_eq!(requests[4], ["one", "r1", "four", "r4", "five"], "a fork sends all it was branched with");
+
+    let (p, r, f) = (transcript_on_disk(&home, &parent), transcript_on_disk(&home, &rewound), transcript_on_disk(&home, &forked));
+    assert_eq!(conversation(&p), ["one", "r1", "two", "r2", "three", "r3"], "the parent is untouched");
+    assert_eq!(conversation(&r), ["one", "r1", "four", "r4"], "a fork is untouched by its own fork");
+    assert_eq!(conversation(&f), ["one", "r1", "four", "r4", "five", "r5"]);
+    let at = forks[0]["message_index"].as_u64().unwrap() as usize;
+    assert_eq!(p[..at], r[..at], "the branches agree up to the fork point");
+    assert_ne!(p[at], r[at], "and differ right after it");
+    let index: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join(".openmax").join("sessions").join("index.json")).unwrap(),
+    ).unwrap();
+    let entry = |id: &str| index.as_array().unwrap().iter().find(|m| m["id"] == id).unwrap().clone();
+    assert_eq!(entry(&rewound)["forked_from"], serde_json::json!({"parent_id": parent, "message_index": at}));
+    assert!(entry(&parent).get("forked_from").is_none(), "a session that is no fork writes no field");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A completion gate's refusal reaches the model as a user message right
+/// after the reply it refused, and belongs to that turn: `rewind` counts
+/// the turns that sent a `done`, so turn 1 ends after the reply the gate let
+/// through, and a session of two prompts has two turns whatever the gate
+/// wrote between them.
+#[test]
+fn a_rewind_counts_a_turn_a_completion_gate_refused_as_one_turn() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, home) = fresh_dirs("fork-gate");
+    let record = project.parent().unwrap().join("requests.jsonl");
+    let replies = ["r1", "r1 checked", "r2", "r3"].map(sse_text).to_vec();
+    let (base_url, _server) = spawn_recording_server(replies, record.clone());
+    write_settings_with_mode(&home, &base_url, "auto");
+    // Refuses the first end attempt and lets every later one through.
+    let gate = project.join("gate.sh");
+    let passed = project.parent().unwrap().join("passed");
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\nif [ -f '{0}' ]; then exit 0; fi\n: > '{0}'\necho 'the build does not compile yet'\nexit 1\n",
+            passed.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("gate.toml"),
+        format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n", gate.display()),
+    )
+    .unwrap();
+
+    let lines = stdio_steps(&project, &home, &[], &[
+        r#"{"cmd":"user","text":"one"}"#,
+        r#"{"cmd":"user","text":"two"}"#,
+        r#"{"cmd":"rewind","turn":3}"#,
+        r#"{"cmd":"rewind","turn":1}"#,
+        r#"{"cmd":"user","text":"three"}"#,
+    ]);
+    assert!(lines.iter().any(|l| l["type"] == "turn_refused"), "the gate never refused: {lines:#?}");
+    let refusal = lines.iter().find(|l| l["type"] == "protocol_error").expect("rewind 3 was not refused");
+    assert_eq!(refusal["message"], "no turn 3 to rewind to; the session has 2", "{lines:#?}");
+    assert!(lines.iter().any(|l| l["type"] == "forked"), "{lines:#?}");
+
+    let requests: Vec<Vec<String>> = std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(|body| conversation(serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"].as_array().unwrap()))
+        .collect();
+    assert_eq!(requests.len(), 4, "{requests:#?}");
+    assert_eq!(
+        requests[3],
+        ["one", "r1", "the build does not compile yet", "r1 checked", "three"],
+        "turn 1 ends where its done was sent, past the refusal"
+    );
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// The original goes on after a fork just as the fork does: each next
+/// request carries its own session's history alone, and the two transcripts
+/// agree up to the fork point and differ only after it. Before the original
+/// continues, its index entry is rewritten to the exact shape a binary that
+/// predates forks wrote (no `forked_from`), dated after the fork so
+/// `--continue` picks it, and it still loads with its history.
+#[test]
+fn a_fork_and_its_original_both_continue_and_diverge_only_after_the_fork_point() {
+    let (project, home) = fresh_dirs("fork-both");
+    let record = project.parent().unwrap().join("requests.jsonl");
+    let replies = ["r1", "r2", "r3"].map(sse_text).to_vec();
+    let (base_url, _server) = spawn_recording_server(replies, record.clone());
+    write_settings_with_mode(&home, &base_url, "auto");
+
+    let first = stdio_steps(&project, &home, &[], &[
+        r#"{"cmd":"user","text":"one"}"#,
+        r#"{"cmd":"fork"}"#,
+        r#"{"cmd":"user","text":"two"}"#,
+    ]);
+    let original = first[0]["session_id"].as_str().unwrap().to_string();
+    let forked = first.iter().find(|l| l["type"] == "forked").expect("no forked line");
+    let (fork, at) = (forked["session_id"].as_str().unwrap().to_string(), forked["message_index"].as_u64().unwrap() as usize);
+
+    let index_path = home.join(".openmax").join("sessions").join("index.json");
+    let mut index: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+    let entry = index.iter_mut().find(|m| m["id"] == original.as_str()).unwrap();
+    *entry = serde_json::json!({
+        "id": entry["id"], "project": entry["project"], "title": entry["title"],
+        "created_at": entry["created_at"], "updated_at": 4_102_444_800u64,
+    });
+    std::fs::write(&index_path, serde_json::to_string(&index).unwrap()).unwrap();
+
+    let second = stdio_steps(&project, &home, &["--continue"], &[r#"{"cmd":"user","text":"three"}"#]);
+    assert_eq!(second[0]["session_id"], original.as_str(), "--continue loads an entry with no forked_from");
+    assert_eq!(second[0]["continued"], true);
+
+    let requests: Vec<Vec<String>> = std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(|body| conversation(serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"].as_array().unwrap()))
+        .collect();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    assert_eq!(requests[1], ["one", "r1", "two"], "the fork continues from what it copied");
+    assert_eq!(requests[2], ["one", "r1", "three"], "the original continues from its own history alone");
+
+    let (o, f) = (transcript_on_disk(&home, &original), transcript_on_disk(&home, &fork));
+    assert_eq!(conversation(&o), ["one", "r1", "three", "r3"]);
+    assert_eq!(conversation(&f), ["one", "r1", "two", "r2"]);
+    assert_eq!(o[..at], f[..at], "the two agree up to the fork point");
+    assert_eq!(conversation(&o[..at]), ["one", "r1"], "and the fork point is the end of turn one");
+    // The older entry's first turn under this binary records the ends its
+    // messages imply, so its two turns stay two and the second ends last.
+    let index: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+    let ends = index.iter().find(|m| m["id"] == original.as_str()).unwrap()["turn_ends"].clone();
+    assert_eq!(ends, serde_json::json!([at, o.len()]), "{index:#?}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

@@ -140,7 +140,10 @@ Fetch issue $1 with `gh issue view $1`, reproduce it, fix it, and add a test.
 
 Run it as `/fix-issue 42` in the composer, as `openmax -p "/fix-issue 42"`, or
 as a stdio `{"cmd":"user","text":"/fix-issue 42"}` line: every front end expands
-the same, so a delegated child process gets the project's templates too.
+the same, so a delegated child process gets the project's templates too. In
+the composer a built-in slash command wins over a template with the same stem
+(a `fork.md` never runs as `/fork`), and `/help` leaves such a template out;
+`-p` and stdio, which have no built-in slash commands, still expand it.
 
 ## Hooks
 

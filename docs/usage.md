@@ -179,6 +179,7 @@ for the repair: close every openmax, then move the file aside.
 | `/provider [name]` | List or switch providers |
 | `/approvals auto\|ask\|readonly` | Save this project's execution mode |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
+| `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
 | `/reload` | Force a re-freeze now (it also happens automatically when extension files change) |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
@@ -190,3 +191,10 @@ for the repair: close every openmax, then move the file aside.
 The persistent status line stays limited to model, context use, and approval
 mode so the transcript remains readable; `/status` is where the full runtime
 detail lives.
+
+Turn `n` of `/rewind` is the `n`th prompt you sent that ran and stayed in
+the transcript, cut where it finished: a completion gate's refusal and
+other notes the harness writes during a turn stay in that turn. The full
+counting rule, including compaction and sessions saved by an earlier
+version, is in [the stdio protocol](stdio-protocol.md), whose `rewind`
+counts the same way.

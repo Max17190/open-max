@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/6`)
+# stdio protocol (`openmax-stdio/7`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/7","protocol_version":7,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -49,11 +49,47 @@ One JSON object per line.
 | `approve` | `approval_id`, `approved` (bool) | Answer a pending approval |
 | `approval_mode` | `mode` (`auto`, `ask`, or `readonly`) | Save the execution mode for this trusted project; answered by an `approval_mode` line, or a `protocol_error` naming the legal values (on a save failure the mode is unchanged and the error says so) |
 | `reload` | none | Re-freeze tools, skills, and prompt from current config; answered by `refrozen`, or `protocol_error` while a turn is in flight |
+| `fork` | none | Branch the session at its end into a new session and drive that one from now on; answered by `forked`, or `protocol_error` while a turn is in flight or before the session holds any message |
+| `rewind` | `turn` (integer, 1-based) | Branch the session at the end of turn `turn` (counted as below) and drive the branch from now on; answered by `forked`, or `protocol_error` while a turn is in flight or when the session has no such turn |
 | `cancel` | none | Cancel the running turn |
 | `quit` | none | Drain the in-flight turn, then exit |
 
 Unknown `cmd` values are protocol errors; extra fields on a known command are
 ignored; blank lines are skipped; EOF behaves like `quit`.
+
+`fork` and `rewind` never change the session they leave, and never touch
+files: a rewind branches the conversation, so an edit the agent made after
+the cut stays on disk. The new session holds that session's first
+`message_index` messages, its frozen tools, skills, and prompt, and its
+compaction records, so its next request carries exactly that history. A
+compaction summary in that history names the archive of the messages it
+moved out, which stays the original's file: the branch shares it rather
+than copying it, so deleting the original deletes it. It is answered by:
+
+```json
+{"type":"forked","session_id":"...","parent_id":"...","message_index":3}
+```
+
+and every later line carries the new `session_id`. The session left behind is
+released, so `/resume` in the TUI or another process can continue it. On a
+`protocol_error` the session driven is unchanged; one sent after the branch
+was made names it, since `/resume` lists it and a retry would make another.
+
+Turn `n` ends where the `n`th turn whose prompt stayed in the transcript
+sent its `done`: the harness records that point once the turn's transcript
+is saved. A user message the harness writes during a turn (a completion
+gate's refusal, the tool-schema budget note) therefore stays in that turn.
+A prompt refused before it ran (an input gate's block, an unresolvable
+endpoint) leaves nothing and is no turn, so a client that counts `done`
+lines skips those. A turn whose process died before it ended, or whose
+closing save failed, counts as one with the next turn that ends, and as the
+last turn while none has. The turns a compaction folded into its summary
+end together, just after the summary. A session whose index entry records
+no turn ends (saved before this version, or rewritten by one) counts one
+turn per run of user messages instead, which puts a turn boundary at each
+such harness message; it keeps that count for every turn up to and
+including the first one that ends under this version, and counts exactly
+from then on.
 
 ## Events (stdout)
 
@@ -63,8 +99,8 @@ discriminator, then its fields, and is byte for byte the line
 with `type`, then its fields in the order this page shows. openmax emits keys
 in those orders, but object key order is not significant: parse every line by
 field name. Only two lines carry no `session_id`: `protocol_error` and the
-`approval_mode` acknowledgement (`hello` and `transcript` are not events
-either, but carry one).
+`approval_mode` acknowledgement (`hello`, `transcript`, and `forked` are not
+events either, but carry one).
 
 | `type` | Fields |
 | --- | --- |

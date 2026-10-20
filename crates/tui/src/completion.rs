@@ -63,6 +63,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         false,
     ),
     command("new", "", "start a fresh session", true),
+    command("fork", "", "branch this session into a new one and switch to it", true),
+    command(
+        "rewind",
+        "<turn>",
+        "branch this session at the end of a turn and switch to it",
+        false,
+    ),
     command(
         "resume",
         "",

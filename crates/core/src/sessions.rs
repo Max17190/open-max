@@ -56,6 +56,31 @@ pub struct SessionMeta {
     /// distinguishable instead of collapsing into one stream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resume_points: Vec<u64>,
+    /// The session this one was forked from and how many of its messages
+    /// the fork copied. Absent on every session that is not a fork, so an
+    /// index written before forks existed parses unchanged. A binary that
+    /// predates the field drops it when it rewrites the index, which loses
+    /// the picker's fork label and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ForkedFrom>,
+    /// Where each finished turn ends: the message count once its closing
+    /// save landed, so `/rewind n` cuts where turn n's `done` was sent and
+    /// a user message the harness writes mid-turn (a completion gate's
+    /// refusal, a budget note) opens nothing. They move with every edit
+    /// that moves `resume_points`. `None` on an entry written before turn
+    /// ends were recorded, or rewritten by a binary that predates them:
+    /// such a session counts turns from its messages (`turn_ends`) until a
+    /// turn of its own ends, which records its count so far that way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ends: Option<Vec<u64>>,
+}
+
+/// The session a fork branched from, and how many of that session's
+/// messages it copied: also what the stdio `forked` line reports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkedFrom {
+    pub parent_id: String,
+    pub message_index: u64,
 }
 
 /// The lock file lives as long as its session: removing the session unlinks
@@ -816,8 +841,11 @@ pub(crate) fn commit_compaction(
         line.push('\n');
         append_text(&compaction_path(core, id), &line, true)?;
     }
-    let before = metas[pos].resume_points.clone();
-    metas[pos].resume_points = shifted_resume_points(&before, before_len, messages.len(), head);
+    // Turn ends are boundaries of the same kind: a turn the prune folded
+    // into its digest ends just after it, with every other turn it folded.
+    let before = (metas[pos].resume_points.clone(), metas[pos].turn_ends.clone());
+    metas[pos].resume_points = shifted_resume_points(&before.0, before_len, messages.len(), head);
+    metas[pos].turn_ends = before.1.as_deref().map(|ends| shifted_resume_points(ends, before_len, messages.len(), head));
     #[cfg(test)]
     if FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.replace(false)) {
         return Err("injected compaction index failure".into());
@@ -835,7 +863,7 @@ pub(crate) fn commit_compaction(
         // The boundaries moved for a prune that did not land: put them back,
         // and say so if even that write fails, since a boundary that stays
         // shifted renders a replay divider early until the next prune.
-        metas[pos].resume_points = before;
+        (metas[pos].resume_points, metas[pos].turn_ends) = before;
         return Err(match save_index(core, &metas) {
             Ok(()) => error,
             Err(restore) => format!("{error}; the replay boundaries could not be restored either: {restore}"),
@@ -1155,10 +1183,119 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
         created_at: now(),
         updated_at: now(),
         resume_points: Vec::new(),
+        forked_from: None,
+        // Recorded from the first turn, so none is ever counted the way an
+        // entry that predates recording is.
+        turn_ends: Some(Vec::new()),
     };
     let m = meta.clone();
     with_index(core, move |metas| metas.push(m))?;
     Ok(meta)
+}
+
+/// Where a fork cuts its parent: after its last persisted message, or at
+/// the end of turn `n` (1-based, counted as [`turn_ends`] counts them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkAt {
+    End,
+    Turn(usize),
+}
+
+/// Branch `parent_id` at `at`: a new session in the same project whose
+/// transcript is the parent's persisted messages up to the cut and whose
+/// turns are the parent's turns up to it. It gets the parent's manifest, so
+/// its first turn re-freezes the same tools, skills and prompt, and the
+/// parent's compaction records, so its first compaction carries forward
+/// what the copied digest condensed. The parent is only read. The child's
+/// files are written before its index entry, under the store lock, so no
+/// reader ever sees it listed without its history. A cut with no message
+/// before it is refused, since that branch would have no history at all.
+pub fn fork(core: &Core, parent_id: &str, at: ForkAt) -> Result<SessionMeta, String> {
+    let (_memo, _flock) = lock_store(core)?;
+    let metas = match read_index(core) {
+        IndexRead::Loaded(metas) => metas,
+        IndexRead::Missing => Vec::new(),
+        IndexRead::Damaged(reason) => return Err(reason),
+    };
+    let parent = metas
+        .iter()
+        .find(|m| m.id == parent_id)
+        .ok_or_else(|| format!("no session {parent_id} to fork"))?;
+    let messages = load_messages_locked(core, parent_id)?.unwrap_or_default();
+    let ends = turn_ends(parent.turn_ends.as_deref(), &messages);
+    let cut = match at {
+        ForkAt::End => messages.len(),
+        ForkAt::Turn(n) => match n.checked_sub(1).and_then(|i| ends.get(i)) {
+            Some(&end) => end,
+            None => return Err(format!("no turn {n} to rewind to; the session has {}", ends.len())),
+        },
+    };
+    // A fork of nothing would list a session with no history behind it,
+    // the entry `discard_if_empty` exists to remove.
+    if cut == 0 {
+        return Err(format!("nothing to fork: session {parent_id} has no message yet"));
+    }
+    // Read before anything is written, so a refusal leaves no file behind.
+    let manifest = read_if_present(&manifest_path(core, parent_id))?;
+    let compactions = read_if_present(&compaction_path(core, parent_id))?;
+    let at = cut as u64;
+    let child = SessionMeta {
+        id: uuid::Uuid::new_v4().to_string(),
+        project: parent.project.clone(),
+        title: parent.title.clone(),
+        created_at: now(),
+        updated_at: now(),
+        resume_points: parent.resume_points.iter().copied().filter(|p| *p < at).collect(),
+        forked_from: Some(ForkedFrom { parent_id: parent_id.to_string(), message_index: at }),
+        turn_ends: Some(ends.into_iter().filter(|&e| e <= cut).map(|e| e as u64).collect()),
+    };
+    write_jsonl(&messages_path(core, &child.id), &messages[..cut])?;
+    if let Some(bytes) = manifest {
+        write_atomic(&manifest_path(core, &child.id), bytes)?;
+    }
+    if let Some(bytes) = compactions {
+        write_atomic(&compaction_path(core, &child.id), bytes)?;
+    }
+    let mut metas = metas;
+    metas.push(child.clone());
+    save_index(core, &metas)?;
+    Ok(child)
+}
+
+/// A file's bytes, or `None` when there is no such file. Any other failure
+/// is refused: a copy that skipped a file it could not read would be a
+/// different session than the one asked for.
+fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} is unreadable: {e}", path.display())),
+    }
+}
+
+/// Where each turn of `messages` ends, in order, as a message count. With
+/// `recorded` (the entry's `turn_ends`) those are the ends, plus one at the
+/// transcript's end when a user message follows the last of them: a turn
+/// whose process died before it finished. Without, each run of user
+/// messages opens a turn, which keeps a note the harness inserts ahead of a
+/// prompt in that prompt's turn but also opens one at every user message
+/// the harness writes mid-turn; that is why ends are recorded.
+pub fn turn_ends(recorded: Option<&[u64]>, messages: &[ChatMessage]) -> Vec<usize> {
+    let len = messages.len();
+    let Some(recorded) = recorded else {
+        let opens: Vec<usize> = (0..len)
+            .filter(|&i| messages[i].role == "user" && (i == 0 || messages[i - 1].role != "user"))
+            .collect();
+        return opens.iter().skip(1).copied().chain(opens.first().map(|_| len)).collect();
+    };
+    let mut ends: Vec<usize> = recorded.iter().map(|&e| e as usize).filter(|&e| e > 0 && e <= len).collect();
+    ends.sort_unstable();
+    ends.dedup();
+    let last = ends.last().copied().unwrap_or(0);
+    if messages[last..].iter().any(|m| m.role == "user") {
+        ends.push(len);
+    }
+    ends
 }
 
 /// One session's index entry, if it exists.
@@ -1171,12 +1308,7 @@ pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
 /// of the boundary shift for a prune, which handles shrinkage. Hydration of
 /// a transcript saved without its system prompt inserts that prompt at 0.
 pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<(), String> {
-    ensure_owned(core, id)?;
-    with_index(core, |metas| {
-        if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
-            shift_points_for_insert(&mut m.resume_points, at);
-        }
-    })
+    apply_resume_edits(core, id, &[ResumeEdit::Insert(at)])
 }
 
 fn shift_points_for_insert(points: &mut [u64], at: u64) {
@@ -1211,18 +1343,20 @@ pub enum ResumeEdit {
     Remove(u64),
 }
 
-/// Move every replay boundary through `edits`, in the order they were made,
-/// in one index write: either every edit lands or none does, so a caller
-/// whose write failed keeps the edits and retries them whole, and no
-/// boundary moves twice.
+/// Move every replay boundary and recorded turn end through `edits`, in
+/// the order they were made, in one index write: either every edit lands or
+/// none does, so a caller whose write failed keeps the edits and retries
+/// them whole, and no boundary moves twice.
 pub fn apply_resume_edits(core: &Core, id: &str, edits: &[ResumeEdit]) -> Result<(), String> {
     ensure_owned(core, id)?;
     with_index(core, |metas| {
         if let Some(m) = metas.iter_mut().find(|m| m.id == id) {
-            for edit in edits {
-                match *edit {
-                    ResumeEdit::Insert(at) => shift_points_for_insert(&mut m.resume_points, at),
-                    ResumeEdit::Remove(at) => shift_points_for_remove(&mut m.resume_points, at),
+            for points in std::iter::once(&mut m.resume_points).chain(m.turn_ends.as_mut()) {
+                for edit in edits {
+                    match *edit {
+                        ResumeEdit::Insert(at) => shift_points_for_insert(points, at),
+                        ResumeEdit::Remove(at) => shift_points_for_remove(points, at),
+                    }
                 }
             }
         }
@@ -1368,6 +1502,19 @@ pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
 }
 
 pub fn touch(core: &Core, id: &str) {
+    bump(core, id, None);
+}
+
+/// [`touch`] for a turn that just ended with `messages` on disk, recording
+/// where it ends in the same index write. An entry that never recorded an
+/// end (it predates recording) first records the ends its messages imply
+/// ([`turn_ends`] without any), so its numbering so far stays as it was,
+/// and every later turn counts exactly.
+pub fn end_turn(core: &Core, id: &str, messages: &[ChatMessage]) {
+    bump(core, id, Some(messages));
+}
+
+fn bump(core: &Core, id: &str, ended: Option<&[ChatMessage]>) {
     if let Err(message) = ensure_owned(core, id) {
         core.send_agent(id, AgentEvent::Error { message });
         return;
@@ -1380,6 +1527,16 @@ pub fn touch(core: &Core, id: &str) {
         if let Some(i) = metas.iter().position(|m| m.id == id) {
             let mut m = metas.remove(i);
             m.updated_at = now();
+            if let Some(messages) = ended {
+                let ends = m
+                    .turn_ends
+                    .get_or_insert_with(|| turn_ends(None, messages).into_iter().map(|e| e as u64).collect());
+                let end = messages.len() as u64;
+                if !ends.contains(&end) {
+                    ends.push(end);
+                    ends.sort_unstable();
+                }
+            }
             metas.push(m);
         }
     });
@@ -1598,13 +1755,18 @@ mod tests {
         }
         assert!(save_messages(&core, &id, &original, &mut 0, true));
         record_resume_point(&core, &id, 6);
+        end_turn(&core, &id, &original[..4]);
+        end_turn(&core, &id, &original);
         let candidate = vec![original[0].clone(), original[1].clone(), ChatMessage::user("digest"), original[7].clone()];
         FAIL_COMPACTION_TRANSCRIPT_WRITE.with(|fail| fail.set(true));
         assert!(commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len(), 2).is_err());
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![6], "boundaries restored");
+        assert_eq!(meta(&core, &id).unwrap().turn_ends, Some(vec![4, 8]), "turn ends too");
         assert_eq!(serde_json::to_value(load_messages(&core, &id).unwrap().unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
         commit_compaction(&core, &id, &candidate, &original[2..7], None, original.len(), 2).unwrap();
         assert_eq!(meta(&core, &id).unwrap().resume_points, vec![3], "boundaries shift with the prune that landed");
+        // A turn the prune folded into the digest ends just after it.
+        assert_eq!(meta(&core, &id).unwrap().turn_ends, Some(vec![3, 4]));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1762,6 +1924,151 @@ mod tests {
         )
         .unwrap();
         assert!(m.resume_points.is_empty());
+        assert!(m.forked_from.is_none(), "an entry written before forks is no fork");
+        assert!(m.turn_ends.is_none(), "nor recorded its turn ends");
+        let line = serde_json::to_string(&m).unwrap();
+        assert!(!line.contains("forked_from"), "a non-fork writes the shape older binaries wrote: {line}");
+        assert!(!line.contains("turn_ends"), "{line}");
+    }
+
+    /// A turn is what ran to one `done`. A session that records its turn
+    /// ends counts from them, so a completion gate's refusal written after
+    /// the model's final reply stays in its turn, and a turn whose process
+    /// died before it ended still counts as one. An entry from before
+    /// recording counts each run of user messages instead, which keeps a
+    /// note inserted ahead of a prompt in that prompt's turn but opens one
+    /// at the refusal; the first turn it ends records the ends that count
+    /// implies, so its numbering stays as it was. Recorded ends move with
+    /// the edits that move replay boundaries.
+    #[test]
+    fn turns_end_where_they_were_recorded_and_older_entries_count_runs_of_user_messages() {
+        let gated = vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("one"),
+            ChatMessage::assistant(Some("done".into()), None),
+            ChatMessage::user("the build does not compile yet"),
+            ChatMessage::assistant(Some("fixed".into()), None),
+            ChatMessage::user("[execution policy: auto]"),
+            ChatMessage::user("two"),
+            ChatMessage::assistant(Some("r2".into()), None),
+        ];
+        assert_eq!(turn_ends(Some(&[5, 8]), &gated), [5, 8]);
+        assert_eq!(turn_ends(Some(&[8, 5, 5, 0, 12]), &gated), [5, 8], "sorted, deduplicated, inside the transcript");
+        assert_eq!(turn_ends(None, &gated), [3, 5, 8], "counted by runs, the refusal opens a turn");
+        let mut killed = gated.clone();
+        killed.push(ChatMessage::user("three"));
+        assert_eq!(turn_ends(Some(&[5, 8]), &killed), [5, 8, 9], "a turn that never ended is the last one");
+        killed.push(ChatMessage::assistant(Some("half".into()), None));
+        assert_eq!(turn_ends(Some(&[5, 8]), &killed), [5, 8, 10]);
+        assert_eq!(turn_ends(Some(&[]), &gated[..1]), Vec::<usize>::new(), "no user message, no turn");
+        assert_eq!(turn_ends(None, &gated[..1]), Vec::<usize>::new());
+        assert_eq!(turn_ends(None, &gated[1..3]), [2], "a transcript may open on its prompt");
+
+        let dir = std::env::temp_dir().join(format!("openmax-turn-ends-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let fresh = create(&core, "/tmp/p".into()).unwrap().id;
+        assert_eq!(meta(&core, &fresh).unwrap().turn_ends, Some(vec![]), "recorded from the start");
+        end_turn(&core, &fresh, &gated[..5]);
+        end_turn(&core, &fresh, &gated);
+        end_turn(&core, &fresh, &gated);
+        assert_eq!(meta(&core, &fresh).unwrap().turn_ends, Some(vec![5, 8]));
+        apply_resume_edits(&core, &fresh, &[ResumeEdit::Insert(0), ResumeEdit::Remove(7)]).unwrap();
+        assert_eq!(meta(&core, &fresh).unwrap().turn_ends, Some(vec![6, 8]), "hydration edits move them");
+
+        let old = create(&core, "/tmp/p".into()).unwrap().id;
+        with_index(&core, |metas| metas.iter_mut().filter(|m| m.id == old).for_each(|m| m.turn_ends = None)).unwrap();
+        end_turn(&core, &old, &gated);
+        assert_eq!(meta(&core, &old).unwrap().turn_ends, Some(vec![3, 5, 8]), "an older entry keeps its count");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fork copies the parent's history up to the cut, its manifest, and
+    /// its compaction records, names its parent, keeps only the replay
+    /// boundaries and turn ends inside what it copied, and leaves every byte
+    /// of the parent as it was. A rewind cuts where the turn's `done` was,
+    /// past a gate's refusal, and a cut that does not exist writes nothing.
+    #[test]
+    fn a_fork_copies_the_prefix_and_manifest_and_leaves_the_parent_untouched() {
+        let dir = std::env::temp_dir().join(format!("openmax-fork-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let parent = create(&core, "/tmp/p".into()).unwrap().id;
+        let history = vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("one"),
+            ChatMessage::assistant(Some("r1".into()), None),
+            ChatMessage::user("the tests fail"),
+            ChatMessage::assistant(Some("r1 again".into()), None),
+            ChatMessage::user("two"),
+            ChatMessage::assistant(Some("r2".into()), None),
+        ];
+        assert!(save_messages(&core, &parent, &history, &mut 0, true));
+        save_manifest(&core, &parent, &crate::registry::Registry::builtin_only().to_manifest());
+        append_text(&compaction_path(&core, &parent), "{\"digest\":\"before\"}\n", false).unwrap();
+        end_turn(&core, &parent, &history[..5]);
+        end_turn(&core, &parent, &history);
+        record_resume_point(&core, &parent, 5);
+        record_resume_point(&core, &parent, 6);
+        let before = std::fs::read(messages_path(&core, &parent)).unwrap();
+
+        let child = fork(&core, &parent, ForkAt::Turn(1)).unwrap();
+        assert_ne!(child.id, parent);
+        let from = ForkedFrom { parent_id: parent.clone(), message_index: 5 };
+        assert_eq!(child.forked_from.as_ref(), Some(&from));
+        assert_eq!(meta(&core, &child.id).unwrap().forked_from, Some(from));
+        assert_eq!(child.resume_points, Vec::<u64>::new(), "a boundary at the cut is past the copy");
+        assert_eq!(child.turn_ends, Some(vec![5]), "the copy holds turn 1 alone");
+        let copied: Vec<Option<String>> =
+            load_messages(&core, &child.id).unwrap().unwrap().into_iter().map(|m| m.content).collect();
+        assert_eq!(copied, ["rules", "one", "r1", "the tests fail", "r1 again"].map(|t| Some(t.to_string())));
+        assert_eq!(
+            std::fs::read(manifest_path(&core, &child.id)).unwrap(),
+            std::fs::read(manifest_path(&core, &parent)).unwrap(),
+            "the child re-freezes from the parent's manifest"
+        );
+        assert_eq!(
+            std::fs::read(compaction_path(&core, &child.id)).unwrap(),
+            std::fs::read(compaction_path(&core, &parent)).unwrap(),
+            "and compacts on from its records"
+        );
+        assert_eq!(std::fs::read(messages_path(&core, &parent)).unwrap(), before);
+        let left = meta(&core, &parent).unwrap();
+        assert_eq!((left.resume_points, left.turn_ends, left.forked_from), (vec![5, 6], Some(vec![5, 7]), None));
+
+        let whole = fork(&core, &parent, ForkAt::End).unwrap();
+        assert_eq!((whole.resume_points, whole.turn_ends), (vec![5, 6], Some(vec![5, 7])));
+        assert_eq!(load_messages(&core, &whole.id).unwrap().unwrap().len(), history.len());
+        assert_eq!(fork(&core, &parent, ForkAt::Turn(2)).unwrap().forked_from.unwrap().message_index, 7);
+        // A parent with no manifest or records yet (no turn has run) forks
+        // without them, and one that ended no turn still has its last.
+        let bare = create(&core, "/tmp/p".into()).unwrap().id;
+        assert!(save_messages(&core, &bare, &history[..3], &mut 0, true));
+        let unfrozen = fork(&core, &bare, ForkAt::Turn(1)).unwrap();
+        assert!(!manifest_path(&core, &unfrozen.id).exists(), "no manifest to copy, none written");
+        assert!(!compaction_path(&core, &unfrozen.id).exists());
+        assert_eq!(unfrozen.turn_ends, Some(vec![3]));
+
+        let empty = create(&core, "/tmp/p".into()).unwrap().id;
+        let listed = load_index(&core).len();
+        let files = std::fs::read_dir(sessions_dir(&core)).unwrap().count();
+        let err = fork(&core, &parent, ForkAt::Turn(3)).unwrap_err();
+        assert_eq!(err, "no turn 3 to rewind to; the session has 2");
+        assert!(fork(&core, &parent, ForkAt::Turn(0)).unwrap_err().starts_with("no turn 0"));
+        assert!(fork(&core, "missing", ForkAt::End).is_err());
+        let err = fork(&core, &empty, ForkAt::End).unwrap_err();
+        assert!(err.starts_with("nothing to fork"), "a branch with no history is refused: {err}");
+        // A manifest or record that exists but cannot be read is refused,
+        // not skipped: the branch would re-freeze from current config, or
+        // compact on without what the copied digest condensed.
+        std::fs::create_dir(manifest_path(&core, &bare)).unwrap();
+        let err = fork(&core, &bare, ForkAt::End).unwrap_err();
+        assert!(err.contains("manifest.json is unreadable"), "{err}");
+        std::fs::remove_dir(manifest_path(&core, &bare)).unwrap();
+        std::fs::create_dir(compaction_path(&core, &bare)).unwrap();
+        let err = fork(&core, &bare, ForkAt::End).unwrap_err();
+        assert!(err.contains("compaction.jsonl is unreadable"), "{err}");
+        assert_eq!(load_index(&core).len(), listed, "a refused fork lists nothing");
+        assert_eq!(std::fs::read_dir(sessions_dir(&core)).unwrap().count(), files + 1, "and writes nothing");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     use crate::state::Core;
@@ -1825,6 +2132,8 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 resume_points: Vec::new(),
+                forked_from: None,
+                turn_ends: None,
             })
         })
         .unwrap();
@@ -1951,6 +2260,8 @@ mod tests {
                         created_at: 1,
                         updated_at: 1,
                         resume_points: Vec::new(),
+                        forked_from: None,
+                        turn_ends: None,
                     });
                 })
                 .unwrap();

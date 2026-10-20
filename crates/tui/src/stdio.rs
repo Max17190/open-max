@@ -4,7 +4,7 @@
 //! speak line-delimited JSON (an editor plugin, an orchestrator, another
 //! openmax) can drive a complete interactive session, approvals included.
 //!
-//! Protocol (`openmax-stdio/6`), one JSON object per line. The normative
+//! Protocol (`openmax-stdio/7`), one JSON object per line. The normative
 //! reference (every field of every line) is `docs/stdio-protocol.md`, kept in
 //! step with `openmax --spec stdio`; `crates/core/src/types.rs` golden tests
 //! pin the event wire.
@@ -14,13 +14,16 @@
 //!   {"cmd":"approve","approval_id":"...","approved":true}
 //!   {"cmd":"approval_mode","mode":"auto|ask|readonly"}
 //!   {"cmd":"reload"}                                 re-freeze tools/skills/prompt
+//!   {"cmd":"fork"}                                   branch the session here, switch to it
+//!   {"cmd":"rewind","turn":1}                        branch at the end of turn 1, switch to it
 //!   {"cmd":"cancel"}                                 cancel the running turn
 //!   {"cmd":"quit"}                                   finish the turn, then exit
 //!
 //! stdout lines:
-//!   {"type":"hello","proto":"openmax-stdio/6","protocol_version":6,"session_id":"...","version":"...","project":"...","continued":false}
+//!   {"type":"hello","proto":"openmax-stdio/7","protocol_version":7,"session_id":"...","version":"...","project":"...","continued":false}
 //!   AgentEvent envelopes exactly as `--print --json` emits them
 //!   {"type":"protocol_error","message":"..."}        bad input; session unharmed
+//!   {"type":"forked","session_id":"...","parent_id":"...","message_index":3}
 //!
 //! `protocol_version` is an integer a client can compare directly; `proto`
 //! carries the same major as a human-readable id. `openmax --check --stdio`
@@ -47,11 +50,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
 use std::time::Instant;
 
-pub const PROTO: &str = "openmax-stdio/6";
+pub const PROTO: &str = "openmax-stdio/7";
 /// Machine-comparable protocol major. A client negotiates on this integer;
 /// `PROTO` embeds the same number as a human-readable id (checked in tests).
 /// Bump on any wire change (event field, command shape, framing line).
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 
 // Unknown `cmd` values are protocol errors; extra fields on a known command
 // are ignored (lenient by design, so clients can annotate lines freely).
@@ -64,6 +67,11 @@ enum Command {
     ApprovalMode { mode: String },
     /// Re-freeze tools, skills, and prompt from current config, like /reload.
     Reload,
+    /// Branch the session at its end and drive the branch, like /fork.
+    Fork,
+    /// Branch the session at the end of turn `turn` (1-based) and drive the
+    /// branch, like /rewind. The session it leaves is not changed.
+    Rewind { turn: usize },
     Cancel,
     Quit,
 }
@@ -243,6 +251,7 @@ async fn drive_loop<W: Write>(
     out: &mut W,
     stop_by: &mut Option<Instant>,
 ) -> i32 {
+    let mut session_id = session_id;
     let mut running = false;
     let mut closing = false;
     let mut exit_code = 0i32;
@@ -394,6 +403,35 @@ async fn drive_loop<W: Write>(
                             Err(e) => protocol_error(out, &e),
                         }
                     }
+                    Some(Ok(cmd @ (Command::Fork | Command::Rewind { .. }))) => {
+                        if running {
+                            protocol_error(out, "a turn is in flight; wait for done");
+                            continue;
+                        }
+                        let at = match cmd {
+                            Command::Rewind { turn } => sessions::ForkAt::Turn(turn),
+                            _ => sessions::ForkAt::End,
+                        };
+                        // Reads the transcript and writes the index, either of
+                        // which can wait on another process, so a signal bounds
+                        // it like a turn start.
+                        let branch = {
+                            let (core, parent) = (core.clone(), session_id.clone());
+                            move || fork_session(&core, &parent, at)
+                        };
+                        match crate::until_stopped(&mut quit, stop_by, branch).await {
+                            Some(Ok(child)) => {
+                                emit_own(out, &StdioLine::Forked {
+                                    session_id: &child.id,
+                                    parent_id: &session_id,
+                                    message_index: child.forked_from.as_ref().map_or(0, |f| f.message_index),
+                                });
+                                session_id = child.id;
+                            }
+                            Some(Err(e)) => protocol_error(out, &e),
+                            None => return crate::quit_status(),
+                        }
+                    }
                     Some(Ok(Command::User { text })) => {
                         if text.trim().is_empty() {
                             refuse(out, &session_id, "user text is empty");
@@ -480,6 +518,29 @@ enum StdioLine<'a> {
     Transcript { session_id: &'a str, messages: Vec<TranscriptMessage<'a>>, truncated: bool },
     ProtocolError { message: &'a str },
     ApprovalMode { mode: &'a str },
+    /// The session now driven is a fork of `parent_id` holding its first
+    /// `message_index` messages; every later line carries the new id.
+    Forked { session_id: &'a str, parent_id: &'a str, message_index: u64 },
+}
+
+/// Branch `parent` at `at`, release the parent so any frontend can
+/// continue it, and claim the branch. The switch happens whole or not at
+/// all: on a refusal `parent` is still the session driven, and the refusal
+/// names the branch, since /resume lists it and a retry would make a second
+/// one. The release goes first because it is the step that can fail while
+/// nothing is wrong (the session state is busy for a moment), and undoing a
+/// claim would wait on that same state.
+fn fork_session(core: &Core, parent: &str, at: sessions::ForkAt) -> Result<sessions::SessionMeta, String> {
+    let child = sessions::fork(core, parent, at).map_err(|e| sessions::refusal_with_repair(core, e))?;
+    let made = |e: String| format!("{e}; the branch {} was made and is listed in /resume", child.id);
+    sessions::detach(core, parent).map_err(made)?;
+    if let Err(e) = sessions::attach(core, &child.id) {
+        return Err(made(match sessions::attach(core, parent) {
+            Ok(()) => e,
+            Err(back) => format!("{e}; reclaiming this session failed too: {back}"),
+        }));
+    }
+    Ok(child)
 }
 
 #[derive(Serialize)]
@@ -614,7 +675,7 @@ fn transcript<'a>(
     StdioLine::Transcript { session_id, messages: out, truncated }
 }
 
-/// Validate one JSONL line against the `openmax-stdio/6` contract using the
+/// Validate one JSONL line against the `openmax-stdio/7` contract using the
 /// authoritative types (`Command` for stdin, `AgentEvent` for stdout events),
 /// so there is no second schema to drift. Returns a short label on success
 /// (`cmd user`, `event token`, `hello`) or a human reason on failure.
@@ -634,6 +695,8 @@ pub fn validate_line(line: &str) -> Result<String, String> {
             Command::Approve { .. } => "approve",
             Command::ApprovalMode { .. } => "approval_mode",
             Command::Reload => "reload",
+            Command::Fork => "fork",
+            Command::Rewind { .. } => "rewind",
             Command::Cancel => "cancel",
             Command::Quit => "quit",
         };
@@ -671,6 +734,17 @@ pub fn validate_line(line: &str) -> Result<String, String> {
                 return Err("protocol_error missing string 'message'".to_string());
             }
             Ok("protocol_error".to_string())
+        }
+        "forked" => {
+            for field in ["session_id", "parent_id"] {
+                if !obj.get(field).map(serde_json::Value::is_string).unwrap_or(false) {
+                    return Err(format!("forked missing string '{field}'"));
+                }
+            }
+            if !obj.get("message_index").map(serde_json::Value::is_u64).unwrap_or(false) {
+                return Err("forked missing integer 'message_index'".to_string());
+            }
+            Ok("forked".to_string())
         }
         "approval_mode" => {
             if !obj.get("mode").map(serde_json::Value::is_string).unwrap_or(false) {
@@ -837,6 +911,12 @@ mod tests {
             validate_line(r#"{"type":"protocol_error","message":"nope"}"#).unwrap(),
             "protocol_error"
         );
+        assert_eq!(
+            validate_line(r#"{"type":"forked","session_id":"s2","parent_id":"s1","message_index":3}"#).unwrap(),
+            "forked"
+        );
+        assert!(validate_line(r#"{"type":"forked","session_id":"s2","message_index":3}"#).is_err());
+        assert!(validate_line(r#"{"type":"forked","session_id":"s2","parent_id":"s1","message_index":"3"}"#).is_err());
 
         // A foreign proto or version fails: the validator only blesses the
         // contract this binary implements.
@@ -1107,6 +1187,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A fork leaves the original free for any frontend: another process
+    /// (here a second Core on the same store, whose session locks conflict
+    /// as another process's do) can claim it while this one holds the
+    /// branch. When the original cannot be released nothing switches: it
+    /// stays this process's, the branch is left free, and the refusal names
+    /// the branch so a retry need not make another.
+    #[tokio::test]
+    async fn a_fork_releases_the_original_or_switches_nothing() {
+        use open_max_core::types::ChatMessage;
+        let dir = crate::test_temp_dir("openmax-stdio-fork");
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let parent = sessions::create(&core, dir.display().to_string()).unwrap().id;
+        sessions::attach(&core, &parent).unwrap();
+        assert!(sessions::save_messages(&core, &parent, &[ChatMessage::system("sys"), ChatMessage::user("hi")], &mut 0, true));
+        let (other, _other_rx) = Core::new(dir.clone()).unwrap();
+
+        let busy = core.sessions.try_lock().unwrap();
+        let err = fork_session(&core, &parent, sessions::ForkAt::End).unwrap_err();
+        drop(busy);
+        let listed = sessions::list(&core, &dir.display().to_string()).unwrap();
+        let stray = listed.into_iter().find(|m| m.forked_from.is_some()).unwrap().id;
+        assert!(err.contains(&format!("the branch {stray} was made and is listed in /resume")), "{err}");
+        assert!(sessions::attach(&other, &parent).is_err(), "the original is still this process's");
+        sessions::attach(&other, &stray).expect("the branch is left free");
+        sessions::detach(&other, &stray).unwrap();
+
+        let child = fork_session(&core, &parent, sessions::ForkAt::End).unwrap();
+        assert_eq!(child.forked_from.unwrap().message_index, 2);
+        sessions::attach(&other, &parent).expect("the original is released");
+        assert!(sessions::attach(&other, &child.id).is_err(), "the branch is this process's now");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The session exists from the handshake on (its id is in `hello`), so a
     /// client that quits first has left an index entry with no file behind
     /// it: `--recall` would report it as unreadable history on every run and
@@ -1186,6 +1299,8 @@ mod tests {
             r#"{"cmd":"approve","approval_id":"a","approved":true}"#,
             r#"{"cmd":"approval_mode","mode":"auto"}"#,
             r#"{"cmd":"reload"}"#,
+            r#"{"cmd":"fork"}"#,
+            r#"{"cmd":"rewind","turn":1}"#,
             r#"{"cmd":"cancel"}"#,
             r#"{"cmd":"quit"}"#,
         ];
@@ -1195,6 +1310,8 @@ mod tests {
                 Command::Approve { .. } => "approve",
                 Command::ApprovalMode { .. } => "approval_mode",
                 Command::Reload => "reload",
+                Command::Fork => "fork",
+                Command::Rewind { .. } => "rewind",
                 Command::Cancel => "cancel",
                 Command::Quit => "quit",
             })
@@ -1215,7 +1332,7 @@ mod tests {
                 "--spec stdio never names command '{name}'"
             );
         }
-        for ty in ["hello", "protocol_error", "approval_mode", "transcript"] {
+        for ty in ["hello", "protocol_error", "approval_mode", "transcript", "forked"] {
             assert!(
                 text.contains(&format!("\"type\":\"{ty}\"")),
                 "--spec stdio never names bespoke line '{ty}'"

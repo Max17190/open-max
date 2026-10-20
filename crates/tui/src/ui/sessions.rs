@@ -80,6 +80,22 @@ fn clip(s: &str, max: usize) -> String {
     super::text::clip(s, max)
 }
 
+/// The first eight characters of a session id: enough to tell sessions
+/// apart in one project, short enough for a picker row.
+pub fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// A row's title, naming the parent of a fork and where it branched. A
+/// fork shares its parent's title, so the label goes first: clipping a narrow
+/// row cuts the shared part, never the part that tells the two apart.
+fn row_title(item: &SessionMeta) -> String {
+    match &item.forked_from {
+        Some(from) => format!("fork of {} at message {}: {}", short_id(&from.parent_id), from.message_index, item.title),
+        None => item.title.clone(),
+    }
+}
+
 /// One picker row: marker, title, age. The title yields cells to the age at
 /// narrow widths: recency is the panel's only ordering signal, and the
 /// leading half of a title is its unique half, so the age must never be the
@@ -113,7 +129,7 @@ fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line
     Line::from(vec![
         marker,
         Span::styled(
-            super::text::pad_right(&clip(&item.title, title_w.saturating_sub(2)), title_w),
+            super::text::pad_right(&clip(&row_title(item), title_w.saturating_sub(2)), title_w),
             title_style,
         ),
         Span::styled(age_txt, Style::default().fg(theme::DIM())),
@@ -132,6 +148,27 @@ mod tests {
         assert_eq!(age(1_000, 1_000 + 2 * 86_400), "2d ago");
     }
 
+    /// A fork's row names its parent and the fork point ahead of the
+    /// title it shares with that parent; any other row is its title alone.
+    #[test]
+    fn a_fork_row_names_its_parent() {
+        let mut meta = SessionMeta {
+            id: "child".into(),
+            project: "/p".into(),
+            title: "fix the parser".into(),
+            created_at: 0,
+            updated_at: 0,
+            resume_points: vec![],
+            forked_from: Some(open_max_core::sessions::ForkedFrom { parent_id: "0123456789abcdef".into(), message_index: 3 }),
+            turn_ends: None,
+        };
+        let row: String = session_row(&meta, false, 0, 80).spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(row.contains("fork of 01234567 at message 3: fix the parser"), "{row:?}");
+        meta.forked_from = None;
+        let row: String = session_row(&meta, false, 0, 80).spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!row.contains("fork of") && row.contains("fix the parser"), "{row:?}");
+    }
+
     /// At narrow widths the age must survive whole and the row must fit:
     /// recency is the panel's only ordering signal, so the title is what
     /// yields. Wide panels keep the fixed 52-cell title column.
@@ -144,6 +181,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             resume_points: vec![],
+            forked_from: None,
+            turn_ends: None,
         };
         let now = 15 * 60; // renders as "15m ago"
         let plain: String = session_row(&meta, false, now, 44)
