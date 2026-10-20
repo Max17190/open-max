@@ -138,7 +138,7 @@ mod first_frame {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -180,6 +180,22 @@ mod first_frame {
         }
 
         fn spawn_with(tag: &str, cols: u16, rows: u16, settings: &str) -> Session {
+            Session::spawn_home(tag, cols, rows, |dir, cmd, _, _| {
+                std::fs::write(dir.join("settings.json"), settings).unwrap();
+                cmd.arg("--trust-project");
+            })
+        }
+
+        /// `spawn` with `~/.openmax` (the `Path`), the command's arguments
+        /// and its stderr set up by `setup` instead. The `File`s are the
+        /// child's terminal end and the controller, where what is written
+        /// before the spawn waits as input typed ahead.
+        fn spawn_home(
+            tag: &str,
+            cols: u16,
+            rows: u16,
+            setup: impl FnOnce(&Path, &mut Command, &File, &mut File),
+        ) -> Session {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -189,12 +205,10 @@ mod first_frame {
             let (home, project) = (dir.join("home"), dir.join("project"));
             std::fs::create_dir_all(home.join(".openmax")).unwrap();
             std::fs::create_dir_all(&project).unwrap();
-            std::fs::write(home.join(".openmax").join("settings.json"), settings).unwrap();
-            let (controller, terminal) = pseudo_terminal();
+            let (mut controller, terminal) = pseudo_terminal();
             set_size(&terminal, cols, rows);
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
-            cmd.arg("--trust-project")
-                .current_dir(&project)
+            cmd.current_dir(&project)
                 .env("HOME", &home)
                 .env("TERM", "xterm-256color")
                 .env_remove("OPENMAX_API_KEY")
@@ -204,6 +218,7 @@ mod first_frame {
                 .stdin(terminal.try_clone().unwrap())
                 .stdout(terminal.try_clone().unwrap())
                 .stderr(Stdio::null());
+            setup(&home.join(".openmax"), &mut cmd, &terminal, &mut controller);
             // SAFETY: setsid and ioctl are async-signal-safe, and the closure
             // touches nothing else between fork and exec.
             unsafe {
@@ -475,6 +490,295 @@ mod first_frame {
         assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
     }
 
+    /// A named pipe at `path` that nothing writes yet, so whoever opens it to
+    /// read waits; `serve` lets the first reader through.
+    fn unwritten(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo reads one NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Give the first reader of the pipe at `path` `content`, and put a file
+    /// holding it in the pipe's place before that reader can see the end, so
+    /// every later read gets the file.
+    fn serve(path: PathBuf, content: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut pipe = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            pipe.write_all(content.as_bytes()).unwrap();
+            let file = path.with_extension("served");
+            std::fs::write(&file, &content).unwrap();
+            std::fs::rename(&file, &path).unwrap();
+        })
+    }
+
+    /// The first frame waits on no file. With trust.json and settings.json
+    /// pipes that nothing writes yet, reading either waits, and the frame
+    /// still arrives: the project path, the empty conversation and the
+    /// composer. Once they are written, both are read behind it, and the
+    /// session goes on to show the model the settings name and the mode the
+    /// trust records.
+    #[test]
+    fn the_first_frame_waits_on_neither_trust_nor_settings() {
+        let mut s = Session::spawn_home("unread", 80, 24, |dir, cmd, _, _| {
+            unwritten(&dir.join("trust.json"));
+            unwritten(&dir.join("settings.json"));
+            cmd.arg("--trust-project");
+        });
+        let frame = s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| {
+            panic!("no first frame while trust.json and settings.json are unread: {}", s.context())
+        });
+        let shown = screen(&s.out[..frame + FRAME_END.len()], 80, 24).join("\n");
+        assert!(shown.contains("project") && shown.contains("READY") && shown.contains("❯"), "{shown}");
+
+        let dir = s.dir.join("home/.openmax");
+        let root = std::fs::canonicalize(s.dir.join("project")).unwrap();
+        let trust = serde_json::json!({"version": 1, "projects": [root], "approval_modes": {root.to_str().unwrap(): "auto"}});
+        let served = [
+            serve(dir.join("trust.json"), trust.to_string()),
+            serve(
+                dir.join("settings.json"),
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#.into(),
+            ),
+        ];
+        let shown = screen_when(&mut s, 80, 24, Duration::from_secs(10), |shown| {
+            shown.contains("stub-model  auto")
+        });
+        assert!(shown.contains("stub-model  auto"), "{shown}\n{}", s.context());
+        s.write(ANSWER);
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+        for server in served {
+            server.join().unwrap();
+        }
+    }
+
+    /// A project that is not trusted is asked about after the first frame, on
+    /// the shell: the session paints, hands the terminal back and asks there,
+    /// and on `y` takes the terminal again, paints the whole screen, which
+    /// entering it again blanked, and goes on in auto. Ctrl+C at the question
+    /// ends the run at once, as at any shell prompt, with nothing trusted. A
+    /// `y` typed before the question shows answers it, as when the question
+    /// came first: the session reads no input before the question does, so
+    /// the `y` is neither lost nor left in the prompt's draft.
+    #[test]
+    fn the_trust_question_comes_after_the_first_frame_on_the_shell() {
+        let asked = |tag: &str, typed_ahead: &[u8]| {
+            let mut s = Session::spawn_home(tag, 80, 24, |dir, cmd, terminal, controller| {
+                std::fs::write(
+                    dir.join("settings.json"),
+                    r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#,
+                )
+                .unwrap();
+                cmd.stderr(terminal.try_clone().unwrap());
+                controller.write_all(typed_ahead).unwrap();
+            });
+            let frame = s.wait_for(FRAME_END, 0, Duration::from_secs(10));
+            let handed_back = frame.and_then(|at| s.wait_for(LEAVE_ALT_SCREEN, at, Duration::from_secs(10)));
+            let question = handed_back.and_then(|at| s.wait_for(b"Trust project", at, Duration::from_secs(10)));
+            assert!(question.is_some(), "no first frame, then the question on the shell: {}", s.context());
+            s.pump_for(Duration::from_millis(50));
+            s
+        };
+        let trusted = |s: &Session| {
+            open_max_core::trust::is_trusted(&s.dir.join("home/.openmax"), &s.dir.join("project")).unwrap()
+        };
+
+        let mut s = asked("ask-cancel", b"");
+        s.write(b"\x03");
+        let status = s.wait_exit(Duration::from_secs(5));
+        assert_eq!(status.and_then(|e| e.code()), Some(130), "{status:?}: {}", s.context());
+        assert!(!trusted(&s), "{}", s.context());
+
+        let mut s = asked("ask-yes", b"");
+        s.write(b"y\r");
+        let shown = screen_when(&mut s, 80, 24, Duration::from_secs(10), |shown| {
+            shown.contains("stub-model  auto")
+        });
+        assert!(shown.contains("stub-model  auto"), "{shown}\n{}", s.context());
+        assert!(
+            shown.contains("project") && shown.contains("READY") && shown.contains("❯"),
+            "the screen taken again shows only what the session changed: {shown}\n{}",
+            s.context()
+        );
+        assert!(trusted(&s), "{}", s.context());
+        s.write(ANSWER);
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+
+        let mut s = asked("ask-typed-ahead", b"y\r");
+        let shown = screen_when(&mut s, 80, 24, Duration::from_secs(10), |shown| {
+            shown.contains("stub-model  auto")
+        });
+        assert!(shown.contains("stub-model  auto"), "the typed-ahead y did not answer: {shown}\n{}", s.context());
+        assert!(trusted(&s), "{}", s.context());
+        s.write(ANSWER);
+        s.pump_for(Duration::from_millis(200));
+        let shown = screen(&s.out, 80, 24).join("\n");
+        assert!(shown.contains("❯ Describe a task"), "the draft is not empty: {shown}");
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+    }
+
+    /// What a session that painted first has to say before it runs lands on
+    /// the shell, after the terminal is handed back (the alternate screen
+    /// left), never on the screen the session leaves behind. A
+    /// `--trust-project` grant reports once the session ends, and ahead of
+    /// the refusal when settings that do not parse then refuse the session
+    /// (exit 2). A trust file that does not parse and a grant asked for from
+    /// an agent session refuse it too (exit 3).
+    #[test]
+    fn a_grant_and_a_refusal_behind_the_first_frame_print_on_the_shell() {
+        // The run's exit code and what it printed once it left the
+        // alternate screen; `go_on` answers a session that starts.
+        let on_the_shell = |tag: &str, setup: &dyn Fn(&Path, &mut Command), go_on: bool| {
+            let mut s = Session::spawn_home(tag, 80, 24, |dir, cmd, terminal, _| {
+                setup(dir, cmd);
+                cmd.stderr(terminal.try_clone().unwrap());
+            });
+            if go_on {
+                // The query follows the session's own first frame, once its
+                // loop reads keys, so Ctrl+C is a key there.
+                let query = s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10));
+                assert!(query.is_some(), "no keyboard query: {}", s.context());
+                s.write(ANSWER);
+                s.write(CTRL_C_TWICE);
+            }
+            let status = s.wait_exit(Duration::from_secs(10));
+            let left = find(&s.out, FRAME_END, 0).and_then(|at| find(&s.out, LEAVE_ALT_SCREEN, at));
+            let left = left.unwrap_or_else(|| panic!("no first frame, then the shell: {}", s.context()));
+            let shell = String::from_utf8_lossy(&s.out[left..]).into_owned();
+            (status.and_then(|e| e.code()), shell)
+        };
+        let settings = |dir: &Path| {
+            std::fs::write(
+                dir.join("settings.json"),
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#,
+            )
+            .unwrap()
+        };
+
+        let (code, shell) = on_the_shell(
+            "grant-reported",
+            &|dir, cmd| {
+                settings(dir);
+                cmd.arg("--trust-project");
+            },
+            true,
+        );
+        assert_eq!(code, Some(0), "{shell:?}");
+        assert!(shell.contains("openmax: trusted project"), "{shell:?}");
+
+        let (code, shell) = on_the_shell(
+            "grant-then-bad-settings",
+            &|dir, cmd| {
+                std::fs::write(dir.join("settings.json"), "{").unwrap();
+                cmd.arg("--trust-project");
+            },
+            false,
+        );
+        assert_eq!(code, Some(2), "{shell:?}");
+        let grant = shell.find("openmax: trusted project");
+        let refusal = shell.find("openmax: invalid settings file");
+        assert!(grant.is_some() && grant < refusal, "the grant's line, then the refusal: {shell:?}");
+
+        let (code, shell) = on_the_shell(
+            "bad-trust",
+            &|dir, _| {
+                settings(dir);
+                std::fs::write(dir.join("trust.json"), "{").unwrap();
+            },
+            false,
+        );
+        assert_eq!(code, Some(3), "{shell:?}");
+        assert!(shell.contains("openmax: invalid ") && shell.contains("trust.json"), "{shell:?}");
+
+        let (code, shell) = on_the_shell(
+            "agent-grant",
+            &|dir, cmd| {
+                settings(dir);
+                cmd.arg("--trust-project").env("OPENMAX_SESSION", "1");
+            },
+            false,
+        );
+        assert_eq!(code, Some(3), "{shell:?}");
+        assert!(shell.contains("openmax: trust grants are human actions"), "{shell:?}");
+    }
+
+    /// Hold the pipe at `path` open to write once its reader has it open, so
+    /// that reader waits in its read: a write end opened without blocking is
+    /// refused until a reader is there.
+    fn reader_waits(path: &Path, within: Duration) -> File {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = Instant::now() + within;
+        loop {
+            match std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(path) {
+                Ok(pipe) => return pipe,
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("nothing reads {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// Start a `--trust-project` session whose read of the file `stalled`
+    /// names in `~/.openmax` waits on a pipe nothing writes, as on storage
+    /// that stalls; once the first frame is up and the read waits, stop the
+    /// run with `stop`. It must end at once with `code`, the terminal handed
+    /// back.
+    fn stopped_while_reading(tag: &str, stalled: impl Fn(&Path) -> PathBuf, stop: impl FnOnce(&mut Session), code: i32) {
+        let mut pipe = PathBuf::new();
+        let mut s = Session::spawn_home(tag, 80, 24, |dir, cmd, _, _| {
+            std::fs::write(
+                dir.join("settings.json"),
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#,
+            )
+            .unwrap();
+            pipe = stalled(dir);
+            std::fs::create_dir_all(pipe.parent().unwrap()).unwrap();
+            unwritten(&pipe);
+            cmd.arg("--trust-project");
+        });
+        let frame = s.wait_for(FRAME_END, 0, Duration::from_secs(10));
+        let frame = frame.unwrap_or_else(|| panic!("{tag}: no first frame: {}", s.context()));
+        let _held = reader_waits(&pipe, Duration::from_secs(10));
+        stop(&mut s);
+        let status = s.wait_exit(Duration::from_secs(5));
+        assert_eq!(status.and_then(|e| e.code()), Some(code), "{tag}: {status:?}: {}", s.context());
+        assert!(find(&s.out, LEAVE_ALT_SCREEN, frame).is_some(), "{tag}: {}", s.context());
+    }
+
+    /// Until the session's loop reads the quit, the first signal ends the run
+    /// at once, with its status and the terminal handed back, as it did when
+    /// trust and settings were read before the session took the terminal,
+    /// and Ctrl+C at the terminal raises SIGINT, as it did before raw mode.
+    /// Both hold while trust.json is read, in front of the session, and while
+    /// the prompt history is read, as the session starts behind the first
+    /// frame.
+    #[test]
+    fn a_signal_or_ctrl_c_before_the_loop_runs_ends_the_run_at_once() {
+        let trust = |dir: &Path| dir.join("trust.json");
+        let history = |dir: &Path| {
+            let project = dir.parent().unwrap().parent().unwrap().join("project");
+            dir.join("history").join(format!("{}.json", open_max_core::ledger::project_key(&project)))
+        };
+        let term = |s: &mut Session| {
+            // SAFETY: kill sends one signal to one pid.
+            assert_eq!(unsafe { libc::kill(s.child.id() as libc::pid_t, libc::SIGTERM) }, 0);
+        };
+        let ctrl_c = |s: &mut Session| {
+            s.write(b"\x03");
+        };
+        stopped_while_reading("stalled-trust-term", trust, term, 128 + libc::SIGTERM);
+        stopped_while_reading("stalled-trust-ctrl-c", trust, ctrl_c, 128 + libc::SIGINT);
+        stopped_while_reading("stalled-history-term", history, term, 128 + libc::SIGTERM);
+        stopped_while_reading("stalled-history-ctrl-c", history, ctrl_c, 128 + libc::SIGINT);
+    }
+
     #[test]
     fn a_slow_answer_still_enables_the_protocol_and_keeps_keys_typed_meanwhile() {
         let mut s = Session::spawn("slow", 80, 24);
@@ -550,16 +854,18 @@ mod first_frame {
 
     /// An absolute palette slot is the background of some terminal theme:
     /// slot 15 text vanishes on a light terminal and a slot 0 fill is a box
-    /// there. The first frame as the terminal receives it (header, focused
-    /// composer and its border, status line) selects only the terminal's own
-    /// colors and the palette's gray, whatever the tokens map to.
+    /// there. The first frames as the terminal receives them (the shell's
+    /// header and focused composer with its border, then the session's
+    /// status line) select only the terminal's own colors and the palette's
+    /// gray, whatever the tokens map to. The keyboard query follows the
+    /// session's first frame.
     #[test]
     fn the_first_frame_uses_only_the_terminals_own_colors_and_its_gray() {
         let mut s = Session::spawn("palette", 80, 24);
-        let frame = s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| {
-            panic!("no first frame: {}", s.context())
+        let query = s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).unwrap_or_else(|| {
+            panic!("no keyboard query: {}", s.context())
         });
-        let foreign = foreign_colors(&s.out[..frame]);
+        let foreign = foreign_colors(&s.out[..query]);
         assert!(foreign.is_empty(), "{foreign:?}: {}", s.context());
         s.write(ANSWER);
         s.write(CTRL_C_TWICE);
@@ -598,6 +904,8 @@ mod first_frame {
                                 col = n.get(1).copied().unwrap_or(1).max(1) - 1;
                             }
                             Some('J') if params == "2" || params == "3" => grid = blank(),
+                            // Entering the alternate screen blanks it.
+                            Some('h') if params == "?1049" => grid = blank(),
                             Some('K') => {
                                 if let Some(line) = grid.get_mut(row) {
                                     line[col.min(cols)..].fill(' ');

@@ -141,6 +141,13 @@ impl Composer {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        Self { history, history_path, ..Self::blank() }
+    }
+
+    /// An empty draft with no history and nowhere to keep one, built without
+    /// touching the disk: what the first frame paints before a session's
+    /// own composer has read its history (see `app::draw_shell`).
+    pub fn blank() -> Self {
         Self {
             lines: vec![String::new()],
             row: 0,
@@ -155,10 +162,10 @@ impl Composer {
             wraps: 0,
             #[cfg(test)]
             char_inserts: 0,
-            history,
+            history: Vec::new(),
             hist_idx: None,
             stash: String::new(),
-            history_path,
+            history_path: PathBuf::new(),
             pastes: Vec::new(),
         }
     }

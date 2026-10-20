@@ -514,6 +514,9 @@ async fn event_loop(
 ) -> std::io::Result<()> {
     let quit = quit.notified();
     tokio::pin!(quit);
+    // From here the loop reads the quit, so a signal before the session's
+    // first frame no longer ends the run at once, and Ctrl+C is a key.
+    crate::quit_is_read();
     // Terminal events are forwarded through a channel so the core-event arm
     // can be gated on `input_rx.is_empty()` — a token firehose must never
     // starve a keypress (crossterm's EventStream itself is not peekable).
@@ -3473,51 +3476,11 @@ impl App {
         self.composer_draw_area = Rect::default();
         if self.pending_approval.is_some() {
             self.draw_approval(frame, layout.input);
-        } else if layout.input.height >= 3 {
-            let border_color = if self.focus == Focus::Composer {
-                theme::ACCENT()
-            } else {
-                theme::BORDER()
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color));
-            let inner = block.inner(layout.input);
-            block.render(layout.input, frame.buffer_mut());
-            let (composer_lines, cx, cy) = self.composer.render(inner.width, inner.height);
-            self.composer_draw_area = inner;
-            Paragraph::new(composer_lines).render(inner, frame.buffer_mut());
-            if self.focus == Focus::Composer
-                && self.history_search.is_none()
-                && self.scroll_search.is_none()
-            {
-                frame.set_cursor_position(Position::new(inner.x + cx, inner.y + cy));
-            }
-        } else if layout.input.height > 0 {
-            // Below three rows a box has no interior. Keep the prompt usable
-            // by dropping only the border and bottom-aligning its visible rows.
-            let (composer_lines, cx, cy) =
-                self.composer.render(layout.input.width, layout.input.height);
-            let composer_h = (composer_lines.len() as u16).min(layout.input.height);
-            let composer_area = Rect {
-                y: layout.input.bottom().saturating_sub(composer_h),
-                height: composer_h,
-                ..layout.input
-            };
-            self.composer_draw_area = composer_area;
-            Paragraph::new(composer_lines).render(composer_area, frame.buffer_mut());
-            if self.focus == Focus::Composer
-                && self.history_search.is_none()
-                && self.scroll_search.is_none()
-                && composer_area.width > 0
-                && composer_area.height > 0
-            {
-                frame.set_cursor_position(Position::new(
-                    (composer_area.x + cx).min(composer_area.right().saturating_sub(1)),
-                    (composer_area.y + cy).min(composer_area.bottom().saturating_sub(1)),
-                ));
-            }
+        } else {
+            let focused = self.focus == Focus::Composer;
+            let cursor = focused && self.history_search.is_none() && self.scroll_search.is_none();
+            self.composer_draw_area =
+                draw_composer(frame, layout.input, &mut self.composer, focused, cursor);
         }
         self.draw_status(frame, layout.status);
     }
@@ -4306,6 +4269,86 @@ fn scroll_search_lines(
         ]));
     }
     lines
+}
+
+/// The composer in the input band `area`, boxed, its border bright while it
+/// has focus, and the terminal cursor at the draft's caret when `cursor`.
+/// Returns where the draft painted, for the mouse.
+fn draw_composer(
+    frame: &mut Frame,
+    area: Rect,
+    composer: &mut Composer,
+    focused: bool,
+    cursor: bool,
+) -> Rect {
+    if area.height >= 3 {
+        let border_color = if focused { theme::ACCENT() } else { theme::BORDER() };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color));
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+        let (composer_lines, cx, cy) = composer.render(inner.width, inner.height);
+        Paragraph::new(composer_lines).render(inner, frame.buffer_mut());
+        if cursor {
+            frame.set_cursor_position(Position::new(inner.x + cx, inner.y + cy));
+        }
+        return inner;
+    }
+    if area.height == 0 {
+        return Rect::default();
+    }
+    // Below three rows a box has no interior. Keep the prompt usable by
+    // dropping only the border and bottom-aligning its visible rows.
+    let (composer_lines, cx, cy) = composer.render(area.width, area.height);
+    let composer_h = (composer_lines.len() as u16).min(area.height);
+    let composer_area = Rect {
+        y: area.bottom().saturating_sub(composer_h),
+        height: composer_h,
+        ..area
+    };
+    Paragraph::new(composer_lines).render(composer_area, frame.buffer_mut());
+    if cursor && composer_area.width > 0 && composer_area.height > 0 {
+        frame.set_cursor_position(Position::new(
+            (composer_area.x + cx).min(composer_area.right().saturating_sub(1)),
+            (composer_area.y + cy).min(composer_area.bottom().saturating_sub(1)),
+        ));
+    }
+    composer_area
+}
+
+/// Paint the first frame of a session at a terminal, before anything is read
+/// from disk: an empty session's own first frame (the project path, the empty
+/// conversation, the focused composer) but for its status row, which names
+/// the model and the approval mode and so waits for settings and trust. The
+/// session's first frame, drawn over this one, sends only what differs: for
+/// a new session, that row. One synchronized update, like every frame (see
+/// `draw_frame`).
+pub fn draw_shell<W: std::io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<crate::FrameWriter<W>>>,
+    project: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    crossterm::queue!(terminal.backend_mut(), crossterm::terminal::BeginSynchronizedUpdate)?;
+    terminal.draw(|f| shell(f, project))?;
+    crossterm::queue!(terminal.backend_mut(), crossterm::terminal::EndSynchronizedUpdate)?;
+    terminal.backend_mut().flush()
+}
+
+/// `draw_shell`'s frame, laid out as `App::draw` lays out an empty session.
+fn shell(frame: &mut Frame, project: &std::path::Path) {
+    let area = frame.area();
+    let mut composer = Composer::blank();
+    let input_h = composer.height(area.width.saturating_sub(2)).saturating_add(2).max(3);
+    let layout = conversation_layout(area, true, input_h, 0, 0);
+    if layout.header.height > 0 {
+        header_path_line(project, layout.header.width as usize).render(layout.header, frame.buffer_mut());
+    }
+    if layout.chat.height > 0 {
+        render_ready(layout.chat, frame.buffer_mut());
+    }
+    draw_composer(frame, layout.input, &mut composer, true, true);
 }
 
 /// The one persistent line of top chrome: the project path, parent dimmed
@@ -6450,6 +6493,45 @@ mod tests {
         assert!(!text.contains("●"));
         assert!(!text.contains("ctx 0%"));
         assert!(rows(&buffer).last().unwrap().starts_with('╰'));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The first frame (`shell`) is an empty session's own first frame but
+    /// for the status row, which it leaves blank: every other cell with its
+    /// style, and the cursor, match at every size, the heights that drop the
+    /// header, the status row or the composer's box included. So the
+    /// session's first frame, drawn over it, changes only that row.
+    #[test]
+    fn the_shell_is_an_empty_sessions_first_frame_but_its_status_row() {
+        fn painted(width: u16, height: u16, paint: impl FnOnce(&mut ratatui::Frame)) -> (Buffer, ratatui::layout::Position) {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(paint).unwrap();
+            let cursor = terminal.get_cursor_position().unwrap();
+            (terminal.backend().buffer().clone(), cursor)
+        }
+        let (mut app, dir) = app_fixture();
+        app.core.settings.lock().unwrap().model = "provider/test-model".into();
+        let project = app.project.clone();
+        for (width, height) in [(96, 18), (80, 24), (34, 8), (12, 5), (64, 4), (64, 3), (64, 2), (1, 1)] {
+            let (session, session_cursor) = painted(width, height, |f| app.draw(f));
+            let (first, first_cursor) = painted(width, height, |f| super::shell(f, &project));
+            let size = format!("{width}x{height}");
+            assert_eq!(first_cursor, session_cursor, "{size}");
+            let input_h = crate::input::Composer::blank().height(width.saturating_sub(2)).saturating_add(2).max(3);
+            let status = conversation_layout(Rect::new(0, 0, width, height), true, input_h, 0, 0).status;
+            for y in 0..height {
+                for x in 0..width {
+                    if status.height > 0 && y == status.y {
+                        assert_eq!(first[(x, y)], ratatui::buffer::Cell::default(), "{size} status row");
+                    } else {
+                        assert_eq!(first[(x, y)], session[(x, y)], "{size} at ({x}, {y})");
+                    }
+                }
+            }
+            if status.height > 0 && width >= 54 {
+                assert!(rows(&session)[status.y as usize].contains("test-model  ask"), "{size}");
+            }
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
