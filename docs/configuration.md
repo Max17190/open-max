@@ -39,11 +39,87 @@ in `readonly`, refuses the call.
 A missing settings file means defaults, and the default `base_url` and `model`
 are empty: endpoint resolution fails until `base_url`, `model` and
 `context_tokens` are set, here or through a named provider, and one error
-names every one that is missing, with an example. There is no built-in
-localhost fallback. A settings file that exists but does not parse, uses an unknown key,
+names every one that is missing, with the flag that writes it and an example
+of both. There is no built-in localhost fallback. A settings file that exists but does not parse, uses an unknown key,
 or sets an unrecognized `approval_mode` is a startup error (fail closed): Open
 Max exits with the parse reason instead of silently reverting your endpoint and
 approval policy to defaults.
+
+### Settings from the command line
+
+The first run can write settings.json for you, so the whole first run is one
+command:
+
+```sh
+openmax --trust-project --base-url https://llm.example.com/v1 --model my-model --api-key '$LLM_API_KEY' --context-tokens 131072 -p "summarize this repo"   # from a terminal
+```
+
+`--base-url`, `--api-key`, `--model` and `--context-tokens` each set the key of
+the same name, and one rule decides what each does:
+
+- A key settings.json leaves unset (there is no file yet, `base_url`, `model` or
+  `api_key` is empty, or `api_key` or `context_tokens` is absent) is
+  written to the file before the run. The file is saved whole, as `/model`
+  saves it: every value it had is kept, and a setting it left out is written
+  with its default. The run prints `openmax: wrote <keys> to <path>` on
+  stderr.
+- A key the file sets to another value is overridden for this run only. The
+  file keeps its value, and the run prints `openmax: for this run only, the
+  command line overrides <keys> in <path>; the file is unchanged, so set them
+  there to keep them` on stderr. A `/model` or `/provider` save during the
+  session writes the file's value for each overridden key until the session
+  sets that key to another value itself; from then on the session's value is
+  saved, as any in-session choice is. A switch to another provider than the
+  run's is the session's own choice of endpoint, so the model the session
+  runs is saved with it, a flag's included: the file's `model` may be one
+  that provider does not serve.
+- A flag equal to the file's value changes nothing and prints nothing, so the
+  first command can be run again as it is.
+
+Keys are written only when the run uses the endpoint settings.json selects.
+`--base-url` names the flat endpoint, so beside a `provider` in settings.json
+it sets that provider aside for the run, and a `--provider` other than the
+file's picks another endpoint, with `provider` among the keys the run
+overrides; a `--base-url` other than the file's own `base_url` is another
+server. On such a run every flag is for this run only, so a key meant for one
+server is never written beside another's `base_url`. While the run uses that other
+endpoint, a model picked with `/model` is that endpoint's, so a save keeps the
+file's `model` as well. A `/provider` switch to another provider than the
+run's is saved with the model the session runs, and the file then selects
+the run's endpoint, so later picks are saved too.
+
+settings.json's `api_key` is the credential for the server its `base_url`
+names, by scheme, host and port. A `--base-url` naming another server is not
+sent it: without `--api-key`, the run sends no settings key and prints
+`openmax: this run sends no api_key: the one in <path> is for the server its
+base_url names, and --base-url names another; pass --api-key to send one` on
+stderr, with `api_key` among the keys the run overrides, so the file keeps
+it. `OPENMAX_API_KEY` in the command's environment is still sent, as it is
+to any flat endpoint. A `--base-url` on the file's server with another path
+keeps the file's key, and so does one the run writes to an unset `base_url`,
+which makes its server the file's.
+`--provider` beside `--base-url` or `--api-key` is refused (exit 2), since a
+named provider takes its `base_url` and key from providers.json. `--provider`
+itself is never written by the command line.
+
+Beside a `provider` that settings.json selects, the provider's entry in
+providers.json supplies the key, so `--api-key` without `--base-url` is
+refused (exit 2) before the trust grant, with nothing written: the settings
+`api_key` goes only to the server `base_url` names (see [multiple providers](#multiple-providers)).
+`--context-tokens` there is the window for a model the entry does not size;
+when the entry gives the run's model a window, that window wins, and the run
+says so on stderr.
+
+Values are checked before anything runs, and a refused one exits 2 with
+nothing written: `--base-url` must be an http or https URL, `--context-tokens`
+a positive number, `--model` not the placeholder `MODEL`, an `--api-key
+'$NAME'` must name a variable set in the environment the command runs in, and
+no flag may be empty. Values are trimmed. Single quotes around
+`'$LLM_API_KEY'` keep the shell from expanding it, so settings.json stores
+the variable's name, and the key is read from the environment when a request
+is sent; a literal key is stored as given, in plain text. The flags are applied once, at
+launch and before the first turn: settings.json is still read only at launch,
+and the run that writes a key already uses it.
 
 ## Context window and compaction
 
@@ -255,14 +331,16 @@ With neither `-p` nor `--stdio`, `--trust-project` goes on to the interactive
 session, which draws on stdout. At a terminal, the session paints its first
 frame before the grant is recorded, and the line that reports the grant prints
 on the shell once the session ends, or ahead of the reason when the session
-then cannot start (settings that do not parse). A signal that forces the exit
+then cannot start (settings that do not parse). The lines that say what the
+settings flags wrote or overrode print with it. A signal that forces the exit
 first, one before the session's loop starts (Ctrl+C at the terminal included)
 or a second one, ends the run without the line. Where stdout is not a
 terminal, no session starts: the run ends after the grant and says so. The
 grant alone exits 0.
-With `--continue`, `--model` or `--provider` as well, the run asked for the
-session itself, which cannot start there, so it exits 1 once the grant is
-recorded.
+With `--continue` or a settings flag (`--model`, `--provider`, `--base-url`,
+`--api-key`, `--context-tokens`) as well, the run asked for the session
+itself, which cannot start there, so it exits 1 once the grant is recorded,
+and writes no settings.
 
 Trust is persisted for the exact canonical path in `~/.openmax/trust.json`,
 together with the project's approval mode (see [approvals](#approvals)). It

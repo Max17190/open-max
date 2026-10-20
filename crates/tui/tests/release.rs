@@ -278,7 +278,8 @@ fn ci_pins_every_action_to_a_commit() {
 /// is uploaded, on every run of the job. dist's own installer skips the
 /// archive check wherever `sha256sum` is missing, which is every macOS before
 /// 15, so a release that uploaded it unpatched would install whatever archive
-/// it downloaded there.
+/// it downloaded there; and it ends without the first command, so its user
+/// would have to find the endpoint flags in the docs.
 #[test]
 fn the_release_patches_the_installer_it_uploads() {
     let job = workflow_job(".github/workflows/release.yml", "build-global-artifacts");
@@ -290,14 +291,15 @@ fn the_release_patches_the_installer_it_uploads() {
     let build = step("dist build of the installer", &|line| {
         line.starts_with("dist build ") && line.contains("--artifacts=global")
     });
-    let patch = step("step that patches the installer", &|line| {
-        line == "run: scripts/patch-installer-checksum.sh target/distrib/openmax-installer.sh"
-    });
     let upload = step("upload step", &|line| line == r#"- name: "Upload artifacts""#);
-    assert!(
-        build < patch && patch < upload,
-        "the installer is patched at line {patch} of the job, not between its build (line {build}) and its upload (line {upload})"
-    );
+    for script in ["patch-installer-checksum.sh", "patch-installer-first-command.sh"] {
+        let run = format!("run: scripts/{script} target/distrib/openmax-installer.sh");
+        let patch = step(&format!("step that runs {script} on the installer"), &|line| line == run);
+        assert!(
+            build < patch && patch < upload,
+            "{script} patches the installer at line {patch} of the job, not between its build (line {build}) and its upload (line {upload})"
+        );
+    }
     // Either one lets the job upload dist's installer unpatched.
     let soft: Vec<&str> = job
         .iter()
@@ -308,6 +310,164 @@ fn the_release_patches_the_installer_it_uploads() {
         })
         .collect();
     assert!(soft.is_empty(), "build-global-artifacts can skip the installer patch: {soft:?}");
+}
+
+/// The installer a release publishes ends with the first run: a line that
+/// names the binary by the absolute path it was installed to, because the
+/// PATH change it made reaches only a new shell, and carries the trust grant,
+/// the endpoint flags and a first task. The end of install() is dist's own,
+/// as the v2026.10.1 installer shipped it, patched by the script the release
+/// runs on it. The patch applies exactly once, and fails leaving the file as
+/// it was otherwise. The line's flags are ones the binary takes: pasted
+/// unchanged, or with any one placeholder left as it is, it is refused before
+/// anything is written, and with values for them all (the key's variable
+/// exported) it gets as far as the trust grant.
+#[test]
+fn the_installer_ends_with_the_first_command() {
+    let fixture = "crates/tui/tests/fixtures/dist-installer-finish.sh";
+    let dist = read(fixture);
+    let extracted_from = dist
+        .lines()
+        .next()
+        .and_then(|line| line.split_once("cargo-dist "))
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{fixture}'s first line names no cargo-dist version"));
+    assert_eq!(
+        manifest_table("workspace.metadata.dist").get("cargo-dist-version").and_then(toml::Value::as_str),
+        Some(extracted_from),
+        "cargo-dist changed, and with it maybe the end of its installer: re-extract {fixture} from an installer the new version generates, name that version on its first line, and update scripts/patch-installer-first-command.sh to match it"
+    );
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("openmax-installer-finish-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let installer = dir.join("installer.sh");
+    let patch = || {
+        let out = Command::new("sh")
+            .arg(repo().join("scripts/patch-installer-first-command.sh"))
+            .arg(&installer)
+            .output()
+            .unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    std::fs::write(&installer, dist.repeat(2)).unwrap();
+    let (patched, report) = patch();
+    assert!(!patched && report.contains("more than one end of install()"), "{report}");
+    assert_eq!(std::fs::read_to_string(&installer).unwrap(), dist.repeat(2), "a patch that failed changed the installer");
+    std::fs::write(&installer, &dist).unwrap();
+    let (patched, report) = patch();
+    assert!(patched, "the patch does not apply to dist's installer: {report}");
+    let once = std::fs::read_to_string(&installer).unwrap();
+    let (patched, report) = patch();
+    assert!(!patched && report.contains("no end of install()"), "the patch applies twice: {report}");
+    assert_eq!(std::fs::read_to_string(&installer).unwrap(), once, "a patch that failed changed the installer");
+
+    // The installer's last line, installed to `bin`, run from `dir`.
+    let finish = |bin: &std::path::Path| {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(r#". "$1"; _install_dir=$2; _bins=openmax; PRINT_QUIET=0; finish_install"#)
+            .arg("sh")
+            .arg(&installer)
+            .arg(bin)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        stdout
+    };
+    let bin = dir.join("home/.openmax/bin");
+    let stdout = finish(&bin);
+    let last = stdout.lines().last().unwrap_or_default();
+    let command = format!(
+        "{}/openmax --trust-project --base-url URL --model MODEL --api-key '$MY_API_KEY' --context-tokens TOKENS -p 'first task'",
+        bin.display()
+    );
+    assert_eq!(last.trim_start(), command, "{stdout}");
+    // A relative OPENMAX_INSTALL_DIR installs under the directory the
+    // installer ran in, and the line names that absolute path, since the
+    // first command runs in the project.
+    let stdout = finish(std::path::Path::new("rel/.openmax/bin"));
+    let resolved = format!("{}/rel/.openmax/bin/openmax --trust-project ", dir.canonicalize().unwrap().display());
+    assert!(stdout.lines().last().unwrap_or_default().trim_start().starts_with(&resolved), "{stdout}");
+
+    // The line's own words, split by a shell, reach the binary built here.
+    let run = |tag: &str, line: &str, key: Option<&str>| {
+        let home = dir.join(format!("run-{tag}"));
+        std::fs::create_dir_all(&home).unwrap();
+        let words = line.split_once("/openmax ").unwrap().1;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(r#"exec "$0" {words}"#))
+            .arg(env!("CARGO_BIN_EXE_openmax"))
+            .current_dir(&dir)
+            .env("HOME", &home)
+            .env_remove("OPENMAX_SESSION")
+            .env_remove("OPENMAX_HUMAN_ATTEST")
+            .env_remove("MY_API_KEY")
+            .stdin(std::process::Stdio::null());
+        if let Some(key) = key {
+            command.env("MY_API_KEY", key);
+        }
+        let out = command.output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned(), home.join(".openmax/settings.json").exists())
+    };
+    let (code, stderr, written) = run("unchanged", last, None);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(!written, "a placeholder reached settings.json: {stderr}");
+    // Each word in capitals, filled with a value, and the key by exporting
+    // the variable it names.
+    let values = [("URL", "http://127.0.0.1:9/v1"), ("MODEL", "m"), ("TOKENS", "8192")];
+    let fill_line = |line: &str, left: &str| {
+        values
+            .iter()
+            .filter(|(placeholder, _)| *placeholder != left)
+            .fold(line.to_string(), |line, (placeholder, value)| line.replace(&format!(" {placeholder} "), &format!(" {value} ")))
+    };
+    let fill = |left: &str| fill_line(last, left);
+    for (left, _) in values {
+        let (code, stderr, written) = run(left, &fill(left), Some("k"));
+        assert_eq!(code, Some(2), "{left} left as it is must be refused: {stderr}");
+        assert!(!written, "{left} reached settings.json: {stderr}");
+    }
+    let (code, stderr, written) = run("key-unset", &fill(""), None);
+    assert_eq!(code, Some(2), "'$MY_API_KEY' with the variable unset must be refused: {stderr}");
+    assert!(stderr.contains("--api-key '$MY_API_KEY' reads an environment variable that is not set") && !written, "{stderr}");
+    let (code, stderr, written) = run("filled", &fill(""), Some("k"));
+    assert_eq!(code, Some(3), "every flag parses, so the run reaches the trust grant, which needs a terminal: {stderr}");
+    assert!(stderr.contains("a trust grant is a human action") && !written, "{stderr}");
+
+    // An install path a shell would split or expand is printed single-quoted,
+    // and a backslash in it as it is, so the whole line, pasted as it is,
+    // runs the binary installed there.
+    let odd = dir.join("home dir/it's $HOME/team\\tools/.openmax/bin");
+    std::fs::create_dir_all(&odd).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_openmax"), odd.join("openmax")).unwrap();
+    let stdout = finish(&odd);
+    let quoted = stdout.lines().last().unwrap_or_default().trim_start();
+    let expected = format!("'{}/openmax' --trust-project ", odd.display().to_string().replace('\'', r"'\''"));
+    assert!(quoted.starts_with(&expected), "{stdout}");
+    let home = dir.join("run-quoted");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(fill_line(quoted, ""))
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .env("MY_API_KEY", "k")
+        .env_remove("OPENMAX_SESSION")
+        .env_remove("OPENMAX_HUMAN_ATTEST")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "the quoted path is one word naming the binary: {stderr}");
+    assert!(stderr.contains("a trust grant is a human action"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Where `tool` is on this machine, if anywhere: on PATH, or in /usr/sbin or

@@ -50,7 +50,9 @@ libc = "0.2"
 # when bun is on PATH. The "Let the installer verify with shasum where there is
 # no sha256sum" step in `build-global-artifacts` runs
 # scripts/patch-installer-checksum.sh on the shell installer, so it checks the
-# archive it downloads on macOS 14 and earlier instead of skipping the check.
+# archive it downloads on macOS 14 and earlier instead of skipping the check,
+# and the "End the installer with the first command to run" step after it runs
+# scripts/patch-installer-first-command.sh, so its last line is the first run.
 #
 # `allow-dirty = ["ci"]` is what lets those edits survive: without it `dist plan`
 # fails the job because the checked-in workflow no longer matches what it would

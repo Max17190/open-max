@@ -761,6 +761,19 @@ refuse to start (exit 2) until fixed. A missing file means defaults. The
 TUI rewrites the whole file on `/model` and `/provider`, so
 manual edits can be overwritten by the next in-app settings change.
 
+Launch flags `--base-url`, `--api-key`, `--model` and `--context-tokens` set
+the key of the same name. A flag whose key this file leaves unset is written
+here before the run (a first run configures the install in one command); a
+key the file sets is overridden for that run only, and an in-app save writes
+the file's value for it until the session sets that key itself (a provider
+switch saves the session's model with it). A `--base-url` for another server
+than `base_url` (scheme, host, port) is not sent this file's `api_key`. On a run
+whose endpoint is not the one this file selects (a `--provider` other than
+`provider`, `--base-url` beside one, or a `--base-url` other than
+`base_url`) nothing is written, and an in-app
+save keeps this file's `model` too, since one picked there is that
+endpoint's. `--api-key` beside a selected provider is refused.
+
 Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 `context_tokens` fails at resolve, i.e. every turn refuses with the reason):
 - `provider`: named entry in providers.json; supplies base_url/credentials/

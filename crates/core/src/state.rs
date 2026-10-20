@@ -159,6 +159,13 @@ pub struct Core {
     /// discipline: never held across the `settings` lock (see
     /// `approval_mode`'s note; this mutex is leaf-only).
     settings_disk_fingerprint: Mutex<SettingsFingerprint>,
+    /// The keys a command-line flag overrode for this run only, set at
+    /// launch by [`Core::apply_key_flags`]: every save writes the file's
+    /// value for each until the session sets it to another value, so no
+    /// override reaches settings.json (see [`crate::config::RunOnly`]). Lock
+    /// order: taken under `settings` when a caller holds it, and held across
+    /// the `settings_disk_fingerprint` lock, which stays leaf-only.
+    run_only: Mutex<Option<crate::config::RunOnly>>,
     events: mpsc::UnboundedSender<AgentEventEnvelope>,
 }
 
@@ -315,6 +322,7 @@ impl Core {
             session_owners: Default::default(),
             message_restorations: Default::default(),
             settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
+            run_only: Mutex::new(None),
             events: tx,
         });
         Ok((core, rx))
@@ -356,6 +364,7 @@ impl Core {
             session_owners: Default::default(),
             message_restorations: Default::default(),
             settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
+            run_only: Mutex::new(None),
             events: tx,
         });
         (core, rx, unreadable)
@@ -363,8 +372,13 @@ impl Core {
 
     /// Persist settings through the process's own hand: the on-disk
     /// fingerprint is refreshed with the write, so a TUI-authored save never
-    /// reads as external drift.
+    /// reads as external drift. A key the command line overrode for this run
+    /// is saved with the file's value until the session sets it (see
+    /// `run_only`).
     pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
+        let mut run_only = self.run_only.lock().unwrap_or_else(|e| e.into_inner());
+        let held = run_only.as_ref().map(|r| r.save(settings));
+        let settings = held.as_ref().map_or(settings, |(kept, _)| kept);
         // Hold the fingerprint lock across the write so a concurrent drift
         // check cannot observe the new bytes before this process claims
         // them, and fingerprint the exact bytes WRITTEN - not a re-read of
@@ -376,7 +390,27 @@ impl Core {
             .unwrap_or_else(|e| e.into_inner());
         let written = crate::config::save_bytes(&self.data_dir, settings)?;
         *seen = SettingsFingerprint::Bytes(hash_bytes(&written));
+        if let Some((_, next)) = held {
+            *run_only = Some(next);
+        }
         Ok(())
+    }
+
+    /// Apply the command line's settings flags once, at launch and before
+    /// any turn (the rule is [`crate::config::KeyFlags`]'s): save the keys
+    /// settings.json leaves unset, then run with every flag on top. A failed
+    /// save changes nothing, here or on disk.
+    pub fn apply_key_flags(&self, flags: &crate::config::KeyFlags) -> Result<crate::config::Applied, String> {
+        let mut live = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = live.clone();
+        let (run, applied) = flags.apply(&mut file);
+        if !applied.written.is_empty() {
+            self.save_settings(&file)?;
+        }
+        *self.run_only.lock().unwrap_or_else(|e| e.into_inner()) =
+            crate::config::RunOnly::new(file, run.clone(), &applied);
+        *live = run;
+        Ok(applied)
     }
 
     /// Whether settings.json on disk moved since this process last read or
@@ -578,6 +612,182 @@ mod tests {
         a.refresh_saved_approval_modes();
         assert_eq!((a.approval_mode(&project), a.approval_mode(&nested)), (Auto, Readonly), "this process's own selection loosens it");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Launch flags fill the keys settings.json leaves unset through the
+    /// core's own save (never drift), and override the rest for the run.
+    /// An override stays the run's: a save from the session, as `/model`
+    /// makes, writes the file's `api_key` and `context_tokens`, which no
+    /// in-session command sets, and the model it is given; the run keeps its
+    /// own values.
+    #[test]
+    fn launch_flags_fill_unset_keys_and_never_save_an_override() {
+        let data = std::env::temp_dir().join(format!("omx-key-flags-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("settings.json"),
+            r#"{"base_url":"http://file/v1","api_key":"$FILE_KEY","context_tokens":1000}"#,
+        )
+        .unwrap();
+        let (core, _) = Core::new(data.clone()).unwrap();
+        let flags = crate::config::KeyFlags {
+            base_url: Some("http://file/v1".into()),
+            api_key: Some("$FLAG_KEY".into()),
+            model: Some("m".into()),
+            context_tokens: Some(2000),
+            ..Default::default()
+        };
+        let applied = core.apply_key_flags(&flags).unwrap();
+        assert_eq!(applied.written, ["model"]);
+        assert_eq!(applied.overridden, ["api_key", "context_tokens"]);
+        assert!(core.settings_disk_changed().is_none(), "the core's own write is not drift");
+        let file = |disk: crate::config::Settings| (disk.base_url, disk.api_key, disk.model, disk.context_tokens);
+        let kept = |model: &str| ("http://file/v1".to_string(), Some("$FILE_KEY".to_string()), model.to_string(), Some(1000));
+        assert_eq!(file(crate::config::load(&data).unwrap()), kept("m"), "only the unset key is written");
+
+        let mut next = core.settings.lock().unwrap().clone();
+        let run = ("http://file/v1".to_string(), Some("$FLAG_KEY".to_string()), "m".to_string(), Some(2000));
+        assert_eq!(file(next.clone()), run, "the run uses every flag");
+        next.model = "m2".into();
+        core.save_settings(&next).unwrap();
+        assert_eq!(file(crate::config::load(&data).unwrap()), kept("m2"), "a session save keeps the file's key and window");
+        assert!(core.settings_disk_changed().is_none());
+
+        // With nothing overridden, a save writes what it is given.
+        let (plain, _) = Core::new(data.clone()).unwrap();
+        let mut next = plain.settings.lock().unwrap().clone();
+        next.base_url = "http://saved/v1".into();
+        plain.save_settings(&next).unwrap();
+        assert_eq!(crate::config::load(&data).unwrap().base_url, "http://saved/v1");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A data dir holding `json` as settings.json, launched with `flags` the
+    /// way `main` applies them.
+    fn launched(json: &str, flags: crate::config::KeyFlags) -> (Arc<Core>, PathBuf) {
+        let data = std::env::temp_dir().join(format!("omx-run-only-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("settings.json"), json).unwrap();
+        let (core, _) = Core::new(data.clone()).unwrap();
+        core.apply_key_flags(&flags).unwrap();
+        (core, data)
+    }
+
+    /// A save from the session as `/model` and `/provider` make one: the live
+    /// settings with one change, adopted once written.
+    fn session_save(core: &Core, change: impl FnOnce(&mut crate::config::Settings)) {
+        let mut next = core.settings.lock().unwrap().clone();
+        change(&mut next);
+        core.save_settings(&next).unwrap();
+        *core.settings.lock().unwrap() = next;
+    }
+
+    /// `--base-url` beside a `settings.provider` sets the provider aside for
+    /// this run only. A `/model` save in that session carries the run's
+    /// provider (none) and base_url, and must still leave the file selecting
+    /// its provider, or the next plain launch has no endpoint. The model is
+    /// picked on the run's server, so the file keeps its own.
+    #[test]
+    fn a_session_save_keeps_the_provider_a_flag_set_aside() {
+        let flags = crate::config::KeyFlags {
+            base_url: Some("http://local/v1".into()),
+            context_tokens: Some(8000),
+            ..Default::default()
+        };
+        let (core, data) = launched(r#"{"provider":"p","model":"x"}"#, flags);
+        session_save(&core, |s| s.model = "m2".into());
+        let disk = crate::config::load(&data).unwrap();
+        assert_eq!(
+            (disk.provider.as_deref(), disk.base_url.as_str(), disk.model.as_str(), disk.context_tokens),
+            (Some("p"), "", "x", None),
+            "the file is as launch left it"
+        );
+        let run = core.settings.lock().unwrap().clone();
+        assert_eq!((run.provider, run.base_url.as_str(), run.model.as_str()), (None, "http://local/v1", "m2"));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// `--provider q` on a flat install picks another endpoint for this run
+    /// only: a `/model` save carries the run's provider, and the file must
+    /// stay flat, with its own model, since the one picked is q's.
+    #[test]
+    fn a_session_save_never_writes_a_provider_flag() {
+        let flags = crate::config::KeyFlags { provider: Some("q".into()), ..Default::default() };
+        let (core, data) = launched(r#"{"base_url":"http://file/v1","model":"x","context_tokens":1000}"#, flags);
+        session_save(&core, |s| s.model = "m2".into());
+        let disk = crate::config::load(&data).unwrap();
+        assert_eq!((disk.provider.as_deref(), disk.base_url.as_str(), disk.model.as_str()), (None, "http://file/v1", "x"));
+        assert_eq!(core.settings.lock().unwrap().provider.as_deref(), Some("q"), "the run keeps its provider");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A model picked while the run talks to the command line's server
+    /// belongs to that server, so a save keeps the file's model next to the
+    /// file's endpoint. A flag that leaves the server as it is (`--api-key`)
+    /// leaves the model the session's to save.
+    #[test]
+    fn a_model_picked_on_the_command_lines_server_stays_with_the_run() {
+        let flat = r#"{"base_url":"http://file/v1","api_key":"$FILE_KEY","model":"x","context_tokens":1000}"#;
+        let flags = crate::config::KeyFlags { base_url: Some("http://flag/v1".into()), ..Default::default() };
+        let (core, data) = launched(flat, flags);
+        session_save(&core, |s| s.model = "m2".into());
+        let disk = crate::config::load(&data).unwrap();
+        assert_eq!((disk.base_url.as_str(), disk.model.as_str()), ("http://file/v1", "x"));
+        let _ = std::fs::remove_dir_all(data);
+
+        let flags = crate::config::KeyFlags { api_key: Some("$FLAG_KEY".into()), ..Default::default() };
+        let (core, data) = launched(flat, flags);
+        session_save(&core, |s| s.model = "m2".into());
+        let disk = crate::config::load(&data).unwrap();
+        assert_eq!((disk.api_key.as_deref(), disk.model.as_str()), (Some("$FILE_KEY"), "m2"));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A key the session sets to another value is the session's from then on:
+    /// `/model` after `--model` saves each model picked, the launch value
+    /// included once the session has moved off it. `/provider r` on a run
+    /// whose provider the command line chose saves r and its model, and the
+    /// file then selects the run's server, so later picks are saved too,
+    /// while a flag the session never set (`--context-tokens`) stays the
+    /// run's through every later save.
+    #[test]
+    fn a_key_the_session_sets_is_saved_from_then_on() {
+        let flags = crate::config::KeyFlags { model: Some("m".into()), ..Default::default() };
+        let (core, data) = launched(r#"{"base_url":"http://file/v1","model":"x","context_tokens":1000}"#, flags);
+        let model = |data: &PathBuf| crate::config::load(data).unwrap().model;
+        session_save(&core, |s| s.approval_mode = crate::config::ApprovalMode::Readonly);
+        assert_eq!(model(&data), "x", "a save that leaves the model alone keeps the file's");
+        session_save(&core, |s| s.model = "m2".into());
+        assert_eq!(model(&data), "m2");
+        session_save(&core, |s| s.model = "m".into());
+        assert_eq!(model(&data), "m");
+        let _ = std::fs::remove_dir_all(data);
+
+        let flags = crate::config::KeyFlags { provider: Some("q".into()), context_tokens: Some(9000), ..Default::default() };
+        let (core, data) = launched(r#"{"provider":"p","model":"x"}"#, flags);
+        session_save(&core, |s| {
+            s.provider = Some("r".into());
+            s.model = "r1".into();
+        });
+        let disk = crate::config::load(&data).unwrap();
+        assert_eq!((disk.provider.as_deref(), disk.model.as_str()), (Some("r"), "r1"));
+        session_save(&core, |s| s.model = "r2".into());
+        let disk = crate::config::load(&data).unwrap();
+        assert_eq!(disk.model, "r2", "the file selects the run's server now");
+        assert_eq!(disk.context_tokens, None, "the window flag stays the run's");
+        let _ = std::fs::remove_dir_all(data);
+
+        // `/provider r` keeps the run's model when r serves it too. Saved, r
+        // runs that model: the file's may be one r does not serve.
+        let both = crate::config::KeyFlags { provider: Some("q".into()), model: Some("common".into()), ..Default::default() };
+        let model_only = crate::config::KeyFlags { model: Some("common".into()), ..Default::default() };
+        for flags in [both, model_only] {
+            let (core, data) = launched(r#"{"provider":"p","model":"x"}"#, flags.clone());
+            session_save(&core, |s| s.provider = Some("r".into()));
+            let disk = crate::config::load(&data).unwrap();
+            assert_eq!((disk.provider.as_deref(), disk.model.as_str()), (Some("r"), "common"), "{flags:?}");
+            let _ = std::fs::remove_dir_all(data);
+        }
     }
 
     #[tokio::test]

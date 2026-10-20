@@ -474,33 +474,44 @@ impl std::fmt::Display for ResolveError {
         match self {
             ResolveError::MissingEndpoint => write!(
                 f,
-                "no model endpoint configured: set base_url in ~/.openmax/settings.json, or define one in ~/.openmax/providers.json and select it with settings.provider"
+                "no model endpoint configured: pass --base-url or set base_url in ~/.openmax/settings.json, or define one in ~/.openmax/providers.json and select it with --provider or settings.provider"
             ),
             ResolveError::MissingModel => write!(
                 f,
-                "no model configured: set model in ~/.openmax/settings.json"
+                "no model configured: pass --model or set model in ~/.openmax/settings.json"
             ),
             ResolveError::MissingContextTokens => write!(
                 f,
-                "no context window configured: set context_tokens in ~/.openmax/settings.json (read at launch; restart after editing) or in the model's entry in ~/.openmax/providers.json (hot) to what the endpoint actually serves; nothing is queried from the server"
+                "no context window configured: pass --context-tokens or set context_tokens in ~/.openmax/settings.json (read at launch; restart after editing) or in the model's entry in ~/.openmax/providers.json (hot) to what the endpoint actually serves; nothing is queried from the server"
             ),
             ResolveError::Unconfigured { endpoint, model, context_tokens, provider } => {
                 let mut what = Vec::new();
+                let mut flags = Vec::new();
                 let mut keys = Vec::new();
+                let mut command = vec!["openmax"];
                 let mut example = Vec::new();
                 if *endpoint {
                     what.push("endpoint");
+                    flags.push("--base-url");
                     keys.push("base_url");
+                    command.push("--base-url URL");
                     example.push("  \"base_url\": \"http://localhost:8080/v1\"");
                 }
                 if *model {
                     what.push("model");
+                    flags.push("--model");
                     keys.push("model");
+                    command.push("--model MODEL");
                     example.push("  \"model\": \"the model id the server expects\"");
+                }
+                if *endpoint {
+                    command.push("--api-key '$MY_API_KEY'");
                 }
                 if *context_tokens {
                     what.push("context window");
+                    flags.push("--context-tokens");
                     keys.push("context_tokens");
+                    command.push("--context-tokens TOKENS");
                     example.push("  \"context_tokens\": 128000");
                 }
                 if *endpoint {
@@ -508,22 +519,30 @@ impl std::fmt::Display for ResolveError {
                 }
                 // The first line stands on its own: /status and --check show
                 // only it, and a one-line renderer drops the newlines below.
+                // The flags come first because they are the whole repair: a
+                // flag whose key settings.json leaves unset is written there
+                // (config::KeyFlags), so nothing is edited by hand.
                 write!(
                     f,
-                    "no {} configured: set {} in ~/.openmax/settings.json, which is read at launch, then start openmax again",
+                    "no {} configured: start openmax with {}, which write {} to ~/.openmax/settings.json where it leaves them unset, or set them in that file, which is read at launch",
                     join_list(&what, "or"),
+                    join_list(&flags, "and"),
                     join_list(&keys, "and"),
                 )?;
                 if *provider {
                     write!(f, "; context_tokens can instead go in the model's entry in ~/.openmax/providers.json, which is read hot")?;
                 }
                 writeln!(f, ".")?;
-                writeln!(f, "For example:\n{{\n{}\n}}", example.join(",\n"))?;
+                // Placeholders the flag parser refuses (the key's while
+                // MY_API_KEY is unset), so a command pasted unchanged writes
+                // nothing.
+                writeln!(f, "For example, with your server's values for the capitals:\n  {}", command.join(" "))?;
+                writeln!(f, "or in ~/.openmax/settings.json:\n{{\n{}\n}}", example.join(",\n"))?;
                 if *context_tokens {
                     write!(f, "Set context_tokens to the window the server actually serves for that model; nothing is queried from the server. ")?;
                 }
                 if *endpoint {
-                    write!(f, "api_key is needed only when the server checks one; $NAME reads that environment variable. ")?;
+                    write!(f, "api_key is needed only when the server checks one; $NAME reads that environment variable when a request is sent, so the key stays out of the file (single quotes keep the shell from expanding it). ")?;
                 }
                 if *provider {
                     write!(f, "In the TUI, /model <id> sets the model id without a restart.")
@@ -720,7 +739,7 @@ fn settings_key(key: Option<&str>) -> Option<String> {
 /// Whether two base URLs name the same server: scheme, host, and port
 /// (explicit or the scheme's default) all match. The path does not count.
 /// A URL that does not parse matches nothing.
-fn same_server(a: &str, b: &str) -> bool {
+pub(crate) fn same_server(a: &str, b: &str) -> bool {
     let server = |url: &str| {
         let url = reqwest::Url::parse(url.trim()).ok()?;
         Some((url.scheme().to_string(), url.host_str()?.to_string(), url.port_or_known_default()?))
@@ -746,7 +765,7 @@ fn withheld_key_hint(name: &str, p: &ProviderConfig) -> String {
 /// - `$$...` → literal starting with `$` (escape)
 /// - `$ENV_VAR` → environment value
 /// - otherwise literal (trimmed). Empty → None.
-fn expand_secret(raw: &str) -> Option<String> {
+pub(crate) fn expand_secret(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
         return None;
@@ -1209,7 +1228,40 @@ mod tests {
                     );
                     let text = err.to_string();
                     let first = text.lines().next().unwrap();
-                    assert!(first.ends_with("then start openmax again."), "the first line stands alone: {first}");
+                    assert!(first.ends_with("which is read at launch."), "the first line stands alone: {first}");
+                    // The error is the first run's documentation: each missing
+                    // key is named with the flag that writes it, in the first
+                    // line and in an example command.
+                    let command = text
+                        .lines()
+                        .find(|l| l.starts_with("  openmax "))
+                        .unwrap_or_else(|| panic!("no example command: {text}"));
+                    for (missing, flag, key) in
+                        [(endpoint, "--base-url", "base_url"), (model, "--model", "model"), (window, "--context-tokens", "context_tokens")]
+                    {
+                        assert_eq!(first.contains(flag), missing, "{flag}: {first}");
+                        assert_eq!(first.contains(key), missing, "{key}: {first}");
+                        assert_eq!(command.contains(&format!("{flag} ")), missing, "{flag}: {command}");
+                    }
+                    assert_eq!(command.contains("--api-key '$MY_API_KEY'"), endpoint, "{command}");
+                    // Pasted unchanged, the command is refused before it can
+                    // write a placeholder: each one alone is refused.
+                    let words: Vec<&str> = command.split_whitespace().collect();
+                    for pair in words[1..].chunks(2) {
+                        let (flag, value) = (pair[0], pair[1].trim_matches('\''));
+                        let flags = match flag {
+                            "--base-url" => crate::config::KeyFlags { base_url: Some(value.into()), ..Default::default() },
+                            "--model" => crate::config::KeyFlags { model: Some(value.into()), ..Default::default() },
+                            "--api-key" if std::env::var_os("MY_API_KEY").is_some() => continue,
+                            "--api-key" => crate::config::KeyFlags { api_key: Some(value.into()), ..Default::default() },
+                            "--context-tokens" => {
+                                assert!(value.parse::<usize>().is_err(), "{value} parses as a window");
+                                continue;
+                            }
+                            other => panic!("{other} in {command}"),
+                        };
+                        assert!(flags.problem().is_some(), "{flag} {value} pasted unchanged is written: {command}");
+                    }
                     let block = text
                         .lines()
                         .skip_while(|l| *l != "{")
@@ -1242,7 +1294,7 @@ mod tests {
         }
         let text = resolve(&Settings::default(), &dir).unwrap_err().to_string();
         assert!(
-            text.starts_with("no endpoint, model or context window configured: set base_url, model and context_tokens in ~/.openmax/settings.json, which is read at launch, then start openmax again."),
+            text.starts_with("no endpoint, model or context window configured: start openmax with --base-url, --model and --context-tokens, which write base_url, model and context_tokens to ~/.openmax/settings.json where it leaves them unset, or set them in that file, which is read at launch.\nFor example, with your server's values for the capitals:\n  openmax --base-url URL --model MODEL --api-key '$MY_API_KEY' --context-tokens TOKENS\n"),
             "{text}"
         );
 
@@ -1259,7 +1311,7 @@ mod tests {
             "{err:?}"
         );
         let text = err.to_string();
-        assert!(text.starts_with("no model or context window configured: set model and context_tokens in ~/.openmax/settings.json"), "{text}");
+        assert!(text.starts_with("no model or context window configured: start openmax with --model and --context-tokens, which write model and context_tokens to ~/.openmax/settings.json"), "{text}");
         assert!(text.contains("providers.json, which is read hot") && text.contains("/model <id>"), "{text}");
         assert!(!text.contains("base_url") && !text.contains("For several servers"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
