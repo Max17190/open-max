@@ -358,8 +358,15 @@ pub struct App {
     file_index_pending: bool,
     /// Prompt templates as (name, description); rescanned when a fresh `/` opens.
     templates: Vec<(String, String)>,
-    /// Messages typed while the agent works, sent in order after the turn.
+    /// Messages typed while the agent works, shown in the strip above the
+    /// composer. The oldest `steered` were sent to the running turn and leave
+    /// on its SteerAccepted; the rest (typed during a compaction, or after
+    /// one the turn could not take) are sent in order after it.
     queued: Vec<String>,
+    /// How many of `queued`'s oldest entries the running turn holds as
+    /// steers. Zeroed when the turn ends: what it never reached is then
+    /// ordinary queue, flushed or handed back like any other entry.
+    steered: usize,
     flush_queue: bool,
     /// Text of the in-flight user submit, kept so a `user_prompt_submit`
     /// block can restore the composer and drop the optimistic UI bubble.
@@ -716,6 +723,7 @@ impl App {
             file_index_pending: false,
             templates: Vec::new(),
             queued: Vec::new(),
+            steered: 0,
             flush_queue: false,
             running: false,
             compacting: false,
@@ -1557,7 +1565,8 @@ impl App {
         // Up in an empty composer pulls the newest queued message back for
         // editing, mirroring up-to-edit-history: the only other way to
         // amend a queued message is cancelling the whole turn.
-        if key.code == KeyCode::Up && self.composer.is_empty() && !self.queued.is_empty() {
+        // A steer cannot come back: the running turn already holds it.
+        if key.code == KeyCode::Up && self.composer.is_empty() && self.queued.len() > self.steered {
             if let Some(text) = self.queued.pop() {
                 self.composer.load(&text);
             }
@@ -2334,9 +2343,18 @@ impl App {
             text
         };
         if self.running {
-            // Queue instead of refusing: the message goes out, in order, as
-            // soon as the current turn finishes. Esc cancels and hands the
+            // A running turn takes the message at its next iteration
+            // boundary, where SteerAccepted paints it; until then it waits
+            // in the queue strip. A compaction takes no steer (the core
+            // refuses it), and nothing is steered past an entry still
+            // waiting for the turn to end, so order holds: those queue and
+            // go out, in order, once it finishes. Esc cancels and hands the
             // queue back to the composer.
+            let steered = self.steered == self.queued.len()
+                && self.session_id.as_ref().is_some_and(|id| self.core.steer(id, text.clone()).is_ok());
+            if steered {
+                self.steered += 1;
+            }
             self.queued.push(text);
             self.transcript.follow();
             self.dirty.mark_chat();
@@ -2837,6 +2855,7 @@ impl App {
         }
         let mut text = self.queued.join("\n");
         self.queued.clear();
+        self.steered = 0;
         if !self.composer.is_empty() {
             text.push('\n');
             text.push_str(&self.composer.text());
@@ -3134,8 +3153,40 @@ impl App {
                 // enter its matches now, exactly as a finished message does.
                 self.refilter_scroll_search_live();
             }
+            AgentEvent::SteerAccepted { text } => {
+                // The steer leaves the queue strip for its place in the
+                // transcript, the one a resumed session replays it at.
+                if let Some(i) = self.queued[..self.steered].iter().position(|q| *q == text) {
+                    self.queued.remove(i);
+                    self.steered -= 1;
+                }
+                self.insert_user_block(&text);
+                self.refilter_scroll_search_live();
+                self.dirty.mark_chat();
+                self.dirty.mark_chrome();
+            }
+            AgentEvent::SteerBlocked { text, reason } => {
+                // The gate refused it, so it is the user's to edit, not the
+                // queue's to send after the turn: that would run the gate on
+                // it again and start work the user was told is blocked. Back
+                // to the composer, ahead of any draft, as a blocked prompt
+                // comes back.
+                if let Some(i) = self.queued[..self.steered].iter().position(|q| *q == text) {
+                    self.queued.remove(i);
+                    self.steered -= 1;
+                }
+                let mut restored = text;
+                if !self.composer.is_empty() {
+                    restored.push('\n');
+                    restored.push_str(&self.composer.text());
+                }
+                self.composer.load(&restored);
+                self.dirty.mark_chrome();
+                self.error(&format!("steer blocked: {reason}"));
+            }
             AgentEvent::Done { stop_reason } => {
                 self.running = false;
+                self.steered = 0;
                 self.set_presence(Presence::Idle);
                 self.running_tool = None;
                 self.pending_approval = None;
@@ -4005,6 +4056,9 @@ impl App {
                 return format!("↓ {unread} new · esc follow · pgup/pgdn scroll").into();
             }
             "esc follow · pgup/pgdn scroll"
+        } else if self.running && !self.compacting && self.steered == self.queued.len() {
+            // `handle_submit` steers only when no entry waits ahead.
+            "enter steer · esc cancel"
         } else if self.running {
             "enter queue · esc cancel"
         } else if self.quit_armed {
@@ -4049,7 +4103,7 @@ fn model_selection(current: &config::Settings, provider: Option<String>, model: 
 /// Single source of truth for `/help` and onboarding copy.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
-    ("enter while working", "queue the message for after this turn"),
+    ("enter while working", "steer the turn: the message joins it before its next request"),
     ("tab", "focus conversation ↔ composer"),
     ("shift+tab", "switch saved project approvals: ask ↔ auto (readonly → ask)"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
@@ -7119,6 +7173,91 @@ mod tests {
 
         assert_eq!(app.composer.text(), "second");
         assert_eq!(app.queued, vec!["first".to_string()]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Enter while a turn runs hands the message to that turn, and the hint
+    /// says so. Behind an entry that waits for the turn to end it waits too,
+    /// so the order typed is the order the model reads, and the hint says
+    /// Enter queues, as it does during a compaction. A session with no turn
+    /// running refuses a steer.
+    #[tokio::test]
+    async fn enter_while_a_turn_runs_steers_it_unless_an_entry_waits_ahead() {
+        let (mut app, dir) = app_fixture();
+        let idle = open_max_core::sessions::create(&app.core, dir.display().to_string()).unwrap();
+        assert!(app.core.steer(&idle.id, "x".into()).is_err(), "an idle session takes no steer");
+        // Accepts and never answers, so the turn stays in flight.
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.core.settings.lock().unwrap().base_url = format!("http://{}/v1", endpoint.local_addr().unwrap());
+        app.handle_submit("go".into()).await.unwrap();
+        assert!(app.running);
+        assert_eq!(app.status_hint(), "enter steer · esc cancel");
+
+        app.handle_submit("first".into()).await.unwrap();
+        app.handle_submit("second".into()).await.unwrap();
+        assert_eq!((app.queued.len(), app.steered), (2, 2), "both went to the running turn");
+
+        app.queued = vec!["held".into()];
+        app.steered = 0;
+        app.handle_submit("next".into()).await.unwrap();
+        assert_eq!(app.queued, vec!["held".to_string(), "next".to_string()]);
+        assert_eq!(app.steered, 0, "nothing is steered past an entry waiting for the turn to end");
+        assert_eq!(app.status_hint(), "enter queue · esc cancel");
+
+        app.queued.clear();
+        assert_eq!(app.status_hint(), "enter steer · esc cancel");
+        app.compacting = true;
+        assert_eq!(app.status_hint(), "enter queue · esc cancel");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A steer the running turn holds cannot be pulled back (the turn would
+    /// still deliver it), and its SteerAccepted moves it from the queue strip
+    /// into the transcript; an entry queued behind it stays queued.
+    #[tokio::test]
+    async fn a_steer_leaves_the_queue_only_when_the_turn_accepts_it() {
+        let (mut app, dir) = app_fixture();
+        app.running = true;
+        app.queued = vec!["steer".into(), "after".into()];
+        app.steered = 1;
+        let up = || TermEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        app.on_term_event(up()).await.unwrap();
+        assert_eq!(app.composer.text(), "after");
+        app.composer.load("");
+        app.on_term_event(up()).await.unwrap();
+        assert_eq!(app.composer.text(), "", "the steer stays with the turn");
+        assert_eq!(app.queued, vec!["steer".to_string()]);
+
+        app.on_agent_event(AgentEvent::SteerAccepted { text: "steer".into() });
+        assert!(app.queued.is_empty());
+        assert_eq!(app.steered, 0);
+        assert!(app.transcript.pop_last_user(), "the accepted steer is painted as a user block");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A steer a `user_prompt_submit` gate refused leaves the queue, so the
+    /// end of the turn does not send it as a new turn past the gate's
+    /// verdict (the gate judges it once), and comes back to the composer
+    /// ahead of the draft there, as a blocked prompt does. An entry queued
+    /// behind it is still sent after the turn, alone.
+    #[tokio::test]
+    async fn a_blocked_steer_returns_to_the_composer_and_is_not_resent() {
+        let (mut app, dir) = app_fixture();
+        app.running = true;
+        app.queued = vec!["steer".into(), "after".into()];
+        app.steered = 1;
+        app.composer.load("draft");
+
+        app.on_agent_event(AgentEvent::SteerBlocked { text: "steer".into(), reason: "no v2 here".into() });
+        assert_eq!(app.queued, vec!["after".to_string()], "the blocked steer is not sent after the turn");
+        assert_eq!(app.steered, 0);
+        assert_eq!(app.composer.text(), "steer\ndraft");
+
+        app.on_agent_event(AgentEvent::Done { stop_reason: "stop".into() });
+        assert!(app.flush_queue, "the entry behind the blocked steer goes out after the turn");
+        assert_eq!(app.queued, vec!["after".to_string()], "and only that entry");
+        assert_eq!(app.composer.text(), "steer\ndraft", "the blocked steer stays the user's to edit");
         fs::remove_dir_all(dir).unwrap();
     }
 

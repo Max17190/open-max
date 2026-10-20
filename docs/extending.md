@@ -155,7 +155,9 @@ first turn), `compaction` (context was pruned; receives the digest record), and
 `turn_end` hook with `blocking = true` is a completion gate instead: a nonzero
 exit refuses the turn's end and sends its reason back as a user message; up to
 8 refusals are honored, and a further refusal ends the turn `unverified`. Each
-hook gets one JSON payload on stdin.
+hook gets one JSON payload on stdin. `user_prompt_submit` also runs on every
+message steered into a running turn, with the payload a prompt gets, so a gate
+with side effects runs once per steer too.
 
 A `post_tool_use` payload carries the tool result the model saw: `output` (its
 first 16 KiB, cut on a character boundary), `output_bytes` (that result's

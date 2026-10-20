@@ -206,7 +206,7 @@ pub enum AgentEvent {
         /// as structured data, not folded into `detail`, so the frontend
         /// controls its own un-clippable placement. Additive and defaulted:
         /// a stream without the key deserializes unchanged, and the key is
-        /// omitted from the wire whenever it is empty, so `openmax-stdio/7`
+        /// omitted from the wire whenever it is empty, so `openmax-stdio/8`
         /// bytes are byte-identical for every call that grants no env.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<String>,
@@ -233,7 +233,7 @@ pub enum AgentEvent {
         /// shell-quoted). In auto such a tool is callable from the next step
         /// with no card, so this is what the TUI shows when it lands.
         /// In-process only: `serde(skip)` keeps it off the wire, so
-        /// `openmax-stdio/7` bytes are unchanged and a parsed event carries
+        /// `openmax-stdio/8` bytes are unchanged and a parsed event carries
         /// it empty.
         #[serde(skip)]
         runs: Vec<(String, String)>,
@@ -269,6 +269,25 @@ pub enum AgentEvent {
     /// payload carried for this attempt: refusals honored before this one,
     /// and how many the harness had left to honor.
     TurnRefused { hook: String, reason: String, continuation: usize, continuations_left: usize },
+    /// A message sent while the turn ran (`Core::steer`) entered the
+    /// transcript as a user message at an iteration boundary, after the
+    /// output above it and before the next request. `text` is exactly what
+    /// `Core::steer` was given (a frontend that expands a prompt template
+    /// sends the expansion). Sent after the save that records it, so the live
+    /// view renders it at the position a replay of the session shows; when
+    /// that save fails, its own Error goes first and this still follows,
+    /// since the steer still goes to the model. A steer the turn ended before
+    /// reaching gets no event: it never reached the model. Accepted is not
+    /// answered: a turn that ends before the model answers it (its next
+    /// request refused at admission, a compaction ahead of it failing) leaves
+    /// the saved steer for the next turn's first request.
+    SteerAccepted { text: String },
+    /// A message sent while the turn ran was refused by a
+    /// `user_prompt_submit` gate at an iteration boundary and entered
+    /// nothing. Carries the text, as `SteerAccepted` does, so the frontend
+    /// holding it hands it back for editing instead of sending it again, and
+    /// the gate's reason.
+    SteerBlocked { text: String, reason: String },
     /// Exactly one per turn, and the only guaranteed terminator. Carries the
     /// provider's `finish_reason` on a normal end, or one of the harness's own:
     /// `truncated` (the stream ended with no completion signal, so the reply is
@@ -316,7 +335,7 @@ mod tests {
     /// exactly as `--stdio` and `--print --json` emit it: both write
     /// `to_json_line`, which this pins, and crates/tui/tests/cli.rs checks
     /// that one turn comes out of the two in the same bytes. These strings
-    /// are the `openmax-stdio/7` contract: session_id first, then the `type`
+    /// are the `openmax-stdio/8` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
@@ -467,6 +486,14 @@ mod tests {
             r#"{"session_id":"s1","type":"turn_refused","hook":"verify","reason":"tests failing","continuation":0,"continuations_left":8}"#
         );
         assert_eq!(
+            env(AgentEvent::SteerAccepted { text: "use the v2 API".into() }),
+            r#"{"session_id":"s1","type":"steer_accepted","text":"use the v2 API"}"#
+        );
+        assert_eq!(
+            env(AgentEvent::SteerBlocked { text: "use the v2 API".into(), reason: "no v2 here".into() }),
+            r#"{"session_id":"s1","type":"steer_blocked","text":"use the v2 API","reason":"no v2 here"}"#
+        );
+        assert_eq!(
             env(AgentEvent::Done { stop_reason: "stop".into() }),
             r#"{"session_id":"s1","type":"done","stop_reason":"stop"}"#
         );
@@ -540,6 +567,8 @@ mod tests {
                 AgentEvent::SchemasOverBudget { .. } => {}
                 AgentEvent::HookFailed { .. } => {}
                 AgentEvent::TurnRefused { .. } => {}
+                AgentEvent::SteerAccepted { .. } => {}
+                AgentEvent::SteerBlocked { .. } => {}
                 AgentEvent::Done { .. } => {}
                 AgentEvent::Error { .. } => {}
                 // No wildcard: a new variant must be added here AND byte-pinned
