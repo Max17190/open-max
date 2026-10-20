@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/7`)
+# stdio protocol (`openmax-stdio/8`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/7","protocol_version":7,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -45,7 +45,7 @@ One JSON object per line.
 
 | Command | Fields | Effect |
 | --- | --- | --- |
-| `user` | `text` | Start a turn with the text |
+| `user` | `text` | Start a turn with the text; sent while a turn runs, steer that turn instead (see below) |
 | `approve` | `approval_id`, `approved` (bool) | Answer a pending approval |
 | `approval_mode` | `mode` (`auto`, `ask`, or `readonly`) | Save the execution mode for this trusted project; answered by an `approval_mode` line, or a `protocol_error` naming the legal values (on a save failure the mode is unchanged and the error says so) |
 | `reload` | none | Re-freeze tools, skills, and prompt from current config; answered by `refrozen`, or `protocol_error` while a turn is in flight |
@@ -121,6 +121,8 @@ events either, but carry one).
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the prune target and nothing changed) |
 | `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |
+| `steer_accepted` | `text` (a `user` line sent while the turn ran entered the transcript as a user message here; see below) |
+| `steer_blocked` | `text`, `reason` (a `user_prompt_submit` gate refused a steer, which entered nothing; see below) |
 | `done` | `stop_reason` |
 | `error` | `message` |
 
@@ -152,14 +154,56 @@ cause, while a replay of the same session from disk shows the injected message.
 carried for this attempt: refusals honored before this one, and how many the
 harness had left to honor.
 
+A `user` line sent while a turn runs steers it. A `/name args` line is
+expanded as a prompt template first, as a turn's first prompt is, and the
+expansion is the steer from then on: what the gate judges, what enters the
+transcript, and the `text` of the `steer_accepted` or `steer_blocked` that
+answers it. Match each answer to its steer by that `text`: the answers to
+steers sent together need not come in the order sent, since a
+`steer_blocked` goes out as soon as its gate refuses, and the
+`steer_accepted` lines only once every steer waiting at that boundary has
+been judged and the allowed ones saved.
+
+The steer passes the same `user_prompt_submit` gate as a turn's first prompt,
+then enters the transcript as a user message at the turn's next iteration
+boundary: after the reply or tool results above it and before the next
+request is built, so that request carries it. `steer_accepted` marks the
+position and goes out after the save that records the message; when that
+save fails, its own `error` line goes out first, and the steer still goes to
+the model with the transcript and still gets its `steer_accepted` (the next
+save that lands writes it). An accepted steer is a saved user message, like
+the turn's own prompt: when the turn ends before the model answers it, it
+stays in the transcript at that position and the next turn's first request
+carries it, so it is not sent again. That holds even when the request
+carrying it never goes out: a `cancel`, `budget_exhausted` (the
+`max_agent_tokens` cap refusing that request at admission), or an `error`
+from the compaction that runs ahead of it. Steers sent together are appended in
+the order they were sent. A model that stops answering while a steer waits is
+sent round again to read it, unless the turn is on its last iteration
+(`max_agent_iterations`), which ends on that answer.
+
+A steer the turn ends without taking gets neither answer, never reached the
+model, and may be sent again as its own `user` line after the turn's `done`:
+one waiting when the turn is cancelled, fails, runs out of budget, or reaches
+that last iteration, and one sent after the turn took the model's final
+answer (while a `turn_end` hook judges an answer it lets stand, or as the
+turn saves and settles). None of those got a `protocol_error` when sent:
+only the missing answer says the turn did not take it. A steer blocked by the
+gate gets a `steer_blocked` instead, carrying its `text` and the gate's
+`reason`, and enters nothing: an answer the model already finished stands,
+and no request is sent for it. Hand the text back to the user to edit;
+sending it again as a `user` line runs the gate on it a second time.
+
 ## Turn guarantees
 
 For an admitted turn, `done` is emitted after the core releases its running
 state and cancellation token. A client may submit the next turn immediately.
 
-Every `user` command is answered by exactly one `done`, and `done` is the only
-guaranteed terminator: never block waiting for another event. On a normal turn
-a run of `token` deltas is terminated by one `message_done`, but a turn that
+Every `user` command sent while no turn runs is answered by exactly one
+`done` (one sent while a turn runs steers it and gets none of its own; see
+below), and `done` is the only guaranteed terminator: never block waiting for
+another event. On a normal turn a run of `token` deltas is terminated by
+one `message_done`, but a turn that
 hits a provider-stream error, including a failure the provider reports inside
 the stream after some `token` lines, emits an `error` line and then `done`
 with no `message_done`; that partial text is not kept. A turn that dies
@@ -190,8 +234,14 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `refused` | The command started no turn; a `protocol_error` precedes it |
 
 The one case with no `done` is a `user` sent while a turn is already in flight:
-it is refused with a `protocol_error` alone, because the running turn owns the
-next `done` and a second one would report that turn as finished.
+it steers that turn, and the running turn owns the next `done`, so a second
+one would report that turn as finished. One with empty text, one that would
+make the steers still waiting for the turn pass 8 MiB together (send it again
+after the next `steer_accepted`, `steer_blocked`, or `done`: the turn's next
+boundary takes every steer waiting there at once, and its end drops them), or
+one that arrives after the turn stopped taking steers, as it settles but
+before its `done` (send it again after that `done`), is refused with a
+`protocol_error` alone.
 
 The process exit code is 1 when any turn ended with `stop_reason` `error` or
 the session could not be opened, 2 on a usage or configuration error or when
@@ -234,3 +284,18 @@ native host process with openmax's own authority. Such a request carries
 chars of the file's sha256); a client that cannot prompt a human must surface
 `openmax --approve <source_path>` rather than decline silently. Both fields are
 empty strings when `reason` is `gate`.
+
+## Version history
+
+Any wire change bumps `protocol_version`. What each version changed:
+
+| Version | Change |
+| --- | --- |
+| 8 | A `user` line sent while a turn runs steers that turn instead of being refused; `steer_accepted` and `steer_blocked` events |
+| 7 | `fork` and `rewind` commands and the `forked` line |
+| 6 | `retry` event |
+| 5 | `harness_note` event |
+| 4 | `turn_refused` event |
+| 3 | `approval_request` carries `source_path` and `source_sha` |
+| 2 | `refrozen` carries `changes`, the refreeze receipt |
+| 1 | The first versioned contract |
