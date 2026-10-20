@@ -4636,6 +4636,9 @@ fn is_shift_tab(key: &KeyEvent) -> bool {
 }
 
 #[cfg(test)]
+mod thesis_frames;
+
+#[cfg(test)]
 mod tests {
     use super::{
         approval_card_lines, approval_choice_hit_regions, command_parts, compact_approval_lines,
@@ -4667,7 +4670,7 @@ mod tests {
     use crate::theme;
     use crate::ui::transcript::Transcript;
 
-    fn app_fixture() -> (App, std::path::PathBuf) {
+    pub(super) fn app_fixture() -> (App, std::path::PathBuf) {
         let dir = crate::test_temp_dir("openmax-app-render");
         let (core, _rx) = Core::new(dir.clone()).unwrap();
         open_max_core::trust::trust_project(&dir, &dir).unwrap();
@@ -7282,7 +7285,7 @@ mod tests {
 
     /// A long history, as a resumed marathon session leaves it: prose that
     /// wraps at narrow widths, folded and failed tool cards, and notices.
-    fn push_long_history(app: &mut App, blocks: usize) {
+    pub(super) fn push_long_history(app: &mut App, blocks: usize) {
         let output = "src/ledger.rs:42: let hash = sha256(&bytes); // a grep or test log line\n"
             .repeat(6);
         for index in 0..blocks {
