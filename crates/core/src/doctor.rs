@@ -3331,10 +3331,10 @@ mod tests {
     async fn a_receipt_names_the_bytes_that_were_probed_not_the_bytes_after() {
         let root = temp_project();
         let script = root.join("slow.sh");
-        write(
-            script.clone(),
-            "#!/bin/sh\nsleep 1\nprintf hello\n",
-        );
+        // The probe marks its start in its scratch (its HOME) and holds until
+        // the rewrite is done, so the rewrite lands while it runs.
+        let body = "#!/bin/sh\n: > \"$HOME/started\"\nwhile [ ! -e rewritten ]; do sleep 0.01; done\nprintf hello\n";
+        write(script.clone(), body);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3349,19 +3349,34 @@ mod tests {
         let original_script_sha = crate::ledger::sha256_hex(&std::fs::read(&script).unwrap());
         let manifest_sha = crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap());
 
-        // Rewrite the script mid-run: the probe sleeps 1s, we swap at ~200ms.
+        // Rewrite the script mid-run, once the probe has started. A probe
+        // that never marks its start is released after ten seconds, and a
+        // host with no sandbox runs no probe, so the rewrite is called off
+        // once the examples have reported.
         let rewriter = {
-            let script = script.clone();
+            let (script, root, scratch) = (script.clone(), root.clone(), data.join("probes-scratch"));
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                // Same length and same output as the original, so the
-                // shell (which reads scripts incrementally) still exits 0
-                // and prints hello - only the BYTES differ. That is the
-                // precise shape where a post-run hash would lie.
-                std::fs::write(&script, "#!/bin/sh\nsleep 1\nprintf hello\n#x").unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let started = || {
+                    std::fs::read_dir(&scratch)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|run| run.path().join("started").exists())
+                };
+                while !started() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                // The original plus a trailing comment, so the shell (which
+                // reads scripts incrementally) still exits 0 and prints hello
+                // - only the BYTES differ. That is the precise shape where a
+                // post-run hash would lie.
+                std::fs::write(&script, format!("{body}#x")).unwrap();
+                std::fs::write(root.join("rewritten"), "").unwrap();
             })
         };
         let results = examples(&root, &data).await.unwrap();
+        rewriter.abort();
         let _ = rewriter.await;
         let v = verdict(&results, "slow");
         if let Err(reason) = &v.result {

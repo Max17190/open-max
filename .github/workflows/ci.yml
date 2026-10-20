@@ -21,6 +21,13 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # The suite time gate's budget on each runner, as a multiple of the
+        # 5-second target. scripts/check-suite-time.sh gives the reasons.
+        include:
+          - os: ubuntu-latest
+            suite_time_multiplier: 3
+          - os: macos-latest
+            suite_time_multiplier: 4
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -34,6 +41,16 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # Hard gate: the suite just built runs again with every test binary at
+      # once and fails over its time budget, so a test that makes the suite
+      # slower fails the pull request that adds it. The target is 5 seconds;
+      # each runner gets the multiple of it its matrix entry sets. A test
+      # that hangs only beside the others fails the step at its timeout
+      # instead of holding the job until the job's own limit.
+      - name: Check suite time
+        run: scripts/check-suite-time.sh ${{ matrix.suite_time_multiplier }}
+        timeout-minutes: 5
 
       # The zero-warning baseline is only real if something checks it. It was
       # set deliberately, then drifted back to three warnings because nothing

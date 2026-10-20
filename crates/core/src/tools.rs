@@ -2035,7 +2035,7 @@ async fn bash_tool(
         args: vec!["-c".into(), command.into()],
         cwd: root.to_path_buf(),
         stdin: StdinMode::Null,
-        timeout: std::time::Duration::from_secs(deadline.secs),
+        timeout: execution::timeout_secs(deadline.secs),
         capture: CaptureSpec {
             head_bytes: caps.command_bytes / HEAD_SHARE_DIVISOR,
             tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
@@ -3371,20 +3371,33 @@ mod tests {
     /// so the result must carry it instead of reporting only that time ran
     /// out.
     ///
-    /// The timeout has to outlast shell startup by a wide margin: on a loaded
-    /// CI runner a one-second budget can expire before `echo` ever runs, and
-    /// then there is nothing captured for the result to carry.
+    /// The timeout has to outlast shell startup: on a loaded CI runner a
+    /// short one can expire before `echo` ever runs, and then there is
+    /// nothing captured for the result to carry. The command marks that it
+    /// got past the `echo`, and a run killed before that is tried again with
+    /// longer seconds.
     #[tokio::test]
     async fn a_timed_out_command_reports_the_tail_it_captured() {
         let root = temp_project();
-        let out = bash_tool(
-            &root.join("data"),
-            &root,
-            &json!({"command": "echo before-the-timeout; sleep 30", "timeout_secs": 5}),
-            OutputCaps::default(),
-            Arc::new(CancelToken::default()),
-        )
-        .await;
+        let echoed = root.join("echoed");
+        let mut out = None;
+        for second in execution::TRIAL_SECONDS {
+            let _second = execution::short_seconds(second);
+            let run = bash_tool(
+                &root.join("data"),
+                &root,
+                &json!({"command": "echo before-the-timeout; : > echoed; sleep 30", "timeout_secs": 5}),
+                OutputCaps::default(),
+                Arc::new(CancelToken::default()),
+            )
+            .await;
+            out = Some(run);
+            if echoed.exists() {
+                break;
+            }
+        }
+        let out = out.unwrap();
+        assert!(echoed.exists(), "the command never got past its echo: {}", out.output);
 
         assert!(!out.ok);
         assert!(out.output.contains("timed out after 5s"), "{}", out.output);
@@ -4065,6 +4078,7 @@ mod tests {
         assert!(out.ok, "{}", out.output);
         assert_eq!(std::fs::read_to_string(root.join("twice.txt")).unwrap(), "y\ny\n");
 
+        let short = execution::short_seconds(execution::TRIAL_SECONDS[0]);
         let out = bash_tool(
             &root.join("data"),
             &root,
@@ -4073,6 +4087,7 @@ mod tests {
             Arc::new(CancelToken::default()),
         )
         .await;
+        drop(short);
         assert!(!out.ok && out.output.contains("timed out after 2s"), "{}", out.output);
 
         // The helper's own shape: anything else still falls back.

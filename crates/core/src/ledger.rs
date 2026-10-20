@@ -480,6 +480,21 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Put `file`'s writes on the drive itself, past its cache: its data and
+/// metadata, or (`all` false) its data and only the metadata needed to read
+/// it back. On macOS each one is a full drive barrier, which is what the
+/// ordering of [`append_chained`] relies on across a power cut. Unit tests
+/// skip them: no test can observe a power cut, and at three per append a
+/// suite approving a few hundred files spent seconds queued on the drive.
+/// The binary's own tests, which approve through a real `openmax`, pay them.
+fn flush(file: &std::fs::File, all: bool) -> std::io::Result<()> {
+    match (cfg!(test), all) {
+        (true, _) => Ok(()),
+        (false, true) => file.sync_all(),
+        (false, false) => file.sync_data(),
+    }
+}
+
 /// Durable atomic replace. Used only where a crash that loses the write would
 /// be *harmful*; the ordering below spends exactly one of these per append,
 /// because on macOS each one is a full drive barrier.
@@ -494,7 +509,7 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = std::fs::File::create(&tmp)
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     file.write_all(bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    file.sync_all().map_err(|e| format!("cannot flush {}: {e}", tmp.display()))?;
+    flush(&file, true).map_err(|e| format!("cannot flush {}: {e}", tmp.display()))?;
     drop(file);
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -503,7 +518,7 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // Best effort: directory fsync is the POSIX way to make the rename
     // durable, and is not available on every platform.
     if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
+        let _ = flush(&dir, true);
     }
     Ok(())
 }
@@ -528,7 +543,7 @@ fn append_chained(dir: &Path, lines: &str, new_head: &str) -> Result<(), String>
         .map_err(|e| format!("cannot append to ledger: {e}"))?;
     file.write_all(lines.as_bytes())
         .map_err(|e| format!("cannot append to ledger: {e}"))?;
-    file.sync_data().map_err(|e| format!("cannot flush ledger: {e}"))?;
+    flush(&file, false).map_err(|e| format!("cannot flush ledger: {e}"))?;
     crate::sessions::write_atomic(&chain_head_path(dir), new_head)?;
     let _ = std::fs::remove_file(pending_head_path(dir));
     Ok(())

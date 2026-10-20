@@ -27,6 +27,9 @@ use crate::state::CancelToken;
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+/// How often a group given [`TERMINATION_GRACE`] is checked for members
+/// still running.
+const GROUP_EXIT_POLL: Duration = Duration::from_millis(2);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// The longest a cancelled command takes to settle: a SIGTERM grace for its
 /// shell and one for the rest of its group, one for a stdin writer the
@@ -40,6 +43,50 @@ pub const CANCEL_SETTLE: Duration = TERMINATION_GRACE
 /// the directory stays bounded (unpruned, one machine reached 95 MB in a
 /// month).
 const SPILL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The timeout a bash call or an external tool asks for in whole seconds,
+/// which is what the bash schema and tool manifests count in. In tests a
+/// second lasts what `short_seconds` set for the thread: a real second,
+/// unless a test that waits a timeout out asked for less.
+pub(crate) fn timeout_secs(secs: u64) -> Duration {
+    #[cfg(not(test))]
+    let second = Duration::from_secs(1);
+    #[cfg(test)]
+    let second = TEST_SECOND.with(std::cell::Cell::get);
+    second.saturating_mul(u32::try_from(secs).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SECOND: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::from_secs(1)) };
+}
+
+/// The lengths a test that waits a timeout out tries for one second of it,
+/// shortest first. A command the timeout stopped before it got as far as the
+/// test needs (a loaded runner can take longer than the short ones to start
+/// a shell) is run again with the next, up to a real second.
+#[cfg(test)]
+pub(crate) const TRIAL_SECONDS: [Duration; 4] =
+    [Duration::from_millis(10), Duration::from_millis(50), Duration::from_millis(250), Duration::from_secs(1)];
+
+/// Makes [`timeout_secs`] count `second` per second on this thread until
+/// the guard drops. A `#[tokio::test]` runs on its own thread, so only that
+/// test's timeouts change.
+#[cfg(test)]
+pub(crate) fn short_seconds(second: Duration) -> ShortSeconds {
+    ShortSeconds(TEST_SECOND.with(|cell| cell.replace(second)))
+}
+
+/// Restores the second [`short_seconds`] replaced.
+#[cfg(test)]
+pub(crate) struct ShortSeconds(Duration);
+
+#[cfg(test)]
+impl Drop for ShortSeconds {
+    fn drop(&mut self) {
+        TEST_SECOND.with(|cell| cell.set(self.0));
+    }
+}
 
 /// A single native process invocation. The caller supplies exact argv and cwd;
 /// no shell interpretation is introduced by the supervisor.
@@ -1010,13 +1057,22 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
 /// here, which is the caller's only signal that a backgrounded child is gone.
 async fn terminate_remaining_group(pid: Option<u32>) -> bool {
     // The leader may already have exited. Give remaining group members the
-    // same grace period, then kill the group unconditionally if still present.
+    // same grace period, then kill the group if any of them is still there.
+    // The wait ends when the last one exits: a fixed sleep held every call
+    // that left a background process for the whole grace, though one that
+    // exits on SIGTERM is gone within milliseconds.
     if !process_group_exists(pid) {
         return false;
     }
     send_termination_group(pid);
-    tokio::time::sleep(TERMINATION_GRACE).await;
-    send_kill_group(pid);
+    let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
+    while process_group_exists(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            send_kill_group(pid);
+            break;
+        }
+        tokio::time::sleep(GROUP_EXIT_POLL).await;
+    }
     true
 }
 
@@ -1328,7 +1384,7 @@ mod tests {
     /// detached descendant that kept an inherited pipe open. The second wait
     /// must not poll the finished drain again: a `JoinHandle` polled after
     /// completion panics, taking the whole turn down with it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_finished_drain_is_not_polled_again_when_the_other_hangs() {
         let finished = |bytes: &'static [u8]| FinishedStream {
             stream: CapturedStream { total_bytes: bytes.len() as u64, head: bytes.to_vec(), tail: Vec::new() },
@@ -1678,17 +1734,25 @@ mod tests {
         assert_eq!(stream.rendered_bytes(), b"abcde");
     }
 
+    /// A short timeout races process startup on a loaded runner (a 25ms
+    /// window flaked the head assertion on macOS), so the command marks that
+    /// it wrote, and a run stopped before that is tried with a longer one.
     #[tokio::test]
     async fn times_out_and_drains_output() {
-        let mut request = request("/bin/sh", &["-c", "printf before; sleep 10"]);
-        // Long enough that `printf before` reliably writes before the timeout
-        // even on a loaded CI runner (a 25ms window raced process startup and
-        // flaked the head assertion on macOS), still far below the 10s sleep so
-        // the timeout is what ends it.
-        request.timeout = Duration::from_millis(500);
-        let output = run_process(request, Arc::new(CancelToken::default()))
-            .await
-            .unwrap();
+        let wrote = std::env::temp_dir().join(format!("openmax-wrote-{}", uuid::Uuid::new_v4()));
+        let script = format!("printf before; : > '{}'; sleep 10", wrote.display());
+        let mut output = None;
+        for second in TRIAL_SECONDS {
+            let mut request = request("/bin/sh", &["-c", &script]);
+            request.timeout = second / 2;
+            output = Some(run_process(request, Arc::new(CancelToken::default())).await.unwrap());
+            if wrote.exists() {
+                break;
+            }
+        }
+        let output = output.unwrap();
+        assert!(wrote.exists(), "the command never wrote before its timeout");
+        let _ = std::fs::remove_file(&wrote);
         assert!(matches!(output.termination, Termination::TimedOut));
         assert_eq!(output.stdout.head, b"befo");
     }
@@ -1852,7 +1916,7 @@ mod tests {
         assert_eq!(captured.stream.rendered_bytes(), b"partial");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn blocked_stdin_writer_has_bounded_shutdown() {
         let (mut writer, _reader) = tokio::io::duplex(1);
         let task = tokio::spawn(async move { writer.write_all(&vec![b'x'; 64 * 1024]).await });
@@ -1876,9 +1940,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cleans_background_descendants_after_normal_exit() {
-        let marker =
+        let mut lifeline = Lifeline::new();
+        let pid_file =
             std::env::temp_dir().join(format!("openmax-descendant-{}", uuid::Uuid::new_v4()));
-        let script = format!("(sleep 1; touch '{}') &", marker.display());
+        let script = format!("{}; sleep 6844 & exec 3>&-; echo $! > '{}'", lifeline.open_in_shell(), pid_file.display());
         let output = run_process(
             request("/bin/sh", &["-c", &script]),
             Arc::new(CancelToken::default()),
@@ -1886,11 +1951,159 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(output.termination, Termination::Exited(status) if status.success()));
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert!(
-            !marker.exists(),
-            "background descendant survived process cleanup"
-        );
+        let pid = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(!lifeline.survived(pid), "background descendant survived process cleanup");
+    }
+
+    /// A process group whose leader has exited and left `member` running in
+    /// it: the shape a command leaves behind when it backgrounds a child. The
+    /// member is the test's own child, so the test reaps it as it exits, and
+    /// a host whose init does not reap orphans cannot keep it in the group as
+    /// a zombie.
+    #[cfg(unix)]
+    async fn group_whose_leader_exited(member: &[&str]) -> (Option<u32>, Child) {
+        use std::os::unix::process::CommandExt;
+        let mut leader = Command::new("sleep");
+        leader.arg("6846").kill_on_drop(true);
+        leader.as_std_mut().process_group(0);
+        let mut leader = leader.spawn().unwrap();
+        let group = leader.id().unwrap();
+        let mut command = Command::new(member[0]);
+        command
+            .args(&member[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(i32::try_from(group).unwrap());
+        let member = command.spawn().unwrap();
+        leader.start_kill().unwrap();
+        leader.wait().await.unwrap();
+        (Some(group), member)
+    }
+
+    /// A background child that exits on SIGTERM ends the cleanup as soon as
+    /// it is gone. A fixed wait held every call that left one behind for the
+    /// whole grace, though such a child is gone within milliseconds. Only the
+    /// cleanup is timed, from a group whose leader has already exited: on a
+    /// loaded machine, starting a shell alone can take longer than the grace,
+    /// and that is not the wait. The fastest of five runs is the one measured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_child_that_stops_on_sigterm_does_not_hold_the_call() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut fastest = Duration::MAX;
+        for _ in 0..5 {
+            let (group, mut member) = group_whose_leader_exited(&["sleep", "6845"]).await;
+            let started = std::time::Instant::now();
+            let (found, exited) = tokio::join!(terminate_remaining_group(group), member.wait());
+            fastest = fastest.min(started.elapsed());
+            assert!(found, "the background child was not found");
+            assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the background child did not stop on SIGTERM");
+            if fastest < TERMINATION_GRACE {
+                break;
+            }
+        }
+        assert!(fastest < TERMINATION_GRACE, "the cleanup waited {fastest:?} for a child SIGTERM stopped at once");
+    }
+
+    /// A background child that is still there after SIGTERM, cleaning up or
+    /// ignoring it, gets the whole grace: the group's SIGKILL waits for the
+    /// deadline, not for the first checks that find the child still there.
+    /// The child ignores SIGTERM and says so before the cleanup starts, and
+    /// the time is a lower bound, which a loaded machine only lengthens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_child_that_outlasts_sigterm_gets_the_whole_grace() {
+        use std::os::unix::process::ExitStatusExt;
+        let (group, mut member) =
+            group_whose_leader_exited(&["/bin/sh", "-c", "trap '' TERM; echo ready; exec sleep 6847"]).await;
+        let mut ready = [0; 1];
+        let said = member.stdout.take().unwrap().read(&mut ready).await.unwrap();
+        assert_eq!(said, 1, "the background child never set its trap");
+        let started = std::time::Instant::now();
+        assert!(terminate_remaining_group(group).await, "the background child was not found");
+        let waited = started.elapsed();
+        let exited = tokio::time::timeout(Duration::from_secs(5), member.wait())
+            .await
+            .expect("the group was never killed")
+            .unwrap();
+        assert!(waited >= TERMINATION_GRACE, "the group was killed {waited:?} into its {TERMINATION_GRACE:?} grace");
+        assert_eq!(exited.signal(), Some(libc::SIGKILL), "the background child was not killed at the deadline");
+    }
+
+    /// The pid a command wrote to `path` before the call returned.
+    #[cfg(unix)]
+    fn recorded_pid(path: &Path) -> libc::pid_t {
+        let recorded = std::fs::read_to_string(path).unwrap_or_default();
+        recorded.trim().parse().unwrap_or_else(|_| panic!("no pid was recorded: {recorded:?}"))
+    }
+
+    /// A FIFO that the processes a test command starts hold open for
+    /// writing, on descriptor 3 (see [`Lifeline::open_in_shell`]). Its read
+    /// end reports end of file once every one of them has exited, so a test
+    /// sees them end without probing a pid, which a reaped process gives up
+    /// for reuse, and without counting a zombie that no init reaps, which
+    /// holds no descriptors, as a survivor.
+    #[cfg(unix)]
+    struct Lifeline {
+        path: PathBuf,
+        reader: std::fs::File,
+    }
+
+    #[cfg(unix)]
+    impl Lifeline {
+        fn new() -> Self {
+            use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+            let path = std::env::temp_dir().join(format!("openmax-lifeline-{}", uuid::Uuid::new_v4()));
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: mkfifo reads one NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo: {}", std::io::Error::last_os_error());
+            // Opened first: a shell's open for writing waits for a reader.
+            let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&path).unwrap();
+            Self { path, reader }
+        }
+
+        /// The shell command that opens the write end as descriptor 3, which
+        /// every process the shell starts after it inherits. The script
+        /// closes it (`exec 3>&-`) once it has started the processes the test
+        /// follows.
+        fn open_in_shell(&self) -> String {
+            format!("exec 3> '{}'", self.path.display())
+        }
+
+        /// Whether a process still holds the write end two seconds on. One
+        /// that was stopped lets go as it exits, so the answer comes at once
+        /// unless one survived. The survivor is the process recorded as
+        /// `pid`, still running, so the pid is still its own: it is killed,
+        /// and a failing test leaks nothing.
+        fn survived(&mut self, pid: libc::pid_t) -> bool {
+            use std::io::Read;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut buf = [0; 64];
+            loop {
+                match self.reader.read(&mut buf) {
+                    Ok(0) => return false,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("reading the lifeline: {error}"),
+                }
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: kill only sends a signal.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Lifeline {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     /// A timeout stops everything the command started, not just the shell:
@@ -1900,26 +2113,32 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_timeout_stops_every_process_the_command_started() {
-        let dir = std::env::temp_dir().join(format!("openmax-tree-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (started, survived) = (dir.join("started"), dir.join("survived"));
-        // The shell waits for the descendant to start, so the timeout stops
-        // a tree and not a lone shell.
-        let script = format!(
-            "(trap '' TERM; : > '{}'; sleep 2; : > '{}') & while [ ! -e '{}' ]; do sleep 0.05; done; sleep 30",
-            started.display(),
-            survived.display(),
-            started.display()
-        );
-        let mut request = request("/bin/sh", &["-c", &script]);
-        request.timeout = Duration::from_secs(1);
-        let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+        let pid_file = std::env::temp_dir().join(format!("openmax-tree-{}", uuid::Uuid::new_v4()));
+        // The descendant ignores SIGTERM and records its pid once it does;
+        // the shell waits for that, so the timeout stops a tree and not a
+        // lone shell. A run stopped before then is tried with a longer one.
+        let mut tried = None;
+        for second in TRIAL_SECONDS {
+            let _ = std::fs::remove_file(&pid_file);
+            let lifeline = Lifeline::new();
+            let script = format!(
+                "{}; sh -c \"trap '' TERM; echo \\$\\$ > '{1}'; exec sleep 6843\" & exec 3>&-; while [ ! -s '{1}' ]; do sleep 0.01; done; sleep 30",
+                lifeline.open_in_shell(),
+                pid_file.display()
+            );
+            let mut request = request("/bin/sh", &["-c", &script]);
+            request.timeout = second;
+            let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+            tried = Some((output, lifeline));
+            if std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                break;
+            }
+        }
+        let (output, mut lifeline) = tried.unwrap();
         assert!(matches!(output.termination, Termination::TimedOut));
-        assert!(started.exists(), "the descendant never ran, so this proved nothing");
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let survivor = survived.exists();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(!survivor, "a descendant outlived the timeout that stopped its command");
+        let pid = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(!lifeline.survived(pid), "a descendant outlived the timeout that stopped its command");
     }
 
     /// A command dropped mid-run (the runtime shutting down under a TUI that

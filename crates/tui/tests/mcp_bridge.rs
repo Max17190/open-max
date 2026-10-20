@@ -43,12 +43,35 @@ fn main() {
         return;
     }
     println!("\nrunning {} tests", selected.len());
+    // Each test waits on processes, two of them through a timeout and the
+    // server's stop grace, so they run at once, as many at a time as libtest
+    // would run (see `test_threads`).
+    let threads = test_threads(&args, std::env::var("RUST_TEST_THREADS").ok().as_deref());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<(usize, &str, bool)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads.min(selected.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((name, test)) = selected.get(index) else { return done };
+                        // Named after the test, as libtest names its threads,
+                        // so a panic message says which test it came from.
+                        let run = std::thread::Builder::new().name(name.to_string()).spawn(*test).unwrap();
+                        done.push((index, *name, run.join().is_ok()));
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect()
+    });
+    results.sort_by_key(|(index, _, _)| *index);
     let mut failed = Vec::new();
-    for (name, test) in &selected {
-        let ok = std::panic::catch_unwind(*test).is_ok();
+    for (_, name, ok) in results {
         println!("test {name} ... {}", if ok { "ok" } else { "FAILED" });
         if !ok {
-            failed.push(*name);
+            failed.push(name);
         }
     }
     println!(
@@ -90,6 +113,21 @@ fn select(args: &[String]) -> Vec<(&'static str, fn())> {
         .filter(|(name, _)| filters.is_empty() || filters.iter().any(|f| matches(name, f)))
         .filter(|(name, _)| !skips.iter().any(|f| matches(name, f)))
         .collect()
+}
+
+/// How many tests run at once, counted as libtest counts it: the
+/// `--test-threads` option, else `RUST_TEST_THREADS` (given as `env`), else
+/// one per core.
+fn test_threads(args: &[String], env: Option<&str>) -> usize {
+    let option = args.iter().enumerate().find_map(|(at, arg)| match arg.strip_prefix("--test-threads")? {
+        "" => args.get(at + 1).map(String::as_str),
+        value => value.strip_prefix('='),
+    });
+    option
+        .or(env)
+        .and_then(|count| count.parse().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
 }
 
 // ---------------------------------------------------------------- fixture
@@ -238,11 +276,15 @@ fn fixture() -> String {
 /// A fresh project dir plus a fresh HOME, so trust and settings never leak
 /// between tests or into the developer's real ~/.openmax.
 fn fresh_dirs(tag: &str) -> (PathBuf, PathBuf) {
+    // Tests run at once and several take the same tag, so a clock alone,
+    // which can read the same for two of them, does not tell them apart.
+    static TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let base = std::env::temp_dir().join(format!("openmax-mcp-{tag}-{}-{nonce}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("openmax-mcp-{tag}-{}-{n}-{nonce}", std::process::id()));
     let project = base.join("project");
     let home = base.join("home");
     std::fs::create_dir_all(&project).unwrap();
@@ -631,7 +673,8 @@ fn server_traffic_mid_call() {
 
 /// `cargo test -- <libtest options>` reaches this target too. An option's
 /// value read as a name filter, or `--skip` read as a selection, would drop
-/// this whole suite while the run still reports ok.
+/// this whole suite while the run still reports ok, and a thread count
+/// ignored would run every test at once where fewer were asked for.
 fn harness_options() {
     let names = |args: &[&str]| -> Vec<&str> {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -661,4 +704,18 @@ fn harness_options() {
     assert_eq!(names(&[silent, "--exact"]), [silent]);
     assert_eq!(names(&["--ignored"]), Vec::<&str>::new());
     assert_eq!(names(&["--include-ignored"]), all);
+
+    // How many run at once: the option, else RUST_TEST_THREADS, else one per
+    // core, as libtest counts it.
+    let threads = |args: &[&str], env: Option<&str>| {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        test_threads(&args, env)
+    };
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    assert_eq!(threads(&[], None), cores);
+    assert_eq!(threads(&[], Some("1")), 1, "RUST_TEST_THREADS=1 does not run one at a time");
+    assert_eq!(threads(&[], Some("3")), 3);
+    assert_eq!(threads(&["--test-threads", "2"], Some("1")), 2, "the option does not outrank the variable");
+    assert_eq!(threads(&["--test-threads=5", "--nocapture"], None), 5);
+    assert_eq!(threads(&["never_answers", "--test-threads", "1"], None), 1);
 }

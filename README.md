@@ -243,8 +243,11 @@ Sessions, settings, tools, and skills stay under `~/.openmax/` and your project 
 ```sh
 cargo check
 cargo test
+scripts/check-suite-time.sh
 cargo build --release -p openmax
 ```
+
+`cargo test` runs the test binaries one after another. `scripts/check-suite-time.sh`, run once they are built, runs them all at once and fails when the suite takes longer than 5 seconds, or when a test fails (a test binary that fails beside the others is run again alone and fails the check only if it fails again); CI, whose runners have fewer cores, runs it with three times that budget on Linux and four times it on macOS. The script, and the test in `crates/tui/tests/thesis.rs` that drives it as part of `cargo test`, need bash and perl with its core modules JSON::PP and Time::HiRes (on Debian and Ubuntu, the `perl` package: `perl-base` alone has neither).
 
 Set `OPENMAX_PERF=1` while running the TUI to log frame, transcript-layout, and selection-overlay timings. Core logic is in `open-max-core` (`crates/core/src/agent.rs`); the TUI is `crates/tui/src/app.rs`.
 

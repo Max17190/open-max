@@ -10346,13 +10346,15 @@ mod tests {
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
 
         // Two content deltas in one write, so the second lands inside the
-        // first flush's batch window, then a long quiet gap before the
+        // first flush's batch window, then a quiet gap before the
         // terminator: the wire shape of a reply whose text is done while the
-        // response is not.
+        // response is not. The gap lasts until the test has seen the whole
+        // text, or five seconds when the tail never surfaces.
         let tail_sent = Arc::new(AtomicBool::new(false));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let sent = tail_sent.clone();
+        let (release, released) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else { return };
             let mut buf = Vec::new();
@@ -10384,7 +10386,7 @@ mod tests {
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(deltas.as_bytes());
             let _ = stream.flush();
-            std::thread::sleep(Duration::from_secs(3));
+            let _ = released.recv_timeout(Duration::from_secs(5));
             sent.store(true, Ordering::SeqCst);
             let _ = stream.write_all(
                 b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -10416,6 +10418,7 @@ mod tests {
                             && !tail_sent.load(Ordering::SeqCst)
                         {
                             complete_while_open = true;
+                            let _ = release.send(());
                         }
                     }
                     AgentEvent::Done { stop_reason } => {

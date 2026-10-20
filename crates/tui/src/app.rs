@@ -7595,8 +7595,9 @@ mod tests {
     /// up front paints. Blocks off screen count their estimated heights, so
     /// this pins that a scroll moves by exactly the rows it names and that
     /// an estimate turning exact never moves what a scrolled reader is
-    /// looking at. A scripted walk, then seeded random ones over a long
-    /// history and over one short enough to fit on screen.
+    /// looking at. A scripted walk, then seeded random ones over a history
+    /// short enough to fit on screen, and (in the two tests below) over a
+    /// long one.
     #[test]
     fn lazy_wrapping_paints_exactly_what_eager_wrapping_paints() {
         use ViewStep::*;
@@ -7610,9 +7611,20 @@ mod tests {
         ];
         assert_lazy_paints_like_eager(400, &scripted);
         for seed in [1, 2] {
-            assert_lazy_paints_like_eager(400, &random_view_steps(seed, 300, 400));
             assert_lazy_paints_like_eager(6, &random_view_steps(seed, 300, 6));
         }
+    }
+
+    /// A seeded walk over a long history, which repaints four hundred
+    /// blocks twice a step: one test per seed, so the walks run at once.
+    #[test]
+    fn lazy_wrapping_paints_what_eager_wrapping_paints_on_a_long_walk() {
+        assert_lazy_paints_like_eager(400, &random_view_steps(1, 300, 400));
+    }
+
+    #[test]
+    fn lazy_wrapping_paints_what_eager_wrapping_paints_on_another_long_walk() {
+        assert_lazy_paints_like_eager(400, &random_view_steps(2, 300, 400));
     }
 
     /// Heap allocations of one frame that repaints the conversation, after
