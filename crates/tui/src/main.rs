@@ -10,7 +10,7 @@ mod ui;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -306,20 +306,22 @@ fn flush_prompt_tokens(
 /// a human sets on purpose - never one a session exports to its children -
 /// so an agent must both unset the marker AND forge the attestation, which
 /// is a deliberate act with a name, not a stumbled-into one-liner.
-fn require_human(what: &str, repair: &str) {
+///
+/// The refusal is returned for the caller to print before it exits 3, so a
+/// session that already holds the terminal hands it back first.
+fn require_human(what: &str, repair: &str) -> Result<(), String> {
     if std::env::var_os("OPENMAX_SESSION").is_some() {
-        eprintln!(
-            "openmax: {what} is a human action: this process was started from an agent session; ask the user to run `{repair}`"
-        );
-        std::process::exit(3);
+        return Err(format!(
+            "{what} is a human action: this process was started from an agent session; ask the user to run `{repair}`"
+        ));
     }
     let attested = std::env::var_os("OPENMAX_HUMAN_ATTEST").is_some_and(|v| v == "1");
     if !attested && !std::io::stdin().is_terminal() {
-        eprintln!(
-            "openmax: {what} is a human action and this process has no terminal; run `{repair}` from an interactive shell (automation a human runs may set OPENMAX_HUMAN_ATTEST=1)"
-        );
-        std::process::exit(3);
+        return Err(format!(
+            "{what} is a human action and this process has no terminal; run `{repair}` from an interactive shell (automation a human runs may set OPENMAX_HUMAN_ATTEST=1)"
+        ));
     }
+    Ok(())
 }
 
 /// Every printed `openmax --approve` quotes its path (core's shell_quote
@@ -330,7 +332,8 @@ fn approve_command(path: &std::path::Path) -> String {
     format!("openmax --approve {}", open_max_core::doctor::shell_quote(path))
 }
 
-/// Why a command line is refused before anything runs, or None.
+/// The one operation a command line names, None for the interactive
+/// session, or why the command line is refused before anything runs.
 ///
 /// `main` performs one operation, and every operation but a session exits
 /// when it is done, before the next one is considered. A second operation,
@@ -341,7 +344,7 @@ fn approve_command(path: &std::path::Path) -> String {
 /// conflict (one operation given twice is refused while parsing, by
 /// `set_once`). The destructure below is exhaustive, so a new `CliArgs` field
 /// stops compiling here until it is placed among the operations or options.
-fn refusal(cli: &CliArgs) -> Option<String> {
+fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     let CliArgs {
         continue_session,
         model,
@@ -367,7 +370,7 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     } = cli;
     // Each operation, named by its flag. `--check --stdio` is one operation
     // of its own: validating a protocol stream on stdin.
-    let operations: Vec<&str> = [
+    let operations: Vec<&'static str> = [
         (spec.is_some(), "--spec"),
         (*mcp_list, "--mcp-list"),
         (*mcp_call, "--mcp-call"),
@@ -384,7 +387,7 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     .filter_map(|(on, flag)| on.then_some(flag))
     .collect();
     if let [first, second, ..] = operations.as_slice() {
-        return Some(format!("{first} and {second} are separate operations; run them one at a time"));
+        return Err(format!("{first} and {second} are separate operations; run them one at a time"));
     }
     // None is the interactive session.
     let operation = operations.first().copied();
@@ -405,7 +408,7 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         if !on || readers.contains(&operation) {
             continue;
         }
-        return Some(match operation {
+        return Err(match operation {
             Some(operation) => format!("{operation} does not use {flag}; run them separately"),
             None => {
                 let readers: Vec<&str> = readers.iter().flatten().copied().collect();
@@ -424,7 +427,7 @@ fn refusal(cli: &CliArgs) -> Option<String> {
         // after --check), so the refusal names the word instead. The word may
         // be a filename a glob expanded, so it is flattened to one line.
         let words = open_max_core::text::one_line(&prompts.join(" "));
-        return Some(match operation {
+        return Err(match operation {
             None => "unexpected arguments (use --print for headless)".to_string(),
             Some(operation) => {
                 let hint = match operation {
@@ -440,19 +443,18 @@ fn refusal(cli: &CliArgs) -> Option<String> {
     }
     if let Some(operation @ ("--mcp-list" | "--mcp-call")) = operation {
         if mcp_server.as_ref().is_none_or(|words| words.is_empty()) {
-            return Some(format!(
+            return Err(format!(
                 "{operation} needs the MCP server's command after --: openmax {operation} -- <command> [args...]"
             ));
         }
     }
     if mcp_timeout.is_some_and(|secs| !(1..=mcp::MAX_TIMEOUT_SECS).contains(&secs)) {
-        return Some(format!("--mcp-timeout takes 1 to {} seconds", mcp::MAX_TIMEOUT_SECS));
+        return Err(format!("--mcp-timeout takes 1 to {} seconds", mcp::MAX_TIMEOUT_SECS));
     }
-    None
+    Ok(operation)
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<std::process::ExitCode> {
+fn main() -> std::io::Result<std::process::ExitCode> {
     let cli = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -461,11 +463,168 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
         }
     };
 
-    if let Some(reason) = refusal(&cli) {
-        eprintln!("openmax: {reason}\n\n{HELP}");
-        std::process::exit(2);
-    }
+    let operation = match operation(&cli) {
+        Ok(operation) => operation,
+        Err(reason) => {
+            eprintln!("openmax: {reason}\n\n{HELP}");
+            std::process::exit(2);
+        }
+    };
 
+    // The interactive session at a terminal paints its first frame before
+    // the runtime exists. Every other run, a session without a terminal at
+    // both ends included, starts on the runtime.
+    if operation.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return session(cli);
+    }
+    runtime(None).block_on(run(cli))
+}
+
+/// The runtime every run works on: the session's from behind its first
+/// frame, every other run's from the start. One that cannot start ends the
+/// run through `refuse`, after `granted`, the line of a grant made before it.
+fn runtime(granted: Option<&str>) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| refuse(1, &format!("failed to start the runtime: {e}"), granted))
+}
+
+/// The interactive session at a terminal, painted first: the terminal is set
+/// up and the shell of an empty session painted (`app::draw_shell`) before
+/// any file is read or the runtime starts its workers, so the first frame
+/// waits on no disk and on no thread but the signal watcher's. Trust,
+/// settings and the session come behind it, and the session's own first
+/// frame paints over the shell what they add. A refusal among them (a
+/// project that is not trusted, a grant asked for from an agent session,
+/// settings that do not parse) hands the terminal back first and prints on
+/// the shell, as it did before the session took the screen (`refuse`); the
+/// trust question is asked there too (`on_the_shell`), and the line a grant
+/// reports prints there once the session ends, or ahead of a refusal. Until
+/// the session's loop reads the quit, the first signal ends the run
+/// (`QUIT_UNREAD`), and Ctrl+C at the terminal raises one (`signal_keys`).
+/// Input is read only once trust is settled, so keys typed ahead answer the
+/// question, as they did when it came first, and otherwise wait for the
+/// session.
+fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
+    QUIT_UNREAD.store(true, Ordering::SeqCst);
+    // Before the terminal changes, for the reason `run` gives.
+    let quit = watch_quit_signals(true);
+    let mut terminal =
+        init_terminal().unwrap_or_else(|e| refuse(1, &format!("failed to initialize terminal: {e}"), None));
+    let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Err(e) = app::draw_shell(&mut terminal, &project) {
+        refuse(1, &format!("failed to draw the first frame: {e}"), None);
+    }
+    signal_keys(true);
+
+    let data_dir = default_data_dir();
+    let ask = || {
+        on_the_shell(&mut terminal, || {
+            prompt_trust(&mut std::io::stdin().lock(), &mut std::io::stderr(), &data_dir, &project)
+        })
+    };
+    let granted = ensure_project_trust(&cli, &data_dir, &project, ask).unwrap_or_else(|e| refuse(3, &e, None));
+    let (core, core_rx) = Core::new(data_dir).unwrap_or_else(|e| refuse(2, &e, granted.as_deref()));
+    apply_endpoint_flags(&core, &cli);
+    start_input();
+    let runtime = runtime(granted.as_deref());
+    let args = app::Args { continue_session: cli.continue_session, quit };
+    let (result, warnings) = runtime.block_on(app::run(terminal, core, core_rx, args));
+    end_session(result, warnings, granted)
+}
+
+/// End a run that cannot go on, on the shell: hand back the terminal a
+/// session that painted first holds, print `granted`, the line a trust grant
+/// made behind the first frame reports, then why, and exit with `code`.
+fn refuse(code: i32, reason: &str, granted: Option<&str>) -> ! {
+    restore_terminal();
+    if let Some(line) = granted {
+        eprintln!("{line}");
+    }
+    eprintln!("openmax: {reason}");
+    std::process::exit(code)
+}
+
+/// Set while a session that painted first has no loop to read a quit: from
+/// before the terminal is taken, through trust (the question on the shell
+/// included), settings and the session's own start (its prompt history, the
+/// session `--continue` resumes), until its loop reads the quit
+/// (`quit_is_read`). The first signal then takes the exit at once, as it did
+/// when trust and settings came before the session took the terminal, and as
+/// it does at the shell's own prompt. A quit left for the loop would wait on
+/// storage that stalls, or on the answer.
+static QUIT_UNREAD: AtomicBool = AtomicBool::new(false);
+
+/// Called by the session's loop as it starts to read the quit (see
+/// `app::event_loop`): from here a signal is the loop's to read, and Ctrl+C
+/// is a key again. A run that never set `QUIT_UNREAD` is left as it is.
+fn quit_is_read() {
+    if QUIT_UNREAD.load(Ordering::SeqCst) {
+        signal_keys(false);
+        QUIT_UNREAD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether Ctrl+C and Ctrl+\ at the terminal raise SIGINT and SIGQUIT in
+/// raw mode, which turns that off (ISIG). A session that painted first turns
+/// it on until its loop reads keys, so Ctrl+C ends a start that waits on
+/// storage, as it did when trust and settings were read before raw mode; the
+/// signal watcher takes it (`QUIT_UNREAD`). Ctrl+Z stays a key: a stop there
+/// would leave the shell on the alternate screen in raw mode. Leaving raw
+/// mode restores the terminal's own settings, whatever this changed, and a
+/// restore that came first is left as it is (`while_raw`).
+#[cfg(unix)]
+fn signal_keys(on: bool) {
+    while_raw(&TERM_MODES, || {
+        // SAFETY: tcgetattr fills one termios, which tcsetattr then reads.
+        unsafe {
+            let mut mode: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut mode) != 0 {
+                return;
+            }
+            if on {
+                mode.c_lflag |= libc::ISIG;
+                mode.c_cc[libc::VSUSP] = libc::_POSIX_VDISABLE;
+            } else {
+                mode.c_lflag &= !libc::ISIG;
+            }
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &mode);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn signal_keys(_: bool) {}
+
+/// Run `ask` on the shell while a session holds the terminal: the terminal
+/// is handed back (the shell's screen, cooked input) for it, and taken again
+/// only if it succeeds. Entering the alternate screen again blanks it, and
+/// `terminal` is replaced by one whose buffers are blank too, so the next
+/// frame paints whole. `Terminal::clear` would first ask the terminal for the
+/// cursor position and fail the run where no answer comes. Taken again, the
+/// terminal is in raw mode with Ctrl+C a signal, as before (`signal_keys`).
+/// A failure leaves the terminal with the shell, where the refusal prints.
+/// Taking it again can fail like the first time, and ends the run the same
+/// way.
+fn on_the_shell<E>(
+    terminal: &mut ui::transcript::Term,
+    ask: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    restore_terminal();
+    ask()?;
+    if let Err(e) = enter_terminal().and_then(|()| {
+        *terminal = frame_terminal()?;
+        Ok(())
+    }) {
+        refuse(1, &format!("failed to initialize terminal: {e}"), None);
+    }
+    signal_keys(true);
+    Ok(())
+}
+
+/// The run of everything but a session painted first (see `main`).
+async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     if let Some(surface) = &cli.spec {
         // `usage` is the one dynamic surface: it joins each extension's
         // frozen-prompt cost (paid on every request) with its recorded use,
@@ -662,7 +821,10 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
     if let Some(path) = &cli.approve {
         // Approval is a human action, exactly like trust; see require_human
         // for the two walls and why the marker alone was not one.
-        require_human("approval", &approve_command(std::path::Path::new(path)));
+        if let Err(e) = require_human("approval", &approve_command(std::path::Path::new(path))) {
+            eprintln!("openmax: {e}");
+            std::process::exit(3);
+        }
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let file = std::path::Path::new(path);
         let bytes = match std::fs::read(file) {
@@ -887,9 +1049,14 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
 
     let data_dir = default_data_dir();
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if let Err(e) = ensure_project_trust(&cli, &data_dir, &project) {
-        eprintln!("openmax: {e}");
-        std::process::exit(3);
+    let ask = || prompt_trust(&mut std::io::stdin().lock(), &mut std::io::stderr(), &data_dir, &project);
+    match ensure_project_trust(&cli, &data_dir, &project, ask) {
+        Ok(Some(granted)) => eprintln!("{granted}"),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("openmax: {e}");
+            std::process::exit(3);
+        }
     }
     if let Some(code) = exit_after_grant(&cli, std::io::stdout().is_terminal()) {
         eprintln!("openmax: stdout is not a terminal, so no session was started");
@@ -905,24 +1072,16 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
             std::process::exit(2);
         }
     };
-    {
-        let mut s = core.settings.lock().unwrap();
-        if let Some(provider) = &cli.provider {
-            s.provider = Some(provider.clone());
-        }
-        if let Some(model) = &cli.model {
-            s.model = model.clone();
-        }
-        // Headless and stdio runs fail fast on an unresolvable endpoint: there
-        // is no interface behind them to fix it in. The interactive TUI starts
-        // anyway: every turn names every missing setting; /provider switches
-        // among endpoints already in providers.json and /model sets the model
-        // id, but neither adds an endpoint or a window.
-        if let Err(e) = open_max_core::providers::resolve(&s, &core.data_dir) {
-            if cli.stdio || cli.print {
-                eprintln!("openmax: {e}");
-                std::process::exit(2);
-            }
+    apply_endpoint_flags(&core, &cli);
+    // Headless and stdio runs fail fast on an unresolvable endpoint: there is
+    // no interface behind them to fix it in. The interactive TUI starts
+    // anyway: every turn names every missing setting; /provider switches
+    // among endpoints already in providers.json and /model sets the model
+    // id, but neither adds an endpoint or a window.
+    if cli.stdio || cli.print {
+        if let Err(e) = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir) {
+            eprintln!("openmax: {e}");
+            std::process::exit(2);
         }
     }
 
@@ -969,18 +1128,7 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
         }
     };
 
-    // Start crossterm's input reader before the first frame reads the size:
-    // creating it installs the SIGWINCH handler, and a resize before that is
-    // ignored. Nothing reads input yet: the keyboard protocol probe and the
-    // event stream start behind the first frame (see `app::event_loop`).
-    let _ = crossterm::event::poll(std::time::Duration::ZERO);
-    // Bracketed paste for sane multiline paste.
-    enable_mode(MODE_PASTE, crossterm::event::EnableBracketedPaste);
-    // Mouse capture for wheel scrolling of the transcript. Terminals still
-    // allow text selection with the usual modifier (Option on macOS).
-    enable_mode(MODE_MOUSE, app::EnableMouseTracking);
-    // Focus reports gate the turn-done ring on the user being away.
-    enable_mode(MODE_FOCUS, crossterm::event::EnableFocusChange);
+    start_input();
 
     let (result, warnings) = app::run(
         terminal,
@@ -989,8 +1137,50 @@ async fn main() -> std::io::Result<std::process::ExitCode> {
         app::Args { continue_session: cli.continue_session, quit },
     )
     .await;
+    end_session(result, warnings, None)
+}
 
+/// Apply `--provider` and `--model` to the settings this run uses.
+fn apply_endpoint_flags(core: &Core, cli: &CliArgs) {
+    let mut s = core.settings.lock().unwrap();
+    if let Some(provider) = &cli.provider {
+        s.provider = Some(provider.clone());
+    }
+    if let Some(model) = &cli.model {
+        s.model = model.clone();
+    }
+}
+
+/// Start crossterm's input reader and the input modes a session reads.
+fn start_input() {
+    // The reader starts before the session's first frame reads the size:
+    // creating it installs the SIGWINCH handler, and a resize before that is
+    // ignored. Creating it also reads what input is waiting, so it starts
+    // only once nothing else reads the terminal (see `session`). Nothing
+    // reads input yet: the keyboard protocol probe and the event stream
+    // start behind the session's first frame (see `app::event_loop`).
+    let _ = crossterm::event::poll(std::time::Duration::ZERO);
+    // Bracketed paste for sane multiline paste.
+    enable_mode(MODE_PASTE, crossterm::event::EnableBracketedPaste);
+    // Mouse capture for wheel scrolling of the transcript. Terminals still
+    // allow text selection with the usual modifier (Option on macOS).
+    enable_mode(MODE_MOUSE, app::EnableMouseTracking);
+    // Focus reports gate the turn-done ring on the user being away.
+    enable_mode(MODE_FOCUS, crossterm::event::EnableFocusChange);
+}
+
+/// Hand the terminal back once a session's loop has ended, print what had to
+/// wait for the shell (the line of a trust grant made behind the first frame,
+/// `granted`, then the session's exit warnings), and say how it ended.
+fn end_session(
+    result: std::io::Result<()>,
+    warnings: Vec<String>,
+    granted: Option<String>,
+) -> std::io::Result<std::process::ExitCode> {
     restore_terminal();
+    if let Some(line) = granted {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
     let result = finish_tui(result, warnings, &mut std::io::stderr());
     // A signal ended the session: exit with its status, so a supervisor or a
     // wrapper script can tell the stop from a /quit. Returned rather than
@@ -1151,7 +1341,9 @@ fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + 
 /// its normal exit path; a second means that path is stuck, so the tool
 /// groups are killed here, the terminal is restored when `tui` says the TUI
 /// owns it, and the process exits. Once the frontend has ended, nothing
-/// reads a quit again, so the first signal takes that exit itself.
+/// reads a quit again, so the first signal takes that exit itself, and so it
+/// does before a session's loop reads the quit (`QUIT_UNREAD`), where Ctrl+C
+/// and Ctrl+\ at the terminal raise SIGINT and SIGQUIT (`signal_keys`).
 ///
 /// The watcher runs on its own thread and runtime. When main returns, the
 /// main runtime drops its tasks and then waits on blocking work still
@@ -1190,7 +1382,7 @@ fn watch_quit_signals(tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
             }
             let (_, first, _) =
                 select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
-            let last = match event_loop.upgrade() {
+            let last = match event_loop.upgrade().filter(|_| !QUIT_UNREAD.load(Ordering::SeqCst)) {
                 Some(quit) => {
                     QUIT_SIGNAL.store(signals[first].0, Ordering::SeqCst);
                     quit.notify_one();
@@ -1416,24 +1608,35 @@ fn push_title() {
 /// `restore_terminal` is the counterpart on every exit path; it writes to the
 /// shared stdout fd, and every completed frame ends fully flushed.
 fn init_terminal() -> std::io::Result<ui::transcript::Term> {
-    use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
     // Hook first: any panic past raw mode must restore the shell. This thread
     // runs the event loop and draws every frame.
     install_panic_restore(std::thread::current().id(), restore_terminal);
+    let init = || -> std::io::Result<ui::transcript::Term> {
+        enter_terminal()?;
+        frame_terminal()
+    };
+    init().inspect_err(|_| restore_terminal())
+}
+
+/// The frame writer on stdout, its buffers blank: the next frame paints
+/// every cell it draws.
+fn frame_terminal() -> std::io::Result<ui::transcript::Term> {
+    let out = FrameWriter::new(std::io::stdout(), 256 * 1024);
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
+}
+
+/// Raw mode, the shell's title saved, and the alternate screen: what
+/// `restore_terminal` hands back.
+fn enter_terminal() -> std::io::Result<()> {
+    use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
     enter_raw_mode(&TERM_MODES, enable_raw_mode)?;
     // The session states its presence in the tab title while it runs (see
     // app::Presence); save the shell's title and hand it back on every exit
     // path. Pushed only after raw mode succeeds, so an early error cannot
     // leave an orphaned entry on the terminal's title stack.
     push_title();
-    let init = || -> std::io::Result<ui::transcript::Term> {
-        let mut out = FrameWriter::new(std::io::stdout(), 256 * 1024);
-        TERM_MODES.fetch_or(MODE_ALT_SCREEN, Ordering::SeqCst);
-        execute!(out, EnterAlternateScreen)?;
-        out.flush()?;
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out))
-    };
-    init().inspect_err(|_| restore_terminal())
+    TERM_MODES.fetch_or(MODE_ALT_SCREEN, Ordering::SeqCst);
+    execute!(std::io::stdout(), EnterAlternateScreen)
 }
 
 /// Switch to raw mode and record it as one step under the stdout lock, which
@@ -1452,6 +1655,18 @@ fn enter_raw_mode(
     enable()?;
     modes.fetch_or(MODE_RAW, Ordering::SeqCst);
     Ok(())
+}
+
+/// Change the terminal behind raw mode with `change`, under the stdout lock
+/// and only while `modes` records raw mode, for the reason `enter_raw_mode`
+/// gives: a forced exit that restored the shell first has claimed raw mode
+/// and keeps stdout until the process ends, and the shell it handed back
+/// must not be changed behind it.
+fn while_raw(modes: &AtomicU8, change: impl FnOnce()) {
+    let _out = std::io::stdout().lock();
+    if modes.load(Ordering::SeqCst) & MODE_RAW != 0 {
+        change();
+    }
 }
 
 /// A frame-sized `BufWriter` that sends each frame within its capacity in
@@ -1789,7 +2004,7 @@ fn print_usage_economics() {
 /// with one, the session drew its frames into the pipe. The grant alone is
 /// the whole run and exits 0. `--continue`, `--model` and `--provider` ask
 /// for the session itself, so with any of them the run exits 1 rather than
-/// as if that session had run (see `refusal`).
+/// as if that session had run (see `operation`).
 fn exit_after_grant(cli: &CliArgs, stdout_is_terminal: bool) -> Option<i32> {
     if !cli.trust_project || cli.print || cli.stdio || stdout_is_terminal {
         return None;
@@ -1798,11 +2013,16 @@ fn exit_after_grant(cli: &CliArgs, stdout_is_terminal: bool) -> Option<i32> {
     Some(if asks_for_a_session { 1 } else { 0 })
 }
 
+/// Trust this project for the run, or refuse it. A project that is not yet
+/// trusted is offered to the human at the terminal through `ask`
+/// (`prompt_trust`). A `--trust-project` grant returns the line that reports
+/// it, which the caller prints where it can be read.
 fn ensure_project_trust(
     cli: &CliArgs,
     data_dir: &std::path::Path,
     project: &std::path::Path,
-) -> Result<(), String> {
+    ask: impl FnOnce() -> Result<(), String>,
+) -> Result<Option<String>, String> {
     // Trust grants are human actions. Any process the agent loop spawns
     // carries OPENMAX_SESSION, and both the flag and the interactive prompt
     // refuse under it: a session must not be able to grant itself (or a
@@ -1819,27 +2039,26 @@ fn ensure_project_trust(
         // explicit attestation for automation a human runs. The repair is
         // printed as one command to paste, so it carries the directory as a
         // quoted `cd`: a parenthesized note is a shell syntax error.
-        require_human("a trust grant", &open_max_core::doctor::trust_command(project));
+        require_human("a trust grant", &open_max_core::doctor::trust_command(project))?;
         let (trusted, recorded) = open_max_core::trust::grant_trust(
             data_dir,
             project,
             open_max_core::config::ApprovalMode::Auto,
         )?;
-        match recorded {
-            Some(mode) => eprintln!(
+        return Ok(Some(match recorded {
+            Some(mode) => format!(
                 "openmax: trusted project {} in {} mode (change it with /approvals or Shift+Tab)",
                 trusted.display(),
                 mode.as_str()
             ),
-            None => eprintln!(
+            None => format!(
                 "openmax: project {} was already trusted; its approval mode is unchanged (change it with /approvals or Shift+Tab)",
                 trusted.display()
             ),
-        }
-        return Ok(());
+        }));
     }
     if open_max_core::trust::is_trusted(data_dir, project)? {
-        return Ok(());
+        return Ok(None);
     }
     if agent_spawned || cli.print || cli.stdio || !std::io::stdin().is_terminal() {
         // Name a grant that works for every caller here: a frontend's stdin is
@@ -1854,7 +2073,7 @@ fn ensure_project_trust(
         ));
     }
 
-    prompt_trust(&mut std::io::stdin().lock(), &mut std::io::stderr(), data_dir, project)
+    ask().map(|()| None)
 }
 
 /// The interactive trust prompt. The answer is the whole grant: it trusts the
@@ -2187,7 +2406,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cli = parse_args_from(["--trust-project"]).unwrap();
         std::env::set_var("OPENMAX_SESSION", "1");
-        let result = ensure_project_trust(&cli, &dir.join("data"), &dir);
+        let result = ensure_project_trust(&cli, &dir.join("data"), &dir, || unreachable!("a grant asks nothing"));
         std::env::remove_var("OPENMAX_SESSION");
         let err = result.unwrap_err();
         assert!(err.contains("human actions"), "{err}");
@@ -2434,6 +2653,18 @@ mod tests {
             restore.unwrap().join().unwrap()
         });
         assert_eq!(claimed, MODE_RAW, "a restore found raw mode entered but not recorded");
+    }
+
+    #[test]
+    fn a_change_behind_raw_mode_leaves_a_restored_shell_alone() {
+        let modes = AtomicU8::new(MODE_RAW | MODE_TITLE | MODE_ALT_SCREEN);
+        let mut changed = false;
+        while_raw(&modes, || changed = true);
+        assert!(changed, "raw mode is recorded and the change did not run");
+        write_restore(&mut std::io::sink(), &modes);
+        let mut changed = false;
+        while_raw(&modes, || changed = true);
+        assert!(!changed, "the change ran on the shell a restore handed back");
     }
 
     /// SIGTERM's default action ends the process on the spot with every
@@ -2760,10 +2991,31 @@ mod tests {
         })
     }
 
-    fn refusal_of(args: &[&str]) -> Option<String> {
+    /// Why `cli` is refused, or None (see `operation`).
+    fn refusal(cli: &CliArgs) -> Option<String> {
+        operation(cli).err()
+    }
+
+    fn cli_of(args: &[&str]) -> CliArgs {
         let mcp = args.iter().any(|a| a.starts_with("--mcp-") && *a != "--mcp-timeout");
         let server: &[&str] = if mcp { &["--", "srv"] } else { &[] };
-        refusal(&parse_args_from(args.iter().chain(server).copied()).unwrap())
+        parse_args_from(args.iter().chain(server).copied()).unwrap()
+    }
+
+    fn refusal_of(args: &[&str]) -> Option<String> {
+        refusal(&cli_of(args))
+    }
+
+    /// `main` runs the one operation a command line names, and only a line
+    /// that names none is the interactive session, which a terminal at both
+    /// ends paints before anything is read (see `session`).
+    #[test]
+    fn each_command_line_names_the_operation_main_runs() {
+        for (args, name) in OPERATIONS {
+            let named = (!name.is_empty()).then_some(name);
+            assert_eq!(operation(&cli_of(args)), Ok(named), "{args:?}");
+        }
+        assert_eq!(operation(&cli_of(&["--trust-project", "--continue", "-m", "m"])), Ok(None));
     }
 
     /// Every pair of operations is refused before either runs, naming both:

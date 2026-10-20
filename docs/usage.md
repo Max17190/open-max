@@ -11,6 +11,13 @@ Change the mode later with `/approvals` or **Shift+Tab**. See
 [configuration](configuration.md#project-trust) for headless and stdio
 trust.
 
+At a terminal, the first frame (the project path, an empty conversation and
+the prompt) is painted before Open Max reads trust, settings or the session,
+and the status line fills in the model and approval mode once they are read.
+The trust question, and a refusal to start (a trust or settings file that does
+not parse, a trust grant asked for from an agent session), then show on your
+shell, which the interface hands back for them.
+
 The interface uses your terminal's own foreground and background colors. The
 palette's gray (color 8) marks secondary text, selection, and every border
 except the focused prompt's and the approval card's. There is no color
@@ -126,7 +133,11 @@ consumer that stopped reading holds stdout full, the run cannot act on the first
 signal, and only a second one ends it. A signal the run inherited as ignored, as
 under `nohup`, stays ignored. The TUI, where Ctrl+C is a key, ends the session on
 one of these signals as `/quit` does, then exits with the same status, unless its
-terminal has already gone away.
+terminal has already gone away. Until the session's loop starts (while its
+first frame waits on trust, settings, the prompt history or the session
+`--continue` resumes, or the trust question waits on the shell), the first
+signal ends the run at once with that status, and Ctrl+C at the terminal is
+SIGINT.
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
