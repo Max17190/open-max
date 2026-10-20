@@ -366,23 +366,25 @@ fn documented_trust_commands(markdown: &str) -> Vec<String> {
 }
 
 /// The words and trailing comment of one documented shell line, split the
-/// way sh splits the forms the docs use: bare words, double-quoted strings,
+/// way sh splits the forms the docs use: bare words, single- and
+/// double-quoted strings (neither expands anything the docs write in them),
 /// and a `# comment`.
 fn shell_words(line: &str) -> (Vec<String>, String) {
-    let (mut words, mut word, mut quoted) = (Vec::new(), None::<String>, false);
+    let (mut words, mut word, mut quote) = (Vec::new(), None::<String>, None::<char>);
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                quoted = !quoted;
+        match (c, quote) {
+            ('"' | '\'', None) => {
+                quote = Some(c);
                 word.get_or_insert_with(String::new);
             }
-            '#' if !quoted && word.is_none() => return (words, chars.as_str().trim().to_string()),
-            c if c.is_whitespace() && !quoted => words.extend(word.take()),
-            c => word.get_or_insert_with(String::new).push(c),
+            (c, Some(open)) if c == open => quote = None,
+            ('#', None) if word.is_none() => return (words, chars.as_str().trim().to_string()),
+            (c, None) if c.is_whitespace() => words.extend(word.take()),
+            (c, _) => word.get_or_insert_with(String::new).push(c),
         }
     }
-    assert!(!quoted, "unterminated quote in a documented command: {line}");
+    assert!(quote.is_none(), "unterminated quote in a documented command: {line}");
     words.extend(word);
     (words, String::new())
 }
@@ -431,16 +433,29 @@ fn stdio_handshake(
 /// in the context the docs give it: a line commented `from a terminal` gets a
 /// terminal on stdin, any other line gets the pipe a frontend or a CI job
 /// hands it and, as in CI, no controlling terminal. No variable is set that
-/// the line does not set itself. Success is the documented result: the run
+/// the line does not set itself, except the variable an `--api-key '$NAME'`
+/// reads, which the docs tell the user to export first. Success is the
+/// documented result: the run
 /// itself works, the project is trusted in auto although settings.json says
 /// ask, and a frontend's plain `openmax --stdio` then starts with no flag.
+/// A line that carries `--base-url` is a first run: it runs on an install
+/// with no settings.json, against the stub, whose address stands in for the
+/// documented server's, and must leave the endpoint written.
 fn run_documented_trust_command(line: &str) -> Result<(), String> {
-    let (words, comment) = shell_words(line);
+    let (mut words, comment) = shell_words(line);
     let at = words.iter().position(|w| w == "openmax").ok_or("no openmax invocation")?;
     let (project, home) = fresh_dirs("documented-trust");
     let (base_url, _requests, _server) = spawn_stub_server();
-    write_settings(&home, &base_url);
+    let first_run = words.iter().position(|w| w == "--base-url");
+    match first_run {
+        Some(flag) => *words.get_mut(flag + 1).ok_or("--base-url without a value")? = base_url.clone(),
+        None => write_settings(&home, &base_url),
+    }
     let mut command = plain_cmd(&project, &home);
+    let key = words.iter().position(|w| w == "--api-key").and_then(|flag| words.get(flag + 1));
+    if let Some(name) = key.and_then(|key| key.strip_prefix('$')) {
+        command.env(name, "documented-key");
+    }
     for assignment in &words[..at] {
         let (name, value) = assignment
             .split_once('=')
@@ -484,6 +499,10 @@ fn run_documented_trust_command(line: &str) -> Result<(), String> {
     }
     if args.iter().any(|a| a == "-p") && !stdout.contains("stub says hi") {
         return Err(format!("the turn did not reach stdout: {stdout}\n{stderr}"));
+    }
+    let settings = std::fs::read_to_string(home.join(".openmax/settings.json")).unwrap_or_default();
+    if first_run.is_some() && !settings.contains(&base_url) {
+        return Err(format!("the first run did not write its endpoint: {settings:?}\n{stderr}"));
     }
     if open_max_core::trust::is_trusted(&home.join(".openmax"), &project) != Ok(true) {
         return Err("the project is not trusted afterwards".into());
@@ -4088,6 +4107,252 @@ fn a_fresh_install_is_told_every_missing_setting_at_once() {
         assert!(stderr.contains(key), "{key} missing from {stderr}");
     }
     assert!(stderr.contains("read at launch"), "{stderr}");
+    // The error is the documentation of the first run: it names the flags
+    // that set each key as well as the keys.
+    for flag in ["--base-url", "--model", "--context-tokens", "--api-key"] {
+        assert!(stderr.contains(flag), "{flag} missing from {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// The whole first run is one command. On a fresh install, with no
+/// settings.json and no trust.json, `--trust-project` with `--base-url`,
+/// `--model`, `--api-key`, `--context-tokens` and `-p` records the project in
+/// auto, writes the four keys to settings.json before the turn, and prints
+/// the answer on stdout: nothing written by hand, nothing restarted. The next
+/// plain run needs no flag, and the same command run again changes nothing
+/// and says nothing about settings. The key is given as `$NAME` and written
+/// as given, so settings.json names the variable and never holds the secret
+/// the variable carries, which only the request does. The command with an
+/// empty task is a usage error, refused before it grants trust or writes a
+/// key.
+///
+/// The thesis target is under 30 seconds from a fresh install to a first
+/// real answer. Nearly all of that is the download and the model's own
+/// latency, so the harness's share, measured here as the wall time of the
+/// one command against a local endpoint, is held under one second in a
+/// release build (debug builds print it and hold a 20 second sanity bound).
+/// The median gate over repeated runs is in tests/thesis.rs.
+#[test]
+fn a_fresh_install_answers_in_one_command() {
+    let (project, home) = fresh_dirs("one-command");
+    let (base_url, headers) = spawn_header_server();
+    let one_command = [
+        "--trust-project",
+        "--base-url",
+        base_url.as_str(),
+        "--model",
+        "stub-model",
+        "--api-key",
+        "$FIRST_RUN_KEY",
+        "--context-tokens",
+        "16384",
+        "-p",
+        "say hi",
+    ];
+    let secret = "first-run-secret";
+    let mut empty_task = one_command;
+    *empty_task.last_mut().unwrap() = "";
+    let out = cmd(&project, &home).env("FIRST_RUN_KEY", secret).args(empty_task).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.starts_with("openmax: each --print requires a non-empty prompt"), "{stderr}");
+    assert!(!home.join(".openmax").exists(), "a usage error wrote nothing: {stderr}");
+
+    let started = std::time::Instant::now();
+    let out = cmd(&project, &home).env("FIRST_RUN_KEY", secret).args(one_command).output().unwrap();
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("stub says hi"), "stdout: {stdout}\nstderr: {stderr}");
+    let settings_path = home.join(".openmax/settings.json");
+    let written = std::fs::read_to_string(&settings_path).unwrap();
+    let settings: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(settings["base_url"], base_url.as_str(), "{written}");
+    assert_eq!(settings["model"], "stub-model", "{written}");
+    assert_eq!(settings["api_key"], "$FIRST_RUN_KEY", "{written}");
+    assert!(!written.contains(secret), "{written}");
+    assert_eq!(settings["context_tokens"], 16384, "{written}");
+    let sent = headers.lock().unwrap().concat();
+    let authorization = sent.lines().find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization").then(|| value.trim())
+    });
+    assert_eq!(authorization, Some("Bearer first-run-secret"), "the key the variable carries reaches the server: {sent}");
+    assert!(
+        stderr.contains(&format!("openmax: wrote base_url, api_key, model, context_tokens to {}", settings_path.display())),
+        "the run must say what it wrote: {stderr}"
+    );
+    assert_eq!(approval_mode(&home, &project), ApprovalMode::Auto, "{stderr}");
+    if cfg!(debug_assertions) {
+        eprintln!("one-command first run: {elapsed:?} (debug build; the release build holds it under 1 s)");
+        assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
+    } else {
+        assert!(elapsed < std::time::Duration::from_secs(1), "the harness's share of a first answer: {elapsed:?}");
+    }
+
+    let out = cmd(&project, &home).args(["-p", "say hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "the configured install runs with no flag: {stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("stub says hi"), "{stderr}");
+
+    let out = cmd(&project, &home).env("FIRST_RUN_KEY", secret).args(one_command).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("settings.json"), "flags equal to the file change nothing and say nothing: {stderr}");
+    assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), written);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// On an install that already sets a key, the flag for it applies to this
+/// run only: the turn goes to the flag's endpoint, the run says which keys
+/// the command line overrode, and settings.json keeps its bytes, so a typo
+/// in a one-off flag can never break the next plain run. A `--base-url`
+/// other than the file's is another server, so a key the file leaves unset
+/// is not written either: the next plain run would send it to the file's.
+#[test]
+fn flags_override_a_configured_install_for_this_run_only() {
+    let (project, home) = fresh_dirs("override");
+    let (base_url, _requests, _server) = spawn_stub_server();
+    write_settings_with_mode(&home, "http://127.0.0.1:9/v1", "auto");
+    let settings_path = home.join(".openmax/settings.json");
+    let before = std::fs::read(&settings_path).unwrap();
+    let out = cmd(&project, &home)
+        .args(["--trust-project", "--base-url", &base_url, "--api-key", "sk-flag", "--context-tokens", "32768", "-p", "say hi"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("stub says hi"), "the turn must use the flag's endpoint: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "openmax: for this run only, the command line overrides base_url, api_key, context_tokens in {}; the file is unchanged, so set them there to keep them",
+            settings_path.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("wrote"), "{stderr}");
+    assert_eq!(std::fs::read(&settings_path).unwrap(), before, "a configured install is never rewritten by a flag");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A stub endpoint answering like `spawn_stub_server` that records each
+/// request's header block, for what a request carries besides its body.
+fn spawn_header_server() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let length = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            let _ = stream.read_exact(&mut body);
+            log.lock().unwrap().push(head);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{HELLO_SSE}",
+                HELLO_SSE.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), seen)
+}
+
+/// settings.json's api_key is the credential for the server its base_url
+/// names. A one-off `--base-url` for another server is sent no settings
+/// key: its requests carry no Authorization header, the run says why and
+/// how to send one, and the file keeps its key. With `--api-key` the run
+/// sends its own.
+#[test]
+fn a_base_url_flag_for_another_server_is_not_sent_the_files_key() {
+    let (project, home) = fresh_dirs("withheld-key");
+    let dir = home.join(".openmax");
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings_path = dir.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{"base_url":"http://127.0.0.1:9/v1","api_key":"sk-file-secret","model":"stub-model","approval_mode":"auto","context_tokens":16384}"#,
+    )
+    .unwrap();
+    let before = std::fs::read(&settings_path).unwrap();
+    for (key, sent) in [(None, None), (Some("sk-flag"), Some("bearer sk-flag"))] {
+        let (base_url, headers) = spawn_header_server();
+        let mut args = vec!["--trust-project", "--base-url", base_url.as_str()];
+        args.extend(key.map(|k| ["--api-key", k]).into_iter().flatten());
+        let out = cmd(&project, &home).args(args).args(["-p", "say hi"]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("stub says hi"), "{stderr}");
+        let headers = headers.lock().unwrap().join("").to_ascii_lowercase();
+        assert!(!headers.contains("sk-file-secret"), "the file's key reached another server: {headers}");
+        let authorization = headers.lines().find_map(|l| l.strip_prefix("authorization: ")).map(str::trim);
+        assert_eq!(authorization, sent, "{headers}");
+        let withheld = format!(
+            "openmax: this run sends no api_key: the one in {} is for the server its base_url names, and --base-url names another; pass --api-key to send one",
+            settings_path.display()
+        );
+        assert_eq!(stderr.contains(&withheld), key.is_none(), "{stderr}");
+        assert_eq!(std::fs::read(&settings_path).unwrap(), before, "the file keeps its key");
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Where settings.json selects a provider, its providers.json entry gives
+/// the key and may size the model, so the flags for those say what the run
+/// does with them. `--api-key` is the key for `base_url`, never sent to a
+/// provider on another server, so it is refused naming the provider, before
+/// the trust grant, with nothing written. `--context-tokens` is the window
+/// for a model the entry does not size: it is written while settings.json
+/// leaves it unset, and where the entry sizes the model the run says that
+/// window wins.
+#[test]
+fn settings_flags_beside_a_selected_provider_say_what_the_run_uses() {
+    let (project, home) = fresh_dirs("provider-flags");
+    let (base_url, _requests, _server) = spawn_stub_server();
+    let dir = home.join(".openmax");
+    std::fs::create_dir_all(&dir).unwrap();
+    let catalog = serde_json::json!({"providers": {"stub": {"base_url": base_url, "models": [{"id": "stub-model", "context_tokens": 16384}]}}});
+    std::fs::write(dir.join("providers.json"), catalog.to_string()).unwrap();
+    let settings_path = dir.join("settings.json");
+    std::fs::write(&settings_path, r#"{"provider":"stub","model":"stub-model","approval_mode":"auto"}"#).unwrap();
+    let before = std::fs::read(&settings_path).unwrap();
+
+    let out = cmd(&project, &home).args(["--trust-project", "--api-key", "sk-literal", "-p", "say hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--api-key is the key for settings.json's base_url, but this run uses provider 'stub'"), "{stderr}");
+    assert_eq!(std::fs::read(&settings_path).unwrap(), before, "a refused flag writes nothing");
+    assert_eq!(open_max_core::trust::is_trusted(&dir, &project), Ok(false), "a refused flag grants no trust: {stderr}");
+
+    let out = cmd(&project, &home).args(["--trust-project", "--context-tokens", "9000", "-p", "say hi"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("stub says hi"), "{stderr}");
+    assert!(stderr.contains(&format!("openmax: wrote context_tokens to {}", settings_path.display())), "{stderr}");
+    assert!(
+        stderr.contains("openmax: --context-tokens 9000 is not this run's window: provider 'stub' gives model stub-model 16384 tokens in ~/.openmax/providers.json, which wins"),
+        "{stderr}"
+    );
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

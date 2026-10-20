@@ -249,6 +249,20 @@ jobs:
         # than publishing an installer that skips it. The installer is in no
         # checksum file dist publishes, so nothing else changes with it.
         run: scripts/patch-installer-checksum.sh target/distrib/openmax-installer.sh
+      - name: End the installer with the first command to run
+        # LOCAL EDIT, not generated; see the note on the "Install dist" step in
+        # `plan`, and re-apply this step after regenerating.
+        #
+        # When dist's installer adds its directory to PATH, it ends by saying
+        # to restart the shell, because the change reaches only a new one, and
+        # otherwise with "everything's installed!". This patches the
+        # installer built above, before it is uploaded, to end with the whole
+        # first run instead: one command naming the binary by its absolute
+        # path, which grants trust, writes the endpoint to settings.json and
+        # answers a first task. It fails if dist's install function does not
+        # end in the shape the script expects rather than publishing an
+        # installer without that line.
+        run: scripts/patch-installer-first-command.sh target/distrib/openmax-installer.sh
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:
