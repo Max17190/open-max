@@ -306,8 +306,10 @@ check. An unapproved tool is probed in a sandbox that denies the network and
 any write outside its scratch directory, so a non-pass there is reported as a
 warning and does not fail the check: under those restrictions it is
 inconclusive, not proof the tool is broken (a passing probe approves nothing,
-so a failing one condemns nothing). Plain `--check` stays read-only and never
-executes anything; running examples is opt-in per invocation. Fuller
+so a failing one condemns nothing). Plain `--check` runs no command; running
+examples is opt-in per invocation. Like the TUI, `-p` and `--stdio`, it first
+stops the tools a killed openmax left running and removes that openmax's
+record of them (see [usage](usage.md#command-line)). Fuller
 regression suites stay agent-authored files - the example is the smallest
 honest proof that a freshly written tool actually runs.
 
