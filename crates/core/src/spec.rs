@@ -1529,6 +1529,29 @@ mod tests {
         assert!(render("stdio").unwrap().contains("openmax --check --stdio"));
     }
 
+    /// The execution policy note names a mode and its limits and leaves
+    /// content approval detail to the contracts, and docs/configuration.md
+    /// says that detail is in `openmax --spec tools`, `hooks`, and
+    /// `permissions`. Each of those contracts must keep stating its own
+    /// content approval rule, or that sentence sends the reader to a contract
+    /// that no longer says it. Line wrapping is collapsed so the check does
+    /// not depend on where a phrase breaks across lines.
+    #[test]
+    fn specs_state_content_approval_for_tools_hooks_and_permissions() {
+        for (surface, rule) in [
+            ("tools", "requires a human content approval"),
+            ("hooks", "inert until a human approves its exact content"),
+            ("permissions", "inert until a human approves that exact content"),
+        ] {
+            let text = render(surface).unwrap();
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains(rule),
+                "--spec {surface} must state its content approval rule: {rule}"
+            );
+        }
+    }
+
     /// `ask` mode prompts only on calls the harness CLASSIFIES as mutating,
     /// and for an external tool that class is the manifest's self-declared
     /// `mutating` flag - trusted metadata, not an effects check. A tool that
