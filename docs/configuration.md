@@ -72,7 +72,19 @@ override the first two.
 - `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
   keeps up to a quarter of each stream's share of the cap from its start and
   the rest from its end, marks the cut with the bytes it dropped, and spills
-  up to 16 MiB of each stream to `~/.openmax/cmd-logs`.
+  up to 16 MiB of each stream to `~/.openmax/cmd-logs`. Before any of that,
+  bash keeps only the final text of a line redrawn with carriage returns
+  (a progress bar): text that follows a `\r` on the same line replaces the
+  whole line so far, so only its final text counts against the cap and
+  reaches the log. `\r\n` stays a line ending, a run of `\r` before a `\n`
+  becomes one `\r\n`, and a `\r` that ends stdout or stderr is dropped
+  (`last\r` reaches the model as `last`). Once a line holds more than 8 KiB
+  since its last redraw, that text and the rest of the line up to its next
+  `\r` or `\n` are passed on whole, and a later redraw no longer replaces
+  them. The `\r` after them is kept (one for a run of them), so the next
+  frame starts after it instead of running on from their last byte. A file
+  with lone-`\r` line endings printed through bash shows only its last
+  record the same way; `tr '\r' '\n' < file` shows every record.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
 
 Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript

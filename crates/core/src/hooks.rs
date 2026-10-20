@@ -1547,10 +1547,12 @@ async fn run_hook(
             tail_bytes: 0,
             spill_dir: None,
             spill_bytes_per_stream: 0,
+            redraws: false,
         },
         sandbox: None,
         env_allowlist: None,
         self_link: false,
+        env: Vec::new(),
     };
 
     match execution::run_process(request, cancel.clone()).await {
