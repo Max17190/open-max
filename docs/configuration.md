@@ -252,8 +252,14 @@ OPENMAX_HUMAN_ATTEST=1 openmax --trust-project   # the grant alone
 ```
 
 With neither `-p` nor `--stdio`, `--trust-project` goes on to the interactive
-session, which draws on stdout. Where stdout is not a terminal, no session
-starts: the run ends after the grant and says so. The grant alone exits 0.
+session, which draws on stdout. At a terminal, the session paints its first
+frame before the grant is recorded, and the line that reports the grant prints
+on the shell once the session ends, or ahead of the reason when the session
+then cannot start (settings that do not parse). A signal that forces the exit
+first, one before the session's loop starts (Ctrl+C at the terminal included)
+or a second one, ends the run without the line. Where stdout is not a
+terminal, no session starts: the run ends after the grant and says so. The
+grant alone exits 0.
 With `--continue`, `--model` or `--provider` as well, the run asked for the
 session itself, which cannot start there, so it exits 1 once the grant is
 recorded.

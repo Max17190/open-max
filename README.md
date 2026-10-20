@@ -156,7 +156,7 @@ cd ~/code/my-app
 openmax
 ```
 
-On the first interactive run, inspect the project and answer the trust prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`. Headless and stdio runs never prompt: grant trust once from a terminal with `--trust-project`, which records `auto`, and later runs, including a frontend's `openmax --stdio`, need no flag:
+On the first interactive run, inspect the project and answer the trust prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`. The interface paints its first frame before it reads trust, settings or the session, then asks on your shell. Headless and stdio runs never prompt: grant trust once from a terminal with `--trust-project`, which records `auto`, and later runs, including a frontend's `openmax --stdio`, need no flag:
 
 ```sh
 openmax --continue                                 # resume latest session here

@@ -226,3 +226,290 @@ fn whole_suite_runs_in_five_seconds() {
         "the gate does not name what it is missing: {unequipped_report}"
     );
 }
+
+/// Cold start to the first painted frame under one millisecond.
+///
+/// Method: 21 launches, after one warmup launch, each into a fresh fixture
+/// HOME (settings only, the project not yet trusted, so `--trust-project`
+/// grants it) on a fresh 80x24 pseudo-terminal. A launch is timed from just
+/// before the spawn to the return of the read that brings the end of the
+/// first frame, the close of its synchronized update. The spawn is
+/// `posix_spawn` (no `pre_exec`), so the clock does not include forking the
+/// test process. The launches run in a session of their own, which has no
+/// controlling terminal, so each paints at its pseudo-terminal's 80x24
+/// wherever the tests run (`first_frame::alone`). After the frame
+/// the launch answers the keyboard protocol query, quits with Ctrl+C twice,
+/// and keeps reading until the child is reaped, so it never blocks on unread
+/// output. The median is the measurement, printed with the 25th and 75th
+/// percentiles. Beside it, the same binary's process start, timed the same
+/// way, one run in front of each launch so a change in the machine's load
+/// moves both alike: spawn to the first byte that `--version`, printed by
+/// the argument parser as it reaches the flag, writes.
+///
+/// A release build asserts the ratchet, then the target. The ratchet holds
+/// the harness's own work in front of the frame, the frame's median beyond
+/// the process start's, under three times that work's median measured
+/// below, 0.39 ms: room for a busy machine (0.30 ms measured), not for one
+/// so loaded that its process start doubles (up to 0.70 ms measured).
+/// Painting the frame behind the grant again breaks it: 1.0 to 1.4 ms in
+/// five batches. The runtime's start (a median of 0.18 ms) or a settings
+/// read (0.10 ms) in front of the frame stays within the spread of this
+/// change's own batches (0.00 to 0.31 ms), so this cannot see it. Work in
+/// front of argument parsing delays `--version` as much as the frame, so
+/// the ratchet cannot see that either; the target can. The target assertion
+/// fails by design until the process start itself is under 1 ms: alone it
+/// measures 1.41 to 1.53 ms on this platform (below). A debug build prints
+/// the measurement and holds the frame to 20 times the target, which only a
+/// hang or a stall many times today's breaks; its own timings swing with
+/// the machine's load, so it asserts neither the ratchet nor the target.
+///
+/// Measured in a release build on macOS, five batches of 21 launches each,
+/// quoting the batch with the median harness work: the frame painted before
+/// any file is read or the runtime starts, first frame 1.66 ms, process
+/// start 1.53 ms, so 0.13 ms of harness work (0.08 to 0.14 ms over the
+/// batches). With the frame painted behind the grant (trust.json written
+/// with its disk syncs), settings, the session and the runtime: 3.20 ms,
+/// process start 1.51 ms, so 1.70 ms (1.61 to 1.78 ms, and up to 7.70 ms on
+/// a busy machine, as the disk syncs wait on whatever else the disk is
+/// doing), which leaves out that build's runtime start because its
+/// `--version` paid it too. A project already trusted, launched without the
+/// flag: 0.11 ms of harness work, against 0.28 ms behind trust, settings,
+/// the session and the runtime.
+#[cfg(unix)]
+#[test]
+fn first_frame_is_under_one_millisecond() {
+    use std::time::Duration;
+    const TARGET: Duration = Duration::from_millis(1);
+    // Three times the harness work measured in front of the frame (above).
+    const RATCHET: Duration = Duration::from_micros(3 * 130);
+    const LAUNCHES: usize = 21;
+    if !first_frame::alone("first_frame_is_under_one_millisecond") {
+        return;
+    }
+    first_frame::version(0);
+    first_frame::launch(0);
+    let (mut starts, mut times) = (Vec::new(), Vec::new());
+    for n in 1..=LAUNCHES {
+        starts.push(first_frame::version(n));
+        times.push(first_frame::launch(n));
+    }
+    let summary = |times: &mut [Duration]| {
+        times.sort();
+        let quartiles = format!(
+            "median {:?} (p25 {:?}, p75 {:?})",
+            times[LAUNCHES / 2],
+            times[LAUNCHES / 4],
+            times[3 * LAUNCHES / 4]
+        );
+        (times[LAUNCHES / 2], quartiles)
+    };
+    let (start, start_quartiles) = summary(&mut starts);
+    let (frame, frame_quartiles) = summary(&mut times);
+    let report = format!(
+        "first frame: {frame_quartiles} over {LAUNCHES} launches; process start alone: {start_quartiles}"
+    );
+    println!("{report}");
+    if cfg!(debug_assertions) {
+        assert!(frame < TARGET * 20, "in a debug build, {report}: {times:?}");
+        return;
+    }
+    let ahead = frame.saturating_sub(start);
+    assert!(
+        ahead < RATCHET,
+        "the harness spends {ahead:?} in front of the first frame, over its ratchet of {RATCHET:?}; {report}: {times:?}"
+    );
+    assert!(frame < TARGET, "{report}: {times:?}");
+}
+
+#[cfg(unix)]
+mod first_frame {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const FRAME_END: &[u8] = b"\x1b[?2026l";
+    const KEYBOARD_QUERY: &[u8] = b"\x1b[?u";
+    /// A terminal that speaks the keyboard protocol, then its primary device
+    /// attributes; then Ctrl+C twice, which quits.
+    const ANSWER_AND_QUIT: &[u8] = b"\x1b[?0u\x1b[?62;22c\x03\x03";
+
+    /// Whether this is the run of the test `name` in a session of its own;
+    /// if not, run it again in one and pass on how that run ends. crossterm
+    /// reads the size through /dev/tty, the session's controlling terminal,
+    /// ahead of the terminal on stdout, so a launch in the test's session
+    /// paints at the size of whatever terminal runs the tests: from a 250x70
+    /// terminal, 0.2 ms more harness work in front of the frame than at
+    /// 80x24. A new session has no controlling terminal, so each launch
+    /// paints at its pseudo-terminal's size. The rerun forks to start the
+    /// session (`pre_exec`), outside every clock, and the launches it times
+    /// are `posix_spawn`ed into that session.
+    pub fn alone(name: &str) -> bool {
+        use std::os::unix::process::CommandExt;
+        const ALONE: &str = "OPENMAX_THESIS_ALONE";
+        if std::env::var_os(ALONE).is_some() {
+            return true;
+        }
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name, "--nocapture", "--test-threads=1"]).env(ALONE, "1");
+        // SAFETY: setsid is async-signal-safe, and the closure touches
+        // nothing else between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| match libc::setsid() {
+                -1 => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            });
+        }
+        let out = cmd.output().unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        print!("{stdout}");
+        assert!(out.status.success(), "in a session of its own: {stdout}{stderr}");
+        false
+    }
+
+    /// Spawn to the first byte of `openmax --version` on a pseudo-terminal.
+    pub fn version(_: usize) -> Duration {
+        let (mut controller, terminal) = pseudo_terminal(80, 24);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
+        cmd.arg("--version").stdin(Stdio::null()).stdout(terminal).stderr(Stdio::null());
+        let started = Instant::now();
+        let mut child = cmd.spawn().unwrap();
+        drop(cmd);
+        let (mut out, mut first) = (Vec::new(), None);
+        let deadline = started + Duration::from_secs(10);
+        while first.is_none() && Instant::now() < deadline {
+            match read_some(&mut controller, &mut out) {
+                Some(read) if !out.is_empty() => first = Some(read - started),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        while read_some(&mut controller, &mut out).is_some() {}
+        child.wait().unwrap();
+        first.unwrap_or_else(|| panic!("--version printed nothing: {:?}", String::from_utf8_lossy(&out)))
+    }
+
+    /// One launch: spawn to the first frame's end.
+    pub fn launch(n: usize) -> Duration {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("openmax-thesis-first-frame-{}-{nonce}-{n}", std::process::id()));
+        let (home, project) = (dir.join("home"), dir.join("project"));
+        std::fs::create_dir_all(home.join(".openmax")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            home.join(".openmax/settings.json"),
+            r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#,
+        )
+        .unwrap();
+        let (mut controller, terminal) = pseudo_terminal(80, 24);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
+        cmd.arg("--trust-project")
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env_remove("OPENMAX_API_KEY")
+            .env_remove("OPENMAX_SESSION")
+            .env_remove("OPENMAX_PERF")
+            // --trust-project is a human's grant; the test attests to it.
+            .env("OPENMAX_HUMAN_ATTEST", "1")
+            .stdin(terminal.try_clone().unwrap())
+            .stdout(terminal)
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let mut child = cmd.spawn().unwrap();
+        // Only the child holds the terminal end now.
+        drop(cmd);
+        let (mut out, mut painted, mut answered) = (Vec::new(), None, false);
+        let deadline = started + Duration::from_secs(10);
+        while Instant::now() < deadline && !answered {
+            let Some(read) = read_some(&mut controller, &mut out) else { break };
+            if painted.is_none() && find(&out, FRAME_END).is_some() {
+                painted = Some(read - started);
+            }
+            if painted.is_some() && find(&out, KEYBOARD_QUERY).is_some() {
+                controller.write_all(ANSWER_AND_QUIT).unwrap();
+                answered = true;
+            }
+        }
+        // Reap while reading: a child cannot finish exiting while what it
+        // wrote sits unread in its terminal.
+        let reap_by = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > reap_by {
+                let _ = child.kill();
+            }
+            if read_some(&mut controller, &mut Vec::new()).is_none() {
+                let _ = child.wait();
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        painted.unwrap_or_else(|| panic!("no first frame: {:?}", String::from_utf8_lossy(&out)))
+    }
+
+    /// Append what the controller has within 20 ms to `out`, and return when
+    /// the read returned; None once the child closed the terminal.
+    fn read_some(controller: &mut File, out: &mut Vec<u8>) -> Option<Instant> {
+        let mut fd = libc::pollfd { fd: controller.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd for the duration of the call.
+        if unsafe { libc::poll(&mut fd, 1, 20) } <= 0 {
+            return Some(Instant::now());
+        }
+        let mut buf = [0u8; 64 * 1024];
+        match controller.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let read = Instant::now();
+                out.extend_from_slice(&buf[..n]);
+                Some(read)
+            }
+            // EIO on Linux, EOF on macOS: the child is gone.
+            _ => None,
+        }
+    }
+
+    fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// A pseudo-terminal of `cols` by `rows`: the controller end the test
+    /// keeps and the terminal end the child gets, both close-on-exec.
+    fn pseudo_terminal(cols: u16, rows: u16) -> (File, File) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        // ptsname answers in one static buffer.
+        static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let open = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(path)
+                .unwrap()
+        };
+        let controller = open("/dev/ptmx".as_ref());
+        let fd = controller.as_raw_fd();
+        let path = {
+            let _only = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: fd stays open for the whole block, and ptsname's
+            // buffer is copied out before the lock is released.
+            unsafe {
+                assert_eq!(libc::grantpt(fd), 0, "grantpt: {}", std::io::Error::last_os_error());
+                assert_eq!(libc::unlockpt(fd), 0, "unlockpt: {}", std::io::Error::last_os_error());
+                let name = libc::ptsname(fd);
+                assert!(!name.is_null(), "ptsname: {}", std::io::Error::last_os_error());
+                std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr(name).to_bytes()).to_owned()
+            }
+        };
+        let terminal = open(path.as_ref());
+        let size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: TIOCSWINSZ reads one winsize from the pointer.
+        let rc = unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+        assert_eq!(rc, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
+        (controller, terminal)
+    }
+}

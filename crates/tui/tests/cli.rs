@@ -1920,6 +1920,22 @@ fn a_print_run_keeps_harness_notes_off_stderr() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// `--model` names the model a run asks for, over the one settings.json
+/// names: the request a print run sends carries the flag's.
+#[test]
+fn the_model_flag_names_the_model_a_run_asks_for() {
+    let (project, home) = fresh_dirs("model-flag");
+    let (base_url, requests, _server) = spawn_scripted_server(vec![(sse_text("hi"), true)]);
+    write_settings(&home, &base_url);
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+
+    let out = cmd(&project, &home).args(["-m", "flag-model", "-p", "say hi"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let sent: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
+    assert_eq!(sent["model"], "flag-model", "settings.json names stub-model: {sent}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Run `openmax` with `args` and `commands` on stdin, then EOF, which quits a
 /// stdio session once its turn in flight drains, and hand back its stdout
 /// lines with the session's id, taken from `hello`, replaced by `S`.
