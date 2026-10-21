@@ -73,11 +73,13 @@ verification.
 
 `openmax --check --run-examples` adds one `example` surface row per declared
 `[example]`, in text and in JSON, and fails the check when one fails. It is
-the only `--check` mode that executes anything, so it needs a trusted project
-and follows the saved project mode. Auto runs valid examples without content
-approval; ask uses the documented approval and sandbox rules. It honors
-permission rules, `pre_tool_use` hooks, and `approval_mode` exactly as a turn
-does. See [extending](extending.md#proof-of-life).
+the only `--check` mode that runs a command, so it needs a trusted project
+and follows the saved project mode. Like the TUI, `-p` and `--stdio`, plain
+`--check` first stops the tools a killed openmax left running and removes that
+openmax's record of them (see the signals below). Auto runs valid examples
+without content approval; ask uses the documented approval and sandbox rules.
+It honors permission rules, `pre_tool_use` hooks, and `approval_mode` exactly
+as a turn does. See [extending](extending.md#proof-of-life).
 
 A print prompt that starts with `-` parses as options, not text. Put it
 last, after `--`, which ends the options: `openmax -p -- '- list the files'`.
@@ -143,7 +145,43 @@ ends it the same way. A second signal exits without waiting for the turn, with
 to 250 ms for a tool command still being started, so one that starts within that
 wait is killed with the rest. Neither stops a process that leaves its tool's
 group (one that starts a session of its own, as `setsid` does), or a tool command
-whose start outlasts that wait: it runs on after openmax has exited. While a
+whose start outlasts that wait: it runs on after openmax has exited. SIGKILL,
+or a crash that runs no handler, stops no tool: each running tool's group runs
+on until the next openmax launch (the TUI, `-p`, `--stdio`, or `--check`).
+On macOS and Linux, openmax records the process groups of its running tools,
+each leader with its start time, in `~/.openmax/run/<pid>.groups`: one line
+when a group starts and one when it ends. Once the file has passed 4 KiB, it
+is cut back to its first line the next time a group ends with no other
+running. An exit that leaves no tool running removes it, and the `run`
+directory once no other record is left there. A launch reads every record
+whose owner pid no process of the same user holds (none does, or another
+user's does) or names a process started at another time, and sends each group
+the record still lists whose leader runs with its recorded start time SIGTERM,
+then SIGKILL if the group is still there 250 ms later, before it starts
+anything. Neither signal goes to a group whose leader pid has since been
+taken by a process started at another time, and none goes to a group once it
+has been seen gone, since its id can then name another. It then removes those
+records, and the `run` directory once no record is left there. On Linux,
+where start times count from boot, a record's first line also carries the
+boot's id, and a record from an earlier boot is removed with nothing
+signalled. A record a running openmax owns is left alone, and so is that of a
+killed openmax whose parent has not yet waited for it, since it still holds
+its pid: the first launch after that wait stops its tools. A launch never
+signals the group it runs in: an openmax that a left-behind tool's script
+starts leaves that tool's group running, and removes the record. A group is
+recorded just after its spawn has returned, when its command has already
+started, so a SIGKILL in that moment leaves it unrecorded, and a home where
+the record cannot be written (read-only, or on a full disk) records nothing
+while it stays so. No tool and no exit waits on the record's file, as a home
+whose file server stopped answering would make them: one thread makes every
+write to it, and an exit waits at most 100 ms for that thread to remove it.
+The next launch removes a record so left, finding the groups it lists gone. A
+sub-agent openmax among the tools that the SIGKILL ends before it has stopped
+its own tools leaves them to the launch after. A group whose leader had exited
+before the launch, and a process that left its tool's group, are not stopped.
+Nor are the tools of an openmax in another pid namespace that shares the home
+directory, as a container with the home mounted does: a launch outside it
+takes its records for a dead openmax's and removes them. While a
 consumer that stopped reading holds stdout full, the run cannot act on the first
 signal, and only a second one ends it. A signal the run inherited as ignored, as
 under `nohup`, stays ignored. The TUI, where Ctrl+C is a key, ends the session on

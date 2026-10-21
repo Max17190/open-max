@@ -600,6 +600,10 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     signal_keys(true);
 
     let data_dir = default_data_dir();
+    // Behind the first frame, as every file read is, and before anything
+    // can start a tool: as `run` does, stop the tool groups a harness killed
+    // outright left running, then record this session's own.
+    open_max_core::execution::reap_left_behind_groups(&data_dir);
     if let Some(reason) = settings_conflict(&cli, &data_dir) {
         refuse(2, &reason, None);
     }
@@ -754,11 +758,11 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     }
 
     if let Some(query) = &cli.recall {
-        // Read-only introspection, like --check: no session, no endpoint,
-        // no trust gate. Recall only ever surfaces this project's own history
-        // (the session index is keyed by project), and the index matches
-        // this path, as given or resolved, against the resolved path each
-        // session was recorded in.
+        // Read-only introspection: no session, no endpoint, no trust gate.
+        // Recall only ever surfaces this project's own history (the session
+        // index is keyed by project), and the index matches this path, as
+        // given or resolved, against the resolved path each session was
+        // recorded in.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // Settings are how a turn reaches a provider and what it may spend;
         // recall reads neither, so a settings file this process will never act
@@ -1061,13 +1065,17 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         }
     }
 
+    // Every launch that can start a turn or a tool first stops the tool
+    // groups a harness killed outright left running, then records its own.
+    open_max_core::execution::reap_left_behind_groups(&default_data_dir());
+
     if cli.check {
         // With --stdio, validate a JSONL protocol stream on stdin instead of
-        // the filesystem: no session, no endpoint, no state dir either.
+        // the filesystem: no session, no endpoint either.
         if cli.stdio {
             std::process::exit(stdio::run_conformance());
         }
-        // Pure filesystem validation: no session, no endpoint, no state dir.
+        // Pure filesystem validation: no session, no endpoint.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // The text face's repair commands name files relative to the project.
         let findings = match cli.json {

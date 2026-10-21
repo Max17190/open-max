@@ -1279,6 +1279,9 @@ pub fn kill_process_groups() {
     for pid in live_groups().iter() {
         send_kill_group(Some(*pid));
     }
+    // Every group listed was just killed, so the record lists none a later
+    // launch must stop, and the exit removes it.
+    change_record(RecordChange::Clear);
 }
 
 /// Keeps a command's group in `LIVE_GROUPS` while it runs, and kills the
@@ -1304,6 +1307,9 @@ impl GroupGuard {
         let child = command.spawn().map_err(ProcessError::Spawn)?;
         let pid = child.id();
         live_groups().extend(pid);
+        if let Some(pid) = pid {
+            record(pid);
+        }
         Ok((child, Self(pid)))
     }
 
@@ -1312,6 +1318,7 @@ impl GroupGuard {
     fn settled(mut self) {
         if let Some(pid) = self.0.take() {
             forget(&mut live_groups(), pid);
+            unrecord(pid);
         }
     }
 }
@@ -1331,8 +1338,425 @@ impl Drop for GroupGuard {
             let mut live = live_groups();
             forget(&mut live, pid);
             send_kill_group(Some(pid));
+            unrecord(pid);
         }
     }
+}
+
+/// Where the changes to this process's record of the tool groups it started
+/// and has not settled go, armed by [`reap_left_behind_groups`]; unarmed,
+/// nothing is recorded. One thread owns the record and makes every write to
+/// it ([`keep_record`]), so no tool's spawn or settle, and no exit, waits on
+/// the home directory: a home whose file server stopped answering stalls
+/// that thread alone. A harness that dies without its exit path (SIGKILL, a
+/// crash that runs no handler) leaves the file behind, and the next launch
+/// stops the groups it names.
+static RECORDER: std::sync::OnceLock<std::sync::mpsc::Sender<RecordChange>> = std::sync::OnceLock::new();
+
+/// A change to the record, made by its thread in the order sent.
+enum RecordChange {
+    Add(u32, u64),
+    Strike(u32),
+    /// Every group listed was just killed.
+    Clear,
+    /// The process is exiting: remove the record once it lists no group,
+    /// then answer.
+    Close(std::sync::mpsc::Sender<()>),
+}
+
+fn change_record(change: RecordChange) {
+    if let Some(recorder) = RECORDER.get() {
+        let _ = recorder.send(change);
+    }
+}
+
+/// The record's thread: each change in the order sent, until the exit
+/// closes the record.
+fn keep_record(mut record: GroupRecord, changes: std::sync::mpsc::Receiver<RecordChange>) {
+    for change in changes {
+        match change {
+            RecordChange::Add(pid, start) => record.add(pid, start),
+            RecordChange::Strike(pid) => record.strike(pid),
+            RecordChange::Clear => record.live.clear(),
+            RecordChange::Close(closed) => {
+                close(record);
+                let _ = closed.send(());
+                return;
+            }
+        }
+    }
+}
+
+/// Once the record has grown past this many bytes, the next strike that
+/// leaves no group listed cuts it back to its first line. Every group ends
+/// with its tool call, so that happens once a turn's calls have ended, and
+/// the file stays near this size.
+const RECORD_CUT_BYTES: u64 = 4096;
+
+/// `{data_dir}/run/{pid}.groups`, created by the first tool a launch starts and
+/// then held open by the record's thread, so a tool round costs it two appends,
+/// not a rewrite of the file. The first line is the owner's start time, then on
+/// Linux this boot's id; each `<leader> <start>` line adds a group, and each
+/// `-<leader> <start>` line strikes one. Every line is one write, so a kill
+/// never leaves half of one. A write that fails, as on a full disk, can, so the
+/// next change rewrites the file whole.
+struct GroupRecord {
+    path: PathBuf,
+    own_start: u64,
+    file: Option<std::fs::File>,
+    /// The file's length, where the next line goes.
+    len: u64,
+    /// The first line's length, its newline included, once it is written.
+    first_len: u64,
+    live: Vec<(u32, u64)>,
+}
+
+impl GroupRecord {
+    fn new(path: PathBuf, own_start: u64) -> Self {
+        Self { path, own_start, file: None, len: 0, first_len: 0, live: Vec::new() }
+    }
+
+    fn add(&mut self, pid: u32, start: u64) {
+        self.live.push((pid, start));
+        self.write(&format!("{pid} {start}\n"));
+    }
+
+    fn strike(&mut self, pid: u32) {
+        let Some(at) = self.live.iter().position(|(leader, _)| *leader == pid) else { return };
+        let (pid, start) = self.live.swap_remove(at);
+        if self.live.is_empty() && self.len > RECORD_CUT_BYTES {
+            use std::io::Seek;
+            let first_line = self.first_len;
+            if let Some(mut file) = self.file.as_ref() {
+                if file.set_len(first_line).and_then(|()| file.seek(io::SeekFrom::Start(first_line))).is_ok() {
+                    self.len = first_line;
+                    return;
+                }
+            }
+        }
+        self.write(&format!("-{pid} {start}\n"));
+    }
+
+    fn write(&mut self, line: &str) {
+        use std::io::Write;
+        if let Some(mut file) = self.file.as_ref() {
+            if file.write_all(line.as_bytes()).is_ok() {
+                self.len += line.len() as u64;
+                return;
+            }
+            // A write cut short can leave part of a line, which the next
+            // one would run into and hide: rewrite the file whole instead.
+            self.file = None;
+        }
+        // Not open yet, or a write failed: the file starts with the first
+        // line and every group listed, in one write. The run directory is
+        // created by the first tool any launch starts.
+        let first = first_line(self.own_start, boot_id().as_deref());
+        let mut text = format!("{first}\n");
+        for (pid, start) in &self.live {
+            text.push_str(&format!("{pid} {start}\n"));
+        }
+        let create = || std::fs::File::create(&self.path);
+        let created = create().or_else(|_| {
+            std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")))?;
+            create()
+        });
+        if let Ok(mut file) = created {
+            if file.write_all(text.as_bytes()).is_ok() {
+                self.len = text.len() as u64;
+                self.first_len = first.len() as u64 + 1;
+                self.file = Some(file);
+            }
+        }
+    }
+}
+
+/// Read the leader's start time here, while its pid surely names it, and
+/// leave the line to the record's thread.
+fn record(pid: u32) {
+    if let Some(recorder) = RECORDER.get() {
+        if let Some(start) = start_time(pid) {
+            let _ = recorder.send(RecordChange::Add(pid, start));
+        }
+    }
+}
+
+fn unrecord(pid: u32) {
+    change_record(RecordChange::Strike(pid));
+}
+
+/// Stop the tool groups a harness that died without its exit path left
+/// running, then arm this process's own record. Every launch that can start
+/// a turn or a tool calls it first. A record whose owner is gone (no process
+/// of this user has its pid, or the process that has it started at another
+/// time than the record says) names groups nothing else will stop: each
+/// whose leader still runs with the start time recorded for it gets SIGTERM,
+/// then SIGKILL after `TERMINATION_GRACE`, and the record is removed, with
+/// the run directory once no record is left there. A record from another
+/// boot is removed with nothing signalled, and one a running openmax owns
+/// is left alone. A process that left its tool's group, a group whose
+/// leader has exited, and the group this launch runs in are not covered.
+#[cfg(unix)]
+pub fn reap_left_behind_groups(data_dir: &Path) {
+    let run = data_dir.join("run");
+    reap(&run);
+    let pid = std::process::id();
+    let Some(start) = start_time(pid) else { return };
+    let record = GroupRecord::new(run.join(format!("{pid}.groups")), start);
+    let (recorder, changes) = std::sync::mpsc::channel();
+    if RECORDER.set(recorder).is_ok()
+        && std::thread::Builder::new().name("record".into()).spawn(move || keep_record(record, changes)).is_ok()
+    {
+        // Run by `exit`, which a return from `main` reaches too, after the
+        // runtime's shutdown has killed each group a dropped command owned.
+        unsafe { libc::atexit(close_groups_record) };
+    }
+}
+
+#[cfg(not(unix))]
+pub fn reap_left_behind_groups(_: &Path) {}
+
+/// Have the record's thread close the record, and wait for it at most
+/// `RECORD_CLOSE_WAIT`.
+#[cfg(unix)]
+extern "C" fn close_groups_record() {
+    let (closed, done) = std::sync::mpsc::channel();
+    change_record(RecordChange::Close(closed));
+    let _ = done.recv_timeout(RECORD_CLOSE_WAIT);
+}
+
+/// How long an exit waits for the record's thread to remove the record. A
+/// home whose file server stopped answering stalls the thread, and an exit
+/// stalled with it would never end, a second signal's included. Past the
+/// wait the process exits, and the record is left for the next launch to
+/// remove.
+const RECORD_CLOSE_WAIT: Duration = Duration::from_millis(100);
+
+/// At exit, remove the record once it lists no group, and the run directory
+/// once no other openmax keeps a record there, so the next launch reads
+/// nothing. A group still listed is one no exit path stopped: its record
+/// stays for the next launch.
+#[cfg(unix)]
+fn close(record: GroupRecord) {
+    if record.file.is_some() && record.live.is_empty() {
+        let _ = std::fs::remove_file(&record.path);
+        if let Some(run) = record.path.parent() {
+            let _ = std::fs::remove_dir(run);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reap(run: &Path) {
+    // Most launches find no run directory, and read no boot id.
+    if run.exists() {
+        reap_in_boot(run, boot_id().as_deref());
+    }
+}
+
+/// [`reap`], in the boot whose id is `boot`.
+#[cfg(unix)]
+fn reap_in_boot(run: &Path, boot: Option<&str>) {
+    let mut groups = Vec::new();
+    let mut stale = Vec::new();
+    for entry in std::fs::read_dir(run).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(owner) = name.to_str().and_then(|n| n.strip_suffix(".groups")).and_then(positive_pid) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mut lines = text.lines();
+        let first = lines.next();
+        if written_in(boot, first) {
+            if owner_is_running(owner, first) {
+                continue;
+            }
+            for (pid, start) in recorded_groups(lines) {
+                if start_time(pid) == Some(start) {
+                    groups.push((pid, start));
+                }
+            }
+        }
+        stale.push(path);
+    }
+    stop_groups(&groups, is_recorded_group);
+    if stale.is_empty() {
+        return;
+    }
+    for path in stale {
+        let _ = std::fs::remove_file(path);
+    }
+    // And the run directory, once no record is left in it.
+    let _ = std::fs::remove_dir(run);
+}
+
+/// The groups a record's lines leave listed: each one added and not struck
+/// by a later line.
+#[cfg(unix)]
+fn recorded_groups<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<(u32, u64)> {
+    let mut groups = Vec::new();
+    for line in lines {
+        let (struck, line) = match line.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, line),
+        };
+        let Some((pid, start)) = line.split_once(' ') else { continue };
+        let (Some(pid), Ok(start)) = (leader_pid(pid), start.parse::<u64>()) else { continue };
+        if !struck {
+            groups.push((pid, start));
+        } else if let Some(at) = groups.iter().position(|group| *group == (pid, start)) {
+            groups.swap_remove(at);
+        }
+    }
+    groups
+}
+
+/// A pid that names one process: kill takes 0 and negative values as
+/// groups.
+#[cfg(unix)]
+fn positive_pid(text: &str) -> Option<u32> {
+    text.parse::<libc::pid_t>().ok().filter(|pid| *pid > 0).map(|pid| pid as u32)
+}
+
+/// A recorded group leader: never 1, whose group signal, kill(-1), reaches
+/// every process this user may signal, never this launch itself, and never
+/// the group this launch runs in. An openmax that a left-behind tool's
+/// script starts runs in that tool's group, and a signal to it would end
+/// this launch as it starts; that group is left running.
+#[cfg(unix)]
+fn leader_pid(text: &str) -> Option<u32> {
+    let own_group = unsafe { libc::getpgrp() } as u32;
+    positive_pid(text).filter(|pid| *pid > 1 && *pid != std::process::id() && *pid != own_group)
+}
+
+/// Whether the openmax that wrote a record still runs: its pid is held by a
+/// process this user may signal, which started when the first field of the
+/// record's first line says. An openmax runs as the user that reads its
+/// record, so a pid no such process holds (ESRCH, or EPERM for another
+/// user's process) is a harness that is gone. A start time that cannot be
+/// read, or a first line not yet written, is taken as still running.
+#[cfg(unix)]
+fn owner_is_running(pid: u32, recorded_start: Option<&str>) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return false;
+    }
+    match (start_time(pid), recorded_start.and_then(|line| line.split(' ').next()?.parse::<u64>().ok())) {
+        (Some(start), Some(recorded)) => start == recorded,
+        _ => true,
+    }
+}
+
+/// SIGTERM each recorded group, then SIGKILL each still there once the
+/// grace ends. `recorded` ([`is_recorded_group`]) tells whether a group is
+/// still the one recorded, and each is dropped the first time it is not,
+/// never to be signalled again: once a group has ended, its id can name a
+/// new group, which reads as recorded when its own leader has exited.
+#[cfg(unix)]
+fn stop_groups(groups: &[(u32, u64)], mut recorded: impl FnMut(u32, u64) -> bool) {
+    let mut stopping: Vec<(u32, u64)> = groups.iter().copied().filter(|&(pid, start)| recorded(pid, start)).collect();
+    for (pid, _) in &stopping {
+        send_termination_group(Some(*pid));
+    }
+    let deadline = std::time::Instant::now() + TERMINATION_GRACE;
+    loop {
+        stopping.retain(|&(pid, start)| recorded(pid, start));
+        if stopping.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for (pid, _) in stopping {
+        send_kill_group(Some(pid));
+    }
+}
+
+/// Whether the group led by `pid` is still the one a record names, given
+/// that it has not read as gone since the record was read: it exists, and
+/// its leader runs with the recorded start time or has exited. No process
+/// gets a pid that is a live group's ID (POSIX fork: "The child process ID
+/// also shall not match any active process group ID"), so a group that has
+/// existed throughout and whose leader is gone is still the recorded one,
+/// while a leader pid that reads another start time is a process that took
+/// the pid after the recorded group ended, and may lead a group of its own.
+#[cfg(unix)]
+fn is_recorded_group(pid: u32, start: u64) -> bool {
+    process_group_exists(Some(pid)) && start_time(pid).is_none_or(|now| now == start)
+}
+
+/// A record's first line: the owner's start time, then the boot's id where
+/// the system gives one.
+fn first_line(own_start: u64, boot: Option<&str>) -> String {
+    match boot {
+        Some(boot) => format!("{own_start} {boot}"),
+        None => own_start.to_string(),
+    }
+}
+
+/// Whether a record's first line was written in the boot whose id is
+/// `boot`. Linux start times count clock ticks from boot, so after a restart
+/// a pid and start a record names can belong to a new process: a record
+/// from another boot names processes that are all gone, and none of its
+/// groups may be signalled. A first line or a system with no boot id is
+/// taken as this boot's.
+#[cfg(unix)]
+fn written_in(boot: Option<&str>, first_line: Option<&str>) -> bool {
+    match (boot, first_line.and_then(|line| line.split_once(' '))) {
+        (Some(boot), Some((_, recorded))) => recorded == boot,
+        _ => true,
+    }
+}
+
+/// This boot's id: "a UUID generated the first time this is retrieved, and
+/// unvarying after that" (the kernel's sysctl documentation for
+/// `/proc/sys/kernel/random/boot_id`), and a new one each boot.
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty() && !id.contains(' ')).then(|| id.to_owned())
+}
+
+/// Elsewhere none is needed: macOS start times count from the epoch, so a
+/// pid and start a record names never meet a process of a later boot.
+#[cfg(not(target_os = "linux"))]
+fn boot_id() -> Option<String> {
+    None
+}
+
+/// When the process `pid` started, in microseconds since the epoch: the
+/// `pbi_start_tvsec` and `pbi_start_tvusec` of `proc_pidinfo`'s
+/// PROC_PIDTBSDINFO. Fixed for the life of a process, so a pid that now
+/// names another process reads another value.
+#[cfg(target_os = "macos")]
+fn start_time(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+    };
+    (read == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+/// When the process `pid` started, in clock ticks after boot: field 22 of
+/// `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn start_time(pid: u32) -> Option<u64> {
+    stat_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn start_time(_: u32) -> Option<u64> {
+    None
+}
+
+/// Field 22, starttime, of a `/proc/<pid>/stat` line. Fields are counted
+/// after the command name's closing parenthesis, since the name itself can
+/// hold spaces and parentheses: the first field after it is field 3.
+#[cfg(any(target_os = "linux", test))]
+fn stat_start_time(stat: &str) -> Option<u64> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(22 - 3)?.parse().ok()
 }
 
 #[cfg(all(test, unix))]
@@ -1579,6 +2003,602 @@ mod tests {
         assert_eq!(live, [11, 33]);
         forget(&mut live, 44);
         assert_eq!(live, [11, 33], "forgetting an unlisted group changed the list");
+    }
+
+    /// The start time is field 22 of /proc/<pid>/stat, counted after the
+    /// command name, which can itself hold spaces and parentheses.
+    #[test]
+    fn the_linux_start_time_is_field_22_counted_after_the_command_name() {
+        let stat = "4242 (a) b (c) S 1 4242 4242 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 98765 1000 7";
+        assert_eq!(stat_start_time(stat), Some(98765));
+        assert_eq!(stat_start_time("4242 (cut"), None);
+    }
+
+    /// The boot's id is what tells a record from an earlier boot apart: it
+    /// reads, holds no space (the first line splits on one), and stays the
+    /// same within a boot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_boot_id_reads_and_holds_for_the_boot() {
+        let id = boot_id().expect("Linux gives every boot an id");
+        assert_eq!(boot_id().as_deref(), Some(id.as_str()), "the boot id changed within a boot");
+        assert!(!id.is_empty() && !id.contains(' '), "{id:?}");
+        assert_eq!(first_line(5, Some(&id)), format!("5 {id}"));
+    }
+
+    /// A process in a group of its own, standing in for a tool a killed
+    /// harness left running, with its start time as a record names it.
+    #[cfg(unix)]
+    fn left_behind_group() -> (std::process::Child, u64) {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sleep").arg("300").process_group(0).spawn().unwrap();
+        let start = start_time(child.id()).expect("a running child has a start time");
+        (child, start)
+    }
+
+    /// The same, running `setup` under perl first, and returned only once it
+    /// has, so a signal handler it installs is in place.
+    #[cfg(unix)]
+    fn left_behind_perl(setup: &str) -> (std::process::Child, u64) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("perl")
+            .args(["-e", &format!("$| = 1; {setup}; print qq(ready\\n); sleep 300")])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        let start = start_time(child.id()).expect("a running child has a start time");
+        (child, start)
+    }
+
+    /// A pid no process holds, the owner of a record whose harness is gone.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        child.wait().unwrap();
+        child.id()
+    }
+
+    #[cfg(unix)]
+    fn run_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("omx-reap-{tag}-{}", uuid::Uuid::new_v4())).join("run");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn stopped_within(child: &mut std::process::Child, wait: Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// A record whose owner is gone names groups nothing else will stop:
+    /// each whose leader still runs with the recorded start time is stopped,
+    /// and the record is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_harness_record_stops_its_groups_and_is_removed() {
+        let (mut group, start) = left_behind_group();
+        let run = run_dir("dead-owner");
+        let record = run.join(format!("{}.groups", dead_pid()));
+        std::fs::write(&record, format!("1\n{} {start}\n", group.id())).unwrap();
+        reap(&run);
+        let stopped = stopped_within(&mut group, Duration::from_millis(500));
+        let _ = group.kill();
+        let (record_kept, run_kept) = (record.exists(), run.exists());
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(stopped, "the left-behind group is still running");
+        assert!(!record_kept, "the record outlived the reap");
+        assert!(!run_kept, "the run directory the reap emptied outlived it");
+    }
+
+    /// A dead harness's pid can since be held by another user's process,
+    /// which this user may not signal, as with pid 1. No openmax this user
+    /// runs has that pid, so the record is reaped like any other a dead
+    /// harness left, even when its first line is that process's start time.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_whose_owner_pid_another_user_holds_is_reaped() {
+        let (mut group, start) = left_behind_group();
+        let run = run_dir("other-user");
+        let record = run.join("1.groups");
+        // pid 1's own start time, so only the refused signal tells that no
+        // openmax of this user holds it. Where this user may signal pid 1
+        // (as root, or in a container whose init it runs), name another.
+        let owner_start = match start_time(1) {
+            Some(start) if unsafe { libc::kill(1, 0) } == 0 => start + 1,
+            Some(start) => start,
+            None => 0,
+        };
+        std::fs::write(&record, format!("{owner_start}\n{} {start}\n", group.id())).unwrap();
+        reap(&run);
+        let stopped = stopped_within(&mut group, Duration::from_millis(500));
+        let _ = group.kill();
+        let kept = record.exists();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(stopped, "a record whose owner pid another user holds kept its group running");
+        assert!(!kept, "a record whose owner pid another user holds was kept");
+    }
+
+    /// A group that outlives SIGTERM gets SIGKILL once the grace ends, while
+    /// one that ends on SIGTERM is given the grace to: it is not killed
+    /// outright.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_outlives_sigterm_is_killed_once_the_grace_ends() {
+        use std::os::unix::process::ExitStatusExt;
+        let (mut stubborn, stubborn_start) = left_behind_perl(r#"$SIG{TERM} = "IGNORE""#);
+        let (mut graceful, graceful_start) = left_behind_perl("$SIG{TERM} = sub { exit 7 }");
+        let run = run_dir("grace");
+        let record = run.join(format!("{}.groups", dead_pid()));
+        let lines = format!("1\n{} {stubborn_start}\n{} {graceful_start}\n", stubborn.id(), graceful.id());
+        std::fs::write(&record, lines).unwrap();
+        reap(&run);
+        let stubborn_stopped = stopped_within(&mut stubborn, Duration::from_millis(500));
+        let graceful_stopped = stopped_within(&mut graceful, Duration::from_millis(500));
+        let _ = stubborn.kill();
+        let _ = graceful.kill();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(stubborn_stopped, "a group that ignores SIGTERM outlived the reap");
+        assert_eq!(stubborn.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(graceful_stopped, "a group that ends on SIGTERM outlived the reap");
+        let graceful = graceful.wait().unwrap();
+        assert_eq!(graceful.code(), Some(7), "a group that ends on SIGTERM was not given the grace: {graceful:?}");
+    }
+
+    /// The grace is waited out only for a group still running: once every
+    /// signalled group is gone the reap returns, so a launch that stops a
+    /// left-behind tool which ends on SIGTERM does not start 250 ms late.
+    /// A thread reaps the process the moment it exits, as init does for a
+    /// tool whose harness died, since a zombie still counts as its group.
+    #[cfg(unix)]
+    #[test]
+    fn a_reap_whose_groups_end_on_sigterm_does_not_wait_out_the_grace() {
+        let (mut graceful, start) = left_behind_perl("$SIG{TERM} = sub { exit 7 }");
+        let pid = graceful.id();
+        let reaped = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if let Some(status) = graceful.try_wait().unwrap() {
+                    return Some(status);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = graceful.kill();
+            let _ = graceful.wait();
+            None
+        });
+        let run = run_dir("prompt");
+        std::fs::write(run.join(format!("{}.groups", dead_pid())), format!("1\n{pid} {start}\n")).unwrap();
+        let began = std::time::Instant::now();
+        reap(&run);
+        let took = began.elapsed();
+        let status = reaped.join().unwrap();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert_eq!(status.and_then(|status| status.code()), Some(7), "the group did not end on the reap's SIGTERM");
+        assert!(took < TERMINATION_GRACE, "a reap whose group ended on SIGTERM took {took:?}, the whole grace");
+    }
+
+    /// Each signal of a stop goes only to a group still the one recorded. A
+    /// leader pid that reads another start time is a process that took the
+    /// pid once the recorded group ended, as can happen within the grace: it
+    /// is never signalled. A leader that ends on SIGTERM while a member of
+    /// its group ignores it leaves the group the recorded one, since no
+    /// process gets a pid a live group bears, so the member is killed once
+    /// the grace ends. A thread reaps the leader as init would.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_signals_only_a_group_still_the_one_recorded() {
+        use std::io::BufRead;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let (mut earlier, earlier_start) = left_behind_group();
+        std::thread::sleep(Duration::from_millis(20));
+        let (mut bystander, _) = left_behind_group();
+        let (mut leader, leader_start) = left_behind_perl("$SIG{TERM} = sub { exit 0 }");
+        let leader_pid = leader.id();
+        let mut member = std::process::Command::new("perl")
+            .args(["-e", r#"$| = 1; $SIG{TERM} = "IGNORE"; print qq(ready\n); sleep 300"#])
+            .stdout(std::process::Stdio::piped())
+            .process_group(leader_pid as libc::pid_t)
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(member.stdout.as_mut().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        let reaped = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if let Some(status) = leader.try_wait().unwrap() {
+                    return Some(status);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = leader.kill();
+            let _ = leader.wait();
+            None
+        });
+        stop_groups(&[(bystander.id(), earlier_start), (leader_pid, leader_start)], is_recorded_group);
+        let member_stopped = stopped_within(&mut member, Duration::from_millis(500));
+        let bystander_alive = !stopped_within(&mut bystander, Duration::from_millis(50));
+        let _ = member.kill();
+        let _ = bystander.kill();
+        let _ = earlier.kill();
+        let leader_status = reaped.join().unwrap();
+        assert!(bystander_alive, "a process that took a recorded leader's pid was signalled");
+        assert_eq!(leader_status.and_then(|status| status.code()), Some(0), "the leader did not end on SIGTERM");
+        assert!(member_stopped, "a group whose leader ended on SIGTERM kept a member running");
+        assert_eq!(member.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    /// Once a group has ended, its id can name a new group that reads as the
+    /// one recorded: a process that took the leader's pid led a group of its
+    /// own and has exited, leaving members. So a stop drops each group the
+    /// first time it reads as gone, and never signals it again. The group
+    /// stood in for here reads as recorded at the SIGTERM, which it ignores,
+    /// as gone at the first look within the grace, and as recorded after;
+    /// another that ignores SIGTERM holds the grace open to its end.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_read_as_gone_is_never_signalled_again() {
+        let (mut taken, _) = left_behind_perl(r#"$SIG{TERM} = "IGNORE""#);
+        let (mut stubborn, stubborn_start) = left_behind_perl(r#"$SIG{TERM} = "IGNORE""#);
+        let taken_pid = taken.id();
+        let mut looks = 0;
+        stop_groups(&[(taken_pid, 0), (stubborn.id(), stubborn_start)], |pid, start| {
+            if pid != taken_pid {
+                return is_recorded_group(pid, start);
+            }
+            looks += 1;
+            looks != 2
+        });
+        let stubborn_stopped = stopped_within(&mut stubborn, Duration::from_millis(500));
+        let taken_alive = !stopped_within(&mut taken, Duration::from_millis(50));
+        let _ = taken.kill();
+        let _ = stubborn.kill();
+        assert!(stubborn_stopped, "a group that ignores SIGTERM outlived the stop");
+        assert!(taken_alive, "a group id that read as gone within the grace was signalled once it read as recorded");
+    }
+
+    /// A record write can stall, as on a home whose file server stopped
+    /// answering. One thread makes every write to the record, so a tool's
+    /// spawn and settle, and the exit's kill and its close of the record,
+    /// never wait on one, and the exit waits at most `RECORD_CLOSE_WAIT` for
+    /// that thread. A FIFO no process reads stands at the record's path, so
+    /// the thread's first write, the file's creation, blocks for good. The
+    /// kill marks the process as exiting, and the probe exits, so it runs in
+    /// a child, which exits with 42 once a tool round and its exit are
+    /// through.
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_record_write_holds_neither_a_tool_nor_the_exit() {
+        use std::os::unix::ffi::OsStrExt;
+        const CHILD: &str = "OPENMAX_TEST_STALLED_RECORD";
+        if let Some(data) = std::env::var_os(CHILD) {
+            let data = PathBuf::from(data);
+            reap_left_behind_groups(&data);
+            let run = data.join("run");
+            std::fs::create_dir_all(&run).unwrap();
+            let path = run.join(format!("{}.groups", std::process::id()));
+            let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "{}", io::Error::last_os_error());
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let round = runtime.block_on(run_process(request("/bin/echo", &[]), Arc::new(CancelToken::default())));
+            assert!(round.is_ok(), "the tool round failed");
+            kill_process_groups();
+            std::process::exit(42);
+        }
+        let data = std::env::temp_dir().join(format!("omx-stalled-{}", uuid::Uuid::new_v4()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "execution::tests::a_stalled_record_write_holds_neither_a_tool_nor_the_exit"])
+            .env(CHILD, &data)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let exited = stopped_within(&mut child, Duration::from_secs(10));
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr);
+        let _ = std::fs::remove_dir_all(&data);
+        assert!(exited, "a tool round or the exit waited on a stalled record write\n{stderr}");
+        assert_eq!(status.code(), Some(42), "{status:?}\n{stderr}");
+    }
+
+    /// A leader pid that now names a process started at another time is
+    /// someone else's: it is not signalled, though its stale record goes.
+    /// The record names the bystander's pid with the start time of another
+    /// process that really ran, as a group whose leader exited and whose pid
+    /// was taken would, so only start times that tell two processes apart
+    /// keep it running. Linux counts them in clock ticks, 10 ms each, so the
+    /// bystander starts a tick after the other.
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_leader_pid_is_not_signalled() {
+        let (mut earlier, earlier_start) = left_behind_group();
+        std::thread::sleep(Duration::from_millis(20));
+        let (mut bystander, bystander_start) = left_behind_group();
+        let run = run_dir("reused-pid");
+        let record = run.join(format!("{}.groups", dead_pid()));
+        std::fs::write(&record, format!("1\n{} {earlier_start}\n", bystander.id())).unwrap();
+        reap(&run);
+        // A signalled process can still be exiting once its group reads as
+        // gone: give it the time to.
+        let alive = !stopped_within(&mut bystander, Duration::from_millis(50));
+        let _ = bystander.kill();
+        let _ = earlier.kill();
+        let record_kept = record.exists();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(alive, "a process the record does not name was killed");
+        assert!(!record_kept, "the stale record outlived the reap");
+        assert_ne!(earlier_start, bystander_start, "two processes started apart read one start time");
+    }
+
+    /// Linux start times count clock ticks from boot, so once the machine has
+    /// restarted, a pid and start a record names can belong to a new process.
+    /// A record whose first line names another boot is removed with nothing
+    /// signalled; the same record from this boot is reaped.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_from_another_boot_is_removed_without_signalling() {
+        let (mut group, start) = left_behind_group();
+        let run = run_dir("boot");
+        let record = run.join(format!("{}.groups", dead_pid()));
+        std::fs::write(&record, format!("1 an-earlier-boot\n{} {start}\n", group.id())).unwrap();
+        reap_in_boot(&run, Some("this-boot"));
+        let alive = !stopped_within(&mut group, Duration::from_millis(50));
+        let earlier_kept = record.exists();
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(&record, format!("1 this-boot\n{} {start}\n", group.id())).unwrap();
+        reap_in_boot(&run, Some("this-boot"));
+        let stopped = stopped_within(&mut group, Duration::from_millis(500));
+        let _ = group.kill();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(alive, "a record from another boot had its group signalled");
+        assert!(!earlier_kept, "a record from another boot outlived the reap");
+        assert!(stopped, "a record from this boot kept its group running");
+    }
+
+    /// The pid-reuse guard rests on a start time being when the process
+    /// started. On macOS that is microseconds since the epoch, read here
+    /// against the wall clock around the spawn; on Linux, clock ticks after
+    /// boot, read against `/proc/uptime`. A constant, or a value in other
+    /// units, falls outside the window and would let a process that took a
+    /// recorded pid pass as the one recorded.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_start_time_is_when_the_process_started() {
+        #[cfg(target_os = "macos")]
+        let (clock, slack) = (
+            || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64,
+            1_000,
+        );
+        #[cfg(target_os = "linux")]
+        let (clock, slack) = (
+            || {
+                let uptime = std::fs::read_to_string("/proc/uptime").unwrap();
+                let seconds: f64 = uptime.split_whitespace().next().unwrap().parse().unwrap();
+                (seconds * unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64) as u64
+            },
+            2,
+        );
+        let before = clock();
+        let (mut child, start) = left_behind_group();
+        let after = clock();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            before - slack <= start && start <= after + slack,
+            "a process started between {before} and {after} read {start}"
+        );
+    }
+
+    /// kill(-1) signals every process this user may signal, and a group
+    /// signal to this launch's pid, or to the group it runs in, would reach
+    /// this launch: no record line can name any of them, or 0, as a leader.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_never_names_pid_1_0_this_launch_or_its_group_as_a_leader() {
+        let own = std::process::id().to_string();
+        let own_group = unsafe { libc::getpgrp() }.to_string();
+        for text in ["1", "0", "-1", "-42", own.as_str(), own_group.as_str(), "x"] {
+            assert_eq!(leader_pid(text), None, "{text} was taken as a group leader");
+        }
+        assert_eq!(leader_pid("42"), Some(42));
+        assert_eq!(positive_pid("0"), None, "0, which kill takes as a group, was taken as one process");
+    }
+
+    /// A record whose owner pid runs and started when the record says is a
+    /// live openmax's: left alone, groups and file, as is one whose first
+    /// line is not written yet. The same pid with another start time is a
+    /// process that took a dead harness's pid.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_owner_keeps_its_record_and_a_reused_owner_pid_does_not() {
+        let own = (std::process::id(), start_time(std::process::id()).unwrap());
+        let (mut group, start) = left_behind_group();
+        let run = run_dir("live-owner");
+        let mut record = GroupRecord::new(run.join("sub").join(format!("{}.groups", own.0)), own.1);
+        record.add(group.id(), start);
+        let text = std::fs::read_to_string(&record.path).unwrap();
+        assert_eq!(text, format!("{}\n{} {start}\n", first_line(own.1, boot_id().as_deref()), group.id()));
+        reap(record.path.parent().unwrap());
+        assert!(!stopped_within(&mut group, Duration::from_millis(50)), "a live owner's group was stopped");
+        assert!(record.path.exists(), "a live owner's record was removed");
+        let creating = run.join("new").join(format!("{}.groups", own.0));
+        std::fs::create_dir_all(creating.parent().unwrap()).unwrap();
+        std::fs::write(&creating, "").unwrap();
+        reap(creating.parent().unwrap());
+        assert!(creating.exists(), "a record its owner may still be writing was removed");
+
+        let reused = run.join(format!("{}.groups", own.0));
+        std::fs::write(&reused, format!("{}\n{} {start}\n", own.1 + 1, group.id())).unwrap();
+        reap(&run);
+        let stopped = stopped_within(&mut group, Duration::from_millis(500));
+        let _ = group.kill();
+        assert!(stopped, "a record whose owner pid was reused kept its group running");
+        assert!(!reused.exists(), "the reused owner's record outlived the reap");
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+    }
+
+    /// The record lists a group from its spawn until it settles. It grows by
+    /// a line per change, so a small record is never cut. Past its bound,
+    /// the strike that leaves no group listed cuts it back to its first line,
+    /// kept whole, and lines written after the cut still read. While a group
+    /// is listed it is never cut, and a struck group is never signalled, even
+    /// while its leader's pid still names the process it was.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_strikes_settled_groups_and_is_cut_back_once_none_is_listed() {
+        let (mut running, running_start) = left_behind_group();
+        let (mut settled, settled_start) = left_behind_group();
+        let run = run_dir("strike");
+        let path = run.join(format!("{}.groups", dead_pid()));
+        let mut record = GroupRecord::new(path.clone(), 1);
+        let round = "42 7\n-42 7\n".len() as u64;
+        let rounds = |record: &mut GroupRecord| {
+            for _ in 0..=RECORD_CUT_BYTES / round {
+                record.add(42, 7);
+                record.strike(42);
+            }
+        };
+        for _ in 0..10 {
+            record.add(42, 7);
+            record.strike(42);
+        }
+        let small = std::fs::metadata(&path).unwrap().len();
+        let first = first_line(1, boot_id().as_deref()).len() as u64 + 1;
+        assert_eq!(small, first + 10 * round, "a small record was cut");
+        rounds(&mut record);
+        let cut = std::fs::metadata(&path).unwrap().len();
+        assert!(cut < RECORD_CUT_BYTES, "a record past its bound with no group listed was not cut: {cut} bytes");
+        let kept = std::fs::read_to_string(&path).unwrap();
+        let owner = first_line(1, boot_id().as_deref());
+        assert_eq!(kept.lines().next(), Some(owner.as_str()), "a cut did not keep the first line whole");
+        record.add(running.id(), running_start);
+        rounds(&mut record);
+        record.add(settled.id(), settled_start);
+        record.strike(settled.id());
+        reap(&run);
+        let running_stopped = stopped_within(&mut running, Duration::from_millis(500));
+        let settled_alive = !stopped_within(&mut settled, Duration::from_millis(50));
+        let _ = running.kill();
+        let _ = settled.kill();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(running_stopped, "a group listed past a cut outlived the reap of its dead owner's record");
+        assert!(settled_alive, "a group struck from the record was signalled");
+    }
+
+    /// A write that fails, as on a full disk, can leave part of a line, and
+    /// the next line would run into it and hide both. The next change
+    /// rewrites the file whole instead, and later lines append to that.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_is_repaired_by_rewriting_the_record() {
+        use std::io::Write;
+        let run = run_dir("rewrite");
+        let path = run.join("1.groups");
+        let mut record = GroupRecord::new(path.clone(), 1);
+        record.add(42, 7);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"4").unwrap();
+        // A handle every write fails on.
+        record.file = Some(std::fs::File::open(&path).unwrap());
+        record.add(43, 8);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        record.strike(42);
+        let appended = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        let first = first_line(1, boot_id().as_deref());
+        assert_eq!(rewritten, format!("{first}\n42 7\n43 8\n"), "a failed write left the record unreadable");
+        assert_eq!(appended, format!("{first}\n42 7\n43 8\n-42 7\n"), "lines after the rewrite");
+        assert_eq!(recorded_groups(appended.lines().skip(1)), [(43, 8)]);
+    }
+
+    /// At exit a record that lists no group is removed, and the run
+    /// directory with the last record in it. One that still lists a group
+    /// names a tool no exit path stopped, so it stays for the next launch.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_removes_the_record_only_once_it_lists_no_group() {
+        let run = run_dir("close");
+        let listed = run.join("11.groups");
+        let mut record = GroupRecord::new(listed.clone(), 1);
+        record.add(42, 7);
+        close(record);
+        let listed_kept = listed.exists();
+        let settled = |name: &str| {
+            let mut record = GroupRecord::new(run.join(name), 1);
+            record.add(42, 7);
+            record.strike(42);
+            close(record);
+            run.join(name).exists()
+        };
+        let beside_kept = settled("12.groups");
+        let run_kept_beside = run.exists();
+        let _ = std::fs::remove_file(&listed);
+        let last_kept = settled("13.groups");
+        let run_kept = run.exists();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(listed_kept, "an exit removed a record that still lists a group");
+        assert!(!beside_kept, "an exit kept a record that lists no group");
+        assert!(run_kept_beside, "an exit removed the run directory with another record in it");
+        assert!(!last_kept, "an exit kept the last record");
+        assert!(!run_kept, "an exit kept the run directory its last record left empty");
+    }
+
+    /// Recording a tool group is harness time in every tool round: reading
+    /// the leader's start time and sending its line to the record's thread
+    /// at spawn, sending its strike at settle; the thread writes them
+    /// meanwhile. The gate is a tenth of the 0.25 ms a whole tool round may
+    /// cost. Method: the median of 101 rounds after 20 warmup rounds, on a
+    /// record in the temp directory, which the thread then closes, every
+    /// change written; a release build asserts the gate, and a debug build
+    /// prints the median and checks only 20 times the gate.
+    #[cfg(unix)]
+    #[test]
+    fn recording_a_tool_group_costs_under_a_tenth_of_a_tool_round() {
+        let (mut group, _) = left_behind_group();
+        let run = run_dir("cost");
+        let path = run.join("1.groups");
+        let (recorder, changes) = std::sync::mpsc::channel();
+        let record = GroupRecord::new(path.clone(), 1);
+        let keeper = std::thread::spawn(move || keep_record(record, changes));
+        let pid = group.id();
+        let round = || {
+            let began = std::time::Instant::now();
+            let start = start_time(pid).unwrap();
+            recorder.send(RecordChange::Add(pid, start)).unwrap();
+            recorder.send(RecordChange::Strike(pid)).unwrap();
+            began.elapsed()
+        };
+        for _ in 0..20 {
+            round();
+        }
+        let mut rounds: Vec<Duration> = (0..101).map(|_| round()).collect();
+        rounds.sort();
+        let median = rounds[rounds.len() / 2];
+        let (closed, done) = std::sync::mpsc::channel();
+        recorder.send(RecordChange::Close(closed)).unwrap();
+        done.recv().unwrap();
+        keeper.join().unwrap();
+        let kept = path.exists();
+        let _ = group.kill();
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
+        assert!(!kept, "the record's thread did not keep up with every change and remove the record");
+        let gate = Duration::from_micros(25);
+        eprintln!("recording a tool group: median {median:?} over {} rounds, gate {gate:?}", rounds.len());
+        let bound = if cfg!(debug_assertions) { gate * 20 } else { gate };
+        assert!(median < bound, "recording a tool group took {median:?} a round, over {bound:?}");
     }
 
     /// The human attestation never reaches an agent-spawned child, even when

@@ -1103,4 +1103,75 @@ mod first_frame {
         let status = s.wait_exit(Duration::from_secs(10));
         assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
     }
+
+    /// The session at a terminal starts behind its first frame, apart from
+    /// every other run, and records its tool groups as they do: a session
+    /// killed outright leaves its tool's tree running and recorded, and the
+    /// next session at a terminal stops it once its first frame is up and
+    /// removes the record, before it checks its settings flags against
+    /// settings.json, asks for trust or writes settings: here a session
+    /// whose flag settings.json refuses (exit 2) still stops it. The tree
+    /// ignores SIGTERM, so only the SIGKILL after the grace stops it.
+    #[test]
+    fn a_session_at_a_terminal_stops_the_tools_a_killed_session_left_running() {
+        let script = "trap '' TERM; echo $$ >> ../pids; sleep 6841 & echo $! >> ../pids; exec sleep 7841";
+        let call = serde_json::json!({"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": null, "tool_calls": [{"id": "call-1", "type": "function", "function": {
+                "name": "bash",
+                "arguments": serde_json::json!({"command": script}).to_string(),
+            }}],
+        }}]});
+        let base_url = endpoint(vec![call.to_string()]);
+        let settings =
+            serde_json::json!({"base_url": base_url, "model": "stub-model", "context_tokens": 16384}).to_string();
+        let mut killed = Session::spawn_with("reap-killed", 120, 30, &settings);
+        killed
+            .wait_for(FRAME_END, 0, Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("no first frame: {}", killed.context()));
+        killed.write(ANSWER);
+        killed.write(b"start the tree\r");
+        let home = killed.dir.join("home");
+        let record = home.join(".openmax").join("run").join(format!("{}.groups", killed.child.id()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pids = loop {
+            let listed = std::fs::read_to_string(killed.dir.join("pids")).unwrap_or_default();
+            let pids: Vec<i32> = listed.lines().filter_map(|l| l.trim().parse().ok()).collect();
+            let lines = std::fs::read_to_string(&record).unwrap_or_default().lines().count();
+            if (pids.len() == 2 && lines >= 2) || Instant::now() >= deadline {
+                break pids;
+            }
+            killed.pump(Duration::from_millis(20));
+        };
+        let _ = killed.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while killed.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            killed.pump(Duration::from_millis(20));
+        }
+        let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+        let survived_the_kill = pids.len() == 2 && pids.iter().all(alive);
+        let recorded = record.exists();
+        // An --api-key beside the provider settings.json selects is refused
+        // before the trust grant.
+        std::fs::write(home.join(".openmax").join("settings.json"), r#"{"provider":"p","model":"m"}"#).unwrap();
+        let mut next = Session::spawn_home("reap-next", 120, 30, |_, cmd, _, _| {
+            cmd.env("HOME", &home).args(["--trust-project", "--api-key", "sk-k"]);
+        });
+        next.wait_for(FRAME_END, 0, Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("no first frame: {}", next.context()));
+        let status = next.wait_exit(Duration::from_secs(10));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(alive) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let survivors: Vec<i32> = pids.iter().copied().filter(alive).collect();
+        for pid in &survivors {
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        let record_kept = record.exists();
+        assert!(survived_the_kill, "the tool tree did not outlive SIGKILL, so this proves nothing: {pids:?}");
+        assert!(recorded, "the killed session left no record of its tool groups at {}", record.display());
+        assert_eq!(status.and_then(|e| e.code()), Some(2), "the flag was not refused: {}", next.context());
+        assert!(survivors.is_empty(), "the next session left the tool tree running: {survivors:?}");
+        assert!(!record_kept, "the record outlived the session that stopped its groups");
+    }
 }
