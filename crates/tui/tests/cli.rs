@@ -1546,7 +1546,9 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
 /// chain three times, count retries to a budget of 8 that a refused address
 /// never reaches, and repeat the failure as "stopped (error)".
 ///
-/// Each run waits out the real backoff, so the three runs go at once.
+/// Each run waits out its backoff, a millisecond per second in a debug
+/// build (`OPENMAX_TEST_BACKOFF_UNIT_MS`) and the real one in a release
+/// build, so the three runs go at once.
 #[test]
 fn refused_connection_names_the_host_and_the_cause() {
     let (project, home) = fresh_dirs("refused");
@@ -1557,7 +1559,7 @@ fn refused_connection_names_the_host_and_the_cause() {
         for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
             command.env_remove(var);
         }
-        command.envs(env.iter().copied());
+        command.env("OPENMAX_TEST_BACKOFF_UNIT_MS", "1").envs(env.iter().copied());
         command.args(["--trust-project", "-p", "say hi"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
     };
     let finish = |child: std::process::Child| {
@@ -1568,6 +1570,7 @@ fn refused_connection_names_the_host_and_the_cause() {
     // Through a proxy that refuses, the refusal is the proxy's; a proxy
     // that NO_PROXY exempts the endpoint from never sees the request.
     let proxy = format!("http://{}", TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    let started = std::time::Instant::now();
     let direct = start(&[]);
     let proxied = start(&[("HTTP_PROXY", &proxy)]);
     let exempted = start(&[("HTTP_PROXY", &proxy), ("NO_PROXY", "127.0.0.1")]);
@@ -1594,6 +1597,16 @@ fn refused_connection_names_the_host_and_the_cause() {
     // The common setup for a local server behind a proxy.
     let stderr = finish(exempted);
     assert_eq!(failure(&stderr), expected, "stderr: {stderr}");
+    // In a debug build all three ended before the real backoff could have
+    // passed: a second, the backoff's unit, before the first retry the run
+    // announced, doubling before each retry after it.
+    let retries = failure(&stderr).iter().filter(|line| line.contains("; retrying (")).count() as u32;
+    let backoff = std::time::Duration::from_secs(1) * ((1 << retries) - 1);
+    let waited = started.elapsed();
+    assert!(
+        !cfg!(debug_assertions) || waited < backoff,
+        "the runs took {waited:?}: a debug build waited the real backoff of {backoff:?} out"
+    );
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
@@ -3867,18 +3880,71 @@ enum IndexHeld {
     AfterASavedTurn,
 }
 
+/// Whether process `pid` has the file at `path` open, matched by device and
+/// inode: through proc_pidinfo's descriptor list on macOS and /proc/<pid>/fd
+/// elsewhere. A run opens a lock file just before it waits on it, so a test
+/// holding the lock knows the run is waiting once this holds.
+fn holds_open(pid: libc::pid_t, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(file) = std::fs::metadata(path) else { return false };
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return false };
+        fds.flatten().any(|fd| std::fs::metadata(fd.path()).is_ok_and(|m| (m.dev(), m.ino()) == (file.dev(), file.ino())))
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        /// <sys/proc_info.h>'s `vnode_fdinfowithpath`, which libc does not
+        /// declare: a 24-byte `proc_fileinfo`, then the vnode and its path.
+        #[repr(C)]
+        struct VnodeFdInfoWithPath {
+            _file: [u64; 3],
+            vnode: libc::vnode_info_path,
+        }
+        const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        let mut fds = vec![libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; 256];
+        // SAFETY: the buffer holds `fds.len()` entries, and its size in bytes is passed.
+        let listed = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), (fds.len() * entry) as libc::c_int)
+        };
+        fds.truncate(usize::try_from(listed).unwrap_or(0) / entry);
+        fds.iter().filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32).any(|fd| {
+            let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+            let size = std::mem::size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+            // SAFETY: `info` is a zeroed buffer of the size passed, and every
+            // byte pattern is a valid value of its plain integer fields.
+            let stat = unsafe {
+                if libc::proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, info.as_mut_ptr().cast(), size) != size {
+                    return false;
+                }
+                info.assume_init().vnode.vip_vi.vi_stat
+            };
+            // A 32-bit dev_t, which `dev()` widens with its sign.
+            (stat.vst_dev, stat.vst_ino) == (file.dev() as u32, file.ino())
+        })
+    }
+}
+
 /// A signal must end a print or stdio run within the stop's deadline
 /// wherever the run, or its cancelled turn, is waiting on the session index
 /// lock or the trust store's. Each of these waits could hold the first
 /// signal unanswered for as long as the other process kept the lock, so that
 /// only a second signal ended the run. The run must exit
-/// 143 within the deadline, plus half of it for the exit itself, and say so
-/// when the empty session it created stays indexed, and only then.
+/// 143 within the deadline, plus half of the production deadline for the
+/// exit itself, and say so when the empty session it created stays
+/// indexed, and only then.
 fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     // The binary's STOP_SETTLE: a cancelled command's settle, then a second
-    // for the rest of the turn.
-    let bound = open_max_core::execution::CANCEL_SETTLE + std::time::Duration::from_secs(1);
-    let margin = bound / 2;
+    // for the rest of the turn. A run whose lock stays held waits the
+    // deadline out on a timer thread of its own, which a debug build gives a
+    // second (OPENMAX_TEST_STOP_SETTLE_MS) instead. A run whose lock is freed
+    // after the signal must open its session or cancel its turn, then end,
+    // inside the deadline, so it keeps the binary's.
+    let production = open_max_core::execution::CANCEL_SETTLE + std::time::Duration::from_secs(1);
+    let freed = matches!(held, IndexHeld::FreedAfterTheSignal | IndexHeld::OpenFreedAfterTheSignal);
+    let bound = if cfg!(debug_assertions) && !freed { std::time::Duration::from_secs(1) } else { production };
+    let margin = production / 2;
     let (project, home) = fresh_dirs(tag);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     write_settings(&home, &format!("http://{}/v1", listener.local_addr().unwrap()));
@@ -3911,7 +3977,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
         sessions.join("index.lock")
     };
     let mut held_lock = Some(
-        std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(lock_path).unwrap(),
+        std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).unwrap(),
     );
     let take_lock = |lock: &Option<std::fs::File>| {
         lock.as_ref().unwrap().try_lock().expect("nothing else holds the lock yet")
@@ -3920,9 +3986,12 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
         take_lock(&held_lock);
     }
     let stdio = args.contains(&"--stdio");
-    let mut child = cmd(&project, &home)
-        .arg("--trust-project")
-        .args(args)
+    let mut command = cmd(&project, &home);
+    command.arg("--trust-project").args(args);
+    if !freed {
+        command.env("OPENMAX_TEST_STOP_SETTLE_MS", bound.as_millis().to_string());
+    }
+    let mut child = command
         .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3955,15 +4024,23 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
         let said: Vec<String> = std::iter::from_fn(|| lines.recv_timeout(wait).ok()).collect();
         panic!("{tag}: {what}\n{}", said.join("\n"));
     };
+    // The run opens the lock file just before it waits on the lock, with its
+    // signal handlers in place since before its session setup.
+    let wait_on_the_lock = |child: &mut std::process::Child| {
+        let deadline = std::time::Instant::now() + wait;
+        while !holds_open(child.id() as libc::pid_t, &lock_path) {
+            if std::time::Instant::now() >= deadline {
+                fail(child, "the run never opened the lock to wait on it");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
     match held {
         IndexHeld::FromLaunch | IndexHeld::OpenFreedAfterTheSignal => {
-            // The trust line comes just before the signal watcher starts, and
-            // the setup waits on the lock just after it: opening the settings
-            // and registering the handlers take milliseconds.
             if !std::iter::from_fn(|| lines.recv_timeout(wait).ok()).any(|l| l.contains("trusted project")) {
                 fail(&mut child, "the run never reached its session setup");
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            wait_on_the_lock(&mut child);
         }
         IndexHeld::BeforeTheTurn
         | IndexHeld::FreedAfterTheSignal
@@ -3991,8 +4068,8 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
                 _ => r#"{"cmd":"user","text":"wait"}"#,
             };
             writeln!(stdin.as_mut().unwrap(), "{command}").unwrap();
-            // Time for the session to read the command and start on it.
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            // The session has read the command and started on it.
+            wait_on_the_lock(&mut child);
         }
         IndexHeld::AfterASavedTurn => {
             let stdin = stdin.as_mut().unwrap();
@@ -4041,7 +4118,7 @@ fn stop_with_the_session_index_held(tag: &str, args: &[&str], held: IndexHeld) {
     }
     let signalled = std::time::Instant::now();
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-    if matches!(held, IndexHeld::FreedAfterTheSignal | IndexHeld::OpenFreedAfterTheSignal) {
+    if freed {
         std::thread::sleep(bound / 6);
         held_lock = None;
     }

@@ -283,7 +283,7 @@ async fn drive_loop<W: Write>(
             return stopping.unwrap_or(exit_code);
         }
         tokio::select! {
-            _ = &mut quit, if stop_by.is_none() => *stop_by = Some(Instant::now() + crate::STOP_SETTLE),
+            _ = &mut quit, if stop_by.is_none() => *stop_by = Some(Instant::now() + crate::stop_settle()),
             _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
                 if settle.is_some() => return stopping.unwrap_or(exit_code),
             cmd = stdin_rx.recv(), if !closing => {
@@ -337,7 +337,7 @@ async fn drive_loop<W: Write>(
                                         saved.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
                                     }
                                     _ = &mut quit, if stop_by.is_none() => {
-                                        *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                                        *stop_by = Some(Instant::now() + crate::stop_settle());
                                         continue;
                                     }
                                 };
@@ -388,7 +388,7 @@ async fn drive_loop<W: Write>(
                                 // session is going away. A blocking wait it is
                                 // in finishes first, or ends with the process.
                                 reload.abort();
-                                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                                *stop_by = Some(Instant::now() + crate::stop_settle());
                                 return crate::quit_status();
                             }
                         };

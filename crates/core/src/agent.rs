@@ -4860,8 +4860,6 @@ fn prune_transcript(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
 
     #[tokio::test]
@@ -6092,12 +6090,19 @@ mod tests {
     /// there, frontend work included, until the scan finishes. A FIFO in the
     /// memory directory holds the scan open; while it is held, a task on this
     /// single-threaded runtime must still answer.
+    ///
+    /// The scan reads the FIFO to its end, which comes once every copy of the
+    /// write end has closed, and a child forked in this process holds a copy
+    /// of each descriptor open here until it execs, as other tests' children
+    /// do all the while. So a shell of its own holds the write end, and the
+    /// task that answers catches a spawn between fork and exec while the
+    /// scan is held: the scan must still end when the shell lets go.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn reload_reads_memory_off_the_runtime_thread() {
         use crate::state::Core;
+        use std::io::{BufRead, Write};
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::OpenOptionsExt;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
@@ -6114,42 +6119,57 @@ mod tests {
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
 
+        // The shell's open of the write end waits for the scan's; then it
+        // says so, and exits once a line comes, letting go of the write end
+        // without a write, which leaves the FIFO's mtime alone, so the scan
+        // finishes in one read.
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"exec 3> "$0" && echo held && read -r line"#])
+            .arg(&fifo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let (mut release, said) = (shell.stdin.take().unwrap(), shell.stdout.take().unwrap());
+        let (said_tx, said_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(said).read_line(&mut line);
+            let _ = said_tx.send(line);
+        });
         let (ping_tx, ping_rx) = oneshot::channel::<()>();
         let (pong_tx, pong_rx) = std::sync::mpsc::channel::<()>();
         // None: the scan never opened the FIFO. Some(answered): whether the
         // runtime ran another task while the scan was held open.
         let holder = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let held = loop {
-                // A non-blocking writer open succeeds only once a reader has it.
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&fifo)
-                {
-                    Ok(f) => break f,
-                    Err(_) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(5))
-                    }
-                    Err(_) => return None,
-                }
-            };
-            let _ = ping_tx.send(());
-            let answered = pong_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-            // Closing without a write is EOF for the reader and leaves the
-            // FIFO's mtime alone, so the scan finishes in one read.
-            drop(held);
-            Some(answered)
+            let held = said_rx.recv_timeout(Duration::from_secs(10)).is_ok_and(|line| line == "held\n");
+            let answered = held.then(|| {
+                let _ = ping_tx.send(());
+                pong_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            });
+            // A line, as an end of file would wait on the copies of this
+            // pipe's write end too; sent even if the scan never came, so a
+            // scan that comes late is let go at once.
+            let _ = release.write_all(b"\n");
+            answered
         });
 
-        let (reloaded, ()) = tokio::join!(reload_session(&core, &id, &project), async {
-            if ping_rx.await.is_ok() {
+        let (reloaded, spawning) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), reload_session(&core, &id, &project)),
+            async {
+                let spawning = ping_rx.await.ok().map(|()| crate::execution::PausedSpawn::start());
                 let _ = pong_tx.send(());
+                spawning
             }
-        });
-        reloaded.unwrap();
+        );
+        // The child caught mid-spawn execs now, and so lets go of its copies.
+        drop(spawning);
+        let _ = shell.kill();
+        let _ = shell.wait();
         let answered = holder.join().unwrap().expect("the reload scanned the memory directory");
         assert!(answered, "the memory scan behind /reload stalled the runtime thread");
+        reloaded.expect("the scan was still reading the FIFO 10 s after the reload began").unwrap();
 
         let _ = std::fs::remove_dir_all(dir);
     }
