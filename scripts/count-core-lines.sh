@@ -207,7 +207,12 @@ sub lex {
       ( [bc]?r(\#*)".*?"\g{-1}
       | "[^"\\]*(?:\\.[^"\\]*)*"
       | '(?:[\xC0-\xFF][\x80-\xBF]+|\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|.)|[^'\\\n])' )
-    | ((?:r\#)?[A-Za-z_]\w*|[0-9]\w*)
+    # A name is one word even where Rust lets it begin with a character that
+    # is not ASCII: `#[cfg(test)] mod α;` loads α.rs, and read byte by byte α
+    # is punctuation, so the declaration and the file it loads would both be
+    # missed. A character that is not ASCII is its UTF-8 sequence, a lead
+    # byte and its continuation bytes. A lifetime's name stays ASCII.
+    | ((?:r\#)?(?:[A-Za-z_]|[^\x00-\x7F][\x80-\xBF]*)(?:[A-Za-z0-9_]|[^\x00-\x7F][\x80-\xBF]*)*|[0-9]\w*)
     | ('[A-Za-z_]\w*)
     | (//[^\n]*)
     | (/\*(?:[^/*]++|/(?!\*)|\*(?!/)|(?-1))*+\*/)
