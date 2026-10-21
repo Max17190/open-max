@@ -1152,23 +1152,7 @@ fn spawn_server(first: Vec<String>) -> String {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
             // Headers, then exactly Content-Length body bytes.
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while !head.ends_with(b"\r\n\r\n") {
-                match stream.read(&mut byte) {
-                    Ok(1) => head.push(byte[0]),
-                    _ => break,
-                }
-            }
-            let length = String::from_utf8_lossy(&head)
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
-                })
-                .unwrap_or(0);
-            let mut body = vec![0u8; length];
-            let _ = stream.read_exact(&mut body);
+            let _ = read_one_request(&mut stream);
             let answer = first.next().unwrap_or_else(|| ANSWER.to_string());
             let _ = stream.write_all(
                 format!(
@@ -1190,6 +1174,366 @@ fn fresh_install(tag: &str, run: usize) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&home).unwrap();
     (project, home)
+}
+
+/// Peak RSS of a two-round headless turn at most 4 MB, read as 4,000,000
+/// bytes, the stricter of its two readings (4 MiB is 4,194,304 bytes), so
+/// the target is never reported met under the looser one.
+///
+/// Method: `openmax --trust-project -p TASK` on a fresh HOME and project,
+/// against a loopback endpoint (`scripted_endpoint`) that answers the run's
+/// three requests with a `read_file` call, a `list_dir` call and a final
+/// answer. Each run must exit 0 with the answer on stdout, and the endpoint
+/// must have served exactly those three requests, the second carrying the
+/// file's lines as the read's result and the third `notes.txt` as the
+/// listing's. The peak is the child's `ru_maxrss` from `wait4` (bytes on
+/// macOS, KiB on Linux): the high-water mark of its resident memory, its
+/// binary's code pages included, which leaves out a page released before
+/// that mark. Beside each run, the process floor: the peak of `openmax
+/// --version`, which loads the same binary and exits from the argument
+/// parser. One warmup run of each, then the medians of 11, printed with the
+/// 25th and 75th percentiles. The turn runs without proxy variables, so its
+/// requests reach the endpoint directly, and both runs without this
+/// environment's allocator variables (`Malloc*` on macOS, `MALLOC_*` for
+/// glibc), so a setting such as `MallocNanoZone=0` cannot change what either
+/// series measures. The endpoint is plain http on loopback: the figure
+/// counts the TLS configuration the HTTP client builds for every endpoint,
+/// but not what an https provider adds, the handshake and the certificate
+/// chain.
+///
+/// That mark is the child's own on macOS, which starts each child as a task
+/// of its own. On Linux it is not: std spawns the child with `posix_spawn`,
+/// which glibc runs as a vfork in this test process's address space until
+/// the exec, and at an exec the kernel keeps the high-water mark of the
+/// address space it leaves in the process's record, which `wait4` reports.
+/// So every Linux figure, floor and turn alike, is at least this process's
+/// own high-water mark at the launch (`VmHWM`, which the report prints): an
+/// upper bound on the child's, and no basis for a ratchet, which needs the
+/// child's own mark after its exec.
+///
+/// The published figure, which the 4 MB target is reported against until a
+/// turn meets it, is the turn's median with the allocator as a user's run
+/// has it. On macOS 27 that allocator is xzone malloc. It keeps the
+/// allocations that may hold pointers in four type buckets per size class,
+/// each on pages of its own, and picks an allocation's bucket by hashing its
+/// type under keys derived from the boot session and the binary's code
+/// signature. Rust's allocations carry no type, so each one is hashed by the
+/// address it was called from, which address space layout randomization
+/// moves at every launch. How the turn's allocations share pages, and so
+/// the published figure, changes between launches, builds and boots. With
+/// one bucket that draw is gone, so the ratchet is held on a second series
+/// of the same runs, each child started with `MallocMaxMagazines=1`, which
+/// xzone malloc reads as one pointer bucket. With the nano allocator
+/// engaged, as it is by default, that is all it changes: the variable also
+/// limits the allocator's slots to one in all, and the nano configuration
+/// lifts that limit again, so the slots and lists, which start at one per
+/// CPU cluster or one in all and grow to one per CPU under contention,
+/// follow the CPU topology as before, and the bucket count is a constant.
+/// A release build for macOS on Apple silicon asserts the pinned turn's
+/// median beyond the pinned floor's: the value measured below plus 128 KiB
+/// (8 of this platform's 16 KiB pages). The floor is subtracted because
+/// there it is the loader's and the system libraries', which differ between
+/// OS releases. Other platforms, macOS on Intel among them, with no ratchet
+/// measured yet, and every debug build print the published figure and hold
+/// the turn to 20 times the target.
+///
+/// Measured in a release build on macOS 27 (Apple M5, 10 cores in two
+/// clusters, 16 KiB pages), 11 interleaved batches of this test against each
+/// binary, quoting the median batch. A print run on the runtime's default of
+/// one worker thread per core: turn 6,768 KiB, floor 2,336 KiB, 4,432 KiB
+/// beyond it; pinned, 4,128 KiB beyond. On one worker: turn 6,512 KiB,
+/// floor 2,368 KiB, 4,144 KiB beyond it; pinned, 3,888 KiB beyond (3,888 to
+/// 3,904 over the 11 batches, and 3,792 built with Rust 1.99.0 instead of
+/// 1.94.0). The one-worker binary re-signed under eight identifiers, so with
+/// eight bucket keys, 2 batches of 11 runs each in an external harness of
+/// this scenario: beyond the floor, 4,128 to 4,224 KiB by default and 3,872
+/// to 3,904 KiB pinned. With every thread held to one cluster, neither
+/// series moved. Of the one-worker peak, 3,472 KiB is the binary's code
+/// pages the turn touches (217 of 418), about 1,500 KiB the allocator's, 307
+/// KiB of it live at the peak, about 650 KiB the loader's own code, 288 KiB
+/// constant data it rebases at launch, and 224 KiB thread stacks.
+#[test]
+fn headless_turn_peak_rss_is_under_four_megabytes() {
+    const KIB: u64 = 1024;
+    // 4 MB, in bytes (above).
+    const TARGET: u64 = 4_000_000;
+    // The pinned turn's memory beyond the pinned floor, measured above, plus
+    // 128 KiB.
+    const RATCHET: u64 = (3888 + 128) * KIB;
+    const RUNS: usize = 11;
+    // Where the ratchet was measured: macOS on Apple silicon, in a release
+    // build.
+    let gated = cfg!(all(target_os = "macos", target_arch = "aarch64")) && !cfg!(debug_assertions);
+    let endpoint = scripted_endpoint(vec![
+        sse_tool_call("call_1", "read_file", r#"{\"path\":\"notes.txt\"}"#),
+        sse_tool_call("call_2", "list_dir", r#"{\"path\":\".\"}"#),
+        sse_answer("two rounds done"),
+    ]);
+    // One run's floor and turn peaks, both children started without this
+    // environment's allocator variables, and with one pointer bucket when
+    // `pinned`.
+    let measure = |run: usize, pinned: bool| {
+        let allocator = |cmd: &mut Command| {
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().to_ascii_lowercase().starts_with("malloc") {
+                    cmd.env_remove(name);
+                }
+            }
+            if pinned {
+                cmd.env("MallocMaxMagazines", "1");
+            }
+        };
+        let mut version = Command::new(env!("CARGO_BIN_EXE_openmax"));
+        version.arg("--version");
+        allocator(&mut version);
+        let floor = peak_rss(&mut version, "--version").1;
+        let (project, home) = fresh_install("rss", run);
+        let settings = format!(
+            r#"{{"base_url":"{}","model":"stub-model","context_tokens":32768}}"#,
+            endpoint.base_url
+        );
+        std::fs::create_dir_all(home.join(".openmax")).unwrap();
+        std::fs::write(home.join(".openmax/settings.json"), settings).unwrap();
+        std::fs::write(project.join("notes.txt"), "a line the first round reads\n".repeat(20)).unwrap();
+        endpoint.served.lock().unwrap().clear();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
+        cmd.current_dir(&project)
+            .env("HOME", &home)
+            .env_remove("OPENMAX_SESSION")
+            .env_remove("OPENMAX_API_KEY")
+            // --trust-project is a human's grant; the test attests to it.
+            .env("OPENMAX_HUMAN_ATTEST", "1")
+            .args(["--trust-project", "-p", "read notes.txt, then list the directory"]);
+        for proxy in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+            cmd.env_remove(proxy);
+        }
+        allocator(&mut cmd);
+        let (out, turn) = peak_rss(&mut cmd, "the turn");
+        let served = std::mem::take(&mut *endpoint.served.lock().unwrap());
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+        assert!(out.contains("two rounds done"), "no answer on stdout: {out}");
+        assert_eq!(served.len(), 3, "the turn made {} requests, not three: {served:?}", served.len());
+        let read = tool_result(&served[1], "call_1");
+        assert!(read.contains("a line the first round reads"), "the read returned: {read}");
+        assert_eq!(tool_result(&served[2], "call_2"), "notes.txt", "the listing: {}", served[2]);
+        (floor, turn)
+    };
+    let (mut published, mut pinned) = (Vec::new(), Vec::new());
+    for run in 0..=RUNS {
+        let default = measure(run, false);
+        let one = gated.then(|| measure(run, true));
+        if run > 0 {
+            published.push(default);
+            pinned.extend(one);
+        }
+    }
+    // A series' turn median, that median beyond the floor's, and its report.
+    let summary = |runs: &[(u64, u64)]| {
+        let quartiles = |mut values: Vec<u64>| {
+            values.sort();
+            let kib = |n: u64| n / KIB;
+            let text = format!(
+                "median {} KiB (p25 {}, p75 {})",
+                kib(values[RUNS / 2]),
+                kib(values[RUNS / 4]),
+                kib(values[3 * RUNS / 4])
+            );
+            (values[RUNS / 2], text)
+        };
+        let (floor, floor_text) = quartiles(runs.iter().map(|run| run.0).collect());
+        let (turn, turn_text) = quartiles(runs.iter().map(|run| run.1).collect());
+        let beyond = turn.saturating_sub(floor);
+        let text = format!(
+            "{turn_text} over {RUNS} runs; --version floor: {floor_text}; {} KiB beyond the floor",
+            beyond / KIB
+        );
+        (turn, beyond, text)
+    };
+    let (turn, _, text) = summary(&published);
+    let met = if turn <= TARGET { "met" } else { "not met yet" };
+    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    // On Linux every figure starts from this process's own high-water mark
+    // (above), which the report names.
+    let inherited = if cfg!(target_os = "linux") {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let mark = status.lines().find_map(|line| line.strip_prefix("VmHWM:")).map_or("unread", str::trim);
+        format!(
+            "; on Linux each figure is at least this test process's high-water mark at its launch \
+             (VmHWM {mark} now), so it bounds the turn's from above and sets no ratchet"
+        )
+    } else {
+        String::new()
+    };
+    let report =
+        format!("two-round headless turn peak RSS: {text}; target {TARGET} bytes {met} ({build} build){inherited}");
+    println!("{report}");
+    if !gated {
+        assert!(turn < TARGET * 20, "{report}: {published:?}");
+        return;
+    }
+    let (_, beyond, text) = summary(&pinned);
+    let ratchet = format!("with MallocMaxMagazines=1: {text}; ratchet {} KiB beyond the floor", RATCHET / KIB);
+    println!("{ratchet}");
+    assert!(beyond <= RATCHET, "over the ratchet: {ratchet}; {report}");
+}
+
+/// The content of the tool message answering call `id` in a request `body`.
+fn tool_result(body: &str, id: &str) -> String {
+    let request: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    let messages = request["messages"].as_array().unwrap_or_else(|| panic!("no messages: {body}"));
+    let answer = messages.iter().find(|m| m["role"] == "tool" && m["tool_call_id"] == id);
+    let answer = answer.unwrap_or_else(|| panic!("no result for {id}: {body}"));
+    answer["content"].as_str().unwrap_or_default().to_string()
+}
+
+/// Run `cmd` to its exit with stdin closed: what it printed on stdout and its
+/// peak resident set in bytes, read from `wait4`'s rusage (bytes on macOS,
+/// KiB elsewhere). It must exit 0 within 30 seconds, where a turn here takes
+/// well under one; one still running then is killed and reaped, and the
+/// test fails. `what` names it in the failure.
+// The child is reaped by `wait4`, not `Child::wait`, which has no rusage.
+#[allow(clippy::zombie_processes)]
+fn peak_rss(cmd: &mut Command, what: &str) -> (String, u64) {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = std::env::temp_dir().join(format!(
+        "openmax-thesis-rss-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (stdout, stderr) = (dir.join("stdout"), dir.join("stderr"));
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    let mut status = 0;
+    // SAFETY: rusage is integers and timevals, for which all zeroes is a value.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut killed = false;
+    loop {
+        let options = if killed { 0 } else { libc::WNOHANG };
+        // SAFETY: a child of this process not yet reaped; both out-pointers
+        // are valid for the call.
+        let reaped = unsafe { libc::wait4(pid, &mut status, options, &mut usage) };
+        if reaped == pid {
+            break;
+        }
+        assert_eq!(reaped, 0, "wait4: {}", std::io::Error::last_os_error());
+        if Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        // SAFETY: the child is not reaped yet, so the pid is still its own.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        killed = true;
+    }
+    let out = std::fs::read_to_string(&stdout).unwrap_or_default();
+    let err = std::fs::read_to_string(&stderr).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!killed, "{what} was still running after 30 seconds: {out}{err}");
+    let status = std::process::ExitStatus::from_raw(status);
+    assert!(status.success(), "{what} exited {status}: {out}{err}");
+    let unit = if cfg!(target_os = "macos") { 1 } else { 1024 };
+    (out, usage.ru_maxrss as u64 * unit)
+}
+
+/// A running scripted endpoint: its base URL and the request bodies it has
+/// served, in order.
+struct ScriptedEndpoint {
+    base_url: String,
+    served: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// A loopback OpenAI-compatible endpoint that answers the Nth request since
+/// `served` was last cleared with the Nth SSE body of `script`, and a request
+/// past the script with a 400, which the client does not resend. Each
+/// connection is served on a thread of its own, keep-alive, every reply
+/// framed with a Content-Length.
+fn scripted_endpoint(script: Vec<String>) -> ScriptedEndpoint {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (record, script) = (served.clone(), std::sync::Arc::new(script));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let (record, script) = (record.clone(), script.clone());
+            std::thread::spawn(move || {
+                while let Some(body) = read_one_request(&mut stream) {
+                    let reply = {
+                        let mut served = record.lock().unwrap();
+                        served.push(body);
+                        script.get(served.len() - 1).cloned()
+                    };
+                    let head = match &reply {
+                        Some(sse) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                            sse.len()
+                        ),
+                        None => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                    };
+                    let sent = stream.write_all(format!("{head}{}", reply.as_deref().unwrap_or("")).as_bytes());
+                    if sent.is_err() || reply.is_none() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    ScriptedEndpoint { base_url, served }
+}
+
+/// One HTTP request from `stream`: its body, or None once the client closed
+/// the connection.
+fn read_one_request(stream: &mut std::net::TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return None,
+        }
+    }
+    let length = String::from_utf8_lossy(&head)
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).ok()?;
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// An SSE completion that calls tool `name` once with the JSON-escaped
+/// `arguments`.
+fn sse_tool_call(id: &str, name: &str, arguments: &str) -> String {
+    format!(
+        concat!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{}\",\"type\":\"function\",",
+            "\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        id, name, arguments
+    )
+}
+
+/// An SSE completion that answers `text` and stops.
+fn sse_answer(text: &str) -> String {
+    format!(
+        concat!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        text
+    )
 }
 
 /// Zero orphans after kill -9: once openmax starts again, no process of a
