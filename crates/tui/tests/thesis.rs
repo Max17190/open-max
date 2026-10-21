@@ -801,6 +801,11 @@ mod first_frame {
 /// A local OpenAI-compatible endpoint that answers every request with the
 /// same finished one-line completion, for as long as the test runs.
 fn spawn_answering_server() -> String {
+    spawn_server(Vec::new())
+}
+
+/// The same endpoint, answering its first requests with `first`, in turn.
+fn spawn_server(first: Vec<String>) -> String {
     const ANSWER: &str = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"first answer\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
@@ -808,6 +813,7 @@ fn spawn_answering_server() -> String {
     );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let mut first = first.into_iter();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
@@ -829,10 +835,11 @@ fn spawn_answering_server() -> String {
                 .unwrap_or(0);
             let mut body = vec![0u8; length];
             let _ = stream.read_exact(&mut body);
+            let answer = first.next().unwrap_or_else(|| ANSWER.to_string());
             let _ = stream.write_all(
                 format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{ANSWER}",
-                    ANSWER.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{answer}",
+                    answer.len()
                 )
                 .as_bytes(),
             );
@@ -849,6 +856,101 @@ fn fresh_install(tag: &str, run: usize) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&home).unwrap();
     (project, home)
+}
+
+/// Zero orphans after kill -9: once openmax starts again, no process of a
+/// tool tree that an openmax killed outright left running is still running.
+///
+/// Method: a print run (`-p`) on a fresh HOME and project, whose endpoint
+/// asks for one `bash` call. Its shell ignores SIGTERM, writes its pid,
+/// starts a subshell in the background, writes that pid and waits; the
+/// subshell starts a sleeper, the shell's grandchild, writes its pid and
+/// waits. Every process of the tree inherits the ignored SIGTERM, so only a
+/// SIGKILL ends it. Once the three pids are written and the run's record of
+/// its tool groups (`~/.openmax/run/<pid>.groups`) lists the shell's, the
+/// test sends openmax SIGKILL and waits for it, as the shell that started it
+/// would. (b) With nothing started since, it counts the processes of the
+/// tree still running 500 ms after the kill, and prints that count. (a) It
+/// then runs `openmax --check` on the same HOME and counts the processes of
+/// the tree still running once that has exited, waiting up to 500 ms for
+/// the process that adopted them to collect the ones it ended, since
+/// `kill(pid, 0)` finds a process until then. The gate is (a), zero, a
+/// count asserted in every build; (b) only reports.
+#[cfg(unix)]
+#[test]
+fn zero_orphans_after_kill_9() {
+    use std::process::Stdio;
+    let (project, home) = fresh_install("orphans", 0);
+    let base = project.parent().unwrap().to_path_buf();
+    let listed = base.join("pids");
+    let script = format!(
+        "trap '' TERM; echo $$ >> '{p}'; (sleep 6845 & echo $! >> '{p}'; wait) & echo $! >> '{p}'; wait",
+        p = listed.display()
+    );
+    let arguments = serde_json::json!({ "command": script }).to_string();
+    let call = serde_json::json!({"choices": [{"finish_reason": null, "delta": {"tool_calls": [
+        {"index": 0, "id": "call-1", "type": "function", "function": {"name": "bash", "arguments": arguments}},
+    ]}}]});
+    let end = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+    let base_url = spawn_server(vec![format!("data: {call}\n\ndata: {end}\n\ndata: [DONE]\n\n")]);
+    let openmax = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
+        cmd.current_dir(&project).env("HOME", &home).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
+        // Test automation is a human act with no terminal; the grant needs
+        // it said.
+        cmd.env("OPENMAX_HUMAN_ATTEST", "1").args(args).stdin(Stdio::null());
+        cmd
+    };
+    let mut run = openmax(&["--trust-project", "--base-url", &base_url, "--model", "m", "--context-tokens", "32768"])
+        .args(["-p", "start the tree"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let record = home.join(".openmax").join("run").join(format!("{}.groups", run.id()));
+    let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tree = loop {
+        let text = std::fs::read_to_string(&listed).unwrap_or_default();
+        let tree: Vec<i32> = text.lines().filter_map(|line| line.trim().parse().ok()).collect();
+        let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+        let shell = tree.first().map(|shell| format!("{shell} "));
+        if tree.len() == 3 && shell.is_some_and(|shell| recorded.lines().any(|line| line.starts_with(&shell))) {
+            break tree;
+        }
+        if Instant::now() >= deadline || run.try_wait().unwrap().is_some() {
+            let _ = run.kill();
+            let _ = run.wait();
+            for pid in tree.iter().filter(|pid| alive(pid)) {
+                unsafe { libc::kill(*pid, libc::SIGKILL) };
+            }
+            panic!("the tool tree did not start, or was not recorded: pids {tree:?}, record {recorded:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    unsafe { libc::kill(run.id() as libc::pid_t, libc::SIGKILL) };
+    let killed = Instant::now();
+    run.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(500).saturating_sub(killed.elapsed()));
+    let unlaunched = tree.iter().filter(|pid| alive(pid)).count();
+    let check = openmax(&["--check"]).output().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while tree.iter().any(alive) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let survivors: Vec<i32> = tree.iter().copied().filter(alive).collect();
+    for pid in &survivors {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    println!(
+        "orphans after kill -9: {unlaunched} of the tool tree's {} processes running 500 ms after the kill with no \
+         launch since; {} once `openmax --check` has run",
+        tree.len(),
+        survivors.len()
+    );
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(survivors.is_empty(), "the next launch left the tool tree running: {survivors:?}\n{stderr}");
 }
 
 /// One command from a fresh install to a first real answer in under 30
