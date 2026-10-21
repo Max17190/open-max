@@ -1,0 +1,666 @@
+# A checkout for scripts/count-core-lines.sh, read by the thesis test
+# core_source_stays_under_its_line_budget. Each `== path` line starts a
+# file. In a file under src/, `+` starts a line the script counts as
+# production and `-` one it excludes as test code; the marker and the space
+# after it are not part of the file. Files elsewhere are written as they
+# stand, and count only toward total-including-tests, except under a
+# crate's target/, where they count toward nothing. Production code follows
+# each kind of test-only item, so an item read as longer than it is shows,
+# and each test-only module file sits where rustc would look for it.
+== crates/alpha/src/lib.rs
++ //! Test code in the middle of a production file, before more production.
++
++ use std::fmt;
++
+- #[cfg(test)]
+- use std::collections::HashMap;
+- #[cfg(test)]
+- static SEEN: std::sync::OnceLock<HashMap<String, u32>> = std::sync::OnceLock::new();
+- #[cfg(test)]
+- type Seen = HashMap<String, u32>;
++
++ /// Brackets, quotes and attribute text inside literals and comments.
++ pub fn tricky<'a>(s: &'a str) -> (&'a str, &'static str, &'static str, [char; 4], u8) {
++     // } a closing brace in a line comment
++     /* a { brace, /* a nested } comment */ and a } brace */
++     let raw = r#"a raw "} { string"#;
++     let _ = (b"} \" {", c"{ \" }");
++     // Without spaces, a quote read wrongly pairs with the next one.
++     let _ = ('é','}', '\'','{');
++     (s, "} #[cfg(test)] mod hidden { \" {", raw, ['{', '}', '\'', '"'], b'}')
++ }
++
+- /// A test-only helper, its doc comment included.
+- #[cfg(test)]
+- fn helper() -> &'static str {
+-     "}"
+- }
+-
+- #[cfg(test)]
+- mod tests {
+-     use super::*;
+-
+-     #[test]
+-     fn literals() {
+-         assert_eq!(tricky("{").0, "{");
+-         let _ = (r"\", '\\', "{{{", br##"raw "# }"##);
+-     }
+-
+-     // Never read: the module around it is excluded whole.
+-     #[cfg(all(test, unix))]
+-     macro unread() {}
+-     fn after_unread() {}
+- }
++
++ #[derive(Default)]
++ pub struct Counter {
++     pub hits: u32,
+-     #[cfg(test)]
+-     pub probes: HashMap<String, u32>,
++     /// Calls that found nothing.
++     pub misses: u32,
+-     #[cfg(test)]
+-     pub seen: Vec<(u32, u32)>,
++     #[allow(dead_code)]
++     pub last: u32,
+-     #[cfg(test)]
+-     calls: u32,
++     pub total: u32,
+-     #[cfg(test)]
+-     probed: bool,
++ }
++
+- /** A block doc comment is part of its item too. */
+- #[cfg(test)]
+- enum Kind {
+-     Probe,
+- }
++ pub const ONE: u32 = 1;
++ //// Four slashes make a plain comment, not part of the item below.
+- #[cfg(test)]
+- trait Probed {
+-     fn probe(&self);
+- }
++ pub const TWO: u32 = 2;
++ /*** Three stars make a plain comment too. ***/
+- #[cfg(test)]
+- macro_rules! probe {
+-     () => {};
+- }
++ pub const THREE: u32 = 3;
+- #[cfg(test)]
+- extern "C" fn probed() {}
++ pub const FOUR: u32 = 4;
+- #[cfg(test)]
+- unsafe impl Send for Counter {}
++ pub const FIVE: u32 = 5;
+- #[allow(dead_code)]
+- #[cfg(test)]
+- struct Probes {
+-     count: u32,
+- }
++ pub const SIX: u32 = 6;
+- #[cfg(test)]
+- struct Probe(u32);
++ pub struct Buf<const N: usize>;
+- #[cfg(test)]
+- fn buffer() -> Buf<{ 1 + 1 }> {
+-     Buf
+- }
++ pub enum Event {
++     Hit,
+-     #[cfg(test)]
+-     Probe(Probe),
++     Miss {
++         at: u32,
+-         #[cfg(test)]
+-         seen: HashMap<u32, u32>,
++         kept: bool,
++     },
++ }
++ pub union Word {
++     pub int: u32,
+-     #[cfg(test)]
+-     pub probe: std::mem::ManuallyDrop<HashMap<u32, u32>>,
++     pub float: f32,
++ }
++ pub struct Rule {
++     pub name: &'static str,
+-     #[cfg(test)]
+-     pub check: fn(u32, u32) -> bool,
++     pub weight: u32,
++ }
++ pub const STRICT: Rule = Rule {
++     name: "strict",
+-     #[cfg(test)]
+-     check: |a, b| a > b,
++     weight: 2,
++ };
++ pub struct Pool<F: Fn() -> u32> {
++     pub make: F,
+-     #[cfg(test)]
+-     pub made: HashMap<u32, u32>,
++     pub size: u32,
++ }
++ pub struct Pair(
++     pub u32,
+-     #[cfg(test)]
+-     pub HashMap<u32, u32>,
++     pub u32,
++ );
++ pub const RULE: Rule = Rule {
++     name: "rule",
+-     #[cfg(test)]
+-     check: |a, b| a < b,
++     weight: 1,
++ };
++
++ impl Counter {
++     pub fn new() -> Self {
++         let misses = 0;
++         Counter {
+-             #[cfg(test)]
+-             probes: HashMap::new(),
+-             #[cfg(test)]
+-             seen: Vec::new(),
++             hits: 0,
+-             #[cfg(test)]
+-             calls: 1,
++             misses,
+-             #[cfg(test)]
+-             probed: Self::limit() > 2,
++             total: 0,
++             ..Default::default()
++         }
++     }
++
+-     #[cfg(test)]
+-     pub(crate) const fn limit() -> u32 {
+-         3
+-     }
++
++     pub fn hit(&mut self) {
++         self.hits += 1;
+-         #[cfg(test)]
+-         {
+-             self.probes.insert(helper().into(), self.hits);
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         if self.hits > 1 {
+-             self.misses = 0;
+-         } else {
+-             self.misses += 1;
+-         };
++         #[cfg(not(test))]
++         let label = "hit";
+-         #[cfg(test)]
+-         let label: Result<&str, u32> = match self.hits {
+-             0 => Ok("none"),
+-             _ => Err(1),
+-         };
++         let _ = label;
+-         #[cfg(test)]
+-         if let Counter { hits: 2, .. } = self {
+-             self.misses = 2;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         for Counter { hits, .. } in [Counter::new()] {
+-             self.hits += hits;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         while self.hits > 9 {
+-             self.hits -= 1;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         loop {
+-             break;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         tokio::pin! {
+-             let probe = async {};
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         const {
+-             assert!(3 > 0);
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         self.total += if self.hits > 1 {
+-             1u8
+-         } else {
+-             0
+-         } as u32;
++         let mut order: fn(u32, u32) -> bool = |a, b| a < b;
+-         #[cfg(test)]
+-         order = |a, b| a > b;
++         self.total += order(1, 2) as u32;
+-         #[cfg(test)]
+-         unsafe {
+-             std::ptr::read_volatile(&self.hits);
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         match self.hits {
+-             0 => self.misses = 1,
+-             _ => {}
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         match self.hits {
+-             _ => vec![self.misses],
+-         }
+-         .clear();
++         self.total += 1;
+-         #[cfg(test)]
+-         HashMap::<fn() -> u32, String>::new().clear();
++         self.total += 1;
+-         #[cfg(test)]
+-         if { self.hits > 1 } {
+-             self.misses = 0;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         for hit in { [1, 2] } {
+-             self.hits += hit;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         match { self.hits } {
+-             _ => {}
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         if match self.hits {
+-             0 => false,
+-             _ => true,
+-         } {
+-             self.misses = 1;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         for _ in 0.. {
+-             break;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         while { self.hits > 9 } {
+-             self.hits -= 1;
+-         }
++         self.total += 1;
+-         #[cfg(test)]
+-         'outer: loop {
+-             break 'outer;
+-         }
++         self.misses += 0;
++         let _ = 1; #[cfg(test)]
+-         self.misses += 0;
+-         #[cfg(test)]
++         self.hits += 0; self.misses += 0;
++     }
++
++     pub fn pick(&self) -> fn(u32, u32) -> u32 {
++         match self.hits {
+-             #[cfg(test)]
+-             0 => |a, b| a + b,
+-             #[cfg(test)]
+-             1 => move |a, b| a * b,
+-             #[cfg(test)]
+-             2 => {
+-                 |a, b| a - b
+-             },
+-             #[cfg(test)]
+-             3 => {
+-                 |a, b| a / b
+-             }
+-             #[cfg(test)]
+-             4 => match self.misses {
+-                 0 => |a, b| a % b,
+-                 _ => |a, _| a,
+-             }
++             5 => |_, b| b,
++             _ => |a, _| a,
++         }
++     }
++
++     pub fn first(&self) -> Option<u32> {
+-         #[cfg(test)]
+-         match self.hits {
+-             0 => None,
+-             _ => Some(()),
+-         }?;
+-         #[cfg(test)]
+-         if Some(self.hits > 1)? {
+-             return None;
+-         }
++         let shown = self.hits;
+-         #[cfg(test)]
+-         if unsafe { std::ptr::read(&(self.hits > 1)) } {
+-             return None;
+-         }
++         let _ = shown;
+-         #[cfg(test)]
+-         if match self.hits {
+-             0 => None,
+-             _ => Some(1),
+-         }
+-         .is_some()
+-         {
+-             return None;
+-         }
++         Some(self.hits)
++     }
++
++     pub async fn settle(&self) {
+-         #[cfg(test)]
+-         async {}.await
++     }
++
++     pub fn reset(&mut self) {
++         let Counter {
+-             #[cfg(test)]
+-             probes: seen,
++             hits,
++             ..
++         } = self;
++         *hits = 0;
++     }
++
++     pub fn busy(&self) -> bool {
++         match self {
+-             #[cfg(test)]
+-             Counter { hits, .. } if *hits > 9 => true,
++             Counter { total, .. } => *total > 0,
++         }
++     }
++
++     pub fn merged(&self) -> Counter {
++         let mut union = Counter {
+-             #[cfg(test)]
+-             probed: self.hits > 1,
++             ..Default::default()
++         };
+-         #[cfg(test)]
+-         union = if self.hits > 0 {
+-             Counter::new()
+-         } else {
+-             Counter::default()
+-         };
++         union.hits += self.hits;
++         union
++     }
++ }
++
+- #[cfg(test)]
+- thread_local! {
+-     static HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+- }
++ static LIMIT: u32 = 3;
+- #[cfg(test)]
+- std::thread_local! {
+-     static PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+- }
++ pub const EIGHT: u32 = 8;
+- #[cfg(test)]
+- ::tokio::task_local! {
+-     static ID: u32;
+- }
++ pub const NINE: u32 = 9;
+- #[cfg(test)]
+- union Bits {
+-     int: u32,
+-     float: f32,
+- }
++ pub const TEN: u32 = 10;
+- #[cfg(test)]
+- extern crate alloc;
++ pub const ELEVEN: u32 = 11;
+- #[cfg(test)]
+- unsafe extern "C" {
+-     fn abs(x: i32) -> i32;
+- }
++ pub const TWELVE: u32 = 12;
+- #[cfg(test)]
+- std::thread_local!(static CALLS: u32 = 0);
++ pub const THIRTEEN: u32 = 13;
++ std::thread_local!(
+-     #[cfg(test)]
+-     static SEEN: std::cell::Cell<u32> = std::cell::Cell::new(0);
++     static KEPT: u32 = 0;
++ );
++ pub const SHOWN: &str = stringify!(
++     #[cfg(test)]
++     mod example;
++ );
++ macro_rules! twice {
++     ($item:item) => {
++         #[cfg(test)]
++         fn probe() {}
++         $item
++     };
++ }
++
++ pub fn scaled(
+-     #[cfg(test)]
+-     factor: HashMap<u32, u32>,
++     mut by: u32,
++ ) -> u32 {
++     by += 1;
++     by
++ }
++
+- #[cfg(all(test, unix))]
+- impl fmt::Display for Counter {
+-     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-         write!(f, "{}", self.hits)
+-     }
+- }
++
++ #[cfg(not(test))]
++ pub const MODE: &str = "production";
+- #[cfg(test)]
+- pub const MODE: &str = "test";
+- #[cfg(test,)]
+- pub const TRAILING: u32 = 1;
++ #[cfg(any(test, unix))]
++ pub const UNIX: bool = true;
++
+- #[test]
+- fn outside_a_module() {}
+-
+- #[tokio::test(flavor = "current_thread")]
+- async fn outside_a_module_too() {}
++ pub const SEVEN: u32 = 7;
++
+- #[cfg(test)]
+- mod helpers;
+- #[cfg(test)]
+- mod testing;
+- #[cfg(test)]
+- #[path = "./testing/extra.rs"]
+- mod extra;
+- #[cfg(test)]
+- #[path = "data/sample.rs"]
+- mod sample;
++ mod probe;
++
+- #[allow(dead_code)]
+- mod inline_probe {
+-     #![cfg(test)]
+-     mod nested;
+-     pub fn probe() {}
+- }
++
++ pub mod inline {
+-     #[cfg(test)]
+-     #[path = "other.rs"]
+-     mod inner;
++     pub fn kept() {}
++ }
++
++ #[cfg(unix)]
++ pub mod platform {
+-     #[cfg(test)]
+-     fn probe() {}
++     pub fn name() {}
++ }
++ pub mod quoting {
+-     #[cfg(test)]
+-     mod quotes {
+-         const QUOTE: char = '\"';
+-     }
++     pub const QUOTE: char = '"';
++ }
++
++ pub fn after() {}
++
++ pub fn shown() -> u32 {
++     let stringify = {
+-         #[cfg(test)]
+-         let _probe = 1;
++         2
++     };
++     stringify
++ }
+== crates/alpha/src/inline/other.rs
+- pub fn other() {}
+== crates/alpha/src/helpers.rs
+- //! Loaded only by a test-only `mod helpers;`, so excluded whole, with
+- //! the module it declares.
+-
+- mod deeper;
+-
+- pub fn fixture() -> &'static str {
+-     "a fixture"
+- }
+== crates/alpha/src/helpers/deeper.rs
+- pub fn deepest() {}
+== crates/alpha/src/data/sample.rs
+- //! Loaded by a test-only #[path] and sorted before the file that loads it,
+- //! it keeps its modules beside it all the same.
+- #[cfg(test)]
+- mod rows;
+- mod nested {
+-     #[cfg(test)]
+-     #[path = "aux.rs"]
+-     mod aux;
+- }
+== crates/alpha/src/data/rows.rs
+- pub fn rows() {}
+== crates/alpha/src/data/nested/aux.rs
+- //! Found in data/nested/ only once data/sample.rs is known to be loaded by
+- //! a #[path], and loaded by one itself, so its modules sit beside it.
+- #[cfg(test)]
+- mod part;
+== crates/alpha/src/data/nested/part.rs
+- pub fn part() {}
+== crates/alpha/src/testing/mod.rs
+- mod support;
+== crates/alpha/src/testing/support.rs
+- pub fn support() {}
+== crates/alpha/src/testing/extra.rs
+- pub fn extra() {}
+== crates/alpha/src/inline_probe/nested.rs
+- pub fn nested() {}
+== crates/alpha/src/probe.rs
+- #![cfg(test)]
+-
+- pub fn probe() {}
+== crates/alpha/tests/it.rs
+#[test]
+fn integration() {}
+== crates/beta/src/main.rs
++ mod target;
++ mod view;
++ #[path = "widgets/all.rs"]
++ mod widgets;
++ #[cfg(windows)]
++ mod console;
+- #[cfg(test)]
+- #[path = "target/mod.rs"]
+- mod aimed;
+- #[cfg(test)]
+- mod r#type;
++ mod r#match {
+-     #[cfg(test)]
+-     mod inner;
++ }
++
++ fn main() {
++     println!("{}", '}');
++ }
++
+- #[cfg(test)]
+- mod tests {
+-     mod /* loaded beside this module */ fixtures;
+-     #[test]
+-     fn runs() {}
+-     // Read token by token, since the `mod` above could load a file, but
+-     // never bounded: the module around it is excluded whole.
+-     #[cfg(all(test, unix))]
+-     macro unread() {}
+-     fn after_unread() {}
+- }
+== crates/beta/src/tests/fixtures.rs
+- pub fn fixture() {}
+== crates/beta/src/type.rs
+- pub fn probe() {}
+== crates/beta/src/match/inner.rs
+- pub fn inner() {}
+== crates/beta/src/bin/tool.rs
++ fn main() {}
+- #[cfg(test)]
+- mod checks;
+== crates/beta/src/bin/checks/mod.rs
+- pub fn check() {}
+== crates/beta/src/bin/gadget/main.rs
++ fn main() {}
+- #[cfg(test)]
+- mod checks;
+== crates/beta/src/bin/gadget/checks.rs
+- pub fn check() {}
+== crates/beta/src/target/mod.rs
++ //! Source, not build output, though named target, and still counted
++ //! when a test-only module loads it again.
++ pub fn aim() {}
+== crates/beta/src/view.rs
++ pub fn view() {}
++
++ mod parts {
+-     #[cfg(test)]
+-     #[path = "probe.rs"]
+-     mod probe;
+-     #[cfg(test)]
+-     mod sample;
++     pub fn part() {}
++ }
++
++ #[path = "shapes"]
++ mod drawn {
+-     #[cfg(test)]
+-     mod square;
++ }
+== crates/beta/src/view/parts/probe.rs
+- //! Read from the directory of view.rs and its own name, then its inline
+- //! module's, and as a file a #[path] loads, it keeps its modules beside it.
+- mod deeper;
+== crates/beta/src/view/parts/deeper.rs
+- pub fn deeper() {}
+== crates/beta/src/view/parts/sample.rs
+- pub fn sample() {}
+== crates/beta/src/shapes/square.rs
+- pub fn square() {}
+== crates/beta/src/widgets/all.rs
++ //! Loaded by a #[path], so its modules sit beside it.
++ pub fn all() {}
+- #[cfg(test)]
+- mod knob;
+== crates/beta/src/widgets/knob.rs
+- pub fn knob() {}
+== crates/beta/target/debug/build/generated.rs
+pub fn generated() {}
