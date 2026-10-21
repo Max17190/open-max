@@ -258,6 +258,8 @@ Running the text through `eval` shows in a few places. Bash's `set -x` trace lin
 
 Each `bash` or external tool call runs in its own process group, and processes it leaves running in the background are terminated when it returns. The first call in a session that terminated some gets a result that explains why and how to keep one running (a named tmux session); every later one gets one line that says so on its own, which still holds if the model never saw the first (its turn was cancelled) or compaction dropped it. A session loaded again from its file, as a resume does, or one whose extensions were refrozen, explains once more.
 
+An openmax killed outright (`kill -9`, or a crash that runs no handler) cannot stop its tools. On macOS and Linux it records the process group of each tool it runs in `~/.openmax/run`, and the next launch of the TUI, `-p`, `--stdio`, or `--check` stops the groups a killed openmax left running. `zero_orphans_after_kill_9` in `crates/tui/tests/thesis.rs` gates this with `--check` as that launch: a print run gets SIGKILL in the middle of a `bash` call whose shell, child and grandchild all ignore SIGTERM, and once `openmax --check` has run, none of the three is running. The TUI, `-p` and `--stdio` stop the groups before they start a session, so before any tool of their own: a launch refused for a settings flag, which starts no session, stops them too. The limits are in [usage](docs/usage.md#command-line).
+
 Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
 
 Open Max itself does not phone home. Apart from native child processes, the harness contacts only the model endpoint you configure.

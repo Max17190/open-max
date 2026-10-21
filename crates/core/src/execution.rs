@@ -1343,15 +1343,20 @@ impl Drop for GroupGuard {
     }
 }
 
+/// The run directory this process records its tool groups in, set by
+/// [`reap_left_behind_groups`]; unset, nothing is recorded.
+static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Where the changes to this process's record of the tool groups it started
-/// and has not settled go, armed by [`reap_left_behind_groups`]; unarmed,
-/// nothing is recorded. One thread owns the record and makes every write to
-/// it ([`keep_record`]), so no tool's spawn or settle, and no exit, waits on
-/// the home directory: a home whose file server stopped answering stalls
-/// that thread alone. A harness that dies without its exit path (SIGKILL, a
-/// crash that runs no handler) leaves the file behind, and the next launch
-/// stops the groups it names.
-static RECORDER: std::sync::OnceLock<std::sync::mpsc::Sender<RecordChange>> = std::sync::OnceLock::new();
+/// and has not settled go: the record's thread, started by the first tool
+/// or hook the process runs ([`record`]), so a launch that runs none spends
+/// nothing on it, and `None` if it could not start. That thread owns the
+/// record and makes every write to it ([`keep_record`]), so no tool's spawn
+/// or settle, and no exit, waits on the home directory: a home whose file
+/// server stopped answering stalls that thread alone. A harness that dies
+/// without its exit path (SIGKILL, a crash that runs no handler) leaves the
+/// file behind, and the next launch stops the groups it names.
+static RECORDER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<RecordChange>>> = std::sync::OnceLock::new();
 
 /// A change to the record, made by its thread in the order sent.
 enum RecordChange {
@@ -1365,7 +1370,7 @@ enum RecordChange {
 }
 
 fn change_record(change: RecordChange) {
-    if let Some(recorder) = RECORDER.get() {
+    if let Some(Some(recorder)) = RECORDER.get() {
         let _ = recorder.send(change);
     }
 }
@@ -1397,9 +1402,15 @@ const RECORD_CUT_BYTES: u64 = 4096;
 /// then held open by the record's thread, so a tool round costs it two appends,
 /// not a rewrite of the file. The first line is the owner's start time, then on
 /// Linux this boot's id; each `<leader> <start>` line adds a group, and each
-/// `-<leader> <start>` line strikes one. Every line is one write, so a kill
-/// never leaves half of one. A write that fails, as on a full disk, can, so the
-/// next change rewrites the file whole.
+/// `-<leader> <start>` line strikes one. Every line is one write, which a
+/// SIGKILL can still cut short, as Linux ends a write at a page boundary of the
+/// file once one is pending. Only the last line can be cut, and the reader then
+/// skips it or finds in it nothing to signal: a start time cut short is
+/// earlier than that of any process that has had the pid since, and a strike
+/// cut short leaves listed a group that was stopped, or found empty, before
+/// the strike was sent. A write that fails, as on a full disk, can leave part
+/// of a line too, which the next line would run into, so the next change
+/// rewrites the file whole.
 struct GroupRecord {
     path: PathBuf,
     own_start: u64,
@@ -1471,14 +1482,28 @@ impl GroupRecord {
     }
 }
 
-/// Read the leader's start time here, while its pid surely names it, and
-/// leave the line to the record's thread.
+/// Read the leader's start time here, while its pid surely names it (one
+/// that has exited keeps its pid until it is waited for), and leave the
+/// line to the record's thread, which the first tool or hook starts.
 fn record(pid: u32) {
-    if let Some(recorder) = RECORDER.get() {
-        if let Some(start) = start_time(pid) {
-            let _ = recorder.send(RecordChange::Add(pid, start));
-        }
+    let Some(run) = RUN_DIR.get() else { return };
+    if let (Some(recorder), Some(start)) = (RECORDER.get_or_init(|| start_recording(run)), start_time(pid)) {
+        let _ = recorder.send(RecordChange::Add(pid, start));
     }
+}
+
+/// Start the record's thread on `{run}/{pid}.groups`, and have the exit
+/// close the record.
+fn start_recording(run: &Path) -> Option<std::sync::mpsc::Sender<RecordChange>> {
+    let pid = std::process::id();
+    let record = GroupRecord::new(run.join(format!("{pid}.groups")), start_time(pid)?);
+    let (recorder, changes) = std::sync::mpsc::channel();
+    std::thread::Builder::new().name("record".into()).spawn(move || keep_record(record, changes)).ok()?;
+    // Run by `exit`, which a return from `main` reaches too, after the
+    // runtime's shutdown has killed each group a dropped command owned.
+    #[cfg(unix)]
+    unsafe { libc::atexit(close_groups_record) };
+    Some(recorder)
 }
 
 fn unrecord(pid: u32) {
@@ -1486,31 +1511,24 @@ fn unrecord(pid: u32) {
 }
 
 /// Stop the tool groups a harness that died without its exit path left
-/// running, then arm this process's own record. Every launch that can start
-/// a turn or a tool calls it first. A record whose owner is gone (no process
-/// of this user has its pid, or the process that has it started at another
-/// time than the record says) names groups nothing else will stop: each
-/// whose leader still runs with the start time recorded for it gets SIGTERM,
-/// then SIGKILL after `TERMINATION_GRACE`, and the record is removed, with
-/// the run directory once no record is left there. A record from another
-/// boot is removed with nothing signalled, and one a running openmax owns
-/// is left alone. A process that left its tool's group, a group whose
-/// leader has exited, and the group this launch runs in are not covered.
+/// running, then have this process record its own, from the first tool or
+/// hook it runs. Every launch that can start a turn or a tool calls it
+/// first. A record whose owner is gone (no process of this user has its
+/// pid, or the process that has it has exited or started at another time
+/// than the record says) names groups nothing else will stop: each whose
+/// leader still has the start time recorded for it gets SIGTERM, then
+/// SIGKILL after `TERMINATION_GRACE`, and the record is removed, with the
+/// run directory once no record is left there. A record from another boot
+/// is removed with nothing signalled, and one a running openmax owns is
+/// left alone. A process that left its tool's group, and a group whose
+/// leader has exited and been waited for, are not covered. The group this
+/// launch runs in is not signalled, and while its leader runs, its record
+/// is kept for a launch outside it.
 #[cfg(unix)]
 pub fn reap_left_behind_groups(data_dir: &Path) {
     let run = data_dir.join("run");
     reap(&run);
-    let pid = std::process::id();
-    let Some(start) = start_time(pid) else { return };
-    let record = GroupRecord::new(run.join(format!("{pid}.groups")), start);
-    let (recorder, changes) = std::sync::mpsc::channel();
-    if RECORDER.set(recorder).is_ok()
-        && std::thread::Builder::new().name("record".into()).spawn(move || keep_record(record, changes)).is_ok()
-    {
-        // Run by `exit`, which a return from `main` reaches too, after the
-        // runtime's shutdown has killed each group a dropped command owned.
-        unsafe { libc::atexit(close_groups_record) };
-    }
+    let _ = RUN_DIR.set(run);
 }
 
 #[cfg(not(unix))]
@@ -1557,6 +1575,7 @@ fn reap(run: &Path) {
 /// [`reap`], in the boot whose id is `boot`.
 #[cfg(unix)]
 fn reap_in_boot(run: &Path, boot: Option<&str>) {
+    let own_group = unsafe { libc::getpgrp() } as u32;
     let mut groups = Vec::new();
     let mut stale = Vec::new();
     for entry in std::fs::read_dir(run).into_iter().flatten().flatten() {
@@ -1572,10 +1591,15 @@ fn reap_in_boot(run: &Path, boot: Option<&str>) {
             if owner_is_running(owner, first) {
                 continue;
             }
-            for (pid, start) in recorded_groups(lines) {
-                if start_time(pid) == Some(start) {
-                    groups.push((pid, start));
-                }
+            let listed = recorded_groups(lines).into_iter().filter(|&(pid, start)| start_time(pid) == Some(start));
+            let (own, others): (Vec<_>, Vec<_>) = listed.partition(|&(pid, _)| pid == own_group);
+            groups.extend(others);
+            // The group this launch runs in, as an openmax that a left-behind
+            // tool's script starts does: a signal to it would end this launch
+            // as it starts. It is left running, with its record, for the next
+            // launch outside it to stop.
+            if !own.is_empty() {
+                continue;
             }
         }
         stale.push(path);
@@ -1620,29 +1644,29 @@ fn positive_pid(text: &str) -> Option<u32> {
 }
 
 /// A recorded group leader: never 1, whose group signal, kill(-1), reaches
-/// every process this user may signal, never this launch itself, and never
-/// the group this launch runs in. An openmax that a left-behind tool's
-/// script starts runs in that tool's group, and a signal to it would end
-/// this launch as it starts; that group is left running.
+/// every process this user may signal. The group this launch runs in is
+/// left to [`reap_in_boot`].
 #[cfg(unix)]
 fn leader_pid(text: &str) -> Option<u32> {
-    let own_group = unsafe { libc::getpgrp() } as u32;
-    positive_pid(text).filter(|pid| *pid > 1 && *pid != std::process::id() && *pid != own_group)
+    positive_pid(text).filter(|pid| *pid > 1)
 }
 
 /// Whether the openmax that wrote a record still runs: its pid is held by a
-/// process this user may signal, which started when the first field of the
-/// record's first line says. An openmax runs as the user that reads its
-/// record, so a pid no such process holds (ESRCH, or EPERM for another
-/// user's process) is a harness that is gone. A start time that cannot be
-/// read, or a first line not yet written, is taken as still running.
+/// process this user may signal, which has not exited and started when the
+/// first field of the record's first line says. An openmax runs as the user
+/// that reads its record, so a pid no such process holds (ESRCH, or EPERM
+/// for another user's process) is a harness that is gone, as is one that
+/// has exited, which holds its pid until its parent waits for it, as a
+/// killed harness does. A start time that cannot be read, or a first line
+/// not yet written, is taken as still running.
 #[cfg(unix)]
 fn owner_is_running(pid: u32, recorded_start: Option<&str>) -> bool {
     if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
         return false;
     }
-    match (start_time(pid), recorded_start.and_then(|line| line.split(' ').next()?.parse::<u64>().ok())) {
-        (Some(start), Some(recorded)) => start == recorded,
+    match (started(pid), recorded_start.and_then(|line| line.split(' ').next()?.parse::<u64>().ok())) {
+        (Some((_, true)), _) => false,
+        (Some((start, false)), Some(recorded)) => start == recorded,
         _ => true,
     }
 }
@@ -1724,39 +1748,51 @@ fn boot_id() -> Option<String> {
     None
 }
 
-/// When the process `pid` started, in microseconds since the epoch: the
-/// `pbi_start_tvsec` and `pbi_start_tvusec` of `proc_pidinfo`'s
-/// PROC_PIDTBSDINFO. Fixed for the life of a process, so a pid that now
-/// names another process reads another value.
+/// When the process `pid` started, in microseconds since the epoch, and
+/// whether it has exited: the `pbi_start_tvsec`, `pbi_start_tvusec` and
+/// `pbi_status` of `proc_pidinfo`'s PROC_PIDTBSDINFO. The start time is fixed
+/// for the life of a process, so a pid that now names another process reads
+/// another value. A process that has exited holds its pid until its parent
+/// waits for it, and reads only with a nonzero argument, as XNU's
+/// `proc_pidinfo` then looks among those too; its status is then `SZOMB`.
 #[cfg(target_os = "macos")]
-fn start_time(pid: u32) -> Option<u64> {
+fn started(pid: u32) -> Option<(u64, bool)> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let read = unsafe {
-        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 1, (&raw mut info).cast(), size)
     };
-    (read == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    (read == size).then(|| (info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec, info.pbi_status == libc::SZOMB))
 }
 
-/// When the process `pid` started, in clock ticks after boot: field 22 of
-/// `/proc/<pid>/stat`.
+/// When the process `pid` started, in clock ticks after boot, and whether it
+/// has exited, from `/proc/<pid>/stat`, which a process that has exited has
+/// until its parent waits for it.
 #[cfg(target_os = "linux")]
-fn start_time(pid: u32) -> Option<u64> {
-    stat_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+fn started(pid: u32) -> Option<(u64, bool)> {
+    stat_started(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn start_time(_: u32) -> Option<u64> {
+fn started(_: u32) -> Option<(u64, bool)> {
     None
 }
 
-/// Field 22, starttime, of a `/proc/<pid>/stat` line. Fields are counted
-/// after the command name's closing parenthesis, since the name itself can
-/// hold spaces and parentheses: the first field after it is field 3.
+/// When the process `pid` started, whether or not it has exited.
+fn start_time(pid: u32) -> Option<u64> {
+    started(pid).map(|(start, _)| start)
+}
+
+/// Field 22, starttime, of a `/proc/<pid>/stat` line, and whether field 3,
+/// the state, is Z, a process that has exited. Fields are counted after the
+/// command name's closing parenthesis, since the name itself can hold spaces
+/// and parentheses: the first field after it is field 3.
 #[cfg(any(target_os = "linux", test))]
-fn stat_start_time(stat: &str) -> Option<u64> {
+fn stat_started(stat: &str) -> Option<(u64, bool)> {
     let (_, fields) = stat.rsplit_once(')')?;
-    fields.split_whitespace().nth(22 - 3)?.parse().ok()
+    let mut fields = fields.split_whitespace();
+    let exited = fields.next()? == "Z";
+    Some((fields.nth(22 - 4)?.parse().ok()?, exited))
 }
 
 #[cfg(all(test, unix))]
@@ -2005,13 +2041,42 @@ mod tests {
         assert_eq!(live, [11, 33], "forgetting an unlisted group changed the list");
     }
 
-    /// The start time is field 22 of /proc/<pid>/stat, counted after the
-    /// command name, which can itself hold spaces and parentheses.
+    /// The start time is field 22 of /proc/<pid>/stat, and the state field 3,
+    /// counted after the command name, which can itself hold spaces and
+    /// parentheses.
     #[test]
     fn the_linux_start_time_is_field_22_counted_after_the_command_name() {
         let stat = "4242 (a) b (c) S 1 4242 4242 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 98765 1000 7";
-        assert_eq!(stat_start_time(stat), Some(98765));
-        assert_eq!(stat_start_time("4242 (cut"), None);
+        assert_eq!(stat_started(stat), Some((98765, false)));
+        assert_eq!(stat_started(&stat.replace(") S ", ") Z ")), Some((98765, true)), "a state of Z is an exited process");
+        assert_eq!(stat_started("4242 (cut"), None);
+    }
+
+    /// A process that has exited holds its pid until its parent waits for
+    /// it, and its start time still reads until then, with the exit told
+    /// apart: so a tool group whose leader exits before its spawn returns is
+    /// recorded, and a killed harness its parent has not waited for reads as
+    /// gone, not as running. waitid with WNOWAIT returns once the child has
+    /// exited and leaves it unwaited for.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_exited_process_reads_its_start_time_until_it_is_waited_for() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let running = started(child.id());
+        drop(child.stdin.take());
+        let (mut info, options) = (unsafe { std::mem::zeroed::<libc::siginfo_t>() }, libc::WEXITED | libc::WNOWAIT);
+        let exited = match unsafe { libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, options) } {
+            0 => Ok(started(child.id())),
+            _ => Err(io::Error::last_os_error()),
+        };
+        child.wait().unwrap();
+        let start = running.expect("a running process has a start time").0;
+        assert_eq!(running, Some((start, false)), "a running process read as exited");
+        assert_eq!(exited.unwrap(), Some((start, true)), "an exited process its parent has not waited for");
     }
 
     /// The boot's id is what tells a record from an earlier boot apart: it
@@ -2080,26 +2145,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         false
-    }
-
-    /// A record whose owner is gone names groups nothing else will stop:
-    /// each whose leader still runs with the recorded start time is stopped,
-    /// and the record is removed.
-    #[cfg(unix)]
-    #[test]
-    fn a_dead_harness_record_stops_its_groups_and_is_removed() {
-        let (mut group, start) = left_behind_group();
-        let run = run_dir("dead-owner");
-        let record = run.join(format!("{}.groups", dead_pid()));
-        std::fs::write(&record, format!("1\n{} {start}\n", group.id())).unwrap();
-        reap(&run);
-        let stopped = stopped_within(&mut group, Duration::from_millis(500));
-        let _ = group.kill();
-        let (record_kept, run_kept) = (record.exists(), run.exists());
-        let _ = std::fs::remove_dir_all(run.parent().unwrap());
-        assert!(stopped, "the left-behind group is still running");
-        assert!(!record_kept, "the record outlived the reap");
-        assert!(!run_kept, "the run directory the reap emptied outlived it");
     }
 
     /// A dead harness's pid can since be held by another user's process,
@@ -2403,15 +2448,12 @@ mod tests {
         );
     }
 
-    /// kill(-1) signals every process this user may signal, and a group
-    /// signal to this launch's pid, or to the group it runs in, would reach
-    /// this launch: no record line can name any of them, or 0, as a leader.
+    /// kill(-1) signals every process this user may signal, and kill(0)
+    /// this launch's own group: no record line can name either as a leader.
     #[cfg(unix)]
     #[test]
-    fn a_record_never_names_pid_1_0_this_launch_or_its_group_as_a_leader() {
-        let own = std::process::id().to_string();
-        let own_group = unsafe { libc::getpgrp() }.to_string();
-        for text in ["1", "0", "-1", "-42", own.as_str(), own_group.as_str(), "x"] {
+    fn a_record_never_names_pid_1_or_0_as_a_leader() {
+        for text in ["1", "0", "-1", "-42", "x"] {
             assert_eq!(leader_pid(text), None, "{text} was taken as a group leader");
         }
         assert_eq!(leader_pid("42"), Some(42));
@@ -2421,7 +2463,9 @@ mod tests {
     /// A record whose owner pid runs and started when the record says is a
     /// live openmax's: left alone, groups and file, as is one whose first
     /// line is not written yet. The same pid with another start time is a
-    /// process that took a dead harness's pid.
+    /// process that took a dead harness's pid. The first line is the
+    /// owner's start time, then on Linux the boot's id as the kernel gives
+    /// it, and the reap reads it back as written.
     #[cfg(unix)]
     #[test]
     fn a_running_owner_keeps_its_record_and_a_reused_owner_pid_does_not() {
@@ -2431,7 +2475,12 @@ mod tests {
         let mut record = GroupRecord::new(run.join("sub").join(format!("{}.groups", own.0)), own.1);
         record.add(group.id(), start);
         let text = std::fs::read_to_string(&record.path).unwrap();
-        assert_eq!(text, format!("{}\n{} {start}\n", first_line(own.1, boot_id().as_deref()), group.id()));
+        let first = match std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+            Ok(boot) => format!("{} {}", own.1, boot.trim()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => own.1.to_string(),
+            Err(error) => panic!("the boot id: {error}"),
+        };
+        assert_eq!(text, format!("{first}\n{} {start}\n", group.id()));
         reap(record.path.parent().unwrap());
         assert!(!stopped_within(&mut group, Duration::from_millis(50)), "a live owner's group was stopped");
         assert!(record.path.exists(), "a live owner's record was removed");
@@ -2441,13 +2490,13 @@ mod tests {
         reap(creating.parent().unwrap());
         assert!(creating.exists(), "a record its owner may still be writing was removed");
 
-        let reused = run.join(format!("{}.groups", own.0));
-        std::fs::write(&reused, format!("{}\n{} {start}\n", own.1 + 1, group.id())).unwrap();
+        let mut reused = GroupRecord::new(run.join(format!("{}.groups", own.0)), own.1 + 1);
+        reused.add(group.id(), start);
         reap(&run);
         let stopped = stopped_within(&mut group, Duration::from_millis(500));
         let _ = group.kill();
         assert!(stopped, "a record whose owner pid was reused kept its group running");
-        assert!(!reused.exists(), "the reused owner's record outlived the reap");
+        assert!(!reused.path.exists(), "the reused owner's record outlived the reap");
         let _ = std::fs::remove_dir_all(run.parent().unwrap());
     }
 

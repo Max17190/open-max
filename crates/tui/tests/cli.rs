@@ -3438,12 +3438,10 @@ fn a_second_signal_kills_the_tool_tree_on_the_way_out() {
 #[test]
 fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
     let (project, home) = fresh_dirs("record-finished");
-    // A group is recorded only if its leader's start time can still be
-    // read, which on macOS ends as the leader exits, before it is waited
-    // for: the tool waits, up to 5 s, until its group is listed.
-    let tool = r#"i=0; until grep -qs "^$$ " "$HOME"/.openmax/run/*.groups || [ $i -ge 250 ]; do i=$((i+1)); sleep 0.02; done"#;
+    // A leader that has already exited when its spawn returns still has its
+    // start time read, so even a call this short is recorded.
     let (base_url, _requests, _server) = spawn_scripted_server(vec![
-        (sse_tool_call("bash", serde_json::json!({ "command": tool })), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": "true" })), true),
         (sse_text("done"), true),
     ]);
     write_settings_with_mode(&home, &base_url, "auto");
@@ -3504,11 +3502,45 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
 /// its tools, and the tool tree runs on under pid 1. The run keeps a record
 /// of its live tool groups in `~/.openmax/run`, and the next launch (here
 /// `--check`) stops each group a dead run recorded and removes the record.
-/// This tree ignores SIGTERM, so only the SIGKILL after the grace stops it.
 #[test]
 fn the_next_launch_stops_the_tool_tree_a_killed_run_left_behind() {
+    launch_after_a_kill("sigkill-reap", None, &["--check"]);
+}
+
+/// A print run and a stdio session stop the tree as well, and before they
+/// start a session, so before any tool of their own: each here is refused
+/// for a settings flag (`--api-key` beside the provider settings.json
+/// selects), which ends it before any session, and has stopped the tree all
+/// the same.
+#[test]
+fn a_print_run_stops_the_tool_tree_a_killed_run_left_behind_before_its_session() {
+    let provider = Some(r#"{"provider":"p","model":"m"}"#);
+    let print = launch_after_a_kill("sigkill-reap-print", provider, &["--api-key", "sk-k", "-p", "go"]);
+    let stderr = String::from_utf8_lossy(&print.stderr);
+    assert_eq!(print.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--api-key is the key for settings.json's base_url"), "{stderr}");
+}
+
+#[test]
+fn a_stdio_session_stops_the_tool_tree_a_killed_run_left_behind_before_it_starts() {
+    let provider = Some(r#"{"provider":"p","model":"m"}"#);
+    let stdio = launch_after_a_kill("sigkill-reap-stdio", provider, &["--api-key", "sk-k", "--stdio"]);
+    let stderr = String::from_utf8_lossy(&stdio.stderr);
+    assert_eq!(stdio.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--api-key is the key for settings.json's base_url"), "{stderr}");
+}
+
+/// Kill a print run outright once its record lists the group of its `bash`
+/// call, whose tree ignores SIGTERM, so only the SIGKILL after the grace
+/// stops it. Then launch openmax with `next`, on the same home and project
+/// and with `settings` as its settings.json if given, before the killed
+/// run's parent, this test, has waited for it: until then the killed run
+/// holds its pid and its start time, as an exited process. Asserts that the
+/// launch stopped the tree and removed the record and the run directory,
+/// and returns the launch's output.
+fn launch_after_a_kill(tag: &str, settings: Option<&str>, next: &[&str]) -> std::process::Output {
     let ToolTree { mut child, _stdin, pids, base } =
-        start_tool_tree("sigkill-reap", &["--json", "-p", "start the tree"], "trap '' TERM; ");
+        start_tool_tree(tag, &["--json", "-p", "start the tree"], "trap '' TERM; ");
     let home = base.join("home");
     let record = home.join(".openmax").join("run").join(format!("{}.groups", child.id()));
     // The group is recorded just after its spawn returns, which can be after
@@ -3520,11 +3552,20 @@ fn the_next_launch_stops_the_tool_tree_a_killed_run_left_behind() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
-    let _ = child.wait();
+    // Returns once the run has exited, and leaves it unwaited for.
+    let (mut info, options) = (unsafe { std::mem::zeroed::<libc::siginfo_t>() }, libc::WEXITED | libc::WNOWAIT);
+    let exited = match unsafe { libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, options) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    };
     let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
     let survived_the_kill = pids.iter().all(alive);
     let recorded = record.exists();
-    let check = cmd(&base.join("project"), &home).arg("--check").output().unwrap();
+    if let Some(settings) = settings {
+        std::fs::write(home.join(".openmax").join("settings.json"), settings).unwrap();
+    }
+    let launch = cmd(&base.join("project"), &home).args(next).output().unwrap();
+    let _ = child.wait();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while pids.iter().any(alive) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3536,12 +3577,14 @@ fn the_next_launch_stops_the_tool_tree_a_killed_run_left_behind() {
     let record_kept = record.exists();
     let run_kept = record.parent().unwrap().exists();
     let _ = std::fs::remove_dir_all(&base);
-    let stderr = String::from_utf8_lossy(&check.stderr);
+    let stderr = String::from_utf8_lossy(&launch.stderr);
+    assert!(exited.is_ok(), "waitid: {exited:?}");
     assert!(survived_the_kill, "the tool tree did not outlive SIGKILL, so this proves nothing: {pids:?}");
     assert!(recorded, "the killed run left no record of its tool groups at {}", record.display());
     assert!(survivors.is_empty(), "the next launch left the tool tree running: {survivors:?}\n{stderr}");
     assert!(!record_kept, "the record outlived the launch that stopped its groups");
     assert!(!run_kept, "the run directory outlived the launch that emptied it");
+    launch
 }
 
 /// A pid in a dead run's record can since name another process, which the
@@ -3572,8 +3615,9 @@ fn the_next_launch_never_stops_a_process_that_took_a_recorded_pid() {
 
 /// An openmax that a left-behind tool's script starts runs in that tool's
 /// group, which the killed run's record lists. A launch never signals the
-/// group it runs in, which would end it as it starts: it runs to its end,
-/// the tool's group is left running, and the record is removed.
+/// group it runs in, which would end it as it starts: it runs to its end and
+/// leaves the tool's group running with its record in place, so the next
+/// launch outside the group stops it and removes the record.
 #[test]
 fn a_launch_from_a_left_behind_tool_does_not_stop_its_own_group() {
     let preamble = format!(
@@ -3607,14 +3651,23 @@ fn a_launch_from_a_left_behind_tool_does_not_stop_its_own_group() {
     let tree_alive = pids.iter().all(alive);
     let record_kept = record.exists();
     let outside = cmd(&base.join("project"), &home).arg("--check").output().unwrap();
-    for pid in &pids {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while pids.iter().any(alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let survivors: Vec<i32> = pids.iter().copied().filter(alive).collect();
+    for pid in &survivors {
         unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
+    let record_left = record.exists();
     let _ = std::fs::remove_dir_all(&base);
+    let stderr = String::from_utf8_lossy(&outside.stderr);
     assert!(recorded, "the killed run left no record of its tool groups at {}", record.display());
     assert_eq!(status.trim(), outside.status.code().unwrap().to_string(), "the launch inside the tool's group");
     assert!(tree_alive, "a launch stopped the group it runs in: {pids:?}");
-    assert!(!record_kept, "the record outlived the launch that read it");
+    assert!(record_kept, "the launch inside the tool's group removed the record that lists it");
+    assert!(survivors.is_empty(), "the launch outside the group left the tool tree running: {survivors:?}\n{stderr}");
+    assert!(!record_left, "the record outlived the launch that stopped its groups");
 }
 
 /// A consumer that stops reading leaves the run blocked in a write to a full

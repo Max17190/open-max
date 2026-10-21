@@ -155,30 +155,32 @@ is cut back to its first line the next time a group ends with no other
 running. An exit that leaves no tool running removes it, and the `run`
 directory once no other record is left there. A launch reads every record
 whose owner pid no process of the same user holds (none does, or another
-user's does) or names a process started at another time, and sends each group
-the record still lists whose leader runs with its recorded start time SIGTERM,
-then SIGKILL if the group is still there 250 ms later, before it starts
-anything. Neither signal goes to a group whose leader pid has since been
-taken by a process started at another time, and none goes to a group once it
-has been seen gone, since its id can then name another. It then removes those
-records, and the `run` directory once no record is left there. On Linux,
-where start times count from boot, a record's first line also carries the
-boot's id, and a record from an earlier boot is removed with nothing
-signalled. A record a running openmax owns is left alone, and so is that of a
-killed openmax whose parent has not yet waited for it, since it still holds
-its pid: the first launch after that wait stops its tools. A launch never
-signals the group it runs in: an openmax that a left-behind tool's script
-starts leaves that tool's group running, and removes the record. A group is
-recorded just after its spawn has returned, when its command has already
-started, so a SIGKILL in that moment leaves it unrecorded, and a home where
-the record cannot be written (read-only, or on a full disk) records nothing
-while it stays so. No tool and no exit waits on the record's file, as a home
-whose file server stopped answering would make them: one thread makes every
-write to it, and an exit waits at most 100 ms for that thread to remove it.
-The next launch removes a record so left, finding the groups it lists gone. A
-sub-agent openmax among the tools that the SIGKILL ends before it has stopped
-its own tools leaves them to the launch after. A group whose leader had exited
-before the launch, and a process that left its tool's group, are not stopped.
+user's does), or names a process that has exited or started at another time,
+and sends each group the record still lists whose leader still has its
+recorded start time SIGTERM, then SIGKILL if the group is still there 250 ms
+later, before it starts anything. Neither signal goes to a group whose leader
+pid has since been taken by a process started at another time, and none goes
+to a group once it has been seen gone, since its id can then name another. It
+then removes those records, and the `run` directory once no record is left
+there. On Linux, where start times count from boot, a record's first line also
+carries the boot's id, and a record from an earlier boot is removed with
+nothing signalled. A record a running openmax owns is left alone. A killed
+openmax holds its pid until its parent waits for it, and a launch stops its
+tools before that wait too. A launch never signals the group it runs in: an
+openmax that a left-behind tool's script starts leaves that tool's group
+running and, while the group's leader runs, its record in place, so the next
+launch outside that group stops it. A group is recorded just after its spawn
+has returned, when its command has already started, so a SIGKILL in that
+moment leaves it unrecorded, and a home where the record cannot be written
+(read-only, or on a full disk) records nothing while it stays so. No tool and
+no exit waits on the record's file, as a home whose file server stopped
+answering would make them: one thread, started by the first tool or hook a
+launch runs, makes every write to it, and an exit waits at most 100 ms for
+that thread to remove it. The next launch removes a record so left, finding
+the groups it lists gone. A sub-agent openmax among the tools that the SIGKILL
+ends before it has stopped its own tools leaves them to the launch after. A
+group whose leader had exited and been waited for before the launch, and a
+process that left its tool's group, are not stopped.
 Nor are the tools of an openmax in another pid namespace that shares the home
 directory, as a container with the home mounted does: a launch outside it
 takes its records for a dead openmax's and removes them. While a
