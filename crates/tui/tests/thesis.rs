@@ -433,6 +433,166 @@ fn whole_suite_runs_in_five_seconds() {
     assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
 }
 
+/// The core, production Rust without its tests, is about 37,000 lines.
+/// scripts/count-core-lines.sh measures it as core-excluding-tests (the
+/// lines of crates/*/src less test-only items, by the method its header
+/// states) beside total-including-tests (every line of Rust under crates/),
+/// so a test's lines count toward the second wherever they sit and toward
+/// the first nowhere. The target is not met yet, so this prints it beside
+/// both numbers and holds the ratchet: core-excluding-tests at most RATCHET,
+/// the count this test last measured plus MARGIN, and at least that count. A
+/// change that needs more raises RATCHET in its own diff and says why; one
+/// that removes production lines must lower it to its new count plus MARGIN,
+/// so the lines it saves stay saved. A count, so every build asserts it.
+///
+/// First the script is held to a fixture checkout
+/// (crates/tui/tests/fixtures/count-core-lines.txt) whose every source line
+/// is marked counted or excluded: a test module in the middle of a file with
+/// production code after it, brackets and attribute text inside strings, raw
+/// strings, chars and comments, each kind of test-only item, field,
+/// parameter, match arm and statement the script's header names, each with
+/// production code after it, `cfg` forms that do and do not need `test`, and
+/// test-only module files where rustc finds them. Its whole report on the
+/// fixture must match the marks, the excluded lines included. Then a
+/// test-only item the script cannot bound must stop the count with an error
+/// that names its line, whatever follows it.
+#[test]
+fn core_source_stays_under_its_line_budget() -> Result<(), String> {
+    const TARGET: usize = 37_000;
+    // core-excluding-tests measured at 41,433 lines, plus MARGIN.
+    const RATCHET: usize = 41_633;
+    const MARGIN: usize = 200;
+    let gauge = |checkout: &Path, excluded: bool| -> Result<String, String> {
+        let mut gauge = Command::new(repo().join("scripts/count-core-lines.sh"));
+        if excluded {
+            gauge.arg("--excluded");
+        }
+        let out = gauge.arg(checkout).output().map_err(|e| format!("count-core-lines.sh did not run: {e}"))?;
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.status.success() {
+            return Err(format!("count-core-lines.sh failed: {report}{}", String::from_utf8_lossy(&out.stderr)));
+        }
+        Ok(report)
+    };
+
+    // The fixture's files, each with its text and its lines marked excluded.
+    let fixture = std::fs::read_to_string(repo().join("crates/tui/tests/fixtures/count-core-lines.txt")).unwrap();
+    let mut files: Vec<(String, String, Vec<usize>)> = Vec::new();
+    for line in fixture.lines().skip_while(|line| !line.starts_with("== ")) {
+        if let Some(path) = line.strip_prefix("== ") {
+            files.push((path.to_string(), String::new(), Vec::new()));
+            continue;
+        }
+        let (path, text, excluded) = files.last_mut().unwrap();
+        let mut body = line;
+        if path.contains("/src/") {
+            let marked = |mark: char| line.strip_prefix(mark).filter(|rest| rest.is_empty() || rest.starts_with(' '));
+            if let Some(rest) = marked('-') {
+                excluded.push(text.lines().count() + 1);
+                body = rest;
+            } else {
+                body = marked('+').unwrap_or_else(|| panic!("a source line in the fixture is not marked: {line:?}"));
+            }
+            body = body.strip_prefix(' ').unwrap_or(body);
+        }
+        text.push_str(body);
+        text.push('\n');
+    }
+    files.sort();
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("openmax-line-gauge-{}-{nonce}", std::process::id()));
+    // The report the marks call for: each run of excluded lines, then a row
+    // per crate and the total.
+    let (mut expected, mut rows) = (String::new(), std::collections::BTreeMap::<&str, (usize, usize)>::new());
+    for (path, text, excluded) in &files {
+        let file = dir.join("marked").join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+        let row = rows.entry(path.split('/').nth(1).unwrap()).or_default();
+        // A crate's build output counts toward nothing.
+        if path.split('/').nth(2) == Some("target") {
+            continue;
+        }
+        row.1 += text.lines().count();
+        if !path.contains("/src/") {
+            continue;
+        }
+        row.0 += text.lines().count() - excluded.len();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &line in excluded {
+            match runs.last_mut() {
+                Some(run) if run.1 + 1 == line => run.1 = line,
+                _ => runs.push((line, line)),
+            }
+        }
+        for (first, last) in runs {
+            expected.push_str(&format!("{path}:{first}-{last}\n"));
+        }
+    }
+    let (core, total) = rows.values().fold((0, 0), |sum, row| (sum.0 + row.0, sum.1 + row.1));
+    for (name, (core, total)) in rows.into_iter().chain([("TOTAL", (core, total))]) {
+        expected.push_str(&format!("{name:<6} core-excluding-tests={core:<6} total-including-tests={total}\n"));
+    }
+    // A test-only item the gauge cannot bound must stop the count at its
+    // line, whatever follows it, rather than take the code after it for test
+    // code: an unstable `macro` definition, read as an expression, an
+    // unstable `auto trait`, read as an item that ends at its `;`, and an `if`
+    // whose condition has a brace right after `>`, which can close generic
+    // arguments or compare.
+    let unknown = [
+        ("macro probe() {}", "fn after() {}"),
+        ("macro probe() {}", "#[inline]\n    fn after() {}"),
+        ("macro probe() {}", "/// After.\n    fn after() {}"),
+        ("macro probe() {}", "{}"),
+        ("unsafe auto trait Probe {}", "fn after() {}"),
+        ("if 2 > { 1 } {}", "fn after() {}"),
+    ];
+    for (n, (item, after)) in unknown.iter().enumerate() {
+        let src = dir.join(format!("unknown{n}/crates/gamma/src"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), format!("pub fn kept() {{\n    #[cfg(test)]\n    {item}\n    {after}\n}}\n")).unwrap();
+    }
+    let report = gauge(&dir.join("marked"), true);
+    let stops: Vec<_> = (0..unknown.len()).map(|n| gauge(&dir.join(format!("unknown{n}")), false)).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(report?, expected, "the gauge's report on its fixture differs from the fixture's marks");
+    for ((item, after), stop) in unknown.iter().zip(stops) {
+        let Err(stop) = stop else { panic!("the gauge counted past `{item}` before `{after}`") };
+        assert!(
+            stop.contains("crates/gamma/src/lib.rs:2: cannot tell where this test-only item ends"),
+            "the gauge stopped without naming the item: {stop}"
+        );
+    }
+
+    let report = gauge(&repo(), false)?;
+    let count = |name: &str| -> usize {
+        report
+            .lines()
+            .find(|line| line.starts_with("TOTAL "))
+            .and_then(|row| row.split_whitespace().find_map(|field| field.strip_prefix(name)?.parse().ok()))
+            .unwrap_or_else(|| panic!("no total {name} in the gauge's report: {report}"))
+    };
+    let (core, total) = (count("core-excluding-tests="), count("total-including-tests="));
+    println!("core source: {core} lines excluding tests (ratchet {RATCHET}, target {TARGET}), {total} including tests");
+    assert!(
+        core <= RATCHET,
+        "core-excluding-tests is {core}, {} over its ratchet of {RATCHET}: trim it, or raise RATCHET to {} in this \
+         change and say why (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
+        core - RATCHET,
+        core + MARGIN
+    );
+    // Lines a change removes stay removed: it lowers RATCHET with them, so a
+    // later change cannot spend them without raising RATCHET and saying why.
+    assert!(
+        core + MARGIN >= RATCHET,
+        "core-excluding-tests is {core}, {} under the count RATCHET was set from: lower RATCHET to {} in this change",
+        RATCHET - MARGIN - core,
+        core + MARGIN
+    );
+    Ok(())
+}
+
+/// Cold start to the first painted frame under one millisecond.
 /// The thesis claims are gated in CI: every thesis test runs there in
 /// release and fails the pull request, but for the ones a runner reports. A
 /// test that times the harness asserts its bound only in a release build,
