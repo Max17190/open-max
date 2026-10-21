@@ -5,6 +5,13 @@
 //! index, and the tools trailer. `system_prompt_with_breakdown` reports the
 //! size of each, which is what `/context` and `--spec usage` show.
 //!
+//! A session builds its prompt once, at creation (again only at `/reload`),
+//! and persists it with a `PromptIndex` of what its index shows. What the
+//! session's tool files, skills, memories, and `AGENTS.md` change after that
+//! rides `trailing_note`, sent after the history of each request and never
+//! persisted, so a capability the agent writes moves no byte of the prompt
+//! or of the tools array.
+//!
 //! Every variable-length component is capped in bytes (`AGENTS.md` 2,000, the
 //! layout map 1,200 at depth 2, skills 3,000) and says so when it truncates.
 //! Without caps the prompt would grow with the repository, and this text is
@@ -17,9 +24,11 @@
 //! formats, and activation rules live in `spec` and cost nothing until the
 //! agent asks for them.
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::registry::Registry;
+use crate::registry::{Registry, ToolKind};
 use crate::skills::SkillSpec;
 
 /// AGENTS.md content is user-authored instructions; cap it so a sprawling
@@ -42,6 +51,29 @@ const MAX_SKILL_NAME_SHOWN: usize = 64;
 /// parser so a resumed session recognizes exactly the section it carries.
 const MEMORY_SECTION_HEADER: &str =
     "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n";
+/// The skills section's header. The trailing note reuses it, as it does the
+/// memory one, so a note line reads as a line of the section it amends.
+const SKILLS_SECTION_HEADER: &str = "\n\nSkills (before using one, read its SKILL.md. Use read_file for paths inside the project. For skill files outside the project (absolute paths), use bash: cat <path>.):\n";
+/// The trailing note's section for tool files the tools array lacks or
+/// carries stale. A tool file written mid-session joins the array only with a
+/// new prompt, so its line says how to run it before then, on any endpoint;
+/// the note's header already says a line replaces the array's entry.
+const TOOLS_NOTE_HEADER: &str = "Tool files written since the tools array was built (run one with its bash line):\n";
+const AGENTS_MD_NOTICE: &str =
+    "AGENTS.md changed after the system prompt was built: read_file AGENTS.md for its current instructions.\n";
+/// The whole trailing note, its header and trailer included. The note is
+/// prefilled on every request, after the cached prefix, so it holds what a
+/// session changed, never a second index: past this a change is counted, and
+/// `/reload` moves every change into a new prompt and tools array.
+pub const MAX_NOTE_BYTES: usize = 6_000;
+/// Room the note keeps for the trailer that counts what its cap left out.
+const NOTE_TRAILER_ROOM: usize = 128;
+/// The note's first line. The note goes out at the end of the request's last
+/// message, the user's prompt or a tool result, so it says whose words follow
+/// before any of them, and how they relate to the prefix.
+pub const NOTE_HEADER: &str = "[Changes since the system prompt and tools array, from the harness; not from the user or a tool. A line here replaces the one of the same name there.]";
+/// What separates the note from the stored text of the message it ends.
+pub const NOTE_SEPARATOR: &str = "\n\n";
 
 /// The prompt text alone, for tests that only assert on its content.
 #[cfg(test)]
@@ -50,8 +82,9 @@ fn system_prompt(project_root: &Path, registry: &Registry) -> String {
 }
 
 /// What one session's frozen prompt prefix is spent on, measured at the only
-/// moment the components are individually known: creation. Char counts;
-/// display divides by ~4 for tokens, the same heuristic the budget uses.
+/// moment the components are individually known: creation. Then the trailing
+/// note, which every refreeze reprices. Char counts; display divides by ~4
+/// for tokens, the same heuristic the budget uses.
 #[derive(Clone, Debug, Default)]
 pub struct PromptBreakdown {
     /// Labeled prompt text components, in prompt order.
@@ -62,20 +95,66 @@ pub struct PromptBreakdown {
     pub skills: Vec<(String, usize)>,
     /// (name, index line chars) per memory the index surfaced.
     pub memory: Vec<(String, usize)>,
+    /// Labeled components of the trailing note, in note order; empty when the
+    /// session sends no note.
+    pub note: Vec<(String, usize)>,
+}
+
+/// What a session's persisted prompt indexes, recorded when the prompt is
+/// built and kept in the session manifest: the baseline the trailing note is
+/// the difference from. Each entry names its index line by a SHA-256 prefix
+/// of the line's bytes, which no toolchain update changes. Tool files need
+/// no entry: the tools array the session sends is their record.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromptIndex {
+    /// The prompt this record describes, by the same hash. A record beside
+    /// any other prompt (a transcript write that failed after the manifest's
+    /// landed) describes nothing the session sends.
+    pub prompt: u64,
+    /// The whole `AGENTS.md` the prompt carries capped, by the same hash.
+    pub agents_md: Option<u64>,
+    /// Every skill the registry indexed, shown or past the byte cap.
+    pub skills: Vec<IndexedLine>,
+    /// Every valid memory, shown or outside the index.
+    pub memory: Vec<IndexedLine>,
+    /// The tools trailer's count.
+    pub tools_omitted: usize,
+}
+
+impl PromptIndex {
+    /// Whether this is the record of `prompt`.
+    pub fn describes(&self, prompt: &str) -> bool {
+        self.prompt == line_id(prompt)
+    }
+}
+
+/// One entry the prompt's index knew: its name, its line's hash, and whether
+/// the prompt shows the line. An entry it knew but did not show is recorded
+/// too, so a note tells an edit from a move in or out of the index, which
+/// is not a change.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndexedLine {
+    pub name: String,
+    pub line: u64,
+    pub shown: bool,
+    /// The line's length in bytes: what the prompt pays for it when shown.
+    pub bytes: usize,
 }
 
 impl PromptBreakdown {
     /// For resumed sessions the persisted prompt is one opaque string; the
-    /// per-tool/skill split still comes from the frozen registry, and the
-    /// memory rows come from the registry's frozen row channel, recorded by
-    /// the same freeze that wrote the prompt. They are
+    /// per-tool split comes from the tools array the session sends, the
+    /// skill rows from the prompt's record (`PromptIndex`), and the memory
+    /// rows from the registry's frozen row channel, each recorded by the same
+    /// freeze that wrote the prompt. They are
     /// deliberately NOT parsed back out of the prompt: filenames and other
     /// author-controlled bytes are rendered into later sections, so any
     /// content-based reconstruction is forgeable;
     /// and re-scanning disk would price TODAY'S selection rather than the
     /// lines the prefix actually pays for. A manifest predating the row
-    /// field reads as version-absent and refreezes, so the channel is Some
-    /// on every live path; empty means the freeze indexed no memories.
+    /// field reads as version-absent, and hydration rebuilds the prompt
+    /// instead, so the channel is Some on every live path; empty means the
+    /// freeze indexed no memories.
     pub fn from_persisted(prompt: &str, registry: &Registry, project_root: &Path) -> Self {
         let mut breakdown = Self {
             components: vec![("system prompt (persisted)".into(), prompt.len())],
@@ -83,20 +162,46 @@ impl PromptBreakdown {
         };
         breakdown.add_registry(registry, project_root);
         breakdown.memory = registry.frozen_memory_rows.clone().unwrap_or_default();
+        // A refreeze moves the generation and leaves the prompt, so the
+        // record of this prompt prices its skill rows when the registry
+        // carries it: the lines the prompt shows, not the ones the
+        // generation's skills would show now.
+        if registry.prompt_index.describes(prompt) {
+            breakdown.skills = registry
+                .prompt_index
+                .skills
+                .iter()
+                .map(|entry| (entry.name.clone(), if entry.shown { entry.bytes } else { 0 }))
+                .collect();
+        }
         breakdown
     }
 
+    /// The same prompt priced with `note` as the trailing note's components:
+    /// a refreeze changes the note and nothing else this prices.
+    pub(crate) fn with_note(&self, note: Vec<(String, usize)>) -> Self {
+        Self { note, ..self.clone() }
+    }
+
     fn add_registry(&mut self, registry: &Registry, project_root: &Path) {
-        if let Some(entries) = registry.tool_schemas_json().as_array() {
-            for (entry, spec) in entries.iter().zip(&registry.tools) {
-                let external = !matches!(spec.kind, crate::registry::ToolKind::Builtin);
-                self.tools.push((spec.name.clone(), entry.to_string().len(), external));
-            }
+        // Each entry of the array the session sends, by its own name: after a
+        // refreeze that array is the one the prompt was built with, not the
+        // generation's tool list, so the two are not zipped.
+        for entry in registry.tool_schemas_json().as_array().into_iter().flatten() {
+            let name = crate::registry::entry_name(entry);
+            let external = !crate::tools::TOOL_NAMES.contains(&name);
+            self.tools.push((name.to_string(), entry.to_string().len(), external));
         }
         // The per-skill cost is what the section actually carries: the index
         // line for a skill under the byte cap, nothing for one past it.
         self.skills = skill_index_costs(project_root, &registry.skills);
     }
+}
+
+/// The prompt a new session would freeze, and what it costs.
+pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
+    let (prompt, breakdown, _) = session_prompt(project_root, registry);
+    (prompt, breakdown)
 }
 
 /// System prompt: short, imperative, explicit about tool use, and every line
@@ -109,8 +214,9 @@ impl PromptBreakdown {
 /// prefix stays byte-stable across every turn, which is what keeps the
 /// server-side prompt cache warm. Without the map, a session typically opens
 /// with two or three list_dir/glob calls just to learn the layout, and each
-/// of those is a full prefill+decode round trip.
-pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
+/// of those is a full prefill+decode round trip. The record it returns is
+/// what the index shows, read from the same scans as the text.
+pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown, PromptIndex) {
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
     // Tool-specific guidance lives in each tool's schema description (which
@@ -134,30 +240,17 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         prompt.push_str(SELF_EXTENSION);
         breakdown.components.push(("self-extension guide".into(), prompt.len() - before));
     }
-    if let Some(instructions) = agents_md(project_root) {
+    let instructions = agents_md(project_root);
+    if let Some(instructions) = &instructions {
         let before = prompt.len();
         prompt.push_str("\n\nProject instructions (AGENTS.md):\n");
-        prompt.push_str(&instructions);
+        prompt.push_str(&capped_agents_md(instructions));
         breakdown.components.push(("AGENTS.md".into(), prompt.len() - before));
     }
     // The memory index rides the frozen prefix like the skills index: a line
     // per surfaced fact, bodies loaded on demand, nothing when the project
     // has no live memories so the zero-cost invariant holds.
-    // Prefer the section captured in the registry's own freeze scan, so the
-    // frozen prompt and the refreeze receipt describe the same memory
-    // selection (two separate scans could diverge). The signal is
-    // `memory_scanned` - whether THIS registry ran a scan - not whether the
-    // scan found anything: a freeze that scanned and found no memories
-    // captures `memory_section = None`, and rescanning there would re-inject a
-    // memory written after the freeze while the receipt reports no change. A
-    // registry that never scanned (builtin-only, or restored from a manifest,
-    // which keeps memory_files for the resume delta but captured no section)
-    // scans fresh, or a resumed session would render no memory index at all.
-    let memory = if registry.memory_scanned {
-        registry.memory_section.clone()
-    } else {
-        crate::memory::index_section(project_root, crate::memory::unix_now())
-    };
+    let (memory, memory_lines) = memory_index(project_root, registry);
     if let Some((index, rows)) = memory {
         let before = prompt.len();
         prompt.push_str(MEMORY_SECTION_HEADER);
@@ -173,21 +266,306 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
     }
     if let Some(skills) = skills_section(project_root, &registry.skills, registry.skills_omitted) {
         let before = prompt.len();
-        prompt.push_str("\n\nSkills (before using one, read its SKILL.md. Use read_file for paths inside the project. For skill files outside the project (absolute paths), use bash: cat <path>.):\n");
+        prompt.push_str(SKILLS_SECTION_HEADER);
         prompt.push_str(&skills);
         breakdown.components.push(("skills index".into(), prompt.len() - before));
     }
     if registry.tools_omitted > 0 {
         let before = prompt.len();
-        prompt.push_str(&format!(
-            "\n\n… {} more tools were discovered but not loaded ({}-tool cap): consolidate or delete files in .openmax/tools and ~/.openmax/tools; openmax --check names them.\n",
-            registry.tools_omitted,
-            crate::registry::MAX_EXTERNAL_TOOLS,
-        ));
+        prompt.push_str("\n\n");
+        prompt.push_str(&tools_trailer(registry.tools_omitted));
         breakdown.components.push(("tools trailer".into(), prompt.len() - before));
     }
     breakdown.add_registry(registry, project_root);
-    (prompt, breakdown)
+    let index = PromptIndex {
+        prompt: line_id(&prompt),
+        agents_md: instructions.as_deref().map(line_id),
+        skills: indexed(skill_lines(project_root, &registry.skills)),
+        memory: indexed(memory_lines),
+        tools_omitted: registry.tools_omitted,
+    };
+    (prompt, breakdown, index)
+}
+
+/// Freeze a new prompt for `registry`, as session creation and `/reload` do:
+/// the prompt, its record and the memory rows it carries installed on the
+/// registry, and the note against it (none, unless a file changed between
+/// the two reads), with one breakdown pricing both.
+pub fn session_context(project_root: &Path, registry: &mut Registry) -> (String, Option<String>, PromptBreakdown) {
+    let (prompt, mut breakdown, index) = session_prompt(project_root, registry);
+    registry.prompt_index = std::sync::Arc::new(index);
+    registry.frozen_memory_rows = Some(breakdown.memory.clone());
+    let (note, components) = trailing_note(project_root, registry);
+    breakdown.note = components;
+    (prompt, note, breakdown)
+}
+
+/// The trailing note for one generation: what its tool files, skills,
+/// memories, and `AGENTS.md` change against the prefix the session sends,
+/// the tools array the registry carries and the prompt its `prompt_index`
+/// records. Rebuilt when the registry is, and sent after the history on every
+/// request. None when nothing changed, so a session that writes no
+/// capability pays nothing. Returns the note's labeled components, which
+/// price every byte of it, for `/context`.
+pub fn trailing_note(project_root: &Path, registry: &Registry) -> (Option<String>, Vec<(String, usize)>) {
+    note_with_memory(project_root, registry, memory_index(project_root, registry).1)
+}
+
+/// The trailing note with memory read from disk now instead of from the
+/// generation's own scan. A memory written with the file tools changes no
+/// extension byte, so no refreeze follows it; without this the note, sent
+/// after the history as the harness's account of what changed, would go on
+/// presenting the line the write replaced.
+pub fn note_after_memory_write(project_root: &Path, registry: &Registry) -> (Option<String>, Vec<(String, usize)>) {
+    let scan = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
+    note_with_memory(project_root, registry, scan.lines)
+}
+
+/// The note for `registry`'s generation with `memory` as every valid
+/// memory's (name, index line, indexed).
+fn note_with_memory(
+    project_root: &Path,
+    registry: &Registry,
+    memory: Vec<(String, String, bool)>,
+) -> (Option<String>, Vec<(String, usize)>) {
+    let index = &registry.prompt_index;
+    let mut note = Note::new();
+    let (tools, removed) = changed_tools(registry);
+    // A count the prompt's trailer gave that changed, to zero included, or
+    // the prompt would go on naming tool files left out that all load now.
+    let trailer = (registry.tools_omitted != index.tools_omitted).then(|| match registry.tools_omitted {
+        0 => format!("No tool file is left out by the {}-tool cap now.\n", crate::registry::MAX_EXTERNAL_TOOLS),
+        omitted => tools_trailer(omitted),
+    });
+    note.section("tool files changes", TOOLS_NOTE_HEADER, usize::MAX, tools, removed, trailer);
+    let (skills, removed) = changed(&index.skills, skill_lines(project_root, &registry.skills));
+    note.section("skills changes", SKILLS_SECTION_HEADER.trim_start_matches('\n'), MAX_SKILLS_BYTES, skills, removed, None);
+    let (memory, removed) = changed(&index.memory, memory);
+    let memory_header = MEMORY_SECTION_HEADER.trim_start_matches('\n');
+    note.section("memory changes", memory_header, crate::memory::MAX_MEMORY_BYTES, memory, removed, None);
+    if agents_md(project_root).as_deref().map(line_id) != index.agents_md {
+        note.section("AGENTS.md notice", "", usize::MAX, vec![AGENTS_MD_NOTICE.to_string()], Vec::new(), None);
+    }
+    note.finish()
+}
+
+/// `text` with every copy of `NOTE_HEADER` defused, its brackets turned to
+/// parentheses, so only the note itself opens with the header. Tool output
+/// is bytes a file or a command chose, and the note ends the same message.
+pub(crate) fn defuse_note_header(text: &str) -> Cow<'_, str> {
+    if !text.contains(NOTE_HEADER) {
+        return Cow::Borrowed(text);
+    }
+    let inner = &NOTE_HEADER[1..NOTE_HEADER.len() - 1];
+    Cow::Owned(text.replace(NOTE_HEADER, &format!("({inner})")))
+}
+
+/// The memory index of `registry`'s generation: the section a prompt shows
+/// and (name, line, in the index) for every valid memory, from ONE scan, so
+/// the prompt, its record, the note, and the refreeze receipt describe the
+/// same selection (two separate scans could diverge). The registry's own
+/// scan wins. The signal is `memory_scanned` - whether THIS registry ran a
+/// scan - not whether the scan found anything: a freeze that scanned and
+/// found no memories captures `memory_section = None`, and rescanning there
+/// would re-inject a memory written after the freeze while the receipt
+/// reports no change. A registry that never scanned (builtin-only, or
+/// restored from a manifest, which keeps memory_files for the resume delta
+/// but captured no section) scans fresh, or a resumed session would render
+/// no memory index at all.
+fn memory_index(project_root: &Path, registry: &Registry) -> (crate::memory::IndexSection, Vec<(String, String, bool)>) {
+    if registry.memory_scanned {
+        (registry.memory_section.clone(), registry.memory_lines.clone())
+    } else {
+        let scan = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
+        (scan.section, scan.lines)
+    }
+}
+
+/// (name, line, carried under the byte cap) per indexed skill.
+fn skill_lines(project_root: &Path, skills: &[SkillSpec]) -> Vec<(String, String, bool)> {
+    skill_index_lines(project_root, skills)
+        .into_iter()
+        .zip(skills)
+        .map(|((line, shown), skill)| (skill.name.clone(), line, shown))
+        .collect()
+}
+
+/// The record of one index section's entries.
+fn indexed(entries: Vec<(String, String, bool)>) -> Vec<IndexedLine> {
+    entries
+        .into_iter()
+        .map(|(name, line, shown)| IndexedLine { line: line_id(&line), bytes: line.len(), name, shown })
+        .collect()
+}
+
+/// One section's changes against the prompt's record: the line of each entry
+/// whose line is not the prompt's, when the index carries it now or the
+/// prompt showed the old one, and the names the prompt showed that are gone.
+/// An entry that only moved in or out of the index is not a change.
+fn changed(before: &[IndexedLine], now: Vec<(String, String, bool)>) -> (Vec<String>, Vec<String>) {
+    let was: HashMap<&str, &IndexedLine> = before.iter().map(|entry| (entry.name.as_str(), entry)).collect();
+    let mut present = HashSet::new();
+    let mut lines = Vec::new();
+    for (name, line, indexed) in now {
+        match was.get(name.as_str()) {
+            Some(entry) if entry.line == line_id(&line) => {}
+            Some(entry) if indexed || entry.shown => lines.push(line),
+            None if indexed => lines.push(line),
+            _ => {}
+        }
+        present.insert(name);
+    }
+    let removed = before
+        .iter()
+        .filter(|entry| entry.shown && !present.contains(&entry.name))
+        .map(|entry| entry.name.chars().take(MAX_SKILL_NAME_SHOWN).collect())
+        .collect();
+    (lines, removed)
+}
+
+/// The tool files the tools array the session sends does not carry as they
+/// are now: the line of each one the array lacks, or carries with another
+/// name, description, or schema, and the names of the tool files the array
+/// carries that no longer load. Both in a stable order, the generation's and
+/// the array's.
+fn changed_tools(registry: &Registry) -> (Vec<String>, Vec<String>) {
+    let sent: Vec<&serde_json::Value> = registry
+        .tool_schemas_json()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| !crate::tools::TOOL_NAMES.contains(&crate::registry::entry_name(entry)))
+        .collect();
+    let lines = registry
+        .tools
+        .iter()
+        .filter_map(|spec| match &spec.kind {
+            ToolKind::External(ext) => Some((spec, ext)),
+            ToolKind::Builtin => None,
+        })
+        .filter(|(spec, _)| {
+            let entry = crate::registry::schema_entry(spec);
+            !sent.iter().any(|carried| **carried == entry)
+        })
+        .map(|(spec, ext)| tool_line(spec, ext))
+        .collect();
+    let removed = sent
+        .iter()
+        .map(|entry| crate::registry::entry_name(entry))
+        .filter(|name| registry.get(name).is_none())
+        .map(str::to_string)
+        .collect();
+    (lines, removed)
+}
+
+/// A tool file's line in the note: its name, its description, its `params`
+/// schema as compact JSON, and the bash command that runs it the way the
+/// harness does, `command` with `args` in the project root and the JSON
+/// arguments on stdin as one line. That works on every endpoint, which a
+/// call by a name the request's tools array does not declare may not.
+/// `printf` and not `echo`: the bash tool falls back to `/bin/sh`, whose
+/// `echo` can rewrite the backslash escapes a JSON string carries. A tool
+/// file allowed longer than a bash call's default gets its own limit as the
+/// call's `timeout_secs`, or bash would stop it sooner than the harness does.
+fn tool_line(spec: &crate::registry::ToolSpec, ext: &crate::registry::ExternalTool) -> String {
+    let timeout = if ext.timeout_secs > crate::tools::BASH_DEFAULT_TIMEOUT_SECS {
+        format!(", timeout_secs {}", ext.timeout_secs)
+    } else {
+        String::new()
+    };
+    format!(
+        "- {}: {} {}; bash{timeout}: printf '%s\\n' '<JSON arguments>' | {}\n",
+        spec.name,
+        crate::text::one_line(&spec.description),
+        spec.parameters,
+        ext.command_line()
+    )
+}
+
+/// The trailing note as it is assembled: the header, then each section after
+/// one blank line, every line whole, under its section's cap and the note's.
+struct Note {
+    text: String,
+    components: Vec<(String, usize)>,
+    left: usize,
+    dropped: usize,
+}
+
+impl Note {
+    fn new() -> Self {
+        Self {
+            text: NOTE_HEADER.into(),
+            components: vec![("note header".into(), NOTE_HEADER.len())],
+            left: MAX_NOTE_BYTES - NOTE_HEADER.len() - NOTE_TRAILER_ROOM,
+            dropped: 0,
+        }
+    }
+
+    /// The gap before the next section: one blank line after a body, which
+    /// ends its own last line, or after the header, which does not.
+    fn gap(&self) -> &'static str {
+        if self.text.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        }
+    }
+
+    /// A section of every line that fits, the removals and the trailer after
+    /// the changed lines; one that does not fit is counted for the trailer.
+    fn section(&mut self, label: &str, header: &str, cap: usize, lines: Vec<String>, removed: Vec<String>, trailer: Option<String>) {
+        let removed = (!removed.is_empty()).then(|| format!("Removed: {}\n", removed.join(", ")));
+        let gap = self.gap();
+        let mut room = self.left.saturating_sub(gap.len() + header.len()).min(cap);
+        let mut body = String::new();
+        for line in lines.into_iter().chain(removed).chain(trailer) {
+            if line.len() <= room {
+                room -= line.len();
+                body.push_str(&line);
+            } else {
+                self.dropped += 1;
+            }
+        }
+        if body.is_empty() {
+            return;
+        }
+        let piece = format!("{gap}{header}{body}");
+        self.left -= piece.len();
+        self.text.push_str(&piece);
+        self.components.push((label.into(), piece.len()));
+    }
+
+    /// The note, or None when no section has anything to say.
+    fn finish(mut self) -> (Option<String>, Vec<(String, usize)>) {
+        if self.dropped > 0 {
+            let piece = format!(
+                "{}… {} more changes past the note's {MAX_NOTE_BYTES}-byte cap (ls .openmax/tools .agents/skills .openmax/memory)\n",
+                self.gap(),
+                self.dropped
+            );
+            self.text.push_str(&piece);
+            self.components.push(("note trailer".into(), piece.len()));
+        }
+        if self.components.len() == 1 {
+            return (None, Vec::new());
+        }
+        (Some(self.text), self.components)
+    }
+}
+
+/// An index line's name in a `PromptIndex`: the first 8 bytes of its SHA-256.
+fn line_id(line: &str) -> u64 {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(line.as_bytes());
+    u64::from_le_bytes(digest[..8].try_into().expect("a SHA-256 digest is 32 bytes"))
+}
+
+/// The tools trailer: the tool files the load cap kept out, never silently.
+fn tools_trailer(omitted: usize) -> String {
+    format!(
+        "… {omitted} more tools were discovered but not loaded ({}-tool cap): consolidate or delete files in .openmax/tools and ~/.openmax/tools; openmax --check names them.\n",
+        crate::registry::MAX_EXTERNAL_TOOLS,
+    )
 }
 
 /// The extension pointer, paid in every frozen prompt: which surfaces exist
@@ -297,22 +675,27 @@ pub fn skill_index_costs(project_root: &Path, skills: &[SkillSpec]) -> Vec<(Stri
         .collect()
 }
 
-/// Project-level AGENTS.md, capped. The de facto convention for handing
-/// agents project conventions; ignoring it wastes the user's own groundwork.
+/// Project-level AGENTS.md as written, trimmed; None when absent or blank.
+/// The prompt carries it capped, and the change notice compares it whole, so
+/// an edit past the cap, which the agent can read, is still news.
 fn agents_md(project_root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(project_root.join("AGENTS.md")).ok()?;
     let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// AGENTS.md as the prompt carries it, capped. The de facto convention for
+/// handing agents project conventions; ignoring it wastes the user's own
+/// groundwork.
+fn capped_agents_md(text: &str) -> String {
     if text.len() <= MAX_AGENTS_MD_BYTES {
-        return Some(text.to_string());
+        return text.to_string();
     }
     let mut cut = MAX_AGENTS_MD_BYTES;
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    Some(format!("{}\n…[AGENTS.md truncated; read_file it for the rest]", &text[..cut]))
+    format!("{}\n…[AGENTS.md truncated; read_file it for the rest]", &text[..cut])
 }
 
 /// A shallow, gitignore-aware file map: directories first, then files, both
@@ -978,6 +1361,28 @@ mod tests {
             "a freeze that indexed nothing prices nothing, whatever the prompt spells: {:?}",
             empty.memory
         );
+    }
+
+    /// A note section's room is what the note has left less the gap before
+    /// the section and its header, so a line that fills that room exactly is
+    /// carried and one a byte longer is counted for the trailer instead; a
+    /// section spends what it carries, so the next one finds no room left.
+    /// The boundary sits more than a tool line past anything a project can
+    /// write, so it is pinned here rather than through files.
+    #[test]
+    fn a_note_section_carries_a_line_that_fills_its_room() {
+        let filled = |extra: usize| {
+            let mut note = Note::new();
+            let room = note.left - "\n\n".len() - "H:\n".len();
+            let line = format!("{}\n", "x".repeat(room - 1 + extra));
+            note.section("s", "H:\n", usize::MAX, vec![line], Vec::new(), None);
+            note
+        };
+        assert_eq!(filled(1).dropped, 1, "a line one byte longer than the room is not carried");
+        let mut note = filled(0);
+        assert_eq!((note.dropped, note.left), (0, 0), "a line of exactly the room is carried and spends it");
+        note.section("t", "H:\n", usize::MAX, vec!["y\n".into()], Vec::new(), None);
+        assert_eq!(note.dropped, 1, "so the next section has no room");
     }
 
     #[test]

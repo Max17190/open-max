@@ -4,9 +4,12 @@
 //!
 //! Frozen per freeze window: built at session creation, then re-frozen when
 //! extension files change on disk (fingerprint at turn start) or the user
-//! forces `/reload`. Between freezes the serialized tool schema array is
-//! byte-stable so the server's KV cache stays warm. An unchanged disk is a
-//! no-op.
+//! forces `/reload`. A re-freeze swaps what runs, and keeps the serialized
+//! tool schema array the session's prompt was built with
+//! (`Registry::keep_prompt_of`), so that array is byte-stable for the whole
+//! session and the server's KV cache stays warm; only a new prompt (session
+//! creation, `/reload`) builds it from the current generation. An unchanged
+//! disk is a no-op.
 //!
 //! With no external tools or skills installed, the schema JSON is
 //! byte-identical to the built-in `tools::tool_schemas()` array and the
@@ -69,6 +72,21 @@ pub struct ExternalTool {
     pub timeout_secs: u64,
     /// Where the definition came from, for actionable error messages.
     pub source_path: PathBuf,
+}
+
+impl ExternalTool {
+    /// `command args...` as the manifest declares it: what the approval
+    /// card, the TUI's refreeze line, and the trailing note's bash line show
+    /// the tool runs. Each argv token is shell-quoted, so `a b`, an empty
+    /// arg, or a value with quotes/metacharacters keeps its boundary - a
+    /// space-joined line reads as a different or ambiguous invocation.
+    pub(crate) fn command_line(&self) -> String {
+        std::iter::once(&self.command)
+            .chain(self.args.iter())
+            .map(|a| crate::doctor::shell_quote(Path::new(a)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -134,13 +152,21 @@ pub struct Registry {
     /// `None` here is ambiguous on its own - an empty scan and a registry that
     /// never scanned both leave it None - so `memory_scanned` disambiguates.
     pub memory_section: Option<(String, Vec<(String, usize)>)>,
+    /// (name, index line, indexed) for every valid memory the same scan
+    /// read: what the trailing note compares with the prompt's record.
+    pub(crate) memory_lines: Vec<(String, String, bool)>,
     /// The memory index rows (stem, line bytes) frozen WITH the persisted
     /// prompt, kept apart from `memory_files` because the two answer
     /// different questions: this is what /context prices, that is the
-    /// receipt's delta baseline. Carried by the manifest (version 4); a
-    /// pre-field manifest reads as absent and refreezes, so this is Some on
-    /// every live path.
+    /// receipt's delta baseline. Carried by the manifest (version 4) and by
+    /// every re-freeze, which keeps the prompt; a pre-field manifest reads as
+    /// absent, so this is Some on every live path.
     pub(crate) frozen_memory_rows: Option<Vec<(String, usize)>>,
+    /// What the session's persisted prompt indexes: set when that prompt is
+    /// built (session creation, `/reload`) and kept by every other re-freeze
+    /// (`keep_prompt_of`), so the trailing note carries only what changed
+    /// since. Persisted in the manifest.
+    pub prompt_index: Arc<crate::prompt::PromptIndex>,
     /// True only when THIS registry actually ran a memory scan (a fresh
     /// freeze). A manifest-restored registry carries `memory_files` as the
     /// resume delta's baseline but never captured a section, so it is false
@@ -149,7 +175,10 @@ pub struct Registry {
     /// A scanned-but-empty freeze is true, so its empty selection is honored
     /// (no rescan), which is the invariant `memory_section` exists for.
     pub memory_scanned: bool,
-    /// Schema array value form: prompt breakdown and tests walk this.
+    /// The tools array the session sends, value form: this generation's for a
+    /// new prompt, and the prompt's own from then on (`keep_prompt_of`), so
+    /// it can list a tool file that no longer loads and lack one written
+    /// since. Prompt breakdown, the trailing note, and tests walk this.
     schemas: Value,
     /// Schema array wire form: frozen once so chat request bodies inject the
     /// exact same tool bytes every iteration without re-serializing Value.
@@ -469,13 +498,35 @@ impl Registry {
         registry.broken = snapshot.broken;
         registry.broken_tools = snapshot.broken_tools;
         registry.shadowed_skills = snapshot.shadowed_skills;
-        let mem = crate::memory::freeze_snapshot(&snapshot.project_root, crate::memory::unix_now());
+        registry.scan_memory(&snapshot.project_root);
         registry.frozen_memory_rows =
-            Some(mem.section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default());
-        registry.memory_files = Some(mem.identities);
-        registry.memory_section = mem.section;
-        registry.memory_scanned = true;
+            Some(registry.memory_section.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default());
         registry
+    }
+
+    /// One memory scan, which every memory view of this generation reads:
+    /// the section a new prompt shows, every memory's line for the trailing
+    /// note to compare, and the identities the next refreeze's receipt diffs
+    /// against. Activation calls it, and so does a resume, so that receipt
+    /// names only what moved after the note the resume sent.
+    pub(crate) fn scan_memory(&mut self, project_root: &Path) {
+        let mem = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
+        self.memory_files = Some(mem.identities);
+        self.memory_section = mem.section;
+        self.memory_lines = mem.lines;
+        self.memory_scanned = true;
+    }
+
+    /// Keep the prompt the session sends. A re-freeze swaps the generation
+    /// (what runs, and what the trailing note compares) and never the
+    /// prefix, so the incoming registry takes the outgoing one's tools
+    /// array, its record of the persisted prompt, and the memory rows that
+    /// prompt carries.
+    pub fn keep_prompt_of(&mut self, sent: &Registry) {
+        self.schemas = sent.schemas.clone();
+        self.schemas_wire = sent.schemas_wire.clone();
+        self.prompt_index = sent.prompt_index.clone();
+        self.frozen_memory_rows = sent.frozen_memory_rows.clone();
     }
 
     /// A registry with built-ins only: the shape a session without a
@@ -495,19 +546,9 @@ impl Registry {
         external.sort_by(|a, b| a.name.cmp(&b.name));
         tools_list.extend(external);
 
-        let mut schemas = tools::tool_schemas().clone();
-        if let Some(arr) = schemas.as_array_mut() {
-            for spec in tools_list.iter().filter(|s| !matches!(s.kind, ToolKind::Builtin)) {
-                arr.push(serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": spec.name,
-                        "description": spec.description,
-                        "parameters": spec.parameters,
-                    }
-                }));
-            }
-        }
+        let schemas = with_builtins(
+            tools_list.iter().filter(|s| !matches!(s.kind, ToolKind::Builtin)).map(schema_entry),
+        );
 
         let by_name = tools_list
             .iter()
@@ -528,6 +569,8 @@ impl Registry {
             memory_files: None,
             frozen_memory_rows: None,
             memory_section: None,
+            memory_lines: Vec::new(),
+            prompt_index: Arc::default(),
             memory_scanned: false,
             schemas,
             schemas_wire,
@@ -709,12 +752,22 @@ pub struct RegistryManifest {
     /// absent in older manifests, whose first receipt compares index lines.
     #[serde(default)]
     pub read_files: Option<Vec<(PathBuf, u64)>>,
+    /// The tool files' entries in the tools array the session sends, which a
+    /// re-freeze keeps: a resume sends the built-ins and these, whatever has
+    /// loaded since (`external_tools` is what runs).
+    pub frozen_tools: Vec<Value>,
+    /// What the session's persisted prompt indexes, which the trailing note
+    /// is the difference from.
+    pub prompt_index: crate::prompt::PromptIndex,
+    /// The generation's count of tool files past the load cap, which the
+    /// note compares with the count the prompt's trailer gave.
+    pub tools_omitted: usize,
 }
 
 /// Current manifest format. A manifest carrying any other version is treated
-/// as absent (fail closed on unknown future formats): the session falls back
-/// to built-ins and the next turn re-freezes cleanly from disk, instead of
-/// deserializing a newer format into the wrong shape.
+/// as absent (fail closed on unknown future formats): hydration rebuilds the
+/// session's prompt and registry from disk, instead of deserializing a newer
+/// format into the wrong shape.
 ///
 /// v3: external tools carry an `env` allowlist. A v2 manifest has no such
 /// field, and defaulting it to empty would resume a credential-dependent
@@ -733,7 +786,13 @@ pub struct RegistryManifest {
 // and no fingerprint change to repair it. Reading v4 as absent retires
 // those records the way this constant always has: built-ins until the next
 // turn start, which refreezes prompt and manifest from disk together.
-pub const MANIFEST_VERSION: u32 = 5;
+// 6: a re-freeze keeps the prompt and the tools array, so the manifest
+// records what the prompt indexes (`prompt_index`), the tool files that
+// array carries (`frozen_tools`), and the generation's count of tool files
+// past the load cap (`tools_omitted`), and the trailing note carries what
+// changed since. A v5 manifest records none of them, so it reads as absent
+// and hydration rebuilds the prompt and the registry from disk once.
+pub const MANIFEST_VERSION: u32 = 6;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolManifest {
@@ -794,6 +853,16 @@ impl Registry {
             external_tools,
             skills: self.skills.clone(),
             ext_fingerprint: self.ext_fingerprint,
+            frozen_tools: self
+                .schemas
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|entry| !tools::TOOL_NAMES.contains(&entry_name(entry)))
+                .cloned()
+                .collect(),
+            prompt_index: self.prompt_index.as_ref().clone(),
+            tools_omitted: self.tools_omitted,
         }
     }
 
@@ -821,19 +890,25 @@ impl Registry {
             .collect();
         let mut registry = Self::assemble(external, manifest.skills);
         registry.ext_fingerprint = manifest.ext_fingerprint;
-        // The manifest's memory identities are the baseline for the first
-        // refreeze's memory receipt. A resumed session's prompt is the
-        // persisted one, whose memory section those identities describe, and
-        // the model reads it until that refreeze rebuilds it: the delta from
-        // them to the fresh scan is exactly what the next prompt gains and
-        // loses. `memory_scanned` stays false, because this registry captured
-        // no section of its own, so a prompt built from it (a transcript that
-        // lost its system line) scans fresh. The row accounting rides the
+        registry.tools_omitted = manifest.tools_omitted;
+        // The manifest's memory identities are the receipt baseline the
+        // restored generation carries. A resume replaces them with a fresh
+        // scan (`scan_memory`), since the note it sends already shows what
+        // moved since the prompt. `memory_scanned` stays false, because this
+        // registry captured no section of its own, so a prompt built from it
+        // without that scan reads memory fresh. The row accounting rides the
         // frozen channel: /context prices the rows of the freeze that WROTE
         // the persisted prompt, which is precisely what the manifest carries.
         registry.memory_files = manifest.memory_files.clone();
         registry.frozen_memory_rows = manifest.memory_rows.clone();
         registry.read_paths = manifest.read_files.map(|files| files.into_iter().collect());
+        // The array the session sends is the one its prompt was built with,
+        // not the generation's: today's built-ins, then the tool files it
+        // carried, a name a built-in now takes excepted.
+        let frozen = manifest.frozen_tools.into_iter().filter(|e| !tools::TOOL_NAMES.contains(&entry_name(e)));
+        registry.schemas = with_builtins(frozen);
+        registry.schemas_wire = registry.schemas.to_string().into();
+        registry.prompt_index = Arc::new(manifest.prompt_index);
         registry
     }
 
@@ -856,6 +931,32 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
     } else {
         summarize_external(name, args)
     }
+}
+
+/// The built-in schemas followed by `entries`: a tools array as sent.
+fn with_builtins(entries: impl IntoIterator<Item = Value>) -> Value {
+    let mut schemas = tools::tool_schemas().clone();
+    if let Some(arr) = schemas.as_array_mut() {
+        arr.extend(entries);
+    }
+    schemas
+}
+
+/// A tool file's entry in the tools array, exactly as the model receives it.
+pub(crate) fn schema_entry(spec: &ToolSpec) -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+        }
+    })
+}
+
+/// The name a tools-array entry declares; empty for an entry without one.
+pub(crate) fn entry_name(entry: &Value) -> &str {
+    entry["function"]["name"].as_str().unwrap_or_default()
 }
 
 /// Built-in tool specs derived from the canonical `tools::tool_schemas()`
