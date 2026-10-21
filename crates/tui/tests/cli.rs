@@ -190,6 +190,58 @@ fn a_damaged_session_index_is_named_by_continue_and_check() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// `openmax --replay <file> --json` prints a session log's lines after its
+/// format line as they were recorded, a final line that lost only its
+/// newline with one, and passes over a final line a crash cut off. A file it
+/// cannot replay exits 1, naming the file and why on stderr: a session's
+/// transcript is not an event log, a log in another format names both, and
+/// a damaged log stops at its damaged line, after printing the lines before
+/// it. No run opens a data dir.
+#[test]
+fn a_replay_prints_what_a_log_recorded_and_refuses_what_it_cannot_read() {
+    let (project, home) = fresh_dirs("replay");
+    let header = "{\"format\":\"openmax-events/1\"}\n";
+    let token = "{\"session_id\":\"s\",\"type\":\"token\",\"text\":\"a\"}\n";
+    let done = "{\"session_id\":\"s\",\"type\":\"done\",\"stop_reason\":\"stop\"}\n";
+    let cases = [
+        ("whole", format!("{header}{token}{done}"), format!("{token}{done}"), None),
+        ("unterminated", format!("{header}{token}{}", done.trim_end()), format!("{token}{done}"), None),
+        ("torn", format!("{header}{token}{{\"session_id\":\"s\",\"ty"), token.to_string(), None),
+        ("s.messages.json", "{\"role\":\"user\",\"content\":\"hi\"}\n".to_string(), String::new(), Some("is not an openmax event log")),
+        ("empty", String::new(), String::new(), Some("is not an openmax event log")),
+        ("other-format", format!("{{\"format\":\"other/1\"}}\n{token}"), String::new(), Some("is not an openmax event log")),
+        (
+            "newer",
+            format!("{{\"format\":\"openmax-events/2\"}}\n{token}"),
+            String::new(),
+            Some("is an event log in openmax-events/2; this build replays openmax-events/1"),
+        ),
+        ("not-json", format!("{header}{token}not json\n{done}"), token.to_string(), Some("is damaged at line 3")),
+        ("not-an-object", format!("{header}{token}[1]\n{done}"), token.to_string(), Some("is damaged at line 3")),
+        ("cut-mid-file", format!("{header}{token}{{\"session_id\":\n{done}"), token.to_string(), Some("is damaged at line 3")),
+    ];
+    for (name, bytes, printed, refusal) in cases {
+        let file = project.join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let out = cmd(&project, &home).arg("--replay").arg(&file).arg("--json").output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), printed, "{name}: {stderr}");
+        match refusal {
+            None => assert_eq!((out.status.code(), stderr.as_ref()), (Some(0), ""), "{name}"),
+            Some(reason) => {
+                assert_eq!(out.status.code(), Some(1), "{name}: {stderr}");
+                assert_eq!(stderr, format!("openmax: {} {reason}\n", file.display()), "{name}");
+            }
+        }
+    }
+    let missing = cmd(&project, &home).args(["--replay", "missing", "--json"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert_eq!(missing.status.code(), Some(1), "{stderr}");
+    assert!(stderr.starts_with("openmax: cannot read missing: "), "{stderr}");
+    assert!(!home.join(".openmax").exists(), "a replay opens no data dir");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// A fresh project dir plus a fresh HOME, so trust and settings never leak
 /// between tests or into the developer's real ~/.openmax.
 fn fresh_dirs(tag: &str) -> (PathBuf, PathBuf) {

@@ -30,6 +30,7 @@ You own the endpoints, the tools, the skills, and the context.
 - **Recall over everything kept.** `openmax --recall "<query>"` searches this project's past sessions, compaction archives, digests, and memories in one bounded streaming pass — BM25 relevance fused with the same recency law, ranked excerpts, each citing the file with the full record. No index to build or maintain: the stores on disk stay the single source of truth.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
 - **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts only the model endpoint you configure.
+- **Offline replay.** Each session keeps an event log. Copied to any machine, `openmax --replay <log> --json` prints from it, byte for byte, what `-p --json` printed during the run, with no endpoint, settings, trust or data dir.
 
 ## Design
 
