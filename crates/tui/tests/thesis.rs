@@ -1001,6 +1001,137 @@ mod first_frame {
     }
 }
 
+/// One session file reproduces the event stream byte for byte, offline, on
+/// any machine.
+///
+/// Method: a live `openmax --trust-project --json -p` run against a local
+/// endpoint whose first reply calls `bash` to create a marker file and whose
+/// second streams the answer in two pieces with usage, so the run has a tool
+/// round, tokens, usage and a done. The session's own event log,
+/// `~/.openmax/sessions/<id>.events.jsonl` as the live run left it, is
+/// copied unchanged into another directory, as onto another machine, and
+/// `openmax --replay <copy> --json` runs there under another HOME (empty: no
+/// settings, no trust, no data dir), working directory and TMPDIR. Its
+/// stdout must equal the live run's stdout byte for byte, and the replay
+/// must exit 0, send no request (the endpoint, still listening, served the
+/// live run's two), run no tool (no marker where it ran) and create no data
+/// dir. A byte gate, so it asserts in every build.
+#[test]
+fn replay_reproduces_the_event_stream_byte_for_byte() {
+    let chunk = |delta: serde_json::Value, finish: Option<&str>, usage: Option<(u64, u64)>| {
+        let mut chunk = serde_json::json!({"choices": [{"delta": delta, "finish_reason": finish}]});
+        if let Some((prompt, completion)) = usage {
+            chunk["usage"] = serde_json::json!({"prompt_tokens": prompt, "completion_tokens": completion});
+        }
+        format!("data: {chunk}\n\n")
+    };
+    let call = serde_json::json!([{"index": 0, "id": "call_0", "type": "function",
+        "function": {"name": "bash", "arguments": r#"{"command":"touch ran.marker"}"#}}]);
+    let script = vec![
+        chunk(serde_json::json!({"tool_calls": call}), None, None)
+            + &chunk(serde_json::json!({}), Some("tool_calls"), Some((40, 5)))
+            + "data: [DONE]\n\n",
+        chunk(serde_json::json!({"content": "replayed"}), None, None)
+            + &chunk(serde_json::json!({"content": " answer"}), None, None)
+            + &chunk(serde_json::json!({}), Some("stop"), Some((60, 3)))
+            + "data: [DONE]\n\n",
+    ];
+    let (base_url, served) = spawn_scripted_server(script);
+    let (project, home) = fresh_install("replay-live", 0);
+    let live = Command::new(env!("CARGO_BIN_EXE_openmax"))
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env_remove("OPENMAX_SESSION")
+        .env_remove("OPENMAX_API_KEY")
+        // Test automation is a human act with no terminal; the grant needs it said.
+        .env("OPENMAX_HUMAN_ATTEST", "1")
+        .args(["--trust-project", "--base-url", &base_url, "--model", "m", "--context-tokens", "32768"])
+        .args(["--json", "-p", "make the marker"])
+        .output()
+        .unwrap();
+    let printed = String::from_utf8(live.stdout).unwrap();
+    assert_eq!(live.status.code(), Some(0), "{printed}{}", String::from_utf8_lossy(&live.stderr));
+    assert!(project.join("ran.marker").exists(), "the live run's tool round ran: {printed}");
+    let kinds: Vec<serde_json::Value> =
+        printed.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["type"].clone()).collect();
+    for kind in ["tool_start", "tool_end", "token", "usage", "done"] {
+        assert!(kinds.contains(&kind.into()), "the live run printed no {kind} line: {printed}");
+    }
+    let first: serde_json::Value = serde_json::from_str(printed.lines().next().unwrap()).unwrap();
+    let id = first["session_id"].as_str().unwrap();
+    let log = home.join(".openmax/sessions").join(format!("{id}.events.jsonl"));
+    assert!(log.is_file(), "the live run left no event log at {}", log.display());
+
+    let (elsewhere, other_home) = fresh_install("replay-elsewhere", 0);
+    let tmp = elsewhere.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let copy = elsewhere.join("copied").join("session.events.jsonl");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::copy(&log, &copy).unwrap();
+    let replayed = Command::new(env!("CARGO_BIN_EXE_openmax"))
+        .current_dir(&elsewhere)
+        .env("HOME", &other_home)
+        .env("TMPDIR", &tmp)
+        .env_remove("OPENMAX_SESSION")
+        .env_remove("OPENMAX_API_KEY")
+        .arg("--replay")
+        .arg(&copy)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(replayed.status.code(), Some(0), "{}", String::from_utf8_lossy(&replayed.stderr));
+    assert_eq!(String::from_utf8(replayed.stdout).unwrap(), printed, "the replay prints what the live run printed");
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2, "the replay sent a request");
+    assert!(!elsewhere.join("ran.marker").exists(), "the replay ran a tool");
+    assert!(!other_home.join(".openmax").exists(), "the replay opened a data dir");
+    for dir in [project.parent().unwrap(), elsewhere.parent().unwrap()] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A local OpenAI-compatible endpoint that answers the Nth request it reads
+/// with the Nth SSE body of `script`, and any later one with a 400, for as
+/// long as the test runs; and the count of requests it has read.
+fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = served.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            if !head.ends_with(b"\r\n\r\n") {
+                continue;
+            }
+            let length = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let _ = stream.read_exact(&mut vec![0u8; length]);
+            let response = match script.get(count.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) {
+                Some(sse) => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                    sse.len()
+                ),
+                None => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), served)
+}
+
 /// A local OpenAI-compatible endpoint that answers every request with the
 /// same finished one-line completion, for as long as the test runs.
 fn spawn_answering_server() -> String {

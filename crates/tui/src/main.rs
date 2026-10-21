@@ -45,6 +45,12 @@ options:
                          repeat -p for multi-turn on the same session)
       --json             with --print, emit AgentEvent envelopes as JSONL;
                          with --check, emit every finding as one JSON array
+      --replay <file> --json
+                         print the events a session's log (~/.openmax/
+                         sessions/<id>.events.jsonl, copied anywhere)
+                         recorded, each line as --print --json prints it.
+                         Reads that file alone: no endpoint, trust or data
+                         dir, and no tool runs
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"approval_mode\"|
                          \"reload\"|\"fork\"|\"rewind\"|\"cancel\"|\"quit\"}),
@@ -145,6 +151,8 @@ struct CliArgs {
     /// Query string for `--recall`: ranked search over this project's own
     /// session history and memories.
     recall: Option<String>,
+    /// `--replay`: the session event log to print.
+    replay: Option<String>,
     /// Quarantine an unverifiable ledger log and start a new chain.
     ledger_repair: bool,
     /// Surface name whose authoring contract should be printed (`--spec`).
@@ -191,6 +199,7 @@ where
         forget: None,
         ledger: false,
         recall: None,
+        replay: None,
         ledger_repair: false,
         spec: None,
         mcp_list: false,
@@ -238,6 +247,7 @@ where
             Long("forget") => set_once(&mut out.forget, "--forget", &mut parser)?,
             Long("ledger") => out.ledger = true,
             Long("recall") => set_once(&mut out.recall, "--recall", &mut parser)?,
+            Long("replay") => set_once(&mut out.replay, "--replay", &mut parser)?,
             Long("ledger-repair") => out.ledger_repair = true,
             Long("spec") => set_once(&mut out.spec, "--spec", &mut parser)?,
             Long("mcp-list") => out.mcp_list = true,
@@ -391,6 +401,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         forget,
         ledger,
         recall,
+        replay,
         ledger_repair,
         spec,
         mcp_list,
@@ -407,6 +418,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         (*mcp_list, "--mcp-list"),
         (*mcp_call, "--mcp-call"),
         (recall.is_some(), "--recall"),
+        (replay.is_some(), "--replay"),
         (*ledger, "--ledger"),
         (*ledger_repair, "--ledger-repair"),
         (approve.is_some(), "--approve"),
@@ -434,7 +446,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         (base_url.is_some(), "--base-url", SESSIONS),
         (api_key.is_some(), "--api-key", SESSIONS),
         (context_tokens.is_some(), "--context-tokens", SESSIONS),
-        (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall"), Some("--mcp-list")]),
+        (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall"), Some("--replay"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
         (*all, "--all", &[Some("--check")]),
         (mcp_timeout.is_some(), "--mcp-timeout", MCP),
@@ -454,6 +466,11 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
                 format!("{flag} requires {readers}")
             }
         });
+    }
+    // A replay prints the JSON lines `--print --json` prints, so it is asked
+    // for the same way.
+    if operation == Some("--replay") && !*json {
+        return Err("--replay prints the recorded JSON lines; add --json".into());
     }
     if !prompts.is_empty() && operation != Some("--print") {
         // With no operation named, a stray word is most likely a prompt
@@ -551,6 +568,10 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         }
     };
 
+    if let Some(file) = &cli.replay {
+        std::process::exit(replay(std::path::Path::new(file)));
+    }
+
     // The interactive session at a terminal paints its first frame before
     // the runtime exists. Every other run, a session without a terminal at
     // both ends included, starts on the runtime.
@@ -558,6 +579,24 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         return session(cli);
     }
     runtime(None).block_on(run(cli))
+}
+
+/// `--replay <file> --json`: print the lines an event log recorded, each as
+/// `--print --json` prints it (`sessions::replay_events`), so a print run's
+/// log prints that run's stdout. It reads that one file and nothing else, no
+/// runtime, settings, trust, endpoint or data dir, so a log copied to another
+/// machine prints the same there. 0 once every line is out, 1 when the file
+/// is not a log this build replays, is damaged, or stdout refused a line.
+fn replay(file: &std::path::Path) -> i32 {
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    match open_max_core::sessions::replay_events(file, &mut out) {
+        Ok(()) => 0,
+        Err(e) => {
+            drop(out);
+            eprintln!("openmax: {e}");
+            1
+        }
+    }
 }
 
 /// The runtime every run works on: the session's from behind its first
@@ -3103,7 +3142,7 @@ mod tests {
     /// believed it approved.
     #[test]
     fn an_operation_given_twice_is_refused_naming_it() {
-        for flag in ["--approve", "--forget", "--spec", "--recall"] {
+        for flag in ["--approve", "--forget", "--spec", "--recall", "--replay"] {
             let err = parse_args_from([flag, "a", flag, "b"])
                 .err()
                 .unwrap_or_else(|| panic!("{flag} given twice must be refused"))
@@ -3119,11 +3158,13 @@ mod tests {
     /// refusal gives it. `-p` comes last in any line built from these: the
     /// tokens after it are its prompt. An MCP operation's server command
     /// comes after `--`, so `refusal_of` closes such a line with one. An
-    /// empty name is the interactive session.
-    const OPERATIONS: [(&[&str], &str); 13] = [
+    /// empty name is the interactive session. `--replay` is given with the
+    /// `--json` it requires.
+    const OPERATIONS: [(&[&str], &str); 14] = [
         (&[], ""),
         (&["--spec", "tools"], "--spec"),
         (&["--recall", "q"], "--recall"),
+        (&["--replay", "f", "--json"], "--replay"),
         (&["--ledger"], "--ledger"),
         (&["--ledger-repair"], "--ledger-repair"),
         (&["--approve", "f"], "--approve"),
@@ -3216,7 +3257,7 @@ mod tests {
             (&["--base-url", "http://h/v1"], "--base-url", sessions),
             (&["--api-key", "k"], "--api-key", sessions),
             (&["--context-tokens", "8"], "--context-tokens", sessions),
-            (&["--json"], "--json", &["--print", "--check", "--recall", "--mcp-list"]),
+            (&["--json"], "--json", &["--print", "--check", "--recall", "--replay", "--mcp-list"]),
             (&["--run-examples"], "--run-examples", &["--check"]),
             (&["--all"], "--all", &["--check"]),
             (&["--mcp-timeout", "5"], "--mcp-timeout", &["--mcp-list", "--mcp-call"]),
@@ -3247,11 +3288,16 @@ mod tests {
             &["--provider", "p", "--context-tokens", "8", "--stdio"],
             &["--trust-project", "--continue", "--stdio"],
             &["--recall", "q", "--json"],
+            &["--json", "--replay", "f"],
             &["--mcp-timeout", "60", "--mcp-list", "--json"],
             &["--mcp-call", "--mcp-timeout", "60"],
         ] {
             assert_eq!(refusal_of(args), None, "{args:?} is a valid command line");
         }
+        // A replay prints JSON lines, so it is asked for with --json, as
+        // print mode's are.
+        let reason = refusal_of(&["--replay", "f"]).expect("--replay without --json must be refused");
+        assert!(names(&reason, "--replay") && names(&reason, "--json"), "{reason}");
     }
 
     /// A named provider carries its own base_url and key, so `--base-url` or
