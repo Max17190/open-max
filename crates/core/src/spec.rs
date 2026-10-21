@@ -231,7 +231,7 @@ capped rendering a tool call returns (the tail, once output exceeds the cap),
 so a token printed early by a noisy command can scroll out of the window.
 Trailing whitespace, the final newline included, is removed before matching:
 `^[0-9]+$` matches a command that runs `echo 63`.
-Plain `--check` never executes anything.
+Plain `--check` runs no command.
 
 In auto, examples run the real host command without content approval, behind
 hook gates and permission denies. Permission ask rules do not prompt or block
