@@ -2568,13 +2568,19 @@ fn spawn_stale_flusher(batcher: &Arc<StdMutex<TokenBatcher>>) -> tokio::task::Jo
     })
 }
 
+/// The mode as the model reads it. It goes out ahead of a session's first
+/// prompt, and again only when the mode changes or a resumed session's
+/// history no longer holds it, but the history resends it on every request
+/// after, so every request pays for it like the system prompt: it names the
+/// mode and its limits, and leaves content approval detail to the contracts
+/// `openmax --spec` prints.
 fn execution_policy_note(mode: ApprovalMode) -> String {
     let detail = match mode {
-        ApprovalMode::Auto => "carry out authorized work, including extension creation and repair, without asking for confirmation. Valid tools, hooks, and permission allows need no content approval. Deny rules and validation still apply",
-        ApprovalMode::Ask => "mutating calls and unapproved tool content require confirmation unless the applicable gate permits them. Hooks and permission allows require content approval",
-        ApprovalMode::Readonly => "mutating calls and calls requiring approval are disabled",
+        ApprovalMode::Auto => "do authorized work without asking, extensions included; deny rules and validation still apply",
+        ApprovalMode::Ask => "mutating calls need approval unless a permission allows them; unapproved tool content always does",
+        ApprovalMode::Readonly => "mutating calls and calls needing approval are disabled",
     };
-    format!("[execution policy: {} for this trusted project; {detail}.]", mode.as_str())
+    format!("[execution policy: {}; {detail}.]", mode.as_str())
 }
 
 fn rehydrate_approval_mode(messages: &[ChatMessage]) -> Option<ApprovalMode> {

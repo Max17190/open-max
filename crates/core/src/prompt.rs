@@ -12,10 +12,10 @@
 //! the life of the session, and a test fails the build if the base prompt plus
 //! built-in schemas exceeds its budget.
 //!
-//! The guide itself is a pointer, not a manual. It names the extension
-//! surfaces and the command that prints each contract in about a hundred
-//! tokens; paths, formats, and activation rules live in `spec` and cost
-//! nothing until the agent asks for them.
+//! The guide itself is a pointer, not a manual: one line naming the
+//! extension surfaces and the command that prints each contract. Paths,
+//! formats, and activation rules live in `spec` and cost nothing until the
+//! agent asks for them.
 
 use std::path::Path;
 
@@ -121,15 +121,12 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
         "You are Open Max, a coding agent working on the project at {root}.\n\
         \n\
         Rules:\n\
-        - All tool paths are project-relative.\n\
-        - Never invent paths or file contents; read the real code first.\n\
-        - Prefer edit_file for existing files; write_file only for new files or full rewrites.\n\
-        - Make small, focused changes in the existing style; verify by compile, test, or re-read.\n\
-        - On a tool error, correct the next call; never repeat a failing call.\n\
-        - Never print tool-call JSON or XML as reply text; call tools only via the API.\n\
-        - When done, stop calling tools; reply with a short summary of changes and verification.\n\
-        \n\
-        Keep replies brief: no filler, no repeating file contents."
+        - Tool paths are project-relative.\n\
+        - Read code before changing it; never guess paths or contents.\n\
+        - Make small changes in the existing style; verify by build, test, or re-read.\n\
+        - On a tool error, fix the call; never repeat it.\n\
+        - Call tools via the API, never as JSON or XML text.\n\
+        - When done, stop calling tools; briefly summarize changes and verification without repeating file contents."
     );
     breakdown.components.push(("base rules".into(), prompt.len()));
     {
@@ -196,11 +193,9 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
 /// The extension pointer, paid in every frozen prompt: which surfaces exist
 /// and the one command that prints each surface's contract. Paths, formats,
 /// approval, and activation rules all live in `--spec`, read on demand, so
-/// the prefix carries the index and never the manual. Every line here is
-/// resent on every request for the life of the session.
-const SELF_EXTENSION: &str = "\n\nWhen the user asks for a reusable capability (tool, skill, prompt template, hook, permission rule, provider, or memory), read its contract first with bash: openmax --spec <surface>. It gives the file path, format, approval, and activation rules; verify with openmax --check.\n\
-Surfaces: tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp.\n\
-Past sessions and memories: openmax --recall \"<query>\". Isolated or parallel work: a child openmax -p or openmax --stdio process, in tmux when it must outlive the turn.";
+/// the prefix carries the index and never the manual. It is one line, resent
+/// on every request for the life of the session.
+const SELF_EXTENSION: &str = "\n\nFor a reusable capability, first run openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp> in bash; verify with openmax --check. Past sessions and memories: openmax --recall \"<query>\". Sub-agent: openmax -p, in tmux to outlive the turn.";
 
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
@@ -401,23 +396,24 @@ mod tests {
 
     /// The extension pointer is part of every frozen prompt: the agent must
     /// be able to find the surfaces, the command that prints each contract,
-    /// the verifier, and preserved history. Paths, formats, and activation
-    /// timing live in the contracts, not here: the prefix is resent on every
-    /// request, and the manual that used to ride it measured over a quarter
-    /// of the fixed payload before it was cut to this pointer.
+    /// the verifier, preserved history, and the sub-agent flag, all in one
+    /// line. Paths, formats, and activation timing live in the contracts,
+    /// not here: the prefix is resent on every request, and the manual that
+    /// used to ride it measured over a quarter of the fixed payload before it
+    /// was cut to this pointer.
     #[test]
     fn prompt_carries_self_extension_guide() {
         let dir = temp_project();
         let prompt = builtin_prompt(&dir);
+        assert_eq!(SELF_EXTENSION.trim_start().lines().count(), 1, "the pointer is one line: {SELF_EXTENSION}");
         assert!(prompt.contains("reusable capability"));
-        assert!(prompt.contains("openmax --spec <surface>"));
-        assert!(prompt.contains("activation rules"));
+        assert!(prompt.contains("openmax --spec <tools|"));
         assert!(prompt.contains("openmax --check"));
         assert!(prompt.contains("openmax --recall"), "preserved history must be findable");
         // Capability-file history is no longer recorded, so a pointer to it
         // would be bytes every request pays for a command with nothing to show.
         assert!(!prompt.contains("openmax --ledger"), "no pointer to history that is not kept");
-        assert!(prompt.contains("openmax -p or openmax --stdio"));
+        assert!(prompt.contains("Sub-agent: openmax -p"));
         assert!(prompt.contains("tmux"));
         // The per-surface paths moved into the contracts the pointer names.
         // A path here is prefix bytes every request pays for a file the
@@ -704,13 +700,12 @@ mod tests {
     /// from the next turn, templates on next use, permission rules at turn
     /// start (one-directional within a turn), providers on the next turn's
     /// re-read, and memory at the next re-freeze, never on its own write. It
-    /// lives in the surface specs the pointer sends the model to. The
-    /// pointer promises those specs carry it, so both halves are pinned
-    /// here for every authoring surface the pointer names: the prefix stays
-    /// free of the nuance, and each contract still states its trigger.
+    /// lives in the surface specs the pointer sends the model to, so both
+    /// halves are pinned here for every authoring surface the pointer names:
+    /// the prefix stays free of the nuance, and each contract still states
+    /// its trigger.
     #[test]
     fn the_guide_defers_activation_timing_to_the_contracts() {
-        assert!(SELF_EXTENSION.contains("activation rules"));
         assert!(!SELF_EXTENSION.contains("mutating call"));
         assert!(!SELF_EXTENSION.contains("next turn"));
         let states = |surface: &str, trigger: &str| {
@@ -732,15 +727,16 @@ mod tests {
         // be exactly the deliberate ones: settings, recall, and usage are not
         // authoring surfaces, and the moments that need them carry their own
         // pointer (--check settings rows print "openmax --spec settings"; the
-        // guide's memory line names --recall). A new --spec surface must
+        // pointer names openmax --recall itself). A new --spec surface must
         // either join the pointer or this list, consciously. `mcp` adds no
         // file kind of its own, but it is named: it is the recipe that turns
         // an MCP server into a tool and a skill, and without it a request
         // for a server leaves the agent writing its own protocol client.
-        let pointer: Vec<&str> = SELF_EXTENSION.lines()
-            .find_map(|line| line.strip_prefix("Surfaces: "))
+        let pointer: Vec<&str> = SELF_EXTENSION
+            .split_once("openmax --spec <")
+            .and_then(|(_, rest)| rest.split_once('>'))
             .expect("the guide lists its authoring contracts")
-            .trim_end_matches('.')
+            .0
             .split('|')
             .collect();
         assert!(pointer.contains(&"mcp"), "the pointer names the MCP recipe: {pointer:?}");
@@ -764,9 +760,11 @@ mod tests {
     }
 
     /// The path-free base rules, extension pointer, and builtin schemas must
-    /// fit in 3,450 bytes (the payload measured 3,357 bytes when the cap was
-    /// set, and 3,361 bytes once the pointer named `mcp`). Grounding sections
-    /// have separate caps. Measure the payload with
+    /// fit in 2,662 bytes, 63 over the 2,599 bytes (589 o200k tokens) they
+    /// measured when the cap came down from 3,450; before that cut they
+    /// measured 3,362 bytes (762 tokens). It is a ratchet: a cut lowers it,
+    /// and growth needs the argument for why every request pays for it.
+    /// Grounding sections have separate caps. Measure the payload with
     /// dump_frozen_prompt_payload_for_tokenizer and a real tokenizer before
     /// changing this budget; provider framing is not included.
     #[test]
@@ -794,7 +792,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 3_450;
+        const CAP: usize = 2_662;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
