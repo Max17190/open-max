@@ -337,27 +337,43 @@ impl Worktree {
     /// only by its id, unless a remote-tracking branch there holds it, as it
     /// does a commit the child fetched.
     fn unsaved(&self, tip: &str) -> Result<Vec<String>, String> {
-        let status = git_output(&self.root, &["status", "--porcelain", "--ignore-submodules=none"])?;
-        // Each line as git wrote it: a status code, a space, then the path.
-        let status = String::from_utf8_lossy(&status);
-        let mut left: Vec<String> = status.lines().map(|line| line.get(3..).unwrap_or(line).to_string()).collect();
+        let status = git_output(&self.root, &["status", "--porcelain", "-z", "--ignore-submodules=none"])?;
+        // Each record ends in NUL: two status letters, a space, then the path
+        // bytes, which are kept exactly as git wrote them, so a name that is
+        // not UTF-8 still names the directory the child worked in. A rename
+        // or copy gives its new path, then the one it came from.
+        let mut left: Vec<&[u8]> = Vec::new();
+        let mut records = status.split(|byte| *byte == 0).filter(|record| !record.is_empty());
+        while let Some(record) = records.next() {
+            if let Some(path) = record.get(3..) {
+                left.push(path);
+            }
+            if matches!(record.first(), Some(&b'R') | Some(&b'C')) {
+                let _ = records.next();
+            }
+        }
         let changes = ["diff-tree", "-r", "-z", "--ignore-submodules=none", self.base.as_str(), tip];
         let changes = git_output(&self.root, &changes)?;
         // `:<mode> <mode> <id> <id> <status>`, then the path, each ending in
         // NUL; a repository's commit has mode 160000.
-        let changes = String::from_utf8_lossy(&changes);
-        let mut fields = changes.split('\0');
+        let mut fields = changes.split(|byte| *byte == 0);
         while let (Some(change), Some(path)) = (fields.next(), fields.next()) {
+            let Ok(change) = std::str::from_utf8(change) else {
+                continue;
+            };
             let [_, "160000", _, commit, _] = change.split(' ').collect::<Vec<_>>()[..] else {
                 continue;
             };
             let refs = ["for-each-ref", "--count=1", "--contains", commit, "refs/remotes/"];
-            let held = git(&self.root.join(path), &refs).is_ok_and(|held| !held.is_empty());
-            if !held && !left.iter().any(|left| left == path) {
-                left.push(path.to_string());
+            let held = git(&self.root.join(path_from_bytes(path)), &refs).is_ok_and(|held| !held.is_empty());
+            if !held && !left.contains(&path) {
+                left.push(path);
             }
         }
-        Ok(left)
+        // A path is reported, not resolved: the line renders it with every
+        // byte that is not printable escaped, so two paths never read alike
+        // and the line stays one line.
+        Ok(left.iter().map(|path| path_report(path)).collect())
     }
 
     /// Remove the worktree, ignored files included, then `.worktrees` if it
@@ -580,6 +596,32 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
+/// A path as the report names it: quoted, with the bytes that are not
+/// printable and the two a quoted name escapes written as escapes, so the
+/// line stays one line and no two paths read the same. Git's own quoting
+/// would do this, but the report no longer reads a quoted name: the paths
+/// are kept as bytes to be looked up, and rendered only here.
+fn path_report(path: &[u8]) -> String {
+    let printable = |byte: &u8| (0x20..=0x7e).contains(byte) && *byte != b'"' && *byte != b'\\';
+    if path.iter().all(printable) {
+        return String::from_utf8_lossy(path).into_owned();
+    }
+    let mut out = String::from("\"");
+    for &byte in path {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            b'\r' => out.push_str("\\r"),
+            b if printable(&b) => out.push(b as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(not(unix))]
 fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
@@ -653,5 +695,86 @@ mod tests {
         assert_eq!(headline("  fix it\nthen the rest"), "fix it");
         assert_eq!(headline(&"é".repeat(70)), format!("{}…", "é".repeat(60)));
         assert_eq!(headline(&"x".repeat(60)), "x".repeat(60));
+    }
+
+    /// A reported path keeps one line and one reading: a byte that is not
+    /// printable, or one a quoted name escapes, is written as an escape, and
+    /// a path of plain bytes is not quoted at all.
+    #[test]
+    fn a_reported_path_escapes_what_would_break_the_line() {
+        assert_eq!(path_report(b"notes.txt"), "notes.txt");
+        assert_eq!(path_report(b"dir/notes.txt"), "dir/notes.txt");
+        assert_eq!(path_report(b"a\nb"), "\"a\\nb\"");
+        assert_eq!(path_report(b"inner\xff"), "\"inner\\xff\"");
+        assert_eq!(path_report(b"q\"uote"), "\"q\\\"uote\"");
+        assert_eq!(path_report(b"back\\slash"), "\"back\\\\slash\"");
+        assert_ne!(path_report(b"a b"), path_report(b"a\nb"), "two paths read the same");
+    }
+
+    /// A nested repository whose directory name is not UTF-8 is looked up
+    /// where it is. Its commit is held by a remote-tracking ref there, as one
+    /// the child fetched is, so the branch's record of it carries the work
+    /// and the report names nothing. Read as text before the lookup, the name
+    /// would be a different directory, the lookup would fail, and the run
+    /// would keep a worktree whose work is safe. Linux only: a name is bytes
+    /// there, and a macOS volume refuses one that is not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_nested_repository_is_found_by_the_bytes_of_its_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!("omx-subagent-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run = |dir: &Path, args: &[&OsStr]| -> String {
+            let out = Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                // The machine's identity and config are not this test's.
+                .env("GIT_AUTHOR_NAME", "openmax test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "openmax test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let o = OsStr::new;
+        run(&base, &[o("init"), o("-q"), o(".")]);
+        std::fs::write(base.join("a.txt"), "outer\n").unwrap();
+        run(&base, &[o("add"), o("a.txt")]);
+        run(&base, &[o("commit"), o("-qm"), o("outer")]);
+        let made = run(&base, &[o("rev-parse"), o("HEAD")]);
+
+        // The nested repository, at a name git records and reports byte for
+        // byte, with a commit its remote holds.
+        let name = OsStr::from_bytes(b"inner\xff");
+        let nested = base.join(name);
+        std::fs::create_dir_all(&nested).unwrap();
+        run(&nested, &[o("init"), o("-q"), o(".")]);
+        std::fs::write(nested.join("b.txt"), "inner\n").unwrap();
+        run(&nested, &[o("add"), o("b.txt")]);
+        run(&nested, &[o("commit"), o("-qm"), o("inner")]);
+        let inner = run(&nested, &[o("rev-parse"), o("HEAD")]);
+        run(&nested, &[o("update-ref"), o("refs/remotes/origin/main"), o(&inner)]);
+        // The outer repository records the nested one by its commit.
+        run(&base, &[o("add"), name]);
+        run(&base, &[o("commit"), o("-qm"), o("nested")]);
+        let tip = run(&base, &[o("rev-parse"), o("HEAD")]);
+
+        let tree = Worktree {
+            parent: base.clone(),
+            root: base.clone(),
+            project: base.clone(),
+            branch: "subagent/bytes".into(),
+            base: made,
+        };
+        let left = tree.unsaved(&tip).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(left.is_empty(), "a nested commit its remote holds is reported as left behind: {left:?}");
     }
 }
