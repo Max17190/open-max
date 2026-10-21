@@ -36,8 +36,17 @@ fn ci_job(name: &str) -> Vec<String> {
 /// three to start), each the way `cargo test` would (from its package
 /// directory, with Ctrl+C not ignored), passes a suite inside 5 seconds
 /// times the multiplier, and fails one over it or with a binary that fails
-/// again when run alone, naming the binary and showing its failures, and
-/// passes one whose binary failed only beside the others. Under a perl
+/// again when run alone (or that a signal ends, SIGALRM included), naming
+/// the binary and showing its failures, and passes one whose binary failed
+/// only beside the others. A binary still running at three times the budget
+/// is stopped, with every process still under it (a grandchild and one in a
+/// session of its own among them; on Linux, with no `ps` on the PATH), and
+/// fails the gate, which names the test it had not finished. Run several
+/// times over (`--runs N`), it reports each run's time, slowest binary and
+/// load (with no `uptime` on the PATH), shows and counts a binary that
+/// passed only alone, then the median of an odd or even count and the
+/// slowest run, and fails when any run fails, saying why when a binary
+/// never reported. It refuses arguments it does not take. Under a perl
 /// without a module it needs, it stops before cargo and names the module.
 #[test]
 fn whole_suite_runs_in_five_seconds() {
@@ -137,12 +146,78 @@ fn whole_suite_runs_in_five_seconds() {
     };
     let failing = dir.join("failing");
     executable(&failing, "#!/bin/sh\necho 'test boom ... FAILED'\nprintf 'failures:\\n\\n---- boom stdout ----\\nit broke\\n'\nexit 101\n");
+    // A binary that a signal ends, as a crash would, here SIGALRM: its
+    // status, 142, is one a binary can end with, so it must not read as the
+    // gate's own stop at the bound.
+    let crashing = dir.join("crashing");
+    executable(&crashing, "#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nkill -s ALRM $$\n");
+    // A binary that, beside the others, finishes one of its two tests and
+    // hangs in the other past the bound of the gate run that lists it, and
+    // passes alone. It leaves processes running that hold the write end of
+    // `lifeline`, one in a session of its own and one that a child of the
+    // binary started, so a sweep has to look past the binary's children:
+    // the read end, opened here first, sees the end of the file once none
+    // of them runs, with no pid to probe.
+    let (hanging, hung, lifeline) = (dir.join("hanging"), dir.join("hanging-ran"), dir.join("lifeline"));
+    let fifo = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(lifeline.as_os_str())).unwrap();
+    // SAFETY: mkfifo reads one NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut left_running = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&lifeline)
+        .unwrap();
+    executable(
+        &hanging,
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = --list ] && {{ printf 'hangs: test\\nquick: test\\n'; exit 0; }}\n\
+             [ -e '{0}' ] && exit 0\n: > '{0}'\necho 'test quick ... ok'\nexec 3> '{1}'\nsh -c 'sleep 5; :' &\n\
+             perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sleep 5 &\necho started >&3\nexec 3>&-\nexec sleep 5\n",
+            hung.display(),
+            lifeline.display()
+        ),
+    );
     // A binary that misses a deadline beside the others and passes alone,
     // as a test with a deadline can on a small runner: it fails its first
     // run (not counting the `--list` before the clock) and passes the next.
-    let contended = dir.join("contended");
-    let ran = dir.join("contended-ran");
-    executable(&contended, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\n[ -e '{0}' ] && exit 0\n: > '{0}'\necho 'test race ... FAILED'\nexit 101\n", ran.display()));
+    let fails_once = |name: &str| {
+        let (path, ran) = (dir.join(name), dir.join(format!("{name}-ran")));
+        executable(&path, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\n[ -e '{0}' ] && exit 0\n: > '{0}'\necho 'test race ... FAILED'\nexit 101\n", ran.display()));
+        path
+    };
+    let (contended, flaky) = (fails_once("contended"), fails_once("flaky"));
+    // A binary whose n-th run sleeps the n-th of `sleeps` seconds, for the
+    // gate run several times over. In each series below the median is a
+    // tenth of a second or more from the mean, the last run and the middle
+    // of the run order (and in the even one from either middle run), so
+    // load on the machine does not blur them, and the slowest run is
+    // neither the first nor the last.
+    let uneven = |name: &str, sleeps: &[&str]| {
+        let (path, counted) = (dir.join(name), dir.join(format!("{name}-runs")));
+        let cases: String = sleeps.iter().enumerate().map(|(n, sleep)| format!("{}) sleep {sleep} ;; ", n + 1)).collect();
+        executable(&path, &format!(
+            "#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nn=$(($(cat '{0}' 2>/dev/null || echo 0) + 1))\necho $n > '{0}'\n\
+             case $n in {cases}esac\n",
+            counted.display()
+        ));
+        path
+    };
+    let (odd, even) = (uneven("odd", &["0.1", "0.5", "0"]), uneven("even", &["0.2", "0.6", "0", "0"]));
+    // A binary that takes its runner, the shell above its launcher, down
+    // with it, so it never reports.
+    let vanishing = dir.join("vanishing");
+    executable(
+        &vanishing,
+        "#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nkill -9 $(cut -d ' ' -f 4 /proc/$PPID/stat 2>/dev/null || ps -o ppid= -p $PPID)\n",
+    );
+    // No `uptime`, and on Linux no `ps`, as on a minimal Debian or Ubuntu
+    // image, where procps provides both: the gate reads the load average,
+    // and sweeps what a stopped binary left running, without them.
+    executable(&bin.join("uptime"), "#!/bin/sh\nexit 127\n");
+    if cfg!(target_os = "linux") {
+        executable(&bin.join("ps"), "#!/bin/sh\nexit 127\n");
+    }
     let artifact = |name: &str, exe: Option<&Path>| {
         format!(
             r#"{{"reason":"compiler-artifact","manifest_path":"{}/Cargo.toml","target":{{"name":"{name}","kind":["test"]}},"profile":{{"test":{}}},"executable":{}}}"#,
@@ -156,15 +231,15 @@ fn whole_suite_runs_in_five_seconds() {
     let no_json = dir.join("no-json-pp");
     std::fs::create_dir_all(no_json.join("JSON")).unwrap();
     std::fs::write(no_json.join("JSON/PP.pm"), "die \"Can't locate JSON/PP.pm\\n\";\n").unwrap();
-    // One run of the gate on the binaries listed for it, its perl looking
-    // for modules in `perl_lib` first when one is given.
-    let run_gate = |label: &str, multiplier: &str, binaries: &[(&str, Option<&Path>)], perl_lib: Option<&Path>| {
+    // One run of the gate with `args` on the binaries listed for it, its
+    // perl looking for modules in `perl_lib` first when one is given.
+    let run_gate = |label: &str, args: &[&str], binaries: &[(&str, Option<&Path>)], perl_lib: Option<&Path>| {
         let listed = dir.join(format!("{label}.jsonl"));
         let lines: Vec<String> = binaries.iter().map(|(name, exe)| artifact(name, *exe)).collect();
         std::fs::write(&listed, lines.join("\n") + "\n").unwrap();
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
         let mut gate = Command::new(repo().join("scripts/check-suite-time.sh"));
-        gate.arg(multiplier).env("PATH", path).env("ARTIFACTS", &listed).env_remove("GITHUB_ACTIONS");
+        gate.args(args).env("PATH", path).env("ARTIFACTS", &listed).env_remove("GITHUB_ACTIONS");
         if let Some(lib) = perl_lib {
             gate.env("PERL5LIB", lib);
         }
@@ -178,32 +253,78 @@ fn whole_suite_runs_in_five_seconds() {
         (passed, report),
         (over, over_report),
         (failed, failed_report),
+        (stopped, stopped_report),
         (usage, _),
+        (leftover, _),
         (retried, retried_report),
         (unequipped, unequipped_report),
+        repeated_odd,
+        repeated_even,
+        (repeated_failed, repeated_failed_report),
+        (unreported, unreported_report),
+        (no_runs, _),
     ) = std::thread::scope(|scope| {
         let passed = scope.spawn(|| {
             let mut binaries: Vec<(&str, Option<&Path>)> =
                 ["a", "b", "c", "d"].iter().zip(&quick).map(|(name, exe)| (*name, Some(exe.as_path()))).collect();
             binaries.push(("built but no test", None));
-            run_gate("passed", "1", &binaries, None)
+            run_gate("passed", &["1"], &binaries, None)
         });
         // A tenth of the target is half a second, which the slow binary
         // outlasts on any machine.
-        let over = scope.spawn(|| run_gate("over", "0.1", &[("slow", Some(slow.as_path()))], None));
-        let failed = scope.spawn(|| run_gate("failed", "1", &[("broken", Some(failing.as_path()))], None));
-        let usage = scope.spawn(|| run_gate("usage", "twice", &[], None));
-        let retried = scope.spawn(|| run_gate("retried", "1", &[("contended", Some(contended.as_path()))], None));
-        let unequipped = scope.spawn(|| run_gate("unequipped", "1", &[], Some(&no_json)));
+        let over = scope.spawn(|| run_gate("over", &["0.1"], &[("slow", Some(slow.as_path()))], None));
+        let failed = scope.spawn(|| {
+            run_gate("failed", &["1"], &[("broken", Some(failing.as_path())), ("crashing", Some(crashing.as_path()))], None)
+        });
+        // A twenty-fifth of the target is a fifth of a second, so the bound
+        // is three fifths.
+        let stopped = scope.spawn(|| run_gate("stopped", &["0.04"], &[("hanging", Some(hanging.as_path()))], None));
+        let usage = scope.spawn(|| run_gate("usage", &["twice"], &[], None));
+        let leftover = scope.spawn(|| run_gate("leftover", &["1", "--runs", "2"], &[], None));
+        let retried = scope.spawn(|| run_gate("retried", &["1"], &[("contended", Some(contended.as_path()))], None));
+        let unequipped = scope.spawn(|| run_gate("unequipped", &["1"], &[], Some(&no_json)));
+        let repeated_odd = scope.spawn(|| run_gate("repeated-odd", &["--runs", "3", "1"], &[("odd", Some(odd.as_path()))], None));
+        let repeated_even =
+            scope.spawn(|| run_gate("repeated-even", &["--runs", "4", "1"], &[("even", Some(even.as_path()))], None));
+        let repeated_failed = scope.spawn(|| {
+            let binaries = [("broken", Some(failing.as_path())), ("flaky", Some(flaky.as_path()))];
+            run_gate("repeated-failed", &["--runs", "2", "1"], &binaries, None)
+        });
+        let unreported =
+            scope.spawn(|| run_gate("unreported", &["--runs", "2", "1"], &[("vanishing", Some(vanishing.as_path()))], None));
+        let no_runs = scope.spawn(|| run_gate("no-runs", &["--runs", "0", "1"], &[], None));
         (
             passed.join().unwrap(),
             over.join().unwrap(),
             failed.join().unwrap(),
+            stopped.join().unwrap(),
             usage.join().unwrap(),
+            leftover.join().unwrap(),
             retried.join().unwrap(),
             unequipped.join().unwrap(),
+            repeated_odd.join().unwrap(),
+            repeated_even.join().unwrap(),
+            repeated_failed.join().unwrap(),
+            unreported.join().unwrap(),
+            no_runs.join().unwrap(),
         )
     });
+    // What the processes the hanging binary left running wrote, and whether
+    // one of them still holds the lifeline two seconds on.
+    let (mut said, mut chunk) = (Vec::new(), [0_u8; 64]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let outlived = loop {
+        match left_running.read(&mut chunk) {
+            Ok(0) => break false,
+            Ok(read) => said.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("reading the lifeline: {error}"),
+        }
+        if Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(passed, Some(0), "binaries that pass, run at once, fail the gate: {report}");
@@ -216,8 +337,35 @@ fn whole_suite_runs_in_five_seconds() {
     assert!(over_report.contains("over its 0.50s budget"), "the budget is not the target times the multiplier: {over_report}");
     assert_eq!(failed, Some(1), "a failing test binary passes the gate: {failed_report}");
     assert!(failed_report.contains("broken (test) FAILED (exit 101)"), "{failed_report}");
+    // A signal's end reads as a shell reports it, 128 plus the signal, and
+    // never as a stop at the bound.
+    assert!(
+        failed_report.contains("crashing (test) FAILED (exit 142)") && failed_report.contains("crashing (test) failed:"),
+        "a binary that a signal ended passes, or reads as stopped at the bound: {failed_report}"
+    );
     assert!(failed_report.contains("---- boom stdout ----\nit broke"), "the failure is not shown: {failed_report}");
+    // A binary still running at three times the budget is stopped with
+    // every process still under it, in its session or not, and its run
+    // fails, naming the test it had not finished, even though the binary
+    // then passes alone.
+    assert_eq!(stopped, Some(1), "a binary that hangs beside the others passes the gate: {stopped_report}");
+    assert!(
+        said == b"started\n",
+        "the hanging binary was stopped before it started what it leaves running, so no sweep was tried (they wrote {:?}): {stopped_report}",
+        String::from_utf8_lossy(&said)
+    );
+    assert!(!outlived, "the processes the stopped binary left running outlived it: {stopped_report}");
+    let unfinished: Vec<&str> = stopped_report
+        .split_once("hanging (test) failed beside the other binaries and passed alone:\nstill running at 0.60s, when it was stopped:\n")
+        .map_or(Vec::new(), |(_, rest)| rest.lines().take_while(|line| !line.is_empty() && !line.contains(' ')).collect());
+    assert!(
+        stopped_report.contains("hanging (test) FAILED (stopped at 0.60s)")
+            && unfinished == ["hangs"]
+            && stopped_report.contains("over its 0.20s budget"),
+        "the binary stopped at its bound, or the test it had not finished, is not named: {stopped_report}"
+    );
     assert_eq!(usage, Some(2), "a multiplier that is not a number is not refused");
+    assert_eq!(leftover, Some(2), "arguments after the multiplier are not refused");
     assert_eq!(retried, Some(0), "a binary that passes alone fails the gate: {retried_report}");
     assert!(
         retried_report.contains("contended (test) failed beside the other binaries and passed alone"),
@@ -228,6 +376,61 @@ fn whole_suite_runs_in_five_seconds() {
         unequipped_report.contains("needs perl with its core modules JSON::PP and Time::HiRes"),
         "the gate does not name what it is missing: {unequipped_report}"
     );
+    // Run several times over, the gate reports each run (its time, its
+    // slowest binary and the load it began under), then the median of the
+    // times it reported (the middle one of an odd count, the mean of the
+    // middle two of an even one) and the slowest.
+    for ((code, report), runs, name) in [(repeated_odd, 3, "odd"), (repeated_even, 4, "even")] {
+        assert_eq!(code, Some(0), "runs that each pass fail the gate run {runs} times: {report}");
+        let mut took: Vec<f64> = (1..=runs)
+            .map(|n| {
+                let line = report.lines().find_map(|line| line.strip_prefix(&format!("run {n} of {runs}: ")));
+                let time = line.and_then(|line| {
+                    let (time, rest) = line.split_once("s, slowest binary ")?;
+                    let (slowest, load) = rest.split_once(", load ")?;
+                    let reported = slowest.ends_with(&format!("s {name} (test)")) && load.parse::<f64>().is_ok();
+                    time.parse::<f64>().ok().filter(|_| reported)
+                });
+                time.unwrap_or_else(|| panic!("run {n} of {runs} is not reported: {report}"))
+            })
+            .collect();
+        took.sort_by(f64::total_cmp);
+        let middle = if runs % 2 == 1 { took[runs / 2] } else { (took[runs / 2 - 1] + took[runs / 2]) / 2.0 };
+        let summary = report
+            .lines()
+            .find_map(|line| line.strip_prefix("median ")?.strip_suffix(&format!("s over {runs} runs, against the 5.00s budget of each")))
+            .and_then(|line| line.split_once("s, slowest "))
+            .and_then(|(median, slowest)| Some((median.parse::<f64>().ok()?, slowest.parse::<f64>().ok()?)));
+        // Times print in hundredths, cut short: the mean of two printed
+        // times can be half a hundredth off the one the gate computed.
+        let near = |a: f64, b: f64, by: f64| (a - b).abs() <= by + 1e-9;
+        assert!(
+            summary.is_some_and(|(median, slowest)| near(median, middle, if runs % 2 == 1 { 0.0 } else { 0.005 })
+                && near(slowest, took[runs - 1], 0.0)),
+            "not a median of {middle:.3}s and a slowest run of {:.2}s: {report}",
+            took[runs - 1]
+        );
+    }
+    // A run that failed shows why and says so, and fails the gate; a run in
+    // which a binary passed only alone shows that too, and counts it.
+    let run_line = |n: usize| repeated_failed_report.lines().find(|line| line.starts_with(&format!("run {n} of 2: ")));
+    assert_eq!(repeated_failed, Some(1), "a failing binary passes the gate run several times: {repeated_failed_report}");
+    assert!(
+        repeated_failed_report.contains("---- boom stdout ----\nit broke")
+            && repeated_failed_report.contains("flaky (test) failed beside the other binaries and passed alone")
+            && run_line(1).is_some_and(|line| line.ends_with(", 1 passed only when run again alone, failed"))
+            && run_line(2).is_some_and(|line| line.ends_with(", failed") && !line.contains("alone")),
+        "the failing runs are not shown, or the binary that passed only alone is not counted: {repeated_failed_report}"
+    );
+    // A binary that never reports fails its run, which says why, and the
+    // runs after it go on.
+    assert_eq!(unreported, Some(1), "a run whose binary never reported passes: {unreported_report}");
+    assert!(
+        unreported_report.contains("error: 1 of 1 test binaries did not report")
+            && unreported_report.lines().any(|line| line.starts_with("run 2 of 2: ") && line.ends_with(", failed")),
+        "the run whose binary never reported does not say why: {unreported_report}"
+    );
+    assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
 }
 
 /// The thesis claims are gated in CI: every thesis test runs there in

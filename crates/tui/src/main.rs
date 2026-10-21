@@ -1577,6 +1577,16 @@ static QUIT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 pub(crate) const STOP_SETTLE: std::time::Duration =
     open_max_core::execution::CANCEL_SETTLE.saturating_add(std::time::Duration::from_secs(1));
 
+/// [`STOP_SETTLE`], or in a debug binary `OPENMAX_TEST_STOP_SETTLE_MS`
+/// milliseconds when set, for the CLI tests that wait the deadline out.
+pub(crate) fn stop_settle() -> std::time::Duration {
+    #[cfg(all(debug_assertions, not(test)))]
+    if let Some(ms) = std::env::var("OPENMAX_TEST_STOP_SETTLE_MS").ok().and_then(|ms| ms.parse().ok()) {
+        return std::time::Duration::from_millis(ms);
+    }
+    STOP_SETTLE
+}
+
 /// How a session that a signal stopped exits: 128 plus the signal's number,
 /// the status a shell reports for a job the signal ended, so a script or a
 /// supervisor can tell a stop from a finished run.
@@ -1633,7 +1643,7 @@ pub(crate) async fn until_stopped<T: Send + 'static>(
                 return Some(done.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic())));
             }
             _ = &mut quit, if expiry.is_none() => {
-                let by = std::time::Instant::now() + STOP_SETTLE;
+                let by = std::time::Instant::now() + stop_settle();
                 *stop_by = Some(by);
                 expiry = Some(deadline(by));
             }
@@ -1669,7 +1679,7 @@ pub(crate) async fn discard_empty_session(
     stop_by: Option<std::time::Instant>,
 ) {
     use open_max_core::sessions;
-    let stopped = || format!("the stop's {STOP_SETTLE:?} deadline passed before it could be removed");
+    let stopped = || format!("the stop's {:?} deadline passed before it could be removed", stop_settle());
     let past = stop_by.is_some_and(|by| by <= std::time::Instant::now());
     // Set by the job before it waits on the lock: whether the session has history.
     let history = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -1700,7 +1710,7 @@ pub(crate) async fn discard_empty_session(
         tokio::select! {
             joined = &mut job => break joined.unwrap_or_else(|e| Err(e.to_string())),
             _ = &mut quit, if expiry.is_none() => {
-                expiry = Some(deadline(std::time::Instant::now() + STOP_SETTLE));
+                expiry = Some(deadline(std::time::Instant::now() + stop_settle()));
             }
             _ = async { if let Some(expiry) = expiry.as_mut() { let _ = expiry.await; } },
                 if expiry.is_some() => break match history.get() {
@@ -1709,7 +1719,8 @@ pub(crate) async fn discard_empty_session(
                     None => {
                         eprintln!(
                             "openmax: warning: the session {session_id} stays indexed and may be empty: \
-                             the stop's {STOP_SETTLE:?} deadline passed before it could be checked"
+                             the stop's {:?} deadline passed before it could be checked",
+                            stop_settle()
                         );
                         return;
                     }

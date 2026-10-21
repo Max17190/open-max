@@ -963,11 +963,17 @@ pub(crate) fn sync(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
 }
 
 /// `sync` with the OS error as it came, so `sync_dir` can read its code.
+/// Unit tests record each barrier and skip the device, as they skip the
+/// ledger's flushes: no test observes a power cut, and the barriers queued
+/// the tests that save behind each other on the drive.
 fn sync_device(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     SYNCED.with(|synced| synced.borrow_mut().push(path.to_path_buf()));
     #[cfg(not(test))]
     let _ = path;
+    if cfg!(test) {
+        return Ok(());
+    }
     #[cfg(target_vendor = "apple")]
     let result = {
         use std::os::fd::AsRawFd;

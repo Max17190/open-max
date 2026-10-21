@@ -1506,9 +1506,20 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// undercuts the backoff, so a server answering 0 to every client at once
 /// cannot pull this one into a tight loop.
 fn backoff(attempt: u32, asked: Option<u64>) -> std::time::Duration {
-    let floor = BACKOFF_UNIT.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
-    let asked = BACKOFF_UNIT.saturating_mul(asked.unwrap_or(0).min(RETRY_AFTER_CAP_SECS) as u32);
+    let unit = backoff_unit();
+    let floor = unit.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
+    let asked = unit.saturating_mul(asked.unwrap_or(0).min(RETRY_AFTER_CAP_SECS) as u32);
     floor.max(asked)
+}
+
+/// [`BACKOFF_UNIT`], or in a debug binary `OPENMAX_TEST_BACKOFF_UNIT_MS`
+/// milliseconds when set, for the CLI tests that wait a backoff out.
+fn backoff_unit() -> std::time::Duration {
+    #[cfg(all(debug_assertions, not(test)))]
+    if let Some(ms) = std::env::var("OPENMAX_TEST_BACKOFF_UNIT_MS").ok().and_then(|ms| ms.parse().ok()) {
+        return std::time::Duration::from_millis(ms);
+    }
+    BACKOFF_UNIT
 }
 
 /// Why an attempt ended when the endpoint sent nothing for `idle`.

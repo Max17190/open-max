@@ -203,7 +203,7 @@ async fn run_turn_events(
                 }
             },
             _ = &mut quit, if stop_by.is_none() => {
-                *stop_by = Some(Instant::now() + crate::STOP_SETTLE);
+                *stop_by = Some(Instant::now() + crate::stop_settle());
                 continue;
             }
             _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },

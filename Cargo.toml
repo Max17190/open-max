@@ -107,3 +107,28 @@ opt-level = "s"
 # optimization the CI size gate measures, rather than a second, untuned shape.
 [profile.dist]
 inherits = "release"
+
+# `cargo test` builds the dev profile. The terminal rendering and JSON crates
+# below are optimized (level 1): run all at once the suite is CPU-bound, and
+# this takes the TUI's unit tests, its slowest binary, from 4.9 to 3.4
+# CPU-seconds and the whole suite from 21.2 to 19.3, for 2 seconds more on a
+# clean test build (30 to 32 at 3 jobs). The other dependencies and the
+# workspace's own crates stay unoptimized, so an edit rebuilds as before.
+# Optimizing every dependency saved no more and doubled that clean build,
+# since it optimizes the proc macros too, `syn` first.
+[profile.dev.package]
+ratatui-core.opt-level = 1
+ratatui-widgets.opt-level = 1
+compact_str.opt-level = 1
+kasuari.opt-level = 1
+hashbrown.opt-level = 1
+itertools.opt-level = 1
+line-clipping.opt-level = 1
+unicode-segmentation.opt-level = 1
+unicode-truncate.opt-level = 1
+unicode-width.opt-level = 1
+serde_json.opt-level = 1
+serde_core.opt-level = 1
+ryu.opt-level = 1
+itoa.opt-level = 1
+memchr.opt-level = 1
