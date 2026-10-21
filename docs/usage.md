@@ -244,7 +244,7 @@ for the repair: close every openmax, then move the file aside.
 | `/approvals auto\|ask\|readonly` | Save this project's execution mode |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
 | `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
-| `/reload` | Force a re-freeze now (it also happens automatically when extension files change) |
+| `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the trailing note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |

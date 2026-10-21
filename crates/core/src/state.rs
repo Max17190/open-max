@@ -32,10 +32,16 @@ use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 #[derive(Default, Clone)]
 pub struct SessionData {
     pub messages: Vec<ChatMessage>,
-    /// The tool registry frozen at session creation; its serialized schemas
-    /// are part of the prompt-cache prefix and must never change mid-session.
+    /// The session's current extension generation. Its serialized schemas
+    /// are the tools array the session's prompt was built with, part of the
+    /// prompt-cache prefix: a refreeze swaps what runs and keeps them, so it
+    /// moves no byte of that prefix.
     pub registry: Arc<Registry>,
-    /// Where the frozen prompt prefix's tokens go, for /context.
+    /// The trailing note for `registry`'s generation, what it changed since
+    /// the prompt was built, sent after the history on every request: rebuilt
+    /// with the registry, never persisted. None when nothing changed.
+    pub trailing_note: Option<Arc<str>>,
+    /// Where the prompt's and the note's tokens go, for /context.
     pub prompt_breakdown: Arc<crate::prompt::PromptBreakdown>,
     /// Messages already written to disk; enables append-only persistence.
     pub persisted_count: usize,

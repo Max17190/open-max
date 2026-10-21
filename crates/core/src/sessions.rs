@@ -2224,6 +2224,9 @@ mod tests {
             memory_files: None,
             memory_rows: None,
             read_files: None,
+            frozen_tools: Vec::new(),
+            prompt_index: Default::default(),
+            tools_omitted: 0,
         });
         assert!(load_manifest(&core, &id).is_none(), "and so does its manifest");
         // All five session-scoped files, so this cannot regress one at a time.

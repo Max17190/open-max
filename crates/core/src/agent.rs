@@ -48,7 +48,7 @@ use crate::client::{ChatClient, CompletionResult, StreamDelta, TRUNCATED};
 use crate::config::{ApprovalMode, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
-use crate::prompt::{system_prompt_with_breakdown, PromptBreakdown};
+use crate::prompt::{session_context, trailing_note, PromptBreakdown};
 use crate::registry::Registry;
 use crate::sessions;
 use crate::state::{CancelToken, Core, SessionData};
@@ -459,10 +459,11 @@ fn outside_approval_note(fresh: &[String]) -> String {
     )
 }
 
-/// Tell the frontend, once per session, that the installed tool schemas cost
-/// more than the window can spend. It holds on every turn once it holds at
-/// all, so repeating it per turn would be noise; the turn still runs, because
-/// this is the user's configuration to fix, not a failure of this turn.
+/// Tell the frontend, once per session, that the installed tool schemas and
+/// any trailing note cost more than the window can spend. It holds on every
+/// turn once it holds at all, so repeating it per turn would be noise; the
+/// turn still runs, because this is the user's configuration to fix, not a
+/// failure of this turn.
 async fn report_schemas_over_budget(
     core: &Arc<Core>,
     session_id: &str,
@@ -497,11 +498,12 @@ async fn report_schemas_over_budget(
         // a note beside it renders the same advisory twice (the same reason
         // the post-approval receipt rides `outcome.output`).
         let note = crate::text::one_line(&format!(
-            "[tool schemas cost ~{schema_tokens} tokens of the ~{budget_tokens} this context \
-             window can spend on a request. They are resent whole every request, so history \
-             compacts early and a long turn may not fit at all. Price each tool with bash: \
-             openmax --spec usage, retire one you are not using (delete its .toml), or raise \
-             context_tokens for this model.]"
+            "[tool schemas and any trailing note cost ~{schema_tokens} tokens of the \
+             ~{budget_tokens} this context window can spend on a request. They are resent \
+             whole every request, so history compacts early and a long turn may not fit at \
+             all. Price each tool with bash: openmax --spec usage, retire one you are not \
+             using (delete its .toml; the tools array drops it at /reload or in a new \
+             session), or raise context_tokens for this model.]"
         ));
         // APPENDED, never inserted before the tail. `insert_startup_note`
         // inserts at len-1 because at turn start the tail is the user's own
@@ -535,26 +537,46 @@ fn seen_approval_events(core: &Core, project_root: &Path) -> Option<HashSet<u64>
 fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> Result<SessionData, String> {
     sessions::ensure_owned(core, session_id)?;
     Ok(if let Some(mut messages) = sessions::load_messages(core, session_id)? {
-        // Resume: registry frozen at creation — manifest if present, else built-ins only.
-        let registry = if let Some(manifest) = sessions::load_manifest(core, session_id) {
-            Arc::new(Registry::from_manifest(manifest))
-        } else {
-            Arc::new(Registry::builtin_only())
-        };
         let count = messages.len();
         // The prompt lives at index 0. A transcript without it there is from
         // a build that predates the rule (none was ever released): give the
         // model its prompt, and the file is rewritten into that shape below.
         let needs_system = messages.first().map(|m| m.role.as_str()) != Some("system");
-        let prompt_breakdown = if needs_system {
-            let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
-            messages.insert(0, ChatMessage::system(prompt));
-            Arc::new(breakdown)
-        } else {
-            let persisted_prompt =
-                messages.first().and_then(|m| m.content.as_deref()).unwrap_or("");
-            Arc::new(PromptBreakdown::from_persisted(persisted_prompt, &registry, project_root))
+        // Resume: the generation the session last froze, its tools array,
+        // and the record of what its persisted prompt indexes, from a
+        // manifest whose record describes that prompt. Without one, nothing
+        // says what the prompt indexes: the session is from an older shape,
+        // its manifest write failed, or a transcript write failed after the
+        // manifest's landed. The prompt and the registry are then rebuilt
+        // from disk once, as at creation, and saved with the manifest, so
+        // every later sitting sends the persisted bytes as they are.
+        let persisted = messages.first().filter(|m| m.role == "system").and_then(|m| m.content.as_deref());
+        let manifest = sessions::load_manifest(core, session_id)
+            .filter(|m| persisted.is_some_and(|prompt| m.prompt_index.describes(prompt)));
+        let rebuild_prompt = manifest.is_none();
+        let (registry, note, breakdown) = match manifest {
+            Some(manifest) => {
+                let mut registry = Registry::from_manifest(manifest);
+                registry.scan_memory(project_root);
+                let (note, rows) = trailing_note(project_root, &registry);
+                let prompt = persisted.unwrap_or_default();
+                let breakdown = PromptBreakdown::from_persisted(prompt, &registry, project_root).with_note(rows);
+                (registry, note, breakdown)
+            }
+            None => {
+                let mut registry = Registry::build(&core.data_dir, project_root);
+                let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+                if needs_system {
+                    messages.insert(0, ChatMessage::system(prompt));
+                } else {
+                    messages[0] = ChatMessage::system(prompt);
+                }
+                sessions::save_manifest(core, session_id, &registry.to_manifest());
+                (registry, note, breakdown)
+            }
         };
+        let registry = Arc::new(registry);
+        let prompt_breakdown = Arc::new(breakdown);
         // A process that died mid-tool left a call on record with no reply,
         // and a provider refuses every request that carries one. Answer it
         // where it stands, including in a transcript that went on growing
@@ -576,7 +598,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
             .map(|at| sessions::ResumeEdit::Insert(at as u64))
             .chain(strays.into_iter().map(|at| sessions::ResumeEdit::Remove(at as u64)))
             .collect();
-        let (persisted_count, saved) = if edits.is_empty() {
+        let (persisted_count, saved) = if edits.is_empty() && !rebuild_prompt {
             (count, true)
         } else {
             let mut persisted = 0usize;
@@ -600,6 +622,7 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
         let mut data = SessionData {
             messages,
             registry,
+            trailing_note: note.map(Arc::from),
             prompt_breakdown,
             persisted_count,
             deferred_resume_edits: edits,
@@ -615,21 +638,24 @@ fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -
     } else {
         // No transcript on disk: start fresh, honoring a manifest saved
         // before the session wrote its first message.
-        let (registry, had_manifest) = if let Some(manifest) = sessions::load_manifest(core, session_id) {
-            (Arc::new(Registry::from_manifest(manifest)), true)
-        } else {
-            (Arc::new(Registry::build(&core.data_dir, project_root)), false)
+        let mut registry = match sessions::load_manifest(core, session_id) {
+            Some(manifest) => {
+                let mut registry = Registry::from_manifest(manifest);
+                registry.scan_memory(project_root);
+                registry
+            }
+            None => Registry::build(&core.data_dir, project_root),
         };
-        if !had_manifest {
-            // Always persisted (even builtin-only) so the extension
-            // fingerprint travels with the session; without it every resume
-            // would look like a self-modification and re-freeze for nothing.
-            sessions::save_manifest(core, session_id, &registry.to_manifest());
-        }
-        let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+        let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+        // Always persisted (even builtin-only) so the extension fingerprint
+        // and the record of what the prompt indexes travel with the session;
+        // without them every resume would look like a self-modification and
+        // re-freeze for nothing, and rebuild the prompt.
+        sessions::save_manifest(core, session_id, &registry.to_manifest());
         SessionData {
             messages: vec![ChatMessage::system(prompt)],
-            registry,
+            registry: Arc::new(registry),
+            trailing_note: note.map(Arc::from),
             prompt_breakdown: Arc::new(breakdown),
             persisted_count: 0,
             deferred_resume_edits: Vec::new(),
@@ -655,10 +681,13 @@ pub const APPROVAL_TIMEOUT_MESSAGE: &str =
     "Approval request timed out with no response. Stop and summarize what you were about to do.";
 
 fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
+    // The trailing note can end this very message, so what a file or a
+    // command printed never carries the note's header.
+    let output = crate::prompt::defuse_note_header(&outcome.output);
     if outcome.ok || outcome.output == APPROVAL_TIMEOUT_MESSAGE {
-        outcome.output.clone()
+        output.into_owned()
     } else {
-        format!("Error: {}", outcome.output)
+        format!("Error: {output}")
     }
 }
 
@@ -1606,10 +1635,12 @@ fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Re-freeze a live session's registry and system prompt from the current
-/// on-disk config. This is the deliberate, user-triggered cache break behind
-/// `/reload`: the agent authors a tool, skill, or prompt change mid-session
-/// and uses it in the same conversation instead of losing context to `/new`.
+/// Re-freeze a live session's registry, system prompt, and tools array from
+/// the current on-disk config. This is the one user act that starts a new
+/// prefix, the deliberate cache break behind `/reload`: the changes the note
+/// carried move into a new prompt and tools array, and the note empties,
+/// without losing the conversation to `/new`. A tool or skill change needs
+/// none of it to be usable; the automatic refreezes carry it in the note.
 /// Returns the newly frozen registry's tool and skill counts, the capability
 /// files that changed (as `Refrozen::changes`), and what each new or changed
 /// external tool runs (as `Refrozen::runs`).
@@ -1636,10 +1667,10 @@ pub async fn reload_session(
         .map_err(|e| format!("reload discovery failed: {e}"))?;
     // Activation reads the memory store, so it stays off the runtime thread
     // like the capture above.
-    let registry = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot))
+    let mut registry = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot))
         .await
         .map_err(|e| format!("reload discovery failed: {e}"))?;
-    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+    let (prompt, note, breakdown) = session_context(project_root, &mut registry);
 
     ensure_session_hydrated(core, session_id, project_root).await?;
 
@@ -1656,7 +1687,7 @@ pub async fn reload_session(
         }
         let changes = generation_changes(&data.registry, &registry, project_root);
         let runs = tool_runs(&data.registry, &registry);
-        apply_freeze(core, session_id, data, registry, prompt, breakdown);
+        apply_freeze(core, session_id, data, registry, Some(prompt), note, breakdown);
         (changes, runs)
     };
     Ok((counts.0, counts.1, changes, runs))
@@ -1761,7 +1792,7 @@ async fn run_compact(
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
     let client = ChatClient::from_endpoint(&endpoint);
-    let (messages, registry, take_seq, factor) = {
+    let (messages, registry, note, take_seq, factor) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
             .get_mut(session_id)
@@ -1772,12 +1803,15 @@ async fn run_compact(
             return Err("a turn is in flight; run /compact after it finishes".into());
         }
         let registry = data.registry.clone();
+        let note = data.trailing_note.clone();
         let factor = token_factor(route_ratio(data.prompt_ratio.as_ref(), &client.origin()));
         let (messages, seq) = take_messages(data);
-        (messages, registry, seq, factor)
+        (messages, registry, note, seq, factor)
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
-    let schema_tokens = estimate_tokens(registry.schemas_wire_arc().len());
+    // The same overhead the turn loop budgets with: the tool schemas and the
+    // trailing note the next request sends after the history.
+    let schema_tokens = request_overhead(&registry.schemas_wire_arc(), note.as_deref());
     // In estimator units, like the turn loop's; the receipt converts back.
     let budget = to_estimate(
         endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024),
@@ -1800,9 +1834,9 @@ async fn run_compact(
     if schemas_exceed_budget(trigger, schema_tokens) {
         guard.commit().await;
         return Err(
-            "the frozen tool schemas alone fill the window, so pruning cannot help; \
-             uninstall tools (`openmax --spec usage` ranks what each costs) or raise \
-             context_tokens"
+            "the frozen tool schemas and any trailing note alone fill the window, so pruning \
+             cannot help; uninstall tools (`openmax --spec usage` ranks what each costs) and \
+             /reload, or raise context_tokens"
                 .into(),
         );
     }
@@ -1839,30 +1873,40 @@ async fn run_compact(
     })
 }
 
-/// Install a rebuilt registry + system prompt into a live session and persist
-/// the new shape (manifest plus a full transcript rewrite, since the prefix
-/// changed). Shared by /reload and the automatic turn-start re-freeze.
+/// Install a rebuilt registry, its note, and what they cost into a live
+/// session and persist the manifest. Shared by /reload and the automatic
+/// turn-start re-freeze. Only /reload passes a `prompt`: then messages[0] is
+/// replaced and the transcript rewritten, since its first line changed. The
+/// automatic refreeze leaves the prompt and the transcript alone, so the
+/// cached prefix survives it.
 fn apply_freeze(
     core: &Arc<Core>,
     session_id: &str,
     data: &mut SessionData,
     registry: Registry,
-    prompt: String,
+    prompt: Option<String>,
+    note: Option<String>,
     breakdown: PromptBreakdown,
 ) {
-    if data.messages.first().is_some_and(|m| m.role == "system") {
-        data.messages[0] = ChatMessage::system(prompt);
-    } else {
+    let rewrite = prompt.is_some();
+    match prompt {
+        Some(prompt) if data.messages.first().is_some_and(|m| m.role == "system") => {
+            data.messages[0] = ChatMessage::system(prompt);
+        }
         // Hydration guarantees system-at-0; this is for callers that
         // assembled messages by other means.
-        data.messages.insert(0, ChatMessage::system(prompt));
+        Some(prompt) => data.messages.insert(0, ChatMessage::system(prompt)),
+        None => {}
     }
     data.registry = Arc::new(registry);
+    data.trailing_note = note.map(Arc::from);
     data.prompt_breakdown = Arc::new(breakdown);
     sessions::save_manifest(core, session_id, &data.registry.to_manifest());
-    data.persisted_count = 0;
-    let saved = sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
-    land_deferred_resume_edits(core, session_id, data, saved);
+    if rewrite {
+        data.persisted_count = 0;
+        let saved = sessions::save_messages(core, session_id, &data.messages, &mut data.persisted_count, true);
+        land_deferred_resume_edits(core, session_id, data, saved);
+    }
 }
 
 /// Load a session into the in-memory map if this process has not seen it yet.
@@ -1955,7 +1999,7 @@ fn append_and_emit_note(
     // The same door for every mid-turn note. The `\n` below is the harness's
     // own separator between the tool result and its note, so it is the note
     // that flattens, never the assembled content.
-    let note = &crate::text::one_line(note);
+    let note = &crate::prompt::defuse_note_header(&crate::text::one_line(note)).into_owned();
     let call_id = messages
         .iter()
         .rev()
@@ -2238,7 +2282,7 @@ fn tool_runs(old: &Registry, new: &Registry) -> Vec<(String, String)> {
             let unchanged = old.get(&spec.name).is_some_and(|before| {
                 matches!(&before.kind, crate::registry::ToolKind::External(b) if b.source_sha256 == ext.source_sha256)
             });
-            (!unchanged).then(|| (spec.name.clone(), command_line(ext)))
+            (!unchanged).then(|| (spec.name.clone(), ext.command_line()))
         })
         .collect()
 }
@@ -2316,9 +2360,10 @@ fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Ve
 
 /// The self-modification loop closes here: at turn start, capture one immutable
 /// generation of extension bytes. If its fingerprint no longer matches the
-/// session's registry, activate that exact generation and rebuild the prompt in
-/// place. An unchanged generation preserves the prompt cache; a tool the agent
-/// wrote last turn is callable on this one without /new or /reload.
+/// session's registry, activate that exact generation and rebuild the note.
+/// The prompt and the tools array stay as they are, so the cached prefix
+/// survives; a tool the agent wrote last turn runs on this one, through the
+/// bash line the note gives it, without /new or /reload.
 async fn refreeze_if_extensions_changed(
     core: &Arc<Core>,
     session_id: &str,
@@ -2334,19 +2379,21 @@ async fn refreeze_if_extensions_changed(
         }
     };
     let disk_fp = snapshot.fingerprint();
-    let stale = {
+    let sent = {
         let sessions_map = core.sessions.lock().await;
         sessions_map
             .get(session_id)
-            .is_some_and(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
-    };
-    if !stale {
-        return None;
-    }
-    let Ok(registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
+            .filter(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+            .map(|d| d.registry.clone())
+    }?;
+    let Ok(mut registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
         return None;
     };
-    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &registry);
+    // A refreeze swaps the generation, never the prefix: the new registry
+    // keeps the tools array and the record of the prompt the session sends,
+    // and the note is the difference from them.
+    registry.keep_prompt_of(&sent);
+    let (note, rows) = trailing_note(project_root, &registry);
     let counts = (registry.tools.len(), registry.skills.len());
     let broken = registry.broken.clone();
     let shadowed = registry.shadowed_skills.clone();
@@ -2361,7 +2408,8 @@ async fn refreeze_if_extensions_changed(
                 let added = classify_added_tools(&data.registry, &registry, mode, &core.data_dir, project_root);
                 let changes = generation_changes(&data.registry, &registry, project_root);
                 let runs = tool_runs(&data.registry, &registry);
-                apply_freeze(core, session_id, data, registry, prompt, breakdown);
+                let breakdown = data.prompt_breakdown.with_note(rows);
+                apply_freeze(core, session_id, data, registry, None, note, breakdown);
                 Some((added, changes, runs))
             }
             _ => None,
@@ -2387,14 +2435,16 @@ async fn refreeze_if_extensions_changed(
 
 /// The mid-turn half of the self-modification loop. The turn-start check
 /// closes create-then-use across turns; this closes it within one turn:
-/// called between iterations after a mutating call succeeded, it captures one
+/// called between iterations after a mutating call executed, it captures one
 /// immutable extension generation, and if the fingerprint moved it swaps the
-/// turn's registry and the transcript's system prompt in place, installs the
-/// new generation into the session (the next turn-start check must compare
-/// against it), and persists the manifest. The caller updates its own wire
-/// state and rewrites the transcript. The session's `data.messages` is empty
-/// while the turn owns the transcript, so unlike `apply_freeze` this never
-/// touches it; this turn holds `running`, so nothing else mutates the session.
+/// turn's registry and note, installs the new generation into the session
+/// (the next turn-start check must compare against it), and persists the
+/// manifest. messages[0] and the tools array do not change, so the request
+/// that follows reuses every cached byte; the receipt rides the last tool
+/// result, which is not on disk yet, so the save that follows only appends.
+/// The session's `data.messages` is empty while the turn owns the
+/// transcript, so unlike `apply_freeze` this never touches it; this turn
+/// holds `running`, so nothing else mutates the session.
 ///
 /// Returns true when a new generation was activated.
 async fn refreeze_between_iterations(
@@ -2402,7 +2452,8 @@ async fn refreeze_between_iterations(
     session_id: &str,
     project_root: &Path,
     registry: &mut Arc<Registry>,
-    messages: &mut Vec<ChatMessage>,
+    note: &mut Option<Arc<str>>,
+    messages: &mut [ChatMessage],
 ) -> bool {
     let snapshot = {
         let root = project_root.to_path_buf();
@@ -2416,12 +2467,14 @@ async fn refreeze_between_iterations(
     if snapshot.fingerprint() == registry.ext_fingerprint {
         return false;
     }
-    let Ok(new_registry) =
+    let Ok(mut new_registry) =
         tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await
     else {
         return false;
     };
-    let (prompt, breakdown) = system_prompt_with_breakdown(project_root, &new_registry);
+    new_registry.keep_prompt_of(registry);
+    let (new_note, rows) = trailing_note(project_root, &new_registry);
+    let new_note: Option<Arc<str>> = new_note.map(Arc::from);
     let counts = (new_registry.tools.len(), new_registry.skills.len());
     let mode = core.approval_mode(project_root);
     let added_tools = classify_added_tools(registry, &new_registry, mode, &core.data_dir, project_root);
@@ -2430,20 +2483,17 @@ async fn refreeze_between_iterations(
     let broken = new_registry.broken.clone();
     let shadowed = new_registry.shadowed_skills.clone();
     let new_registry = Arc::new(new_registry);
-    if messages.first().is_some_and(|m| m.role == "system") {
-        messages[0] = ChatMessage::system(prompt);
-    } else {
-        messages.insert(0, ChatMessage::system(prompt));
-    }
     {
         let mut sessions_map = core.sessions.lock().await;
         if let Some(data) = sessions_map.get_mut(session_id) {
             data.registry = new_registry.clone();
-            data.prompt_breakdown = Arc::new(breakdown);
+            data.trailing_note = new_note.clone();
+            data.prompt_breakdown = Arc::new(data.prompt_breakdown.with_note(rows));
             sessions::save_manifest(core, session_id, &data.registry.to_manifest());
         }
     }
     *registry = new_registry;
+    *note = new_note;
     // The Refrozen event below reaches the UI, not the model, and the eval
     // showed exactly that gap: an agent authored a valid tool, three
     // refreezes fired, and it still ran the script by hand because nothing
@@ -2459,6 +2509,32 @@ async fn refreeze_between_iterations(
         runs,
     });
     true
+}
+
+/// Rebuild the turn's and the session's note with memory read from disk now,
+/// after an iteration whose file tools wrote a memory: the generation, the
+/// prompt, and the tools array stay as they are, and nothing is announced,
+/// as a memory write never refreezes. The scan reads the memory store, so it
+/// runs off the runtime thread like an activation's.
+async fn refresh_note_after_memory_write(
+    core: &Arc<Core>,
+    session_id: &str,
+    project_root: &Path,
+    registry: &Arc<Registry>,
+    note: &mut Option<Arc<str>>,
+) {
+    let (root, generation) = (project_root.to_path_buf(), registry.clone());
+    let Ok((fresh, rows)) =
+        tokio::task::spawn_blocking(move || crate::prompt::note_after_memory_write(&root, &generation)).await
+    else {
+        return;
+    };
+    let fresh: Option<Arc<str>> = fresh.map(Arc::from);
+    if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
+        data.trailing_note = fresh.clone();
+        data.prompt_breakdown = Arc::new(data.prompt_breakdown.with_note(rows));
+    }
+    *note = fresh;
 }
 
 /// Buffers streamed deltas and flushes them as batched events. Flushes on
@@ -2820,13 +2896,13 @@ async fn run_loop(
 
     // Take ownership of the in-memory transcript for this turn (no full clone).
     // MessageGuard restores it on drop so panic/abort cannot empty the session.
-    let (messages, mut registry, take_seq, first_turn) = {
+    let (messages, mut registry, mut note, take_seq, first_turn) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map.get_mut(session_id).expect("session was hydrated");
         let first_turn = data.messages.len() <= 1;
         data.messages.push(ChatMessage::user(user_text));
         let (messages, seq) = take_messages(data);
-        (messages, data.registry.clone(), seq, first_turn)
+        (messages, data.registry.clone(), data.trailing_note.clone(), seq, first_turn)
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
 
@@ -2938,10 +3014,11 @@ async fn run_loop(
         }
     };
     let client = ChatClient::from_endpoint(&endpoint);
-    // Frozen wire form per freeze window: every iteration injects the same
-    // tool schema bytes without re-serializing the Value array. `mut` because
-    // a mid-turn refreeze swaps in the next generation between iterations.
-    let mut schemas_wire = registry.schemas_wire_arc();
+    // Frozen wire form: every request of the session injects the same tool
+    // schema bytes without re-serializing the Value array. A refreeze swaps
+    // the registry and keeps these (a tool file written since rides the
+    // note), so they never move until /reload.
+    let schemas_wire = registry.schemas_wire_arc();
     let caps = tools::OutputCaps::from_settings(&settings);
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
@@ -2990,11 +3067,12 @@ async fn run_loop(
         reload_approval_policy(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions);
         accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await;
         narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
-        // The tool schemas are re-sent whole on every request, so they are as
-        // real as the transcript. Read per iteration: a mid-turn refreeze
-        // swaps the wire bytes, and the overhead must follow the current
+        // The tool schemas and the note are re-sent whole on every request,
+        // so they are as real as the transcript: the overhead every request
+        // carries besides the history. Read per iteration: a mid-turn
+        // refreeze swaps the note, and the overhead must follow the current
         // generation, not the one this turn started with.
-        let schema_tokens = estimate_tokens(schemas_wire.len());
+        let schema_tokens = request_overhead(&schemas_wire, note.as_deref());
         // The window is counted in the server's tokens and everything
         // compaction compares is an estimate, so the window side converts
         // here, once. `compaction_tokens` converts with it (inside the
@@ -3040,7 +3118,7 @@ async fn run_loop(
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
         let result = client
-            .stream_chat(guard.messages(), &schemas_wire, cancelled.clone(), move |delta| {
+            .stream_chat_with_note(guard.messages(), note.as_deref(), &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -3302,6 +3380,9 @@ async fn run_loop(
         // unapproved content, which asks on its own first call, and under
         // auto nothing asks.
         let mut extensions_touched = false;
+        // The memory accesses this iteration's calls add after these: a
+        // memory written with the file tools refreshes the note below.
+        let memory_seen = turn_usage.lock().unwrap_or_else(|e| e.into_inner()).memory.len();
 
         let batch_mode = core.approval_mode_canonical(&canonical_root);
         let segments = partition_concurrent_runs(&tool_calls, |call| {
@@ -3924,22 +4005,27 @@ async fn run_loop(
         // The mid-turn half of the self-modification loop: an extension file
         // written by this iteration's mutating calls activates before the
         // next model request, so a tool the agent writes in iteration N is
-        // callable in iteration N+1 without ending the turn. One deliberate
-        // prompt-cache re-prefill, and only when extension bytes actually
-        // changed; hook file edits keep their per-turn discovery timing
-        // (permissions reload per mutating call, above).
+        // callable in iteration N+1 without ending the turn. Only the note
+        // and the receipt change, both after every cached byte; hook file
+        // edits keep their per-turn discovery timing (permissions reload per
+        // mutating call, above).
         let refrozen = extensions_touched
-            && refreeze_between_iterations(core, session_id, project_root, &mut registry, guard.messages())
+            && refreeze_between_iterations(core, session_id, project_root, &mut registry, &mut note, guard.messages())
                 .await;
+        let memory_written = turn_usage.lock().unwrap_or_else(|e| e.into_inner()).memory[memory_seen..]
+            .iter()
+            .any(|(_, kind)| kind == "write");
         if refrozen {
-            schemas_wire = registry.schemas_wire_arc();
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
             approval_seen = approval_state(core, &registry, project_root, &canonical_root);
+        } else if memory_written {
+            // A memory write changes no extension byte, so no refreeze ran,
+            // and the note, sent after the history as the harness's account
+            // of what changed, must not go on presenting the line it replaced.
+            refresh_note_after_memory_write(core, session_id, project_root, &registry, &mut note).await;
         }
-        // The system prompt at index 0 changed on refreeze, so the transcript
-        // prefix on disk is stale: rewrite instead of append.
-        save_messages(core, session_id, guard.messages(), refrozen).await;
+        save_messages(core, session_id, guard.messages(), false).await;
     }
 
     // A turn can end with the last assistant's tool_calls persisted but never
@@ -3999,6 +4085,17 @@ async fn run_loop(
         );
     }
     stop_reason
+}
+
+/// What every request carries besides the history, in estimated tokens: the
+/// tool schemas and the trailing note, both re-sent whole each time. The
+/// note is priced as it rides the last message, its separator included; a
+/// history ending with an assistant reply sends it as a message of its own,
+/// one message's framing more than this counts. The turn loop and `/compact`
+/// both price a request here, so both count the same bytes.
+fn request_overhead(schemas_wire: &str, note: Option<&str>) -> usize {
+    estimate_tokens(schemas_wire.len())
+        + note.map_or(0, |note| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + note.len()))
 }
 
 /// Persist transcript to disk without cloning it back into SessionData.
@@ -4162,19 +4259,6 @@ struct UnapprovedCapability {
     shas: Vec<String>,
 }
 
-/// `command args...` as an external tool's manifest declares it: what the
-/// approval card and the TUI's refreeze line show the tool runs. Each argv
-/// token is shell-quoted, so `a b`, an empty arg, or a value with
-/// quotes/metacharacters keeps its boundary - a space-joined line reads as a
-/// different or ambiguous invocation.
-fn command_line(ext: &crate::registry::ExternalTool) -> String {
-    std::iter::once(&ext.command)
-        .chain(ext.args.iter())
-        .map(|a| crate::doctor::shell_quote(std::path::Path::new(a)))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The unapproved capability file behind `name`, or None when the call needs
 /// no content approval.
 ///
@@ -4213,7 +4297,7 @@ fn unapproved_capability(
     Some(UnapprovedCapability {
         path: path.display().to_string(),
         sha256: ext.source_sha256.clone(),
-        command_line: command_line(ext),
+        command_line: ext.command_line(),
         env: ext.env.clone(),
         source_path: ext.source_path.clone(),
         shas,
@@ -4628,7 +4712,7 @@ fn over_budget_error_context(
     context_tokens: usize,
 ) -> String {
     format!(
-        "this request was over budget before it was sent: ~{used_tokens} tokens ({schema_tokens} of them frozen tool schemas re-sent every request) against a send budget of {budget} (context_tokens {context_tokens} minus response headroom). if the provider refused it for length: uninstall tools (`openmax --spec usage` ranks what each costs) or raise context_tokens to what the endpoint really serves"
+        "this request was over budget before it was sent: ~{used_tokens} tokens ({schema_tokens} of them frozen tool schemas and any trailing note, re-sent every request) against a send budget of {budget} (context_tokens {context_tokens} minus response headroom). if the provider refused it for length: uninstall tools (`openmax --spec usage` ranks what each costs) and /reload, or raise context_tokens to what the endpoint really serves"
     )
 }
 
@@ -5955,9 +6039,10 @@ mod tests {
     /// A manifest written by the build that briefly had a second session
     /// shape (v4, with a shape field) must not resume into a hybrid: the
     /// persisted one-line prompt beside the full tool set. The version gate
-    /// retires that shape wholesale. The manifest reads as absent, the
-    /// session falls back to built-ins, and the first turn-start check
-    /// refreezes prompt and manifest from disk into one consistent shape.
+    /// retires that shape wholesale. The manifest reads as absent, so
+    /// hydration rebuilds the prompt and the registry from disk into one
+    /// consistent shape and saves the current manifest, which leaves the
+    /// first turn-start check nothing to refreeze.
     #[tokio::test]
     async fn a_manifest_from_the_retired_shape_refreezes_into_one_shape() {
         use crate::state::Core;
@@ -5987,21 +6072,21 @@ mod tests {
         let data = build_session_data(&core, &id, &project).unwrap();
         core.sessions.lock().await.insert(id.clone(), data);
         assert!(
-            refreeze_if_extensions_changed(&core, &id, &project).await.is_some(),
-            "the first turn-start check refreezes from disk"
+            refreeze_if_extensions_changed(&core, &id, &project).await.is_none(),
+            "hydration already rebuilt from disk"
         );
         {
             let map = core.sessions.lock().await;
             let data = map.get(&id).unwrap();
             let prompt = data.messages[0].content.as_deref().unwrap();
-            assert_ne!(prompt, bare, "the bare prompt must not survive beside seven tools");
+            assert_ne!(prompt, bare, "the bare prompt must not survive beside the built-ins");
             assert!(prompt.contains("Rules:"), "{prompt}");
             assert_eq!(data.registry.tool_names().len(), tools::TOOL_NAMES.len());
         }
         assert_eq!(
             sessions::load_manifest(&core, &id).map(|m| m.version),
             Some(crate::registry::MANIFEST_VERSION),
-            "the refreeze writes the current manifest shape"
+            "hydration writes the current manifest shape"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6035,6 +6120,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A reload's prompt replaces messages[0] only when that is the prompt:
+    /// a transcript assembled without one gets the prompt in front, and no
+    /// message of the conversation is overwritten. The automatic refreeze
+    /// passes no prompt and leaves the transcript as it is.
+    #[test]
+    fn a_freeze_never_overwrites_a_message_that_is_not_the_prompt() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let mut data = SessionData { messages: vec![ChatMessage::user("hi")], ..Default::default() };
+        let contents = |data: &SessionData| data.messages.iter().map(|m| (m.role.clone(), m.content.clone().unwrap())).collect::<Vec<_>>();
+        apply_freeze(&core, &id, &mut data, Registry::builtin_only(), None, None, PromptBreakdown::default());
+        assert_eq!(contents(&data), [("user".to_string(), "hi".to_string())], "no prompt, no change");
+        apply_freeze(&core, &id, &mut data, Registry::builtin_only(), Some("first".into()), None, PromptBreakdown::default());
+        assert_eq!(contents(&data), [("system".to_string(), "first".to_string()), ("user".to_string(), "hi".to_string())]);
+        apply_freeze(&core, &id, &mut data, Registry::builtin_only(), Some("second".into()), Some("note".into()), PromptBreakdown::default());
+        assert_eq!(contents(&data), [("system".to_string(), "second".to_string()), ("user".to_string(), "hi".to_string())]);
+        assert_eq!(data.trailing_note.as_deref(), Some("note"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn reload_session_refreezes_registry_prompt_and_manifest() {
         use crate::state::Core;
@@ -6061,6 +6169,9 @@ mod tests {
         )
         .unwrap();
 
+        // So is an AGENTS.md edit, which only /reload brings into the prompt.
+        std::fs::write(project.join("AGENTS.md"), "Reload picks this up.").unwrap();
+
         // A running turn blocks the reload.
         core.running.lock().unwrap().insert(id.to_string());
         assert!(reload_session(&core, id, &project).await.is_err());
@@ -6077,6 +6188,10 @@ mod tests {
         let data = map.get(id).unwrap();
         assert!(data.registry.is_mutating("deploy"));
         assert_eq!(data.messages[0].role, "system");
+        let prompt = data.messages[0].content.as_deref().unwrap();
+        assert!(prompt.contains("Reload picks this up."), "/reload starts a new prompt: {prompt}");
+        assert!(data.registry.tool_schemas_wire().contains("\"name\":\"deploy\""), "and a new tools array");
+        assert_eq!(data.trailing_note, None, "which carry every change, so no note is left");
         assert_eq!(data.messages.len(), 3, "conversation must survive the reload");
         assert_eq!(data.persisted_count, 3, "transcript must be rewritten to disk");
         drop(map);
@@ -6156,9 +6271,9 @@ mod tests {
 
     /// The create-then-use loop closes inside one turn: after a mutating call
     /// writes a tool file, the between-iterations check swaps the turn's own
-    /// registry and system prompt, installs the generation into the session,
-    /// and persists the manifest, so iteration N+1 can call what iteration N
-    /// wrote. An unchanged disk stays a no-op (prompt cache kept).
+    /// registry and note, installs the generation into the session, and
+    /// persists the manifest, so iteration N+1 can call what iteration N
+    /// wrote. messages[0] keeps its bytes, and an unchanged disk is a no-op.
     #[tokio::test]
     async fn midturn_refreeze_activates_new_tool_between_iterations() {
         use crate::state::Core;
@@ -6175,17 +6290,18 @@ mod tests {
         }
         // Simulate the running turn: the transcript is taken, the session's
         // message list is empty, and the loop holds its own registry Arc.
-        let (mut messages, mut registry) = {
+        let (mut messages, mut registry, mut note) = {
             let mut map = core.sessions.lock().await;
             let data = map.get_mut(id).unwrap();
             let (messages, _seq) = take_messages(data);
-            (messages, data.registry.clone())
+            (messages, data.registry.clone(), data.trailing_note.clone())
         };
         assert!(registry.get("deploy").is_none());
+        let prompt = messages[0].clone();
 
         // Unchanged disk between iterations: no-op, same registry Arc.
         let before = registry.clone();
-        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
         assert!(Arc::ptr_eq(&registry, &before), "no-op must not rebuild");
 
         // Iteration N writes a tool file; the check activates it for N+1.
@@ -6195,14 +6311,20 @@ mod tests {
             "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\nmutating = true\n",
         )
         .unwrap();
-        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
         assert!(registry.is_mutating("deploy"), "turn-local registry must carry the new tool");
-        assert_eq!(messages[0].role, "system", "system prompt swapped in place");
+        assert_eq!(messages[0].content, prompt.content, "the refreeze leaves messages[0] alone");
         assert_eq!(messages.len(), 2, "conversation must survive the refreeze");
+        assert!(note.as_deref().is_some_and(|n| n.contains("- deploy: ships it")), "the note indexes the tool: {note:?}");
         {
             let map = core.sessions.lock().await;
             let data = map.get(id).unwrap();
             assert!(data.registry.get("deploy").is_some(), "session registry must be installed");
+            assert_eq!(data.trailing_note, note, "the session's note is the turn's");
+            // /context prices the refrozen note and keeps the prompt's rows.
+            let priced: usize = data.prompt_breakdown.note.iter().map(|(_, chars)| chars).sum();
+            assert_eq!(priced, note.as_deref().map_or(0, str::len), "the breakdown prices the new note");
+            assert!(!data.prompt_breakdown.components.is_empty(), "and keeps the prompt's components");
             assert!(data.messages.is_empty(), "the taken transcript must stay owned by the turn");
         }
         let manifest = sessions::load_manifest(&core, id).expect("manifest saved");
@@ -6210,7 +6332,7 @@ mod tests {
 
         // Same generation again: idempotent, so the next model request keeps
         // its (already re-prefilled) cache.
-        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert!(!refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
 
         // The wire event carried a receipt naming the file, and the refreeze
         // wrote nothing to the ledger: no change record, no copy of the bytes.
@@ -6253,18 +6375,18 @@ mod tests {
             data.messages.push(ChatMessage::user("write a deploy tool"));
             core.sessions.lock().await.insert(id.to_string(), data);
         }
-        let (mut messages, mut registry) = {
+        let (mut messages, mut registry, mut note) = {
             let mut map = core.sessions.lock().await;
             let data = map.get_mut(id).unwrap();
             let (messages, _seq) = take_messages(data);
-            (messages, data.registry.clone())
+            (messages, data.registry.clone(), data.trailing_note.clone())
         };
         let mut refreeze = async |manifest: Option<&str>| {
             if let Some(manifest) = manifest {
                 std::fs::write(tools.join("deploy.toml"), manifest).unwrap();
             }
             messages.push(ChatMessage::tool("c1", "ok"));
-            assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+            assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
             let mut runs = None;
             while let Ok(env) = rx.try_recv() {
                 if let AgentEvent::Refrozen { runs: shown, .. } = env.event {
@@ -7425,11 +7547,11 @@ mod tests {
             data.messages.push(ChatMessage::user("write a deploy tool"));
             core.sessions.lock().await.insert(id.to_string(), data);
         }
-        let (mut messages, mut registry) = {
+        let (mut messages, mut registry, mut note) = {
             let mut map = core.sessions.lock().await;
             let data = map.get_mut(id).unwrap();
             let (messages, _seq) = take_messages(data);
-            (messages, data.registry.clone())
+            (messages, data.registry.clone(), data.trailing_note.clone())
         };
         // The iteration that wrote the file left its tool result last, where
         // the receipt rides.
@@ -7451,7 +7573,7 @@ mod tests {
             "name = \"deploy\"\ndescription = \"ships it\"\n",
         )
         .unwrap();
-        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
+        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
         assert!(registry.get("deploy").is_none(), "a broken file must not load");
         let tool_msg = messages.iter().rev().find(|m| m.role == "tool").unwrap();
         let content = tool_msg.content.as_deref().unwrap();
@@ -7606,17 +7728,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A resumed session's prompt is the persisted one, and the manifest's
-    /// memory identities describe the index that prompt carries. Memory
-    /// edits between sittings do not refreeze it on their own (the persisted
-    /// prefix keeps its cache), but the first refreeze something else causes
-    /// rebuilds the prompt from a fresh scan, so the delta from those
-    /// identities is exactly what the model's next prompt gains and loses,
-    /// and the receipt has to name it. Without that baseline the receipt said
-    /// only "extension files changed", and the model could not tell which
-    /// fact had moved.
+    /// A resumed session's prompt is the persisted one, byte for byte, with
+    /// the memory index it was built with, and its note compares a memory
+    /// scan at hydration with that index: a fact edited or added between
+    /// sittings reaches the model on the resumed sitting's first request,
+    /// with no refreeze and no change to the cached prefix. That scan is the
+    /// receipt's baseline, so the first refreeze something else causes names
+    /// only what moved after it, never a fact the note already showed.
     #[tokio::test]
-    async fn a_resumed_session_names_the_memory_its_first_refreeze_gained() {
+    async fn a_resumed_session_sends_the_memory_index_as_it_is_now() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -7627,39 +7747,39 @@ mod tests {
         std::fs::create_dir_all(&memory).unwrap();
         std::fs::write(memory.join("deploy-port.md"), "# deploy port is 8080\n").unwrap();
 
-        // A prior sitting: the prompt froze with one memory line, and the
-        // manifest recorded that index beside the transcript.
-        {
+        // A prior sitting: the prompt carried the fact, and nothing changed.
+        let saved = {
             let mut data = build_session_data(&core, id, &project).unwrap();
-            assert!(
-                data.messages[0].content.as_deref().unwrap().contains("deploy port is 8080"),
-                "the frozen prompt carries the fact"
-            );
+            assert!(data.messages[0].content.as_deref().unwrap().contains("deploy port is 8080"), "the prompt carries the fact");
+            assert_eq!(data.trailing_note, None, "a session that changed nothing sends no note");
             data.messages.push(ChatMessage::user("hi"));
             let mut persisted = 0usize;
             assert!(sessions::save_messages(&core, id, &data.messages, &mut persisted, true));
-        }
+            data.messages[0].content.clone()
+        };
 
         // Between sittings the fact changed and another appeared.
         std::fs::write(memory.join("deploy-port.md"), "# deploy port is 9090\n").unwrap();
-        std::fs::write(memory.join("ci-lane.md"), "# ci runs on the fast lane\n").unwrap();
+        std::fs::write(memory.join("ci-queue.md"), "# ci runs on the fast queue\n").unwrap();
 
-        // Fresh process, exactly as after `-c`: the registry is restored from
-        // the manifest, and memory edits alone leave the persisted prompt in
-        // place.
+        // Fresh process, exactly as after `-c`.
         assert!(core.sessions.lock().await.is_empty());
         ensure_session_hydrated(&core, id, &project).await.unwrap();
-        let persisted = core.sessions.lock().await.get(id).unwrap().messages[0].content.clone();
         assert!(
             refreeze_if_extensions_changed(&core, id, &project).await.is_none(),
-            "a memory edit must not refreeze the persisted prompt"
+            "a memory edit does not refreeze"
         );
-        let prompt = core.sessions.lock().await.get(id).unwrap().messages[0].content.clone();
-        assert_eq!(prompt, persisted, "the persisted prefix is byte-identical");
-        assert!(prompt.unwrap().contains("deploy port is 8080"));
+        {
+            let map = core.sessions.lock().await;
+            let data = map.get(id).unwrap();
+            assert_eq!(data.messages[0].content, saved, "the persisted prefix is byte-identical");
+            let note = data.trailing_note.as_deref().unwrap();
+            assert!(note.contains("- deploy-port: deploy port is 9090") && note.contains("- ci-queue: ci runs"), "{note}");
+        }
 
-        // A tool written between sittings refreezes, and that receipt reports
-        // what the rebuilt memory index gained and changed.
+        // After the resume the fact moves again and a tool is written: the
+        // receipt names the move and not the fact the note already showed.
+        std::fs::write(memory.join("deploy-port.md"), "# deploy port is 7070\n").unwrap();
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
@@ -7669,12 +7789,13 @@ mod tests {
         let receipt = refreeze_if_extensions_changed(&core, id, &project)
             .await
             .expect("a tool write moves the fingerprint");
-        assert!(receipt.contains("Memory index rebuilt"), "the receipt names the index: {receipt}");
-        assert!(receipt.contains("indexed: ci-lane"), "{receipt}");
         assert!(receipt.contains("updated: deploy-port"), "{receipt}");
+        assert!(!receipt.contains("ci-queue"), "the note already showed it: {receipt}");
         let map = core.sessions.lock().await;
-        let prompt = map.get(id).unwrap().messages[0].content.clone().unwrap();
-        assert!(prompt.contains("deploy port is 9090") && prompt.contains("ci-lane"), "{prompt}");
+        let data = map.get(id).unwrap();
+        assert_eq!(data.messages[0].content, saved, "the refreeze leaves the prompt alone");
+        let note = data.trailing_note.as_deref().unwrap();
+        assert!(note.contains("deploy port is 7070") && note.contains("- deploy: ships it"), "{note}");
         drop(map);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -9327,7 +9448,7 @@ mod tests {
         let map = core.sessions.lock().await;
         let data = &map[id];
         let sent = &data.messages[..data.messages.len() - 1];
-        estimate_tokens(data.registry.schemas_wire_arc().len())
+        request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
             + sent.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
     }
 
@@ -9568,7 +9689,7 @@ mod tests {
         let (pruned, raised) = {
             let map = core.sessions.lock().await;
             let data = &map[&id];
-            let sent = estimate_tokens(data.registry.schemas_wire_arc().len())
+            let sent = request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
                 + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
             (sent, data.prompt_ratio.as_ref().unwrap().1)
         };
@@ -10353,7 +10474,8 @@ mod tests {
         let message = error.expect("the failed turn must surface an error");
         assert!(message.contains("maximum context length exceeded"), "{message}");
         assert!(message.contains("over budget before it was sent"), "{message}");
-        assert!(message.contains("frozen tool schemas"), "{message}");
+        assert!(message.contains("frozen tool schemas and any trailing note, re-sent every request"), "{message}");
+        assert!(message.contains("and /reload"), "a frozen schema leaves the request only at /reload: {message}");
         assert!(message.contains("context_tokens 1200"), "{message}");
         assert_eq!(stop.as_deref(), Some("error"));
 
@@ -12404,7 +12526,7 @@ mod tests {
             }
             // The fat tail puts the automatic path in its fallback band:
             // enforce_budget must hold still on this exact transcript.
-            let schema_tokens = estimate_tokens(data.registry.schemas_wire_arc().len());
+            let schema_tokens = request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
                 compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &data.messages),
@@ -12539,13 +12661,14 @@ mod tests {
         messages.iter().any(|m| m.role == "user" && m.content.as_deref() == Some(request))
     }
 
-    /// The window a forced prune must cut into: the transcript as it stands
-    /// is the whole budget, so the 70% target sits below it.
+    /// The window a forced prune must cut into: the transcript as it stands,
+    /// with the schemas and the note every request carries, is the whole
+    /// budget, so the 70% target sits below it.
     async fn size_window_to_transcript(core: &Arc<Core>, id: &str) {
         let used = {
             let map = core.sessions.lock().await;
             let data = &map[id];
-            estimate_tokens(data.registry.schemas_wire_arc().len())
+            request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
                 + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
         };
         let mut s = core.settings.lock().unwrap();
@@ -12752,7 +12875,7 @@ mod tests {
         let notes: Vec<&str> = msgs
             .iter()
             .filter_map(|m| m.content.as_deref())
-            .filter(|c| c.contains("tool schemas cost"))
+            .filter(|c| c.contains("tool schemas and any trailing note cost"))
             .collect();
         assert_eq!(notes.len(), 1, "{msgs:?}");
 
@@ -12789,11 +12912,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A mid-turn refreeze changes the wire schemas, so the overhead the
-    /// budget carries must track the current frozen generation, not the one
-    /// the session started with.
+    /// A mid-turn refreeze leaves the wire schemas alone and grows the note,
+    /// so the overhead the budget carries must follow the current
+    /// generation's note, not the one the session started with.
     #[tokio::test]
-    async fn budget_overhead_tracks_refrozen_schemas() {
+    async fn budget_overhead_tracks_the_refrozen_note() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -12805,17 +12928,21 @@ mod tests {
             let data = build_session_data(&core, id, &project).unwrap();
             core.sessions.lock().await.insert(id.to_string(), data);
         }
-        let (mut messages, mut registry) = {
+        let (mut messages, mut registry, mut note) = {
             let mut map = core.sessions.lock().await;
             let data = map.get_mut(id).unwrap();
             let (messages, _seq) = take_messages(data);
-            (messages, data.registry.clone())
+            (messages, data.registry.clone(), data.trailing_note.clone())
         };
-        let before = registry.schema_tokens();
+        let wire = registry.schemas_wire_arc();
+        let carried = |note: &Option<Arc<str>>| {
+            note.as_deref().map_or(0, |n| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + n.len()))
+        };
+        let before = request_overhead(&wire, note.as_deref());
         assert_eq!(
             before,
-            estimate_tokens(registry.tool_schemas_wire().len()),
-            "overhead must be the wire bytes the request actually carries"
+            estimate_tokens(wire.len()) + carried(&note),
+            "overhead must be the bytes the request actually carries: the schemas, and the note with its separator"
         );
 
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
@@ -12824,8 +12951,10 @@ mod tests {
             "name = \"deploy\"\ndescription = \"ships the current branch to production\"\ncommand = \"/bin/true\"\n",
         )
         .unwrap();
-        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut messages).await);
-        let after = registry.schema_tokens();
+        assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
+        assert_eq!(registry.tool_schemas_wire(), &*wire, "the schemas never move");
+        let after = request_overhead(&wire, note.as_deref());
+        assert_eq!(after, estimate_tokens(wire.len()) + carried(&note), "the refrozen note, priced the same way");
         assert!(after > before, "a new tool must grow the overhead: {before} -> {after}");
 
         // And enforcement follows: a window that fit the old generation with
@@ -12841,7 +12970,54 @@ mod tests {
         assert!(!enforce_budget(&mut old_generation, budget, before).0);
         assert!(
             enforce_budget(&mut transcript, budget, after).0,
-            "the refrozen schemas must be what pushes the turn over"
+            "the refrozen note must be what pushes the turn over"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `/compact` prices a request the way the turn loop does: the tool
+    /// schemas plus the trailing note the next request sends after the
+    /// history. Pricing the schemas alone under-reported its receipt by the
+    /// note and aimed the prune at a target the next request overshoots by
+    /// the same amount, so the next turn's own budget pass pruned again.
+    #[tokio::test]
+    async fn compact_prices_the_trailing_note_like_the_turn_loop() {
+        use crate::state::{CancelToken, Core};
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.context_tokens = Some(400_000);
+            s.max_tokens = 1_024;
+        }
+        let mut data = build_session_data(&core, &id, &project).unwrap();
+        data.messages.push(ChatMessage::user("ship it".to_string()));
+        data.messages.push(ChatMessage::assistant(Some("shipped".into()), None));
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        // The note a tool written after the prompt leaves.
+        data.trailing_note = Some(Arc::from(format!("{}\n\n- wordfreq: top-n words {{}}\n", crate::prompt::NOTE_HEADER)));
+        let transcript: usize = data.messages.iter().map(ChatMessage::estimated_tokens).sum();
+        let wire = data.registry.schemas_wire_arc();
+        let note = data.trailing_note.clone();
+        core.sessions.lock().await.insert(id.clone(), data);
+
+        let turn_loop = request_overhead(&wire, note.as_deref());
+        assert!(turn_loop > estimate_tokens(wire.len()), "the note must cost something here");
+
+        let receipt = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
+        assert_eq!(receipt.compacted_messages, 0, "the transcript is already under the target");
+        assert_eq!(
+            receipt.tokens_before,
+            turn_loop + transcript,
+            "/compact must count what the turn loop counts: the schemas, the note, and the transcript"
         );
 
         let _ = std::fs::remove_dir_all(dir);

@@ -342,6 +342,10 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
 pub struct MemoryFreeze {
     pub section: IndexSection,
     pub identities: Vec<(String, u64)>,
+    /// (name, index line, indexed) for every valid memory the scan read,
+    /// strongest first, so a session can tell a memory that changed from one
+    /// that only moved in or out of the index.
+    pub lines: Vec<(String, String, bool)>,
 }
 
 /// Read a memory file's bytes and its mtime as ONE coherent generation. An
@@ -371,7 +375,7 @@ fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)
 
 pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
     let Ok(read_dir) = std::fs::read_dir(memory_dir(project_root)) else {
-        return MemoryFreeze { section: None, identities: Vec::new() };
+        return MemoryFreeze { section: None, identities: Vec::new(), lines: Vec::new() };
     };
     let log = load_log(project_root);
     let mut entries: Vec<MemoryEntry> = Vec::new();
@@ -396,7 +400,8 @@ pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
     }
     let scan = fill_index(entries);
     let (section, identities) = section_and_identities(&scan);
-    MemoryFreeze { section, identities }
+    let lines = scan.entries.iter().map(|e| (e.name.clone(), index_line(e), e.in_index)).collect();
+    MemoryFreeze { section, identities, lines }
 }
 
 fn trailer_line(omitted: usize) -> String {

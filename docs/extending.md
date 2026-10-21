@@ -46,6 +46,25 @@ rejected, not truncated. At most 64 external tools load (the name-sorted head);
 the prompt trailer reports how many were left out and `openmax --check` names
 the files. Hooks are capped at 32 per event the same way.
 
+A session's `tools` array is the one it began with, so writing a tool file
+mid-session moves no byte of the cached prompt prefix. From the agent's next
+step the new tool is a line of the trailing note (see
+[Freezing and re-freezing](#freezing-and-re-freezing)): its name, description,
+and `params` schema, then the bash command that runs it the way the harness
+does, `printf '%s\n' '<JSON arguments>' | 'command' 'arg'...` in the project
+root; a tool whose `timeout_secs` is longer than a bash call's 120-second
+default has it on the line too, as the `timeout_secs` to give that call. Run
+that way, the call is a `bash` call: bash's approval, permission
+rules, and hooks apply, and the process gets bash's environment instead of the
+scrubbed one. A call by the tool's own name also runs it, under the tool's own
+gates, but only on an endpoint that accepts a tool name the request does not
+declare; a server that constrains decoding to the declared tools never emits
+one. A tool file whose description or schema changes mid-session is a note
+line the same way (a change to its `command` or `args` alone needs none: a
+call by its declared name runs the new bytes), and a removed one is named by
+the note while its old entry stays in the array. The array takes every
+change at `/reload` or in a new session.
+
 ## Skills
 
 A directory with `SKILL.md` under `.agents/skills/` or `~/.openmax/skills/`.
@@ -97,8 +116,11 @@ base-level activation (each past access at age `t` hours contributes
 `t^-0.5`; activation is the log of the sum, so one recall revives an old
 memory) and injected as one index line each under a 1500-byte budget. The
 index is frozen with the prompt: writing a memory mid-session does not
-re-freeze, so the prompt cache survives the write, and the new line appears at
-the next session, `/reload`, or a re-freeze a tool or skill change causes. The
+re-freeze, so the prompt cache survives the write. The new line rides the
+trailing note from the agent's next step when it writes the memory with
+`write_file` or `edit_file`, and otherwise from the next re-freeze a tool or
+skill change causes or the next resume; it reaches the prompt at the next
+session or `/reload`. The
 harness logs accesses through `read_file`, `write_file`, and `edit_file` to
 `.openmax/memory/.access.jsonl`. An entry whose most recent observed use is
 over 21 days old leaves the index but stays searchable on disk. The harness
@@ -548,16 +570,52 @@ same validation code in tests so the text cannot drift from the binary.
 
 ## Freezing and re-freezing
 
-Tools and skills freeze per freeze window for prompt-cache stability, and the
-harness re-freezes them automatically. At each turn start, and again between
-iterations after a mutating call, even a failed one, it captures one immutable
-generation of extension bytes, fingerprints that snapshot, and parses those
-same bytes. If the generation changed, it rebuilds the registry and prompt in
-place (one deliberate cache re-prefill, conversation kept, a `refrozen` event
-for clients), so a tool the agent writes is callable on its very next step,
-inside the same turn, with no human action. Atomic replacement and symlink
-swaps cannot make the activated registry disagree with its fingerprint. An
-unchanged generation does not rebuild or invalidate the prompt cache.
-`/reload` forces a new capture immediately; `/new` starts clean. Hooks,
-permissions, and templates re-discover on every turn or invocation. Use
-`/tools`, `/skills`, and `/context` to inspect the frozen set and its cost.
+The frozen prefix of every request is the system prompt (messages[0]) and the
+`tools` array, and both are byte-identical for the whole session, a resume
+included. Both are built when the session is created: the prompt from the base
+rules, the extension pointer, `AGENTS.md` (capped at 2000 bytes), the memory
+index, the layout map, and the skills index as they stand then, and the array
+from the built-ins and the tool files that load then. The prompt is persisted
+with the session, and its manifest records the array's tool files and what the
+prompt's index shows.
+
+What the session changes after that rides the trailing note: each tool file
+the array lacks or carries with another description or schema, by its line
+(schema and bash command included, see [Tools](#tools)); each skill and memory
+added or changed, by its new index line; each tool file, skill, and memory the
+prefix showed that is gone, by name; and a notice when `AGENTS.md` changed,
+compared whole though the prompt carries it capped. An entry that only moved
+in or out of the index (a memory that faded, a skill the byte cap now leaves
+out) is not a change, and the layout map stays the prompt's. The note is built
+when a generation activates, at a resume, and after the agent writes a memory
+with `write_file` or `edit_file`, never persisted, and sent after
+the whole history of each request: it ends the content of the last message
+(the user's prompt or the newest tool result) after a blank line and a header
+that names the harness as its source, or, after an assistant reply, goes as a
+user message of its own, so the endpoint sees the stored role order (see
+[configuration](configuration.md#multiple-providers)) and a provider's prompt
+cache covers the prompt and the whole conversation. A session that changes
+nothing sends no note. The note holds at most 6000 bytes, with the skills and
+memory sections under their prompt sections' caps (3000 and 1500), and counts
+what it leaves out. A copy of the note's header in tool output has its
+brackets turned to parentheses where the output is captured, so a file the
+agent reads cannot open a note of its own; the lines themselves are as
+trustworthy as the files they describe.
+
+The harness re-freezes extensions automatically. At each turn start, and again
+between iterations after a mutating call, even a failed one, it captures one
+immutable generation of extension bytes, fingerprints that snapshot, and
+parses those same bytes. If the generation changed, it swaps in the new
+registry and note (conversation kept, prompt and tools array untouched, a
+`refrozen` event for clients), so a tool the agent writes runs on its very
+next step, inside the same turn, with no human action and no cache re-prefill.
+Atomic replacement and symlink swaps cannot make the activated registry
+disagree with its fingerprint. An unchanged generation rebuilds nothing.
+`/reload` is the one act that starts a new prefix: it captures immediately and
+builds the prompt and the array again, so the note's changes and an
+`AGENTS.md` edit move into them and the prompt cache re-prefills once; `/new`
+starts clean. A session with no current manifest (saved by an older build, or
+one whose manifest was lost) rebuilds its prompt and array from disk once when
+it resumes, and saves the manifest. Hooks, permissions, and templates
+re-discover on every turn or invocation. `/tools` and `/skills` list what is
+loaded now; `/context` shows the frozen prefix, the note, and their cost.
