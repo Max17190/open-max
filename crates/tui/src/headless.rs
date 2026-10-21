@@ -17,6 +17,9 @@ use std::time::Instant;
 pub struct HeadlessArgs {
     /// One or more user prompts; each runs as a sequential turn on the same session.
     pub prompts: Vec<String>,
+    /// The project the turns run in: the working directory, or a sub-agent's
+    /// place in its worktree.
+    pub project: PathBuf,
     pub continue_session: bool,
     pub json: bool,
     /// Notified on a quit signal (see `watch_quit_signals`).
@@ -31,8 +34,7 @@ pub async fn run(
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: HeadlessArgs,
 ) -> i32 {
-    let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_key = project.display().to_string();
+    let project_key = args.project.display().to_string();
 
     // Finding or creating the session waits on the session index lock.
     let setup = {
@@ -97,7 +99,7 @@ async fn run_prompts(
     args: &HeadlessArgs,
     stop_by: &mut Option<Instant>,
 ) -> i32 {
-    let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = &args.project;
     let mut exit_code = 0i32;
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
@@ -447,6 +449,7 @@ mod tests {
         let mut stderr = io::stderr();
         let args = HeadlessArgs {
             prompts: Vec::new(),
+            project: dir.clone(),
             continue_session: false,
             json: true,
             quit: Arc::new(Notify::new()),
@@ -511,6 +514,7 @@ mod tests {
         let (mut saw_tokens, mut stop_by) = (false, None);
         let args = HeadlessArgs {
             prompts: Vec::new(),
+            project: dir.clone(),
             continue_session: false,
             json: true,
             quit: Arc::new(Notify::new()),

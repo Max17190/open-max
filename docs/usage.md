@@ -32,6 +32,7 @@ openmax -c
 openmax --provider ollama --model qwen2.5-coder:7b
 openmax -p "summarize the top level layout of this repo"
 openmax -p --json "list public modules in crates/core"
+openmax --subagent "fix the flaky test" --worktree   # one task in a new worktree
 openmax --check                       # validate extension files and the session index
 openmax --spec hooks                  # print an extension surface's contract
 openmax --recall "deploy port"        # search past sessions and memories
@@ -75,9 +76,9 @@ verification.
 `openmax --check --run-examples` adds one `example` surface row per declared
 `[example]`, in text and in JSON, and fails the check when one fails. It is
 the only `--check` mode that runs a command, so it needs a trusted project
-and follows the saved project mode. Like the TUI, `-p` and `--stdio`, plain
-`--check` first stops the tools a killed openmax left running and removes that
-openmax's record of them (see the signals below). Auto runs valid examples
+and follows the saved project mode. Like the TUI, `-p`, `--stdio` and
+`--subagent`, plain `--check` first stops the tools a killed openmax left
+running and removes that openmax's record of them (see the signals below). Auto runs valid examples
 without content approval; ask uses the documented approval and sandbox rules.
 It honors permission rules, `pre_tool_use` hooks, and `approval_mode` exactly
 as a turn does. See [extending](extending.md#proof-of-life).
@@ -148,7 +149,8 @@ wait is killed with the rest. Neither stops a process that leaves its tool's
 group (one that starts a session of its own, as `setsid` does), or a tool command
 whose start outlasts that wait: it runs on after openmax has exited. SIGKILL,
 or a crash that runs no handler, stops no tool: each running tool's group runs
-on until the next openmax launch (the TUI, `-p`, `--stdio`, or `--check`).
+on until the next openmax launch (the TUI, `-p`, `--stdio`, `--subagent`, or
+`--check`).
 On macOS and Linux, openmax records the process groups of its running tools,
 each leader with its start time, in `~/.openmax/run/<pid>.groups`: one line
 when a group starts and one when it ends. Once the file has passed 4 KiB, it
@@ -235,6 +237,102 @@ A damaged or unreadable session index (`~/.openmax/sessions/index.json`)
 refuses new sessions and continuation with its path, and the app keeps
 running. Open Max never replaces it with an empty index. Run `openmax --check`
 for the repair: close every openmax, then move the file aside.
+
+## Sub-agents
+
+```sh
+openmax --subagent "make the flaky retry test deterministic" --worktree
+openmax --subagent "list the public modules" --worktree --json
+```
+
+`--subagent "<task>" --worktree` hands one task to one child session in a new
+git worktree of the repository, and is how an agent delegates through `bash`;
+`openmax --spec subagent` prints the recipe. One command runs one child, and
+nothing queues or schedules them. The flag adds nothing to any request: the
+prompt and the tool schemas do not mention it, and the child's first request
+is the one `openmax -p "<task>"` sends from the project, its path aside. An
+agent's `bash` call that outlives its `timeout_secs` (120 unless set, at most
+600) is stopped with signals to its whole process group, which end a
+sub-agent in it as a second signal does, before its cleanup; the recipe runs
+longer tasks in a tmux session instead.
+
+- It is refused, leaving nothing behind, when the project is not trusted
+  (exit 3); when the endpoint does not resolve, outside a git repository, in
+  a repository with no commit yet, or in a directory HEAD does not have or
+  holds as a link that leads out of the worktree (exit 2); and when git
+  cannot make the worktree, as when a `post-checkout` hook fails (exit 1).
+  A signal while git makes the worktree leaves nothing either: it does not
+  wait for git, whose process group, a `post-checkout` hook still running
+  included, gets SIGTERM, then SIGKILL within a quarter of a second.
+  `--subagent` without `--worktree` is a usage error, and so is `--continue`
+  beside it. Git's variables that name a repository, a working tree or an
+  index (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and the others
+  `git rev-parse --local-env-vars` lists) are cleared first, for the run's
+  own git commands and for the child's tools, so a caller's (a git hook's,
+  say) cannot point either at another repository.
+- The worktree is a checkout of HEAD at `.worktrees/<name>` under the
+  directory the command runs in, on a new branch `subagent/<name>`, where
+  `<name>` is the task's first words (up to 32 characters) and eight hex
+  digits; the run names both on stderr before the child starts. Uncommitted
+  changes in the tree, staged, unstaged or untracked, are not in the
+  worktree, and the run says so on stderr when there are any; nor are files
+  the repository ignores, such as a `.env` or build output. The tree itself
+  is not changed: once its worktree is made and checked, a run adds the line
+  `.worktrees/` to the repository's own exclude file (`.git/info/exclude`,
+  never committed) when it is not there yet, which keeps the worktrees out
+  of the tree's `git status`, glob and grep, and it removes `.worktrees`
+  once that is empty.
+- The child runs in the same process, at the command's directory inside the
+  worktree, as one print-mode turn: text on stdout and tool progress on
+  stderr, or with `--json` the event lines `-p --json` prints, as they arrive,
+  with the final answer last. Its session is recorded under the worktree's
+  path.
+- Trust: the worktree lies inside the project, so the trust a human granted
+  the project covers it, as it covers any subdirectory. The flag grants
+  nothing: an untrusted project is refused, and a sub-agent never asks, even
+  at a terminal. Approval mode: the child runs in the project's mode, or in a
+  stricter one saved for a path inside `.worktrees`, never in a looser one.
+  Like any print run it declines every approval, so in `ask` its mutating
+  calls are declined.
+- When the turn ends, or a signal stops it as it stops a print run (SIGINT,
+  SIGTERM, SIGHUP, SIGQUIT, SIGUSR1 or SIGUSR2), the child's tool processes
+  are stopped and everything it changed is committed to its branch:
+  `git add --all`, then a commit that is not signed, on the run's branch or
+  on a detached HEAD, never on a branch of the user's the child switched
+  to. That and every other git command of the run but `git worktree add` run
+  none of the repository's hooks and no file-system monitor, so nothing of
+  the repository's can fail them or hold up a stop that waits for them; one
+  still running 3 seconds after a stop (a clean filter of the repository's
+  that takes its time, say) is stopped, and the worktree stays. The branch
+  is set to the worktree's last commit even if the child switched branches
+  or detached HEAD there. Files the repository ignores are not committed and go
+  with the worktree, which is removed with `git worktree remove --force`.
+  The last line on stderr names the branch and its diffstat, as in
+  `openmax: the sub-agent's changes are on branch subagent/<name>: 1 file changed, 2 insertions(+)`,
+  or says the child changed nothing, and then no branch is kept.
+- The exit status is 128 plus the signal's number after a signal, and
+  otherwise the turn's, as for `-p` (0, 1 or 4), except that a finished turn
+  exits 1 when its work cannot all be put on its branch (git has no identity
+  configured, the branch is locked, or the child changed files inside a
+  nested repository or a submodule, or committed there what no
+  remote-tracking branch of that repository holds: a commit of this
+  repository records only that repository's commit id), or when its
+  worktree cannot be removed (the child locked it, for example). The
+  worktree then stays, with the work, and stderr names it and the branch.
+
+A second signal exits at once, as in print mode, and can leave the worktree
+in place. So does a turn that is still running when the stop's 3-second
+deadline passes (its transcript save waits on another openmax holding the
+session index, for example): a file tool of it, which runs inside openmax,
+can still be writing in the worktree, so the run leaves the worktree as it
+is, uncommitted, and names it on stderr. SIGKILL, or a crash, runs no
+cleanup. The child's tool processes are recorded as the tools of the openmax
+process that ran it, so the next launch stops them (see the signals above).
+Nothing cleans up the worktree, the changes it holds or its branch:
+`git worktree list` names the worktree, and
+`git worktree remove --force <path>` removes it once its changes are saved. A
+git command the run had started (making the worktree, the commit, or the
+removal) runs to its end on its own.
 
 ## Keys
 

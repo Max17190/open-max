@@ -1107,10 +1107,12 @@ mod tests {
     #[test]
     fn the_guide_pointer_names_only_real_surfaces() {
         // Every surface the pointer names must exist, and the omissions must
-        // be exactly the deliberate ones: settings, recall, and usage are not
-        // authoring surfaces, and the moments that need them carry their own
-        // pointer (--check settings rows print "openmax --spec settings"; the
-        // pointer names openmax --recall itself). A new --spec surface must
+        // be exactly the deliberate ones: settings, recall, subagent, and
+        // usage are not authoring surfaces, and the moments that need them
+        // carry their own pointer (--check settings rows print "openmax --spec
+        // settings"; the pointer names openmax --recall itself; its Sub-agent
+        // entry names delegation, and `openmax --help` lists --subagent and
+        // its recipe). A new --spec surface must
         // either join the pointer or this list, consciously. `mcp` adds no
         // file kind of its own, but it is named: it is the recipe that turns
         // an MCP server into a tool and a skill, and without it a request
@@ -1137,7 +1139,7 @@ mod tests {
         // here, only the SET of deliberate omissions is.
         assert_eq!(
             omitted,
-            ["recall", "settings", "usage"],
+            ["recall", "settings", "subagent", "usage"],
             "a new surface joins the pointer or the deliberate-omission list"
         );
     }
