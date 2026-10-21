@@ -109,7 +109,8 @@ async fn a_session_that_writes_nothing_sends_no_note() {
     let prompt = &sent[0].prompt;
     for line in [
         "- deploy-port: The deploy port is 7443 — .openmax/memory/deploy-port.md",
-        "src/main.rs",
+        // The layout map names the directory once and its entries under it.
+        "src/: main.rs",
         "- release: cut a release — .agents/skills/release/SKILL.md",
     ] {
         assert!(prompt.contains(line), "the prompt indexes {line}:\n{prompt}");
