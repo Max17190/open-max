@@ -173,7 +173,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "list_dir",
-                "description": "List a directory. Path \".\" is the project root.",
+                "description": "List a directory.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -193,7 +193,7 @@ pub fn tool_schemas() -> &'static Value {
                     "properties": {
                         "path": { "type": "string" },
                         "offset": { "type": "integer", "description": "1-based start line" },
-                        "limit": { "type": "integer", "description": "Max lines" }
+                        "limit": { "type": "integer" }
                     },
                     "required": ["path"]
                 }
@@ -203,12 +203,12 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file; parent dirs are created.",
+                "description": "Create a file or fully rewrite one; prefer edit_file for changes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "content": { "type": "string", "description": "Full file content" }
+                        "content": { "type": "string" }
                     },
                     "required": ["path", "content"]
                 }
@@ -218,14 +218,14 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace old_string with new_string in a file. Read it first; old_string must match exactly and be unique unless replace_all.",
+                "description": "Replace old_string with new_string; old_string must match exactly and be unique unless replace_all.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
                         "old_string": { "type": "string" },
                         "new_string": { "type": "string" },
-                        "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)" }
+                        "replace_all": { "type": "boolean" }
                     },
                     "required": ["path", "old_string", "new_string"]
                 }
@@ -235,7 +235,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files by glob pattern, e.g. \"**/*.rs\"; newest first.",
+                "description": "Find files by glob, newest first, e.g. **/*.rs",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -249,13 +249,13 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Regex-search file contents; returns path:line: text.",
+                "description": "Search file contents by regex.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Rust regex; no lookahead/backrefs" },
-                        "path": { "type": "string", "description": "Directory to search (default \".\")" },
-                        "glob": { "type": "string", "description": "Only files matching, e.g. \"*.rs\"" }
+                        "pattern": { "type": "string", "description": "Rust regex, no lookaround or backrefs" },
+                        "path": { "type": "string" },
+                        "glob": { "type": "string" }
                     },
                     "required": ["pattern"]
                 }
@@ -265,7 +265,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a shell command in the project root (builds, tests, git).",
+                "description": "Run a shell command in the project root.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2763,6 +2763,33 @@ mod tests {
         assert!(out.output.contains("src/a.rs"), "{}", out.output);
         assert!(out.output.contains("src/deep/b.rs"), "{}", out.output);
         assert!(!out.output.contains("docs/c.md"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// No glob result says how its paths are ordered, so only the tool's
+    /// description tells the model. The order matters: recent edits come
+    /// first, and past MAX_RESULTS the listed paths are the most recently
+    /// modified ones. The description and the order must agree.
+    #[test]
+    fn glob_lists_newest_first_as_its_description_says() {
+        let root = temp_project();
+        std::fs::write(root.join("src/c.rs"), "").unwrap();
+        let now = std::time::SystemTime::now();
+        // Newest first here is neither path order nor its reverse.
+        for (path, age_secs) in [("src/c.rs", 100), ("src/a.rs", 200), ("src/deep/b.rs", 300)] {
+            let file = std::fs::File::options().write(true).open(root.join(path)).unwrap();
+            file.set_modified(now - std::time::Duration::from_secs(age_secs)).unwrap();
+        }
+        let out = glob_tool(&root, &json!({"pattern": "**/*.rs"}));
+        assert_eq!(out.output, "src/c.rs\nsrc/a.rs\nsrc/deep/b.rs", "glob lists the newest file first");
+        let glob = tool_schemas()
+            .as_array()
+            .expect("schemas are an array")
+            .iter()
+            .find(|tool| tool["function"]["name"] == "glob")
+            .expect("glob is a built-in tool");
+        let description = glob["function"]["description"].as_str().unwrap_or_default();
+        assert!(description.contains("newest first"), "glob's description must state its order: {description}");
         let _ = std::fs::remove_dir_all(root);
     }
 

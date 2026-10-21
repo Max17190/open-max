@@ -219,6 +219,12 @@ If the mode changes during pre-tool checks, those calls are refused without
 replaying hooks. The agent can request them again under the new mode.
 Returning to `ask` restores content requirements for anything created in `auto`.
 
+The model reads the mode in a one-line `[execution policy: <mode>; ...]` note
+placed ahead of a session's first prompt, and written again only when the mode
+changes or a resumed session's history no longer holds it. The history resends
+it on every later request, so it states only the mode's limits; content
+approval detail is in `openmax --spec tools`, `hooks`, and `permissions`.
+
 Only a human can select a saved mode: at the trust grant, or with the
 selectors above in a human-controlled frontend. Agent-spawned processes can
 use an existing choice but can neither grant trust nor change the choice
