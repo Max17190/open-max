@@ -578,7 +578,26 @@ fn main() -> std::io::Result<std::process::ExitCode> {
     if operation.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         return session(cli);
     }
-    runtime(None).block_on(run(cli))
+    runtime(None, runtime_workers(&cli)).block_on(run(cli))
+}
+
+/// The worker threads of a print or stdio run's runtime. Its frontend, which
+/// writes the events and waits on a quit or on a stop's deadline, runs on the
+/// main thread inside `block_on`, and the session's turns run on the worker,
+/// so a worker held in a lock wait (a cancelled turn saving while another
+/// process holds the session index) still leaves the stop on time. File
+/// tools run on the blocking pool and commands as processes, so a round's
+/// calls still run beside each other, up to `max_parallel_tools`. The
+/// default runtime starts one worker per core, each with a stack and a run
+/// queue of its own, for work that keeps one busy: on a 10-core machine,
+/// about 240 KiB of a two-round turn's peak RSS (see
+/// `headless_turn_peak_rss_is_under_four_megabytes`).
+const HEADLESS_WORKERS: usize = 1;
+
+/// The worker threads of the runtime `main` starts for `cli`: one for a print
+/// or stdio run (`HEADLESS_WORKERS`), else one per core.
+fn runtime_workers(cli: &CliArgs) -> Option<usize> {
+    (cli.print || cli.stdio).then_some(HEADLESS_WORKERS)
 }
 
 /// `--replay <file> --json`: print the lines an event log recorded, each as
@@ -600,11 +619,16 @@ fn replay(file: &std::path::Path) -> i32 {
 }
 
 /// The runtime every run works on: the session's from behind its first
-/// frame, every other run's from the start. One that cannot start ends the
-/// run through `refuse`, after `granted`, the lines of a grant and of the
-/// settings flags made before it.
-fn runtime(granted: Option<&str>) -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
+/// frame, every other run's from the start, with `workers` worker threads,
+/// or one per core when None. One that cannot start ends the run through
+/// `refuse`, after `granted`, the lines of a grant and of the settings flags
+/// made before it.
+fn runtime(granted: Option<&str>, workers: Option<usize>) -> tokio::runtime::Runtime {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(workers) = workers {
+        builder.worker_threads(workers);
+    }
+    builder
         .enable_all()
         .build()
         .unwrap_or_else(|e| refuse(1, &format!("failed to start the runtime: {e}"), granted))
@@ -657,7 +681,7 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     // What the settings flags did prints with the grant's line.
     let granted = granted.into_iter().chain(notes).reduce(|lines, line| format!("{lines}\n{line}"));
     start_input();
-    let runtime = runtime(granted.as_deref());
+    let runtime = runtime(granted.as_deref(), None);
     let args = app::Args { continue_session: cli.continue_session, quit };
     let (result, warnings) = runtime.block_on(app::run(terminal, core, core_rx, args));
     end_session(result, warnings, granted)
@@ -3210,6 +3234,17 @@ mod tests {
             assert_eq!(operation(&cli_of(args)), Ok(named), "{args:?}");
         }
         assert_eq!(operation(&cli_of(&["--trust-project", "--continue", "-m", "m"])), Ok(None));
+    }
+
+    /// A print or stdio run's runtime starts one worker thread, and every
+    /// other run's one per core (see `HEADLESS_WORKERS`).
+    #[test]
+    fn a_print_or_stdio_run_starts_one_runtime_worker() {
+        for (args, name) in OPERATIONS {
+            let one = name == "--print" || name.contains("--stdio");
+            assert_eq!(runtime_workers(&cli_of(args)), one.then_some(1), "{args:?}");
+        }
+        assert_eq!(runtime(None, Some(HEADLESS_WORKERS)).metrics().num_workers(), 1);
     }
 
     /// Every pair of operations is refused before either runs, naming both:
