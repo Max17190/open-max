@@ -827,6 +827,104 @@ fn an_untrusted_project_fails_closed_with_exit_3() {
     assert!(stderr.contains("trust"), "{stderr}");
 }
 
+/// A sub-agent is refused, leaving nothing behind, where it cannot run:
+/// outside a git repository, in one with no commit yet, in a directory HEAD
+/// does not have, and in one HEAD holds as a link that leads out of the
+/// worktree (into the project's own tree here), each exit 2 with the reason;
+/// and where git cannot make its worktree, exit 1: a `.worktrees` that is a
+/// file, once git made the branch, and a post-checkout hook that fails once
+/// the worktree and its branch exist. An untrusted project is refused with
+/// exit 3, and a human at a terminal is not asked to trust it, as print mode
+/// does not ask. No run reaches the endpoint.
+#[test]
+fn a_sub_agent_is_refused_where_it_cannot_run_and_leaves_nothing() {
+    let refused = |project: &Path, home: &Path, trusted: bool| {
+        write_settings(home, "http://127.0.0.1:9/v1");
+        if trusted {
+            open_max_core::trust::grant_trust(&home.join(".openmax"), project, ApprovalMode::Auto).unwrap();
+        }
+        let mut command = plain_cmd(project, home);
+        // git looks for no repository above the test's own directory.
+        command.envs(SUB_AGENT_GIT).env("GIT_CEILING_DIRECTORIES", project.parent().unwrap().parent().unwrap());
+        command.args(["--subagent", "edit the notes", "--worktree"]).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+    };
+    let finish = |command: &mut Command, code: i32, reason: &str| -> String {
+        let out = finish_with_deadline(command.stdin(Stdio::null()).spawn().unwrap());
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(code), "{stderr}");
+        assert!(stderr.contains(reason), "{reason:?} in {stderr}");
+        stderr
+    };
+    let (outside, home) = fresh_dirs("sub-agent-outside");
+    finish(&mut refused(&outside, &home, true), 2, "is not in a git repository");
+    assert!(!outside.join(".worktrees").exists());
+
+    let (empty, home) = fresh_dirs("sub-agent-no-commit");
+    git(&empty, &["init", "-q"]);
+    finish(&mut refused(&empty, &home, true), 2, "has no commit yet");
+    assert!(!empty.join(".worktrees").exists());
+
+    let (project, home) = sub_agent_repo("sub-agent-untracked-dir");
+    let untracked = project.join("drafts");
+    std::fs::create_dir(&untracked).unwrap();
+    std::fs::write(untracked.join("idea.txt"), "x\n").unwrap();
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    finish(&mut refused(&untracked, &home, false), 2, "HEAD has no drafts");
+    assert!(!untracked.join(".worktrees").exists());
+    assert_eq!(git(&project, &["branch", "--list", "subagent/*"]), "");
+    assert_eq!(git(&project, &["worktree", "list"]).lines().count(), 1);
+
+    // HEAD holds `sub` as a link to a directory inside the tree's own `sub`,
+    // which the tree has as a directory: in the worktree the link leads back
+    // into the tree the command runs in.
+    let (linked, home) = sub_agent_repo("sub-agent-linked-dir");
+    let inner = std::fs::canonicalize(&linked).unwrap().join("sub").join("inner");
+    std::os::unix::fs::symlink(&inner, linked.join("sub")).unwrap();
+    git(&linked, &["add", "--all"]);
+    git(&linked, &["commit", "-q", "-m", "a link"]);
+    std::fs::remove_file(linked.join("sub")).unwrap();
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("kept.txt"), "kept\n").unwrap();
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &linked, ApprovalMode::Auto).unwrap();
+    finish(&mut refused(&linked.join("sub"), &home, false), 2, "outside its worktree");
+    assert!(!linked.join("sub/.worktrees").exists());
+    let excluded = std::fs::read_to_string(linked.join(".git/info/exclude")).unwrap_or_default();
+    assert!(!excluded.contains(".worktrees/"), "a refusal left the exclude line: {excluded}");
+    let names: Vec<_> = std::fs::read_dir(&inner).unwrap().flatten().map(|entry| entry.file_name()).collect();
+    assert_eq!(names, ["kept.txt"]);
+    assert_eq!(git(&linked, &["branch", "--list", "subagent/*"]), "");
+    assert_eq!(git(&linked, &["worktree", "list"]).lines().count(), 1);
+
+    let (blocked, home) = sub_agent_repo("sub-agent-worktrees-file");
+    std::fs::write(blocked.join(".worktrees"), "not a directory\n").unwrap();
+    finish(&mut refused(&blocked, &home, true), 1, "cannot make the sub-agent's worktree");
+    assert_eq!(std::fs::read_to_string(blocked.join(".worktrees")).unwrap(), "not a directory\n");
+    assert_eq!(git(&blocked, &["branch", "--list", "subagent/*"]), "");
+
+    let (hooked, home) = sub_agent_repo("sub-agent-hook-fails");
+    let hook = hooked.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    finish(&mut refused(&hooked, &home, true), 1, "cannot make the sub-agent's worktree");
+    assert!(!hooked.join(".worktrees").exists());
+    assert_eq!(git(&hooked, &["branch", "--list", "subagent/*"]), "");
+    assert_eq!(git(&hooked, &["worktree", "list"]).lines().count(), 1);
+
+    let (project, home) = sub_agent_repo("sub-agent-untrusted");
+    let (_controller, terminal) = pseudo_terminal();
+    let out = finish_with_deadline(refused(&project, &home, false).stdin(terminal).spawn().unwrap());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("is not trusted") && !stderr.contains("Trust project"), "{stderr}");
+    assert!(!project.join(".worktrees").exists());
+    assert_eq!(git(&project, &["branch", "--list", "subagent/*"]), "");
+    for dir in [outside, empty, linked, blocked, hooked, project] {
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+    let _ = std::fs::remove_dir_all(untracked.parent().unwrap().parent().unwrap());
+}
+
 #[test]
 fn check_exit_codes_follow_findings() {
     let (project, home) = fresh_dirs("check");
@@ -3296,6 +3394,476 @@ fn ask_saved_by_another_frontend_reaches_a_running_session() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// Git's identity and config for the git commands a sub-agent test and its
+/// openmax run: none of the machine's own.
+const SUB_AGENT_GIT: [(&str, &str); 6] = [
+    ("GIT_AUTHOR_NAME", "openmax test"),
+    ("GIT_AUTHOR_EMAIL", "test@example.com"),
+    ("GIT_COMMITTER_NAME", "openmax test"),
+    ("GIT_COMMITTER_EMAIL", "test@example.com"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git").current_dir(dir).args(args).envs(SUB_AGENT_GIT).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A project that is a git repository with notes.txt committed.
+fn sub_agent_repo(tag: &str) -> (PathBuf, PathBuf) {
+    let (project, home) = fresh_dirs(tag);
+    git(&project, &["init", "-q"]);
+    std::fs::write(project.join("notes.txt"), "first\n").unwrap();
+    git(&project, &["add", "notes.txt"]);
+    git(&project, &["commit", "-q", "-m", "notes"]);
+    (project, home)
+}
+
+/// Commit a submodule, `lib`, to `project`: a repository beside it with one
+/// commit, which a worktree of HEAD starts with uninitialized. Returns the
+/// submodule's source repository.
+fn sub_agent_submodule(project: &Path) -> PathBuf {
+    let source = project.parent().unwrap().join("lib");
+    std::fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-q"]);
+    std::fs::write(source.join("g"), "one\n").unwrap();
+    git(&source, &["add", "g"]);
+    git(&source, &["commit", "-qm", "one"]);
+    git(project, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", source.to_str().unwrap(), "lib"]);
+    git(project, &["commit", "-qm", "a submodule"]);
+    source
+}
+
+/// A sub-agent's child runs in its project's approval mode or a stricter
+/// one, never a looser one. A choice saved for `.worktrees`, a path inside
+/// the project, that is looser than the project's does not apply, and one
+/// that is stricter does: in readonly, each child's write is refused, so it
+/// changes nothing and keeps no branch. A project with uncommitted work is
+/// told its child starts from HEAD without it, and a `.worktrees` the user
+/// made is left as it was.
+#[test]
+fn a_sub_agent_runs_in_its_projects_approval_mode_or_a_stricter_one() {
+    let start = |tag: &str, project_mode: &str, inner_mode: &str, dirty: bool| {
+        let (project, home) = sub_agent_repo(tag);
+        if dirty {
+            std::fs::write(project.join("scratch.txt"), "not committed\n").unwrap();
+            std::fs::create_dir(project.join(".worktrees")).unwrap();
+            std::fs::write(project.join(".worktrees/mine.txt"), "the user's\n").unwrap();
+        }
+        let (base_url, _requests, _server) = spawn_scripted_server(vec![
+            (sse_tool_call("write_file", serde_json::json!({"path": "notes.txt", "content": "edited\n"})), true),
+            (sse_text("done"), true),
+        ]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let root = std::fs::canonicalize(&project).unwrap();
+        let mut modes = serde_json::Map::new();
+        modes.insert(root.display().to_string(), project_mode.into());
+        modes.insert(root.join(".worktrees").display().to_string(), inner_mode.into());
+        let store = serde_json::json!({ "version": 1, "projects": [root.display().to_string()], "approval_modes": modes });
+        std::fs::write(home.join(".openmax/trust.json"), store.to_string()).unwrap();
+        let mut command = cmd(&project, &home);
+        command.envs(SUB_AGENT_GIT).args(["--subagent", "edit the notes", "--worktree"]);
+        (command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(), project)
+    };
+    let looser_inside = start("sub-agent-mode-loose", "readonly", "auto", true);
+    let stricter_inside = start("sub-agent-mode-strict", "auto", "readonly", false);
+    for ((child, project), dirty) in [(looser_inside, true), (stricter_inside, false)] {
+        let out = finish_with_deadline(child);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert_eq!(
+            stderr.lines().last(),
+            Some("openmax: the sub-agent changed nothing, so no branch was kept"),
+            "a write ran outside readonly:\n{stderr}"
+        );
+        assert_eq!(git(&project, &["branch", "--list", "subagent/*"]), "", "{stderr}");
+        assert_eq!(std::fs::read_to_string(project.join("notes.txt")).unwrap(), "first\n");
+        let left: Vec<String> = std::fs::read_dir(project.join(".worktrees"))
+            .map(|dir| dir.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        let users: &[&str] = if dirty { &["mine.txt"] } else { &[] };
+        assert_eq!(left, users, "only the user's own .worktrees is left: {stderr}");
+        let told = stderr.contains("uncommitted changes in this tree are not in its worktree");
+        assert_eq!(told, dirty, "{stderr}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+/// A child that detaches HEAD in its worktree, or switches to a branch of
+/// its own, still leaves its work on the branch the run names: removing the
+/// worktree would otherwise leave that commit on no branch at all. One that
+/// switches to a branch of the user's leaves that branch as it was. A child
+/// that moves a submodule to a commit the submodule's remote holds leaves
+/// that on the branch too, and its worktree goes: the commit is not only
+/// there.
+#[test]
+fn a_sub_agent_leaves_its_work_on_its_branch_wherever_it_moved_head() {
+    let start = |tag: &str, command: &str, prepare: &dyn Fn(&Path)| {
+        let (project, home) = sub_agent_repo(tag);
+        prepare(&project);
+        let (base_url, _requests, _server) = spawn_scripted_server(vec![
+            (sse_tool_call("bash", serde_json::json!({ "command": command })), true),
+            (sse_text("done"), true),
+        ]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+        let mut command = cmd(&project, &home);
+        command.envs(SUB_AGENT_GIT).args(["--subagent", "detach", "--worktree"]);
+        (command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(), project)
+    };
+    let detached = start("sub-agent-detached", "git switch -q --detach && echo detached > d.txt", &|_| {});
+    let switched = start("sub-agent-switched", "git switch -q mine && echo switched > d.txt", &|project| {
+        git(project, &["branch", "mine"]);
+    });
+    // The submodule's source gains a commit after HEAD recorded the first.
+    let bump = "git -c protocol.file.allow=always submodule update -q --init && git -C lib checkout -q origin/HEAD";
+    let bumped = start("sub-agent-submodule-bump", bump, &|project| {
+        let source = sub_agent_submodule(project);
+        git(&source, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    });
+    for ((child, project), written) in [(detached, Some("detached")), (switched, Some("switched")), (bumped, None)] {
+        let out = finish_with_deadline(child);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        let branch = stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("openmax: the sub-agent's changes are on branch "))
+            .and_then(|rest| rest.split(": ").next())
+            .unwrap_or_else(|| panic!("{stderr}"));
+        match written {
+            Some(text) => assert_eq!(git(&project, &["show", &format!("{branch}:d.txt")]), text, "{stderr}"),
+            None => {
+                let moved_to = git(&project.parent().unwrap().join("lib"), &["rev-parse", "HEAD"]);
+                assert_eq!(git(&project, &["rev-parse", &format!("{branch}:lib")]), moved_to, "{stderr}");
+            }
+        }
+        if !git(&project, &["branch", "--list", "mine"]).is_empty() {
+            // The user's branch is where it was, at the base.
+            assert_eq!(git(&project, &["rev-parse", "mine"]), git(&project, &["rev-parse", "HEAD"]), "{stderr}");
+        }
+        assert!(!project.join(".worktrees").exists(), "{stderr}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+/// The child starts where the command ran, at that directory's place in
+/// the worktree, whatever the directory's name holds: here a tracked
+/// directory whose name starts with a space, as git reports it. Git's own
+/// variables that name a repository, a working tree or an index (a git
+/// hook's GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE, pointing at another
+/// repository here) do not move it there.
+#[test]
+fn a_sub_agent_starts_at_its_directorys_place_in_the_worktree() {
+    let (project, home) = sub_agent_repo("sub-agent-subdir");
+    let sub = project.join(" sub dir");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("kept.txt"), "tracked\n").unwrap();
+    git(&project, &["add", "--all"]);
+    git(&project, &["commit", "-q", "-m", "sub dir"]);
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("write_file", serde_json::json!({"path": "here.txt", "content": "here\n"})), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    let (other, _) = sub_agent_repo("sub-agent-other-repository");
+    let out = cmd(&sub, &home)
+        .envs(SUB_AGENT_GIT)
+        .env("GIT_DIR", other.join(".git"))
+        .env("GIT_WORK_TREE", &other)
+        .env("GIT_INDEX_FILE", other.join(".git/index"))
+        .args(["--subagent", "write here", "--worktree"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let branch = stderr
+        .lines()
+        .last()
+        .and_then(|line| line.strip_prefix("openmax: the sub-agent's changes are on branch "))
+        .and_then(|rest| rest.split(": ").next())
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert_eq!(git(&project, &["show", &format!("{branch}: sub dir/here.txt")]), "here", "{stderr}");
+    assert!(!sub.join(".worktrees").exists(), "{stderr}");
+    assert_eq!(git(&other, &["branch", "--list", "subagent/*"]), "", "{stderr}");
+    assert_eq!(git(&other, &["worktree", "list"]).lines().count(), 1, "{stderr}");
+    for dir in [project, other] {
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+}
+
+/// A worktree that holds work the run cannot put on the child's branch, or
+/// that the run cannot remove, stays, with the work in it, and the run
+/// exits 1 naming it: removing it would lose the work. Here git has no
+/// identity and may not guess one, so the commit fails; a child that
+/// detached HEAD finds its branch locked, as a git command cut short leaves
+/// it; a child's edits inside a nested repository, or inside a submodule it
+/// initialized, are beyond any commit of the outer one, even where the
+/// repository's settings or `.gitmodules` keep them out of its
+/// `git status`, and so is a commit it made in a nested repository, which
+/// the branch records only by its id; and a child locked its worktree, which
+/// git then refuses to remove.
+#[test]
+fn a_sub_agent_keeps_its_worktree_when_its_work_cannot_reach_its_branch() {
+    let start = |tag: &str, call: (&str, serde_json::Value), identity: bool, prepare: &dyn Fn(&Path)| {
+        let (project, home) = sub_agent_repo(tag);
+        git(&project, &["config", "user.useConfigOnly", "true"]);
+        git(&project, &["config", "diff.ignoreSubmodules", "all"]);
+        prepare(&project);
+        let (base_url, _requests, _server) =
+            spawn_scripted_server(vec![(sse_tool_call(call.0, call.1), true), (sse_text("done"), true)]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+        let mut command = cmd(&project, &home);
+        for (name, _) in &SUB_AGENT_GIT[..4] {
+            command.env_remove(name);
+        }
+        let git_env = if identity { &SUB_AGENT_GIT[..] } else { &SUB_AGENT_GIT[4..] };
+        command.envs(git_env.iter().copied()).args(["--subagent", "edit the notes", "--worktree"]);
+        (command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(), project)
+    };
+    let bash = |command: &str| ("bash", serde_json::json!({ "command": command }));
+    let write = ("write_file", serde_json::json!({"path": "notes.txt", "content": "edited\n"}));
+    let lock = concat!(
+        "b=$(git branch --show-current) && git switch -q --detach && echo detached > notes.txt && ",
+        "touch \"$(git rev-parse --path-format=absolute --git-common-dir)/refs/heads/$b.lock\""
+    );
+    let nested = "git init -q inner && echo one > inner/g && git -C inner add g && git -C inner commit -qm one && echo edited > inner/g";
+    // All of it committed in the nested repository, none in the outer one.
+    let committed = "git init -q inner && echo one > inner/g && git -C inner add g && git -C inner commit -qm one";
+    let as_is = |_: &Path| {};
+    // HEAD records a submodule whose `.gitmodules` entry ignores its changes.
+    let submodule = |project: &Path| {
+        sub_agent_submodule(project);
+        git(project, &["config", "-f", ".gitmodules", "submodule.lib.ignore", "all"]);
+        git(project, &["commit", "-qam", "ignore the submodule"]);
+    };
+    let initialized = "git -c protocol.file.allow=always submodule update -q --init && echo edited > lib/g";
+    let not_on = "openmax: the sub-agent's changes are not on branch subagent/edit-the-notes-";
+    // (run, how the last line starts, what precedes the worktree's path there, a file it keeps, its text)
+    let cases = [
+        (start("sub-agent-no-identity", write, false, &as_is), not_on, "; they stay in ", "notes.txt", "edited"),
+        (start("sub-agent-locked-branch", bash(lock), true, &as_is), not_on, "; they stay in ", "notes.txt", "detached"),
+        (
+            start("sub-agent-submodule", bash(initialized), true, &submodule),
+            "openmax: the sub-agent's work in lib is not on branch subagent/edit-the-notes-",
+            "; it stays in ",
+            "lib/g",
+            "edited",
+        ),
+        (
+            start("sub-agent-nested-repo", bash(nested), true, &as_is),
+            "openmax: the sub-agent's work in inner is not on branch subagent/edit-the-notes-",
+            "; it stays in ",
+            "inner/g",
+            "edited",
+        ),
+        (
+            start("sub-agent-nested-commit", bash(committed), true, &as_is),
+            "openmax: the sub-agent's work in inner is not on branch subagent/edit-the-notes-",
+            "; it stays in ",
+            "inner/g",
+            "one",
+        ),
+        (
+            start("sub-agent-locked-worktree", bash("git worktree lock . && echo locked > lock.txt"), true, &as_is),
+            "openmax: the sub-agent's changes are on branch subagent/edit-the-notes-",
+            "; its worktree stays at ",
+            "lock.txt",
+            "locked",
+        ),
+    ];
+    for ((child, project), starts, marker, file, text) in cases {
+        let out = finish_with_deadline(child);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        let last = stderr.lines().last().unwrap_or_default();
+        assert!(last.starts_with(starts), "{stderr}");
+        let kept = last.split_once(marker).map(|(_, rest)| PathBuf::from(rest.split(": ").next().unwrap_or(rest)));
+        let kept = kept.unwrap_or_else(|| panic!("the run names where the work is: {stderr}"));
+        assert_eq!(std::fs::read_to_string(kept.join(file)).unwrap(), format!("{text}\n"), "{stderr}");
+        assert_eq!(git(&project, &["worktree", "list"]).lines().count(), 2, "{stderr}");
+        if file == "inner/g" {
+            // What the outer repository can hold, the nested one's commit, is on the branch.
+            let branch = last.split("on branch ").nth(1).and_then(|rest| rest.split(',').next()).unwrap_or_default();
+            assert!(git(&project, &["ls-tree", branch, "inner"]).starts_with("160000 commit"), "{stderr}");
+        }
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+/// Two sub-agents run side by side in one project, each in a worktree of
+/// its own: the repository's exclude file gains the `.worktrees/` line once,
+/// which keeps both worktrees out of the project's `git status` while they
+/// run, and `.worktrees` is gone once both have ended.
+#[test]
+fn two_sub_agents_run_side_by_side_in_one_project() {
+    let (project, home) = sub_agent_repo("sub-agent-side-by-side");
+    let base = project.parent().unwrap().to_path_buf();
+    // Each child holds its bash call until the test releases it, once both run.
+    let hold = format!(
+        "touch '{b}/ready-'$$; i=0; while [ ! -e '{b}/release' ] && [ $i -lt 400 ]; do sleep 0.025; i=$((i+1)); done",
+        b = base.display()
+    );
+    let held = sse_tool_call("bash", serde_json::json!({ "command": hold }));
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (held.clone(), true),
+        (held, true),
+        (sse_text("done"), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    let start = || {
+        let mut command = cmd(&project, &home);
+        command.envs(SUB_AGENT_GIT).args(["--subagent", "wait", "--worktree"]);
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+    };
+    let runs = [start(), start()];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let ready = || std::fs::read_dir(&base).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("ready-")).count();
+    while ready() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let both = ready();
+    let status = git(&project, &["status", "--porcelain"]);
+    let worktrees = git(&project, &["worktree", "list"]).lines().count();
+    std::fs::write(base.join("release"), "").unwrap();
+    for run in runs {
+        let out = finish_with_deadline(run);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert_eq!(stderr.lines().last(), Some("openmax: the sub-agent changed nothing, so no branch was kept"), "{stderr}");
+    }
+    let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!((both, worktrees), (2, 3), "both children ran, each in a worktree of its own");
+    assert_eq!(status, "", "the running worktrees showed in the project's status");
+    assert_eq!(exclude.lines().filter(|line| *line == ".worktrees/").count(), 1, "{exclude}");
+    let added = "\n# openmax sub-agent worktrees\n.worktrees/\n";
+    assert!(exclude.ends_with(added) && !exclude.contains("\n\n# openmax"), "{exclude}");
+    assert!(!project.join(".worktrees").exists());
+}
+
+/// A stop that outlasts its deadline keeps the worktree as it is and says
+/// where, as removing it could lose work. A turn the deadline leaves behind
+/// may still be writing in the worktree from inside openmax, where stopping
+/// process groups does not reach: here the model hangs up on the turn's
+/// first request, and the cancelled turn's save waits on the session index,
+/// which the test holds as another openmax on the same data dir would. And a
+/// snapshot can wait on a clean filter of the repository's: here one that
+/// takes 30 seconds over the child's edit, which the stop ends, the edit
+/// kept in the worktree. Both stops run at once.
+#[test]
+fn a_sub_agent_whose_stop_outlasts_its_deadline_keeps_its_worktree() {
+    // The snapshot's `git add` runs a clean filter that takes 30 seconds
+    // over the child's edit, and passes anything else through.
+    let (filtered, filtered_home) = sub_agent_repo("sub-agent-slow-filter");
+    let filter_pid = filtered.parent().unwrap().join("filter.pid");
+    std::fs::write(filtered.join(".gitattributes"), "notes.txt filter=slow\n").unwrap();
+    git(&filtered, &["add", ".gitattributes"]);
+    git(&filtered, &["commit", "-qm", "a filter"]);
+    let clean = format!(
+        "c=$(cat); if [ \"$c\" = edited ]; then echo $$ > '{}'; exec sleep 30; fi; printf '%s\\n' \"$c\"",
+        filter_pid.display()
+    );
+    git(&filtered, &["config", "filter.slow.clean", &clean]);
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("write_file", serde_json::json!({"path": "notes.txt", "content": "edited\n"})), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&filtered_home, &base_url, "auto");
+    open_max_core::trust::grant_trust(&filtered_home.join(".openmax"), &filtered, ApprovalMode::Auto).unwrap();
+    let mut command = cmd(&filtered, &filtered_home);
+    command.envs(SUB_AGENT_GIT).args(["--subagent", "edit the notes", "--worktree"]);
+    let mut saving = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+
+    let (project, home) = sub_agent_repo("sub-agent-unsettled");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_settings_with_mode(&home, &format!("http://{}/v1", listener.local_addr().unwrap()), "auto");
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    // Takes the first request, then hangs up and stops listening: the turn retries.
+    let (asked, request) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let _ = read_request(&mut stream);
+        let _ = asked.send(());
+    });
+    let mut command = cmd(&project, &home);
+    command.envs(SUB_AGENT_GIT).args(["--subagent", "wait", "--worktree", "--json"]);
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    if request.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+        let _ = child.kill();
+        let _ = saving.kill();
+        panic!("the turn never asked the endpoint: {}", String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr));
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(home.join(".openmax/sessions/index.lock"))
+        .unwrap();
+    lock.try_lock().expect("nothing else holds the session index");
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let filtering = loop {
+        // Only a whole line: the filter may be writing it.
+        let text = std::fs::read_to_string(&filter_pid).unwrap_or_default();
+        if let Some(pid) = text.strip_suffix('\n').and_then(|pid| pid.parse::<i32>().ok()) {
+            break pid;
+        }
+        if std::time::Instant::now() >= deadline || saving.try_wait().unwrap().is_some() {
+            let _ = saving.kill();
+            panic!("the filter never ran: {}", String::from_utf8_lossy(&saving.wait_with_output().unwrap().stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    unsafe { libc::kill(saving.id() as libc::pid_t, libc::SIGTERM) };
+
+    let out = finish_with_deadline(child);
+    drop(lock);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last = stderr.lines().last().unwrap_or_default();
+    let kept = last
+        .strip_prefix("openmax: the sub-agent's turn did not stop in time, so its work stays as it is in ")
+        .and_then(|rest| rest.split(" on branch ").next())
+        .map(PathBuf::from);
+    let kept_dir = kept.as_ref().is_some_and(|kept| kept.is_dir());
+    let worktrees = git(&project, &["worktree", "list"]).lines().count();
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert_eq!(out.status.code(), Some(143), "{stderr}");
+    assert!(kept_dir, "the run must name the worktree it keeps: {stderr}");
+    assert_eq!(worktrees, 2, "{stderr}");
+
+    let out = finish_with_deadline(saving);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let alive = || unsafe { libc::kill(filtering, 0) == 0 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survived = alive();
+    if survived {
+        unsafe { libc::kill(filtering, libc::SIGKILL) };
+    }
+    let last = stderr.lines().last().unwrap_or_default();
+    let kept = last
+        .strip_prefix("openmax: the sub-agent's changes are not on branch subagent/edit-the-notes-")
+        .and_then(|rest| rest.split_once(" (a signal stopped it); they stay in "))
+        .map(|(_, root)| PathBuf::from(root));
+    let edit = kept.as_ref().and_then(|kept| std::fs::read_to_string(kept.join("notes.txt")).ok());
+    let worktrees = git(&filtered, &["worktree", "list"]).lines().count();
+    let _ = std::fs::remove_dir_all(filtered.parent().unwrap());
+    assert_eq!(out.status.code(), Some(143), "{stderr}");
+    assert_eq!(edit.as_deref(), Some("edited\n"), "the run must name the worktree that holds the edit: {stderr}");
+    assert!(!survived, "the filter outlived the run: {stderr}");
+    assert_eq!(worktrees, 2, "{stderr}");
+}
+
 /// A run whose model answered with one bash call that leaves a tree behind,
 /// the shape of a build or a dev server the agent started: the shell (which
 /// then becomes a long foreground command) and a background child each
@@ -3472,6 +4040,150 @@ fn sigusr2_stops_a_text_print_run_and_its_tool_tree() {
     assert!(survivors.is_empty(), "tool processes outlived the run: {survivors:?}\n{stderr}");
     assert_eq!(output.status.code(), Some(128 + libc::SIGUSR2), "{:?}\n{stderr}", output.status);
     assert!(stderr.contains("openmax: stopped (cancelled)"), "{stderr}");
+}
+
+/// SIGINT, SIGHUP and SIGQUIT stop a sub-agent as SIGTERM does (the thesis
+/// gate's case): the run exits 128 plus the signal's number with the child's
+/// tool tree stopped, its worktree removed, and what it wrote committed to
+/// its branch, which the last line names. A text run says the turn stopped.
+#[test]
+fn sigint_sighup_and_sigquit_stop_a_sub_agent_and_keep_its_work() {
+    let start = |signal: libc::c_int, json: bool| {
+        let (project, home) = sub_agent_repo(&format!("sub-agent-signal-{signal}"));
+        let pids = project.parent().unwrap().join("pids");
+        let tree = format!(
+            "echo partial > partial.txt; echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; exec sleep 7841",
+            p = pids.display()
+        );
+        let (base_url, _requests, _server) = spawn_scripted_server(vec![
+            (sse_tool_call("bash", serde_json::json!({ "command": tree })), true),
+            (sse_text("done"), true),
+        ]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+        let mut command = cmd(&project, &home);
+        command.envs(SUB_AGENT_GIT).args(["--subagent", "start the tree", "--worktree"]);
+        if json {
+            command.arg("--json");
+        }
+        let child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        (signal, json, child, pids, project)
+    };
+    let runs = [start(libc::SIGINT, true), start(libc::SIGHUP, false), start(libc::SIGQUIT, true)];
+    // Each is signalled once its tree runs, and all are stopping at once.
+    let stopping: Vec<_> = runs
+        .into_iter()
+        .map(|(signal, json, mut child, pids, project)| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let started = loop {
+                let text = std::fs::read_to_string(&pids).unwrap_or_default();
+                let started: Vec<i32> = text.lines().filter_map(|line| line.trim().parse().ok()).collect();
+                if started.len() == 2 || std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                    break started;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+            (signal, json, child, started, project)
+        })
+        .collect();
+    for (signal, json, child, started, project) in stopping {
+        let out = finish_with_deadline(child);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(started.len(), 2, "the tool tree never started: {stderr}");
+        let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while started.iter().any(alive) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let survivors: Vec<i32> = started.iter().copied().filter(alive).collect();
+        for pid in &survivors {
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(survivors.is_empty(), "signal {signal}: tool processes outlived the run: {survivors:?}\n{stderr}");
+        assert_eq!(out.status.code(), Some(128 + signal), "{stderr}");
+        assert!(!project.join(".worktrees").exists(), "{stderr}");
+        let branch = stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("openmax: the sub-agent's changes are on branch "))
+            .and_then(|rest| rest.split(": ").next())
+            .unwrap_or_else(|| panic!("signal {signal}: {stderr}"));
+        assert_eq!(git(&project, &["show", &format!("{branch}:partial.txt")]), "partial");
+        if json {
+            let done = last_event(&out.stdout);
+            assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{done}");
+        } else {
+            assert!(stderr.contains("openmax: stopped (cancelled)"), "{stderr}");
+        }
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+/// A signal while git makes a sub-agent's worktree does not wait for git,
+/// which here runs a post-checkout hook that takes 30 seconds and keeps
+/// running through SIGTERM: git's process group, the hook in it, gets
+/// SIGTERM and then SIGKILL, and the run exits 128 plus the signal's number,
+/// leaving no worktree and no branch. The cleanup, which the stop waits for,
+/// runs no hook: a reference-transaction hook that would take 30 seconds over
+/// the branch's deletion does not run.
+#[test]
+fn a_signal_while_git_makes_a_sub_agents_worktree_stops_git_and_leaves_nothing() {
+    let (project, home) = sub_agent_repo("sub-agent-launch-signal");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    let base = project.parent().unwrap().to_path_buf();
+    let hook = project.join(".git/hooks/post-checkout");
+    let script = format!(
+        "#!/bin/sh\ntrap 'echo term > \"{b}/hook.term\"' TERM\necho $$ > \"{b}/hook.pid\"\ni=0\nwhile [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done\n",
+        b = base.display()
+    );
+    std::fs::write(&hook, script).unwrap();
+    // Takes 30 seconds over the deletion of a sub-agent's branch, whose new
+    // value is all zeros.
+    let deletion = "#!/bin/sh\nwhile read old new ref; do\n  case $ref in refs/heads/subagent/*) case $new in *[!0]*) ;; *) sleep 30 ;; esac ;; esac\ndone\n";
+    let refs = project.join(".git/hooks/reference-transaction");
+    std::fs::write(&refs, deletion).unwrap();
+    for hook in [&hook, &refs] {
+        std::fs::set_permissions(hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    let mut command = cmd(&project, &home);
+    command.envs(SUB_AGENT_GIT).args(["--subagent", "edit the notes", "--worktree"]);
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let hook_pid = loop {
+        // Only a whole line: the hook may be writing it.
+        let text = std::fs::read_to_string(base.join("hook.pid")).unwrap_or_default();
+        if let Some(pid) = text.strip_suffix('\n').and_then(|pid| pid.parse::<i32>().ok()) {
+            break pid;
+        }
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            panic!("the hook never ran: {}", String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let out = finish_with_deadline(child);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let alive = || unsafe { libc::kill(hook_pid, 0) == 0 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survived = alive();
+    if survived {
+        unsafe { libc::kill(hook_pid, libc::SIGKILL) };
+    }
+    let termed = base.join("hook.term").exists();
+    let left = (project.join(".worktrees").exists(), git(&project, &["branch", "--list", "subagent/*"]));
+    let listed = git(&project, &["worktree", "list"]).lines().count();
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(out.status.code(), Some(143), "{stderr}");
+    assert!(stderr.contains("openmax: cannot make the sub-agent's worktree: a signal stopped it"), "{stderr}");
+    assert!(termed, "the hook was not sent SIGTERM: {stderr}");
+    assert!(!survived, "the hook outlived the run: {stderr}");
+    assert_eq!((left, listed), ((false, String::new()), 1), "{stderr}");
 }
 
 /// A second signal while the first is still stopping the tools exits

@@ -10,7 +10,7 @@
 //! parsers in tests, so the printed contract cannot drift from the loop.
 
 /// Every surface `render` accepts, in the order the help text lists them.
-pub const SURFACES: [&str; 12] = [
+pub const SURFACES: [&str; 13] = [
     "tools",
     "skills",
     "prompts",
@@ -22,6 +22,7 @@ pub const SURFACES: [&str; 12] = [
     "recall",
     "stdio",
     "mcp",
+    "subagent",
     "usage",
 ];
 
@@ -39,6 +40,7 @@ pub fn render(surface: &str) -> Option<&'static str> {
         "recall" => Some(RECALL),
         "stdio" => Some(STDIO),
         "mcp" => Some(MCP),
+        "subagent" => Some(SUBAGENT),
         _ => None,
     }
 }
@@ -1219,6 +1221,92 @@ read-only. `timeout_secs` must cover starting the server and the call.
 
 3. Verify both files with `openmax --check`. They activate like any other tool
 and skill (`openmax --spec tools`, `openmax --spec skills`).
+"#;
+
+const SUBAGENT: &str = r#"# Sub-agents
+
+A sub-agent is a second session that takes one task off this one. Start it
+from bash in one of two ways:
+
+- `openmax --subagent "<task>" --worktree` runs the task in a new git worktree
+  of this repository, so the child's edits stay out of this tree, and keeps
+  them on a branch of their own.
+- `openmax -p "<task>"` runs it as a print-mode turn in this tree.
+
+One command runs one child; nothing queues or schedules them. A bash call
+that outlives its `timeout_secs` (120 unless set, at most 600) is stopped with
+signals to its whole process group, which end a sub-agent in it before its
+cleanup (see `kill -9` below). Give the call a timeout that covers the task, or
+start the sub-agent in a tmux session of its own, which is also how several run
+in parallel, and read its output from a file:
+
+```sh
+tmux new-session -d -s flaky 'openmax --subagent "make the flaky retry test deterministic" --worktree > /tmp/flaky.log 2>&1'
+tail -n 1 /tmp/flaky.log
+```
+
+## --subagent "<task>" --worktree
+
+- Refused, leaving nothing behind: an untrusted project (exit 3); an endpoint
+  that does not resolve, a directory outside a git repository, a repository
+  with no commit yet, and a directory HEAD does not have or holds as a link
+  out of the worktree (exit 2); and a worktree git cannot make, as when a
+  `post-checkout` hook fails (exit 1). A signal while git makes the worktree
+  stops git and its hooks, and leaves nothing either. `--subagent` without
+  `--worktree` is a usage error. Git's variables that name a repository, a
+  working tree or an index (`GIT_DIR` and the rest of
+  `git rev-parse --local-env-vars`) are cleared for the run's git commands
+  and the child's tools.
+- The worktree is a checkout of HEAD at `.worktrees/<name>` under this
+  directory, on a new branch `subagent/<name>`, where `<name>` is the task's
+  first words and a suffix; the run names both on stderr. Uncommitted changes
+  in this tree (staged, unstaged or untracked) are not in it, and the run says
+  so when there are any: commit what the child needs first. Once the worktree
+  is made and checked, the run adds `.worktrees/` to the repository's
+  `.git/info/exclude` when it is not there, which keeps the worktrees out of
+  this tree's `git status`, glob and grep, and removes `.worktrees` once it
+  is empty.
+- The child starts at this directory's place in the worktree and runs the task
+  as one print-mode turn: its events print as they arrive, as `openmax -p`
+  prints them (text on stdout and tool progress on stderr, or with `--json`
+  one event line per event on stdout), the final answer last.
+- Trust and mode: the worktree lies inside this project, so the trust a human
+  granted the project covers it, as it covers any subdirectory; the flag
+  grants nothing itself. The child runs in this project's approval mode, or in
+  a stricter one saved for a path inside `.worktrees`, never in a looser one.
+  A print-mode turn declines every approval, so in `ask` its mutating calls
+  are declined.
+- When the child ends, finished, failed, or stopped by SIGINT, SIGTERM, SIGHUP
+  or SIGQUIT, its tool processes are stopped, everything it changed is
+  committed to its branch (`git add --all`, then a commit with signing off,
+  never on a branch of yours the child switched to; the run's git commands,
+  but `git worktree add`, run no repository hook, and one still running 3
+  seconds after a stop is stopped, keeping the worktree; files the
+  repository ignores are not kept), the worktree is removed, and the last
+  line on stderr names the branch and its diffstat:
+  `openmax: the sub-agent's changes are on branch subagent/<name>: 1 file changed, 2 insertions(+)`.
+  A child that changed nothing leaves no branch. Take the work with
+  `git merge` or `git cherry-pick`, or delete the branch.
+- Exit status: 128 plus the signal's number after a signal; otherwise the
+  turn's, as print mode's (0, 1, 4), except that a finished turn exits 1 when
+  its work cannot all be put on its branch (changes inside a nested
+  repository or a submodule included, and commits there that no
+  remote-tracking branch holds, which a commit here records only by their
+  id) or its worktree cannot be removed. The worktree then stays, with the
+  work, and stderr names it.
+
+A second signal exits at once, as in print mode, and can leave the worktree in
+place, as does a turn still running when the stop's deadline passes, whose
+worktree stays as it is and is named on stderr. `kill -9` runs no cleanup: the
+next openmax launch stops the child's tool processes, which this process
+recorded as its own, but the worktree, its uncommitted changes and its branch
+stay. `git worktree list` names the worktree; save what it holds, then remove
+it with `git worktree remove --force <path>`.
+
+```sh
+openmax --subagent "make the flaky retry test deterministic" --worktree
+git log --stat -1 subagent/make-the-flaky-retry-test-1a2b3c4d
+```
 "#;
 
 #[cfg(test)]

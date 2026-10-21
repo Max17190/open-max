@@ -285,6 +285,21 @@ impl Core {
         Ok(())
     }
 
+    /// Hold this canonical project, and its subdirectories without a choice
+    /// of their own, at `mode` or the mode that governs it now, whichever is
+    /// stricter, for the life of this process. Nothing is saved, and a
+    /// refresh only ever tightens it (see [`ProjectModes`]). A sub-agent's
+    /// worktree is held at the mode of the project it was started from, so a
+    /// looser choice saved for a path inside the worktree never applies.
+    pub fn hold_approval_mode(&self, project_root: &std::path::Path, mode: crate::config::ApprovalMode) {
+        let canonical = canonical_root(project_root);
+        // Taken first and released: the settings lock is never held with this one.
+        let default = self.settings.lock().unwrap_or_else(|e| e.into_inner()).approval_mode;
+        let mut modes = self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::trust::nearest_approval_mode(&modes.live, &canonical).unwrap_or(default);
+        modes.live.insert(canonical, now.stricter(mode));
+    }
+
     /// Read back the choices other processes saved since this one last
     /// looked, and apply each one that is stricter (see [`ProjectModes`]).
     /// Turns call it before each request and tool call, before a queued
@@ -588,6 +603,37 @@ mod tests {
         core.set_project_approval_mode(&project, ApprovalMode::Auto).unwrap();
         assert_eq!(core.approval_mode(&worktree), ApprovalMode::Auto, "live selection");
         assert_eq!(Core::new(data).unwrap().0.approval_mode(&worktree), ApprovalMode::Auto, "launch snapshot");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A held worktree runs at the stricter of the hold and the choice that
+    /// governs it: a looser choice saved for a path inside it never loosens
+    /// the hold, a stricter one still applies, the hold saves nothing, and a
+    /// refresh keeps it.
+    #[test]
+    fn a_held_mode_is_the_stricter_of_the_hold_and_the_saved_choice() {
+        use crate::config::ApprovalMode::{Ask, Auto, Readonly};
+        let dir = std::env::temp_dir().join(format!("omx-mode-hold-{}", uuid::Uuid::new_v4()));
+        let (project, data) = (dir.join("project"), dir.join("data"));
+        let (loose, strict) = (project.join(".worktrees").join("loose"), project.join(".worktrees").join("strict"));
+        std::fs::create_dir_all(loose.join("sub")).unwrap();
+        std::fs::create_dir_all(&strict).unwrap();
+        crate::trust::grant_trust(&data, &project, Readonly).unwrap();
+        crate::trust::set_approval_mode(&data, &loose, Auto).unwrap();
+        crate::trust::set_approval_mode(&data, &strict, Readonly).unwrap();
+        let (core, _) = Core::new(data.clone()).unwrap();
+        let store = std::fs::read(crate::trust::trust_path(&data)).unwrap();
+
+        core.hold_approval_mode(&loose, Ask);
+        assert_eq!(core.approval_mode(&loose), Ask, "a looser saved choice does not loosen the hold");
+        assert_eq!(core.approval_mode(&loose.join("sub")), Ask, "the hold covers the worktree's subdirectories");
+        core.hold_approval_mode(&strict, Ask);
+        assert_eq!(core.approval_mode(&strict), Readonly, "a stricter saved choice still applies");
+        assert_eq!(std::fs::read(crate::trust::trust_path(&data)).unwrap(), store, "a hold saves nothing");
+
+        crate::trust::set_approval_mode(&data, &project, Auto).unwrap();
+        core.refresh_saved_approval_modes();
+        assert_eq!(core.approval_mode(&loose), Ask, "a refresh never loosens the hold");
         let _ = std::fs::remove_dir_all(dir);
     }
 
