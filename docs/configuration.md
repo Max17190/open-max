@@ -164,7 +164,8 @@ override the first two.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
 
 Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript
-plus the frozen tool schemas (estimated at ~4 bytes per token, scaled up when
+plus the frozen tool schemas and the trailing note every request re-sends
+beside it (estimated at ~4 bytes per token, scaled up when
 the server reported more `prompt_tokens` than estimated for the session's last
 request, as BPE tokenizers do on code, or refused a request for length
 (recognized by the error's wording) that the estimate said fit). Both are kept
@@ -271,6 +272,22 @@ requests.
 Set `"provider"` in settings, use the provider CLI option, or use `/provider`
 when you only want to change the endpoint. Optional `compat` flags cover picky
 gateways (for example `max_completion_tokens` versus `max_tokens`).
+
+The trailing note (the tool files, skills, and memories a session added,
+changed, or removed after its prompt and tools array were built) is appended
+to the content of the request's last message, the user's prompt or the newest
+tool result, after a blank line and a header that names the harness as its
+source, and it is never stored. Every endpoint, a flat `base_url` or a named
+provider, therefore sees the stored transcript's role order, the same as with
+no note, and the system prompt stays the only system message. A note of its
+own after the history is what picky servers refuse: some hosted validators
+reject a system or a user message after a tool message, a chat template that
+enforces user/assistant alternation rejects a user message after the prompt,
+and some gateways hoist every system message into the system prompt, which
+would move the cached prefix on every capability write. Only a history that
+ends with an assistant reply gets the note as a user message of its own,
+which those servers take there. A prefix cache keeps every stored byte before
+the note.
 
 A provider takes its key from its own `api_key` or `api_key_env`. Without one,
 it uses the settings `api_key` (or `OPENMAX_API_KEY`) only when its `base_url`

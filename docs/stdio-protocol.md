@@ -48,7 +48,7 @@ One JSON object per line.
 | `user` | `text` | Start a turn with the text; sent while a turn runs, steer that turn instead (see below) |
 | `approve` | `approval_id`, `approved` (bool) | Answer a pending approval |
 | `approval_mode` | `mode` (`auto`, `ask`, or `readonly`) | Save the execution mode for this trusted project; answered by an `approval_mode` line, or a `protocol_error` naming the legal values (on a save failure the mode is unchanged and the error says so) |
-| `reload` | none | Re-freeze tools, skills, and prompt from current config; answered by `refrozen`, or `protocol_error` while a turn is in flight |
+| `reload` | none | Re-freeze tools, skills, and prompt from current config, rebuilding the system prompt and the tools array so the trailing note's changes move into them (the one command that starts a new prompt prefix); answered by `refrozen`, or `protocol_error` while a turn is in flight |
 | `fork` | none | Branch the session at its end into a new session and drive that one from now on; answered by `forked`, or `protocol_error` while a turn is in flight or before the session holds any message |
 | `rewind` | `turn` (integer, 1-based) | Branch the session at the end of turn `turn` (counted as below) and drive the branch from now on; answered by `forked`, or `protocol_error` while a turn is in flight or when the session has no such turn |
 | `cancel` | none | Cancel the running turn |
@@ -107,7 +107,7 @@ events either, but carry one).
 | `token` | `text` |
 | `thinking` | `text` |
 | `message_done` | `text` |
-| `budget` | `used_tokens` (estimated: transcript plus the frozen tool schemas re-sent every request, scaled up when the server reported more prompt tokens than estimated for the session's last request, or refused a request for length (recognized by the error's wording) that the estimate said fit), `context_tokens` |
+| `budget` | `used_tokens` (estimated: transcript plus the frozen tool schemas and the trailing note re-sent every request, scaled up when the server reported more prompt tokens than estimated for the session's last request, or refused a request for length (recognized by the error's wording) that the estimate said fit), `context_tokens` |
 | `usage` | `prompt_tokens`, `completion_tokens`, `cached_tokens` (or null) |
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
@@ -117,7 +117,7 @@ events either, but carry one).
 | `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha`, and optional `env` (see below) |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: one line per tool or skill file added, modified, or removed) |
-| `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the installed tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
+| `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the frozen tool schemas and the trailing note take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the prune target and nothing changed) |
 | `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |

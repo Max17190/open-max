@@ -353,24 +353,23 @@ async fn harness_time_per_tool_round() {
 /// manifest (a refreeze), writes a project memory, reads a file and answers;
 /// turn two reads three files and answers. The test checks that all six
 /// tool calls succeeded, that both files exist, and that the new tool's
-/// schema is absent from the first request's `tools` and present in the
-/// last's, since a write that failed or a manifest the registry refused
-/// would leave the prefix alone and raise the rate. A request is a hit when
-/// the raw wire bytes of its `messages[0]` and of its `tools` array, sliced
-/// out of the body unparsed, both equal the previous request's; the rate is
-/// hits over the 7 requests that have a predecessor. Prints the rate and
-/// which requests missed.
+/// index line is absent from the first request's last message and present
+/// in the last request's, where the trailing note carries it, and never in
+/// any request's `tools`, since a write that failed or a manifest the
+/// registry refused would leave the prefix alone and raise the rate. A
+/// request is a hit when the raw wire bytes of its `messages[0]` and of its
+/// `tools` array, sliced out of the body unparsed, both equal the previous
+/// request's; the rate is hits over the 7 requests that have a predecessor.
+/// Prints the rate and which requests missed.
 ///
-/// Target 1.0. Measured on this tree: 6/7 (0.86) in debug and release. The
-/// one miss is request 2, the first after the tool write, whose `tools`
-/// array carries the new tool's schema; the memory write leaves turn two's
-/// system message as it was. The ratchet asserts the tree's 6 hits, a count,
-/// so it holds in debug and release alike. The schema check pins today's
-/// mechanism, a new tool's schema joining `tools`; a loop that reaches the
-/// target by carrying a new tool some other way changes that check with it.
+/// Target 1.0. Measured on this tree: 7/7 (1.00), a count, so it holds in
+/// debug and release alike, and the ratchet asserts it. The tool write
+/// moves no prefix byte: the tools array keeps the tools the session began
+/// with until /reload, and the new tool reaches the model on its line in
+/// the note, with the bash form that runs it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefix_cache_hit_rate() {
-    const RATCHET_HITS: usize = 6;
+    const RATCHET_HITS: usize = 7;
     let _serial = SERIAL.lock().await;
     let manifest = "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\nmutating = false\n";
     let (tool_path, memory_path) = (".openmax/tools/wordfreq.toml", ".openmax/memory/build-command.md");
@@ -403,24 +402,28 @@ async fn prefix_cache_hit_rate() {
     assert_eq!(served.len(), requests, "the scripted session makes exactly {requests} requests");
     // The exact bytes the client wrote: a parse into `Value` and back would
     // sort keys and normalize escapes, hiding a reorder in the frozen wire.
-    let prefixes: Vec<(String, String)> = served
+    let (prefixes, lasts): (Vec<(String, String)>, Vec<String>) = served
         .iter()
         .map(|s| {
             let top: std::collections::HashMap<String, Box<RawValue>> =
                 serde_json::from_str(&s.body).unwrap();
             let messages: Vec<&RawValue> = serde_json::from_str(top["messages"].get()).unwrap();
             let tools = top.get("tools").map(|t| t.get().to_owned()).unwrap_or_default();
-            (messages[0].get().to_owned(), tools)
+            ((messages[0].get().to_owned(), tools), messages.last().unwrap().get().to_owned())
         })
-        .collect();
+        .unzip();
     assert!(
         prefixes.iter().all(|(system, _)| system.contains("\"role\":\"system\"")),
         "every request opens with a system message"
     );
-    let schema = "\"name\":\"wordfreq\"";
+    let index_line = "- wordfreq: top-n words {";
     assert!(
-        !prefixes[0].1.contains(schema) && prefixes[requests - 1].1.contains(schema),
-        "the written tool reaches the wire: its schema is absent from request 1 and present in request {requests}"
+        !lasts[0].contains(index_line) && lasts[requests - 1].contains(index_line),
+        "the written tool reaches the wire: its index line is absent from request 1 and present in request {requests}"
+    );
+    assert!(
+        prefixes.iter().all(|(_, tools)| !tools.contains("\"name\":\"wordfreq\"")),
+        "a tool file written mid-session never joins the tools array"
     );
     let misses: Vec<usize> =
         (1..prefixes.len()).filter(|&i| prefixes[i] != prefixes[i - 1]).map(|i| i + 1).collect();

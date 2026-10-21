@@ -102,7 +102,7 @@ pub fn short_model(model: &str) -> &str {
 pub fn tools_block(registry: &Registry, frozen: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let header = if frozen {
-        "tools (frozen at session creation; config changes apply to /new)"
+        "tools (loaded now; the frozen tools array takes a new one at /reload)"
     } else {
         "tools (preview of the next new session)"
     };
@@ -159,7 +159,7 @@ pub fn tools_block(registry: &Registry, frozen: bool) -> Vec<Line<'static>> {
 pub fn skills_block(skills: &[SkillSpec], project_root: &Path, frozen: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let header = if frozen {
-        "skills (frozen at session creation; config changes apply to /new)"
+        "skills (loaded now; the frozen prompt takes a new one at /reload)"
     } else {
         "skills (preview of the next new session)"
     };

@@ -213,6 +213,18 @@ forces it now. Verify the file parses with `openmax --check`. Test the
 script itself before first use:
 `echo '{"path":"src"}' | sh ./scripts/todo-scan.sh`.
 
+The tools array is the one the session began with, so a write never moves
+the cached prompt prefix. A tool file written or changed after that is a
+line of the trailing note at the end of each request, `- name: description
+<params as JSON>; bash: printf '%s\n' '<JSON arguments>' | command args`
+(command and args shell-quoted): run it with that bash command, the JSON
+arguments filled in (a `'` in them written `'\''`), from your next step on.
+A tool whose `timeout_secs` is longer than a bash call's default shows it
+after `bash` (`bash, timeout_secs 300:`): give that call the same
+`timeout_secs`. A call by the tool's own name runs it too, on an endpoint
+that accepts a tool name the request does not declare. It joins the tools
+array at `/reload` or in a new session.
+
 ## Proof of life
 
 An optional `[example]` table declares one runnable call:
@@ -303,6 +315,9 @@ budget for the lines after them, and renaming changes who competes for the
 budget first. More skills or longer descriptions can push a skill out of the
 prompt entirely (`openmax --check` names each one it drops). The prompt
 shows each indexed skill as `- name: description — path/to/SKILL.md`.
+A skill written or changed after the prompt was built shows the same line
+in the trailing note at the end of each request until `/reload` or a new
+session puts it in the prompt.
 
 Example (`.agents/skills/release/SKILL.md`):
 
@@ -856,7 +871,7 @@ Fields (the file IS the contract):
   no describable first line is ignored.
 - body: free-form markdown, any length, read on demand with read_file.
 
-Index: at session creation (and /reload or a re-freeze) live memories are
+Index: at session creation (and /reload) live memories are
 ranked and injected as one line each - `- name: description — path` - under a
 1500-byte budget, strongest first, with a trailer counting what did not fit.
 No memories, no section, zero prompt cost.
@@ -887,11 +902,13 @@ Supersede, do not duplicate: update the existing file when a fact changes
 history that keeps a fact alive.
 
 Activation: a memory write does not re-freeze. The index is frozen with the
-prompt, and rewriting the prompt would discard the provider's prompt cache to
-show you a fact your own write already put in context. The index rebuilds at
-session creation, /reload, and any re-freeze a tool or skill change causes
-(that receipt then says "Memory index rebuilt with this refreeze (indexed:
-<name>)"). Verify what you wrote with `openmax --check` (it names every
+prompt for the whole session, so the provider's prompt cache survives every
+write. A memory added, edited, or deleted after the prompt was built is a
+line of the trailing note at the end of each request: from your next step
+when you write it with write_file or edit_file, and otherwise (bash, another
+process) from the next re-freeze a tool or skill change causes (that receipt
+then says "Memory index rebuilt with this refreeze (indexed: <name>)") or the
+next resume. /reload or a new session puts it in the prompt. Verify what you wrote with `openmax --check` (it names every
 ignored file and why; `--all` adds what the index will show).
 
 ## Searching what was kept
@@ -1023,7 +1040,7 @@ fields. Parse by field name, never by key order. Only two lines carry no
 `session_id`: `protocol_error` and the `approval_mode` acknowledgement
 (`hello`, `transcript`, and `forked` are not events either, but carry one). Types: `token` (text), `thinking`
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
-the frozen tool schemas sent on every request, context_tokens),
+the tool schemas and any trailing note sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
 (call_id, name, args), `tool_end` (call_id, ok, output), `harness_note`
 (call_id, text: a note the harness wrote into the MODEL's transcript - a
@@ -1039,9 +1056,9 @@ path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt, one line
 per tool or skill file added, modified, or removed), `schemas_over_budget`
-(schema_tokens, budget_tokens: the installed tools take most of what the
-window can spend, so compaction runs early and stops entirely once they
-reach it; advisory, at most once per session), `compacted` (tokens_before,
+(schema_tokens, budget_tokens: the tool schemas and any trailing note take
+most of what the window can spend, so compaction runs early and stops
+entirely once they reach it; advisory, at most once per session), `compacted` (tokens_before,
 tokens_after, compacted_messages: the receipt of a forced compaction;
 compacted_messages of 0 means the transcript was already at or under the
 prune target and nothing changed),

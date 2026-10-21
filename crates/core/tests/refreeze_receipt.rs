@@ -8,69 +8,15 @@
 //! the tool. The receipt must land where the model reads: in the transcript
 //! the next request carries.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+mod common;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use common::{drive_turn, note_marker, recording_endpoint};
 use open_max_core::agent::start_turn;
 use open_max_core::state::Core;
 use open_max_core::types::AgentEvent;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// A completions endpoint that answers each request with the next scripted
-/// message and records every request body it saw.
-async fn recording_endpoint(
-    responses: Vec<serde_json::Value>,
-) -> (String, Arc<Mutex<Vec<String>>>) {
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let record = bodies.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        for body in responses {
-            let Ok((mut sock, _)) = listener.accept().await else { return };
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            let mut need = usize::MAX;
-            loop {
-                let Ok(n) = sock.read(&mut chunk).await else { return };
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if need == usize::MAX {
-                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&buf[..end]).to_lowercase();
-                        need = end
-                            + 4
-                            + headers
-                                .lines()
-                                .find_map(|l| l.strip_prefix("content-length:"))
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .unwrap_or(0);
-                    }
-                }
-                if need != usize::MAX && buf.len() >= need {
-                    break;
-                }
-            }
-            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                record
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&buf[end + 4..]).to_string());
-            }
-            let payload = serde_json::to_string(&body).unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-    });
-    (format!("http://{addr}"), bodies)
-}
 
 fn completion_with_tool_call(name: &str, args: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -188,36 +134,6 @@ fn write_config(data: &std::path::Path, base_url: &str, project: &std::path::Pat
     .unwrap();
 }
 
-async fn drive_turn(
-    core: &Arc<Core>,
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<open_max_core::types::AgentEventEnvelope>,
-    session: &str,
-    project: &std::path::Path,
-    text: &str,
-) -> Vec<AgentEvent> {
-    start_turn(Arc::clone(core), session.into(), project.to_path_buf(), text.into()).unwrap();
-    let mut events = Vec::new();
-    loop {
-        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
-            .await
-            .expect("turn finishes within 30s")
-            .expect("event channel stays open");
-        match &envelope.event {
-            AgentEvent::ApprovalRequest { approval_id, .. } => { core.respond_approval(approval_id, true); }
-            AgentEvent::Done { .. } => break,
-            _ => {}
-        }
-        events.push(envelope.event);
-    }
-    // Done is emitted before the session's `running` flag clears; a second
-    // start_turn racing that window is refused as "already working". Wait
-    // for idle, as the headless front end does.
-    while core.is_running(session) {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    events
-}
-
 /// A broken tool write refreezes too (its bytes moved the fingerprint), and
 /// the receipt the model reads says the file did NOT load and why - without
 /// this, "file changed" reads as "tool is live" and the model calls a tool
@@ -300,7 +216,10 @@ async fn a_turn_start_refreeze_note_reaches_the_model() {
 
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
     let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    assert_eq!(first["messages"][0], second["messages"][0], "the turn-start refreeze keeps the prompt");
+    assert_eq!(first["tools"], second["tools"], "and the tools array");
     let messages = second["messages"].as_array().unwrap();
     let note = messages
         .iter()
@@ -314,12 +233,16 @@ async fn a_turn_start_refreeze_note_reaches_the_model() {
         content.contains("checksum"),
         "the note names the tool that appeared: {content}"
     );
+    // The trailing note ends the last message on the wire, the user's
+    // prompt, and adds none; the refreeze receipt precedes the prompt.
     let last = messages.last().unwrap();
-    assert_eq!(
-        last["content"].as_str().unwrap(),
-        "second turn",
-        "the user's prompt stays the final message; the note precedes it"
-    );
+    let (prompt, _) = last["content"]
+        .as_str()
+        .unwrap()
+        .split_once(&note_marker())
+        .unwrap_or_else(|| panic!("the request ends with the trailing note: {last}"));
+    assert_eq!(last["role"], "user");
+    assert_eq!(prompt, "second turn", "the user's prompt stays the final history message; the receipt precedes it");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -626,9 +549,11 @@ async fn a_memory_write_keeps_the_frozen_prompt_and_emits_no_receipt() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A tool write still refreezes after a memory write, and that refreeze is
-/// when the saved fact reaches the index: the rebuilt prompt carries its line
-/// and the receipt names it as part of the rebuild.
+/// A memory write refreshes the note from disk, with no refreeze and no
+/// receipt, so the saved fact's line rides the next request; a tool write
+/// after it still refreezes, and that receipt names the memory the rebuilt
+/// index gained, its baseline being the generation's own scan. The prompt
+/// stays as it was through both writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tool_write_still_refreezes_and_rebuilds_the_memory_index() {
     let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
@@ -659,11 +584,20 @@ async fn a_tool_write_still_refreezes_and_rebuilds_the_memory_index() {
     assert_eq!(bodies.len(), 3);
     let (first, second, third) = (request(&bodies, 0), request(&bodies, 1), request(&bodies, 2));
     assert_eq!(first["messages"][0], second["messages"][0], "the memory write froze nothing");
-    assert_ne!(second["messages"][0], third["messages"][0], "the tool write refreezes the prompt");
-    let system = third["messages"][0]["content"].as_str().unwrap();
+    assert_eq!(second["messages"][0], third["messages"][0], "the tool write leaves the prompt alone");
+    let note_of = |body: &serde_json::Value| {
+        let last = body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        last.split_once(&note_marker()).map(|(_, note)| note.to_string()).unwrap_or_default()
+    };
+    let note = note_of(&second);
     assert!(
-        system.contains("rotation-interval: archive rotation interval is 17 days"),
-        "the refreeze rebuilds the memory index from disk: {system}"
+        note.contains("rotation-interval: archive rotation interval is 17 days"),
+        "the memory write refreshes the note: {note}"
+    );
+    let note = note_of(&third);
+    assert!(
+        note.contains("rotation-interval: archive rotation interval is 17 days"),
+        "the refreeze rebuilds the memory index from disk: {note}"
     );
     let tools: Vec<&str> = third["messages"]
         .as_array()
@@ -732,9 +666,10 @@ async fn a_rejected_memory_name_is_never_claimed_indexed() {
             );
         }
     }
-    // And the rebuilt prompt carries no Invalid-Stem index line.
-    let system = messages[0]["content"].as_str().unwrap();
-    assert!(!system.contains("Invalid-Stem"), "the prompt omits it: {system}");
+    // And the rebuilt note carries no Invalid-Stem index line.
+    let last = messages.last().unwrap()["content"].as_str().unwrap();
+    let (_, note) = last.split_once(&note_marker()).unwrap_or_else(|| panic!("the request ends with the note: {last}"));
+    assert!(!note.contains("Invalid-Stem"), "the note omits it: {note}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -2031,7 +2031,7 @@ const RUN_COMMAND: &str = r#"eval "unset OPENMAX_COMMAND; $OPENMAX_COMMAND""#;
 /// Seconds a bash call may run when the model sets no `timeout_secs`: long
 /// enough for a typical cold test run or dependency fetch, which a shorter
 /// default killed mid-way and then had to be rerun with a deadline.
-const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
+pub(crate) const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// The longest one bash call may run. A larger request is held to this, and
 /// a command that then times out is told so: when the result named only the
 /// ceiling, nothing said the request had been cut, and a retry asked for the

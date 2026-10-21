@@ -3130,10 +3130,10 @@ impl App {
                 // Says what it costs and what to do, not how compaction reacts:
                 // that depends on whether any room is left at all.
                 self.note(&format!(
-                    "installed tool schemas cost ~{schema_tokens} tokens of the ~{budget_tokens} \
-                     this context window can spend: little is left for the conversation, so history \
-                     is compacted early and turns may not fit at all. Remove tools (/tools, \
-                     openmax --spec usage) or raise context_tokens"
+                    "tool schemas and any trailing note cost ~{schema_tokens} tokens of the \
+                     ~{budget_tokens} this context window can spend: little is left for the \
+                     conversation, so history is compacted early and turns may not fit at all. \
+                     Remove tools (/tools, openmax --spec usage) and /reload, or raise context_tokens"
                 ));
             }
             AgentEvent::HookFailed { hook, event, detail } => {
