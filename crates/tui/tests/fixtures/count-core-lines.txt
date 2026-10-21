@@ -586,6 +586,8 @@ fn integration() {}
 - mod aimed;
 - #[cfg(test)]
 - mod r#type;
+- #[cfg(test)]
+- mod α;
 + mod r#match {
 -     #[cfg(test)]
 -     mod inner;
@@ -610,6 +612,10 @@ fn integration() {}
 - pub fn fixture() {}
 == crates/beta/src/type.rs
 - pub fn probe() {}
+== crates/beta/src/α.rs
+- //! Loaded only by a test-only `mod α;`, whose name is one word though it
+- //! does not begin with an ASCII character, so it is excluded whole.
+- pub fn unicode() {}
 == crates/beta/src/match/inner.rs
 - pub fn inner() {}
 == crates/beta/src/bin/tool.rs
