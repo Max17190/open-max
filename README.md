@@ -281,6 +281,7 @@ Sessions, settings, tools, and skills stay under `~/.openmax/` and your project 
 - [Usage](docs/usage.md): CLI flags, keybindings, slash commands
 - [Extending](docs/extending.md): tools, skills, templates, hooks, permissions, validation, freezing
 - [stdio protocol](docs/stdio-protocol.md): the `openmax-stdio/8` contract for custom frontends
+- [Testing](docs/testing.md): the test count and mutation score CI gates, and how to read a mutation run
 
 ## Development
 
@@ -289,6 +290,7 @@ cargo check
 cargo test
 scripts/check-suite-time.sh
 scripts/count-core-lines.sh
+scripts/check-test-count.sh
 cargo build --release -p openmax
 ```
 
@@ -297,6 +299,10 @@ cargo build --release -p openmax
 The thesis tests (in every `crates/*/tests/thesis*.rs` and the binary's `thesis_frames` module) print what they measure. One that times the harness asserts its bound only in a release build, and a 20x sanity bound in debug; a byte or count one asserts the same in every build. CI's thesis job builds them in release, the profile the published binary ships with, and runs them on Linux and macOS in a step that fails the pull request, except the ones a runner reports instead, listed in its matrix entry in `.github/workflows/ci.yml`: a step allowed to fail runs those before the gate step, prints their numbers and copies each `MEASURE` line to the job's summary. Today those are `harness_time_per_tool_round` (target 250 us) on both runners and `transcript_frame_p99_at_100k_lines` (target 0.5 ms) on macOS, targets those runners do not meet with room. The first frame's 1 ms target is not asserted in CI: timed from the spawn, a frame includes the runner's own process start, which is not the harness's work. CI holds instead the ratio of the first frame's median to the median start of a baseline binary (`crates/tui/examples/startup_baseline.rs`, which writes the end of a frame and exits), timed the same way on the same runner, under a ratchet per platform, and prints both times and their difference, the harness's own work, without asserting them.
 
 `scripts/count-core-lines.sh` (bash and perl) prints two line counts for each crate and in total: core-excluding-tests, the lines of `crates/*/src` less its test-only code (`#[test]` functions, `#[<path>::test]` functions such as `#[tokio::test]` ones, items under a `cfg` that needs `test`, and the module files those items load, found by matching brackets outside strings, chars and comments, by the method in the script's header; the input of `stringify!` and the rules of a `macro_rules!` are text the build keeps, so no attribute in them is read), and total-including-tests, every line of every `.rs` file under `crates/` (build output in a crate's `target/` directory aside), so a test's lines count toward total-including-tests wherever they sit and toward core-excluding-tests nowhere. The script stops with an error naming the file and line of a test-only item whose end it cannot find, rather than guess. The test `core_source_stays_under_its_line_budget` in `crates/tui/tests/thesis.rs` holds the script to a fixture whose every source line is marked counted or excluded, and fails when the script stops, when core-excluding-tests is over the ratchet the test sets, or when it is under the count that ratchet was set from, so a change that removes production lines lowers the ratchet with them.
+
+`scripts/check-test-count.sh` counts the tests `cargo test --workspace -- --list` lists, less the ignored ones, and fails when there are fewer than 1,427 on Linux, or 1,425 on macOS: each compiles a few tests the other does not, so each has a floor of its own. CI runs it in the test job on both; on any other platform it reports the count and passes. The target is 2,000 tests.
+
+The Mutants workflow runs cargo-mutants (configured in `.cargo/mutants.toml`) on Linux runners, and `scripts/check-mutants.sh` judges its outcomes. On a pull request it tests the mutants in the code the change touches, and fails when one was missed or timed out and is not listed with its reason in `.cargo/mutants-allowed.txt`. On a push to main, weekly, and when run by hand, it tests every mutant in the workspace, and fails when the mutation score, caught / (caught + missed), is under 76.60%: the score of the full run that set it, 76.80%, less a margin of 0.20 points for the few mutants that come out differently from one run of the same code to the next. Either run leaves out the mutants in code Linux does not compile, such as macOS-only code. A full run takes hours, so a push made while one is going waits, and only the newest push waiting is tested. The target is 95%. [Testing](docs/testing.md) says what each outcome counts for, how the floor moves, and how to read a run.
 
 Set `OPENMAX_PERF=1` while running the TUI to log frame, transcript-layout, and selection-overlay timings. Core logic is in `open-max-core` (`crates/core/src/agent.rs`); the TUI is `crates/tui/src/app.rs`.
 
