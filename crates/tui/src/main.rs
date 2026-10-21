@@ -5,6 +5,7 @@ mod headless;
 mod input;
 mod mcp;
 mod stdio;
+mod subagent;
 mod theme;
 mod ui;
 
@@ -43,14 +44,23 @@ options:
                          beside it
   -p, --print            headless: run one turn and exit (prompt required;
                          repeat -p for multi-turn on the same session)
-      --json             with --print, emit AgentEvent envelopes as JSONL;
-                         with --check, emit every finding as one JSON array
+      --json             with --print, --replay or --subagent, emit AgentEvent envelopes
+                         as JSONL; with --check, emit every finding as one JSON array
       --replay <file> --json
                          print the events a session's log (~/.openmax/
                          sessions/<id>.events.jsonl, copied anywhere)
                          recorded, each line as --print --json prints it.
                          Reads that file alone: no endpoint, trust or data
                          dir, and no tool runs
+      --subagent <task> --worktree
+                         run <task> as one child session in a new git
+                         worktree of this repository at HEAD, made under
+                         .worktrees/ on a new branch subagent/<name>, under
+                         this project's trust and its approval mode or a
+                         stricter one; prints the child's events as -p does,
+                         then commits its changes to that branch, removes the
+                         worktree, and names the branch with a diffstat on
+                         stderr. Recipe: --spec subagent
       --stdio            bidirectional JSONL session: commands on stdin
                          ({\"cmd\":\"user\"|\"approve\"|\"approval_mode\"|
                          \"reload\"|\"fork\"|\"rewind\"|\"cancel\"|\"quit\"}),
@@ -94,7 +104,7 @@ options:
       --spec <surface>   print the authoring contract for one surface and
                          exit (tools, skills, prompts, hooks, permissions,
                          providers, settings, memory, recall, stdio, mcp,
-                         usage)
+                         subagent, usage)
       --mcp-list -- <server command...>
                          start an MCP stdio server, print its tools as a
                          skill body (name, arguments, description), and stop
@@ -108,10 +118,10 @@ options:
                          with --mcp-list or --mcp-call, the longest wait for
                          each server reply (default 30, at most 3600)
       --trust-project    trust this exact project root in auto mode (a project
-                         already trusted keeps its mode), then run. With
-                         neither -p nor --stdio and stdout not a terminal, no
-                         session starts: the grant alone exits 0, and with
-                         --continue or a settings flag it exits 1
+                         already trusted keeps its mode), then run. With none
+                         of -p, --stdio and --subagent, and stdout not a
+                         terminal, no session starts: the grant alone exits
+                         0, and with --continue or a settings flag it exits 1
   -V, --version          print the version
   -h, --help             this help
 
@@ -127,7 +137,8 @@ examples:
   openmax --provider ollama -m qwen2.5-coder:7b
   openmax -p \"summarize this repo\"
   openmax -p --json \"list top-level files\"
-  openmax -p \"list crates\" -p \"summarize the first one\"";
+  openmax -p \"list crates\" -p \"summarize the first one\"
+  openmax --subagent \"make the flaky test deterministic\" --worktree";
 
 struct CliArgs {
     continue_session: bool,
@@ -167,6 +178,11 @@ struct CliArgs {
     /// `--mcp-timeout`: seconds each wait for an MCP server reply may take.
     mcp_timeout: Option<u64>,
     trust_project: bool,
+    /// `--subagent`: the task one child session runs in a new worktree (see
+    /// `subagent`).
+    subagent: Option<String>,
+    /// `--worktree`: the isolation `--subagent` runs its child in.
+    worktree: bool,
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
     prompts: Vec<String>,
@@ -207,6 +223,8 @@ where
         mcp_server: None,
         mcp_timeout: None,
         trust_project: false,
+        subagent: None,
+        worktree: false,
         prompts: Vec::new(),
     };
     // Tokens for the current -p group; flushed into prompts on the next -p or end.
@@ -254,6 +272,8 @@ where
             Long("mcp-call") => out.mcp_call = true,
             Long("mcp-timeout") => out.mcp_timeout = Some(parser.value()?.parse()?),
             Long("trust-project") => out.trust_project = true,
+            Long("subagent") => set_once(&mut out.subagent, "--subagent", &mut parser)?,
+            Long("worktree") => out.worktree = true,
             Short('V') | Long("version") => {
                 println!("openmax {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -409,6 +429,8 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         mcp_server,
         mcp_timeout,
         trust_project,
+        subagent,
+        worktree,
         prompts,
     } = cli;
     // Each operation, named by its flag. `--check --stdio` is one operation
@@ -426,6 +448,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         (*check, if *stdio { "--check --stdio" } else { "--check" }),
         (*stdio && !*check, "--stdio"),
         (*print, "--print"),
+        (subagent.is_some(), "--subagent"),
     ]
     .into_iter()
     .filter_map(|(on, flag)| on.then_some(flag))
@@ -437,19 +460,22 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     let operation = operations.first().copied();
     // Each option and the operations that read it.
     const SESSIONS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print")];
+    // A sub-agent's child is a session too, but a new one in a new worktree.
+    const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 11] = [
-        (*trust_project, "--trust-project", SESSIONS),
+    let options: [(bool, &str, &[Option<&str>]); 12] = [
+        (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
-        (model.is_some(), "--model", SESSIONS),
-        (provider.is_some(), "--provider", SESSIONS),
-        (base_url.is_some(), "--base-url", SESSIONS),
-        (api_key.is_some(), "--api-key", SESSIONS),
-        (context_tokens.is_some(), "--context-tokens", SESSIONS),
-        (*json, "--json", &[Some("--print"), Some("--check"), Some("--recall"), Some("--replay"), Some("--mcp-list")]),
+        (model.is_some(), "--model", RUNS),
+        (provider.is_some(), "--provider", RUNS),
+        (base_url.is_some(), "--base-url", RUNS),
+        (api_key.is_some(), "--api-key", RUNS),
+        (context_tokens.is_some(), "--context-tokens", RUNS),
+        (*json, "--json", &[Some("--print"), Some("--subagent"), Some("--check"), Some("--recall"), Some("--replay"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
         (*all, "--all", &[Some("--check")]),
         (mcp_timeout.is_some(), "--mcp-timeout", MCP),
+        (*worktree, "--worktree", &[Some("--subagent")]),
     ];
     for (on, flag, readers) in options {
         if !on || readers.contains(&operation) {
@@ -487,6 +513,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
                     "--check --stdio" => "; it reads the stream on stdin",
                     "--mcp-list" => "; the server's command goes after --",
                     "--mcp-call" => "; the server's command goes after --, and the call on stdin",
+                    "--subagent" => "; the task is the one quoted argument after --subagent",
                     _ => "",
                 };
                 format!("{operation} takes no other arguments (got '{words}'){hint}")
@@ -498,6 +525,19 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
             return Err(format!(
                 "{operation} needs the MCP server's command after --: openmax {operation} -- <command> [args...]"
             ));
+        }
+    }
+    if let Some(task) = subagent {
+        if task.trim().is_empty() {
+            return Err("--subagent requires a non-empty task".into());
+        }
+        // The one isolation it offers, named on the command line so a reader
+        // of it knows the child does not work in this tree.
+        if !*worktree {
+            return Err(
+                "--subagent requires --worktree; the child runs in a new git worktree of this repository (-p runs a task in this tree)"
+                    .into(),
+            );
         }
     }
     if mcp_timeout.is_some_and(|secs| !(1..=mcp::MAX_TIMEOUT_SECS).contains(&secs)) {
@@ -570,6 +610,11 @@ fn main() -> std::io::Result<std::process::ExitCode> {
 
     if let Some(file) = &cli.replay {
         std::process::exit(replay(std::path::Path::new(file)));
+    }
+
+    // Here, while this is the only thread: no other reads the environment.
+    if operation == Some("--subagent") {
+        subagent::clear_repository_variables();
     }
 
     // The interactive session at a terminal paints its first frame before
@@ -1248,11 +1293,13 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         }
     }
     // Headless and stdio runs fail fast on an unresolvable endpoint: there is
-    // no interface behind them to fix it in. The interactive TUI starts
-    // anyway: every turn names every missing setting; /provider switches
-    // among endpoints already in providers.json and /model sets the model
-    // id, but neither adds an endpoint or a window.
-    if cli.stdio || cli.print {
+    // no interface behind them to fix it in, and a sub-agent's fails before
+    // its worktree is made. The interactive TUI starts anyway: every turn
+    // names every missing setting; /provider switches among endpoints
+    // already in providers.json and /model sets the model id, but neither
+    // adds an endpoint or a window.
+    let unattended = cli.stdio || cli.print || cli.subagent.is_some();
+    if unattended {
         if let Err(e) = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir) {
             eprintln!("openmax: {e}");
             std::process::exit(2);
@@ -1268,7 +1315,11 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     // the terminal changes, so none of them can fall back to its default
     // action: exiting with every mode left on, or with a tool still running
     // in a session of its own that no signal from the terminal reaches.
-    let quit = watch_quit_signals(!(cli.stdio || cli.print));
+    let quit = watch_quit_signals(!unattended);
+
+    if let Some(task) = cli.subagent {
+        std::process::exit(subagent::run(core, core_rx, &project, task, cli.json, quit).await);
+    }
 
     if cli.stdio || cli.print {
         let code = if cli.stdio {
@@ -1277,6 +1328,7 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         } else {
             let args = headless::HeadlessArgs {
                 prompts: cli.prompts,
+                project: project.clone(),
                 continue_session: cli.continue_session,
                 json: cli.json,
                 quit,
@@ -2205,17 +2257,17 @@ fn print_usage_economics() {
 
 /// The exit code of a run that ends once `ensure_project_trust` has
 /// recorded its grant, or None when it goes on. `--trust-project` with no
-/// `-p` or `--stdio` goes on to the interactive session, which draws on
-/// stdout, so with stdout not a terminal no session starts. Going on there
-/// was wrong either way: with no controlling terminal (a CI job), starting
-/// the session failed after the grant was recorded and the run exited 1;
-/// with one, the session drew its frames into the pipe. The grant alone is
-/// the whole run and exits 0. `--continue` and the settings flags (`--model`,
-/// `--provider`, `--base-url`, `--api-key`, `--context-tokens`) ask for the
-/// session itself, so with any of them the run exits 1 rather than as if that
-/// session had run (see `operation`), and writes no settings.
+/// `-p`, `--stdio` or `--subagent` goes on to the interactive session, which
+/// draws on stdout, so with stdout not a terminal no session starts. Going on
+/// there was wrong either way: with no controlling terminal (a CI job),
+/// starting the session failed after the grant was recorded and the run
+/// exited 1; with one, the session drew its frames into the pipe. The grant
+/// alone is the whole run and exits 0. `--continue` and the settings flags
+/// (`--model`, `--provider`, `--base-url`, `--api-key`, `--context-tokens`)
+/// ask for the session itself, so with any of them the run exits 1 rather
+/// than as if that session had run (see `operation`), and writes no settings.
 fn exit_after_grant(cli: &CliArgs, stdout_is_terminal: bool) -> Option<i32> {
-    if !cli.trust_project || cli.print || cli.stdio || stdout_is_terminal {
+    if !cli.trust_project || cli.print || cli.stdio || cli.subagent.is_some() || stdout_is_terminal {
         return None;
     }
     let asks_for_a_session = cli.continue_session || key_flags(cli) != Default::default();
@@ -2269,7 +2321,7 @@ fn ensure_project_trust(
     if open_max_core::trust::is_trusted(data_dir, project)? {
         return Ok(None);
     }
-    if agent_spawned || cli.print || cli.stdio || !std::io::stdin().is_terminal() {
+    if agent_spawned || cli.print || cli.stdio || cli.subagent.is_some() || !std::io::stdin().is_terminal() {
         // Name a grant that works for every caller here: a frontend's stdin is
         // its protocol pipe, and telling it to add --trust-project only leads
         // to require_human's no-terminal refusal. The grant is pasted into a
@@ -3178,13 +3230,40 @@ mod tests {
         assert_eq!((cli.model.as_deref(), cli.provider.as_deref()), (Some("b"), Some("y")));
     }
 
+    /// `--subagent` takes its task as one argument and runs it only with
+    /// `--worktree`, the isolation it offers. Without it the command is
+    /// refused, naming the flag it needs and the run that works in this tree;
+    /// an empty task and a second one are refused; a task that starts with a
+    /// dash is still the task. Like `-p`, it never ends on a trust grant.
+    #[test]
+    fn a_sub_agent_takes_one_task_and_needs_its_worktree() {
+        let reason = refusal_of(&["--subagent", "fix it"]).unwrap();
+        assert!(
+            names(&reason, "--subagent") && names(&reason, "--worktree") && reason.contains("-p runs a task in this tree"),
+            "{reason}"
+        );
+        assert_eq!(refusal_of(&["--subagent", " ", "--worktree"]).as_deref(), Some("--subagent requires a non-empty task"));
+        // An unquoted task: its first word is the task, the rest strays.
+        assert_eq!(
+            refusal_of(&["--subagent", "fix", "the", "test", "--worktree"]).as_deref(),
+            Some("--subagent takes no other arguments (got 'the test'); the task is the one quoted argument after --subagent")
+        );
+        let err = parse_args_from(["--subagent", "a", "--subagent", "b", "--worktree"]).err().unwrap().to_string();
+        assert!(err.contains("--subagent given twice"), "{err}");
+        let cli = cli_of(&["--subagent", "-x then y", "--worktree", "--json"]);
+        assert_eq!((cli.subagent.as_deref(), cli.worktree, cli.json), (Some("-x then y"), true, true));
+        assert_eq!(operation(&cli), Ok(Some("--subagent")));
+        let granted = cli_of(&["--trust-project", "--subagent", "x", "--worktree"]);
+        assert_eq!(exit_after_grant(&granted, false), None, "the grant goes on to the sub-agent");
+    }
+
     /// Every operation a command line can select, as its args and the name a
     /// refusal gives it. `-p` comes last in any line built from these: the
     /// tokens after it are its prompt. An MCP operation's server command
     /// comes after `--`, so `refusal_of` closes such a line with one. An
     /// empty name is the interactive session. `--replay` is given with the
     /// `--json` it requires.
-    const OPERATIONS: [(&[&str], &str); 14] = [
+    const OPERATIONS: [(&[&str], &str); 15] = [
         (&[], ""),
         (&["--spec", "tools"], "--spec"),
         (&["--recall", "q"], "--recall"),
@@ -3199,6 +3278,7 @@ mod tests {
         (&["-p", "x"], "--print"),
         (&["--mcp-list"], "--mcp-list"),
         (&["--mcp-call"], "--mcp-call"),
+        (&["--subagent", "x", "--worktree"], "--subagent"),
     ];
 
     /// Whether a refusal names `flag` as a whole flag, so `--ledger` is not
@@ -3284,18 +3364,20 @@ mod tests {
     #[test]
     fn an_option_the_operation_does_not_read_is_refused_naming_both() {
         let sessions: &[&str] = &["", "--stdio", "--print"];
-        let options: [(&[&str], &str, &[&str]); 12] = [
-            (&["--trust-project"], "--trust-project", sessions),
+        let runs: &[&str] = &["", "--stdio", "--print", "--subagent"];
+        let options: [(&[&str], &str, &[&str]); 13] = [
+            (&["--trust-project"], "--trust-project", runs),
             (&["--continue"], "--continue", sessions),
-            (&["-m", "m"], "--model", sessions),
-            (&["--provider", "p"], "--provider", sessions),
-            (&["--base-url", "http://h/v1"], "--base-url", sessions),
-            (&["--api-key", "k"], "--api-key", sessions),
-            (&["--context-tokens", "8"], "--context-tokens", sessions),
-            (&["--json"], "--json", &["--print", "--check", "--recall", "--replay", "--mcp-list"]),
+            (&["-m", "m"], "--model", runs),
+            (&["--provider", "p"], "--provider", runs),
+            (&["--base-url", "http://h/v1"], "--base-url", runs),
+            (&["--api-key", "k"], "--api-key", runs),
+            (&["--context-tokens", "8"], "--context-tokens", runs),
+            (&["--json"], "--json", &["--print", "--subagent", "--check", "--recall", "--replay", "--mcp-list"]),
             (&["--run-examples"], "--run-examples", &["--check"]),
             (&["--all"], "--all", &["--check"]),
             (&["--mcp-timeout", "5"], "--mcp-timeout", &["--mcp-list", "--mcp-call"]),
+            (&["--worktree"], "--worktree", &["--subagent"]),
             // A bare word is a prompt, which only --print reads.
             (&["extra"], "", &["--print"]),
         ];
@@ -3322,6 +3404,7 @@ mod tests {
             &["--trust-project", "--base-url", "http://h/v1", "-m", "m", "--api-key", "sk-k", "--context-tokens", "8", "-p", "x"],
             &["--provider", "p", "--context-tokens", "8", "--stdio"],
             &["--trust-project", "--continue", "--stdio"],
+            &["--trust-project", "-m", "m", "--subagent", "fix the test", "--worktree", "--json"],
             &["--recall", "q", "--json"],
             &["--json", "--replay", "f"],
             &["--mcp-timeout", "60", "--mcp-list", "--json"],
@@ -3433,6 +3516,38 @@ mod tests {
         for operation in ["--mcp-list --", "--mcp-call --", "--mcp-list -- notes-server --stdio"] {
             assert!(shown.iter().any(|c| c.starts_with(operation)), "{operation} is shown: {shown:?}");
         }
+    }
+
+    /// `--spec subagent` and the help text are what an agent copies a
+    /// delegation from, so every `openmax --subagent` command they show runs
+    /// as written, its quoted task one argument.
+    #[test]
+    fn every_sub_agent_command_shown_is_accepted() {
+        let spec = open_max_core::spec::render("subagent").expect("--spec subagent renders");
+        let mut shown = 0;
+        for text in [spec, HELP] {
+            for (at, _) in text.match_indices("openmax --subagent") {
+                let rest = &text[at..];
+                // A command ends at its closing backtick or quote, a shell
+                // operator or redirect, or the end of its line.
+                let end = [rest.find(['`', '\'', '&', '|', '\n']), rest.find(" >")].into_iter().flatten().min();
+                let line = &rest[..end.unwrap_or(rest.len())];
+                // Shell words: whitespace splits them outside double quotes.
+                let (mut words, mut word, mut quoted) = (Vec::new(), String::new(), false);
+                for c in line.chars().chain([' ']) {
+                    match c {
+                        '"' => quoted = !quoted,
+                        c if c.is_whitespace() && !quoted => words.extend((!word.is_empty()).then(|| std::mem::take(&mut word))),
+                        c => word.push(c),
+                    }
+                }
+                let cli = parse_args_from(words.iter().skip(1)).unwrap_or_else(|e| panic!("{line} does not parse: {e}"));
+                assert_eq!(operation(&cli), Ok(Some("--subagent")), "{line}");
+                assert!(cli.subagent.as_deref().is_some_and(|task| task.contains(' ') || task == "<task>"), "{line}");
+                shown += 1;
+            }
+        }
+        assert!(shown >= 4, "the recipe's three commands and the help's example: {shown}");
     }
 
     /// With no operation named, a stray word is most likely a prompt missing

@@ -1132,6 +1132,316 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
     (format!("http://{addr}/v1"), served)
 }
 
+/// One flag runs a sub-agent, and the flag adds nothing to any request.
+/// Method: in a git repository a human trusted in auto, an agent's bash call
+/// (the session marker set, no human present) runs
+/// `openmax --subagent TASK --worktree --json` against a scripted endpoint
+/// whose model writes notes.txt, starts a background process with bash, and
+/// answers. The gate holds the run to: the child's events on stdout in the
+/// order they happened, its answer the last message; its edit committed on the
+/// branch the last stderr line names, the project's own tree untouched; the
+/// worktree and `.worktrees` gone; no process the child started still running.
+/// Zero tokens: the child's first request, with its worktree path read as the
+/// project's, is byte for byte the first request `openmax -p TASK` sends from
+/// the project, and no request names the flag; the project's own sessions are
+/// unchanged, as nothing in the prompt or the tools array mentions it
+/// (crates/core/tests/thesis.rs holds those bytes). An untrusted project is
+/// refused with exit 3 before a worktree or a request is made, and SIGTERM
+/// during the child's bash call ends the run with 143, with the child's
+/// processes stopped, the worktree removed, and its partial work on its branch.
+#[cfg(unix)]
+#[test]
+fn a_sub_agent_is_one_flag_and_zero_prompt_tokens() {
+    use std::process::Stdio;
+    use sub_agent::{answer, calls, git, repo, serve, trust};
+    let gone = |pid: i32| {
+        // A killed process answers until init has reaped it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(pid, 0) != 0 }
+    };
+    let openmax = |project: &Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_openmax"));
+        command
+            .current_dir(project)
+            .env("HOME", project.parent().unwrap().join("home"))
+            .env_remove("OPENMAX_API_KEY")
+            .env_remove("OPENMAX_HUMAN_ATTEST")
+            .env("OPENMAX_SESSION", "1")
+            .envs(sub_agent::GIT_ENV);
+        command
+    };
+    let branch_line = |stderr: &str| -> (String, String) {
+        let last = stderr.lines().last().unwrap_or_default();
+        let rest = last.strip_prefix("openmax: the sub-agent's changes are on branch ");
+        let (branch, stat) = rest.and_then(|rest| rest.split_once(": ")).unwrap_or_else(|| panic!("{stderr}"));
+        (branch.to_string(), stat.to_string())
+    };
+
+    // SIGTERM while the child's bash call runs: started first, stopped last.
+    let stopped = repo("stopped");
+    trust(&stopped);
+    let pids = stopped.parent().unwrap().join("pids");
+    let tree = format!(
+        "echo partial > partial.txt; echo $$ >> '{p}'; sleep 6841 & echo $! >> '{p}'; exec sleep 7841",
+        p = pids.display()
+    );
+    serve(&stopped, vec![calls(&[("bash", serde_json::json!({ "command": tree }))])]);
+    /// Stops the run on the way out of a failed assertion too: SIGTERM
+    /// stops its tool tree with it.
+    struct Stopped(Option<std::process::Child>);
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut stopping = Stopped(Some(
+        openmax(&stopped)
+            .args(["--subagent", "stop me", "--worktree", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+
+    // An untrusted project: refused before a worktree or a request is made.
+    let untrusted = repo("untrusted");
+    serve(&untrusted, Vec::new());
+    let out = openmax(&untrusted).args(["--subagent", "edit the notes", "--worktree"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("is not trusted"), "{stderr}");
+    assert!(!untrusted.join(".worktrees").exists(), "{stderr}");
+    assert_eq!(git(&untrusted, &["branch", "--list", "subagent/*"]), "", "{stderr}");
+
+    // The sub-agent edits notes.txt, leaves a process behind, and answers.
+    let project = repo("edits");
+    trust(&project);
+    let sleeper = project.parent().unwrap().join("sleeper");
+    let background = format!("sleep 6841 & echo $! > '{}'", sleeper.display());
+    let bodies = serve(
+        &project,
+        vec![
+            calls(&[
+                ("write_file", serde_json::json!({ "path": "notes.txt", "content": "edited\n" })),
+                ("bash", serde_json::json!({ "command": background })),
+            ]),
+            answer("edited the notes"),
+            answer("ok"),
+        ],
+    );
+    let out = openmax(&project).args(["--subagent", "edit the notes", "--worktree", "--json"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let mut tools = std::collections::HashMap::new();
+    let happened: Vec<String> = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|_| panic!("not an event line: {line}")))
+        .filter_map(|event| {
+            let call = event["call_id"].as_str().unwrap_or_default().to_string();
+            match event["type"].as_str()? {
+                "tool_start" => {
+                    tools.insert(call, event["name"].as_str()?.to_string());
+                    Some(format!("start {}", event["name"].as_str()?))
+                }
+                "tool_end" => Some(format!("end {} ok={}", tools.get(&call)?, event["ok"])),
+                // A message that only calls tools is done with no text.
+                "message_done" => Some(format!("answer {}", event["text"].as_str().filter(|text| !text.is_empty())?)),
+                "done" => Some(format!("done {}", event["stop_reason"].as_str()?)),
+                _ => None,
+            }
+        })
+        .collect();
+    let expected =
+        ["start write_file", "end write_file ok=true", "start bash", "end bash ok=true", "answer edited the notes", "done stop"];
+    assert_eq!(happened, expected, "{stdout}");
+    let root = std::fs::canonicalize(&project).unwrap();
+    let first = stderr.lines().next().unwrap_or_default();
+    let worktree = first.strip_prefix("openmax: sub-agent working in ").and_then(|rest| rest.split(" on branch ").next());
+    let worktree = worktree.unwrap_or_else(|| panic!("the run names its worktree first: {stderr}"));
+    assert!(worktree.starts_with(&format!("{}/.worktrees/edit-the-notes-", root.display())), "{stderr}");
+    let (branch, stat) = branch_line(&stderr);
+    assert_eq!(stat, "1 file changed, 1 insertion(+), 1 deletion(-)", "{stderr}");
+    assert_eq!(git(&project, &["show", &format!("{branch}:notes.txt")]), "edited");
+    assert_eq!(std::fs::read_to_string(project.join("notes.txt")).unwrap(), "first\n", "the project's tree is untouched");
+    assert_eq!(git(&project, &["status", "--porcelain"]), "", "{stderr}");
+    assert!(!project.join(".worktrees").exists(), "{stderr}");
+    assert_eq!(git(&project, &["worktree", "list"]).lines().count(), 1, "{stderr}");
+    let sleeper: i32 = std::fs::read_to_string(&sleeper).unwrap().trim().parse().unwrap();
+    assert!(gone(sleeper), "the child's background process {sleeper} outlived the run");
+
+    // Zero tokens: what the child sent first is what -p sends from the project.
+    let out = openmax(&project).args(["-p", "edit the notes", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3, "two child requests, then the -p request");
+    assert_eq!(bodies[0].replace(worktree, &root.display().to_string()), bodies[2], "the child's request differs from -p's");
+    for body in &bodies {
+        assert!(!body.contains("--subagent") && !body.contains("--worktree"), "a request names the flag: {body}");
+    }
+
+    // The stopped run: no process, no worktree, and its partial work kept.
+    let mut running = stopping.0.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let started = loop {
+        let text = std::fs::read_to_string(&pids).unwrap_or_default();
+        let started: Vec<i32> = text.lines().filter_map(|line| line.trim().parse().ok()).collect();
+        if started.len() == 2 || Instant::now() >= deadline || running.try_wait().unwrap().is_some() {
+            break started;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    unsafe { libc::kill(running.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while running.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = running.kill();
+    let out = running.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(started.len(), 2, "the child's bash call never started: {stderr}");
+    let survivors: Vec<i32> = started.into_iter().filter(|pid| !gone(*pid)).collect();
+    for pid in &survivors {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    assert!(survivors.is_empty(), "the child's processes outlived the stop: {survivors:?}\n{stderr}");
+    assert_eq!(out.status.code(), Some(143), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let done: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap_or_default()).unwrap_or_default();
+    assert_eq!((done["type"].as_str(), done["stop_reason"].as_str()), (Some("done"), Some("cancelled")), "{stdout}");
+    assert!(!stopped.join(".worktrees").exists(), "{stderr}");
+    let (branch, _) = branch_line(&stderr);
+    assert_eq!(git(&stopped, &["show", &format!("{branch}:partial.txt")]), "partial");
+    for dir in [stopped, untrusted, project] {
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+}
+
+/// Git repositories, their HOMEs, and scripted endpoints for the sub-agent
+/// gate.
+#[cfg(unix)]
+mod sub_agent {
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    /// Git's identity and config for every git command the test and openmax
+    /// run: none of the machine's own.
+    pub const GIT_ENV: [(&str, &str); 6] = [
+        ("GIT_AUTHOR_NAME", "openmax test"),
+        ("GIT_AUTHOR_EMAIL", "test@example.com"),
+        ("GIT_COMMITTER_NAME", "openmax test"),
+        ("GIT_COMMITTER_EMAIL", "test@example.com"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ];
+
+    pub fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").current_dir(dir).args(args).envs(GIT_ENV).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A project that is a git repository with notes.txt committed, beside an
+    /// empty HOME.
+    pub fn repo(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("openmax-thesis-subagent-{tag}-{}-{nonce}", std::process::id()));
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(base.join("home/.openmax")).unwrap();
+        git(&project, &["init", "-q"]);
+        std::fs::write(project.join("notes.txt"), "first\n").unwrap();
+        git(&project, &["add", "notes.txt"]);
+        git(&project, &["commit", "-q", "-m", "notes"]);
+        project
+    }
+
+    /// Trust `project` in auto, as a human's grant leaves it.
+    pub fn trust(project: &Path) {
+        let data = project.parent().unwrap().join("home/.openmax");
+        open_max_core::trust::grant_trust(&data, project, open_max_core::config::ApprovalMode::Auto).unwrap();
+    }
+
+    /// Point `project`'s HOME at an endpoint that answers request n with
+    /// `replies[n]` and refuses connections after the last, and return the
+    /// request bodies it records.
+    pub fn serve(project: &Path, replies: Vec<String>) -> Arc<Mutex<Vec<String>>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let settings = serde_json::json!({ "base_url": url, "model": "m", "approval_mode": "ask", "context_tokens": 32768 });
+        std::fs::write(project.parent().unwrap().join("home/.openmax/settings.json"), settings.to_string()).unwrap();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let record = bodies.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let length = String::from_utf8_lossy(&head)
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                if stream.read_exact(&mut body).is_err() {
+                    return;
+                }
+                record.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        bodies
+    }
+
+    fn sse(chunks: &[serde_json::Value]) -> String {
+        chunks.iter().map(|chunk| format!("data: {chunk}\n\n")).chain(["data: [DONE]\n\n".to_string()]).collect()
+    }
+
+    /// One assistant message calling each tool in order.
+    pub fn calls(calls: &[(&str, serde_json::Value)]) -> String {
+        let deltas: Vec<serde_json::Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| {
+                serde_json::json!({
+                    "index": i, "id": format!("call_{i}"), "type": "function",
+                    "function": { "name": name, "arguments": args.to_string() }
+                })
+            })
+            .collect();
+        sse(&[
+            serde_json::json!({ "choices": [{ "delta": { "tool_calls": deltas }, "finish_reason": null }] }),
+            serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }),
+        ])
+    }
+
+    pub fn answer(text: &str) -> String {
+        sse(&[
+            serde_json::json!({ "choices": [{ "delta": { "content": text }, "finish_reason": null }] }),
+            serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+        ])
+    }
+}
+
 /// A local OpenAI-compatible endpoint that answers every request with the
 /// same finished one-line completion, for as long as the test runs.
 fn spawn_answering_server() -> String {

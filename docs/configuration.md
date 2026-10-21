@@ -197,7 +197,9 @@ a project trusted by an earlier version; select a mode there once to save
 one. Symlink aliases share the choice. A subdirectory of the project,
 including a worktree placed under it (such as `.worktrees/`) where a
 delegated `openmax -p` child starts, follows the nearest enclosing project's
-choice unless it has a saved choice of its own. Inheritance follows the path,
+choice unless it has a saved choice of its own. A `--subagent` child's
+worktree there runs in the project's choice or a stricter one, never a looser
+one (see [sub-agents](usage.md#sub-agents)). Inheritance follows the path,
 not the Git repository: a worktree outside the root, such as one made with
 `git worktree add ../feature`, gets neither the project's trust nor its
 choice and needs its own.
@@ -350,11 +352,11 @@ OPENMAX_HUMAN_ATTEST=1 openmax --trust-project -p "summarize this repo"
 OPENMAX_HUMAN_ATTEST=1 openmax --trust-project   # the grant alone
 ```
 
-With neither `-p` nor `--stdio`, `--trust-project` goes on to the interactive
-session, which draws on stdout. At a terminal, the session paints its first
-frame before the grant is recorded, and the line that reports the grant prints
-on the shell once the session ends, or ahead of the reason when the session
-then cannot start (settings that do not parse). The lines that say what the
+With none of `-p`, `--stdio` and `--subagent`, `--trust-project` goes on to
+the interactive session, which draws on stdout. At a terminal, the session
+paints its first frame before the grant is recorded, and the line that reports
+the grant prints on the shell once the session ends, or ahead of the reason
+when the session then cannot start (settings that do not parse). The lines that say what the
 settings flags wrote or overrode print with it. A signal that forces the exit
 first, one before the session's loop starts (Ctrl+C at the terminal included)
 or a second one, ends the run without the line. Where stdout is not a

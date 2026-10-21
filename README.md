@@ -40,7 +40,7 @@ The design starts with one question: **What is the smallest capability Open Max 
 | --- | --- |
 | External service or specialized capability | A CLI-backed TOML tool plus an on-demand skill, without an MCP runtime |
 | Reusable workflow or command | A `SKILL.md` package or prompt template slash command |
-| Isolated or parallel work | A child `openmax -p` or interactive `openmax --stdio` process, usually in tmux |
+| Isolated or parallel work | `openmax --subagent "<task>" --worktree`, one child session in a new git worktree whose changes land on a branch, or a child `openmax -p` or `openmax --stdio` process, usually in tmux |
 | Durable background work | A named tmux session that the agent can inspect and reattach |
 | Planning and task state | `PLAN.md` and `TODO.md`, visible to the user and every tool |
 | Lifecycle policy and events | Process hooks and permission files |
@@ -195,6 +195,14 @@ openmax --stdio                                    # a frontend, once trusted
 A frontend's stdin is its protocol pipe, not a terminal, so it cannot grant trust itself. For CI and other automation a human runs, see [project trust](docs/configuration.md#project-trust).
 
 In print mode, text goes to stdout and tool progress to stderr; with `--json`, each `AgentEvent` is one JSON line. Press **/** for slash commands and **@** to mention a project file. Full flags, keybindings, and commands are in [usage](docs/usage.md).
+
+One flag hands a task to a sub-agent, from your shell or from the agent's `bash`:
+
+```sh
+openmax --subagent "make the flaky retry test deterministic" --worktree
+```
+
+The child is one session in a new git worktree of the repository at HEAD, trusted because the project is, in the project's approval mode or a stricter one. Its events print as `-p` prints them. When it ends, or a signal stops it, its tools are stopped, its changes are committed to a branch of their own, the worktree is removed, and the last line names the branch with a diffstat, or says the child changed nothing. The flag adds nothing to any request. See [sub-agents](docs/usage.md#sub-agents).
 
 ## Extend
 
