@@ -52,6 +52,13 @@ jobs:
         run: scripts/check-suite-time.sh ${{ matrix.suite_time_multiplier }}
         timeout-minutes: 5
 
+      # Hard gate: a change that deletes tests fails under the floor. The
+      # script counts the tests the suite just built lists, against the floor
+      # of the runner's platform (each compiles a few tests the other does
+      # not); it gives the method and how the floors move.
+      - name: Check test count
+        run: scripts/check-test-count.sh
+
       # The zero-warning baseline is only real if something checks it. It was
       # set deliberately, then drifted back to three warnings because nothing
       # did.

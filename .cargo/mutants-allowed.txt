@@ -1,0 +1,14 @@
+# Mutants allowed to survive a mutation run, each with its reason
+# (scripts/check-mutants.sh reads this).
+#
+# One mutant per line: its name as cargo-mutants prints it, without the line
+# and column (they move with every edit above them), then " # " and the
+# reason. For example:
+#
+#   crates/core/src/execution.rs: replace || with && in stop_groups # hangs: ...
+#
+# An entry covers every mutant in that file with that name. A pull request's
+# run passes a listed mutant that was missed or timed out. In the score, a
+# listed mutant that timed out counts as caught, because its reason says why
+# the hang is how it fails; a listed mutant that was missed still counts as
+# missed: listing a mutant lets a change through, it does not catch it.

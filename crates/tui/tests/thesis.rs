@@ -10,13 +10,13 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The lines of one job in ci.yml, from its key up to the next key at the
-/// jobs' indentation or less.
-fn ci_job(name: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+/// The lines of one job in a workflow under .github/workflows, from its key up
+/// to the next key at the jobs' indentation or less.
+fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(repo().join(".github/workflows").join(workflow)).unwrap();
     let key = format!("  {name}:");
     let mut lines = text.lines().skip_while(|line| line.trim_end() != key);
-    assert!(lines.next().is_some(), "ci.yml has no `{name}` job");
+    assert!(lines.next().is_some(), "{workflow} has no `{name}` job");
     lines
         .take_while(|line| {
             let body = line.trim_start();
@@ -24,6 +24,72 @@ fn ci_job(name: &str) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+/// The lines of one job in ci.yml.
+fn ci_job(name: &str) -> Vec<String> {
+    workflow_job("ci.yml", name)
+}
+
+/// The keys of the step in `job` that holds line `at`, from its first key to
+/// the next step, each without the `- ` that starts a step.
+fn step_keys(job: &[String], at: usize) -> Vec<&str> {
+    let first = job[..=at].iter().rposition(|line| line.trim().starts_with("- ")).expect("a line outside every step");
+    let end = job[at + 1..].iter().position(|line| line.trim().starts_with("- ")).map_or(job.len(), |n| at + 1 + n);
+    job[first..end].iter().map(|line| line.trim().trim_start_matches("- ")).collect()
+}
+
+/// The value a shell script assigns to `name` (a `name=value` line).
+fn assigned(script: &str, name: &str) -> String {
+    let prefix = format!("{name}=");
+    script
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("the script assigns no `{name}`"))
+        .to_string()
+}
+
+/// `n` with a comma between each group of three digits, as the README writes
+/// a count.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// A new, empty directory for one test's files.
+fn scratch(tag: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("openmax-thesis-{tag}-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Write `body` to `path` as an executable script.
+fn executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// One of the repository's scripts, to run outside GitHub Actions unless the
+/// caller says otherwise.
+fn script(path: &str) -> Command {
+    let mut command = Command::new(repo().join(path));
+    command.env_remove("GITHUB_ACTIONS").env_remove("GITHUB_STEP_SUMMARY");
+    command
+}
+
+/// A command's exit code and everything it printed, stdout then stderr.
+fn ran(command: &mut Command) -> (Option<i32>, String) {
+    let out = command.output().unwrap();
+    (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
 /// The whole suite runs in 5 seconds after compilation. No test inside the
@@ -62,9 +128,7 @@ fn whole_suite_runs_in_five_seconds() {
     // The gate's own step, from its first key, whichever that is, to the
     // next step: a condition there skips the gate on some runner, and so
     // passes the pull request that slowed the suite on it.
-    let first = job[..gate].iter().rposition(|line| line.trim().starts_with("- ")).unwrap();
-    let end = job[gate..].iter().position(|line| line.trim().starts_with("- ")).map_or(job.len(), |n| gate + n);
-    let keys: Vec<&str> = job[first..end].iter().map(|line| line.trim().trim_start_matches("- ")).collect();
+    let keys = step_keys(&job, gate);
     let soft: Vec<&&str> =
         keys.iter().filter(|key| ["if:", "continue-on-error:"].iter().any(|soft| key.starts_with(soft))).collect();
     assert!(soft.is_empty(), "the suite time gate can be skipped or ignored: {soft:?}");
@@ -772,6 +836,507 @@ fn thesis_claims_are_gated_in_ci() {
     );
 }
 
+/// The workspace has 2,000 tests. No test can count the suite it runs in, so
+/// CI does: its test job runs scripts/check-test-count.sh on each of its
+/// runners once the suite has built and passed, in a step that nothing there
+/// skips or lets fail. Linux and macOS each compile a few tests the other does
+/// not, so the script counts against the floor of the platform `uname -s`
+/// names, each a ratchet at that platform's count when it was last raised,
+/// and every runner of the job has one. It fails under that floor, offers to
+/// raise that floor when the count is over it, reports the distance to the
+/// 2,000-test target until that is met, and on a platform with no floor
+/// reports the count and passes; the README states both floors and the
+/// target. This test holds the wiring, holds the README to the script, and
+/// holds the script to its method by driving it with a stand-in `uname` and a
+/// stand-in `cargo` whose test binaries list their tests as libtest does: it
+/// counts the lines that end in ": test" (not a benchmark, not the summary),
+/// takes out the ones `--list --ignored` names, and on Linux and on macOS
+/// passes a count at that platform's floor, fails one under it and names that
+/// floor for a count over it; it passes any count on another platform, and
+/// fails when cargo fails rather than counting nothing.
+#[test]
+fn the_workspace_has_two_thousand_tests() {
+    let gate = std::fs::read_to_string(repo().join("scripts/check-test-count.sh")).unwrap();
+    let floor_of = |name: &str| -> u64 { assigned(&gate, name).parse().unwrap_or_else(|_| panic!("{name} is not a count")) };
+    let (linux, macos) = (floor_of("linux_floor"), floor_of("macos_floor"));
+    let target: u64 = assigned(&gate, "target").parse().expect("the target is a count");
+    assert_eq!(target, 2000, "the target is 2,000 tests");
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        format!("fails when there are fewer than {} on Linux, or {} on macOS", thousands(linux), thousands(macos)),
+        format!("The target is {} tests", thousands(target)),
+    ] {
+        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which scripts/check-test-count.sh gates");
+    }
+
+    let job = ci_job("test");
+    let step = |run: &str| {
+        job.iter()
+            .position(|line| line.trim() == format!("run: {run}"))
+            .unwrap_or_else(|| panic!("the test job does not run `{run}`"))
+    };
+    let (tests, count) = (step("cargo test --workspace --locked"), step("scripts/check-test-count.sh"));
+    assert!(tests < count, "the tests are counted before the suite is built");
+    // Every runner counts against its own platform's floor: a condition
+    // skips the gate on some runner, and continue-on-error lets it fail.
+    let keys = step_keys(&job, count);
+    let soft: Vec<&&str> = keys.iter().filter(|key| key.starts_with("if:") || key.starts_with("continue-on-error:")).collect();
+    assert!(soft.is_empty(), "the test count can be skipped or ignored on a runner: {soft:?}");
+    let runners: Vec<&str> = job
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("os: [")?.strip_suffix(']'))
+        .expect("the test job names no runners")
+        .split(", ")
+        .collect();
+    for runner in &runners {
+        assert!(
+            runner.starts_with("ubuntu-") || runner.starts_with("macos-"),
+            "the test job's runner {runner} counts against no floor: scripts/check-test-count.sh has Linux's and macOS's"
+        );
+    }
+
+    let dir = scratch("test-count");
+    // `cargo test --workspace --locked -- --list [--ignored]` as libtest
+    // prints it: each test, a benchmark, a blank line and the summary.
+    executable(
+        &dir.join("cargo"),
+        "#!/bin/sh\n\
+         [ -z \"$CARGO_FAILS\" ] || { echo 'error: could not compile `open-max-core`' >&2; exit 101; }\n\
+         case \"$*\" in\n\
+           'test --workspace --locked -- --list --ignored') n=$IGNORED ;;\n\
+           'test --workspace --locked -- --list') n=$LISTED ;;\n\
+           *) echo \"unexpected: cargo $*\" >&2; exit 2 ;;\n\
+         esac\n\
+         i=0\n\
+         while [ $i -lt $n ]; do echo \"tests::case_$i: test\"; i=$((i + 1)); done\n\
+         echo 'benches::parse: benchmark'\n\
+         echo\n\
+         echo \"$n tests, 1 benchmarks\"\n",
+    );
+    // `uname -s` as the platform under test prints it.
+    executable(&dir.join("uname"), "#!/bin/sh\necho \"$UNAME\"\n");
+    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+    let count_with = |uname: &str, listed: u64, ignored: u64, fails: bool| {
+        let mut gate = script("scripts/check-test-count.sh");
+        gate.env("PATH", &path).env("UNAME", uname).env("LISTED", listed.to_string()).env("IGNORED", ignored.to_string());
+        if fails {
+            gate.env("CARGO_FAILS", "1");
+        } else {
+            gate.env_remove("CARGO_FAILS");
+        }
+        ran(&mut gate)
+    };
+    // Each platform with a floor, as `uname -s` names it, as the report names
+    // it, and the floor's name in the script: a count at the floor, a test
+    // under it, and a test over it.
+    let platforms = [("Linux", "Linux", "linux_floor", linux), ("Darwin", "macOS", "macos_floor", macos)];
+    let counted: Vec<_> = platforms
+        .iter()
+        .map(|&(uname, _, _, floor)| {
+            (count_with(uname, floor + 3, 3, false), (floor > 0).then(|| count_with(uname, floor + 2, 3, false)), count_with(uname, floor + 4, 3, false))
+        })
+        .collect();
+    // Elsewhere no floor holds, however few the tests.
+    let (elsewhere, elsewhere_report) = count_with("FreeBSD", 3, 3, false);
+    let (broken, broken_report) = count_with("Linux", linux + 3, 3, true);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    for (&(_, platform, name, floor), (at, under, over)) in platforms.iter().zip(counted) {
+        let (at, at_report) = at;
+        assert_eq!(at, Some(0), "a suite at {platform}'s floor of {floor} fails the gate on {platform}: {at_report}");
+        let counted = format!("{floor} tests on {platform} ({} listed, 3 of them ignored); floor {floor}, target {target}", floor + 3);
+        assert!(at_report.contains(&counted), "not counted as libtest lists tests: {at_report}");
+        if floor < target {
+            let to_go = format!("{} tests under the target of {target}", target - floor);
+            assert!(at_report.contains(&to_go), "the distance to the target is not reported: {at_report}");
+        }
+        assert!(!at_report.contains("can be raised"), "a suite at {platform}'s floor offers to raise it: {at_report}");
+        if let Some((under, under_report)) = under {
+            assert_eq!(under, Some(1), "a suite a test under {platform}'s floor of {floor} passes the gate on {platform}: {under_report}");
+            assert!(under_report.contains(&format!("tests on {platform}, 1 under its floor of {floor}")), "{under_report}");
+        }
+        let (over, over_report) = over;
+        assert_eq!(over, Some(0), "a suite a test over {platform}'s floor fails the gate on {platform}: {over_report}");
+        let raise = format!("{name} in scripts/check-test-count.sh can be raised to {}", floor + 1);
+        assert!(over_report.contains(&raise), "a count over {platform}'s floor does not offer to raise that floor, {raise:?}: {over_report}");
+    }
+    assert_eq!(elsewhere, Some(0), "a platform with no floor fails the gate: {elsewhere_report}");
+    assert!(elsewhere_report.contains("0 tests on FreeBSD (3 listed, 3 of them ignored); no floor, target"), "{elsewhere_report}");
+    assert_eq!(broken, Some(1), "a suite that does not build passes the gate: {broken_report}");
+    assert!(
+        broken_report.contains("could not compile") && broken_report.contains("--list` failed"),
+        "the failure is not shown: {broken_report}"
+    );
+}
+
+/// The mutation score, caught / (caught + missed) over every mutant of the
+/// workspace, reaches 95%. No test can mutate the code it runs in, so CI does:
+/// the Mutants workflow runs cargo-mutants, every job with one pinned
+/// compiler, on a pull request over the code it changes (a newer push
+/// cancels the older run), and on a push to main, weekly and by hand over the
+/// whole workspace (never cancelled: a newer run waits, and replaces any
+/// older one waiting), split into shards that all run with the plan's shard
+/// count, each in a cgroup that caps its memory below the runner's, where
+/// every test of the workspace first passes on the unmutated tree, each
+/// keeping its outcomes as an artifact that a re-run of it replaces; its last
+/// job judges the shards' outcomes with scripts/check-mutants.sh whatever the
+/// shards did, unless the run was cancelled. On a pull request (`--diff`) the
+/// script fails when a mutant was missed or timed out and is not listed in
+/// .cargo/mutants-allowed.txt; on the other runs it fails when the score is
+/// under its floor, a ratchet that sits a margin under the score of the run
+/// that last raised it, and reports the distance to the 95% target until that
+/// is met. The README states the floor, the score that set it, the margin and
+/// the target, and docs/testing.md the margin and the timeout that
+/// .cargo/mutants.toml sets.
+/// This test holds the wiring and the documents to the files, and holds the
+/// script to its rules by driving it with shards' outcomes as cargo-mutants
+/// 27.1.0 writes them, over a source file with a macOS-only function,
+/// non-Unix statements, a statement under cfg(not(test)) and one under
+/// cfg(true): it merges shards; leaves out the unviable mutants and the ones
+/// the run's target does not compile (read from each shard's cfg.txt), there
+/// and on macOS, keeping code that either build of a crate, with or without
+/// cfg(test), compiles; counts a listed timeout as caught, an unlisted one
+/// and a listed miss as missed; passes a score exactly at the floor and fails
+/// one a mutant under it; offers to raise the floor to a score less the
+/// margin, and only when that is above the floor; on a pull request fails on
+/// exactly the unlisted misses and timeouts, marking each on its line with
+/// its message escaped as a workflow command needs; and refuses a shard that
+/// did not finish, one whose unmutated tests failed, shards that overlap,
+/// built different targets or hold fewer mutants than the plan listed, and an
+/// allowlist entry with no reason.
+#[test]
+fn mutation_score_is_at_least_ninety_five_percent() {
+    let gate = std::fs::read_to_string(repo().join("scripts/check-mutants.sh")).unwrap();
+    let (floor, margin, target) = (assigned(&gate, "floor"), assigned(&gate, "margin"), assigned(&gate, "target"));
+    assert_eq!(target, "95", "the target is 95%");
+    // A percentage with two decimals, in hundredths of a point.
+    let hundredths = |value: &str| {
+        let (whole, part) = value.split_once('.').unwrap_or_else(|| panic!("{value} has no decimals"));
+        let bp = whole.parse::<u64>().unwrap() * 100 + part.parse::<u64>().unwrap();
+        assert!(part.len() == 2 && bp <= 10_000, "{value} is not a percentage with two decimals");
+        bp
+    };
+    let percent = |bp: u64| format!("{}.{:02}%", bp / 100, bp % 100);
+    let (floor_bp, margin_bp) = (hundredths(&floor), hundredths(&margin));
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let measured = format!("{}, less a margin of {margin} points", percent(floor_bp + margin_bp));
+    for claim in [format!("is under {floor}%"), measured, format!("The target is {target}%")] {
+        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which scripts/check-mutants.sh gates");
+    }
+    let config: toml::Table = std::fs::read_to_string(repo().join(".cargo/mutants.toml")).unwrap().parse().unwrap();
+    let (multiplier, minimum) = (config["timeout_multiplier"].as_float().unwrap(), config["minimum_test_timeout"].as_integer().unwrap());
+    let testing = std::fs::read_to_string(repo().join("docs/testing.md")).unwrap();
+    let timeout = format!("the larger of {minimum} seconds and {multiplier} times the time the unmutated tests took");
+    assert!(testing.contains(&timeout), "docs/testing.md does not give the timeout .cargo/mutants.toml sets: {timeout}");
+    let margined = format!("less a margin of {margin} points");
+    assert!(testing.contains(&margined), "docs/testing.md does not give the margin scripts/check-mutants.sh sets: {margined}");
+    assert_eq!(config["test_workspace"].as_bool(), Some(true), "a mutant is not tested by every package that can observe it");
+    // Every listed mutant gives its reason, and is in a file that exists.
+    let allowed = std::fs::read_to_string(repo().join(".cargo/mutants-allowed.txt")).unwrap();
+    for entry in allowed.lines().filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#')) {
+        let (mutant, reason) = entry.split_once(" # ").unwrap_or_else(|| panic!("an allowlist entry without a reason: {entry}"));
+        assert!(!reason.trim().is_empty(), "an allowlist entry without a reason: {entry}");
+        let file = mutant.split_once(": ").map_or(mutant, |(file, _)| file);
+        assert!(repo().join(file).is_file(), "an allowlist entry for a file that does not exist: {entry}");
+    }
+
+    let workflow = std::fs::read_to_string(repo().join(".github/workflows/mutants.yml")).unwrap();
+    let triggers: Vec<&str> =
+        workflow.lines().skip_while(|line| *line != "on:").skip(1).take_while(|line| line.starts_with(' ') || line.is_empty()).collect();
+    for trigger in ["  pull_request:", "  push:", "  schedule:", "  workflow_dispatch:"] {
+        assert!(triggers.contains(&trigger), "the Mutants workflow does not run on `{}`", trigger.trim());
+    }
+    let pushed = triggers.iter().find_map(|line| {
+        let value = line.split(" #").next().unwrap_or_default().trim();
+        value.strip_prefix("branches: [")?.strip_suffix(']')
+    });
+    assert!(pushed.is_some_and(|branches| branches.split(", ").any(|branch| branch == "main")), "the Mutants workflow does not run on a push to main");
+    // A pull request's newer push cancels its older run. A run of the whole
+    // workspace is never cancelled: a newer one waits in the branch's group,
+    // which keeps only the newest one waiting.
+    let concurrency = "concurrency:\n  group: mutants-${{ github.event.pull_request.number || github.ref }}\n  \
+                       cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n";
+    assert!(
+        workflow.contains(concurrency),
+        "the Mutants workflow's runs do not queue one group per pull request or branch, cancelling only a pull request's: {concurrency}"
+    );
+    // A listing that fails reads as no mutants unless the pipe fails too.
+    assert!(workflow.contains("defaults:\n  run:\n    shell: bash\n"), "the workflow's steps do not run under bash -eo pipefail");
+    // Linux runners, as the README says: the code a run leaves out as not
+    // built is the code Linux does not compile.
+    let runners: Vec<&str> = workflow.lines().filter_map(|line| line.trim().strip_prefix("runs-on: ")).collect();
+    assert!(
+        !runners.is_empty() && runners.iter().all(|runner| *runner == "ubuntu-latest"),
+        "a job of the Mutants workflow runs off Linux: {runners:?}"
+    );
+    assert!(!workflow.contains("continue-on-error"), "a step of the Mutants workflow may fail without failing it");
+    // One compiler, a release's, for every job: under a floating `stable` a
+    // Rust release during a full run would build its shards with two.
+    let compiler = workflow.lines().find_map(|line| line.strip_prefix("  RUST_TOOLCHAIN: ")).expect("the Mutants workflow pins no compiler");
+    assert!(
+        compiler.split('.').count() == 3 && compiler.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+        "the Mutants workflow's compiler {compiler} is not a release"
+    );
+    let installed: Vec<&str> = workflow.lines().filter_map(|line| line.trim().strip_prefix("toolchain: ")).collect();
+    assert!(
+        installed.iter().all(|toolchain| *toolchain == "${{ env.RUST_TOOLCHAIN }}"),
+        "a job of the Mutants workflow installs another compiler than the pinned one: {installed:?}"
+    );
+    let (plan, shards, judge) = (workflow_job("mutants.yml", "plan"), workflow_job("mutants.yml", "mutants"), workflow_job("mutants.yml", "judge"));
+    let holds = |job: &[String], line: &str| job.iter().any(|l| l.trim() == line);
+    for job in [&plan, &shards] {
+        assert!(holds(job, "echo \"$CARGO_MUTANTS_SHA256  $RUNNER_TEMP/cargo-mutants.tar.gz\" | sha256sum -c -"), "cargo-mutants runs unchecked");
+        assert!(holds(job, "toolchain: ${{ env.RUST_TOOLCHAIN }}"), "a job of the Mutants workflow builds with the runner's own compiler");
+    }
+    assert!(holds(&plan, "mutants=$(cargo mutants --list \"$@\" | wc -l)"), "the plan does not count the mutants it shards");
+    assert!(holds(&shards, "shard: ${{ fromJSON(needs.plan.outputs.shards) }}"), "the shards are not the plan's");
+    assert!(holds(&shards, "SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.count }}"), "a shard runs with another shard count");
+    assert!(holds(&shards, "set -- --in-place --shard \"$SHARD\" --annotations none -vV"), "a shard does not test its share");
+    // A test that a mutant drives to allocate without bound is killed inside
+    // the shard's memory-capped cgroup, not left to starve the runner: the
+    // step caps the cgroup and joins it before cargo-mutants starts.
+    let at = |line: &str| shards.iter().position(|l| l.trim() == line);
+    let capped = shards.iter().any(|l| l.contains("| sudo tee \"$fence/memory.max\" > /dev/null"));
+    let (joined, tested) = (at("echo $$ | sudo tee \"$fence/cgroup.procs\" > /dev/null"), at("cargo mutants \"$@\" || status=$?"));
+    assert!(
+        capped && matches!((joined, tested), (Some(joined), Some(tested)) if joined < tested),
+        "a shard's mutants run outside a memory-capped cgroup"
+    );
+    // cargo-mutants' baseline runs only the tests of the packages its mutants
+    // are in, and each mutant every package's: a test that failed without any
+    // mutant would catch them all. So every test of the workspace passes on
+    // the unmutated tree first, in the cgroup the mutants run in.
+    let unmutated = at("cargo test --workspace --locked");
+    assert!(
+        matches!((joined, unmutated, tested), (Some(joined), Some(unmutated), Some(tested)) if joined < unmutated && unmutated < tested),
+        "a shard tests its mutants before every test of the workspace has passed on the unmutated tree in its cgroup"
+    );
+    for job in [&plan, &shards] {
+        assert!(holds(job, "git diff HEAD^1 HEAD > \"$RUNNER_TEMP/change.diff\""), "a pull request's run does not take its change");
+    }
+    assert!(holds(&judge, "if: ${{ !cancelled() }}"), "the judgement is skipped when a shard fails");
+    assert!(holds(&judge, "needs: [plan, mutants]"), "the judgement does not wait for the shards");
+    assert!(holds(&judge, "set -- --diff"), "a pull request's run is judged as a score");
+    // The download puts a lone shard's artifact in shards/ itself, and each of
+    // several in a directory of its own: a pull request with one shard's worth
+    // of mutants is judged too.
+    assert!(
+        holds(&judge, "if [ -e shards/outcomes.json ]; then dirs=(shards); else dirs=(shards/*/); fi"),
+        "a run with a single shard is not judged"
+    );
+    assert!(
+        holds(&judge, "scripts/check-mutants.sh \"$@\" --mutants \"$MUTANTS\" --missed missed.txt \"${dirs[@]}\""),
+        "the shards are not judged against the number of mutants the plan listed"
+    );
+    // Re-running a run's failed jobs keeps its earlier attempt's artifacts,
+    // and the upload refuses a name the run holds unless it may overwrite it:
+    // a shard that failed once cargo-mutants had started kept its outcomes,
+    // which the re-run docs/testing.md gives must replace.
+    let lines: Vec<String> = workflow.lines().map(str::to_string).collect();
+    let uploads: Vec<Vec<&str>> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim().starts_with("uses: actions/upload-artifact@"))
+        .map(|(at, _)| step_keys(&lines, at))
+        .collect();
+    assert!(
+        uploads.iter().any(|keys| keys.contains(&"name: mutants-shard-${{ matrix.shard }}"))
+            && uploads.iter().all(|keys| keys.contains(&"overwrite: true")),
+        "a job of the Mutants workflow cannot upload its artifact again when it is re-run: {uploads:?}"
+    );
+
+    let tree = scratch("mutants");
+    std::fs::create_dir_all(tree.join("src")).unwrap();
+    std::fs::create_dir_all(tree.join(".cargo")).unwrap();
+    // Line 2 is `kept`'s body, 8 `apple`'s (macOS only; its span starts at
+    // its doc comment, line 5), 14 a non-Unix statement of `split`'s, 18 a
+    // Unix one, 27 the else branch of a non-Unix `if` in `branch`, 34 a
+    // statement only a build without cfg(test) compiles, which is built: the
+    // integration tests and the binary use that build; and 40 a statement
+    // under cfg(true), which every build compiles.
+    std::fs::write(
+        tree.join("src/lib.rs"),
+        "fn kept(a: u32) -> bool {\n    a > 1\n}\n\n/// Built only on macOS.\n#[cfg(target_os = \"macos\")]\n\
+         fn apple(a: u32) -> bool {\n    a > 1\n}\n\nfn split(a: u32) -> u32 {\n    #[cfg(not(unix))]\n    {\n        a + 1\n    }\n\
+         \x20   #[cfg(unix)]\n    {\n        a + 2\n    }\n}\n\n\
+         fn branch(a: u32) -> u32 {\n    #[cfg(not(unix))]\n    if a > 1 {\n        return a;\n    } else {\n        return a + 3;\n    }\n    a\n}\n\n\
+         fn quiet(a: u32) -> u32 {\n    #[cfg(not(test))]\n    let a = a % 7;\n    a\n}\n\n\
+         fn always(a: u32) -> u32 {\n    #[cfg(true)]\n    let a = a + 4;\n    a\n}\n",
+    )
+    .unwrap();
+    let allowlist = |extra: &str| {
+        std::fs::write(
+            tree.join(".cargo/mutants-allowed.txt"),
+            format!(
+                "# Mutants allowed to survive.\n\
+                 src/lib.rs: replace > with == in kept # hangs: the loop it ends never ends\n\
+                 src/lib.rs: replace + with - in split # the sum is only logged\n{extra}"
+            ),
+        )
+        .unwrap()
+    };
+    allowlist("");
+    let linux = "debug_assertions\ntarget_family=\"unix\"\ntarget_os=\"linux\"\nunix\n";
+    let macos = "debug_assertions\ntarget_family=\"unix\"\ntarget_os=\"macos\"\nunix\n";
+    // One shard's output directory, as cargo-mutants writes it, each mutant
+    // `(name, the line its function starts on, outcome)`.
+    let shard = |name: &str, cfg: &str, mutants: &[(String, usize, &str)], finished: bool, baseline: &str| {
+        let dir = tree.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outcomes: Vec<serde_json::Value> = std::iter::once(serde_json::json!({"scenario": "Baseline", "summary": baseline}))
+            .chain(mutants.iter().map(|(mutant, function, summary)| {
+                let file = mutant.split(':').next().unwrap();
+                serde_json::json!({
+                    "scenario": {"Mutant": {"name": mutant, "file": file, "function": {"span": {"start": {"line": function}}}}},
+                    "summary": summary,
+                })
+            }))
+            .collect();
+        let end = if finished { serde_json::json!("2026-10-21T00:00:00Z") } else { serde_json::Value::Null };
+        let run = serde_json::json!({"outcomes": outcomes, "end_time": end});
+        std::fs::write(dir.join("outcomes.json"), run.to_string()).unwrap();
+        std::fs::write(dir.join("cfg.txt"), cfg).unwrap();
+        dir
+    };
+    let m = |name: &str, function: usize, summary: &'static str| (name.to_string(), function, summary);
+    // Caught: 5, one of them under cfg(true), and a listed timeout. Missed:
+    // two unlisted, one of them under cfg(not(test)), a listed one and an
+    // unlisted timeout. Unviable: 1. Not built on Linux: `apple`'s, the
+    // non-Unix statement's and the non-Unix `if`'s.
+    let first = [
+        m("src/lib.rs:2:7: replace > with >= in kept", 1, "MissedMutant"),
+        m("src/lib.rs:2:6: replace > with == in kept", 1, "Timeout"),
+        m("src/lib.rs:8:7: replace > with >= in apple", 5, "MissedMutant"),
+        m("src/lib.rs:2:5: replace kept -> bool with true", 1, "CaughtMutant"),
+        m("src/lib.rs:2:5: replace kept -> bool with false", 1, "CaughtMutant"),
+    ];
+    let second = [
+        m("src/lib.rs:14:11: replace + with - in split", 11, "MissedMutant"),
+        m("src/lib.rs:18:11: replace + with - in split", 11, "MissedMutant"),
+        m("src/lib.rs:18:11: replace + with * in split", 11, "CaughtMutant"),
+        m("src/lib.rs:2:8: replace > with < in kept", 1, "Timeout"),
+        m("src/lib.rs:12:5: replace split -> u32 with 0", 11, "Unviable"),
+        m("src/lib.rs:12:5: replace split -> u32 with 1", 11, "CaughtMutant"),
+        m("src/lib.rs:27:18: replace + with - in branch", 22, "MissedMutant"),
+        m("src/lib.rs:34:15: replace % with / in quiet", 32, "MissedMutant"),
+        m("src/lib.rs:40:15: replace + with - in always", 38, "CaughtMutant"),
+    ];
+    let (one, two) = (shard("one", linux, &first, true, "Success"), shard("two", linux, &second, true, "Success"));
+    let on_macos = shard("on-macos", macos, &first, true, "Success");
+    let again = shard("again", linux, &first, true, "Success");
+    let unfinished = shard("unfinished", linux, &first, false, "Success");
+    let unbaselined = shard("unbaselined", linux, &first, true, "Failure");
+    let other_target = shard("other-target", macos, &second, true, "Success");
+    // Scores of exactly the floor, a mutant under it, exactly the floor plus
+    // the margin, and 100%, each over the fewest mutants that score it
+    // exactly: hundredths of a point over 10,000, in lowest terms.
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let exactly = |bp: u64| (bp / gcd(bp, 10_000), 10_000 / gcd(bp, 10_000));
+    let boundary = |name: &str, (caught, scored): (u64, u64)| {
+        let mutants: Vec<_> = (0..scored)
+            .map(|i| m(&format!("src/lib.rs:2:{}: replace > with < in kept", 100 + i), 1, if i < caught { "CaughtMutant" } else { "MissedMutant" }))
+            .collect();
+        shard(name, linux, &mutants, true, "Success")
+    };
+    let at_floor = exactly(floor_bp);
+    let passing = boundary("passing", at_floor);
+    let failing = (at_floor.0 > 0).then(|| boundary("failing", (at_floor.0 - 1, at_floor.1)));
+    let margin_over = (floor_bp + margin_bp <= 10_000).then(|| boundary("margin-over", exactly(floor_bp + margin_bp)));
+    let perfect = boundary("perfect", (1, 1));
+    let missed = tree.join("missed.txt");
+    let summary = tree.join("summary.md");
+    let judge_run = |args: &[&str], dirs: &[&PathBuf]| {
+        let mut gate = script("scripts/check-mutants.sh");
+        gate.current_dir(&tree).args(args).args(dirs);
+        ran(&mut gate)
+    };
+    let (score, score_report) = {
+        let mut gate = script("scripts/check-mutants.sh");
+        gate.current_dir(&tree).env("GITHUB_STEP_SUMMARY", &summary).args(["--mutants", "14", "--missed"]).arg(&missed).args([&one, &two]);
+        ran(&mut gate)
+    };
+    let (change, change_report) = {
+        let mut gate = script("scripts/check-mutants.sh");
+        gate.current_dir(&tree).env("GITHUB_ACTIONS", "true").arg("--diff").args([&one, &two]);
+        ran(&mut gate)
+    };
+    let (macos_change, macos_report) = judge_run(&["--diff"], &[&on_macos]);
+    let (at, at_report) = judge_run(&[], &[&passing]);
+    let under = failing.as_ref().map(|failing| judge_run(&[], &[failing]));
+    let over = margin_over.as_ref().map(|margin_over| judge_run(&[], &[margin_over]));
+    let (full, full_report) = judge_run(&[], &[&perfect]);
+    let refusals: Vec<(&str, (Option<i32>, String))> = vec![
+        ("did not finish", judge_run(&[], &[&unfinished])),
+        ("the unmutated tests did not pass", judge_run(&[], &[&unbaselined])),
+        ("the shards overlap", judge_run(&[], &[&one, &again])),
+        ("the shards built different targets", judge_run(&[], &[&one, &other_target])),
+        ("a shard is missing", judge_run(&["--mutants", "15"], &[&one, &two])),
+    ];
+    let missed_list = std::fs::read_to_string(&missed).unwrap_or_default();
+    let summary_text = std::fs::read_to_string(&summary).unwrap_or_default();
+    allowlist("src/lib.rs: replace > with >= in kept\n");
+    let (unreasoned, unreasoned_report) = judge_run(&["--diff"], &[&one]);
+    let _ = std::fs::remove_dir_all(&tree);
+
+    let expect_failed = 6 * 10_000 < floor_bp * 10;
+    assert_eq!(score, Some(i32::from(expect_failed)), "a score of 60.00% against the floor of {floor}%: {score_report}");
+    for line in [
+        "14 mutants in 2 shards:",
+        "      5 caught\n      3 missed\n",
+        "      2 timed out: 1 listed with a reason, counted caught; 1 not, counted missed",
+        "      1 unviable\n      3 not built for this target\n",
+        "score: 60.00%, 6 caught of 10 caught or missed",
+        "missed, per file:\n      4 src/lib.rs\n",
+    ] {
+        assert!(score_report.contains(line), "the report does not say {line:?}: {score_report}");
+    }
+    assert_eq!(
+        missed_list,
+        "src/lib.rs:2:7: replace > with >= in kept\nsrc/lib.rs:2:8: replace > with < in kept\nsrc/lib.rs:18:11: replace + with - in split\nsrc/lib.rs:34:15: replace % with / in quiet\n",
+        "the missed list is not the misses and the unlisted timeout, in source order"
+    );
+    assert!(summary_text.starts_with("## Mutation score\n") && summary_text.contains("score: 60.00%"), "{summary_text}");
+
+    assert_eq!(change, Some(1), "a change with unlisted misses passes: {change_report}");
+    assert!(change_report.contains("3 missed or timed out and not listed in .cargo/mutants-allowed.txt:\n  src/lib.rs:2:7: replace > with >= in kept\n  src/lib.rs:2:8: replace > with < in kept\n  src/lib.rs:34:15: replace % with / in quiet\n"), "{change_report}");
+    // Each blocking mutant is marked on its line, its message escaped as a
+    // workflow command needs (% as %25), and nothing else is marked.
+    for (line, column, what) in [(2, 7, "replace > with >= in kept"), (2, 8, "replace > with < in kept"), (34, 15, "replace %25 with / in quiet")] {
+        let mark = format!("::error file=src/lib.rs,line={line},col={column}::Not caught, and not listed in .cargo/mutants-allowed.txt: {what}\n");
+        assert!(change_report.contains(&mark), "a blocking mutant is not marked on its line as {mark:?}: {change_report}");
+    }
+    assert_eq!(change_report.matches("::error").count(), 3, "a mutant that does not block the change is marked: {change_report}");
+    assert_eq!(macos_change, Some(1), "on macOS the macOS-only function is built, and its miss blocks: {macos_report}");
+    assert!(macos_report.contains("  src/lib.rs:8:7: replace > with >= in apple\n") && macos_report.contains("      0 not built for this target"), "{macos_report}");
+
+    let offer = "the floor in scripts/check-mutants.sh can be raised to";
+    assert_eq!(at, Some(0), "a score of exactly the floor, {} caught of {}, fails the floor of {floor}%: {at_report}", at_floor.0, at_floor.1);
+    assert!(!at_report.contains(offer), "a score at the floor offers to raise it: {at_report}");
+    if let Some((under, under_report)) = under {
+        assert_eq!(under, Some(1), "a score a mutant under the floor of {floor}% passes: {under_report}");
+        assert!(under_report.contains(&format!("the score is under its floor of {floor}%")), "{under_report}");
+    }
+    // The floor may rise to a run's score less the margin, and only above itself.
+    if let Some((over, over_report)) = over {
+        assert_eq!(over, Some(0), "a score the margin over the floor of {floor}% fails it: {over_report}");
+        assert!(!over_report.contains(offer), "a score the margin over the floor offers to raise the floor to itself: {over_report}");
+    }
+    assert_eq!(full, Some(0), "a score of 100% fails the floor of {floor}%: {full_report}");
+    assert!(full_report.contains(&format!("the target of {target}% is met")), "{full_report}");
+    if 10_000 - margin_bp > floor_bp {
+        let raise = format!("{offer} {}, the score less its margin of {margin} points", percent(10_000 - margin_bp));
+        assert!(full_report.contains(&raise), "a score of 100% does not offer to raise the floor to the score less the margin, {raise:?}: {full_report}");
+    }
+    for (why, (code, report)) in refusals {
+        assert_eq!(code, Some(2), "a run where {why} is judged: {report}");
+        assert!(report.contains(why), "the refusal does not say {why:?}: {report}");
+    }
+    assert_eq!(unreasoned, Some(2), "an allowlist entry without a reason is taken: {unreasoned_report}");
+    assert!(unreasoned_report.contains("not a mutant's name, then \" # \" and the reason it may survive"), "{unreasoned_report}");
+}
+
 /// The first frame, held in CI by its ratio to a baseline binary's start.
 ///
 /// The target, cold start to the first painted frame in 1 ms, is a release
@@ -788,8 +1353,7 @@ fn thesis_claims_are_gated_in_ci() {
 /// machine's start of a release binary (the spawn, the dynamic loader, the
 /// runtime's start) and the pseudo-terminal's delivery, so the ratio is the
 /// harness's start to its first frame, its own binary's loading included,
-/// in units of that.
-///
+/// in units of that.///
 /// Method: 21 launches, after one warmup launch, each into a fresh fixture
 /// HOME (settings only, the project not yet trusted, so `--trust-project`
 /// grants it) on a fresh 80x24 pseudo-terminal. A launch is timed from just

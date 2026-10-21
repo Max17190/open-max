@@ -1,0 +1,46 @@
+# How cargo-mutants tests this workspace: in CI (.github/workflows/mutants.yml)
+# and when run by hand with `cargo mutants`. What its outcomes count for is in
+# scripts/check-mutants.sh.
+
+# Timeouts. A mutant's tests are stopped at 5 times the time the unmutated
+# tests took in the same run (the baseline), and never sooner than 150
+# seconds: about 5 times the whole workspace's tests on a CI runner (30 s).
+# cargo-mutants 27.1.0 times only the packages its mutants are in for the
+# baseline (8 s for open-max-core alone), while every mutant runs the whole
+# workspace's tests (below). Only a mutant that makes the tests hang, or run
+# several times longer, is stopped. Such a timeout is not a catch: it counts
+# as caught only when .cargo/mutants-allowed.txt gives the reason the hang is
+# how the mutant fails, and as missed otherwise. Builds have no timeout: a
+# mutated constant that evaluates forever stops rustc with an error (the
+# long_running_const_eval lint), which makes the mutant unviable, and the CI
+# job's own time limit bounds the rest.
+timeout_multiplier = 5.0
+minimum_test_timeout = 150
+
+# Each mutant runs every test target of the workspace: the tests of the package
+# it is in, and of the package that depends on it. The openmax tests start the
+# binary, which runs open-max-core's code, so they observe a mutant there that
+# open-max-core's own tests may not.
+#
+# Some of those tests stop openmax with a signal (crates/tui/tests/cli.rs sends
+# SIGINT, SIGQUIT, SIGHUP and SIGTERM), and openmax keeps a signal it inherited
+# as ignored. cargo-mutants handles SIGINT, SIGTERM and SIGHUP itself, which
+# hands the tests their defaults, but passes SIGQUIT on as it got it: started
+# as a shell's background job (`&`), which ignores SIGQUIT, its unmutated run
+# fails the SIGQUIT test. Run it in the foreground, as CI's step does.
+test_workspace = true
+
+# CI checks every crate with --locked; so does each mutant's build.
+additional_cargo_args = ["--locked"]
+
+# A CI run splits the mutants over runners with --shard k/n. Round-robin gives
+# each shard every n-th mutant, so each gets a like mix of files and the shards
+# finish together.
+sharding = "round-robin"
+
+# Mutants no test can observe, by name, each with its reason. A mutant in code
+# the run's target does not compile (#[cfg(...)] false there) is not listed
+# here: cargo-mutants names a function's non-Unix twin exactly as its Unix one,
+# so a name here would hide both. scripts/check-mutants.sh sets those aside
+# from the source instead.
+exclude_re = []

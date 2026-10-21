@@ -245,32 +245,34 @@ fn the_size_gate_fails_a_binary_over_its_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Every action CI runs is pinned to a full commit SHA, with the release it
-/// corresponds to in a trailing comment. A tag can be moved to other code
-/// after review, and these jobs run with the repository's token; a commit
-/// cannot change under its SHA.
+/// Every action CI runs, in ci.yml and in the Mutants workflow, is pinned to
+/// a full commit SHA, with the release it corresponds to in a trailing
+/// comment. A tag can be moved to other code after review, and these jobs run
+/// with the repository's token; a commit cannot change under its SHA.
 #[test]
 fn ci_pins_every_action_to_a_commit() {
-    let ci = read(".github/workflows/ci.yml");
-    let actions: Vec<&str> = ci
-        .lines()
-        .filter_map(|line| line.trim().trim_start_matches("- ").strip_prefix("uses: "))
-        .collect();
-    assert!(!actions.is_empty(), "ci.yml runs no actions, so this test pins nothing");
-    let unpinned: Vec<&str> = actions
-        .iter()
-        .copied()
-        .filter(|action| {
-            let Some((_, pin)) = action.split_once('@') else { return true };
-            let (sha, version) = pin.split_once(" # ").unwrap_or((pin, ""));
-            let full_sha = sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-            !full_sha || version.trim().is_empty()
-        })
-        .collect();
-    assert!(
-        unpinned.is_empty(),
-        "actions not pinned to a full commit SHA with their version in a trailing comment: {unpinned:?}"
-    );
+    for workflow in [".github/workflows/ci.yml", ".github/workflows/mutants.yml"] {
+        let text = read(workflow);
+        let actions: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.trim().trim_start_matches("- ").strip_prefix("uses: "))
+            .collect();
+        assert!(!actions.is_empty(), "{workflow} runs no actions, so this test pins nothing");
+        let unpinned: Vec<&str> = actions
+            .iter()
+            .copied()
+            .filter(|action| {
+                let Some((_, pin)) = action.split_once('@') else { return true };
+                let (sha, version) = pin.split_once(" # ").unwrap_or((pin, ""));
+                let full_sha = sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                !full_sha || version.trim().is_empty()
+            })
+            .collect();
+        assert!(
+            unpinned.is_empty(),
+            "{workflow}: actions not pinned to a full commit SHA with their version in a trailing comment: {unpinned:?}"
+        );
+    }
 }
 
 /// The release patches the shell installer after dist builds it and before it

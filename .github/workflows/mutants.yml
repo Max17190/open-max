@@ -1,0 +1,256 @@
+name: Mutants
+
+# Mutation testing with cargo-mutants, configured in .cargo/mutants.toml. A
+# pull request's run tests the mutants in the code it changes, and fails when
+# one was missed or timed out and is not listed with its reason in
+# .cargo/mutants-allowed.txt. A run of main, the weekly run and a run by hand
+# (on any branch) test every mutant in the workspace, and fail when the
+# mutation score is under its floor. scripts/check-mutants.sh judges both and
+# says what each outcome counts for.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays at 04:17 UTC.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A pull request's newer push cancels its older run. Runs of the whole
+# workspace queue instead: one runs, and a newer one waiting replaces an older
+# one waiting.
+concurrency:
+  group: mutants-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# bash with pipefail: a listing that fails must fail its step, not read as an
+# empty list.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-mutants 27.1.0's x86_64-unknown-linux-gnu release binary, checked
+  # against the sha256 its release publishes before it runs.
+  CARGO_MUTANTS_URL: https://github.com/sourcefrog/cargo-mutants/releases/download/v27.1.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz
+  CARGO_MUTANTS_SHA256: dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e
+  # Every job builds with this compiler, pinned like ci.yml's clippy
+  # toolchain. A full run lasts hours: under a floating `stable`, a Rust
+  # release during it would build the later shards with another compiler,
+  # whose `rustc --print cfg` can differ, and the judge refuses shards that
+  # differ. A new compiler can also move the unviable and caught counts, so
+  # the score compares only between runs of one version. 1.99.1 measured the
+  # floor in scripts/check-mutants.sh: bump it on purpose, with a full run,
+  # and move the floor in the same commit if the score moves.
+  RUST_TOOLCHAIN: 1.99.1
+
+# Every action is pinned to a full commit SHA, with its release in a trailing
+# comment, as ci.yml explains.
+jobs:
+  # Lists the mutants and splits them into shards. A mutant takes 18.5 seconds
+  # on a runner on average, its build and its tests together: 50 to a runner
+  # for a pull request, about 18 minutes with the shard's setup and its run
+  # of the unmutated tests, so a typical one finishes inside 30 minutes; 400
+  # to a runner for the whole workspace, 2 hours on average and under 3,
+  # inside GitHub's 6-hour job limit.
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      mutants: ${{ steps.plan.outputs.mutants }}
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # A pull request's run checks out its merge commit, whose first
+          # parent is the base branch: the change is the diff between them.
+          fetch-depth: 2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install cargo-mutants
+        run: |
+          curl -sSfL --retry 3 "$CARGO_MUTANTS_URL" -o "$RUNNER_TEMP/cargo-mutants.tar.gz"
+          echo "$CARGO_MUTANTS_SHA256  $RUNNER_TEMP/cargo-mutants.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/cargo-mutants.tar.gz" -C ~/.cargo/bin cargo-mutants
+
+      - name: List the mutants
+        id: plan
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git diff HEAD^1 HEAD > "$RUNNER_TEMP/change.diff"
+            set -- --in-diff "$RUNNER_TEMP/change.diff"
+            per_shard=50 most=8
+          else
+            set --
+            per_shard=400 most=40
+          fi
+          mutants=$(cargo mutants --list "$@" | wc -l)
+          shards=$(( (mutants + per_shard - 1) / per_shard ))
+          [ "$shards" -le "$most" ] || shards=$most
+          [ "$shards" -ge 1 ] || shards=1
+          echo "$mutants mutants in $shards shards"
+          {
+            echo "mutants=$mutants"
+            echo "count=$shards"
+            echo "shards=[$(seq -s , 0 $((shards - 1)))]"
+          } >> "$GITHUB_OUTPUT"
+
+  # Named without the matrix, so GitHub names each shard's job "Shard (k)",
+  # and the job a run without mutants skips "Shard": a name that read the
+  # matrix would show its expressions unevaluated there.
+  mutants:
+    name: Shard
+    needs: plan
+    if: needs.plan.outputs.mutants != '0'
+    runs-on: ubuntu-latest
+    # Inside GitHub's 6-hour job limit, which would end the job before it kept
+    # its outcomes.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      # Leaves room for every other workflow's jobs within the account's
+      # concurrent job limit (20 on GitHub's free plan).
+      max-parallel: 10
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      # No debug info: every mutant rebuilds and relinks the test binaries,
+      # and the tests behave the same without it.
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # Only main saves this cache: one for every pull request's shards would
+      # push main's out of the repository's cache space.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-mutants
+        run: |
+          curl -sSfL --retry 3 "$CARGO_MUTANTS_URL" -o "$RUNNER_TEMP/cargo-mutants.tar.gz"
+          echo "$CARGO_MUTANTS_SHA256  $RUNNER_TEMP/cargo-mutants.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/cargo-mutants.tar.gz" -C ~/.cargo/bin cargo-mutants
+
+      # Builds in the checkout (--in-place), so the cached dependencies are
+      # reused. cargo-mutants 27.1.0 tests the unmutated tree first (its
+      # baseline), but with only the packages its mutants are in, while each
+      # mutant runs every package's tests (test_workspace in
+      # .cargo/mutants.toml): a test of another package that fails here
+      # without any mutant would catch every mutant. So the step runs the
+      # whole workspace's tests on the unmutated tree first, in the same
+      # cgroup and with the same settings, and a failure there fails the
+      # shard; the mutants' builds reuse its build. Every shard runs the same
+      # arguments and shard count.
+      - name: Test the shard's mutants
+        env:
+          # rust-cache turns incremental compilation off for the steps after
+          # it, as suits a cached build. Each mutant rebuilds the one crate it
+          # changed, which is what incremental compilation is for.
+          CARGO_INCREMENTAL: 1
+          SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.count }}
+        run: |
+          # This step and every process it starts go in a cgroup that may use
+          # three quarters of the runner's memory, and no swap. A mutant can
+          # make a test allocate without bound (next_line answering Some(0)
+          # at the end of a file forever, to a test that keeps every line).
+          # In the cgroup such a test never takes the runner's own share: the
+          # kernel kills it at the cap, and it fails or times out. Without
+          # the cgroup the runner can run out of memory and be shut down,
+          # and the shard's outcomes are lost.
+          fence=/sys/fs/cgroup/mutants
+          grep -qw memory /sys/fs/cgroup/cgroup.subtree_control || echo +memory | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null
+          sudo mkdir -p "$fence"
+          echo "$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) * 3 / 4))K" | sudo tee "$fence/memory.max" > /dev/null
+          if [ -e "$fence/memory.swap.max" ]; then echo 0 | sudo tee "$fence/memory.swap.max" > /dev/null; fi
+          echo $$ | sudo tee "$fence/cgroup.procs" > /dev/null
+          echo "in cgroup $(cut -d: -f3 /proc/self/cgroup), memory.max $(cat "$fence/memory.max")"
+          # Every test passes on the unmutated tree, or a catch means nothing
+          # (above).
+          cargo test --workspace --locked
+          set -- --in-place --shard "$SHARD" --annotations none -vV
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git diff HEAD^1 HEAD > "$RUNNER_TEMP/change.diff"
+            set -- "$@" --in-diff "$RUNNER_TEMP/change.diff"
+          fi
+          # 2: a mutant was missed; 3: one timed out. The last job judges
+          # those; any other failure is the run's own.
+          status=0
+          cargo mutants "$@" || status=$?
+          case $status in 0 | 2 | 3) ;; *) exit "$status" ;; esac
+          # The target the mutants were built for, from which
+          # scripts/check-mutants.sh tells the code this run did not build.
+          rustc --print cfg > mutants.out/cfg.txt
+
+      # Re-running a run's failed jobs keeps the artifacts its earlier attempt
+      # uploaded, and the upload refuses a name the run already holds unless
+      # it may overwrite it. A shard that failed once cargo-mutants had
+      # started (its own unmutated run failed, or the job ran out of time)
+      # kept its outcomes under this name, so its re-run replaces them.
+      - name: Keep the shard's outcomes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          retention-days: 14
+          overwrite: true
+
+  # The shards' outcomes, merged and judged.
+  judge:
+    name: ${{ github.event_name == 'pull_request' && 'Mutants in the change' || 'Mutation score' }}
+    needs: [plan, mutants]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.plan.outputs.mutants != '0'
+        with:
+          pattern: mutants-shard-*
+          path: shards
+
+      - name: Judge the outcomes
+        env:
+          PLANNED: ${{ needs.plan.result }}
+          TESTED: ${{ needs.mutants.result }}
+          MUTANTS: ${{ needs.plan.outputs.mutants }}
+        run: |
+          [ "$PLANNED" = success ] || { echo "::error::listing the mutants failed"; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            [ "$MUTANTS" != 0 ] || { echo "the change has no mutants to test"; exit 0; }
+            set -- --diff
+          fi
+          [ "$TESTED" = success ] || { echo "::error::a shard did not finish: $TESTED"; exit 1; }
+          # A single artifact downloads into shards/ itself; more than one, each
+          # into a directory of its own there.
+          if [ -e shards/outcomes.json ]; then dirs=(shards); else dirs=(shards/*/); fi
+          scripts/check-mutants.sh "$@" --mutants "$MUTANTS" --missed missed.txt "${dirs[@]}"
+
+      - name: Keep the missed mutants
+        if: ${{ !cancelled() && hashFiles('missed.txt') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-missed
+          path: missed.txt
+          # A re-run of this job replaces the list, as a shard's re-run does
+          # its outcomes.
+          overwrite: true

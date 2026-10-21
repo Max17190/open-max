@@ -3,6 +3,9 @@ target
 
 # Local tooling state
 .firecrawl
+# cargo mutants, run by hand with .cargo/mutants.toml, writes its outcomes here
+/mutants.out/
+/mutants.out.old/
 .claude/settings.local.json
 .claude/worktrees/
 .worktrees/
