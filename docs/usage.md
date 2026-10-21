@@ -35,6 +35,7 @@ openmax -p --json "list public modules in crates/core"
 openmax --check                       # validate extension files and the session index
 openmax --spec hooks                  # print an extension surface's contract
 openmax --recall "deploy port"        # search past sessions and memories
+openmax --replay <id>.events.jsonl --json   # a session's events, offline
 openmax --stdio                       # full session over JSONL pipes
 openmax --mcp-list -- <server>        # list an MCP server's tools
 ```
@@ -201,6 +202,23 @@ it is idle. Close it in the other process or start a new session to continue
 working. `/new` and switching sessions release the old attachment after any
 in-flight work settles. A process exit releases its session locks. Read-only
 history and recall remain available.
+
+Each session keeps an event log, `~/.openmax/sessions/<id>.events.jsonl`: a
+format line, then every event sent to a frontend for the session while an
+openmax held it, each as the line `-p --json` prints for it.
+`openmax --replay <file> --json` prints those lines from that one file and
+reads nothing else, so a log copied to another machine replays there with no
+endpoint, settings, trust or data dir, and no tool runs; for a `-p --json` run
+it prints that run's stdout byte for byte. The log is written when a turn or a
+`/compact` ends, before the events that close it are sent; while a turn runs,
+each time 64 KiB of lines wait; and when the session is released. A turn that
+ends with its process (a crash, or a TUI quit while it runs) leaves out what it
+had not yet written, and a final line a crash cut off is passed over. A
+continued session appends to its log, a `/fork` or `/rewind` branch's log
+starts at the branch, a session saved before logs existed starts one when it
+is next continued, and deleting a session deletes its log. A file that is not
+an event log, a log in another format, or a damaged line exits 1 with the
+reason on stderr, after the lines before the damage.
 
 A damaged or unreadable transcript stops continuation with its path and the
 failure reason. Open Max preserves the original bytes and does not silently

@@ -166,6 +166,11 @@ pub struct Core {
     /// order: taken under `settings` when a caller holds it, and held across
     /// the `settings_disk_fingerprint` lock, which stays leaf-only.
     run_only: Mutex<Option<crate::config::RunOnly>>,
+    /// The event log lines each held session has not written yet
+    /// (`sessions::EventLog`). Held while an event is recorded and sent, so a
+    /// log holds a session's events in the order its frontend reads them.
+    /// Leaf-only: nothing else is locked while it is held.
+    pub(crate) event_log: Mutex<crate::sessions::EventLog>,
     events: mpsc::UnboundedSender<AgentEventEnvelope>,
 }
 
@@ -323,6 +328,7 @@ impl Core {
             message_restorations: Default::default(),
             settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
             run_only: Mutex::new(None),
+            event_log: Default::default(),
             events: tx,
         });
         Ok((core, rx))
@@ -365,6 +371,7 @@ impl Core {
             message_restorations: Default::default(),
             settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
             run_only: Mutex::new(None),
+            event_log: Default::default(),
             events: tx,
         });
         (core, rx, unreadable)
@@ -431,11 +438,19 @@ impl Core {
         Some(crate::config::load(&self.data_dir).map(|_| ()))
     }
 
+    /// Send `event` to the frontend and record it in the session's event log
+    /// (`sessions::record_event`), both under one lock, so the log holds the
+    /// session's events in the order the frontend reads them.
     pub fn send_agent(&self, session_id: &str, event: AgentEvent) {
-        let _ = self.events.send(AgentEventEnvelope {
-            session_id: session_id.to_string(),
-            event,
-        });
+        let envelope = AgentEventEnvelope { session_id: session_id.to_string(), event };
+        let mut log = self.event_log.lock().unwrap_or_else(|e| e.into_inner());
+        crate::sessions::record_event(&mut log, self, &envelope);
+        let _ = self.events.send(envelope);
+    }
+
+    /// Send a receipt `sessions::record_receipts` already recorded.
+    pub(crate) fn send_recorded(&self, receipt: AgentEventEnvelope) {
+        let _ = self.events.send(receipt);
     }
 
     pub fn respond_approval(&self, approval_id: &str, approved: bool) {

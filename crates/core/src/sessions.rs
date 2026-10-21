@@ -32,6 +32,17 @@
 //! with sessions silently dropped from the index. No lookup finds such a
 //! session again, and the still-indexed gate silently drops the transcript
 //! writes of any claim that did not see it indexed.
+//!
+//! Beside them, each session keeps an event log (`*.events.jsonl`): a format
+//! line, then every event a process holding the session sent its frontend
+//! for it, each as the line `--print --json` prints, in the order the
+//! frontend read them. It is written when a turn or a compaction ends, before
+//! its receipts are sent, mid-turn once 64 KiB wait, and on release, so a
+//! process that dies mid-turn leaves out what that turn had not written.
+//! Nothing reads it back but `--replay`, which prints it from that one file
+//! on any machine (`replay_events`). No other file changes for it: a session
+//! that predates it loads as before and starts a log when next continued,
+//! and a fork's log starts at the fork, as its usage log does.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -41,7 +52,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::state::Core;
-use crate::types::{AgentEvent, ChatMessage};
+use crate::types::{AgentEvent, AgentEventEnvelope, ChatMessage};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -141,6 +152,7 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
     // The one index read the session's writes cost while this claim lasts.
     if matches!(read_index(core), IndexRead::Loaded(metas) if metas.iter().any(|m| m.id == id)) {
         memo.listed.insert(id.to_string());
+        core.event_log.lock().unwrap_or_else(|e| e.into_inner()).pending.entry(id.to_string()).or_default();
     }
     owners.insert(id.to_string(), SessionOwner { _file: file, detach: false });
     Ok(())
@@ -165,6 +177,119 @@ pub(crate) struct StoreMemo {
     removed: HashSet<String>,
     /// Each owned transcript as this process last validated or wrote it.
     transcripts: HashMap<String, Stamp>,
+}
+
+/// The event log lines each session has not written yet, guarded by
+/// `Core::event_log`. A session has an entry while this process holds it and
+/// saw it indexed: a claim adds it with `listed`, and a release (after one
+/// last write) or a removal takes it out, so only an owner writes a log and a
+/// removed session's log is never written again. An event for a session
+/// without an entry, such as a refusal for one open in another process, is
+/// in no log.
+#[derive(Default)]
+pub(crate) struct EventLog {
+    pending: HashMap<String, String>,
+}
+
+/// The bytes of lines a session's event log holds back before writing them
+/// mid-turn: a streamed reply costs no write per token, and what waits stays
+/// this small however long the turn runs.
+const EVENTS_BATCH: usize = 64 * 1024;
+
+/// The format an event log's first line names, and the line itself.
+const EVENTS_FORMAT: &str = "openmax-events/1";
+const EVENTS_HEADER: &str = "{\"format\":\"openmax-events/1\"}\n";
+
+/// Record `envelope` in its session's event log as the line `--print --json`
+/// prints for it ([`AgentEventEnvelope::to_json_line`]), when the session has
+/// an entry (see [`EventLog`]), and write the log once [`EVENTS_BATCH`] bytes
+/// wait. The caller holds `Core::event_log` across this and the send, so the
+/// log holds the events in the order the frontend reads them.
+pub(crate) fn record_event(log: &mut EventLog, core: &Core, envelope: &AgentEventEnvelope) {
+    let Some(lines) = log.pending.get_mut(&envelope.session_id) else { return };
+    push_event(lines, envelope);
+    if lines.len() >= EVENTS_BATCH {
+        write_events(core, &envelope.session_id, lines);
+    }
+}
+
+/// Record the receipts that end a turn or a compaction (a turn's `done`; a
+/// compaction's `budget` and `compacted`, or its `error`) in the session's
+/// event log and write it, then hand them back to be sent
+/// (`Core::send_recorded`). The log is written before they are sent, since a
+/// frontend may exit on reading one (print mode exits on `done`), and while
+/// this process still holds the session: a detach the frontend asked for
+/// releases it before they are sent, and from then on another process may
+/// write the log.
+pub(crate) fn record_receipts(core: &Core, id: &str, events: Vec<AgentEvent>) -> Vec<AgentEventEnvelope> {
+    let receipts: Vec<_> =
+        events.into_iter().map(|event| AgentEventEnvelope { session_id: id.to_string(), event }).collect();
+    let mut log = core.event_log.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(lines) = log.pending.get_mut(id) {
+        receipts.iter().for_each(|receipt| push_event(lines, receipt));
+        write_events(core, id, lines);
+    }
+    receipts
+}
+
+fn push_event(lines: &mut String, envelope: &AgentEventEnvelope) {
+    if let Ok(line) = envelope.to_json_line() {
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+}
+
+/// Append `lines` to the session's event log, opened with its header when
+/// the file holds no line yet, and free them. Best-effort and silent, like
+/// usage: the events were already shown, so a full disk costs the replay
+/// those lines and never the turn. Called under `Core::event_log`, whose
+/// entries say this process may write the log.
+fn write_events(core: &Core, id: &str, lines: &mut String) {
+    if !lines.is_empty() {
+        let _ = append_records(&events_path(core, id), EVENTS_HEADER, &std::mem::take(lines), false);
+    }
+}
+
+/// Write the lines `path`, an event log, recorded to `out`: each line after
+/// the header, byte for byte, as `--print --json` prints it, in the order the
+/// frontend read them. Reads nothing but `path` (no index, settings, or data
+/// dir), so a log copied to another machine replays the same there. A final
+/// line a crash cut off is passed over, as every reader here passes one over;
+/// any other line that is not a JSON object is refused with its line number,
+/// after the lines before it are written.
+pub fn replay_events(path: &Path, out: &mut impl Write) -> Result<(), String> {
+    use std::io::BufRead;
+    let unreadable = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(unreadable)?);
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).map_err(unreadable)?;
+    let header = serde_json::from_slice::<serde_json::Value>(line.strip_suffix(b"\n").unwrap_or(&line)).ok();
+    match header.as_ref().and_then(|header| header.get("format")?.as_str()) {
+        Some(EVENTS_FORMAT) => {}
+        Some(format) if format.starts_with("openmax-events/") => {
+            return Err(format!("{} is an event log in {format}; this build replays {EVENTS_FORMAT}", path.display()));
+        }
+        _ => return Err(format!("{} is not an openmax event log", path.display())),
+    }
+    let mut number = 1;
+    loop {
+        line.clear();
+        number += 1;
+        if reader.read_until(b'\n', &mut line).map_err(unreadable)? == 0 {
+            break;
+        }
+        let record = line.strip_suffix(b"\n");
+        if record.is_none() && is_torn(&line) {
+            break;
+        }
+        let record = record.unwrap_or(&line);
+        let object = serde_json::from_slice::<serde_json::Value>(record).is_ok_and(|record| record.is_object());
+        if !object {
+            return Err(format!("{} is damaged at line {number}", path.display()));
+        }
+        out.write_all(record).and_then(|()| out.write_all(b"\n")).map_err(|e| format!("cannot write the replay: {e}"))?;
+    }
+    out.flush().map_err(|e| format!("cannot write the replay: {e}"))
 }
 
 /// A file as a stat sees it: its length, modification time, and status-change
@@ -240,12 +365,18 @@ pub(crate) fn finish_detach(core: &Core, id: &str, state: &mut HashMap<String, c
 
 /// Let go of a claim. What it let this process know goes first: once the
 /// flock is released another process can claim and remove the session, and
-/// from then on only the index can say whether it still exists.
+/// from then on only the index can say whether it still exists. So does its
+/// event log's entry, after the lines it held back are written, since from
+/// then on another process may write that log.
 fn release(core: &Core, owners: &mut HashMap<String, SessionOwner>, id: &str) {
     let mut memo = core.sessions_lock.lock().unwrap();
     memo.listed.remove(id);
     memo.transcripts.remove(id);
-    drop(memo);
+    let mut log = core.event_log.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut lines) = log.pending.remove(id) {
+        write_events(core, id, &mut lines);
+    }
+    drop((log, memo));
     owners.remove(id);
 }
 
@@ -279,6 +410,10 @@ fn manifest_path(core: &Core, id: &str) -> PathBuf {
 
 fn compaction_path(core: &Core, id: &str) -> PathBuf {
     sessions_dir(core).join(format!("{id}.compaction.jsonl"))
+}
+
+fn events_path(core: &Core, id: &str) -> PathBuf {
+    sessions_dir(core).join(format!("{id}.events.jsonl"))
 }
 
 /// One exchange-drop compaction event, append-only for recoverability.
@@ -1027,7 +1162,7 @@ fn write_jsonl(path: &Path, messages: &[ChatMessage]) -> Result<(), String> {
     write_atomic(path, out)
 }
 
-fn append_jsonl(path: &PathBuf, messages: &[ChatMessage], ordered: bool) -> Result<(), String> {
+fn append_jsonl(path: &Path, messages: &[ChatMessage], ordered: bool) -> Result<(), String> {
     // Serialize the whole tail first, then one write. Callers must heal on
     // failure (rewrite the full file) so a partial write cannot be re-appended
     // and duplicate complete lines when `persisted` is left unchanged.
@@ -1062,7 +1197,13 @@ fn append_jsonl(path: &PathBuf, messages: &[ChatMessage], ordered: bool) -> Resu
 /// first save wrote the file whole (`save_messages`) and what remains ends
 /// in a complete record or a torn one the loader drops, and a sync per save
 /// would cost every model request one.
-fn append_text(path: &PathBuf, text: &str, ordered: bool) -> Result<(), String> {
+fn append_text(path: &Path, text: &str, ordered: bool) -> Result<(), String> {
+    append_records(path, "", text, ordered)
+}
+
+/// `append_text`, with `opening` written ahead of `text` when the file holds
+/// no record: it is new, empty, or holds only a torn one, which is cut.
+fn append_records(path: &Path, opening: &str, text: &str, ordered: bool) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -1085,6 +1226,9 @@ fn append_text(path: &PathBuf, text: &str, ordered: bool) -> Result<(), String> 
         } else {
             buf.push('\n');
         }
+    }
+    if keep == 0 {
+        buf.push_str(opening);
     }
     buf.push_str(text);
     if let Err(e) = file.write_all(buf.as_bytes()) {
@@ -1456,15 +1600,18 @@ fn remove(core: &Core, id: &str, only_if_empty: bool) -> Result<bool, String> {
     metas.retain(|m| m.id != id);
     save_index(core, &metas)?;
     // Gone from the index, so gone for every write still in flight here,
-    // which learns it from this record rather than from the index.
+    // which learns it from this record rather than from the index. The event
+    // log's entry goes before its file, so no event written after recreates it.
     memo.listed.remove(id);
     memo.transcripts.remove(id);
     memo.removed.insert(id.to_string());
+    core.event_log.lock().unwrap_or_else(|e| e.into_inner()).pending.remove(id);
     let _ = std::fs::remove_file(messages_path(core, id));
     let _ = std::fs::remove_file(manifest_path(core, id));
     let _ = std::fs::remove_file(compaction_path(core, id));
     let _ = std::fs::remove_file(archive_path(core, id));
     let _ = std::fs::remove_file(usage_path(core, id));
+    let _ = std::fs::remove_file(events_path(core, id));
     // Still held by the claim above, and unlinked under the store lock every
     // claim opens it under (see `SessionOwner`).
     let _ = std::fs::remove_file(lock_path(core, id));
@@ -2173,6 +2320,63 @@ mod tests {
         assert!(load_usage(&core, &running.id).is_empty(), "a deleted session stays deleted");
         assert!(load_compaction(&core, &running.id).is_empty());
         assert!(load_archive(&core, &running.id).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A session's event log holds the events a process sent while it held
+    /// the session, each as the line `--print --json` prints, and is written
+    /// at a receipt, once 64 KiB wait, and on release: never per event, never
+    /// by a process that does not hold the session, and not again once the
+    /// session is removed. A process that continues it appends, under the
+    /// one header.
+    #[test]
+    fn the_event_log_is_written_by_its_holder_at_receipts_batches_and_release() {
+        let dir = std::env::temp_dir().join(format!("openmax-events-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let (other, _other_rx) = Core::new(dir.clone()).unwrap();
+        let id = create(&core, "/tmp/p".into()).unwrap().id;
+        let log = events_path(&core, &id);
+        let line = |event: &AgentEvent| {
+            AgentEventEnvelope { session_id: id.clone(), event: event.clone() }.to_json_line().unwrap() + "\n"
+        };
+        let text = |text: String| AgentEvent::Token { text };
+        let read = || std::fs::read_to_string(&log).unwrap_or_default();
+
+        core.send_agent(&id, text("not held yet".into()));
+        attach(&core, &id).unwrap();
+        let held = text("held".into());
+        core.send_agent(&id, held.clone());
+        other.send_agent(&id, text("sent by a process that does not hold it".into()));
+        assert!(!log.exists(), "an event is written with others, not on its own");
+        let done = AgentEvent::Done { stop_reason: "stop".into() };
+        let receipts = record_receipts(&core, &id, vec![done.clone()]);
+        assert_eq!(receipts.iter().map(|r| r.to_json_line().unwrap() + "\n").collect::<String>(), line(&done));
+        assert_eq!(read(), format!("{EVENTS_HEADER}{}{}", line(&held), line(&done)), "a receipt writes what waits, then itself");
+
+        // Mid-turn, the lines go out once they reach the documented 64 KiB,
+        // and not a byte before.
+        let fill = 64 * 1024 - line(&text(String::new())).len();
+        let full = text("x".repeat(fill));
+        core.send_agent(&id, full.clone());
+        assert!(read().ends_with(&line(&full)), "a batch's worth is written mid-turn");
+        let short = text("y".repeat(fill - 1));
+        core.send_agent(&id, short.clone());
+        assert!(!read().contains(&line(&short)), "a byte short of the batch waits");
+        detach(&core, &id).unwrap();
+        assert!(read().ends_with(&line(&short)), "a release writes what waits");
+
+        attach(&other, &id).unwrap();
+        let continued = text("continued elsewhere".into());
+        other.send_agent(&id, continued.clone());
+        detach(&other, &id).unwrap();
+        assert!(read().ends_with(&line(&continued)));
+        assert_eq!(read().matches(EVENTS_HEADER).count(), 1, "one header however many writers continue it");
+
+        delete(&core, &id).unwrap();
+        assert!(!log.exists(), "the log goes with its session");
+        core.send_agent(&id, text("late".into()));
+        record_receipts(&core, &id, vec![done]);
+        assert!(!log.exists(), "and nothing written after brings it back");
         let _ = std::fs::remove_dir_all(dir);
     }
 

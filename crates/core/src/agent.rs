@@ -1544,8 +1544,11 @@ async fn finish_session_work(core: &Core, id: &str, events: Vec<AgentEvent>) {
     // here, and its frontend, which saw no SteerAccepted for it, still has it.
     core.steers.lock().unwrap().remove(id);
     running.remove(id);
+    // Into the session's event log while this process still holds it: the
+    // detach below can release it (see `sessions::record_receipts`).
+    let receipts = sessions::record_receipts(core, id, events);
     sessions::finish_detach(core, id, &mut state);
-    for event in events { core.send_agent(id, event); }
+    for receipt in receipts { core.send_recorded(receipt); }
 }
 
 /// Append the messages sent to this turn since its last request
@@ -4959,12 +4962,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A turn's receipt goes out once its state is settled and a detach its
+    /// frontend asked for has released the session, and it is in the
+    /// session's event log by then, written while the session was held.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn completion_settles_state_and_deferred_detachment_before_receipt() {
         let dir = std::env::temp_dir().join(format!("openmax-done-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let (other, _) = Core::new(dir.clone()).unwrap();
         let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let log = dir.join("sessions").join(format!("{id}.events.jsonl"));
         for reason in ["stop", "cancelled", "blocked", "error"] {
             sessions::attach(&core, &id).unwrap();
             core.sessions.lock().await.insert(id.clone(), SessionData::default());
@@ -4979,6 +4986,8 @@ mod tests {
             assert!(sessions::attach(&other, &id).is_err(), "active work retains ownership");
             release.send(()).unwrap();
             let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            let logged = std::fs::read_to_string(&log).unwrap_or_default();
+            assert_eq!(logged.lines().last(), Some(event.to_json_line().unwrap().as_str()), "{logged}");
             assert!(matches!(event.event, AgentEvent::Done { stop_reason } if stop_reason == reason));
             assert!(!core.is_running(&id));
             assert!(!core.cancel_flags.lock().unwrap().contains_key(&id));
