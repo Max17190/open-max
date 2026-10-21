@@ -71,6 +71,92 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
 
+  # The thesis tests' timing assertions hold only in a release build, and the
+  # test job builds in debug, so this job builds them in release, with the
+  # profile the published binary ships with, on the test job's runners, and
+  # runs them one test at a time, so no measurement runs beside another, each
+  # printing what it measured: each test target named thesis* in the
+  # workspace and the binary's thesis_frames module. What each asserts is in
+  # its doc comment; the first frame is held as a ratio to a baseline
+  # binary's start, as timed from the spawn it includes the runner's own
+  # process start, which is not the harness's work.
+  # crates/tui/tests/thesis.rs holds this wiring.
+  thesis:
+    name: Thesis (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # The thesis tests a runner reports instead of gating, as it does not
+        # meet their targets with room; the reports step gives the numbers.
+        # README.md names them too.
+        include:
+          - os: ubuntu-latest
+            reported: harness_time_per_tool_round
+          - os: macos-latest
+            reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      # Only main saves this one: a release build's caches on two runners
+      # from every pull request would push main's out of the repository's
+      # cache space.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # What the two steps below run, so they build nothing under their
+      # timeouts, and the first-frame test's baseline binary, an example,
+      # which `cargo test` leaves unbuilt once a target is selected.
+      - name: Build release tests
+        run: |
+          cargo test --release --workspace --locked --no-run --test 'thesis*' --bin openmax
+          cargo build --release --workspace --locked --example startup_baseline
+
+      # The tests this runner reports, run to print their numbers, which also
+      # go to the job's summary, and allowed to fail, until it meets their
+      # targets with room. A step after a failed one is skipped, so this one
+      # runs before the gate step and prints its numbers whatever the gates
+      # do; its own failure, allowed, skips nothing. Over this job's first
+      # runs, six on ubuntu-latest and seven on macos-latest, the runners
+      # took about twice as long as the reference machine, an Apple M5, on
+      # the same single-threaded work, a transcript frame, and from one run
+      # to the next their times swung by more than the targets' room. The
+      # harness time per tool round, a median of 156 to 186 us on the M5
+      # against its 250 us target, measured 237 to 374 us on ubuntu-latest
+      # and 260 to 659 us on macos-latest. The frame's p99 at 100,000 lines,
+      # 0.074 to 0.090 ms on the M5 against 0.5 ms, measured 0.157 to
+      # 0.240 ms on ubuntu-latest, where it gates, and 0.151 to 0.504 ms on
+      # macos-latest, past the bound in two runs and within a fifth of it in
+      # two more, while its median held at 0.118 to 0.169 ms.
+      - name: Thesis reports
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          [ -n "${{ matrix.reported }}" ] || exit 0
+          cargo test --release --workspace --locked --test 'thesis*' --bin openmax --no-fail-fast -- --test-threads=1 --nocapture ${{ matrix.reported }} 2>&1 | tee "$RUNNER_TEMP/thesis-reports.log"
+          status=${PIPESTATUS[0]}
+          { echo "Reported, not gated, on ${{ matrix.os }}; cargo test exited $status:"; echo '```'; sed -n 's/.*MEASURE /MEASURE /p' "$RUNNER_TEMP/thesis-reports.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      # Every thesis test but the ones this runner reports, failing the pull
+      # request. Each command runs even when the one before it failed, so one
+      # failing test does not hide the others' measurements.
+      - name: Thesis gates
+        timeout-minutes: 5
+        run: |
+          skip=; for test in ${{ matrix.reported }}; do skip="$skip --skip $test"; done
+          cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1
+          cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1
+          exit ${failed:-0}
+
   # A release tag builds every target in Cargo.toml's [workspace.metadata.dist]
   # and publishes nothing unless all of them build, so each one is built here,
   # on the runner `dist plan` assigns it and with the packages the release

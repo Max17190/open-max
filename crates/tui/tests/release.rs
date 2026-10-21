@@ -177,8 +177,7 @@ fn ci_builds_and_size_gates_every_release_target() {
         "an `if:` on the release-build job or its build or gate step skips the gate, which passes the pull request that broke the target"
     );
     // On the gate's step or its job, this lets an over-budget binary pass.
-    let ci = read(".github/workflows/ci.yml");
-    let soft = ci.lines().map(str::trim).find(|line| !line.starts_with('#') && line.contains("continue-on-error"));
+    let soft = job.iter().map(|line| line.trim()).find(|line| !line.starts_with('#') && line.contains("continue-on-error"));
     assert_eq!(soft, None, "a continue-on-error step or job turns the size gate back into a warning");
     // The gate measures the release profile; dist publishes with its own
     // `dist` profile, so that profile must be release, unchanged.
