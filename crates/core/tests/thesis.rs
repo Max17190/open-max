@@ -66,42 +66,80 @@ fn text(reply: &str) -> serde_json::Value {
     })
 }
 
-/// The frozen prefix stays under 700 tokens for an empty project, checked as a
-/// byte cap. The prefix is messages[0] (the base rules, the extension pointer,
-/// and the project path) plus the `tools` array: what every request of a
-/// session resends first, and what a provider's prompt cache keys on. Method:
-/// a scripted endpoint records request 0 of a turn in an empty project trusted
-/// in `auto`; the gate takes the text of messages[0] less the fixture's
-/// project path, adds the `tools` array's raw wire bytes, and holds that
-/// path-free payload to 2,881 bytes: 700 tokens less a 30-token allowance for
-/// one project path, at 4.3 bytes per token. The path is left out because its
-/// cost depends on the machine: the fixture's project sits in a uuid-named
-/// dir, a 112-byte path under a macOS per-user temp dir and 60 bytes under
-/// /tmp, which cost 53 to 66 and 26 to 39 tokens over 2,000 random uuids each
-/// (1.5 to 2.3 bytes per token). Tokens are counted with tiktoken's o200k_base
-/// on each field's own text, messages[0] and the tools array, and summed. On
-/// request 0 from the release binary the path-free payload was 3,362 bytes and
-/// 762 tokens before the prefix was cut and 2,599 bytes and 589 tokens after,
-/// 4.41 bytes per token both times (cl100k_base counts 743 and 572), so the
-/// cap takes 4.3. Paths are priced in place, in the prompt's first sentence:
-/// twelve home-style project paths of 26 to 71 bytes cost 6 to 19 tokens (2.8
-/// to 4.4 bytes per token), so the allowance holds an 83-byte path even at
-/// 2.8. A byte cap is not a token count: text at fewer than 4.3 bytes per
-/// token (short words, punctuation, identifiers) can pass it above the target,
-/// which is why the budget ratchet in prompt.rs pins the same payload 63 bytes
-/// over its size at this cut and asks for a tokenizer count before its cap
-/// moves. The cut keeps the two instructions models break without them, and
-/// the gate holds them: write_file prefers edit_file for changes, and the
-/// closing summary does not repeat file contents. The execution policy note
-/// that follows messages[0] (120 bytes, 22 o200k tokens, after; 258 bytes, 47
-/// tokens, before) is history outside the counted prefix, though every request
-/// resends it too, and is printed here beside it.
+/// This repository's top two levels as its layout map showed them (hidden
+/// entries aside) when the prefix came under 700 tokens: the fixture of the
+/// frozen prefix gate, written out so the gate never reads the live checkout.
+/// A directory ends with a slash.
+const REPOSITORY_TREE: [&str; 17] = [
+    "AGENTS.example.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "crates/core/",
+    "crates/tui/",
+    "docs/assets/",
+    "docs/configuration.md",
+    "docs/extending.md",
+    "docs/stdio-protocol.md",
+    "docs/usage.md",
+    "scripts/check-binary-size.sh",
+    "scripts/check-suite-time.sh",
+    "scripts/patch-installer-checksum.sh",
+    "scripts/patch-installer-first-command.sh",
+    "scripts/release.sh",
+];
+
+/// The frozen prefix stays under 700 tokens in a project with this
+/// repository's top two levels as `REPOSITORY_TREE` records them, checked as a
+/// byte cap. The prefix is what every request of a session sends first:
+/// messages[0] (the base rules, the extension pointer, the project path, and
+/// the layout map) and the `tools` array, what a provider's prompt cache keys
+/// on, then the execution policy note the history resends after them. Method: a
+/// scripted endpoint records request 0 of a turn in a project trusted in `auto`
+/// whose tree is `REPOSITORY_TREE`, without an `AGENTS.md` (in a checkout that
+/// file is the user's own, and git ignores it here); the gate takes the text of
+/// messages[0] less the fixture's project path, adds the `tools` array's raw
+/// wire bytes and the note's text, and holds that path-free payload to 3,036
+/// bytes: 700 tokens less a 10-token allowance for the checkout path, at 4.4
+/// bytes per token. The path is left out because the fixture's sits in a
+/// uuid-named temp dir, whose cost depends on the machine. A checkout of this
+/// repository costs 9 tokens in place, in the prompt's first sentence, on
+/// either CI runner (/home/runner/work/open-max/open-max,
+/// /Users/runner/work/open-max/open-max), and 5 to 18 over ten home-directory
+/// checkouts (/Users/alice/code/open-max costs 7, a 70-byte synced-folder path
+/// 18). Tokens are counted with tiktoken's o200k_base on each field's own text,
+/// messages[0], the tools array and the note, and summed. On request 0 in this
+/// repository, with the tree recorded here, the path-free payload was 3,126
+/// bytes and 716 tokens before the layout map named each directory once (725
+/// with a 9-token checkout path), and 3,022 bytes and 678 tokens after (687),
+/// so a checkout path of up to 22 tokens keeps it within 700. The map's section
+/// went from 407 bytes and 106 tokens to 303 and 68; the payload measured 4.37
+/// and 4.46 bytes per token, so the cap takes 4.4. The tree is a snapshot: the
+/// gate does not see the repository grow, and each script or doc added at its
+/// top two levels adds its name to the live map, 2 to 4 tokens (11 to 20
+/// bytes), priced here only once the tree above lists it. A byte cap is not a
+/// token count: text at fewer than 4.4 bytes per token (short words,
+/// punctuation, identifiers) can pass it above the target, which is why the
+/// budget ratchet in prompt.rs pins the harness's fixed part 63 bytes over its
+/// size and asks for a tokenizer count before its cap moves. The cut keeps the
+/// two instructions models break without them, and the gate holds them:
+/// write_file prefers edit_file for changes, and the closing summary does not
+/// repeat file contents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frozen_prefix_is_under_700_tokens() {
     let dir = std::env::temp_dir().join(format!("omx-thesis-{}", uuid::Uuid::new_v4()));
     let data = dir.join("data");
     let project = dir.join("project");
-    std::fs::create_dir_all(&project).unwrap();
+    for path in REPOSITORY_TREE {
+        let at = project.join(path);
+        if path.ends_with('/') {
+            std::fs::create_dir_all(&at).unwrap();
+        } else {
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(&at, "").unwrap();
+        }
+    }
     let project = project.canonicalize().unwrap();
     let (base_url, bodies) = recording_endpoint(vec![text("ok")]).await;
     std::fs::create_dir_all(&data).unwrap();
@@ -132,18 +170,26 @@ async fn frozen_prefix_is_under_700_tokens() {
     let messages = serde_json::from_str::<Vec<serde_json::Value>>(fields["messages"].get()).unwrap();
     assert_eq!(messages[0]["role"], "system", "messages[0] is the system prompt");
     let system = messages[0]["content"].as_str().expect("the system prompt is text");
+    let note = messages[1]["content"].as_str().unwrap_or_default();
+    assert!(note.starts_with("[execution policy: auto;"), "messages[1] is the auto mode's note: {note}");
+    // The gate prices the fixture's whole layout map: the map's cap left no
+    // entry out, so it has no trailer, and every entry of the tree is named.
+    assert!(!system.contains(" more entries"), "the layout map's cap left entries out:\n{system}");
+    for path in REPOSITORY_TREE {
+        let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+        assert!(system.contains(name), "the layout map names {path}:\n{system}");
+    }
     let root = project.to_string_lossy();
     assert_eq!(system.matches(&*root).count(), 1, "the allowance prices one project path:\n{system}");
     let system_path_free = system.len() - root.len();
-    let bytes = system_path_free + tools.len();
+    let bytes = system_path_free + tools.len() + note.len();
     const TARGET_TOKENS: usize = 700;
-    const PATH_ALLOWANCE_TOKENS: usize = 30;
-    const BYTES_PER_TOKEN_TENTHS: usize = 43;
+    const PATH_ALLOWANCE_TOKENS: usize = 10;
+    const BYTES_PER_TOKEN_TENTHS: usize = 44;
     let cap = (TARGET_TOKENS - PATH_ALLOWANCE_TOKENS) * BYTES_PER_TOKEN_TENTHS / 10;
-    let note = messages[1]["content"].as_str().unwrap_or_default();
     println!(
         "MEASURE frozen_prefix_path_free_bytes {bytes} = {system_path_free} messages[0] without the \
-         {}-byte project path + {} tools; cap {cap}; then {} bytes of history ahead of the prompt: {note}",
+         {}-byte project path + {} tools + {} execution policy note; cap {cap}",
         root.len(),
         tools.len(),
         note.len(),
@@ -152,11 +198,13 @@ async fn frozen_prefix_is_under_700_tokens() {
         bytes <= cap,
         "the path-free frozen prefix is {bytes} bytes, over {cap} ({TARGET_TOKENS} tokens less \
          {PATH_ALLOWANCE_TOKENS} for the project path, at {}.{} bytes per token): messages[0] \
-         {system_path_free} bytes without the {}-byte path, plus tools {} bytes:\n{system}\n{tools}",
+         {system_path_free} bytes without the {}-byte path, plus tools {} bytes, plus the note {} \
+         bytes:\n{system}\n{tools}\n{note}",
         BYTES_PER_TOKEN_TENTHS / 10,
         BYTES_PER_TOKEN_TENTHS % 10,
         root.len(),
         tools.len(),
+        note.len(),
     );
     // Bytes are not bought with the instructions models break without them.
     let schemas = serde_json::from_str::<Vec<serde_json::Value>>(tools).unwrap();
@@ -302,8 +350,10 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
             .collect();
         assert_eq!(systems, [0], "request {n} sent a system message past messages[0]");
     }
-    // The index as the session began rides the prompt itself.
-    assert!(first_system.contains("src/main.rs"), "the prompt carries the layout map: {first_system}");
+    // The index as the session began rides the prompt itself: the layout map's
+    // line, which names the directory once and its entries under it.
+    let map_line = "src/: main.rs";
+    assert!(first_system.contains(map_line), "the prompt carries the layout map: {first_system}");
 
     let mut before: Vec<String> = Vec::new();
     let mut notes = Vec::new();
@@ -370,6 +420,6 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
     for needle in ["- wordfreq: top-n words", ".agents/skills/release/SKILL.md", ".openmax/memory/build.md"] {
         assert!(last.contains(needle), "the trailing note does not name {needle}: {last}");
     }
-    assert!(!last.contains("src/main.rs"), "the note repeats the prompt's index: {last}");
+    assert!(!last.contains(map_line), "the note repeats the prompt's index: {last}");
     let _ = std::fs::remove_dir_all(PathBuf::from(&dir));
 }
