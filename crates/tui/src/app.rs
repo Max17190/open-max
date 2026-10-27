@@ -477,6 +477,7 @@ pub struct App {
     header_line: Line<'static>,
     header_width: u16,
     status_line: Line<'static>,
+    chatgpt_account: Option<String>,
     status_width: u16,
     /// The approval mode the user was last shown: the one `status_line`
     /// shows, or one a note announced since, before the next frame draws it
@@ -783,12 +784,14 @@ impl App {
             header_line: Line::default(),
             header_width: u16::MAX,
             status_line: Line::default(),
+            chatgpt_account: None,
             status_width: u16::MAX,
             status_mode: None,
         }
     }
 
     async fn startup(&mut self, args: &Args) {
+        self.refresh_billing();
         if args.continue_session {
             let project = self.project.display().to_string();
             match sessions::latest(&self.core, &project) {
@@ -1823,6 +1826,13 @@ impl App {
         self.dirty.mark_chrome();
     }
 
+    fn refresh_billing(&mut self) {
+        let provider = self.core.settings.lock().unwrap().provider.clone();
+        self.chatgpt_account = provider.and_then(|p| open_max_core::providers::load_providers(&self.core.data_dir)
+            .get(&p).and_then(|p| p.chatgpt_account.as_deref().map(open_max_core::text::one_line)));
+        self.dirty.mark_chrome();
+    }
+
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
         let next = model_selection(&self.core.settings.lock().unwrap(), provider.clone(), model.clone());
         // The core's own save: it fingerprints the exact bytes it writes,
@@ -1831,6 +1841,7 @@ impl App {
         match self.core.save_settings(&next) {
             Ok(()) => {
                 *self.core.settings.lock().unwrap() = next;
+                self.refresh_billing();
                 let source = provider
                     .map(|name| format!(" from {name}"))
                     .unwrap_or_default();
@@ -2365,6 +2376,7 @@ impl App {
             return Ok(());
         }
 
+        self.refresh_billing();
         let session_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
@@ -2573,6 +2585,7 @@ impl App {
                             }
                             let _ = self.core.save_settings(&s);
                         }
+                        self.refresh_billing();
                         let ep = {
                             let s = self.core.settings.lock().unwrap();
                             open_max_core::providers::resolve(&s, &self.core.data_dir)
@@ -3949,6 +3962,8 @@ impl App {
                 format!(" {hint}")
             };
             let short_model = extensions::short_model(&model);
+            let billed_model = self.chatgpt_account.as_ref().map(|account| format!("Using ChatGPT plan ({account}) · {short_model}"));
+            let short_model = billed_model.as_deref().unwrap_or(short_model);
             // The widest tier labels its numbers: two unlabeled percents
             // (context fill, cache hits) would be indistinguishable. The
             // narrower tiers keep their historical shapes.

@@ -19,7 +19,7 @@ homepage = "https://github.com/Max17190/open-max"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Only the runtime pieces the harness uses; "full" would drag in the rest.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # Only the proxy matcher the HTTP client above decides with, so a connect
 # failure can tell whether the request went through a proxy.
@@ -32,6 +32,9 @@ similar = "2"
 uuid = { version = "1", features = ["v4"] }
 # Content hashes for the capability ledger (objects are addressed by sha256).
 sha2 = "0.10"
+# Reuse the TLS stack's crypto and encoding for OAuth PKCE and ID-token validation.
+ring = "0.17"
+base64 = "0.22"
 # Hand-authored external-tool configs (.openmax/tools/*.toml); parse only.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 libc = "0.2"

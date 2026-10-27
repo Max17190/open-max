@@ -308,6 +308,31 @@ fn cmd(project: &Path, home: &Path) -> Command {
     c
 }
 
+#[test]
+fn chatgpt_setup_is_separate_from_projects_and_session_authority() {
+    let (project, home) = fresh_dirs("chatgpt-setup");
+    // Even malformed project hooks are not loaded by account status.
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    std::fs::write(project.join(".openmax/hooks/invalid.toml"), "invalid [").unwrap();
+    let output = cmd(&project, &home).args(["--chatgpt", "status"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No ChatGPT accounts"));
+    for args in [vec!["--chatgpt","status","--trust-project"],vec!["--chatgpt","status","-p","hello"],
+        vec!["--chatgpt","status","--provider","local"],vec!["--account","main"],vec!["--chatgpt","unknown"]] {
+        let output = cmd(&project, &home).args(args).output().unwrap();
+        assert_eq!(output.status.code(),Some(2),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+    for action in ["login","logout"] {
+        let output = cmd(&project, &home).env("OPENMAX_SESSION","fixture").args(["--chatgpt",action]).output().unwrap();
+        assert_eq!(output.status.code(),Some(3));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("human action"));
+        let output = cmd(&project, &home).env_remove("OPENMAX_HUMAN_ATTEST").stdin(Stdio::null()).args(["--chatgpt",action]).output().unwrap();
+        assert_eq!(output.status.code(),Some(3));
+    }
+    assert!(!home.join(".openmax").exists(),"refused setup created runtime state");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// The authority-granting commands refuse a caller with no terminal and no
 /// attestation, even with the session marker absent: `env -u
 /// OPENMAX_SESSION openmax --approve` from an agent's bash (piped stdio, no

@@ -14,6 +14,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// A completions endpoint that answers each request with the next scripted
 /// reply (one JSON body, no stream) and records every request body.
 pub async fn recording_endpoint(responses: Vec<serde_json::Value>) -> (String, Arc<Mutex<Vec<String>>>) {
+    recording_http(responses, false).await
+}
+
+/// Each value is one terminal Responses event, framed as SSE.
+pub async fn recording_responses(responses: Vec<serde_json::Value>) -> (String, Arc<Mutex<Vec<String>>>) {
+    recording_http(responses, true).await
+}
+
+async fn recording_http(responses: Vec<serde_json::Value>, sse: bool) -> (String, Arc<Mutex<Vec<String>>>) {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let record = bodies.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -50,8 +59,10 @@ pub async fn recording_endpoint(responses: Vec<serde_json::Value>) -> (String, A
                 record.lock().unwrap().push(String::from_utf8_lossy(&buf[end + 4..]).to_string());
             }
             let payload = serde_json::to_string(&body).unwrap();
+            let payload = if sse { format!("data: {payload}\n\n") } else { payload };
+            let content_type = if sse { "text/event-stream" } else { "application/json" };
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 payload.len(),
                 payload
             );

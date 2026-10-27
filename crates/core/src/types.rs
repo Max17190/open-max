@@ -71,7 +71,8 @@ pub struct ChatMessage {
     /// sent (the text or summary of a block it streamed in parts under one
     /// index joined into one entry; every other part kept whole).
     /// OpenRouter carries signed and encrypted reasoning here, which the
-    /// plain text above cannot, and a model whose reasoning is signed needs
+    /// plain text above cannot. Responses stores its opaque reasoning items here
+    /// under the same endpoint-origin rule. A model whose reasoning is signed needs
     /// it back. Absent when the server sent none, like the two above, or an
     /// empty array, which carries nothing to send back.
     #[serde(default, skip_serializing_if = "Option::is_none")]

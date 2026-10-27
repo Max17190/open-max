@@ -39,7 +39,16 @@ openmax --recall "deploy port"        # search past sessions and memories
 openmax --replay <id>.events.jsonl --json   # a session's events, offline
 openmax --stdio                       # full session over JSONL pipes
 openmax --mcp-list -- <server>        # list an MCP server's tools
+openmax --chatgpt login              # browser sign-in and account model catalog
+openmax --chatgpt status             # account labels, without credential values
+openmax --chatgpt models --account work   # refresh one account's model catalog
+openmax --chatgpt logout             # revoke and clear this account's tokens
 ```
+
+ChatGPT account setup is a separate operation and cannot be combined with
+session or trust flags. `--account` defaults to `main`. See
+[ChatGPT sign-in](configuration.md#chatgpt-sign-in) for selecting its provider,
+context-window configuration, and billing behavior.
 
 `--base-url`, `--model`, `--api-key` (a literal or `'$ENV_VAR'`) and
 `--context-tokens` set the settings key of the same name. Each one is written

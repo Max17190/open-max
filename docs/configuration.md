@@ -128,7 +128,7 @@ Five more settings shape the context budget and each turn; all but
 override the first two.
 
 - `context_tokens` (required, here or in the model's `providers.json`
-  entry): the model's context window. Nothing is queried from the server,
+  entry): the model's context window. Ordinary turns do not query it from the server,
   and there is no default: a guessed window is wrong in one direction or the
   other (too small compacts a large model's history early, too large lets a
   small model's requests fail for length), so a turn refuses with a message
@@ -275,6 +275,11 @@ Set `"provider"` in settings, use the provider CLI option, or use `/provider`
 when you only want to change the endpoint. Optional `compat` flags cover picky
 gateways (for example `max_completion_tokens` versus `max_tokens`).
 
+`wire_api` defaults to `chat_completions`, preserving existing requests.
+An explicit `responses` selects the Responses protocol. The ChatGPT setup
+command writes this field with `chatgpt_account`; other endpoints may use
+Responses with their own API key.
+
 The trailing note (the tool files, skills, and memories a session added,
 changed, or removed after its prompt and tools array were built) is appended
 to the content of the request's last message, the user's prompt or the newest
@@ -311,6 +316,84 @@ silent after reply text is reported truncated. A provider's
 
 Open Max works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud
 gateways (OpenRouter and similar), and private proxies.
+
+## ChatGPT sign-in
+
+Run account setup from a human terminal, independently of a project:
+
+```sh
+openmax --chatgpt login
+openmax --chatgpt status
+openmax --chatgpt models
+openmax --chatgpt logout
+```
+
+`login` opens OpenAI's consent page in your browser and prints its URL as a
+fallback. The browser must reach the callback on the machine running Open Max,
+at `127.0.0.1`. Sign-in waits up to five minutes. It uses the documented public
+client flow, without a client secret or an API key. Login and logout use the
+same human-action gate as a trust grant. They load no project instructions,
+run no hooks, and grant no project trust.
+
+The default account label is `main`. Add `--account work` to any setup command
+to use another label. `status` lists all labels. A label retains its issued
+client ID and verified identity after logout, so another identity needs
+another label. Successful login fetches that account's current model catalog
+and adds `chatgpt-main` (or `chatgpt-work`) to `~/.openmax/providers.json`:
+
+```json
+{
+  "base_url": "https://api.openai.com/v1",
+  "wire_api": "responses",
+  "chatgpt_account": "main",
+  "models": []
+}
+```
+
+This is the provider entry's shape; setup fills `models` with the service's
+visible models in their reported order. Setup preserves other providers and
+does not select a provider or overwrite `settings.json`. Select a returned
+model with `/model` or `openmax --provider chatgpt-main --model <model-id>`.
+The picker reads the local catalog; `--chatgpt models` refreshes it explicitly.
+When the service omits a context window, set the model's documented
+`context_tokens` in its catalog entry or pass `--context-tokens`. The existing
+global `context_tokens` fallback still applies; verify it for the selected model. Refreshing
+the catalog retains a manually supplied window when the service omits one.
+No model name, availability, or context limit is guessed.
+
+ChatGPT credentials live only in `~/.openmax/chatgpt.json`, an owner-only
+file (mode 600), separate from provider settings and session transcripts.
+Refresh uses a process lock and atomically replaces the access and refresh
+tokens together. A cancelled waiting turn lets a token rotation finish.
+Logout attempts remote revocation, clears local tokens, and reports when
+remote revocation was not confirmed. To revoke access directly, use
+[ChatGPT Settings](https://chatgpt.com/settings/usage). Temporary network
+failures retain credentials; an unusable refresh token requires sign-in again.
+
+The ChatGPT provider requires the fixed HTTPS API root above and refuses
+custom keys, key environment variables, and headers. It never inherits
+`OPENMAX_API_KEY` or switches billing after an error. If sign-in succeeds
+without permission to use the plan, the account remains signed in with plan
+usage disabled. Run `login` for that label again to request consent, or select
+another provider. Availability depends on the account, plan, workspace, and
+OpenAI policy. The TUI identifies the selected ChatGPT billing route, and
+limit errors link to [usage settings](https://chatgpt.com/settings/usage);
+an app limit does not imply that the whole plan is exhausted.
+
+ChatGPT inference uses streaming Responses with `store: false` and the
+required local history on every request. The existing loop, seven tools,
+trust checks, approvals, permissions, hooks, and sessions still apply.
+Opaque reasoning is replayed only to the same model, endpoint, and registered
+account. Failed, incomplete, and interrupted responses cannot dispatch their
+partial tool calls. The subscription route omits unsupported sampling and
+output-limit parameters: `max_tokens` remains a local context reserve and
+spend estimate, not an enforced server output limit, and `temperature` is
+not sent. API-key providers retain their configured behavior.
+
+Protocol references: [registration](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),
+[account storage and refresh](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions),
+[inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference),
+and [current route limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
 
 ## Project trust
 

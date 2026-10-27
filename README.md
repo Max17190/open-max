@@ -14,7 +14,7 @@
 
 Open Max is a single binary that runs a focused agent loop in your project directory and streams every tool call to the terminal. Point it at the model server you choose: local, cloud, or a private proxy. No desktop shell, no heavyweight runtime, no telemetry.
 
-The endpoint must return structured API `tool_calls` to use tools. For local servers, configure the model's tool parser and chat template. Call markup in assistant text is displayed as text and never executed. Responses are limited to 16 MiB and 128 tool calls.
+The endpoint must return structured API tool calls to use tools. For local servers, configure the model's tool parser and chat template. Call markup in assistant text is displayed as text and never executed. Responses are limited to 16 MiB and 128 tool calls.
 
 
 You own the endpoints, the tools, the skills, and the context.
@@ -29,7 +29,7 @@ You own the endpoints, the tools, the skills, and the context.
 - **File based memory.** One durable fact per file in `.openmax/memory/`, written by the agent, surfaced as an index line in future sessions, ranked by recency and frequency of observed use. Old entries fade from the index and remain searchable on disk until the user or agent deletes them. No database, no daemon, no embeddings; zero prompt cost when empty.
 - **Recall over everything kept.** `openmax --recall "<query>"` searches this project's past sessions, compaction archives, digests, and memories in one bounded streaming pass — BM25 relevance fused with the same recency law, ranked excerpts, each citing the file with the full record. No index to build or maintain: the stores on disk stay the single source of truth.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
-- **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts only the model endpoint you configure.
+- **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts your configured model endpoint and, when you connect ChatGPT, OpenAI's authentication service.
 - **Offline replay.** Each session keeps an event log. Copied to any machine, `openmax --replay <log> --json` prints from it, byte for byte, what `-p --json` printed during the run, with no endpoint, settings, trust or data dir.
 
 ## Design
@@ -160,6 +160,14 @@ Named endpoints in `providers.json` and `compat` flags for picky gateways are co
 
 ## Use
 
+To use an eligible ChatGPT plan, run `openmax --chatgpt login` from your
+terminal. It opens browser consent and adds an account-specific model catalog.
+Choose a returned model with `/model` or `--provider chatgpt-main --model
+<model-id>`. Supply `--context-tokens` from the model's documentation when the
+catalog does not report it. Existing provider settings stay selected until
+you choose ChatGPT. See [ChatGPT sign-in](docs/configuration.md#chatgpt-sign-in)
+for account management and usage limits.
+
 The first run is one command. In your project, give it your model server's
 API root, model id and context window, and a first task:
 
@@ -271,7 +279,7 @@ An openmax killed outright (`kill -9`, or a crash that runs no handler) cannot s
 
 Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
 
-Open Max itself does not phone home. Apart from native child processes, the harness contacts only the model endpoint you configure.
+Open Max itself has no telemetry. Apart from native child processes, the harness contacts your configured model endpoint and, for an explicitly connected ChatGPT account, OpenAI's authentication service for sign-in, renewal, and sign-out.
 
 Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. `/status` lists the destinations configured by the harness and detailed runtime information; it does not enforce or enumerate child-process network access, and external tools you install may open their own network connections.
 
@@ -300,9 +308,9 @@ The thesis tests (in every `crates/*/tests/thesis*.rs` and the binary's `thesis_
 
 The frozen prefix meets its 700-token target: `frozen_prefix_is_under_700_tokens` (`crates/core/tests/thesis.rs`) prices what every request resends first, messages[0] without the project path plus the `tools` array and the note that follows, against a 3,036-byte cap, which is 700 tokens less a 10-token allowance for one path at 4.4 bytes per token, and measures 3,022 bytes, 678 tokens, today. Peak memory does not meet its target yet: `headless_turn_peak_rss_is_under_four_megabytes` reports a two-round turn's peak RSS, from `wait4`, against a 4,000,000-byte target, which a release build misses at 6,544 KiB by median today. What that test enforces is a ratchet, on macOS Apple silicon in a release build only, over a second series of the same runs started with `MallocMaxMagazines=1`: 4,016 KiB beyond the binary's own floor. Anywhere else it asserts a sanity bound of twenty times the target, and on Linux every figure starts from the test process's own high-water mark, so it bounds the turn's from above.
 
-`scripts/count-core-lines.sh` (bash and perl) prints two line counts for each crate and in total: core-excluding-tests, the lines of `crates/*/src` less its test-only code (`#[test]` functions, `#[<path>::test]` functions such as `#[tokio::test]` ones, items under a `cfg` that needs `test`, and the module files those items load, found by matching brackets outside strings, chars and comments, by the method in the script's header; the input of `stringify!` and the rules of a `macro_rules!` are text the build keeps, so no attribute in them is read), and total-including-tests, every line of every `.rs` file under `crates/` (build output in a crate's `target/` directory aside), so a test's lines count toward total-including-tests wherever they sit and toward core-excluding-tests nowhere. The script stops with an error naming the file and line of a test-only item whose end it cannot find, rather than guess. The test `core_source_stays_under_its_line_budget` in `crates/tui/tests/thesis.rs` holds the script to a fixture whose every source line is marked counted or excluded, and fails when the script stops, when core-excluding-tests is over the ratchet the test sets, or when it is under the count that ratchet was set from, so a change that removes production lines lowers the ratchet with them. The ratchet is 41,633 today, 200 over the 41,433 lines measured, against a target of 37,000.
+`scripts/count-core-lines.sh` (bash and perl) prints two line counts for each crate and in total: core-excluding-tests, the lines of `crates/*/src` less its test-only code (`#[test]` functions, `#[<path>::test]` functions such as `#[tokio::test]` ones, items under a `cfg` that needs `test`, and the module files those items load, found by matching brackets outside strings, chars and comments, by the method in the script's header; the input of `stringify!` and the rules of a `macro_rules!` are text the build keeps, so no attribute in them is read), and total-including-tests, every line of every `.rs` file under `crates/` (build output in a crate's `target/` directory aside), so a test's lines count toward total-including-tests wherever they sit and toward core-excluding-tests nowhere. The script stops with an error naming the file and line of a test-only item whose end it cannot find, rather than guess. The test `core_source_stays_under_its_line_budget` in `crates/tui/tests/thesis.rs` holds the script to a fixture whose every source line is marked counted or excluded, and fails when the script stops, when core-excluding-tests is over the ratchet the test sets, or when it is under the count that ratchet was set from, so a change that removes production lines lowers the ratchet with them. The ratchet is 42,870 today, 200 over the 42,670 lines measured, against a target of 37,000. Native ChatGPT authentication and Responses translation add 1,237 production lines; the agent loop and trust dispatcher are unchanged.
 
-`scripts/check-test-count.sh` counts the tests `cargo test --workspace -- --list` lists, less the ignored ones, and fails when there are fewer than 1,427 on Linux, or 1,425 on macOS: each compiles a few tests the other does not, so each has a floor of its own. CI runs it in the test job on both; on any other platform it reports the count and passes. The target is 2,000 tests.
+`scripts/check-test-count.sh` counts the tests `cargo test --workspace -- --list` lists, less the ignored ones, and fails when there are fewer than 1,427 on Linux, or 1,441 on macOS: each compiles a few tests the other does not, so each has a floor of its own. CI runs it in the test job on both; on any other platform it reports the count and passes. The target is 2,000 tests.
 
 The Mutants workflow runs cargo-mutants (configured in `.cargo/mutants.toml`) on Linux runners, and `scripts/check-mutants.sh` judges its outcomes. On a pull request it tests the mutants in the code the change touches, and fails when one was missed or timed out and is not listed with its reason in `.cargo/mutants-allowed.txt`. On a push to main, weekly, and when run by hand, it tests every mutant in the workspace, and fails when the mutation score, caught / (caught + missed), is under 76.60%: the score of the full run that set it, 76.80%, less a margin of 0.20 points for the few mutants that come out differently from one run of the same code to the next. Either run leaves out the mutants in code Linux does not compile, such as macOS-only code. A full run takes hours, so a push made while one is going waits, and only the newest push waiting is tested. The target is 95%. [Testing](docs/testing.md) says what each outcome counts for, how the floor moves, and how to read a run.
 
