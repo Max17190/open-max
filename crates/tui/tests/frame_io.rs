@@ -724,8 +724,8 @@ mod first_frame {
         s.write(b"/login fixture\r");
         let restored = s.wait_for(LEAVE_ALT_SCREEN, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not restore terminal: {}", s.context()));
         s.wait_for(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
-        // Release events, modified characters, oversized paste, and control-bearing paste are inert.
-        s.write(b"\x1b[120;1:3u\x01\x1bqX");
+        // Ordinary c/d are text, not cancellation. Other modified or invalid input is inert.
+        s.write(b"cd\x7f\x7f\x1b[120;1:3u\x01\x1bqX");
         s.write_bounded(format!("\x1b[200~{key}\x1b[201~\x7f\x1b[200~bad\npaste\x1b[201~\x1b[200~{key}\x1b[201~z\r").as_bytes());
         let model = s.wait_for(b"Choose a model", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("catalog was not loaded: {}", s.context()));
         s.write(b"x");
