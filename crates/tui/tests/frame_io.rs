@@ -1391,6 +1391,18 @@ mod first_frame {
         assert_eq!(saved.provider.as_deref(), Some("saved"));
         assert!(saved.reasoning_effort.is_none(), "temporary endpoint effort must not poison the saved endpoint");
         assert!(open_max_core::providers::resolve(&saved, &data).is_ok());
+        s.write(b"/provider saved\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ignores reasoning effort"));
+        assert!(shown.contains("ignores reasoning effort"), "{shown}");
+        assert!(open_max_core::config::load(&data).unwrap().reasoning_effort.is_none());
+        s.write(b"/model stub-model\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("model set to stub-model"));
+        assert!(shown.contains("model set to stub-model"), "{shown}");
+        assert!(open_max_core::config::load(&data).unwrap().reasoning_effort.is_none(), "later saves preserve run-only effort");
+        s.write(b"/effort default\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default"));
+        assert!(shown.contains("requested: default"), "{shown}");
+        assert!(open_max_core::providers::resolve(&open_max_core::config::load(&data).unwrap(), &data).is_ok());
         s.write(CTRL_C_TWICE);
         assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
 

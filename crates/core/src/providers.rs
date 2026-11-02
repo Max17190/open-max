@@ -755,8 +755,8 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
 
 /// Known compatibility routes can accept the field while ignoring its value.
 pub fn validate_reasoning_effort(base: &str, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
-    if effort.is_some() && reqwest::Url::parse(base).ok().and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| host == "api.anthropic.com") {
+    if effort.is_some()
+        && reqwest::Url::parse(base).is_ok_and(|url| url.host_str() == Some("api.anthropic.com")) {
         return Err("this endpoint ignores reasoning effort; choose /effort default or --effort default".into());
     }
     Ok(())

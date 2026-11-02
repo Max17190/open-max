@@ -339,7 +339,7 @@ impl KeyFlags {
             &mut file.context_tokens,
             &mut run.context_tokens,
         );
-        place(&mut applied, "reasoning_effort", self.reasoning_effort, write, Option::is_none,
+        place(&mut applied, "reasoning_effort", self.reasoning_effort.filter(|value| *value != file.reasoning_effort), write, Option::is_none,
             &mut file.reasoning_effort, &mut run.reasoning_effort);
         (run, applied)
     }
@@ -390,7 +390,12 @@ impl RunOnly {
     pub(crate) fn select_effort(&self, settings: &Settings) -> (Settings, RunOnly) {
         let mut selected = self.clone();
         selected.keys.retain(|key| *key != "reasoning_effort");
-        selected.save(settings)
+        let (saved, mut next) = selected.save(settings);
+        if next.holds_endpoint(settings) {
+            next.run.reasoning_effort = settings.reasoning_effort;
+            next.keys.push("reasoning_effort");
+        }
+        (saved, next)
     }
 
     /// What a save of `settings` writes, and the overrides that hold after
@@ -606,6 +611,8 @@ mod tests {
 
     #[test]
     fn effort_overrides_survive_unrelated_saves_without_leaking_to_disk() {
+        let (_, unchanged) = KeyFlags { reasoning_effort: Some(None), ..KeyFlags::default() }.apply(&mut Settings::default());
+        assert_eq!(unchanged, Applied::default(), "Default against an unset value writes nothing");
         for selected in [None, Some(ReasoningEffort::None), Some(ReasoningEffort::Max)] {
             let original = Settings { reasoning_effort: Some(ReasoningEffort::High), ..Settings::default() };
             let mut file = original.clone();
@@ -630,6 +637,11 @@ mod tests {
             assert!(saved.reasoning_effort.is_none(), "temporary endpoint selections must not change the saved endpoint");
             assert!(next.holds_endpoint(&run));
             assert!(next.save(&run).0.reasoning_effort.is_none(), "later unrelated saves keep the same scope");
+            run.provider = None;
+            run.base_url = "http://saved/v1".into();
+            let (saved, next) = next.save(&run);
+            assert!(saved.reasoning_effort.is_none(), "leaving the temporary endpoint cannot persist its effort");
+            assert!(next.save(&run).0.reasoning_effort.is_none());
         }
     }
 
