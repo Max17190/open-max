@@ -128,6 +128,47 @@ async fn invalid_catalogs_and_rejected_edits_preserve_the_original_bytes() {
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
+#[tokio::test]
+async fn catalog_size_limit_accepts_the_boundary_and_rejects_larger_reads_and_writes() {
+    let scratch = Scratch::new();
+    let path = providers::providers_path(&scratch.0);
+    let limit = 1_048_576;
+    let mut entry = json!({"base_url":"https://fixture.invalid/v1","padding":""});
+    let overhead = serde_json::to_vec_pretty(&json!({"providers":{"boundary":entry.clone()}}))
+        .unwrap()
+        .len();
+    let padding = limit - overhead;
+    entry["padding"] = json!("x".repeat(padding));
+    providers::edit_catalog(&scratch.0, |catalog| {
+        catalog.insert("boundary".into(), entry);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let exact = std::fs::read(&path).unwrap();
+    assert_eq!(exact.len(), limit);
+    let loaded = providers::read_catalog(&scratch.0).unwrap();
+    assert_eq!(loaded["boundary"]["padding"].as_str().unwrap().len(), padding);
+    let error = providers::edit_catalog(&scratch.0, |catalog| {
+        let text = catalog["boundary"]["padding"].as_str().unwrap();
+        catalog["boundary"]["padding"] = json!(format!("{text}x"));
+        Ok(())
+    })
+    .await
+    .unwrap_err();
+    assert!(error.contains("size limit"));
+    assert_eq!(std::fs::read(&path).unwrap(), exact);
+    let mut oversized = exact;
+    oversized.push(b' ');
+    std::fs::write(&path, &oversized).unwrap();
+    assert!(providers::read_catalog(&scratch.0).unwrap_err().contains("size limit"));
+    assert!(providers::edit_catalog(&scratch.0, |_| Ok(()))
+        .await
+        .unwrap_err()
+        .contains("size limit"));
+    assert_eq!(std::fs::read(&path).unwrap(), oversized);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn catalog_and_lock_symlinks_are_refused_without_changing_their_targets() {
@@ -161,8 +202,14 @@ async fn a_busy_catalog_lock_has_a_bounded_wait() {
         .unwrap();
     held.lock().unwrap();
     let started = tokio::time::Instant::now();
-    let error = providers::edit_catalog(&scratch.0, |_| Ok(())).await.unwrap_err();
-    assert!(error.contains("busy"));
+    let mut waiting = Box::pin(providers::edit_catalog(&scratch.0, |_| Ok(())));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    match std::future::Future::poll(waiting.as_mut(), &mut context) {
+        std::task::Poll::Ready(Err(error)) => assert!(error.contains("busy")),
+        _ => panic!("provider catalog lock retried past its deadline"),
+    }
     assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(5));
     assert!(!providers::providers_path(&scratch.0).exists());
 }
@@ -200,9 +247,14 @@ async fn temperature_omission_requires_explicit_provider_compatibility() {
     providers::edit_catalog(&scratch.0, |catalog| {
         catalog.remove("automatic");
         Ok(())
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(matches!(providers::resolve(&settings, &scratch.0),
         Err(providers::ResolveError::UnknownProvider(name)) if name == "automatic"));
     settings.provider = Some("original".into());
-    assert_eq!(providers::resolve(&settings, &scratch.0).unwrap().temperature, Some(0.25));
+    assert_eq!(
+        providers::resolve(&settings, &scratch.0).unwrap().temperature,
+        Some(0.25)
+    );
 }

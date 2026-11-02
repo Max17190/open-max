@@ -247,7 +247,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>) -> Result<(),
         }
     }
     eprintln!("Checking access and loading available models...");
-    let models = discover(&base, &key, headers).await?;
+    let models = discover(&base, &key, headers, base == OPENAI).await?;
     let model = if models.is_empty() {
         eprintln!("This endpoint does not expose a model catalog, so access could not be verified. Enter its exact model ID.");
         prompts.ask("Model ID", false).await?
@@ -305,7 +305,28 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>) -> Result<(),
         key
     });
     entry.as_object_mut().unwrap().remove("api_key_env");
-    if preset.is_some() {
+    api_defaults(&mut entry, &name, previous.is_none())?;
+    providers::edit_catalog(dir, |entries| {
+        unchanged(entries.get(&name), previous.as_ref())?;
+        entries.insert(name.clone(), entry);
+        Ok(())
+    })
+    .await?;
+    eprintln!(
+        "Saved connection {}. Credentials are stored locally with owner-only permissions.",
+        one_line(&name)
+    );
+    eprintln!(
+        "Choose it with /model, or run openmax --provider {} --model {}",
+        open_max_core::doctor::shell_quote(Path::new(&name)),
+        open_max_core::doctor::shell_quote(Path::new(&model))
+    );
+    Ok(())
+}
+
+fn api_defaults(entry: &mut Value, name: &str, new: bool) -> Result<(), String> {
+    if !new { return Ok(()); }
+    if matches!(name, "openai" | "anthropic") {
         let compat = entry
             .as_object_mut()
             .unwrap()
@@ -323,21 +344,6 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>) -> Result<(),
             "chat_completions"
         });
     }
-    providers::edit_catalog(dir, |entries| {
-        unchanged(entries.get(&name), previous.as_ref())?;
-        entries.insert(name.clone(), entry);
-        Ok(())
-    })
-    .await?;
-    eprintln!(
-        "Saved connection {}. Credentials are stored locally with owner-only permissions.",
-        one_line(&name)
-    );
-    eprintln!(
-        "Choose it with /model, or run openmax --provider {} --model {}",
-        open_max_core::doctor::shell_quote(Path::new(&name)),
-        open_max_core::doctor::shell_quote(Path::new(&model))
-    );
     Ok(())
 }
 
@@ -374,6 +380,7 @@ async fn discover(
     base: &str,
     key: &str,
     headers: &serde_json::Map<String, Value>,
+    openai: bool,
 ) -> Result<Vec<Value>, String> {
     validate_url(base)?;
     let client = reqwest::Client::builder()
@@ -418,8 +425,12 @@ async fn discover(
         }
         bytes.extend_from_slice(&chunk);
     }
+    parse_catalog(&bytes, openai)
+}
+
+fn parse_catalog(bytes: &[u8], openai: bool) -> Result<Vec<Value>, String> {
     let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "provider returned an invalid model catalog")?;
+        serde_json::from_slice(bytes).map_err(|_| "provider returned an invalid model catalog")?;
     let models = value["data"]
         .as_array()
         .ok_or("provider returned no model catalog")?;
@@ -428,6 +439,7 @@ async fn discover(
         .filter(|m| {
             m["id"].as_str().is_some_and(|id| {
                 !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+                    && (!openai || openai_response_model(id))
             })
         })
         .cloned()
@@ -438,24 +450,54 @@ async fn discover(
     Ok(models)
 }
 
+fn openai_response_model(id: &str) -> bool {
+    let base = id.strip_prefix("ft:").unwrap_or(id).split(':').next().unwrap_or(id);
+    ![
+        "text-embedding", "omni-moderation", "text-moderation", "tts", "dall-e",
+        "gpt-image", "gpt-realtime", "gpt-live", "gpt-transcribe",
+        "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "gpt-4o-mini-tts", "whisper",
+    ].iter().any(|family| {
+        base == *family || base.strip_prefix(family).is_some_and(|suffix| suffix.starts_with('-'))
+    })
+}
+
 #[cfg(test)]
 #[path = "setup_tests.rs"]
 mod tests;
 
+static INPUT_ACTIVE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Keep the guard until forced process exit so another prompt cannot enter behind it.
+pub(crate) fn restore_input() -> std::sync::MutexGuard<'static, bool> {
+    let mut active = INPUT_ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+    if *active {
+        let _ = terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stderr(), crossterm::event::DisableBracketedPaste);
+        *active = false;
+    }
+    active
+}
+
 struct InputMode;
 impl InputMode {
     fn enter() -> Result<Self, String> {
-        terminal::enable_raw_mode().map_err(|_| "cannot read terminal input")?;
-        let guard = Self;
-        crossterm::execute!(std::io::stderr(), crossterm::event::EnableBracketedPaste)
-            .map_err(|_| "cannot prepare terminal input")?;
-        Ok(guard)
+        let prepared = {
+            let mut active = INPUT_ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+            terminal::enable_raw_mode().map_err(|_| "cannot read terminal input")?;
+            *active = true;
+            crossterm::execute!(std::io::stderr(), crossterm::event::EnableBracketedPaste)
+                .map_err(|_| "cannot prepare terminal input")
+        };
+        if let Err(error) = prepared {
+            drop(restore_input());
+            return Err(error.into());
+        }
+        Ok(Self)
     }
 }
 impl Drop for InputMode {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stderr(), crossterm::event::DisableBracketedPaste);
-        let _ = terminal::disable_raw_mode();
+        drop(restore_input());
     }
 }
 

@@ -1755,6 +1755,7 @@ fn watch_quit_signals(tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
                 None => first,
             };
             open_max_core::execution::kill_process_groups();
+            let _setup_input = setup::restore_input();
             // Held until exit (the lock is reentrant, so the restore still
             // writes): the event loop must not paint over the restored shell.
             // A print or stdio run has no screen to restore, and its writer
