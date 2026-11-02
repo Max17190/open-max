@@ -1392,6 +1392,51 @@ mod first_frame {
     }
 
     #[test]
+    fn ctrl_c_discards_the_prompt_then_quits_on_a_second_press() {
+        let (cols, rows) = (100, 30);
+        let mut s = Session::spawn_with("clear-prompt", cols as u16, rows as u16,
+            r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384}"#);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, Duration::from_secs(5)).expect("keyboard negotiation");
+        // A multiline paste must be discarded without becoming submitted history.
+        s.write("\x1b[200~discard this draft\nUnicode λ\x1b[201~".as_bytes());
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("discard this draft"));
+        assert!(shown.contains("discard this draft"), "{shown}");
+        s.write(b"\x03");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ctrl+c again to quit"));
+        assert!(shown.contains("ctrl+c again to quit") && !shown.contains("discard this draft") && !shown.contains("Unicode"), "{shown}");
+        assert!(s.child.try_wait().unwrap().is_none(), "first press quit the app");
+        // Editing disarms quit; Up must not resurrect the discarded draft.
+        s.write(b"\x1b[Anew draft");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("new draft"));
+        assert!(shown.contains("new draft") && !shown.contains("discard this draft") && !shown.contains("ctrl+c again to quit"), "{shown}");
+        s.write(b"\x03");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ctrl+c again to quit"));
+        assert!(shown.contains("ctrl+c again to quit") && !shown.contains("new draft"), "{shown}");
+        // Clearing also releases the completion popup that owned the keys.
+        s.write(b"/sta");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("/status"));
+        assert!(shown.contains("/status"), "completion did not open: {shown}");
+        s.write(b"\x03");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ctrl+c again to quit"));
+        assert!(shown.contains("ctrl+c again to quit") && !shown.contains("/status") && !shown.contains("/sta"), "{shown}");
+        // A collapsed paste has backing content beyond its visible marker.
+        let paste = "collapsed Unicode λ draft\n".repeat(12);
+        s.write(format!("\x1b[200~{paste}\x1b[201~").as_bytes());
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("[pasted #"));
+        assert!(shown.contains("[pasted #") && !shown.contains("ctrl+c again to quit"), "{shown}");
+        s.write(b"\x03");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ctrl+c again to quit"));
+        assert!(shown.contains("ctrl+c again to quit") && !shown.contains("[pasted #"), "{shown}");
+        s.write(b"\x1b[Ausable after paste");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("usable after paste"));
+        assert!(shown.contains("usable after paste") && !shown.contains("[pasted #") && !shown.contains("collapsed Unicode"), "{shown}");
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+    }
+
+    #[test]
     fn effort_picker_selects_cancels_clears_and_refuses_ignored_settings() {
         let (cols, rows) = (160, 40);
         let mut s = Session::spawn_home("effort-picker", cols as u16, rows as u16, |dir, cmd, _, _| {

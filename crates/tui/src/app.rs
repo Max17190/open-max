@@ -1110,6 +1110,7 @@ impl App {
             }
             TermEvent::Paste(text) => {
                 if self.mode == Mode::Chat && self.pending_approval.is_none() {
+                    self.quit_armed = false;
                     self.composer.insert_paste(&text);
                     self.sync_completion();
                     self.dirty.mark_chrome();
@@ -1247,9 +1248,9 @@ impl App {
             return Ok(());
         }
 
-        // Ctrl+C copies a live selection, then cancels a running turn, and
-        // quits on the second press. Ctrl+Shift+C is indistinguishable from
-        // Ctrl+C unless the terminal speaks the kitty keyboard protocol, so
+        // Ctrl+C copies a live selection, cancels a running turn, or clears
+        // an idle draft. A second idle press quits. Ctrl+Shift+C is identical
+        // to Ctrl+C unless the terminal speaks the kitty keyboard protocol, so
         // copy cannot hang off the shift alone: the selection is what makes
         // the press mean copy. Copying drops it, so the next press cancels.
         if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
@@ -1271,7 +1272,10 @@ impl App {
             } else if self.quit_armed {
                 self.should_quit = true;
             } else {
+                self.composer.clear();
+                self.sync_completion();
                 self.quit_armed = true;
+                self.dirty.mark_chrome();
             }
             return Ok(());
         }
@@ -4171,7 +4175,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("double / triple click", "select the word · the whole line"),
     ("ctrl+o / o", "expand a [pasted #N] under the cursor, else the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
-    ("ctrl+c ctrl+c", "quit (the model server keeps running)"),
+    ("ctrl+c", "clear prompt; press again to quit (during a turn, cancel)"),
     ("/<template> [args]", "run a prompt template from .agents/prompts/<name>.md"),
 ];
 
@@ -6276,6 +6280,7 @@ mod tests {
 
         app.on_key(ctrl_c).await.unwrap();
         assert!(app.quit_armed, "a copy must not disarm the quit binding");
+        assert!(app.composer.text().is_empty(), "the next press clears the draft");
         fs::remove_dir_all(dir).unwrap();
     }
 
