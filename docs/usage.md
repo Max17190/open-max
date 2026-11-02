@@ -373,7 +373,7 @@ removal) runs to its end on its own.
 | Wheel | Scroll the conversation · over the prompt, a long draft |
 | **Shift+Tab** | Cycle requested reasoning effort; inside a picker, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
-| **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key resets the quit confirmation |
+| **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
 
 ## Slash commands
 

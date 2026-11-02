@@ -1110,6 +1110,7 @@ impl App {
             }
             TermEvent::Paste(text) => {
                 if self.mode == Mode::Chat && self.pending_approval.is_none() {
+                    self.quit_armed = false;
                     self.composer.insert_paste(&text);
                     self.sync_completion();
                     self.dirty.mark_chrome();

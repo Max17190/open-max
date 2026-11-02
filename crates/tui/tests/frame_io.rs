@@ -1414,7 +1414,25 @@ mod first_frame {
         s.write(b"\x03");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ctrl+c again to quit"));
         assert!(shown.contains("ctrl+c again to quit") && !shown.contains("new draft"), "{shown}");
+        // Clearing also releases the completion popup that owned the keys.
+        s.write(b"/sta");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("/status"));
+        assert!(shown.contains("/status"), "completion did not open: {shown}");
         s.write(b"\x03");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ctrl+c again to quit"));
+        assert!(shown.contains("ctrl+c again to quit") && !shown.contains("/status") && !shown.contains("/sta"), "{shown}");
+        // A collapsed paste has backing content beyond its visible marker.
+        let paste = "collapsed Unicode λ draft\n".repeat(12);
+        s.write(format!("\x1b[200~{paste}\x1b[201~").as_bytes());
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("[pasted #"));
+        assert!(shown.contains("[pasted #") && !shown.contains("ctrl+c again to quit"), "{shown}");
+        s.write(b"\x03");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ctrl+c again to quit"));
+        assert!(shown.contains("ctrl+c again to quit") && !shown.contains("[pasted #"), "{shown}");
+        s.write(b"\x1b[Ausable after paste");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("usable after paste"));
+        assert!(shown.contains("usable after paste") && !shown.contains("[pasted #") && !shown.contains("collapsed Unicode"), "{shown}");
+        s.write(CTRL_C_TWICE);
         assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
     }
 
