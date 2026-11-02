@@ -39,11 +39,20 @@ openmax --recall "deploy port"        # search past sessions and memories
 openmax --replay <id>.events.jsonl --json   # a session's events, offline
 openmax --stdio                       # full session over JSONL pipes
 openmax --mcp-list -- <server>        # list an MCP server's tools
+openmax --login                     # choose a provider and connect it
+openmax --login anthropic           # hidden API-key entry and model selection
+openmax --logout                    # choose a connection to disconnect
 openmax --chatgpt login              # browser sign-in and account model catalog
 openmax --chatgpt status             # account labels, without credential values
 openmax --chatgpt models --account work   # refresh one account's model catalog
 openmax --chatgpt logout             # revoke and clear this account's tokens
 ```
+
+Use `/login` and `/logout` inside a session for the same setup flow. Open Max
+returns to the conversation when setup finishes or you cancel. `/provider`
+and `/model` open the searchable provider/model picker. Setup does not change
+your selected provider until you choose one in that picker. See
+[provider connections](configuration.md#connecting-and-disconnecting-providers).
 
 ChatGPT account setup is a separate operation and cannot be combined with
 session or trust flags. `--account` defaults to `main`. See
@@ -373,7 +382,9 @@ removal) runs to its end on its own.
 | `/model <id>` | Set an exact model id on the active endpoint |
 | `/effort [level]` | Pick reasoning effort with arrow keys and Enter, or request an exact level for the next turn. `default` omits the setting; `none` is explicit. Model support varies |
 | `/copy` | Copy the latest assistant response |
-| `/provider [name]` | List or switch providers |
+| `/provider [name]` | Pick a provider/model pair, or switch to a named provider |
+| `/login [provider]` | Connect a provider through browser sign-in or hidden API-key entry |
+| `/logout [provider]` | Disconnect a provider |
 | `/approvals auto\|ask\|readonly` | Save this project's execution mode |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
 | `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |

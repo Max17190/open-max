@@ -1665,7 +1665,7 @@ fn plain_http_refusal(base_url: &str) -> Option<String> {
 /// api-key, X-Auth-Token). Such a header is read off plain http as easily as
 /// a bearer key, so a check for Authorization alone would let a key in
 /// X-API-Key cross it.
-fn is_credential_header(name: &str) -> bool {
+pub fn is_credential_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     ["auth", "key", "token", "secret", "password", "credential", "cookie"]
         .iter()
