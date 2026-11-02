@@ -408,6 +408,7 @@ pub struct App {
 
     files_tx: mpsc::UnboundedSender<Vec<String>>,
     should_quit: bool,
+    setup_request: Option<(crate::setup::Action, Option<String>)>,
     dirty: Dirty,
 
     /// Live assistant stream, markdown-rendered and wrapped (matches final block).
@@ -513,6 +514,40 @@ pub async fn run(
     (result, warnings)
 }
 
+/// The event reader relinquishes stdin completely while setup owns the shell.
+struct TerminalInput {
+    task: tokio::task::JoinHandle<()>,
+    ready: tokio::sync::oneshot::Receiver<()>,
+    events: mpsc::UnboundedReceiver<TermEvent>,
+}
+
+impl TerminalInput {
+    fn start() -> Self {
+        let (input_tx, events) = mpsc::unbounded_channel();
+        let (probed_tx, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(crate::enable_keyboard_enhancement).await;
+            let _ = probed_tx.send(());
+            let mut term_events = crossterm::event::EventStream::new();
+            while let Some(Ok(event)) = term_events.next().await {
+                if input_tx.send(event).is_err() { break; }
+            }
+        });
+        Self { task, ready, events }
+    }
+
+    async fn stop(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
+impl Drop for TerminalInput {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn event_loop(
     terminal: &mut Term,
     app: &mut App,
@@ -526,10 +561,8 @@ async fn event_loop(
     // first frame no longer ends the run at once, and Ctrl+C is a key.
     crate::quit_is_read();
     // Terminal events are forwarded through a channel so the core-event arm
-    // can be gated on `input_rx.is_empty()` — a token firehose must never
+    // can be gated on `input.events.is_empty()`: a token firehose must never
     // starve a keypress (crossterm's EventStream itself is not peekable).
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_period = TICK;
@@ -551,23 +584,7 @@ async fn event_loop(
     // State the initial presence in the title; transitions are edge-driven.
     app.emit_presence_title();
 
-    // The keyboard protocol probe goes out behind the first frame, so that
-    // frame never waits on the terminal's answer, and input starts after it,
-    // since the event stream would read that answer itself. Keys pressed
-    // meanwhile wait in crossterm's queue.
-    let (probed_tx, mut probed) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let _ = tokio::task::spawn_blocking(crate::enable_keyboard_enhancement).await;
-        let _ = probed_tx.send(());
-        let mut term_events = crossterm::event::EventStream::new();
-        while let Some(ev) = term_events.next().await {
-            let Ok(e) = ev else { break };
-            if input_tx.send(e).is_err() {
-                break;
-            }
-        }
-        // Dropping input_tx closes the channel; the loop reads that as quit.
-    });
+    let mut input = TerminalInput::start();
     // No frame is written while the probe waits, so none can cut into its
     // query or the flags pushed on its answer. Input has not started, so no
     // keypress waits on this.
@@ -579,14 +596,14 @@ async fn event_loop(
             biased;
             // First, so a signal cannot wait behind a token stream.
             _ = &mut quit => app.should_quit = true,
-            _ = &mut probed, if probing => probing = false,
+            _ = &mut input.ready, if probing => probing = false,
             // Streaming sits above input but is gated on the input queue
             // being empty: input-first would let held keys starve redraws,
             // while the gate keeps cancel/quit ahead of the firehose.
-            Some(ce) = core_rx.recv(), if input_rx.is_empty() => {
+            Some(ce) = core_rx.recv(), if input.events.is_empty() => {
                 app.on_core_event(ce).await;
                 for _ in 1..CORE_DRAIN_MAX {
-                    if !input_rx.is_empty() {
+                    if !input.events.is_empty() {
                         break;
                     }
                     match core_rx.try_recv() {
@@ -595,7 +612,7 @@ async fn event_loop(
                     }
                 }
             }
-            ev = input_rx.recv() => {
+            ev = input.events.recv() => {
                 match ev {
                     Some(TermEvent::Resize(_, _)) => {
                         // Terminals emit resize storms mid-drag; rewrapping
@@ -606,7 +623,7 @@ async fn event_loop(
                     Some(e) => {
                         if app.on_input(e).await? {
                             input_unpainted = true;
-                            if input_rx.is_empty() {
+                            if input.events.is_empty() {
                                 wake = Wake::Input;
                             }
                         }
@@ -627,6 +644,39 @@ async fn event_loop(
         }
         if app.should_quit {
             break;
+        }
+        if let Some((action, target)) = app.setup_request.take() {
+            let flag = match action {
+                crate::setup::Action::Login => "--login",
+                crate::setup::Action::Logout => "--logout",
+            };
+            if let Err(error) = crate::require_human("changing provider authentication", &format!("openmax {flag}")) {
+                app.error(&error);
+            } else {
+                input.stop().await;
+                let result = tokio::select! {
+                    result = Box::pin(crate::setup_on_shell(terminal, &app.core.data_dir, action, target.as_deref())) => Some(result?),
+                    _ = &mut quit => None,
+                };
+                let Some(result) = result else { break; };
+                app.refresh_billing();
+                match result {
+                    Ok(()) if action == crate::setup::Action::Login => app.open_model_picker(),
+                    Ok(()) => app.note("provider credentials removed"),
+                    Err(error) => app.error(&error),
+                }
+                app.dirty = Dirty::all();
+                draw_frame(terminal, app, MIN_DRAW_INTERVAL)?;
+                app.dirty.clear();
+                app.emit_presence_title();
+                last_draw = Instant::now();
+                draw_deadline = None;
+                resize_hold = None;
+                input_unpainted = false;
+                last_drew_input = false;
+                input = TerminalInput::start();
+                probing = true;
+            }
         }
         // Animation cadence follows state; the interval is recreated only on
         // transitions (turn start, first token, turn end), not per loop.
@@ -655,8 +705,9 @@ async fn event_loop(
     // the probe has its answer: restored first, the answer would reach the
     // shell as typed text.
     if probing {
-        let _ = probed.await;
+        let _ = (&mut input.ready).await;
     }
+    input.stop().await;
     Ok(())
 }
 
@@ -753,6 +804,7 @@ impl App {
             page_h: 10,
             files_tx,
             should_quit: false,
+            setup_request: None,
             dirty: Dirty::all(),
             stream_wrapped: Vec::new(),
             stream_stable_len: 0,
@@ -1826,6 +1878,24 @@ impl App {
         self.dirty.mark_chrome();
     }
 
+    fn open_model_picker(&mut self) {
+        let settings = self.core.settings.lock().unwrap().clone();
+        let mut picker = model_picker::ModelPickerState::load(
+            &self.core.data_dir, settings.provider.as_deref(), &settings.model,
+        );
+        picker.items.retain(|item| !item.id.is_empty());
+        picker.filtered = (0..picker.items.len()).collect();
+        if picker.items.is_empty() {
+            self.note("no configured models; use /login to connect a provider");
+            return;
+        }
+        self.model_picker = Some(picker);
+        self.transcript.clear_text_selection();
+        self.completion = None;
+        self.mode = Mode::ModelPicker;
+        self.dirty.mark_chrome();
+    }
+
     fn refresh_billing(&mut self) {
         let provider = self.core.settings.lock().unwrap().provider.clone();
         self.chatgpt_account = provider.and_then(|p| open_max_core::providers::load_providers(&self.core.data_dir)
@@ -2479,18 +2549,17 @@ impl App {
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
-            "model" if raw_rest.is_empty() => {
-                let settings = self.core.settings.lock().unwrap().clone();
-                self.model_picker = Some(model_picker::ModelPickerState::load(
-                    &self.core.data_dir,
-                    settings.provider.as_deref(),
-                    &settings.model,
-                ));
-                self.transcript.clear_text_selection();
-                self.completion = None;
-                self.mode = Mode::ModelPicker;
-                self.dirty.mark_chrome();
+            "login" | "logout" => {
+                if self.running {
+                    self.error("finish or cancel the current turn before changing provider credentials");
+                } else if rest.len() > 1 {
+                    self.note(&format!("usage: /{head} [provider]"));
+                } else {
+                    let action = if head == "login" { crate::setup::Action::Login } else { crate::setup::Action::Logout };
+                    self.setup_request = Some((action, rest.first().map(|target| target.to_string())));
+                }
             }
+            "model" if raw_rest.is_empty() => self.open_model_picker(),
             "model" => {
                 let provider = self.core.settings.lock().unwrap().provider.clone();
                 self.persist_model_selection(provider, raw_rest.to_string());
@@ -2532,40 +2601,8 @@ impl App {
                 }
             }
             "provider" => {
-                let names = open_max_core::providers::list_provider_names(&self.core.data_dir);
                 match rest.first() {
-                    None => {
-                        if names.is_empty() {
-                            self.note(
-                                "no providers in ~/.openmax/providers.json (flat base_url still works)",
-                            );
-                        } else {
-                            let active = self
-                                .core
-                                .settings
-                                .lock()
-                                .unwrap()
-                                .provider
-                                .clone()
-                                .unwrap_or_default();
-                            let mut lines = vec![Line::from(Span::styled(
-                                "  providers".to_string(),
-                                Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
-                            ))];
-                            for name in &names {
-                                let mark = if *name == active { "*" } else { " " };
-                                lines.push(Line::from(Span::styled(
-                                    format!("  {mark} {name}"),
-                                    Style::default().fg(theme::DIM()),
-                                )));
-                            }
-                            lines.push(Line::from(Span::styled(
-                                "  use /provider <name> to switch".to_string(),
-                                Style::default().fg(theme::DIM()),
-                            )));
-                            self.transcript.push(lines);
-                        }
-                    }
+                    None => self.open_model_picker(),
                     Some(name) => {
                         let name = name.to_string();
                         let providers = open_max_core::providers::load_providers(&self.core.data_dir);
@@ -4802,7 +4839,7 @@ mod tests {
         compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
         wide_status_right,
         model_selection, paint_pacing, presence_title, rect_contains, turn_end_rings,
-        draw_frame, App, Dirty, Focus, Paint, Presence, TermEvent, Wake, MIN_DRAW_INTERVAL, TICK,
+        draw_frame, App, Dirty, Focus, Mode, Paint, Presence, TermEvent, Wake, MIN_DRAW_INTERVAL, TICK,
         WAIT_TICK,
     };
     use std::time::Duration;
@@ -6350,6 +6387,7 @@ mod tests {
     #[tokio::test]
     async fn enter_on_a_fully_typed_argument_command_submits_its_bare_form() {
         let (mut app, dir) = app_fixture();
+        fs::write(dir.join("providers.json"), r#"{"providers":{"fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"fixture-model"}]}}}"#).unwrap();
         app.composer.load("/provider");
         app.sync_completion();
         assert!(app.completion.is_some());
@@ -6360,10 +6398,41 @@ mod tests {
 
         assert!(app.completion.is_none());
         assert!(app.composer.is_empty(), "draft: {:?}", app.composer.text());
-        assert!(
-            app.transcript.block_count() > 0,
-            "the bare command should have produced output"
-        );
+        assert!(app.mode == Mode::ModelPicker);
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.selected_choice().unwrap().id, "fixture-model");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_commands_request_setup_without_starting_or_replacing_a_session() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/provider".into()).await.unwrap();
+        assert!(app.mode == Mode::Chat);
+        assert!(app.transcript.export_text().contains("/login"));
+        app.session_id = Some("existing-session".into());
+        app.composer.load("draft to keep");
+        app.note("existing transcript");
+        let blocks = app.transcript.block_count();
+        for (command, expected, target) in [
+            ("/login fixture", crate::setup::Action::Login, Some("fixture")),
+            ("/logout", crate::setup::Action::Logout, None),
+        ] {
+            app.handle_submit(command.into()).await.unwrap();
+            assert_eq!(app.setup_request.take(), Some((expected, target.map(str::to_string))));
+            assert_eq!(app.session_id.as_deref(), Some("existing-session"));
+            assert_eq!(app.composer.text(), "draft to keep");
+            assert_eq!(app.transcript.block_count(), blocks);
+            assert!(!app.running);
+        }
+        app.running = true;
+        app.handle_submit("/login fixture".into()).await.unwrap();
+        assert!(app.setup_request.is_none());
+        assert_eq!(app.session_id.as_deref(), Some("existing-session"));
+        app.running = false;
+        app.handle_submit("/logout fixture extra".into()).await.unwrap();
+        assert!(app.setup_request.is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 

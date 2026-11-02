@@ -623,6 +623,118 @@ mod first_frame {
         assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
     }
 
+    #[test]
+    fn provider_setup_hides_keys_and_returns_input_to_the_same_tui() {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "setup did not request the model catalog");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut bytes = [0; 4096];
+                let read = socket.read(&mut bytes).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /v1/models "));
+            assert!(request.to_ascii_lowercase().contains("authorization: bearer $fixture-hidden-key"));
+            let body = r#"{"data":[{"id":"fixture-model","context_window":16384}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let mut s = Session::spawn_home("provider-setup", 80, 24, |dir, cmd, terminal, _| {
+            std::fs::write(dir.join("settings.json"), r#"{"provider":"fixture","model":"previous-model","context_tokens":16384}"#).unwrap();
+            std::fs::write(dir.join("providers.json"), serde_json::json!({"providers":{
+                "fixture":{"base_url":base,"models":[{"id":"previous-model","context_tokens":16384}]},
+                "chatgpt":{"base_url":open_max_core::chatgpt::API,"wire_api":"responses","chatgpt_account":"work",
+                    "models":[{"id":"work-model","context_tokens":16384}]}
+            }}).to_string()).unwrap();
+            let credentials = dir.join("chatgpt.json");
+            std::fs::write(&credentials, serde_json::json!({"host":"fixture","accounts":{
+                "main":{"client_id":"main-client","subject":"main-subject","email":"","tokens":null},
+                "work":{"client_id":"work-client","subject":"work-subject","email":"","tokens":null}
+            }}).to_string()).unwrap();
+            std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+            cmd.arg("--trust-project").stderr(terminal.try_clone().unwrap());
+        });
+        s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
+        s.write(ANSWER);
+        let dir = s.dir.join("home/.openmax");
+        let original_settings = std::fs::read(dir.join("settings.json")).unwrap();
+        let start = s.out.len();
+        s.write(b"/login fixture\r");
+        let restored = s.wait_for(LEAVE_ALT_SCREEN, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not restore terminal: {}", s.context()));
+        s.wait_for(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
+        s.write(b"$fixture-hidden-key\r");
+        let model = s.wait_for(b"Choose a model", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("catalog was not loaded: {}", s.context()));
+        s.write(b"\r");
+        let probe = s.wait_for(KEYBOARD_QUERY, model, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not resume the TUI: {}", s.context()));
+        assert!(s.out[..probe].windows(b"$fixture-hidden-key".len()).all(|window| window != b"$fixture-hidden-key"), "secret appeared on terminal");
+        s.write(ANSWER);
+        let shown = screen_when(&mut s, 80, 24, Duration::from_secs(5), |shown| shown.contains("fixture-model"));
+        assert!(shown.contains("fixture-model"), "model picker did not refresh: {shown}");
+        assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings, "login selected a default before the user picked it");
+        let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
+        assert_eq!(catalog["providers"]["fixture"]["api_key"], "$$fixture-hidden-key");
+        s.write(b"\x1b");
+        s.pump_for(Duration::from_millis(50));
+        let start = s.out.len();
+        s.write(b"/logout fixture\r");
+        let question = s.wait_for(b"Disconnect fixture?", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not get keyboard input: {}", s.context()));
+        s.write(b"\x1b[B\r");
+        s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not resume TUI: {}", s.context()));
+        s.write(ANSWER);
+        let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
+        assert!(catalog["providers"].get("fixture").is_none());
+        assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings);
+        let start = s.out.len();
+        s.write(b"/logout chatgpt\r");
+        let probe = s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("account logout did not resume TUI: {}", s.context()));
+        let output = String::from_utf8_lossy(&s.out[start..probe]);
+        assert!(output.contains("account 'work' signed out"), "{output}");
+        assert!(!output.contains("account 'main' signed out"), "{output}");
+        s.write(ANSWER);
+        let credentials: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("chatgpt.json")).unwrap()).unwrap();
+        assert_eq!(credentials["accounts"]["main"]["subject"], "main-subject");
+        assert_eq!(credentials["accounts"]["work"]["subject"], "work-subject");
+        let original_catalog = std::fs::read(dir.join("providers.json")).unwrap();
+        let start = s.out.len();
+        s.write(b"/login custom\r");
+        let question = s.wait_for(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
+        s.write(b"openai\r");
+        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
+        assert!(!String::from_utf8_lossy(&s.out[question..probe]).contains("API key (hidden)"));
+        assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
+        s.write(ANSWER);
+        let start = s.out.len();
+        s.write(b"/login\r");
+        let question = s.wait_for(b"Connect a provider", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("second login did not get input: {}", s.context()));
+        s.write(b"\x1b");
+        s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
+        s.write(ANSWER);
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(5));
+        assert!(status.is_some_and(|status| status.success()), "{status:?}: {}", s.context());
+        assert!(!s.out.windows(b"$fixture-hidden-key".len()).any(|window| window == b"$fixture-hidden-key"));
+        for entry in std::fs::read_dir(dir.join("history")).unwrap() {
+            assert!(!std::fs::read_to_string(entry.unwrap().path()).unwrap().contains("$fixture-hidden-key"));
+        }
+        server.join().unwrap();
+    }
+
     /// What a session that painted first has to say before it runs lands on
     /// the shell, after the terminal is handed back (the alternate screen
     /// left), never on the screen the session leaves behind. A

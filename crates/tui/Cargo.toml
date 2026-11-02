@@ -30,6 +30,7 @@ tokio.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
 lexopt = "0.3"
 unicode-width = "0.2"
 unicode-segmentation = "1.13"
