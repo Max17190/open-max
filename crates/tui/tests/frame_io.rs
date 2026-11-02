@@ -696,7 +696,7 @@ mod first_frame {
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("GET /v1/models "));
             assert!(request.to_ascii_lowercase().contains(&format!("authorization: bearer {expected_key}\r\n")));
-            let body = r#"{"data":[{"id":"fixture-model","context_window":16384},{"id":"other-model","context_window":16384}]}"#;
+            let body = r#"{"data":[{"id":"fixture-model","context_window":16384},{"id":"other-model","context_window":16384},{"id":"text-embedding-fixture","context_window":16384}]}"#;
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
         let mut s = Session::spawn_home("provider-setup", 80, 24, |dir, cmd, terminal, _| {
@@ -736,7 +736,7 @@ mod first_frame {
         let choice = s.wait_for(b"> fixture-model", filter, Duration::from_secs(5)).expect("backspace did not restore choices");
         s.wait_for(b"Enter confirms; Esc cancels", choice, Duration::from_secs(5)).unwrap();
         let shown: Vec<_> = screen(&s.out[model..], 80, 24).into_iter().filter(|row| !row.is_empty()).collect();
-        assert_eq!(shown, ["Choose a model (type to filter)", ">", "> fixture-model", "  other-model", "Enter confirms; Esc cancels"]);
+        assert_eq!(shown, ["Choose a model (type to filter)", ">", "> fixture-model", "  other-model", "  text-embedding-fixture", "Enter confirms; Esc cancels"]);
         s.write(b"\x1b[B\x1b[A\r");
         let probe = s.wait_for(KEYBOARD_QUERY, model, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not resume the TUI: {}", s.context()));
         assert!(s.out[..probe].windows(b"$fixture-hidden-key".len()).all(|window| window != b"$fixture-hidden-key"), "secret appeared on terminal");
