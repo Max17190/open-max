@@ -972,23 +972,13 @@ fn the_workspace_has_two_thousand_tests() {
 
 /// The mutation score, caught / (caught + missed) over every mutant of the
 /// workspace, reaches 95%. No test can mutate the code it runs in, so CI does:
-/// the Mutants workflow runs cargo-mutants, every job with one pinned
-/// compiler, on a pull request over the code it changes (a newer push
-/// cancels the older run), and on a push to main, weekly and by hand over the
-/// whole workspace (never cancelled: a newer run waits, and replaces any
-/// older one waiting), split into shards that all run with the plan's shard
-/// count, each in a cgroup that caps its memory below the runner's, where
-/// every test of the workspace first passes on the unmutated tree, each
-/// keeping its outcomes as an artifact that a re-run of it replaces; its last
-/// job judges the shards' outcomes with scripts/check-mutants.sh whatever the
-/// shards did, unless the run was cancelled. On a pull request (`--diff`) the
-/// script fails when a mutant was missed or timed out and is not listed in
-/// .cargo/mutants-allowed.txt; on the other runs it fails when the score is
-/// under its floor, a ratchet that sits a margin under the score of the run
-/// that last raised it, and reports the distance to the 95% target until that
-/// is met. The README states the floor, the score that set it, the margin and
-/// the target, and docs/testing.md the margin and the timeout that
-/// .cargo/mutants.toml sets.
+/// the Mutants workflow runs cargo-mutants weekly and by hand over the whole
+/// workspace, with one pinned compiler and at most four concurrent shards.
+/// Runs queue per branch. Each shard first tests the unmutated workspace in
+/// a memory-capped cgroup and preserves outcomes for the final score judge.
+/// The score floor, baseline and margin remain documented in the README;
+/// docs/testing.md also explains targeted local checks with the script's
+/// optional --diff mode. Pull requests and pushes do not trigger full sweeps.
 /// This test holds the wiring and the documents to the files, and holds the
 /// script to its rules by driving it with shards' outcomes as cargo-mutants
 /// 27.1.0 writes them, over a source file with a macOS-only function,
@@ -999,7 +989,7 @@ fn the_workspace_has_two_thousand_tests() {
 /// cfg(test), compiles; counts a listed timeout as caught, an unlisted one
 /// and a listed miss as missed; passes a score exactly at the floor and fails
 /// one a mutant under it; offers to raise the floor to a score less the
-/// margin, and only when that is above the floor; on a pull request fails on
+/// margin, and only when that is above the floor; in diff mode fails on
 /// exactly the unlisted misses and timeouts, marking each on its line with
 /// its message escaped as a workflow command needs; and refuses a shard that
 /// did not finish, one whose unmutated tests failed, shards that overlap,
@@ -1044,23 +1034,14 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     let workflow = std::fs::read_to_string(repo().join(".github/workflows/mutants.yml")).unwrap();
     let triggers: Vec<&str> =
         workflow.lines().skip_while(|line| *line != "on:").skip(1).take_while(|line| line.starts_with(' ') || line.is_empty()).collect();
-    for trigger in ["  pull_request:", "  push:", "  schedule:", "  workflow_dispatch:"] {
+    for trigger in ["  schedule:", "  workflow_dispatch:"] {
         assert!(triggers.contains(&trigger), "the Mutants workflow does not run on `{}`", trigger.trim());
     }
-    let pushed = triggers.iter().find_map(|line| {
-        let value = line.split(" #").next().unwrap_or_default().trim();
-        value.strip_prefix("branches: [")?.strip_suffix(']')
-    });
-    assert!(pushed.is_some_and(|branches| branches.split(", ").any(|branch| branch == "main")), "the Mutants workflow does not run on a push to main");
-    // A pull request's newer push cancels its older run. A run of the whole
-    // workspace is never cancelled: a newer one waits in the branch's group,
-    // which keeps only the newest one waiting.
-    let concurrency = "concurrency:\n  group: mutants-${{ github.event.pull_request.number || github.ref }}\n  \
-                       cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n";
-    assert!(
-        workflow.contains(concurrency),
-        "the Mutants workflow's runs do not queue one group per pull request or branch, cancelling only a pull request's: {concurrency}"
-    );
+    for trigger in ["  pull_request:", "  push:"] {
+        assert!(!triggers.contains(&trigger), "a multi-hour mutation sweep runs automatically on `{}`", trigger.trim());
+    }
+    let concurrency = "concurrency:\n  group: mutants-${{ github.ref }}\n  cancel-in-progress: false\n";
+    assert!(workflow.contains(concurrency), "full mutation sweeps do not queue per branch: {concurrency}");
     // A listing that fails reads as no mutants unless the pipe fails too.
     assert!(workflow.contains("defaults:\n  run:\n    shell: bash\n"), "the workflow's steps do not run under bash -eo pipefail");
     // Linux runners, as the README says: the code a run leaves out as not
@@ -1089,7 +1070,7 @@ fn mutation_score_is_at_least_ninety_five_percent() {
         assert!(holds(job, "echo \"$CARGO_MUTANTS_SHA256  $RUNNER_TEMP/cargo-mutants.tar.gz\" | sha256sum -c -"), "cargo-mutants runs unchecked");
         assert!(holds(job, "toolchain: ${{ env.RUST_TOOLCHAIN }}"), "a job of the Mutants workflow builds with the runner's own compiler");
     }
-    assert!(holds(&plan, "mutants=$(cargo mutants --list \"$@\" | wc -l)"), "the plan does not count the mutants it shards");
+    assert!(holds(&plan, "mutants=$(cargo mutants --list | wc -l)"), "the plan does not count the mutants it shards");
     assert!(holds(&shards, "shard: ${{ fromJSON(needs.plan.outputs.shards) }}"), "the shards are not the plan's");
     assert!(holds(&shards, "SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.count }}"), "a shard runs with another shard count");
     assert!(holds(&shards, "set -- --in-place --shard \"$SHARD\" --annotations none -vV"), "a shard does not test its share");
@@ -1112,21 +1093,18 @@ fn mutation_score_is_at_least_ninety_five_percent() {
         matches!((joined, unmutated, tested), (Some(joined), Some(unmutated), Some(tested)) if joined < unmutated && unmutated < tested),
         "a shard tests its mutants before every test of the workspace has passed on the unmutated tree in its cgroup"
     );
-    for job in [&plan, &shards] {
-        assert!(holds(job, "git diff HEAD^1 HEAD > \"$RUNNER_TEMP/change.diff\""), "a pull request's run does not take its change");
-    }
+    assert!(holds(&shards, "max-parallel: 4"), "background mutation sweeps do not reserve runner capacity");
     assert!(holds(&judge, "if: ${{ !cancelled() }}"), "the judgement is skipped when a shard fails");
     assert!(holds(&judge, "needs: [plan, mutants]"), "the judgement does not wait for the shards");
-    assert!(holds(&judge, "set -- --diff"), "a pull request's run is judged as a score");
     // The download puts a lone shard's artifact in shards/ itself, and each of
-    // several in a directory of its own: a pull request with one shard's worth
-    // of mutants is judged too.
+    // several in a directory of its own: a small workspace with one shard
+    // is judged too.
     assert!(
         holds(&judge, "if [ -e shards/outcomes.json ]; then dirs=(shards); else dirs=(shards/*/); fi"),
         "a run with a single shard is not judged"
     );
     assert!(
-        holds(&judge, "scripts/check-mutants.sh \"$@\" --mutants \"$MUTANTS\" --missed missed.txt \"${dirs[@]}\""),
+        holds(&judge, "scripts/check-mutants.sh --mutants \"$MUTANTS\" --missed missed.txt \"${dirs[@]}\""),
         "the shards are not judged against the number of mutants the plan listed"
     );
     // Re-running a run's failed jobs keeps its earlier attempt's artifacts,
