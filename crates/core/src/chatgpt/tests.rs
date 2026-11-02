@@ -405,8 +405,11 @@ async fn browser_callback_exchange_and_returning_login_validate_and_preserve_reg
                             request.push_str(&" ".repeat(16384 - request.len() - 4));
                             request.push_str("\r\n\r\n");
                             let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).await.unwrap();
-                            socket.write_all(request.as_bytes()).await.unwrap();
                             let mut reply = [0; 256];
+                            let (head, ending) = request.as_bytes().split_at(request.len() - 4);
+                            socket.write_all(head).await.unwrap();
+                            assert!(tokio::time::timeout(Duration::from_millis(50), socket.read(&mut reply)).await.is_err());
+                            socket.write_all(ending).await.unwrap();
                             let n = socket.read(&mut reply).await.unwrap();
                             assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 200"));
                         } else {
@@ -482,9 +485,10 @@ fn invalid_identity_and_callback_cannot_select_an_account() {
         let second = now();
         let mut skewed = valid.clone();
         skewed["iat"] = json!(second + 60);
+        skewed["nbf"] = json!(second);
         let result = validate_id(&signed(&skewed), &keys(), "issued-client", "nonce");
         if now() == second {
-            assert!(result.is_ok(), "the permitted clock skew was rejected");
+            assert!(result.is_ok(), "the permitted clock boundary was rejected");
             checked_clock_boundary = true;
             break;
         }
