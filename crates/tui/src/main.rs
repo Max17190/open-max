@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod chatgpt;
+mod setup;
 mod completion;
 mod headless;
 mod input;
@@ -25,6 +26,9 @@ const HELP: &str = "openmax: a barebones high-performance agent harness
 usage: openmax [options] [prompt...]
 
 options:
+      --login [provider] sign in to a provider or configure its API key
+      --logout [provider]
+                         remove saved provider credentials
       --chatgpt <action>
                          login, logout, status, or models for ChatGPT plan use
       --account <label>  saved ChatGPT account (default: main)
@@ -145,6 +149,8 @@ examples:
   openmax --subagent \"make the flaky test deterministic\" --worktree";
 
 struct CliArgs {
+    login: Option<Option<String>>,
+    logout: Option<Option<String>>,
     chatgpt: Option<String>,
     account: Option<String>,
     continue_session: bool,
@@ -205,6 +211,8 @@ where
 {
     use lexopt::prelude::*;
     let mut out = CliArgs {
+        login: None,
+        logout: None,
         chatgpt: None,
         account: None,
         continue_session: false,
@@ -251,6 +259,13 @@ where
         }
         let Some(arg) = parser.next()? else { break };
         match arg {
+            Long(flag @ ("login" | "logout")) => {
+                let slot = if flag == "login" { &mut out.login } else { &mut out.logout };
+                if slot.is_some() {
+                    return Err(lexopt::Error::from(format!("--{flag} given twice; run one at a time")));
+                }
+                *slot = Some(parser.optional_value().map(|value| value.string()).transpose()?);
+            }
             Long("chatgpt") => set_once(&mut out.chatgpt, "--chatgpt", &mut parser)?,
             Long("account") => set_once(&mut out.account, "--account", &mut parser)?,
             Short('c') | Long("continue") => out.continue_session = true,
@@ -292,7 +307,14 @@ where
                 println!("{HELP}");
                 std::process::exit(0);
             }
-            Value(v) => current.push(v.string()?),
+            Value(v) => {
+                let target = out.login.as_mut().or(out.logout.as_mut());
+                if let Some(target) = target.filter(|target| target.is_none() && current.is_empty() && !out.print) {
+                    *target = Some(v.string()?);
+                } else {
+                    current.push(v.string()?);
+                }
+            }
             _ if out.mcp_list || out.mcp_call => {
                 return Err(lexopt::Error::from(format!(
                     "{}; an MCP server's command and its options go after --",
@@ -415,6 +437,8 @@ fn approve_command(path: &std::path::Path) -> String {
 /// stops compiling here until it is placed among the operations or options.
 fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     let CliArgs {
+        login,
+        logout,
         chatgpt,
         account,
         continue_session,
@@ -448,6 +472,8 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // Each operation, named by its flag. `--check --stdio` is one operation
     // of its own: validating a protocol stream on stdin.
     let operations: Vec<&'static str> = [
+        (login.is_some(), "--login"),
+        (logout.is_some(), "--logout"),
         (chatgpt.is_some(), "--chatgpt"),
         (spec.is_some(), "--spec"),
         (*mcp_list, "--mcp-list"),
@@ -564,6 +590,11 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
             return Err(format!(
                 "--provider and {flag} both choose the endpoint; a provider's base_url and key are in ~/.openmax/providers.json"
             ));
+        }
+    }
+    for (target, flag) in [(login, "--login"), (logout, "--logout")] {
+        if target.as_ref().and_then(Option::as_ref).is_some_and(|name| name.trim().is_empty()) {
+            return Err(format!("{flag} takes a non-empty provider name"));
         }
     }
     if chatgpt.as_deref().is_some_and(|a| !matches!(a, "login" | "logout" | "status" | "models")) {
@@ -841,8 +872,46 @@ fn on_the_shell<E>(
     Ok(())
 }
 
+/// Run setup with the shell's screen, then resume the same application on every
+/// nonfatal outcome. The caller stops terminal input before handing it over.
+async fn setup_on_shell(
+    terminal: &mut ui::transcript::Term,
+    dir: &std::path::Path,
+    action: setup::Action,
+    target: Option<&str>,
+) -> std::io::Result<Result<(), String>> {
+    restore_terminal();
+    let result = setup::run(dir, action, target).await;
+    enter_terminal()?;
+    *terminal = frame_terminal()?;
+    start_input();
+    signal_keys(false);
+    Ok(result)
+}
+
 /// The run of everything but a session painted first (see `main`).
 async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
+    let request = cli.login.as_ref().map(|target| (setup::Action::Login, target.as_deref(), "--login"))
+        .or_else(|| cli.logout.as_ref().map(|target| (setup::Action::Logout, target.as_deref(), "--logout")));
+    if let Some((action, target, flag)) = request {
+        if let Err(error) = require_human("changing provider authentication", &format!("openmax {flag}")) {
+            eprintln!("openmax: {error}");
+            return Ok(std::process::ExitCode::from(3));
+        }
+        let quit = watch_quit_signals(false);
+        let dir = default_data_dir();
+        let result = tokio::select! {
+            result = Box::pin(setup::run(&dir, action, target)) => Some(result),
+            _ = quit.notified() => None,
+        };
+        open_max_core::chatgpt::finish_refreshes().await;
+        if signalled() { return Ok(std::process::ExitCode::from(quit_status() as u8)); }
+        return Ok(match result {
+            Some(Ok(())) => std::process::ExitCode::SUCCESS,
+            Some(Err(error)) => { eprintln!("openmax: {error}"); std::process::ExitCode::from(1) }
+            None => std::process::ExitCode::from(quit_status() as u8),
+        });
+    }
     if let Some(action) = &cli.chatgpt {
         if matches!(action.as_str(), "login" | "logout") {
             if let Err(e) = require_human("changing ChatGPT authentication", &format!("openmax --chatgpt {action}")) {
@@ -1686,6 +1755,7 @@ fn watch_quit_signals(tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
                 None => first,
             };
             open_max_core::execution::kill_process_groups();
+            let _setup_input = setup::restore_input();
             // Held until exit (the lock is reentrant, so the restore still
             // writes): the event loop must not paint over the restored shell.
             // A print or stdio run has no screen to restore, and its writer
@@ -3308,8 +3378,11 @@ mod tests {
     /// comes after `--`, so `refusal_of` closes such a line with one. An
     /// empty name is the interactive session. `--replay` is given with the
     /// `--json` it requires.
-    const OPERATIONS: [(&[&str], &str); 15] = [
+    const OPERATIONS: [(&[&str], &str); 18] = [
         (&[], ""),
+        (&["--login"], "--login"),
+        (&["--logout"], "--logout"),
+        (&["--chatgpt", "status"], "--chatgpt"),
         (&["--spec", "tools"], "--spec"),
         (&["--recall", "q"], "--recall"),
         (&["--replay", "f", "--json"], "--replay"),
@@ -3359,6 +3432,23 @@ mod tests {
             assert_eq!(operation(&cli_of(args)), Ok(named), "{args:?}");
         }
         assert_eq!(operation(&cli_of(&["--trust-project", "--continue", "-m", "m"])), Ok(None));
+    }
+
+    #[test]
+    fn setup_operations_accept_one_optional_provider_and_refuse_conflicts() {
+        for flag in ["--login", "--logout"] {
+            for args in [vec![flag], vec![flag, "fixture"], vec![flag, "--", "fixture"]] {
+                let cli = cli_of(&args);
+                assert_eq!(operation(&cli), Ok(Some(flag)));
+                let target = if flag == "--login" { cli.login } else { cli.logout };
+                assert_eq!(target.flatten().as_deref(), args.last().filter(|value| **value == "fixture").copied());
+            }
+            let cli = cli_of(&[&format!("{flag}=fixture")]);
+            assert_eq!(operation(&cli), Ok(Some(flag)));
+            assert!(refusal_of(&[flag, "fixture", "extra"]).unwrap().contains("extra"));
+            assert!(refusal_of(&[flag, " "]).unwrap().contains("non-empty provider"));
+            assert!(parse_args_from([flag, flag]).is_err());
+        }
     }
 
     /// A print or stdio run's runtime starts one worker thread, and every
@@ -3604,7 +3694,7 @@ mod tests {
     #[test]
     fn a_stray_word_beside_an_operation_is_named_not_sent_to_print() {
         for (operation, name) in OPERATIONS {
-            if matches!(name, "" | "--print") {
+            if matches!(name, "" | "--print" | "--login" | "--logout") {
                 continue;
             }
             let args: Vec<&str> = operation.iter().copied().chain(["stray.toml"]).collect();
