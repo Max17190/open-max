@@ -435,7 +435,8 @@ impl Composer {
         self.col = 0;
     }
 
-    fn clear(&mut self) {
+    /// Discard the draft and collapsed pastes without adding to history.
+    pub fn clear(&mut self) {
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;

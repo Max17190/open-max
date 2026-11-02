@@ -368,12 +368,12 @@ removal) runs to its end on its own.
 | **@** | Mention a project file |
 | Mouse drag | Select transcript or prompt text |
 | Double / triple click | Select the word under the pointer · the whole logical line |
-| **y** or **Ctrl+C** | Copy selected text (**Ctrl+C** cancels when nothing is selected) |
+| **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
 | **Shift+Tab** | Cycle requested reasoning effort; inside a picker, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
-| **Ctrl+C** twice | Quit |
+| **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key resets the quit confirmation |
 
 ## Slash commands
 
