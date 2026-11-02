@@ -733,7 +733,7 @@ impl ChatClient {
                 return Err(naming_wait(err, beyond_cap));
             }
             if self.wire_api == crate::providers::WireApi::Responses {
-                let (reply, unfinished) = responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta).await;
+                let (reply, unfinished) = Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await;
                 let retry = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
                 let failure = match unfinished {
                     Some(Unfinished::Interrupted(reason)) if retry => reason,
@@ -3450,7 +3450,7 @@ mod tests {
         provider_at(&url);
         let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
         let err = request(&endpoint).await.err().expect("a 401 is an error");
-        let head = heads.recv().unwrap().to_ascii_lowercase();
+        let head = heads.recv_timeout(std::time::Duration::from_secs(3)).unwrap().to_ascii_lowercase();
         assert!(!head.contains("authorization") && !head.contains("sk-settings"), "{head}");
         assert!(err.starts_with("backend returned 401 Unauthorized: missing credentials"), "{err}");
         assert!(err.contains("provider 'local'") && err.contains("api_key_env"), "{err}");
@@ -3461,7 +3461,7 @@ mod tests {
         settings.base_url = url.trim_end_matches("/v1").into();
         let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
         assert_eq!(request(&endpoint).await.unwrap().content, "all of it");
-        let head = heads.recv().unwrap().to_ascii_lowercase();
+        let head = heads.recv_timeout(std::time::Duration::from_secs(3)).unwrap().to_ascii_lowercase();
         assert!(head.contains("authorization: bearer sk-settings"), "{head}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3502,7 +3502,7 @@ mod tests {
             .await
             .expect("loopback http carries a key");
         assert_eq!(result.content, "all of it");
-        let head = heads.recv().unwrap().to_ascii_lowercase();
+        let head = heads.recv_timeout(std::time::Duration::from_secs(3)).unwrap().to_ascii_lowercase();
         assert!(head.contains("authorization: bearer sk-local"), "{head}");
     }
 
@@ -3964,6 +3964,10 @@ mod tests {
     /// and the stamp that decides it never leaves the session file.
     #[test]
     fn reasoning_goes_only_to_the_endpoint_that_produced_it() {
+        // Existing session stamps must survive adding another wire protocol.
+        let mut legacy = ChatClient::new("https://example.invalid/v1".into(), Some("fixture-key".into()), "fixture-model".into(), None, 64);
+        legacy.headers = vec![("X-Route".into(), "fixture".into())];
+        assert_eq!(legacy.origin(), "c50bd9d1e91d9ebb");
         let client = |base: &str, model: &str| ChatClient::new(base.into(), None, model.into(), None, 64);
         let deepseek = client("https://api.deepseek.com", "deepseek-reasoner");
         let mut reply = ChatMessage::assistant(None, Some(vec![bash_call()]));

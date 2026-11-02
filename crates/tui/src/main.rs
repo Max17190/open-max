@@ -744,8 +744,10 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let granted = granted.into_iter().chain(notes).reduce(|lines, line| format!("{lines}\n{line}"));
     start_input();
     let runtime = runtime(granted.as_deref(), None);
-    let args = app::Args { continue_session: cli.continue_session, quit };
+    let args = app::Args { continue_session: cli.continue_session, quit: quit.clone() };
     let (result, warnings) = runtime.block_on(app::run(terminal, core, core_rx, args));
+    restore_terminal();
+    runtime.block_on(open_max_core::chatgpt::finish_refreshes());
     end_session(result, warnings, granted)
 }
 
@@ -848,10 +850,18 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 return Ok(std::process::ExitCode::from(3));
             }
         }
-        let result = chatgpt::run(&default_data_dir(), action, cli.account.as_deref().unwrap_or("main")).await;
+        let quit = watch_quit_signals(false);
+        let dir = default_data_dir();
+        let result = tokio::select! {
+            result = chatgpt::run(&dir, action, cli.account.as_deref().unwrap_or("main")) => Some(result),
+            _ = quit.notified() => None,
+        };
+        open_max_core::chatgpt::finish_refreshes().await;
+        if signalled() { return Ok(std::process::ExitCode::from(quit_status() as u8)); }
         return Ok(match result {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(e) => { eprintln!("openmax: {e}"); std::process::ExitCode::from(1) }
+            Some(Ok(())) => std::process::ExitCode::SUCCESS,
+            Some(Err(e)) => { eprintln!("openmax: {e}"); std::process::ExitCode::from(1) }
+            None => std::process::ExitCode::from(quit_status() as u8),
         });
     }
     if let Some(surface) = &cli.spec {
@@ -1348,12 +1358,14 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let quit = watch_quit_signals(!unattended);
 
     if let Some(task) = cli.subagent {
-        std::process::exit(subagent::run(core, core_rx, &project, task, cli.json, quit).await);
+        let code = subagent::run(core, core_rx, &project, task, cli.json, quit.clone()).await;
+        open_max_core::chatgpt::finish_refreshes().await;
+        std::process::exit(if signalled() { quit_status() } else { code });
     }
 
     if cli.stdio || cli.print {
         let code = if cli.stdio {
-            let args = stdio::StdioArgs { continue_session: cli.continue_session, quit };
+            let args = stdio::StdioArgs { continue_session: cli.continue_session, quit: quit.clone() };
             stdio::run(core, core_rx, args).await
         } else {
             let args = headless::HeadlessArgs {
@@ -1361,15 +1373,16 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 project: project.clone(),
                 continue_session: cli.continue_session,
                 json: cli.json,
-                quit,
+                quit: quit.clone(),
             };
             headless::run(core, core_rx, args).await
         };
-        // A signal that landed as the last turn ended still stops the run.
-        let code = if signalled() { quit_status() } else { code };
         // A turn that did not settle in time still owns its tool groups, and
         // exit runs no destructor that would stop them.
         open_max_core::execution::kill_process_groups();
+        open_max_core::chatgpt::finish_refreshes().await;
+        // A signal that landed as the last turn ended still stops the run.
+        let code = if signalled() { quit_status() } else { code };
         std::process::exit(code);
     }
 
@@ -1390,9 +1403,11 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         terminal,
         core,
         core_rx,
-        app::Args { continue_session: cli.continue_session, quit },
+        app::Args { continue_session: cli.continue_session, quit: quit.clone() },
     )
     .await;
+    restore_terminal();
+    open_max_core::chatgpt::finish_refreshes().await;
     end_session(result, warnings, None)
 }
 

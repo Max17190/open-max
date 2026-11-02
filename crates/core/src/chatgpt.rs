@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
@@ -26,6 +27,30 @@ const DISCOVERY: &str = "https://auth.openai.com/.well-known/openid-configuratio
 const SCOPES: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const DIRECT: &str = "chatgpt.tokens.use.direct";
 const LIMIT: usize = 1024 * 1024;
+
+static STOPPING: AtomicBool = AtomicBool::new(false);
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+static SETTLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+struct Pending;
+impl Drop for Pending {
+    fn drop(&mut self) {
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+        SETTLED.notify_waiters();
+    }
+}
+
+/// Final process shutdown: prevent new refreshes and persist any rotation in flight.
+/// With no ChatGPT request this is only an atomic check, with no file or network work.
+pub async fn finish_refreshes() {
+    STOPPING.store(true, Ordering::SeqCst);
+    while PENDING.load(Ordering::SeqCst) != 0 {
+        let settled = SETTLED.notified();
+        tokio::pin!(settled);
+        settled.as_mut().enable();
+        if PENDING.load(Ordering::SeqCst) == 0 { return; }
+        settled.await;
+    }
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct Store {
@@ -257,7 +282,13 @@ impl Connection {
         // Finish a rotating refresh even if its waiting turn is cancelled.
         // Dropping the join handle detaches it; the file lock still covers persistence.
         let (connection, http, url) = (self.clone(), http.clone(), token_url.to_string());
-        tokio::spawn(async move { connection.renew(&http, &url).await })
+        PENDING.fetch_add(1, Ordering::SeqCst);
+        let pending = Pending;
+        if STOPPING.load(Ordering::SeqCst) { return Err("ChatGPT authentication is shutting down".into()); }
+        tokio::spawn(async move {
+            let _pending = pending;
+            connection.renew(&http, &url).await
+        })
             .await
             .map_err(|_| "ChatGPT credential refresh task failed")?
     }

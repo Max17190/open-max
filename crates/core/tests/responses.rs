@@ -48,10 +48,10 @@ fn done(output: Value) -> String {
         "usage":{"input_tokens":120,"output_tokens":15,"input_tokens_details":{"cached_tokens":90}}}}))
 }
 fn message(text: &str) -> Value {
-    json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})
+    json!({"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]})
 }
 fn call(name: &str, args: Value) -> Value {
-    json!({"type":"function_call","call_id":"call-1","name":name,"arguments":args.to_string()})
+    json!({"type":"function_call","status":"completed","call_id":"call-1","name":name,"arguments":args.to_string()})
 }
 
 async fn server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
@@ -97,12 +97,12 @@ async fn server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>, tokio:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_round_and_resume_preserve_instructions_tools_reasoning_and_approvals() {
-    for streamed_items in [false, true] {
-        tool_round_and_resume_case(streamed_items).await;
+    for (streamed_items, terminal_output) in [(false, true), (true, false), (true, true)] {
+        tool_round_and_resume_case(streamed_items, terminal_output).await;
     }
 }
 
-async fn tool_round_and_resume_case(streamed_items: bool) {
+async fn tool_round_and_resume_case(streamed_items: bool, terminal_output: bool) {
     let scratch = Scratch::new();
     let reasoning = json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque-test-state"});
     let first = done(json!([reasoning, call("write_file", json!({"path":"result.txt","content":"hello"}))]));
@@ -119,10 +119,15 @@ async fn tool_round_and_resume_case(streamed_items: bool) {
                 let mut value: Value = serde_json::from_str(data).unwrap();
                 if value["type"] != "response.completed" { return Some(event(value)); }
                 let output = value["response"]["output"].take();
-                let items = output.as_array().unwrap().iter().enumerate().map(|(index, item)| {
+                // A full terminal output is authoritative even if only some items streamed.
+                let items = output.as_array().unwrap().iter().enumerate().filter(|(index, _)| !terminal_output || *index > 0).map(|(index, item)| {
                     event(json!({"type":"response.output_item.done","output_index":index,"item":item}))
                 }).collect::<String>();
-                value["response"].as_object_mut().unwrap().remove("output");
+                if terminal_output {
+                    value["response"]["output"] = output;
+                } else {
+                    value["response"].as_object_mut().unwrap().remove("output");
+                }
                 Some(items + &event(value))
             }).collect()
         }).collect()
@@ -134,7 +139,14 @@ async fn tool_round_and_resume_case(streamed_items: bool) {
     let session = open_max_core::sessions::create(&core, scratch.project().display().to_string()).unwrap().id;
     let events = common::drive_turn(&core, &mut rx, &session, &scratch.project(), "write result").await;
     assert!(events.iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })));
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::Token { text } if text.contains('✓'))));
+    let visible = events.iter().filter_map(|event| match event {
+        AgentEvent::Token { text } => Some(text.as_str()),
+        _ => None,
+    }).collect::<String>();
+    assert_eq!(visible, "Done ✓");
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Usage {
+        prompt_tokens: 120, completion_tokens: 15, cached_tokens: Some(90)
+    })));
     assert_eq!(std::fs::read_to_string(scratch.project().join("result.txt")).unwrap(), "hello");
     common::close(&core, &session).await;
     drop(core);
@@ -290,4 +302,129 @@ async fn quota_and_invalid_completed_calls_fail_without_execution_or_retry() {
         assert_eq!(requests.lock().unwrap().len(), 1);
         job.await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_stream_failures_retry_frozen_requests_without_running_abandoned_calls() {
+    for ending in [
+        event(json!({"type":"error","code":"server_error","message":"temporarily busy"})),
+        event(json!({"type":"response.failed","response":{"error":{
+            "code":"subscription_sharing_usage_unavailable","message":"try again"}}})),
+        event(
+            json!({"type":"error","code":"subscription_sharing_user_unavailable","message":"try again"}),
+        ),
+        String::new(),
+    ] {
+        let scratch = Scratch::new();
+        let abandoned = event(json!({"type":"response.output_item.done","output_index":0,
+            "item":call("write_file", json!({"path":"forbidden","content":"bad"}))}));
+        let (url, requests, job) = server(vec![
+            abandoned + &ending,
+            done(json!([message("Recovered")])),
+        ])
+        .await;
+        scratch.configure(&url);
+        open_max_core::trust::grant_trust(&scratch.data(), &scratch.project(), ApprovalMode::Auto)
+            .unwrap();
+        let (core, mut rx) = Core::new(scratch.data()).unwrap();
+        let events = common::drive_turn(&core, &mut rx, "retry", &scratch.project(), "go").await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Retry { attempt: 2, .. })),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Token { text } if text == "Recovered"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStart { .. } | AgentEvent::Error { .. }))
+        );
+        assert!(!scratch.project().join("forbidden").exists());
+        job.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_failure_after_visible_text_does_not_retry_or_run_calls() {
+    let scratch = Scratch::new();
+    let payload = event(json!({"type":"response.output_text.delta","delta":"Working"}))
+        + &event(json!({"type":"response.output_item.done","output_index":0,
+            "item":call("write_file", json!({"path":"forbidden","content":"bad"}))}))
+        + &event(json!({"type":"response.failed","response":{"error":{
+            "code":"subscription_sharing_usage_unavailable","message":"try again"}}}));
+    let (url, requests, job) = server(vec![payload]).await;
+    scratch.configure(&url);
+    open_max_core::trust::grant_trust(&scratch.data(), &scratch.project(), ApprovalMode::Auto)
+        .unwrap();
+    let (core, mut rx) = Core::new(scratch.data()).unwrap();
+    let events = common::drive_turn(&core, &mut rx, "visible", &scratch.project(), "go").await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Token { text } if text == "Working"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("try again")))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Retry { .. } | AgentEvent::ToolStart { .. }))
+    );
+    assert!(!scratch.project().join("forbidden").exists());
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    job.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_responses_endpoints_withholds_opaque_reasoning_but_keeps_text() {
+    let scratch = Scratch::new();
+    let (first, _, first_job) = server(vec![done(json!([
+        {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"private-state"},
+        message("Previous answer")
+    ]))])
+    .await;
+    let (second, requests, second_job) = server(vec![done(json!([message("Next answer")]))]).await;
+    scratch.configure(&first);
+    std::fs::write(
+        scratch.data().join("providers.json"),
+        json!({"providers":{
+            "test":{"base_url":first,"wire_api":"responses"},
+            "other":{"base_url":second,"wire_api":"responses"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    open_max_core::trust::grant_trust(&scratch.data(), &scratch.project(), ApprovalMode::Auto)
+        .unwrap();
+    let (core, mut rx) = Core::new(scratch.data()).unwrap();
+    common::drive_turn(&core, &mut rx, "switch", &scratch.project(), "first").await;
+    core.settings.lock().unwrap().provider = Some("other".into());
+    let events = common::drive_turn(&core, &mut rx, "switch", &scratch.project(), "second").await;
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    first_job.await.unwrap();
+    second_job.await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let input = requests[0]["input"].as_array().unwrap();
+    assert!(
+        input
+            .iter()
+            .any(|item| item["role"] == "assistant" && item["content"] == "Previous answer")
+    );
+    assert!(!requests[0].to_string().contains("private-state"));
+    assert!(!input.iter().any(|item| item["type"] == "reasoning"));
 }

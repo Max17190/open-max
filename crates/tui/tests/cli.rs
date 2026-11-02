@@ -317,6 +317,11 @@ fn chatgpt_setup_is_separate_from_projects_and_session_authority() {
     let output = cmd(&project, &home).args(["--chatgpt", "status"]).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("No ChatGPT accounts"));
+    let output = cmd(&project, &home).args(["--chatgpt", "status", "--account", "work"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = cmd(&project, &home).args(["--chatgpt", "models", "--account", "work"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("account 'work' is signed out"), "{}", String::from_utf8_lossy(&output.stderr));
     for args in [vec!["--chatgpt","status","--trust-project"],vec!["--chatgpt","status","-p","hello"],
         vec!["--chatgpt","status","--provider","local"],vec!["--account","main"],vec!["--chatgpt","unknown"]] {
         let output = cmd(&project, &home).args(args).output().unwrap();
@@ -330,6 +335,18 @@ fn chatgpt_setup_is_separate_from_projects_and_session_authority() {
         assert_eq!(output.status.code(),Some(3));
     }
     assert!(!home.join(".openmax").exists(),"refused setup created runtime state");
+    let dir = home.join(".openmax");
+    std::fs::create_dir_all(&dir).unwrap();
+    let credentials = dir.join("chatgpt.json");
+    std::fs::write(&credentials, r#"{"host":"fixture","accounts":{"work":{"client_id":"fixture","subject":"fixture","email":""}}}"#).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let output = cmd(&project, &home).args(["--chatgpt", "logout", "--account", "work"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("account 'work' signed out"));
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

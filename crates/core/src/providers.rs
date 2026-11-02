@@ -893,6 +893,17 @@ mod tests {
         .unwrap();
         assert_eq!(check_file(&path).unwrap().unwrap(), (1, Vec::new()));
 
+        let plan = serde_json::json!({"base_url":crate::chatgpt::API,"wire_api":"responses","chatgpt_account":"work"});
+        std::fs::write(&path, serde_json::json!({"providers":{"plan":plan}}).to_string()).unwrap();
+        assert_eq!(check_file(&path).unwrap().unwrap(), (1, Vec::new()));
+        for (key, value) in [("api_key", serde_json::json!("fixture")), ("api_key_env", serde_json::json!("PLAN_KEY")),
+            ("headers", serde_json::json!({"X-Key":"fixture"}))] {
+            let mut invalid = plan.clone();
+            invalid[key] = value;
+            std::fs::write(&path, serde_json::json!({"providers":{"plan":invalid}}).to_string()).unwrap();
+            assert!(check_file(&path).unwrap().is_err(), "accepted {key} on a plan provider");
+        }
+
         std::fs::write(&path, r#"{"providers":{"local":{"base_url":"not a url"}}}"#)
             .unwrap();
         assert!(check_file(&path)

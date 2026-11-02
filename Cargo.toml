@@ -97,16 +97,16 @@ install-updater = false
 [workspace.metadata.dist.github-custom-runners]
 aarch64-apple-darwin = "macos-15"
 
-# Lean, fast binaries: thin LTO and symbol stripping keep the harness tiny so
+# Lean, fast binaries: full LTO and symbol stripping keep the harness tiny so
 # the model gets the machine.
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = true
 opt-level = "s"
 
 # cargo-dist builds with `--profile dist`. Inherit release so a published binary
-# carries the same thin LTO, one codegen unit, stripped symbols and size
+# carries the same full LTO, one codegen unit, stripped symbols and size
 # optimization the CI size gate measures, rather than a second, untuned shape.
 [profile.dist]
 inherits = "release"

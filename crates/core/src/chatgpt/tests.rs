@@ -105,9 +105,34 @@ async fn logout_revokes_or_reports_failure_and_keeps_the_registration() {
     for succeeds in [true, false] {
         let scratch = Scratch::new();
         let auth = seeded(&scratch.0);
+        // Keep the runtime ready so paused time cannot advance while loopback I/O is pending.
+        let clock_guard = succeeds.then(|| tokio::spawn(async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+            panic!("initial revocation did not run without a delay");
+        }));
+        let revocations = Arc::new(Mutex::new(None::<std::time::Instant>));
+        let discovered = Arc::new(Mutex::new(None::<tokio::time::Instant>));
         let (base, server) = serve(if succeeds { 2 } else { 3 }, move |path, body, origin| match path {
-            "/discovery" => (200, json!({"issuer":ISSUER,"revocation_endpoint":format!("{origin}/revoke")})),
+            "/discovery" => {
+                if succeeds {
+                    tokio::time::pause();
+                    *discovered.lock().unwrap() = Some(tokio::time::Instant::now());
+                }
+                (200, json!({"issuer":ISSUER,"revocation_endpoint":format!("{origin}/revoke")}))
+            }
             "/revoke" => {
+                if succeeds {
+                    assert_eq!(tokio::time::Instant::now(), discovered.lock().unwrap().unwrap());
+                    tokio::time::resume();
+                }
+                let mut last = revocations.lock().unwrap();
+                if let Some(previous) = *last {
+                    assert!(std::time::Instant::now().duration_since(previous) >= Duration::from_millis(250));
+                }
+                *last = Some(std::time::Instant::now());
                 let form = fields(body);
                 assert_eq!(form["token"], "old-refresh");
                 assert_eq!(form["token_type_hint"], "refresh_token");
@@ -118,12 +143,32 @@ async fn logout_revokes_or_reports_failure_and_keeps_the_registration() {
         })
         .await;
         let message = logout_at(&scratch.0, "main", &format!("{base}/discovery")).await.unwrap();
+        if let Some(clock_guard) = clock_guard {
+            clock_guard.abort();
+            assert!(clock_guard.await.unwrap_err().is_cancelled());
+        }
         assert_eq!(message.contains("not confirmed"), !succeeds);
         let store = load(&scratch.0).unwrap();
         assert!(store.accounts["main"].tokens.is_none());
         assert_eq!(identity(&store.accounts["main"]), auth.identity);
         assert_eq!(store.host, "urn:uuid:fixture");
+        assert!(logout(&scratch.0, "main").await.unwrap().contains("signed out"));
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn credential_lock_stops_retrying_at_its_deadline() {
+    let scratch = Scratch::new();
+    let _held = lock(&scratch.0).await.unwrap();
+    tokio::time::pause();
+    let mut waiting = Box::pin(lock(&scratch.0));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    tokio::time::advance(Duration::from_secs(35)).await;
+    match std::future::Future::poll(waiting.as_mut(), &mut context) {
+        std::task::Poll::Ready(Err(error)) => assert!(error.contains("credentials are busy")),
+        _ => panic!("credential lock retried past its deadline"),
     }
 }
 
@@ -175,6 +220,64 @@ async fn cancelling_a_refresh_waiter_does_not_discard_rotated_credentials() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "child process for refresh_shutdown_waits_for_rotated_credentials"]
+fn refresh_shutdown_child() {
+    let dir = PathBuf::from(std::env::var_os("OPENMAX_REFRESH_TEST_DIR").unwrap());
+    let url = std::env::var("OPENMAX_REFRESH_TEST_URL").unwrap();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let auth = seeded(&dir);
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let waiter = tokio::spawn(async move { auth.access_at(&http, &url).await });
+        signal.recv().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        finish_refreshes().await;
+        assert!(connection(&dir, "main").unwrap().access().await.unwrap_err().contains("shutting down"));
+        std::process::exit(0);
+    });
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn refresh_shutdown_waits_for_rotated_credentials() {
+    let scratch = Scratch::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "chatgpt::tests::refresh_shutdown_child", "--ignored"])
+        .env("OPENMAX_REFRESH_TEST_DIR", &scratch.0)
+        .env("OPENMAX_REFRESH_TEST_URL", url)
+        .stdout(std::process::Stdio::null())
+        .spawn().unwrap();
+    let check = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&buf[..n]);
+            if bytes.windows(b"old-refresh".len()).any(|w| w == b"old-refresh") { break; }
+        }
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(child.try_wait().unwrap().is_none(), "exit discarded an in-flight rotation");
+        let body = token_body("renewed-id").to_string();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(load(&scratch.0).unwrap().accounts["main"].tokens.as_ref().unwrap().refresh, "rotated-refresh");
+    }).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    check.expect("refresh shutdown did not settle");
+}
+
+#[cfg(unix)]
+#[test]
 fn credentials_refuse_links_and_readable_by_others() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let scratch = Scratch::new();
@@ -184,10 +287,37 @@ fn credentials_refuse_links_and_readable_by_others() {
     assert!(connection(&scratch.0, "main").unwrap_err().contains("mode 600"));
     std::fs::rename(&path, scratch.0.join("moved")).unwrap();
     symlink(scratch.0.join("moved"), &path).unwrap();
-    assert!(connection(&scratch.0, "main").is_err());
+    assert!(connection(&scratch.0, "main").unwrap_err().contains("cannot read"));
     assert!(auth_endpoint("https://wrong.invalid/revoke", DISCOVERY).is_err());
     assert!(auth_endpoint("http://auth.openai.com/revoke", DISCOVERY).is_err());
     assert!(auth_endpoint("https://auth.openai.com:8443/revoke", DISCOVERY).is_err());
+    assert!(auth_endpoint("https://user@auth.openai.com/revoke", DISCOVERY).is_err());
+    assert!(auth_endpoint("https://auth.openai.com/revoke#fragment", DISCOVERY).is_err());
+}
+
+#[test]
+fn credentials_and_account_labels_enforce_size_and_path_boundaries() {
+    let scratch = Scratch::new();
+    for account in ["", "../main", "with space", &"x".repeat(65)] {
+        assert!(connection(&scratch.0, account).unwrap_err().contains("account label"));
+    }
+    for account in ["valid-label", "valid_label", &"x".repeat(64)] {
+        assert!(connection(&scratch.0, account).unwrap_err().contains("signed out"));
+    }
+    let mut store = Store::default();
+    let limit = 1_048_576;
+    store.host = "x".repeat(limit - serde_json::to_vec(&store).unwrap().len());
+    save(&scratch.0, &store).unwrap();
+    let exact = std::fs::read(scratch.0.join("chatgpt.json")).unwrap();
+    assert_eq!(exact.len(), limit);
+    assert_eq!(load(&scratch.0).unwrap().host, store.host);
+    store.host.push('x');
+    assert!(save(&scratch.0, &store).unwrap_err().contains("size limit"));
+    assert_eq!(std::fs::read(scratch.0.join("chatgpt.json")).unwrap(), exact);
+    let mut oversized = exact;
+    oversized.push(b' ');
+    std::fs::write(scratch.0.join("chatgpt.json"), oversized).unwrap();
+    assert!(load(&scratch.0).err().unwrap().contains("size limit"));
 }
 
 #[tokio::test]
@@ -251,6 +381,13 @@ async fn browser_callback_exchange_and_returning_login_validate_and_preserve_reg
                         let client = reqwest::Client::builder().no_proxy().build().unwrap();
                         let mut redirect = reqwest::Url::parse(&auth["redirect_uri"]).unwrap();
                         assert_eq!(redirect.host_str(), Some("127.0.0.1"));
+                        if step == 0 {
+                            let mut oversized = tokio::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).await.unwrap();
+                            oversized.write_all(&vec![b'x'; 17000]).await.unwrap();
+                            let mut reply = [0; 128];
+                            let n = tokio::time::timeout(Duration::from_secs(1), oversized.read(&mut reply)).await.unwrap().unwrap();
+                            assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 400"));
+                        }
                         redirect.query_pairs_mut().extend_pairs([
                             ("state", "wrong-state"),
                             ("code", "discarded"),
@@ -263,7 +400,18 @@ async fn browser_callback_exchange_and_returning_login_validate_and_preserve_reg
                             ("code", "valid-code"),
                             ("client_id", "issued-client"),
                         ]);
-                        assert_eq!(client.get(redirect).send().await.unwrap().status(), 200);
+                        if step == 0 {
+                            let mut request = format!("GET {}?{} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Padding: ", redirect.path(), redirect.query().unwrap());
+                            request.push_str(&" ".repeat(16384 - request.len() - 4));
+                            request.push_str("\r\n\r\n");
+                            let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).await.unwrap();
+                            socket.write_all(request.as_bytes()).await.unwrap();
+                            let mut reply = [0; 256];
+                            let n = socket.read(&mut reply).await.unwrap();
+                            assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 200"));
+                        } else {
+                            assert_eq!(client.get(redirect).send().await.unwrap().status(), 200);
+                        }
                     }));
                 },
                 &format!("{base}/token"),
@@ -307,34 +455,217 @@ fn invalid_identity_and_callback_cannot_select_an_account() {
         ("nonce", json!("wrong")),
         ("exp", json!(now() - 1)),
         ("sub", json!("")),
+        ("iat", json!(now() + 120)),
+        ("iat", Value::Null),
+        ("exp", Value::Null),
         ("nbf", json!(now() + 60)),
+        ("nbf", json!("invalid")),
         ("azp", json!("wrong-client")),
+        ("aud", json!(["issued-client", "other-client"])),
+        ("aud", json!(["other-client"])),
     ] {
         let mut bad = valid.clone();
         bad[field] = value;
-        assert!(validate_id(&signed(&bad), &keys(), "issued-client", "nonce").is_err(), "{field}");
+        assert!(
+            validate_id(&signed(&bad), &keys(), "issued-client", "nonce").is_err(),
+            "{field}"
+        );
+    }
+    let mut multiple = valid.clone();
+    multiple["aud"] = json!(["issued-client"]);
+    assert!(validate_id(&signed(&multiple), &keys(), "issued-client", "nonce").is_ok());
+    multiple["aud"] = json!(["issued-client", "other-client"]);
+    multiple["azp"] = json!("issued-client");
+    assert!(validate_id(&signed(&multiple), &keys(), "issued-client", "nonce").is_ok());
+    let mut checked_clock_boundary = false;
+    for _ in 0..3 {
+        let second = now();
+        let mut skewed = valid.clone();
+        skewed["iat"] = json!(second + 60);
+        let result = validate_id(&signed(&skewed), &keys(), "issued-client", "nonce");
+        if now() == second {
+            assert!(result.is_ok(), "the permitted clock skew was rejected");
+            checked_clock_boundary = true;
+            break;
+        }
+    }
+    assert!(checked_clock_boundary, "clock changed during every validation attempt");
+    for (field, value) in [
+        ("kty", "EC"),
+        ("kid", "unknown"),
+        ("use", "enc"),
+        ("alg", "RS512"),
+    ] {
+        let mut bad_keys = keys();
+        bad_keys["keys"][0][field] = json!(value);
+        assert!(
+            validate_id(&signed(&valid), &bad_keys, "issued-client", "nonce").is_err(),
+            "{field}"
+        );
     }
     let mut tampered = signed(&valid).into_bytes();
     let last = tampered.len() - 10;
     tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
-    assert!(validate_id(std::str::from_utf8(&tampered).unwrap(), &keys(), "issued-client", "nonce").is_err());
+    assert!(
+        validate_id(
+            std::str::from_utf8(&tampered).unwrap(),
+            &keys(),
+            "issued-client",
+            "nonce"
+        )
+        .is_err()
+    );
     for query in [
         "state=x&code=c&client_id=issued-client",
         "state=s&state=s&code=c&client_id=issued-client",
+        "state=s&code=c&code=other&client_id=issued-client",
+        "state=s&code=c&client_id=issued-client&client_id=issued-client",
+        "state=s&code=&client_id=issued-client",
         "state=s&code=c&client_id=dynamic_agent_client",
         "state=s&code=c&client_id=other-client",
         "state=s&error=access_denied",
     ] {
-        assert!(callback(&format!("/auth/callback?{query}"), "s", Some("issued-client")).is_err());
+        assert!(
+            callback(
+                &format!("/auth/callback?{query}"),
+                "s",
+                Some("issued-client")
+            )
+            .is_err()
+        );
     }
     assert!(callback("/auth/callback?state=s&code=c", "s", None).is_err());
-    assert_eq!(callback("/auth/callback?state=s&code=c", "s", Some("issued-client")).unwrap().1, "issued-client");
+    for client in ["", "dynamic_agent_client"] {
+        assert!(callback(&format!("/auth/callback?state=s&code=c&client_id={client}"), "s", None).is_err());
+    }
+    assert_eq!(
+        callback("/auth/callback?state=s&code=c", "s", Some("issued-client"))
+            .unwrap()
+            .1,
+        "issued-client"
+    );
+}
+
+#[tokio::test]
+async fn failed_returning_login_preserves_the_signed_in_account() {
+    for scenario in ["wrong-nonce", "changed-subject", "declined"] {
+        let scratch = Scratch::new();
+        seeded(&scratch.0);
+        let before = std::fs::read(scratch.0.join("chatgpt.json")).unwrap();
+        let authorization = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
+        let captured = authorization.clone();
+        let (base, server) = serve(if scenario == "declined" { 0 } else { 3 }, move |path, _, origin| {
+            (
+                200,
+                match path {
+                    "/token" => {
+                        let auth = captured.lock().unwrap();
+                        let mut identity = claims(if scenario == "changed-subject" {
+                            &auth["nonce"]
+                        } else {
+                            "wrong-nonce"
+                        });
+                        if scenario == "changed-subject" {
+                            identity["sub"] = json!("other-user");
+                        }
+                        token_body(&signed(&identity))
+                    }
+                    "/discovery" => json!({"issuer":ISSUER,"jwks_uri":format!("{origin}/keys")}),
+                    "/keys" => keys(),
+                    _ => panic!("unexpected identity validation request"),
+                },
+            )
+        })
+        .await;
+        let callback_task = Arc::new(Mutex::new(None));
+        let task = callback_task.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            login_at(
+                &scratch.0,
+                "main",
+                |url| {
+                    let url = reqwest::Url::parse(url).unwrap();
+                    let auth = fields(url.query().unwrap());
+                    *authorization.lock().unwrap() = auth.clone();
+                    *task.lock().unwrap() = Some(tokio::spawn(async move {
+                        let mut redirect = reqwest::Url::parse(&auth["redirect_uri"]).unwrap();
+                        redirect.query_pairs_mut().append_pair("state", &auth["state"]);
+                        if scenario == "declined" {
+                            redirect.query_pairs_mut().append_pair("error", "access_denied");
+                        } else {
+                            redirect.query_pairs_mut().append_pair("code", "valid-code");
+                        }
+                        assert_eq!(
+                            reqwest::Client::builder()
+                                .no_proxy()
+                                .build()
+                                .unwrap()
+                                .get(redirect)
+                                .send()
+                                .await
+                                .unwrap()
+                                .status(),
+                            if scenario == "declined" { 400 } else { 200 }
+                        );
+                    }));
+                },
+                &format!("{base}/token"),
+                &format!("{base}/discovery"),
+            ),
+        )
+        .await
+        .unwrap();
+        let error = result.err().expect("invalid identity was accepted");
+        assert!(error.contains(match scenario {
+            "changed-subject" => "differs from the selected account",
+            "declined" => "authorization was declined",
+            _ => "identity validation",
+        }));
+        assert_eq!(
+            std::fs::read(scratch.0.join("chatgpt.json")).unwrap(),
+            before
+        );
+        let task = callback_task.lock().unwrap().take().unwrap();
+        task.await.unwrap();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn refresh_without_plan_scope_persists_rotation_and_blocks_further_use() {
+    let scratch = Scratch::new();
+    let auth = seeded(&scratch.0);
+    let (url, server) = serve(1, |_, _, _| {
+        let mut body = token_body("renewed-id");
+        body["scope"] = json!("openid profile email offline_access");
+        (200, body)
+    })
+    .await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    assert_eq!(
+        auth.access_at(&client, &url).await.unwrap_err(),
+        PLAN_DISABLED
+    );
+    server.await.unwrap();
+    let store = load(&scratch.0).unwrap();
+    let credentials = store.accounts["main"].tokens.as_ref().unwrap();
+    assert_eq!(credentials.refresh, "rotated-refresh");
+    assert_eq!(credentials.access, "new-access");
+    assert_eq!(
+        auth.access_at(&client, &url).await.unwrap_err(),
+        PLAN_DISABLED
+    );
+    assert_eq!(connection(&scratch.0, "main").unwrap_err(), PLAN_DISABLED);
 }
 
 #[tokio::test]
 async fn concurrent_refresh_rotates_once_and_failure_retains_or_clears_as_required() {
     let scratch = Scratch::new();
     let auth = seeded(&scratch.0);
+    let mut store = load(&scratch.0).unwrap();
+    store.accounts.get_mut("main").unwrap().tokens.as_mut().unwrap().expires = now() + 60;
+    save(&scratch.0, &store).unwrap();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let (url, server) = serve(1, |_, body, _| {
         let form = fields(body);
@@ -349,8 +680,15 @@ async fn concurrent_refresh_rotates_once_and_failure_retains_or_clears_as_requir
     for access in [a, b, c] {
         assert_eq!(access.unwrap(), "new-access");
     }
+    assert_eq!(auth.access().await.unwrap(), "new-access");
     server.await.unwrap();
     assert_eq!(load(&scratch.0).unwrap().accounts["main"].tokens.as_ref().unwrap().refresh, "rotated-refresh");
+    let expires = load(&scratch.0).unwrap().accounts["main"].tokens.as_ref().unwrap().expires;
+    assert!(expires > SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+    let mut store = load(&scratch.0).unwrap();
+    store.accounts.get_mut("main").unwrap().subject = "other-user".into();
+    save(&scratch.0, &store).unwrap();
+    assert!(auth.access().await.unwrap_err().contains("account changed"));
     for (status_code, code, retains) in [(503, "temporarily_unavailable", true), (400, "invalid_grant", false)] {
         let auth = seeded(&scratch.0);
         let (url, server) =
@@ -360,6 +698,68 @@ async fn concurrent_refresh_rotates_once_and_failure_retains_or_clears_as_requir
         assert_eq!(load(&scratch.0).unwrap().accounts["main"].tokens.is_some(), retains);
         server.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn invalid_refresh_responses_preserve_the_previous_credentials() {
+    for scenario in ["zero-lifetime", "long-lifetime", "exact-limit", "oversized"] {
+        let scratch = Scratch::new();
+        let auth = seeded(&scratch.0);
+        let before = std::fs::read(scratch.0.join("chatgpt.json")).unwrap();
+        let (url, server) = serve(1, move |_, _, _| {
+            let mut body = token_body("renewed-id");
+            match scenario {
+                "zero-lifetime" => body["expires_in"] = json!(0),
+                "long-lifetime" => body["expires_in"] = json!(86401),
+                "exact-limit" => {
+                    body["padding"] = json!("");
+                    body["padding"] = json!("x".repeat(LIMIT - body.to_string().len()));
+                }
+                _ => body["padding"] = json!("x".repeat(LIMIT)),
+            }
+            (200, body)
+        }).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let result = auth.access_at(&client, &url).await;
+        if scenario == "exact-limit" {
+            assert_eq!(result.unwrap(), "new-access");
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.contains(if scenario == "oversized" { "size limit" } else { "invalid token lifetime" }));
+            assert_eq!(std::fs::read(scratch.0.join("chatgpt.json")).unwrap(), before);
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn catalog_creates_a_provider_and_preserves_only_positive_model_limits() {
+    let scratch = Scratch::new();
+    let catalog = json!({"models":[
+        {"slug":"zero-window","visibility":"list","context_window":0},
+        {"slug":"positive-window","visibility":"list","context_window":1},
+        {"slug":"saved-window","visibility":"list"},
+        {"slug":"empty-window","visibility":"list"}
+    ]});
+    let models = save_catalog(&scratch.0, "main", &catalog).await.unwrap();
+    assert_eq!(models[0].context_tokens, None);
+    assert_eq!(models[1].context_tokens, Some(1));
+    let path = scratch.0.join("providers.json");
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let saved = &mut file["providers"]["chatgpt-main"]["models"];
+    saved[2]["context_tokens"] = json!(4096);
+    saved[2]["max_tokens"] = json!(1);
+    saved[3]["context_tokens"] = json!(0);
+    saved[3]["max_tokens"] = json!(0);
+    std::fs::write(&path, file.to_string()).unwrap();
+    let models = save_catalog(&scratch.0, "main", &catalog).await.unwrap();
+    assert_eq!(models[2].context_tokens, Some(4096));
+    assert_eq!(models[2].max_tokens, Some(1));
+    assert_eq!(models[3].context_tokens, None);
+    assert_eq!(models[3].max_tokens, None);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(save_catalog(&scratch.0, "main", &catalog).await.unwrap_err().contains("cannot read providers.json"));
 }
 
 #[tokio::test]
@@ -392,11 +792,24 @@ async fn catalog_and_provider_resolution_keep_credentials_and_defaults_separate(
     let endpoint = providers::resolve(&settings, &scratch.0).unwrap();
     assert!(endpoint.api_key.is_none());
     assert!(endpoint.chatgpt.is_some());
-    let mut client = crate::client::ChatClient::from_endpoint(&endpoint);
-    client.base_url = "https://wrong.invalid/v1".into();
-    let error =
-        client.stream_chat(&[], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.err().unwrap();
-    assert!(error.contains("fixed OpenAI endpoint"));
+    let mut store = load(&scratch.0).unwrap();
+    store.accounts.get_mut("main").unwrap().tokens.as_mut().unwrap().expires = now() + 3600;
+    save(&scratch.0, &store).unwrap();
+    for guard in ["headers", "api_key", "base_url", "wire_api"] {
+        let mut endpoint = endpoint.clone();
+        if guard == "wire_api" { endpoint.wire_api = providers::WireApi::ChatCompletions; }
+        let mut client = crate::client::ChatClient::from_endpoint(&endpoint);
+        match guard {
+            "headers" => client.headers.push(("X-Test".into(), "fixture".into())),
+            "api_key" => client.api_key = Some("fixture-key".into()),
+            "base_url" => client.base_url = "https://wrong.invalid/v1".into(),
+            _ => {}
+        }
+        let cancelled = Arc::new(crate::state::CancelToken::default());
+        cancelled.cancel();
+        let error = client.stream_chat(&[], "[]", cancelled, |_| {}).await.err().unwrap();
+        assert!(error.contains("fixed OpenAI endpoint"), "{guard}: {error}");
+    }
     settings.provider = Some("local".into());
     let endpoint = providers::resolve(&settings, &scratch.0).unwrap();
     assert!(endpoint.chatgpt.is_none());
@@ -407,6 +820,7 @@ async fn catalog_and_provider_resolution_keep_credentials_and_defaults_separate(
     std::fs::write(scratch.0.join("providers.json"), file.to_string()).unwrap();
     assert_eq!(save_catalog(&scratch.0, "main", &catalog).await.unwrap()[0].context_tokens, Some(123456));
     for (field, value) in [
+        ("chatgpt_account", json!("other-account")),
         ("base_url", json!("https://wrong.invalid")),
         ("headers", json!({"X-Test":"test"})),
         ("api_key", json!("key")),
@@ -416,6 +830,11 @@ async fn catalog_and_provider_resolution_keep_credentials_and_defaults_separate(
         let mut bad = file.clone();
         bad["providers"]["chatgpt-main"][field] = value;
         std::fs::write(scratch.0.join("providers.json"), bad.to_string()).unwrap();
+        if matches!(field, "chatgpt_account" | "base_url" | "wire_api") {
+            assert!(save_catalog(&scratch.0, "main", &catalog).await.is_err(), "{field}");
+            let unchanged: Value = serde_json::from_slice(&std::fs::read(scratch.0.join("providers.json")).unwrap()).unwrap();
+            assert_eq!(unchanged, bad);
+        }
         settings.provider = Some("chatgpt-main".into());
         assert!(providers::resolve(&settings, &scratch.0).is_err(), "{field}");
     }

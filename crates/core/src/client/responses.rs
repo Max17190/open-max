@@ -305,15 +305,211 @@ pub(super) async fn read(
                 _ => {}
             }
         }
-        if consumed > 0 {
-            buffer.drain(..consumed);
-        }
+        buffer.drain(..consumed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn endpoint(replies: Vec<(u16, String)>) -> (ChatClient, Arc<std::sync::Mutex<Vec<Vec<u8>>>>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = ChatClient::new(format!("http://{}", listener.local_addr().unwrap()), None, "fixture".into(), None, 64);
+        client.wire_api = crate::providers::WireApi::Responses;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let job = tokio::spawn(async move {
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buf = [0; 8192];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let len: usize = String::from_utf8_lossy(&bytes[..end]).lines().find_map(|l| {
+                            l.to_ascii_lowercase().strip_prefix("content-length:").map(|s| s.trim().parse().unwrap())
+                        }).unwrap();
+                        if bytes.len() >= end + 4 + len {
+                            recorded.lock().unwrap().push(bytes[end + 4..end + 4 + len].to_vec());
+                            break;
+                        }
+                    }
+                }
+                let header = format!("HTTP/1.1 {status} fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        (client, requests, job)
+    }
+
+    fn completed(text: &str) -> String {
+        format!("data: {}\n\n", json!({"type":"response.completed","response":{"status":"completed","output":[
+            {"type":"message","status":"completed","content":[{"type":"output_text","text":text}]}]}}))
+    }
+
+    #[tokio::test]
+    async fn http_rate_limits_retry_within_budget_and_plan_limits_stop_immediately() {
+        for (replies, expected_requests, expected_error) in [
+            (vec![(429, json!({"error":{"code":"rate_limit_exceeded","message":"busy"}}).to_string()),
+                (200, completed("recovered"))], 2, None),
+            (vec![(429, json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"app limit"}}).to_string()),
+                (200, completed("unexpected"))], 1, Some("https://chatgpt.com/settings/usage")),
+            (vec![(429, json!({"error":{"code":"rate_limit_exceeded","message":"busy"}}).to_string()); 9], 8, Some("backend reported an error (rate_limit_exceeded): busy")),
+            (vec![(400, json!({"message":"request rejected"}).to_string())], 1, Some("request rejected")),
+            (vec![(200, format!("data: {}\n\n", json!({"type":"error","code":"server_error","message":"busy"}))),
+                (200, completed("recovered"))], 2, None),
+            (vec![(200, format!("data: {}\n\n", json!({"type":"error","code":"server_error","message":"busy"}))); 9],
+                8, Some("backend reported an error (server_error): busy")),
+        ] {
+            let streamed_error = replies[0].0 == 200;
+            let (client, requests, job) = endpoint(replies).await;
+            let mut retries = Vec::new();
+            let mut reasons = Vec::new();
+            let mut visible = String::new();
+            let result = client.stream_chat(&[ChatMessage::user("go")], "[]", Arc::new(crate::state::CancelToken::default()), |delta| {
+                if let StreamDelta::Retry { attempt, max_attempts, ref reason } = delta {
+                    retries.push((attempt, max_attempts));
+                    reasons.push(reason.clone());
+                }
+                if let StreamDelta::Content(text) = delta { visible.push_str(&text); }
+            }).await;
+            job.abort();
+            match expected_error {
+                Some(message) => assert!(result.err().unwrap().contains(message)),
+                None => {
+                    assert_eq!(result.unwrap().content, "recovered");
+                    assert_eq!(visible, "recovered");
+                }
+            }
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+            assert_eq!(retries, (2..=expected_requests as u32).map(|attempt| (attempt, 8)).collect::<Vec<_>>());
+            if streamed_error { assert!(reasons[0].contains("server_error")); }
+        }
+        let (client, requests, job) = endpoint(vec![(200, String::new()); 9]).await;
+        let mut retries = Vec::new();
+        let result = client.stream_chat(&[ChatMessage::user("go")], "[]", Arc::new(crate::state::CancelToken::default()), |delta| {
+            if let StreamDelta::Retry { attempt, .. } = delta { retries.push(attempt); }
+        }).await.unwrap();
+        job.abort();
+        assert_eq!(result.finish_reason, TRUNCATED);
+        assert_eq!(requests.lock().unwrap().len(), 8);
+        assert_eq!(retries, vec![2, 3, 4, 5, 6, 7, 8]);
+        for reply in [
+            (200, String::new()),
+            (200, format!("data: {}\n\n", json!({"type":"error","code":"server_error","message":"busy"}))),
+            (429, json!({"error":{"code":"rate_limit_exceeded","message":"busy"}}).to_string()),
+        ] {
+            let (client, requests, job) = endpoint(vec![reply; 2]).await;
+            let cancelled = Arc::new(crate::state::CancelToken::default());
+            let result = client.stream_chat(&[ChatMessage::user("go")], "[]", cancelled.clone(), |delta| {
+                if matches!(delta, StreamDelta::Retry { .. }) { cancelled.cancel(); }
+            }).await.unwrap();
+            job.abort();
+            assert_eq!(result.finish_reason, "cancelled");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_byte_limit_rejects_a_late_completed_call() {
+        let first = format!("data: {}\n\n", json!({"type":"response.output_item.done","output_index":0,
+            "item":{"type":"function_call","status":"completed","call_id":"call-1","name":"write_file","arguments":"{}"}}));
+        let terminal = format!("data: {}\n\n", json!({"type":"response.completed","response":{"status":"completed"}}));
+        for excess in [0, 1] {
+            let padding = MAX_RESPONSE_BYTES + excess - first.len() - terminal.len();
+            let mut body = first.clone() + &": ignored\n\n".repeat(padding / 11 - 1);
+            body.push_str(&format!(":{}\n\n", " ".repeat(padding % 11 + 8)));
+            body.push_str(&terminal);
+            assert_eq!(body.len(), MAX_RESPONSE_BYTES + excess);
+            let (client, _, job) = endpoint(vec![(200, body)]).await;
+            let result = client.stream_chat(&[ChatMessage::user("go")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+            assert_eq!(result.finish_reason, if excess == 0 { "tool_calls" } else { TRUNCATED });
+            assert_eq!(result.tool_calls.len(), usize::from(excess == 0));
+            job.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn multiline_sse_data_preserves_json_token_boundaries() {
+        for (separator, valid) in [("\ndata: ", true), ("1\ndata: 2", false)] {
+            let body = format!("data: {}\n\n", json!({"type":"response.completed","response":{"status":"completed",
+                "output":[{"type":"message","status":"completed","content":[{"type":"refusal","refusal":"Declined"}]},
+                {"type":"function_call","call_id":"call-1","name":"write_file","arguments":"{}"}],
+                "usage":{"input_tokens":12,"output_tokens":1}}}));
+            let body = if valid {
+                body.replace("\"response\":", &format!("\"response\":{separator}"))
+            } else {
+                body.replace("\"input_tokens\":12", &format!("\"input_tokens\":{separator}"))
+            };
+            let (client, _, job) = endpoint(vec![(200, body)]).await;
+            let response = reqwest::Client::new().post(client.endpoint()).body("{}").send().await.unwrap();
+            let (result, unfinished) = read(response, &crate::state::CancelToken::default(), std::time::Duration::from_secs(5), &mut |_| {}).await;
+            if valid {
+                assert!(unfinished.is_none());
+                assert_eq!(result.tool_calls.len(), 1);
+                assert_eq!(result.finish_reason, "tool_calls");
+                assert_eq!(result.content, "Declined");
+                assert_eq!(result.usage.unwrap().prompt_tokens, 12);
+            } else {
+                assert!(matches!(unfinished, Some(Unfinished::Interrupted(_))));
+                assert!(result.tool_calls.is_empty());
+            }
+            job.await.unwrap();
+        }
+        let (client, _, job) = endpoint(vec![(200, format!("data: {}\n\n", json!({"type":"response.incomplete"})))]).await;
+        let response = reqwest::Client::new().post(client.endpoint()).body("{}").send().await.unwrap();
+        let (result, unfinished) = read(response, &crate::state::CancelToken::default(), std::time::Duration::from_secs(5), &mut |_| {}).await;
+        assert!(unfinished.is_none());
+        assert_eq!(result.finish_reason, TRUNCATED);
+        job.await.unwrap();
+    }
+
+    #[test]
+    fn notes_stay_at_the_transcript_tail_and_complex_tool_schemas_keep_their_shape() {
+        let client = ChatClient::new("http://127.0.0.1".into(), None, "fixture".into(), None, 64);
+        for (last, key, folded) in [
+            (ChatMessage::user("task"), "content", true),
+            (ChatMessage::tool("call-1", "result"), "output", true),
+            (ChatMessage::assistant(Some("answer".into()), None), "content", false),
+        ] {
+            let messages = [ChatMessage::system("rules"), last.clone()];
+            let body: Value = serde_json::from_slice(&serialize(&client, &messages, Some("live note"), "[]").unwrap()).unwrap();
+            assert_eq!(body["input"][0]["content"], "rules");
+            let input = body["input"].as_array().unwrap();
+            if folded {
+                assert_eq!(input.len(), 2);
+                assert_eq!(input[1][key], format!("{}{NOTE_SEPARATOR}live note", last.content.unwrap()));
+            } else {
+                assert_eq!(input.len(), 3);
+                assert_eq!(input[1]["content"], "answer");
+                assert_eq!(input[2], json!({"role":"user","content":"live note"}));
+            }
+        }
+        for parameters in [
+            json!({"type":"object","properties":{"value":{"type":"string"}},"required":[],"additionalProperties":false}),
+            json!({"type":"object","properties":{"value":{"type":"array","items":{"type":"string"}}},"required":["value"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":true}),
+        ] {
+            let tools = json!([{"type":"function","function":{"name":"fixture","parameters":parameters}}]);
+            let body: Value = serde_json::from_slice(&serialize(&client, &[], None, &tools.to_string()).unwrap()).unwrap();
+            assert_eq!(body["input"][0]["tools"][0]["strict"], false);
+            assert_eq!(body["input"][0]["tools"][0]["parameters"], parameters);
+        }
+        for same_origin in [true, false] {
+            let mut message = ChatMessage::assistant(Some("answer".into()), None);
+            message.reasoning_details = Some(RawValue::from_string(json!([{"type":"reasoning","encrypted_content":"opaque"}]).to_string()).unwrap());
+            message.reasoning_origin = Some(if same_origin { client.origin() } else { "different-origin".into() });
+            let body = serialize(&client, &[message], None, "[]").unwrap();
+            assert_eq!(String::from_utf8(body).unwrap().contains("opaque"), same_origin);
+        }
+    }
 
     #[test]
     fn subscription_request_omits_unsupported_options_without_changing_key_requests() {

@@ -523,9 +523,9 @@ fn whole_suite_runs_in_five_seconds() {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // Native account authentication and Responses translation add 1,237 lines;
-    // the agent loop and trust dispatcher are unchanged. Measured at 42,670, plus MARGIN.
-    const RATCHET: usize = 42_870;
+    // Native account authentication and Responses translation add 1,281 lines;
+    // the agent loop and trust dispatcher are unchanged. Measured at 42,714, plus MARGIN.
+    const RATCHET: usize = 42_914;
     const MARGIN: usize = 200;
     let gauge = |checkout: &Path, excluded: bool| -> Result<String, String> {
         let mut gauge = Command::new(repo().join("scripts/count-core-lines.sh"));

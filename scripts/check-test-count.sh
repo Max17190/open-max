@@ -26,7 +26,7 @@
 set -u -o pipefail
 
 linux_floor=1427
-macos_floor=1441
+macos_floor=1455
 target=2000
 
 [ $# -eq 0 ] || { echo "usage: $0" >&2; exit 2; }

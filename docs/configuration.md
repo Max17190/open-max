@@ -364,7 +364,9 @@ No model name, availability, or context limit is guessed.
 ChatGPT credentials live only in `~/.openmax/chatgpt.json`, an owner-only
 file (mode 600), separate from provider settings and session transcripts.
 Refresh uses a process lock and atomically replaces the access and refresh
-tokens together. A cancelled waiting turn lets a token rotation finish.
+tokens together. A cancelled waiting turn lets a token rotation finish,
+and normal shutdown waits for it to be saved. A forced exit or process kill
+can still interrupt an in-flight rotation and require another sign-in.
 Logout attempts remote revocation, clears local tokens, and reports when
 remote revocation was not confirmed. To revoke access directly, use
 [ChatGPT Settings](https://chatgpt.com/settings/usage). Temporary network
