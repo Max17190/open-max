@@ -44,6 +44,8 @@ const fn command(
 
 pub const COMMANDS: &[CommandSpec] = &[
     command("help", "", "keybindings and commands", true),
+    command("login", "[provider]", "sign in or configure a provider", true),
+    command("logout", "[provider]", "remove saved provider credentials", true),
     command(
         "model",
         "[id]",
@@ -54,7 +56,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     command(
         "provider",
         "[name]",
-        "list or select a named provider",
+        "pick a configured provider and model",
         false,
     ),
     command(
@@ -798,5 +800,10 @@ mod tests {
         assert_eq!(model.usage(), "/model [id]");
         assert!(model.submits);
         assert!(COMMANDS.iter().any(|spec| spec.name == "copy"));
+        for name in ["login", "logout"] {
+            let command = COMMANDS.iter().find(|spec| spec.name == name).unwrap();
+            assert_eq!(command.args, "[provider]");
+            assert!(command.submits);
+        }
     }
 }

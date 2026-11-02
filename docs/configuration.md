@@ -286,9 +286,12 @@ requests.
 }
 ```
 
-Set `"provider"` in settings, use the provider CLI option, or use `/provider`
-when you only want to change the endpoint. Optional `compat` flags cover picky
+Set `"provider"` in settings, use the provider CLI option, or use `/provider <name>`
+when you only want to change the endpoint. Bare `/provider` opens the searchable
+model picker. Optional `compat` flags cover picky
 gateways (for example `max_completion_tokens` versus `max_tokens`).
+`compat.omit_temperature: true` leaves sampling temperature to that provider;
+it defaults to false and leaves other providers' settings unchanged.
 
 `wire_api` defaults to `chat_completions`, preserving existing requests.
 An explicit `responses` selects the Responses protocol. The ChatGPT setup
@@ -331,6 +334,62 @@ silent after reply text is reported truncated. A provider's
 
 Open Max works with local servers (Ollama, LM Studio, vLLM, llama.cpp), cloud
 gateways (OpenRouter and similar), and private proxies.
+
+## Connecting and disconnecting providers
+
+Run `openmax --login` from a terminal, or `/login` inside a session. Choose a
+provider with the arrow keys, type to filter, and press Enter. Esc cancels
+a setup prompt before its changes are saved. The choices are:
+
+- **OpenAI: ChatGPT plan:** browser sign-in using the account's plan. The
+  command target is `chatgpt`; the default saved connection is `chatgpt-main`.
+- **OpenAI API:** an API key with separate API billing. Target `openai`.
+- **Anthropic API:** an API key with separate API billing. Target `anthropic`.
+- **Other compatible API:** an HTTPS API URL and a Bearer API key. Target
+  `custom`. Plain HTTP is accepted only for a server on loopback.
+- Existing named connections, for updating their API key or selected model.
+
+For example, `openmax --login anthropic` skips the provider menu. Keys are
+entered in a hidden terminal prompt, outside composer history and the
+transcript. When the corresponding `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
+environment variable is present, the prompt offers to copy its current value.
+The connection stores that value privately, rather than depending on that
+environment variable in future shells. Never paste a key as a slash-command
+argument.
+
+API setup loads the endpoint's model catalog and lets you choose an exact
+model. OpenAI setup omits known dedicated embedding, image, speech, realtime,
+and moderation model families; other providers retain their own catalogs.
+When the API does not report its context window, enter the value from
+the model's documentation. An endpoint without a model-list route can be
+configured with an exact model ID; setup reports that access was not verified.
+The selected model is added to the saved catalog, preserving its other models.
+Run login again to add another. Choose the connection with `/model` afterward,
+or use the printed `openmax --provider ... --model ...` command. Login does not
+silently change the default provider or project trust.
+
+The Anthropic preset uses its documented
+[compatible API](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk),
+which supports streaming and tools but does not provide prompt caching.
+It uses API-key authentication with separate API billing. Setup asks for the
+workspace ID when needed; leave it empty for a workspace-scoped key. See
+[Anthropic authentication](https://platform.claude.com/docs/en/manage-claude/authentication).
+New API preset connections omit temperature, so the server chooses its supported
+default. Reconnecting an existing provider preserves its compatibility settings
+and wire protocol, including their implicit defaults.
+
+Use `/logout` or `openmax --logout` to choose a connection to disconnect.
+ChatGPT logout revokes and clears its local tokens. For an API-key connection,
+confirming logout removes that named connection and its model catalog from
+`providers.json`. It does not revoke the API key at its issuer or edit shell
+environment variables. A still-selected removed provider fails explicitly;
+it cannot fall back to another key or endpoint. Other connections and settings
+remain unchanged.
+
+Connection setup requires a human terminal, runs without project hooks, and
+grants no trust. Catalog writes preserve unrelated entries, take a shared
+process lock, and atomically save owner-only files. Existing `--chatgpt`
+commands and manually configured providers remain available.
 
 ## ChatGPT sign-in
 

@@ -16,3 +16,5 @@
 crates/core/src/client/responses.rs: replace + with * in read # hangs: consumed = end * 1 leaves the newline unconsumed; the synchronous SSE loop cannot yield to cancellation or its async timeout.
 crates/core/src/client/responses.rs: replace + with - in read # hangs: consumed = end - 1 revisits the same newline; the synchronous SSE loop cannot yield to cancellation or its async timeout.
 crates/core/src/chatgpt.rs: replace | with ^ in load # equivalent: O_NOFOLLOW and O_NONBLOCK have disjoint bits on Linux and macOS, so OR and XOR pass identical open flags.
+crates/core/src/providers/setup.rs: replace | with ^ in open # equivalent: O_NOFOLLOW and O_NONBLOCK have disjoint bits on Linux and macOS, so OR and XOR pass identical open flags.
+crates/tui/src/setup.rs: replace | with ^ in Prompts::input # equivalent: CONTROL and ALT are disjoint modifier bits (0b10 and 0b100), so OR and XOR produce the same 0b110 mask.

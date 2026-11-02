@@ -957,6 +957,7 @@ dependencies = [
  "libc",
  "open-max-core",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
