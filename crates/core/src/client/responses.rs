@@ -422,10 +422,12 @@ mod tests {
         let first = format!("data: {}\n\n", json!({"type":"response.output_item.done","output_index":0,
             "item":{"type":"function_call","status":"completed","call_id":"call-1","name":"write_file","arguments":"{}"}}));
         let terminal = format!("data: {}\n\n", json!({"type":"response.completed","response":{"status":"completed"}}));
+        let comment = format!(":{}\n\n", "x".repeat(4093));
         for excess in [0, 1] {
             let padding = MAX_RESPONSE_BYTES + excess - first.len() - terminal.len();
-            let mut body = first.clone() + &": ignored\n\n".repeat(padding / 11 - 1);
-            body.push_str(&format!(":{}\n\n", " ".repeat(padding % 11 + 8)));
+            let frames = (padding - 3) / comment.len();
+            let mut body = first.clone() + &comment.repeat(frames);
+            body.push_str(&format!(":{}\n\n", "x".repeat(padding - frames * comment.len() - 3)));
             body.push_str(&terminal);
             assert_eq!(body.len(), MAX_RESPONSE_BYTES + excess);
             let (client, _, job) = endpoint(vec![(200, body)]).await;
