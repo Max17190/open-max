@@ -1017,6 +1017,103 @@ mod first_frame {
         }
     }
 
+    #[test]
+    fn effort_picker_selects_cancels_clears_and_refuses_ignored_settings() {
+        let (cols, rows) = (160, 40);
+        let mut s = Session::spawn_home("effort-picker", cols as u16, rows as u16, |dir, cmd, _, _| {
+            std::fs::write(dir.join("settings.json"),
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384,"reasoning_effort":"high"}"#).unwrap();
+            cmd.args(["--trust-project", "--effort", "default", "--model", "transient-model", "--context-tokens", "8192"]);
+        });
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort default\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default"));
+        assert!(shown.contains("requested: default"), "{shown}");
+        let initial: serde_json::Value = serde_json::from_slice(&std::fs::read(s.dir.join("home/.openmax/settings.json")).unwrap()).unwrap();
+        assert!(initial.get("reasoning_effort").is_none(), "explicit same-value Default clears the file");
+        assert_eq!(initial["model"], "stub-model");
+        assert_eq!(initial["context_tokens"], 16384, "unrelated overrides remain run-only");
+        s.write(b"/effort\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("effort default"));
+        assert!(shown.lines().any(|line| line.contains("effort default") && line.contains("omit the request setting")), "{shown}");
+        s.write(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: high"));
+        assert!(shown.contains("requested: high") && shown.contains("requested high"), "{shown}");
+        let settings_path = s.dir.join("home/.openmax/settings.json");
+        let saved = || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(saved()["reasoning_effort"], "high");
+        s.write(b"/effort\r");
+        screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("effort high"));
+        s.write(b"\x1b");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| !shown.contains("model validates support"));
+        assert!(!shown.contains("model validates support"), "{shown}");
+        assert_eq!(saved()["reasoning_effort"], "high");
+        s.write(b"/effort\r");
+        screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("model validates support"));
+        s.write(b"\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default") && saved().get("reasoning_effort").is_none());
+        assert!(shown.contains("requested: default"), "{shown}");
+        assert!(saved().get("reasoning_effort").is_none());
+        s.write(b"/effort none\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: none"));
+        assert!(shown.contains("requested: none"), "{shown}");
+        assert_eq!(saved()["reasoning_effort"], "none");
+        s.write(b"/effort turbo\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("invalid reasoning effort"));
+        assert!(shown.contains("invalid reasoning effort"), "{shown}");
+        assert_eq!(saved()["reasoning_effort"], "none");
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+
+        let mut s = Session::spawn_home("same-effort", cols as u16, rows as u16, |dir, cmd, _, _| {
+            std::fs::write(dir.join("settings.json"),
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384,"reasoning_effort":"high"}"#).unwrap();
+            cmd.args(["--trust-project", "--effort", "low"]);
+        });
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort low\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: low"));
+        assert!(shown.contains("requested: low"), "{shown}");
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(s.dir.join("home/.openmax/settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["reasoning_effort"], "low", "same-value selection becomes persistent");
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+
+        let mut s = Session::spawn_home("scoped-effort", cols as u16, rows as u16, |dir, cmd, _, _| {
+            std::fs::write(dir.join("settings.json"),
+                r#"{"provider":"saved","model":"stub-model","context_tokens":16384}"#).unwrap();
+            std::fs::write(dir.join("providers.json"),
+                r#"{"providers":{"saved":{"base_url":"https://api.anthropic.com/v1"},"temporary":{"base_url":"http://127.0.0.1:9/v1"}}}"#).unwrap();
+            cmd.args(["--trust-project", "--provider", "temporary"]);
+        });
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort high\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: high"));
+        assert!(shown.contains("requested: high") && shown.contains("for this run only"), "{shown}");
+        let data = s.dir.join("home/.openmax");
+        let saved = open_max_core::config::load(&data).unwrap();
+        assert_eq!(saved.provider.as_deref(), Some("saved"));
+        assert!(saved.reasoning_effort.is_none(), "temporary endpoint effort must not poison the saved endpoint");
+        assert!(open_max_core::providers::resolve(&saved, &data).is_ok());
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+
+        let mut s = Session::spawn_with("ignored-effort", cols as u16, rows as u16,
+            r#"{"base_url":"https://api.anthropic.com/v1","model":"fixture","context_tokens":16384}"#);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort high\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ignores reasoning effort"));
+        assert!(shown.contains("ignores reasoning effort"), "{shown}");
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(s.dir.join("home/.openmax/settings.json")).unwrap()).unwrap();
+        assert!(saved.get("reasoning_effort").is_none());
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+    }
+
     /// In auto a tool the agent writes mid-turn is callable on its next step
     /// with no card, so the screen is the one place a person can see what it
     /// runs before it does: when the tool lands, the transcript names it and

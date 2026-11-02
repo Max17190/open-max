@@ -43,6 +43,8 @@ options:
                          not the one the file selects, is overridden for this
                          run only, and no in-session save writes it; the run
                          says which
+      --effort <level>   reasoning effort: default, none, minimal, low, medium,
+                         high, xhigh or max; support depends on the model
       --provider <name>  use a named provider from ~/.openmax/providers.json
                          for this run; --base-url and --api-key are refused
                          beside it
@@ -149,6 +151,7 @@ struct CliArgs {
     account: Option<String>,
     continue_session: bool,
     model: Option<String>,
+    reasoning_effort: Option<Option<open_max_core::config::ReasoningEffort>>,
     provider: Option<String>,
     /// `--base-url`, `--api-key`, `--context-tokens`: with `--model`, the
     /// settings keys a first run writes (see `config::KeyFlags`).
@@ -209,6 +212,7 @@ where
         account: None,
         continue_session: false,
         model: None,
+        reasoning_effort: None,
         provider: None,
         base_url: None,
         api_key: None,
@@ -255,6 +259,10 @@ where
             Long("account") => set_once(&mut out.account, "--account", &mut parser)?,
             Short('c') | Long("continue") => out.continue_session = true,
             Short('m') | Long("model") => out.model = Some(parser.value()?.string()?),
+            Long("effort") => {
+                let value = parser.value()?.string()?;
+                out.reasoning_effort = Some(open_max_core::config::ReasoningEffort::parse(&value).map_err(lexopt::Error::from)?);
+            }
             Long("provider") => out.provider = Some(parser.value()?.string()?),
             Long("base-url") => out.base_url = Some(parser.value()?.string()?),
             Long("api-key") => out.api_key = Some(parser.value()?.string()?),
@@ -419,6 +427,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         account,
         continue_session,
         model,
+        reasoning_effort,
         provider,
         base_url,
         api_key,
@@ -476,11 +485,12 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // A sub-agent's child is a session too, but a new one in a new worktree.
     const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 13] = [
+    let options: [(bool, &str, &[Option<&str>]); 14] = [
         (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
         (model.is_some(), "--model", RUNS),
+        (reasoning_effort.is_some(), "--effort", RUNS),
         (provider.is_some(), "--provider", RUNS),
         (base_url.is_some(), "--base-url", RUNS),
         (api_key.is_some(), "--api-key", RUNS),
@@ -583,6 +593,7 @@ fn key_flags(cli: &CliArgs) -> open_max_core::config::KeyFlags {
         api_key: trimmed(&cli.api_key),
         model: trimmed(&cli.model),
         context_tokens: cli.context_tokens,
+        reasoning_effort: cli.reasoning_effort,
     }
 }
 
@@ -3217,6 +3228,7 @@ mod tests {
             &["--base-url", "http://h/v1"],
             &["--api-key", "k"],
             &["--context-tokens", "8"],
+            &["--effort", "default"],
         ];
         for session in [&["--continue"][..]].into_iter().chain(settings_flags) {
             let args = [&["--trust-project"][..], session].concat();
@@ -3410,7 +3422,7 @@ mod tests {
     fn an_option_the_operation_does_not_read_is_refused_naming_both() {
         let sessions: &[&str] = &["", "--stdio", "--print"];
         let runs: &[&str] = &["", "--stdio", "--print", "--subagent"];
-        let options: [(&[&str], &str, &[&str]); 13] = [
+        let options: [(&[&str], &str, &[&str]); 14] = [
             (&["--trust-project"], "--trust-project", runs),
             (&["--continue"], "--continue", sessions),
             (&["-m", "m"], "--model", runs),
@@ -3418,6 +3430,7 @@ mod tests {
             (&["--base-url", "http://h/v1"], "--base-url", runs),
             (&["--api-key", "k"], "--api-key", runs),
             (&["--context-tokens", "8"], "--context-tokens", runs),
+            (&["--effort", "high"], "--effort", runs),
             (&["--json"], "--json", &["--print", "--subagent", "--check", "--recall", "--replay", "--mcp-list"]),
             (&["--run-examples"], "--run-examples", &["--check"]),
             (&["--all"], "--all", &["--check"]),
@@ -3494,6 +3507,7 @@ mod tests {
                 api_key: Some("$K".into()),
                 model: Some("m".into()),
                 context_tokens: Some(8),
+                reasoning_effort: None,
             }
         );
         let cli = parse_args_from(["--provider", " p "]).unwrap();

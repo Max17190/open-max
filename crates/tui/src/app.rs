@@ -1846,6 +1846,11 @@ impl App {
                     .map(|name| format!(" from {name}"))
                     .unwrap_or_default();
                 self.note(&format!("model set to {model}{source}"));
+                let settings = self.core.settings.lock().unwrap().clone();
+                if let Err(open_max_core::providers::ResolveError::ReasoningEffort(error)) =
+                    open_max_core::providers::resolve(&settings, &self.core.data_dir) {
+                    self.error(&error);
+                }
             }
             Err(error) => self.error(&format!("could not save model selection: {error}")),
         }
@@ -2478,6 +2483,37 @@ impl App {
                 }
                 self.transcript.push(block);
                 self.dirty.mark_chat();
+            }
+            "effort" => {
+                use open_max_core::config::ReasoningEffort;
+                if raw_rest.is_empty() {
+                    let current = self.core.settings.lock().unwrap().reasoning_effort.map_or("default", ReasoningEffort::as_str);
+                    let items: Vec<_> = ReasoningEffort::LEVELS.iter().map(|level| completion::Item {
+                        insert: format!("/effort {level}"),
+                        label: format!("effort {level}"),
+                        detail: if *level == "default" { "omit the request setting".into() }
+                            else { "requested level; model validates support".into() },
+                        submits: true,
+                    }).collect();
+                    self.completion = Some(completion::Popup {
+                        kind: completion::Kind::Slash, selected: ReasoningEffort::LEVELS.iter().position(|level| *level == current).unwrap_or(0),
+                        total_matches: items.len(), items, token_start: 0, token_len: 0,
+                    });
+                    self.dirty.mark_chrome();
+                    return;
+                }
+                let effort = match ReasoningEffort::parse(raw_rest) {
+                    Ok(effort) => effort,
+                    Err(error) => { self.error(&error); return; }
+                };
+                match self.core.set_reasoning_effort(effort) {
+                    Ok(persisted) => {
+                        self.dirty.mark_chrome();
+                        let scope = if persisted { "saved" } else { "for this run only (temporary endpoint)" };
+                        self.note(&format!("reasoning effort requested: {raw_rest}; {scope}; applies to the next turn (model support varies)"));
+                    }
+                    Err(error) => self.error(&format!("could not save reasoning effort: {error}")),
+                }
             }
             "model" if raw_rest.is_empty() => {
                 let settings = self.core.settings.lock().unwrap().clone();
@@ -3953,7 +3989,10 @@ impl App {
             self.status_width = area.width;
             self.status_mode = Some(mode);
             let approvals = mode.as_str().to_string();
-            let model = self.core.settings.lock().unwrap().model.clone();
+            let (model, effort) = {
+                let settings = self.core.settings.lock().unwrap();
+                (settings.model.clone(), settings.reasoning_effort)
+            };
             let width = area.width as usize;
             let hint = self.status_hint();
             let left = if hint.is_empty() {
@@ -3964,6 +4003,8 @@ impl App {
             let short_model = extensions::short_model(&model);
             let billed_model = self.chatgpt_account.as_ref().map(|account| format!("Using ChatGPT plan ({account}) · {short_model}"));
             let short_model = billed_model.as_deref().unwrap_or(short_model);
+            let requested = effort.map(|level| format!("{short_model} · requested {}", level.as_str()));
+            let short_model = requested.as_deref().unwrap_or(short_model);
             // The widest tier labels its numbers: two unlabeled percents
             // (context fill, cache hits) would be indistinguishable. The
             // narrower tiers keep their historical shapes.

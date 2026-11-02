@@ -50,6 +50,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "pick a configured model or use an exact id",
         true,
     ),
+    command("effort", "[level]", "choose reasoning effort (model-dependent)", true),
     command(
         "provider",
         "[name]",

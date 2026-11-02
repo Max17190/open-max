@@ -145,6 +145,21 @@ override the first two.
   OpenAI-compatible endpoint uses 1.0, not the Modelfile's value. Earlier
   versions wrote `"temperature": 0.2` on every settings save; if you never
   chose it, delete the key.
+- `reasoning_effort` (default unset): an explicit requested level: `none`,
+  `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Use `/effort` for a
+  keyboard picker, `/effort high` to select directly, or `--effort high` at
+  launch. Session choices persist, including selecting the current CLI level,
+  unless the endpoint is a temporary CLI override. In that case the saved
+  endpoint keeps its own effort setting. `/effort default` removes the setting
+  in that same scope; `--effort default` clears it for the run when the file
+  already sets it. Default omits the wire field,
+  unlike explicit `none`. Responses sends `reasoning.effort`; Chat Completions
+  sends `reasoning_effort`. Supported levels depend on the model and endpoint;
+  the server validates explicit selections. A rejection is reported without
+  retrying at another level. Sampling and protocol settings are unchanged.
+  The Anthropic compatibility endpoint ignores effort, so explicit selections
+  there are refused before saving or sending. See the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
+  and [compatibility documentation](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk).
 - `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
   keeps up to a quarter of each stream's share of the cap from its start and
   the rest from its end, marks the cut with the bytes it dropped, and spills
