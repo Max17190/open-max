@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
 
+mod setup;
+pub use setup::{edit_catalog, read_catalog};
+
 /// Wire quirks for picky OpenAI-compatible servers.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -17,6 +20,8 @@ pub struct CompatFlags {
     pub use_max_completion_tokens: bool,
     /// When false, omit `stream_options` (some local servers reject unknown fields).
     pub send_stream_options: bool,
+    /// When true, omit temperature for servers that choose it themselves.
+    pub omit_temperature: bool,
 }
 
 impl CompatFlags {
@@ -24,6 +29,7 @@ impl CompatFlags {
         Self {
             use_max_completion_tokens: false,
             send_stream_options: true,
+            omit_temperature: false,
         }
     }
 }
@@ -35,6 +41,7 @@ impl CompatFlags {
 struct CompatFlagsFile {
     use_max_completion_tokens: Option<bool>,
     send_stream_options: Option<bool>,
+    omit_temperature: Option<bool>,
 }
 
 impl From<CompatFlagsFile> for CompatFlags {
@@ -42,6 +49,7 @@ impl From<CompatFlagsFile> for CompatFlags {
         Self {
             use_max_completion_tokens: f.use_max_completion_tokens.unwrap_or(false),
             send_stream_options: f.send_stream_options.unwrap_or(true),
+            omit_temperature: f.omit_temperature.unwrap_or(false),
         }
     }
 }
@@ -351,7 +359,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
         if let Some(compat) = provider.get("compat").and_then(|v| v.as_object()) {
             unknown_keys(
                 compat,
-                &["use_max_completion_tokens", "send_stream_options"],
+                &["use_max_completion_tokens", "send_stream_options", "omit_temperature"],
                 &format!("in provider '{name}' compat"),
                 &mut out,
             );
@@ -695,7 +703,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             model: model.to_string(),
             context_tokens,
             max_tokens,
-            temperature: settings.temperature,
+            temperature: if p.compat.omit_temperature { None } else { settings.temperature },
             compat: p.compat.clone(),
             idle_timeout_secs: p.idle_timeout_secs,
             key_hint,
@@ -833,7 +841,7 @@ pub(crate) fn expand_secret(raw: &str) -> Option<String> {
     Some(s.to_string())
 }
 
-fn expand_headers(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
+pub fn expand_headers(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
     map.iter()
         .filter_map(|(k, v)| {
             let key = k.trim();
