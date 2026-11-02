@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod chatgpt;
 mod completion;
 mod headless;
 mod input;
@@ -24,6 +25,9 @@ const HELP: &str = "openmax: a barebones high-performance agent harness
 usage: openmax [options] [prompt...]
 
 options:
+      --chatgpt <action>
+                         login, logout, status, or models for ChatGPT plan use
+      --account <label>  saved ChatGPT account (default: main)
   -c, --continue         resume the latest session in this directory
       --base-url <url>   the model server's API root (settings key base_url)
   -m, --model <id>       the model id it expects (settings key model)
@@ -141,6 +145,8 @@ examples:
   openmax --subagent \"make the flaky test deterministic\" --worktree";
 
 struct CliArgs {
+    chatgpt: Option<String>,
+    account: Option<String>,
     continue_session: bool,
     model: Option<String>,
     provider: Option<String>,
@@ -199,6 +205,8 @@ where
 {
     use lexopt::prelude::*;
     let mut out = CliArgs {
+        chatgpt: None,
+        account: None,
         continue_session: false,
         model: None,
         provider: None,
@@ -243,6 +251,8 @@ where
         }
         let Some(arg) = parser.next()? else { break };
         match arg {
+            Long("chatgpt") => set_once(&mut out.chatgpt, "--chatgpt", &mut parser)?,
+            Long("account") => set_once(&mut out.account, "--account", &mut parser)?,
             Short('c') | Long("continue") => out.continue_session = true,
             Short('m') | Long("model") => out.model = Some(parser.value()?.string()?),
             Long("provider") => out.provider = Some(parser.value()?.string()?),
@@ -405,6 +415,8 @@ fn approve_command(path: &std::path::Path) -> String {
 /// stops compiling here until it is placed among the operations or options.
 fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     let CliArgs {
+        chatgpt,
+        account,
         continue_session,
         model,
         provider,
@@ -436,6 +448,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // Each operation, named by its flag. `--check --stdio` is one operation
     // of its own: validating a protocol stream on stdin.
     let operations: Vec<&'static str> = [
+        (chatgpt.is_some(), "--chatgpt"),
         (spec.is_some(), "--spec"),
         (*mcp_list, "--mcp-list"),
         (*mcp_call, "--mcp-call"),
@@ -463,7 +476,8 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // A sub-agent's child is a session too, but a new one in a new worktree.
     const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 12] = [
+    let options: [(bool, &str, &[Option<&str>]); 13] = [
+        (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
         (model.is_some(), "--model", RUNS),
@@ -551,6 +565,9 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
                 "--provider and {flag} both choose the endpoint; a provider's base_url and key are in ~/.openmax/providers.json"
             ));
         }
+    }
+    if chatgpt.as_deref().is_some_and(|a| !matches!(a, "login" | "logout" | "status" | "models")) {
+        return Err("--chatgpt takes login, logout, status, or models".into());
     }
     key_flags(cli).problem().map_or(Ok(operation), Err)
 }
@@ -727,8 +744,10 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let granted = granted.into_iter().chain(notes).reduce(|lines, line| format!("{lines}\n{line}"));
     start_input();
     let runtime = runtime(granted.as_deref(), None);
-    let args = app::Args { continue_session: cli.continue_session, quit };
+    let args = app::Args { continue_session: cli.continue_session, quit: quit.clone() };
     let (result, warnings) = runtime.block_on(app::run(terminal, core, core_rx, args));
+    restore_terminal();
+    runtime.block_on(open_max_core::chatgpt::finish_refreshes());
     end_session(result, warnings, granted)
 }
 
@@ -824,6 +843,27 @@ fn on_the_shell<E>(
 
 /// The run of everything but a session painted first (see `main`).
 async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
+    if let Some(action) = &cli.chatgpt {
+        if matches!(action.as_str(), "login" | "logout") {
+            if let Err(e) = require_human("changing ChatGPT authentication", &format!("openmax --chatgpt {action}")) {
+                eprintln!("openmax: {e}");
+                return Ok(std::process::ExitCode::from(3));
+            }
+        }
+        let quit = watch_quit_signals(false);
+        let dir = default_data_dir();
+        let result = tokio::select! {
+            result = chatgpt::run(&dir, action, cli.account.as_deref().unwrap_or("main")) => Some(result),
+            _ = quit.notified() => None,
+        };
+        open_max_core::chatgpt::finish_refreshes().await;
+        if signalled() { return Ok(std::process::ExitCode::from(quit_status() as u8)); }
+        return Ok(match result {
+            Some(Ok(())) => std::process::ExitCode::SUCCESS,
+            Some(Err(e)) => { eprintln!("openmax: {e}"); std::process::ExitCode::from(1) }
+            None => std::process::ExitCode::from(quit_status() as u8),
+        });
+    }
     if let Some(surface) = &cli.spec {
         // `usage` is the one dynamic surface: it joins each extension's
         // frozen-prompt cost (paid on every request) with its recorded use,
@@ -1318,12 +1358,14 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let quit = watch_quit_signals(!unattended);
 
     if let Some(task) = cli.subagent {
-        std::process::exit(subagent::run(core, core_rx, &project, task, cli.json, quit).await);
+        let code = subagent::run(core, core_rx, &project, task, cli.json, quit.clone()).await;
+        open_max_core::chatgpt::finish_refreshes().await;
+        std::process::exit(if signalled() { quit_status() } else { code });
     }
 
     if cli.stdio || cli.print {
         let code = if cli.stdio {
-            let args = stdio::StdioArgs { continue_session: cli.continue_session, quit };
+            let args = stdio::StdioArgs { continue_session: cli.continue_session, quit: quit.clone() };
             stdio::run(core, core_rx, args).await
         } else {
             let args = headless::HeadlessArgs {
@@ -1331,15 +1373,16 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 project: project.clone(),
                 continue_session: cli.continue_session,
                 json: cli.json,
-                quit,
+                quit: quit.clone(),
             };
             headless::run(core, core_rx, args).await
         };
-        // A signal that landed as the last turn ended still stops the run.
-        let code = if signalled() { quit_status() } else { code };
         // A turn that did not settle in time still owns its tool groups, and
         // exit runs no destructor that would stop them.
         open_max_core::execution::kill_process_groups();
+        open_max_core::chatgpt::finish_refreshes().await;
+        // A signal that landed as the last turn ended still stops the run.
+        let code = if signalled() { quit_status() } else { code };
         std::process::exit(code);
     }
 
@@ -1360,9 +1403,11 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         terminal,
         core,
         core_rx,
-        app::Args { continue_session: cli.continue_session, quit },
+        app::Args { continue_session: cli.continue_session, quit: quit.clone() },
     )
     .await;
+    restore_terminal();
+    open_max_core::chatgpt::finish_refreshes().await;
     end_session(result, warnings, None)
 }
 

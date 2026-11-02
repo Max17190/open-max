@@ -702,6 +702,16 @@ Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
 - `base_url` (required): root of the endpoint's HTTP API; the harness calls
   `chat/completions` on it.
 - `api_key` (optional): literal secret. Prefer `api_key_env`.
+- `wire_api` (optional): `chat_completions` by default; `responses` selects
+  streaming Responses with local history and `store: false`.
+- `chatgpt_account` (optional): a local account label created by a human with
+  `openmax --chatgpt login [--account LABEL]`. Requires `wire_api: responses`
+  and `base_url: https://api.openai.com/v1`; keys, key env vars and headers
+  are refused. No API key is inherited and billing never falls back.
+  Setup adds a model catalog without selecting it. `--chatgpt models`
+  refreshes it; `--chatgpt status` lists accounts; `--chatgpt logout` signs
+  out. A missing context window must be configured. On this route,
+  `max_tokens` is a local reserve only, and `temperature` is not sent.
 - `api_key_env` (optional): env var name, or list of names (first non-empty
   wins). With neither (or both resolving empty), the provider uses
   settings.json's `api_key` / `OPENMAX_API_KEY` only when its `base_url` has

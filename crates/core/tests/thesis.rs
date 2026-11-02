@@ -128,6 +128,19 @@ const REPOSITORY_TREE: [&str; 17] = [
 /// repeat file contents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frozen_prefix_is_under_700_tokens() {
+    frozen_prefix_case(false).await;
+}
+
+/// The Responses prefix includes its additional_tools envelope. With the same
+/// fixture and o200k_base calibration, 3,046 path-free bytes are 691 tokens,
+/// or 700 with the 9-token CI checkout path. This is the same token target;
+/// its JSON dialect has a different bytes-per-token ratio. No runtime tokenizer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_frozen_prefix_is_under_700_tokens() {
+    frozen_prefix_case(true).await;
+}
+
+async fn frozen_prefix_case(responses: bool) {
     let dir = std::env::temp_dir().join(format!("omx-thesis-{}", uuid::Uuid::new_v4()));
     let data = dir.join("data");
     let project = dir.join("project");
@@ -141,12 +154,16 @@ async fn frozen_prefix_is_under_700_tokens() {
         }
     }
     let project = project.canonicalize().unwrap();
-    let (base_url, bodies) = recording_endpoint(vec![text("ok")]).await;
+    let (base_url, bodies) = if responses {
+        common::recording_responses(vec![serde_json::json!({"type":"response.completed","response":{
+            "status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}})]).await
+    } else { recording_endpoint(vec![text("ok")]).await };
     std::fs::create_dir_all(&data).unwrap();
     std::fs::write(
         data.join("settings.json"),
         serde_json::json!({
             "base_url": base_url,
+            "provider": if responses { Some("fixture") } else { None },
             "model": "scripted",
             "approval_mode": "auto",
             "context_tokens": 32768,
@@ -154,6 +171,10 @@ async fn frozen_prefix_is_under_700_tokens() {
         .to_string(),
     )
     .unwrap();
+    if responses {
+        std::fs::write(data.join("providers.json"), serde_json::json!({"providers":{
+            "fixture":{"base_url":base_url,"wire_api":"responses"}}}).to_string()).unwrap();
+    }
     std::fs::write(
         data.join("trust.json"),
         serde_json::json!({ "version": 1, "projects": [project.to_string_lossy()] }).to_string(),
@@ -166,9 +187,16 @@ async fn frozen_prefix_is_under_700_tokens() {
     let bodies: Vec<String> = bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1, "the turn makes one request");
     let fields = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(&bodies[0]).unwrap();
-    let tools = fields["tools"].get();
-    let messages = serde_json::from_str::<Vec<serde_json::Value>>(fields["messages"].get()).unwrap();
-    assert_eq!(messages[0]["role"], "system", "messages[0] is the system prompt");
+    let message_key = if responses { "input" } else { "messages" };
+    let mut messages = serde_json::from_str::<Vec<serde_json::Value>>(fields[message_key].get()).unwrap();
+    let responses_tools;
+    let tools = if responses {
+        let items = serde_json::from_str::<Vec<Box<RawValue>>>(fields["input"].get()).unwrap();
+        responses_tools = items[1].get().to_string();
+        assert_eq!(messages.remove(1)["type"], "additional_tools");
+        responses_tools.as_str()
+    } else { fields["tools"].get() };
+    assert_eq!(messages[0]["role"], if responses { "developer" } else { "system" });
     let system = messages[0]["content"].as_str().expect("the system prompt is text");
     let note = messages[1]["content"].as_str().unwrap_or_default();
     assert!(note.starts_with("[execution policy: auto;"), "messages[1] is the auto mode's note: {note}");
@@ -186,9 +214,9 @@ async fn frozen_prefix_is_under_700_tokens() {
     const TARGET_TOKENS: usize = 700;
     const PATH_ALLOWANCE_TOKENS: usize = 10;
     const BYTES_PER_TOKEN_TENTHS: usize = 44;
-    let cap = (TARGET_TOKENS - PATH_ALLOWANCE_TOKENS) * BYTES_PER_TOKEN_TENTHS / 10;
+    let cap = if responses { 3046 } else { (TARGET_TOKENS - PATH_ALLOWANCE_TOKENS) * BYTES_PER_TOKEN_TENTHS / 10 };
     println!(
-        "MEASURE frozen_prefix_path_free_bytes {bytes} = {system_path_free} messages[0] without the \
+        "MEASURE frozen_prefix_path_free_bytes {bytes} (responses={responses}) = {system_path_free} messages[0] without the \
          {}-byte project path + {} tools + {} execution policy note; cap {cap}",
         root.len(),
         tools.len(),
@@ -196,18 +224,18 @@ async fn frozen_prefix_is_under_700_tokens() {
     );
     assert!(
         bytes <= cap,
-        "the path-free frozen prefix is {bytes} bytes, over {cap} ({TARGET_TOKENS} tokens less \
-         {PATH_ALLOWANCE_TOKENS} for the project path, at {}.{} bytes per token): messages[0] \
-         {system_path_free} bytes without the {}-byte path, plus tools {} bytes, plus the note {} \
-         bytes:\n{system}\n{tools}\n{note}",
-        BYTES_PER_TOKEN_TENTHS / 10,
-        BYTES_PER_TOKEN_TENTHS % 10,
+        "the path-free frozen prefix is {bytes} bytes, over its {cap}-byte calibration for \
+         {TARGET_TOKENS} tokens (responses={responses}): messages[0] {system_path_free} bytes \
+         without the {}-byte path, plus tools {} bytes, plus the note {} bytes:\n{system}\n{tools}\n{note}",
         root.len(),
         tools.len(),
         note.len(),
     );
     // Bytes are not bought with the instructions models break without them.
-    let schemas = serde_json::from_str::<Vec<serde_json::Value>>(tools).unwrap();
+    let schemas = if responses {
+        serde_json::from_str::<serde_json::Value>(tools).unwrap()["tools"].as_array().unwrap().iter()
+            .map(|function| serde_json::json!({"type":"function","function":function})).collect()
+    } else { serde_json::from_str::<Vec<serde_json::Value>>(tools).unwrap() };
     let write_file = schemas
         .iter()
         .find(|tool| tool["function"]["name"] == "write_file")
