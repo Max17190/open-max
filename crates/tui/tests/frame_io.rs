@@ -298,6 +298,33 @@ mod first_frame {
             Instant::now()
         }
 
+        /// Keep large paste writes bounded even when a failing child stops reading stdin.
+        fn write_bounded(&mut self, mut bytes: &[u8]) {
+            struct RestoreFlags(libc::c_int, libc::c_int);
+            impl Drop for RestoreFlags {
+                fn drop(&mut self) { unsafe { libc::fcntl(self.0, libc::F_SETFL, self.1); } }
+            }
+            let fd = self.controller.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            let _restore = RestoreFlags(fd, flags);
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !bytes.is_empty() {
+                assert!(Instant::now() < deadline, "setup stopped consuming pasted input");
+                assert!(self.child.try_wait().unwrap().is_none(), "setup exited while receiving pasted input");
+                match self.controller.write(bytes) {
+                    Ok(0) => panic!("terminal stopped accepting pasted input"),
+                    Ok(n) => bytes = &bytes[n..],
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(self.pump(Duration::from_millis(5)), "setup terminal closed during paste");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("terminal paste failed: {error}"),
+                }
+            }
+        }
+
         /// Wait for the child to exit on its own, reading as it writes.
         fn wait_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
             let deadline = Instant::now() + within;
@@ -626,9 +653,25 @@ mod first_frame {
     #[test]
     fn provider_setup_hides_keys_and_returns_input_to_the_same_tui() {
         use std::os::unix::fs::PermissionsExt;
+        fn begin(s: &mut Session, command: &str, prompt: &[u8]) -> usize {
+            let start = s.out.len();
+            s.write(format!("{command}\r").as_bytes());
+            s.wait_for(prompt, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup prompt missing for {command}: {}", s.context()))
+        }
+        fn resume(s: &mut Session, start: usize) {
+            s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not return to chat: {}", s.context()));
+            s.write(ANSWER);
+        }
+        fn close_picker(s: &mut Session) {
+            let start = s.out.len();
+            s.write(b"\x1b");
+            s.wait_for(FRAME_END, start, Duration::from_secs(5)).expect("model picker did not close");
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let key = format!("$fixture-hidden-key{}", "x".repeat(4096 - "$fixture-hidden-key".len()));
+        let expected_key = key.clone();
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut socket = loop {
@@ -641,6 +684,7 @@ mod first_frame {
                     Err(error) => panic!("{error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let mut request = Vec::new();
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -651,8 +695,8 @@ mod first_frame {
             }
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("GET /v1/models "));
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer $fixture-hidden-key"));
-            let body = r#"{"data":[{"id":"fixture-model","context_window":16384}]}"#;
+            assert!(request.to_ascii_lowercase().contains(&format!("authorization: bearer {expected_key}\r\n")));
+            let body = r#"{"data":[{"id":"fixture-model","context_window":16384},{"id":"other-model","context_window":16384}]}"#;
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
         let mut s = Session::spawn_home("provider-setup", 80, 24, |dir, cmd, terminal, _| {
@@ -660,7 +704,8 @@ mod first_frame {
             std::fs::write(dir.join("providers.json"), serde_json::json!({"providers":{
                 "fixture":{"base_url":base,"models":[{"id":"previous-model","context_tokens":16384}]},
                 "chatgpt":{"base_url":open_max_core::chatgpt::API,"wire_api":"responses","chatgpt_account":"work",
-                    "models":[{"id":"work-model","context_tokens":16384}]}
+                    "models":[{"id":"work-model","context_tokens":16384}]},
+                "plan-work":{"base_url":open_max_core::chatgpt::API,"wire_api":"responses","chatgpt_account":"work"}
             }}).to_string()).unwrap();
             let credentials = dir.join("chatgpt.json");
             std::fs::write(&credentials, serde_json::json!({"host":"fixture","accounts":{
@@ -668,7 +713,8 @@ mod first_frame {
                 "work":{"client_id":"work-client","subject":"work-subject","email":"","tokens":null}
             }}).to_string()).unwrap();
             std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
-            cmd.arg("--trust-project").stderr(terminal.try_clone().unwrap());
+            cmd.arg("--trust-project").env("OPENAI_API_KEY", "fixture-env-key")
+                .env("ANTHROPIC_API_KEY", "fixture-env-key").stderr(terminal.try_clone().unwrap());
         });
         s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
         s.write(ANSWER);
@@ -678,9 +724,20 @@ mod first_frame {
         s.write(b"/login fixture\r");
         let restored = s.wait_for(LEAVE_ALT_SCREEN, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not restore terminal: {}", s.context()));
         s.wait_for(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
-        s.write(b"$fixture-hidden-key\r");
+        // Release events, modified characters, oversized paste, and control-bearing paste are inert.
+        s.write(b"\x1b[120;1:3u\x01\x1bqX");
+        s.write_bounded(format!("\x1b[200~{key}\x1b[201~\x7f\x1b[200~bad\npaste\x1b[201~\x1b[200~{key}\x1b[201~z\r").as_bytes());
         let model = s.wait_for(b"Choose a model", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("catalog was not loaded: {}", s.context()));
-        s.write(b"\r");
+        s.write(b"x");
+        let filtered = s.wait_for(b"> x\r\n", model, Duration::from_secs(5)).expect("filter text was not shown");
+        s.wait_for(b"Enter confirms; Esc cancels", filtered, Duration::from_secs(5)).expect("filter redraw did not finish");
+        let filter = s.out.len();
+        s.write(b"\x7f");
+        let choice = s.wait_for(b"> fixture-model", filter, Duration::from_secs(5)).expect("backspace did not restore choices");
+        s.wait_for(b"Enter confirms; Esc cancels", choice, Duration::from_secs(5)).unwrap();
+        let shown: Vec<_> = screen(&s.out[model..], 80, 24).into_iter().filter(|row| !row.is_empty()).collect();
+        assert_eq!(shown, ["Choose a model (type to filter)", ">", "> fixture-model", "  other-model", "Enter confirms; Esc cancels"]);
+        s.write(b"\x1b[B\x1b[A\r");
         let probe = s.wait_for(KEYBOARD_QUERY, model, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not resume the TUI: {}", s.context()));
         assert!(s.out[..probe].windows(b"$fixture-hidden-key".len()).all(|window| window != b"$fixture-hidden-key"), "secret appeared on terminal");
         s.write(ANSWER);
@@ -688,9 +745,8 @@ mod first_frame {
         assert!(shown.contains("fixture-model"), "model picker did not refresh: {shown}");
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings, "login selected a default before the user picked it");
         let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
-        assert_eq!(catalog["providers"]["fixture"]["api_key"], "$$fixture-hidden-key");
-        s.write(b"\x1b");
-        s.pump_for(Duration::from_millis(50));
+        assert_eq!(catalog["providers"]["fixture"]["api_key"], format!("${key}"));
+        close_picker(&mut s);
         let start = s.out.len();
         s.write(b"/logout fixture\r");
         let question = s.wait_for(b"Disconnect fixture?", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not get keyboard input: {}", s.context()));
@@ -700,17 +756,23 @@ mod first_frame {
         let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
         assert!(catalog["providers"].get("fixture").is_none());
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings);
-        let start = s.out.len();
-        s.write(b"/logout chatgpt\r");
-        let probe = s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("account logout did not resume TUI: {}", s.context()));
-        let output = String::from_utf8_lossy(&s.out[start..probe]);
-        assert!(output.contains("account 'work' signed out"), "{output}");
-        assert!(!output.contains("account 'main' signed out"), "{output}");
-        s.write(ANSWER);
+        for target in ["chatgpt", "plan-work"] {
+            let start = s.out.len();
+            s.write(format!("/logout {target}\r").as_bytes());
+            let probe = s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("account logout did not resume TUI: {}", s.context()));
+            let output = String::from_utf8_lossy(&s.out[start..probe]);
+            assert!(output.contains("account 'work' signed out"), "{output}");
+            assert!(!output.contains("account 'main' signed out"), "{output}");
+            s.write(ANSWER);
+        }
         let credentials: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("chatgpt.json")).unwrap()).unwrap();
         assert_eq!(credentials["accounts"]["main"]["subject"], "main-subject");
         assert_eq!(credentials["accounts"]["work"]["subject"], "work-subject");
         let original_catalog = std::fs::read(dir.join("providers.json")).unwrap();
+        let question = begin(&mut s, "/login custom", b"Connection name");
+        s.write(b"plan-work\r");
+        resume(&mut s, question);
+        assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         let start = s.out.len();
         s.write(b"/login custom\r");
         let question = s.wait_for(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
@@ -719,10 +781,123 @@ mod first_frame {
         assert!(!String::from_utf8_lossy(&s.out[question..probe]).contains("API key (hidden)"));
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         s.write(ANSWER);
+        for (name, valid) in [(String::new(), false), ("x".repeat(64), true), ("x".repeat(65), false),
+            ("x".repeat(66), false), ("dash-name".into(), true), ("under_score".into(), true), ("bad name".into(), false)] {
+            let question = begin(&mut s, "/login custom", b"Connection name");
+            s.write(format!("\x1b[200~{name}\x1b[201~\r").as_bytes());
+            if valid {
+                s.wait_for(b"API base URL", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("valid connection name was refused: {}", s.context()));
+                s.write(b"\x1b");
+            }
+            resume(&mut s, question);
+            assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
+        }
+        let question = begin(&mut s, "/login unknown-fixture", LEAVE_ALT_SCREEN);
+        resume(&mut s, question);
+        let mut entries: serde_json::Value = serde_json::from_slice(&original_catalog).unwrap();
+        entries["providers"]["broken"] = serde_json::Value::Null;
+        std::fs::write(dir.join("providers.json"), entries.to_string()).unwrap();
+        let question = begin(&mut s, "/login broken", LEAVE_ALT_SCREEN);
+        resume(&mut s, question);
+        std::fs::write(dir.join("providers.json"), &original_catalog).unwrap();
+        for (name, env) in [("openai", "OPENAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY")] {
+            let start = s.out.len();
+            let question = begin(&mut s, &format!("/login {name}"), format!("Enter copies {env}").as_bytes());
+            let output = String::from_utf8_lossy(&s.out[start..]);
+            assert_eq!(output.contains("does not provide prompt caching"), name == "anthropic");
+            s.write(b"\x1b");
+            resume(&mut s, question);
+        }
+        for (url, accepted) in [(open_max_core::chatgpt::API, true), ("https://example.invalid/v1", false)] {
+            let mut entries: serde_json::Value = serde_json::from_slice(&original_catalog).unwrap();
+            entries["providers"]["openai"] = serde_json::json!({"base_url":url});
+            std::fs::write(dir.join("providers.json"), entries.to_string()).unwrap();
+            let question = begin(&mut s, "/login openai", LEAVE_ALT_SCREEN);
+            if accepted {
+                s.wait_for(b"Enter copies OPENAI_API_KEY", question, Duration::from_secs(5)).expect("matching preset endpoint refused");
+                s.write(b"\x1b");
+            }
+            resume(&mut s, question);
+        }
+        std::fs::write(dir.join("providers.json"), &original_catalog).unwrap();
+        let manual = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        manual.set_nonblocking(true).unwrap();
+        let mut entries: serde_json::Value = serde_json::from_slice(&original_catalog).unwrap();
+        entries["providers"]["manual"] = serde_json::json!({"base_url":format!("http://{}", manual.local_addr().unwrap())});
+        std::fs::write(dir.join("providers.json"), entries.to_string()).unwrap();
+        let manual_server = std::thread::spawn(move || {
+            for request in 0..6 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match manual.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "manual model discovery did not run");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut header = Vec::new();
+                while !header.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut buffer = [0; 2048];
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    header.extend_from_slice(&buffer[..n]);
+                }
+                let (status, body) = if request < 5 { (404, "") } else {
+                    (200, r#"{"data":[{"id":"reported-zero","context_window":0}]}"#)
+                };
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let question = begin(&mut s, "/login manual", b"API key (hidden)");
+        s.write(b"\r");
+        resume(&mut s, question);
+        for (model, window, success) in [("m".repeat(257), None, false), ("m".repeat(258), None, false),
+            (String::new(), None, false), ("m".repeat(256), Some("1"), true),
+            ("zero-window".into(), Some("0"), false), ("reported-zero".into(), Some("1"), true)] {
+            let question = begin(&mut s, "/login manual", b"API key (hidden)");
+            s.write(b"fixture-manual-key\r");
+            if model == "reported-zero" {
+                s.wait_for(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
+                s.write(b"\r");
+            } else {
+                s.wait_for(b"Model ID", question, Duration::from_secs(5)).expect("manual model prompt missing");
+                s.write(format!("\x1b[200~{model}\x1b[201~\r").as_bytes());
+            }
+            if let Some(window) = window {
+                s.wait_for(b"Context window in tokens", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("context window prompt missing: {}", s.context()));
+                s.write(format!("{window}\r").as_bytes());
+            }
+            let error_from = s.out.len();
+            resume(&mut s, question);
+            if window == Some("0") {
+                assert!(screen(&s.out[error_from..], 80, 24).join("\n").contains("positive number of tokens"), "context-window refusal was not shown");
+            }
+            if success {
+                close_picker(&mut s);
+                let entries: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
+                assert!(entries["providers"]["manual"]["models"].as_array().unwrap().iter()
+                    .any(|entry| entry["id"] == model && entry["context_tokens"] == 1));
+            }
+            assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings);
+        }
+        manual_server.join().unwrap();
         let start = s.out.len();
         s.write(b"/login\r");
         let question = s.wait_for(b"Connect a provider", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("second login did not get input: {}", s.context()));
-        s.write(b"\x1b");
+        s.wait_for(b"manual (configured)", question, Duration::from_secs(5)).expect("configured provider was not appended");
+        assert!(String::from_utf8_lossy(&s.out[question..]).contains("OpenAI API"));
+        assert!(String::from_utf8_lossy(&s.out[question..]).contains("Anthropic API"));
+        s.write(b"manual\r");
+        let key_prompt = s.wait_for(b"API key (hidden)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
+        s.write(b"\x04");
+        resume(&mut s, key_prompt);
+        let question = begin(&mut s, "/login", b"Connect a provider");
+        s.write(b"\x03");
         s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
         s.write(ANSWER);
         s.write(CTRL_C_TWICE);
@@ -1036,6 +1211,12 @@ mod first_frame {
                             Some('H') => {
                                 row = n.first().copied().unwrap_or(1).max(1) - 1;
                                 col = n.get(1).copied().unwrap_or(1).max(1) - 1;
+                            }
+                            Some('A') => row = row.saturating_sub(n.first().copied().unwrap_or(1).max(1)),
+                            Some('G') => col = n.first().copied().unwrap_or(1).max(1) - 1,
+                            Some('J') if params.is_empty() || params == "0" => {
+                                if let Some(line) = grid.get_mut(row) { line[col.min(cols)..].fill(' '); }
+                                for line in grid.iter_mut().skip(row + 1) { line.fill(' '); }
                             }
                             Some('J') if params == "2" || params == "3" => grid = blank(),
                             // Entering the alternate screen blanks it.

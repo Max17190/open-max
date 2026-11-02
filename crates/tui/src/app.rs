@@ -6407,10 +6407,42 @@ mod tests {
 
     #[tokio::test]
     async fn authentication_commands_request_setup_without_starting_or_replacing_a_session() {
+        let (sender, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _sender = sender;
+            std::future::pending::<()>().await;
+        });
+        let (_, ready) = tokio::sync::oneshot::channel();
+        let (_, events) = mpsc::unbounded_channel();
+        drop(super::TerminalInput { task, ready, events });
+        assert!(tokio::time::timeout(Duration::from_secs(1), stopped).await.expect("dropped terminal reader kept running").is_err());
         let (mut app, dir) = app_fixture();
         app.handle_submit("/provider".into()).await.unwrap();
         assert!(app.mode == Mode::Chat);
         assert!(app.transcript.export_text().contains("/login"));
+        fs::write(dir.join("providers.json"), json!({"providers":{
+            "fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384}]},
+            "empty":{"base_url":"http://127.0.0.1:9/v1"}
+        }}).to_string()).unwrap();
+        for (provider, current, expected) in [
+            ("fixture", "one", "one"), ("fixture", "missing", "one"),
+            ("fixture", "two", "two"), ("empty", "keep-exact", "keep-exact"),
+        ] {
+            app.core.settings.lock().unwrap().model = current.into();
+            app.handle_submit(format!("/provider {provider}")).await.unwrap();
+            let settings = app.core.settings.lock().unwrap();
+            assert_eq!(settings.provider.as_deref(), Some(provider));
+            assert_eq!(settings.model, expected);
+        }
+        app.handle_submit("/model fixture/exact/model".into()).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().model, "fixture/exact/model");
+        app.handle_submit("/model".into()).await.unwrap();
+        assert!(app.mode == Mode::ModelPicker);
+        app.on_model_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let settings = app.core.settings.lock().unwrap().clone();
+        app.handle_submit("/provider unknown".into()).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().provider, settings.provider);
+        assert_eq!(app.core.settings.lock().unwrap().model, settings.model);
         app.session_id = Some("existing-session".into());
         app.composer.load("draft to keep");
         app.note("existing transcript");

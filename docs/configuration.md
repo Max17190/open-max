@@ -343,7 +343,9 @@ environment variable in future shells. Never paste a key as a slash-command
 argument.
 
 API setup loads the endpoint's model catalog and lets you choose an exact
-model. When the API does not report its context window, enter the value from
+model. OpenAI setup omits known dedicated embedding, image, speech, realtime,
+and moderation model families; other providers retain their own catalogs.
+When the API does not report its context window, enter the value from
 the model's documentation. An endpoint without a model-list route can be
 configured with an exact model ID; setup reports that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.
@@ -357,7 +359,9 @@ which supports streaming and tools but does not provide prompt caching.
 It uses API-key authentication with separate API billing. Setup asks for the
 workspace ID when needed; leave it empty for a workspace-scoped key. See
 [Anthropic authentication](https://platform.claude.com/docs/en/manage-claude/authentication).
-Both API presets omit temperature, so the server chooses its supported default.
+New API preset connections omit temperature, so the server chooses its supported
+default. Reconnecting an existing provider preserves its compatibility settings
+and wire protocol, including their implicit defaults.
 
 Use `/logout` or `openmax --logout` to choose a connection to disconnect.
 ChatGPT logout revokes and clears its local tokens. For an API-key connection,

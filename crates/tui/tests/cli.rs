@@ -372,6 +372,14 @@ fn provider_setup_commands_refuse_session_authority_before_loading_a_project() {
             assert_eq!(output.status.code(), Some(2));
         }
     }
+    // A terminal on stdin does not make a redirected secret prompt interactive.
+    let (_controller, terminal) = pseudo_terminal();
+    let output = finish_with_deadline(cmd(&project, &home)
+        .env_remove("OPENMAX_HUMAN_ATTEST")
+        .stdin(terminal).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .args(["--login", "fixture"]).spawn().unwrap());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("provider setup needs an interactive terminal"));
     let output = cmd(&project, &home).args(["--login", "--logout"]).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(!home.join(".openmax").exists());
