@@ -699,43 +699,32 @@ pub async fn save_catalog(
             })
         })
         .collect();
-    let _lock = lock(dir).await?;
-    let path = crate::providers::providers_path(dir);
-    let mut file: Value = match std::fs::read(&path) {
-        Ok(b) => serde_json::from_slice(&b).map_err(|_| "providers.json is invalid; catalog was not written")?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({"providers":{}}),
-        Err(_) => return Err("cannot read providers.json".into()),
-    };
-    let providers =
-        file.get_mut("providers").and_then(Value::as_object_mut).ok_or("providers.json lacks a providers object")?;
-    let key = format!("chatgpt-{name}");
-    if let Some(existing) = providers.get(&key) {
-        if existing["chatgpt_account"] != name || existing["base_url"] != API || existing["wire_api"] != "responses" {
-            return Err(format!("provider '{key}' already exists; catalog was not overwritten"));
-        }
-    }
-    let entry =
-        providers.entry(key).or_insert_with(|| json!({"base_url":API,"wire_api":"responses","chatgpt_account":name}));
-    // Preserve explicitly configured windows when the service does not report one.
-    let previous = entry["models"].as_array().cloned().unwrap_or_default();
-    let models: Vec<_> = models
-        .into_iter()
-        .map(|mut m| {
-            if let Some(old) = previous.iter().find(|old| old["id"] == m.id) {
-                m.context_tokens = m.context_tokens.or_else(|| {
-                    old["context_tokens"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0)
-                });
-                m.max_tokens = old["max_tokens"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0);
+    crate::providers::edit_catalog(dir, |providers| {
+        let key = format!("chatgpt-{name}");
+        if let Some(existing) = providers.get(&key) {
+            if existing["chatgpt_account"] != name || existing["base_url"] != API || existing["wire_api"] != "responses" {
+                return Err(format!("provider '{key}' already exists; catalog was not overwritten"));
             }
-            m
-        })
-        .collect();
-    entry["models"] = json!(models);
-    // Other entries can contain API keys; replacing the catalog must not expose them.
-    let bytes = serde_json::to_vec_pretty(&file).map_err(|_| "cannot encode providers")?;
-    crate::sessions::replace_atomic(&path, &bytes, 0o600, |_| Ok(())).map_err(|_| "cannot save providers")?;
-    if let Ok(dir) = File::open(dir) { let _ = dir.sync_all(); }
-    Ok(models)
+        }
+        let entry =
+            providers.entry(key).or_insert_with(|| json!({"base_url":API,"wire_api":"responses","chatgpt_account":name}));
+        // Preserve explicitly configured windows when the service does not report one.
+        let previous = entry["models"].as_array().cloned().unwrap_or_default();
+        let models: Vec<_> = models
+            .into_iter()
+            .map(|mut m| {
+                if let Some(old) = previous.iter().find(|old| old["id"] == m.id) {
+                    m.context_tokens = m.context_tokens.or_else(|| {
+                        old["context_tokens"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0)
+                    });
+                    m.max_tokens = old["max_tokens"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0);
+                }
+                m
+            })
+            .collect();
+        entry["models"] = json!(models);
+        Ok(models)
+    }).await
 }
 
 #[cfg(test)]

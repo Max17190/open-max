@@ -350,6 +350,42 @@ fn chatgpt_setup_is_separate_from_projects_and_session_authority() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+#[test]
+fn provider_setup_commands_refuse_session_authority_before_loading_a_project() {
+    let (project, home) = fresh_dirs("provider-setup-authority");
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    std::fs::write(project.join(".openmax/hooks/invalid.toml"), "invalid [").unwrap();
+    for flag in ["--login", "--logout"] {
+        for args in [vec![flag], vec![flag, "fixture"]] {
+            let output = cmd(&project, &home).env("OPENMAX_SESSION", "fixture").args(&args).output().unwrap();
+            assert_eq!(output.status.code(), Some(3));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("human action"));
+            let output = cmd(&project, &home).env_remove("OPENMAX_HUMAN_ATTEST")
+                .stdin(Stdio::null()).args(&args).output().unwrap();
+            assert_eq!(output.status.code(), Some(3));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("no terminal"));
+        }
+        for other in ["--check", "--stdio", "--trust-project", "--json", "--account"] {
+            let mut args = vec![flag, other];
+            if other == "--account" { args.push("main"); }
+            let output = cmd(&project, &home).args(args).output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+        }
+    }
+    // A terminal on stdin does not make a redirected secret prompt interactive.
+    let (_controller, terminal) = pseudo_terminal();
+    let output = finish_with_deadline(cmd(&project, &home)
+        .env_remove("OPENMAX_HUMAN_ATTEST")
+        .stdin(terminal).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .args(["--login", "fixture"]).spawn().unwrap());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("provider setup needs an interactive terminal"));
+    let output = cmd(&project, &home).args(["--login", "--logout"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!home.join(".openmax").exists());
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// The authority-granting commands refuse a caller with no terminal and no
 /// attestation, even with the session marker absent: `env -u
 /// OPENMAX_SESSION openmax --approve` from an agent's bash (piped stdio, no
