@@ -161,7 +161,7 @@ content approval, even under a permission allow rule. Later calls of the same
 bytes need no content approval, but the mutating/permission gate still applies.
 Readonly refuses mutating calls and calls requiring confirmation.
 
-Select /approvals auto|ask|readonly, or Shift+Tab (switches ask and auto) in a
+Select /permissions auto|ask|readonly in a
 human-controlled frontend.
 The choice persists for this exact trusted project across launches, including
 headless/stdio. A subdirectory, including a worktree placed under the project,
@@ -694,16 +694,18 @@ the exact fail-closed reason for a malformed file).
 
 const PROVIDERS: &str = r#"# Providers
 
-Named OpenAI-compatible endpoints: `~/.openmax/providers.json` (global only;
+Named model endpoints: `~/.openmax/providers.json` (global only;
 it lives outside the project root, so edit it via bash). The file is optional;
 the flat `base_url`/`model` settings path keeps working without it.
 
 Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
-- `base_url` (required): root of the endpoint's HTTP API; the harness calls
-  `chat/completions` on it.
+- `base_url` (required): root of the endpoint's HTTP API; the selected wire
+  protocol determines the request path.
 - `api_key` (optional): literal secret. Prefer `api_key_env`.
 - `wire_api` (optional): `chat_completions` by default; `responses` selects
   streaming Responses with local history and `store: false`.
+  `anthropic` selects native Messages with `x-api-key` and a default
+  `anthropic-version: 2023-06-01` header. Existing protocols never change implicitly.
 - `chatgpt_account` (optional): a local account label created by a human with
   `openmax --chatgpt login [--account LABEL]`. Requires `wire_api: responses`
   and `base_url: https://api.openai.com/v1`; keys, key env vars and headers
@@ -785,7 +787,7 @@ session; tell the user instead (see the model-switch recipe below).
 Parsing is strict and fail-closed: a file that exists but does not parse,
 uses an unknown key, or sets an unrecognized value makes the NEXT launch
 refuse to start (exit 2) until fixed. A missing file means defaults. The
-TUI rewrites the whole file on `/model` and `/provider`, so
+TUI rewrites the whole file on `/model`, `/provider`, and `/effort`, so
 manual edits can be overwritten by the next in-app settings change.
 
 Launch flags `--base-url`, `--api-key`, `--model` and `--context-tokens` set
@@ -798,8 +800,10 @@ than `base_url` (scheme, host, port) is not sent this file's `api_key`. On a run
 whose endpoint is not the one this file selects (a `--provider` other than
 `provider`, `--base-url` beside one, or a `--base-url` other than
 `base_url`) nothing is written, and an in-app
-save keeps this file's `model` too, since one picked there is that
-endpoint's. `--api-key` beside a selected provider is refused.
+save keeps this file's `model` and `reasoning_effort`, since they belong to that
+endpoint. `--api-key` beside a selected provider is refused.
+`--effort` sets `reasoning_effort` under the same write/override rules;
+`--effort default` leaves the request field unset.
 
 Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 `context_tokens` fails at resolve, i.e. every turn refuses with the reason):
@@ -817,7 +821,7 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   project trusted by an earlier version. The trust grant saves the choice:
   auto, unless the human picks ask or readonly at the trust prompt
   (`--trust-project` saves auto; an already trusted project keeps its mode).
-  /approvals, Shift+Tab, and the card's Auto for project choice change it.
+  /permissions, its /approvals alias, and the card's Auto for project choice change it.
   All of these persist in trust.json under the canonical root, not in
   settings.json, and do not change other projects. Auto includes extension
   execution without content approvals; deny rules and validation still
@@ -831,6 +835,12 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   providers.json overrides.
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
+- `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,
+  `xhigh`, or `max`. Unset leaves the provider default. Native Anthropic
+  accepts low through max; model support varies. Its compatibility route
+  ignores effort and is refused when set. Humans use /effort or Shift+Tab
+  for live changes; these never change permissions. Explicit in-session
+  selections persist unless the endpoint is a temporary launch override.
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
 - `compaction_tokens`: optional early-compaction trigger; only ever earlier.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including

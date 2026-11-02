@@ -277,6 +277,16 @@ mod first_frame {
             }
         }
 
+        /// A title can arrive in an earlier read than the editable prompt.
+        /// Match its footer after that title, never one from an older redraw.
+        fn wait_for_prompt(&mut self, title: &[u8], from: usize, within: Duration) -> Option<usize> {
+            let deadline = Instant::now() + within;
+            let at = self.wait_for(title, from, within)?;
+            let left = deadline.checked_duration_since(Instant::now())?;
+            self.wait_for(b"Enter confirms; Esc cancels\r\n", at + title.len(), left)?;
+            Some(at)
+        }
+
         /// Keep reading for `wait`, so answers go out on schedule while the
         /// child keeps writing.
         fn pump_for(&mut self, wait: Duration) {
@@ -656,11 +666,20 @@ mod first_frame {
         fn begin(s: &mut Session, command: &str, prompt: &[u8]) -> usize {
             let start = s.out.len();
             s.write(format!("{command}\r").as_bytes());
-            s.wait_for(prompt, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup prompt missing for {command}: {}", s.context()))
+            let found = if prompt == LEAVE_ALT_SCREEN {
+                s.wait_for(prompt, start, Duration::from_secs(5))
+            } else {
+                s.wait_for_prompt(prompt, start, Duration::from_secs(5))
+            };
+            found.unwrap_or_else(|| panic!("setup prompt missing for {command}: {}", s.context()))
+        }
+        fn answer_probe(s: &mut Session, query: usize) {
+            s.write(ANSWER);
+            s.wait_for(KEYBOARD_PUSH, query, Duration::from_secs(5)).unwrap_or_else(|| panic!("chat keyboard probe did not finish: {}", s.context()));
         }
         fn resume(s: &mut Session, start: usize) {
-            s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not return to chat: {}", s.context()));
-            s.write(ANSWER);
+            let query = s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not return to chat: {}", s.context()));
+            answer_probe(s, query);
         }
         fn close_picker(s: &mut Session) {
             let start = s.out.len();
@@ -716,18 +735,18 @@ mod first_frame {
             cmd.arg("--trust-project").env("OPENAI_API_KEY", "fixture-env-key")
                 .env("ANTHROPIC_API_KEY", "fixture-env-key").stderr(terminal.try_clone().unwrap());
         });
-        s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
-        s.write(ANSWER);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
+        answer_probe(&mut s, probe);
         let dir = s.dir.join("home/.openmax");
         let original_settings = std::fs::read(dir.join("settings.json")).unwrap();
         let start = s.out.len();
         s.write(b"/login fixture\r");
         let restored = s.wait_for(LEAVE_ALT_SCREEN, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not restore terminal: {}", s.context()));
-        s.wait_for(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
+        s.wait_for_prompt(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
         // Ordinary c/d are text, not cancellation. Other modified or invalid input is inert.
         s.write(b"cd\x7f\x7f\x1b[120;1:3u\x01\x1bqX");
         s.write_bounded(format!("\x1b[200~{key}\x1b[201~\x7f\x1b[200~bad\npaste\x1b[201~\x1b[200~{key}\x1b[201~z\r").as_bytes());
-        let model = s.wait_for(b"Choose a model", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("catalog was not loaded: {}", s.context()));
+        let model = s.wait_for_prompt(b"Choose a model", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("catalog was not loaded: {}", s.context()));
         s.write(b"x");
         let filtered = s.wait_for(b"> x\r\n", model, Duration::from_secs(5)).expect("filter text was not shown");
         s.wait_for(b"Enter confirms; Esc cancels", filtered, Duration::from_secs(5)).expect("filter redraw did not finish");
@@ -740,7 +759,7 @@ mod first_frame {
         s.write(b"\x1b[B\x1b[A\r");
         let probe = s.wait_for(KEYBOARD_QUERY, model, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not resume the TUI: {}", s.context()));
         assert!(s.out[..probe].windows(b"$fixture-hidden-key".len()).all(|window| window != b"$fixture-hidden-key"), "secret appeared on terminal");
-        s.write(ANSWER);
+        answer_probe(&mut s, probe);
         let shown = screen_when(&mut s, 80, 24, Duration::from_secs(5), |shown| shown.contains("fixture-model"));
         assert!(shown.contains("fixture-model"), "model picker did not refresh: {shown}");
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings, "login selected a default before the user picked it");
@@ -753,10 +772,10 @@ mod first_frame {
         close_picker(&mut s);
         let start = s.out.len();
         s.write(b"/logout fixture\r");
-        let question = s.wait_for(b"Disconnect fixture?", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not get keyboard input: {}", s.context()));
+        let question = s.wait_for_prompt(b"Disconnect fixture?", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not get keyboard input: {}", s.context()));
         s.write(b"\x1b[B\r");
-        s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not resume TUI: {}", s.context()));
-        s.write(ANSWER);
+        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not resume TUI: {}", s.context()));
+        answer_probe(&mut s, probe);
         let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
         assert!(catalog["providers"].get("fixture").is_none());
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings);
@@ -767,7 +786,7 @@ mod first_frame {
             let output = String::from_utf8_lossy(&s.out[start..probe]);
             assert!(output.contains("account 'work' signed out"), "{output}");
             assert!(!output.contains("account 'main' signed out"), "{output}");
-            s.write(ANSWER);
+            answer_probe(&mut s, probe);
         }
         let credentials: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("chatgpt.json")).unwrap()).unwrap();
         assert_eq!(credentials["accounts"]["main"]["subject"], "main-subject");
@@ -779,18 +798,18 @@ mod first_frame {
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         let start = s.out.len();
         s.write(b"/login custom\r");
-        let question = s.wait_for(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
+        let question = s.wait_for_prompt(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
         s.write(b"openai\r");
         let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
         assert!(!String::from_utf8_lossy(&s.out[question..probe]).contains("API key (hidden)"));
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
-        s.write(ANSWER);
+        answer_probe(&mut s, probe);
         for (name, valid) in [(String::new(), false), ("x".repeat(64), true), ("x".repeat(65), false),
             ("x".repeat(66), false), ("dash-name".into(), true), ("under_score".into(), true), ("bad name".into(), false)] {
             let question = begin(&mut s, "/login custom", b"Connection name");
             s.write(format!("\x1b[200~{name}\x1b[201~\r").as_bytes());
             if valid {
-                s.wait_for(b"API base URL", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("valid connection name was refused: {}", s.context()));
+                s.wait_for_prompt(b"API base URL", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("valid connection name was refused: {}", s.context()));
                 s.write(b"\x1b");
             }
             resume(&mut s, question);
@@ -808,17 +827,28 @@ mod first_frame {
             let start = s.out.len();
             let question = begin(&mut s, &format!("/login {name}"), format!("Enter copies {env}").as_bytes());
             let output = String::from_utf8_lossy(&s.out[start..]);
-            assert_eq!(output.contains("does not provide prompt caching"), name == "anthropic");
+            assert_eq!(output.contains("native Messages API"), name == "anthropic");
+            assert!(!output.contains("uses the compatible API"), "native and unrelated connections must not be mislabeled: {output}");
             s.write(b"\x1b");
             resume(&mut s, question);
         }
+        let mut legacy: serde_json::Value = serde_json::from_slice(&original_catalog).unwrap();
+        legacy["providers"]["anthropic"] = serde_json::json!({"base_url":"https://api.anthropic.com/v1","wire_api":"chat_completions"});
+        std::fs::write(dir.join("providers.json"), legacy.to_string()).unwrap();
+        let start = s.out.len();
+        let question = begin(&mut s, "/login anthropic", b"Enter copies ANTHROPIC_API_KEY");
+        let output = String::from_utf8_lossy(&s.out[start..]);
+        assert!(output.contains("uses the compatible API") && !output.contains("native Messages API"), "legacy connection protocol was mislabeled: {output}");
+        s.write(b"\x1b");
+        resume(&mut s, question);
+        std::fs::write(dir.join("providers.json"), &original_catalog).unwrap();
         for (url, accepted) in [(open_max_core::chatgpt::API, true), ("https://example.invalid/v1", false)] {
             let mut entries: serde_json::Value = serde_json::from_slice(&original_catalog).unwrap();
             entries["providers"]["openai"] = serde_json::json!({"base_url":url});
             std::fs::write(dir.join("providers.json"), entries.to_string()).unwrap();
             let question = begin(&mut s, "/login openai", LEAVE_ALT_SCREEN);
             if accepted {
-                s.wait_for(b"Enter copies OPENAI_API_KEY", question, Duration::from_secs(5)).expect("matching preset endpoint refused");
+                s.wait_for_prompt(b"Enter copies OPENAI_API_KEY", question, Duration::from_secs(5)).expect("matching preset endpoint refused");
                 s.write(b"\x1b");
             }
             resume(&mut s, question);
@@ -866,14 +896,15 @@ mod first_frame {
             let question = begin(&mut s, "/login manual", b"API key (hidden)");
             s.write(b"fixture-manual-key\r");
             if model == "reported-zero" {
-                s.wait_for(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
+                s.wait_for_prompt(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
                 s.write(b"\r");
             } else {
-                s.wait_for(b"Model ID", question, Duration::from_secs(5)).expect("manual model prompt missing");
+                s.wait_for_prompt(b"Model ID", question, Duration::from_secs(5)).unwrap_or_else(||
+                    panic!("manual model prompt missing (model bytes {}, window {window:?}): {}", model.len(), s.context()));
                 s.write(format!("\x1b[200~{model}\x1b[201~\r").as_bytes());
             }
             if let Some(window) = window {
-                s.wait_for(b"Context window in tokens", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("context window prompt missing: {}", s.context()));
+                s.wait_for_prompt(b"Context window in tokens", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("context window prompt missing: {}", s.context()));
                 s.write(format!("{window}\r").as_bytes());
             }
             let error_from = s.out.len();
@@ -892,18 +923,18 @@ mod first_frame {
         manual_server.join().unwrap();
         let start = s.out.len();
         s.write(b"/login\r");
-        let question = s.wait_for(b"Connect a provider", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("second login did not get input: {}", s.context()));
+        let question = s.wait_for_prompt(b"Connect a provider", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("second login did not get input: {}", s.context()));
         s.wait_for(b"manual (configured)", question, Duration::from_secs(5)).expect("configured provider was not appended");
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("OpenAI API"));
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("Anthropic API"));
         s.write(b"manual\r");
-        let key_prompt = s.wait_for(b"API key (hidden)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
+        let key_prompt = s.wait_for_prompt(b"API key (hidden)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
         s.write(b"\x04");
         resume(&mut s, key_prompt);
         let question = begin(&mut s, "/login", b"Connect a provider");
         s.write(b"\x03");
-        s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
-        s.write(ANSWER);
+        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
+        answer_probe(&mut s, probe);
         s.write(CTRL_C_TWICE);
         let status = s.wait_exit(Duration::from_secs(5));
         assert!(status.is_some_and(|status| status.success()), "{status:?}: {}", s.context());
@@ -1312,6 +1343,161 @@ mod first_frame {
             }
             s.pump(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn permissions_picker_owns_explicit_project_changes_while_shift_tab_cycles_effort() {
+        let (cols, rows) = (160, 40);
+        let mut s = Session::spawn("permissions-picker", cols as u16, rows as u16);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        let data = s.dir.join("home/.openmax");
+        let project = s.dir.join("project");
+        let mode = || open_max_core::state::Core::new(data.clone()).unwrap().0.approval_mode(&project);
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("stub-model"));
+        assert!(shown.contains("stub-model"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto, "new trust grants already default to Auto");
+        s.write(b"\x1b[Z");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested none"));
+        assert!(shown.contains("requested none"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
+        s.write(b"/permissions\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("new project default"));
+        assert!(shown.contains("new project default"), "{shown}");
+        s.write(b"\x1b[Z\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: readonly"));
+        assert!(shown.contains("permissions: readonly"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
+        assert_eq!(open_max_core::config::load(&data).unwrap().reasoning_effort, Some(open_max_core::config::ReasoningEffort::None));
+        s.write(b"\x1b[Z");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested minimal"));
+        assert!(shown.contains("requested minimal"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
+        s.write(b"/permissions ask\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: ask"));
+        assert!(shown.contains("permissions: ask"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Ask);
+        s.write(b"/approvals auto\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: auto"));
+        assert!(shown.contains("permissions: auto"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
+        s.write(b"/permissions invalid\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("usage: /permissions"));
+        assert!(shown.contains("usage: /permissions"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
+        assert_eq!(open_max_core::config::load(&data).unwrap().approval_mode, open_max_core::config::ApprovalMode::Ask,
+            "project selections never change the legacy global fallback");
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+    }
+
+    #[test]
+    fn effort_picker_selects_cancels_clears_and_refuses_ignored_settings() {
+        let (cols, rows) = (160, 40);
+        let mut s = Session::spawn_home("effort-picker", cols as u16, rows as u16, |dir, cmd, _, _| {
+            std::fs::write(dir.join("settings.json"),
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384,"reasoning_effort":"high"}"#).unwrap();
+            cmd.args(["--trust-project", "--effort", "default", "--model", "transient-model", "--context-tokens", "8192"]);
+        });
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort default\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default"));
+        assert!(shown.contains("requested: default"), "{shown}");
+        let initial: serde_json::Value = serde_json::from_slice(&std::fs::read(s.dir.join("home/.openmax/settings.json")).unwrap()).unwrap();
+        assert!(initial.get("reasoning_effort").is_none(), "explicit same-value Default clears the file");
+        assert_eq!(initial["model"], "stub-model");
+        assert_eq!(initial["context_tokens"], 16384, "unrelated overrides remain run-only");
+        s.write(b"/effort\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("effort default"));
+        assert!(shown.lines().any(|line| line.contains("effort default") && line.contains("omit the request setting")), "{shown}");
+        s.write(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: high"));
+        assert!(shown.contains("requested: high") && shown.contains("requested high"), "{shown}");
+        let settings_path = s.dir.join("home/.openmax/settings.json");
+        let saved = || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(saved()["reasoning_effort"], "high");
+        s.write(b"/effort\r");
+        screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("effort high"));
+        s.write(b"\x1b");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| !shown.contains("model validates support"));
+        assert!(!shown.contains("model validates support"), "{shown}");
+        assert_eq!(saved()["reasoning_effort"], "high");
+        s.write(b"/effort\r");
+        screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("model validates support"));
+        s.write(b"\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default") && saved().get("reasoning_effort").is_none());
+        assert!(shown.contains("requested: default"), "{shown}");
+        assert!(saved().get("reasoning_effort").is_none());
+        s.write(b"/effort none\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: none"));
+        assert!(shown.contains("requested: none"), "{shown}");
+        assert_eq!(saved()["reasoning_effort"], "none");
+        s.write(b"/effort turbo\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("invalid reasoning effort"));
+        assert!(shown.contains("invalid reasoning effort"), "{shown}");
+        assert_eq!(saved()["reasoning_effort"], "none");
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+
+        let mut s = Session::spawn_home("same-effort", cols as u16, rows as u16, |dir, cmd, _, _| {
+            std::fs::write(dir.join("settings.json"),
+                r#"{"base_url":"http://127.0.0.1:9/v1","model":"stub-model","context_tokens":16384,"reasoning_effort":"high"}"#).unwrap();
+            cmd.args(["--trust-project", "--effort", "low"]);
+        });
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort low\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: low"));
+        assert!(shown.contains("requested: low"), "{shown}");
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(s.dir.join("home/.openmax/settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["reasoning_effort"], "low", "same-value selection becomes persistent");
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+
+        let mut s = Session::spawn_home("scoped-effort", cols as u16, rows as u16, |dir, cmd, _, _| {
+            std::fs::write(dir.join("settings.json"),
+                r#"{"provider":"saved","model":"stub-model","context_tokens":16384}"#).unwrap();
+            std::fs::write(dir.join("providers.json"),
+                r#"{"providers":{"saved":{"base_url":"https://api.anthropic.com/v1"},"temporary":{"base_url":"http://127.0.0.1:9/v1"}}}"#).unwrap();
+            cmd.args(["--trust-project", "--provider", "temporary"]);
+        });
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort high\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: high"));
+        assert!(shown.contains("requested: high") && shown.contains("for this run only"), "{shown}");
+        let data = s.dir.join("home/.openmax");
+        let saved = open_max_core::config::load(&data).unwrap();
+        assert_eq!(saved.provider.as_deref(), Some("saved"));
+        assert!(saved.reasoning_effort.is_none(), "temporary endpoint effort must not poison the saved endpoint");
+        assert!(open_max_core::providers::resolve(&saved, &data).is_ok());
+        s.write(b"/provider saved\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ignores reasoning effort"));
+        assert!(shown.contains("ignores reasoning effort"), "{shown}");
+        assert!(open_max_core::config::load(&data).unwrap().reasoning_effort.is_none());
+        s.write(b"/model stub-model\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("model set to stub-model"));
+        assert!(shown.contains("model set to stub-model"), "{shown}");
+        assert!(open_max_core::config::load(&data).unwrap().reasoning_effort.is_none(), "later saves preserve run-only effort");
+        s.write(b"/effort default\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default"));
+        assert!(shown.contains("requested: default"), "{shown}");
+        assert!(open_max_core::providers::resolve(&open_max_core::config::load(&data).unwrap(), &data).is_ok());
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
+
+        let mut s = Session::spawn_with("ignored-effort", cols as u16, rows as u16,
+            r#"{"base_url":"https://api.anthropic.com/v1","model":"fixture","context_tokens":16384}"#);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        s.write(b"/effort high\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("ignores reasoning effort"));
+        assert!(shown.contains("ignores reasoning effort"), "{shown}");
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(s.dir.join("home/.openmax/settings.json")).unwrap()).unwrap();
+        assert!(saved.get("reasoning_effort").is_none());
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
     }
 
     /// In auto a tool the agent writes mid-turn is callable on its next step

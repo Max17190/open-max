@@ -78,6 +78,9 @@ pub(super) fn serialize(
     }
     let mut body = json!({"model":client.model,"input":input,"store":false,"stream":true,
         "include":["reasoning.encrypted_content"]});
+    if let Some(effort) = client.reasoning_effort {
+        body["reasoning"] = json!({"effort": effort});
+    }
     // Subscription Responses rejects output-token and sampling parameters. The
     // harness's local context reservation and turn-spend admission still apply.
     if client.chatgpt.is_none() {
@@ -531,6 +534,13 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         let origin = client.origin();
+        assert!(body.get("reasoning").is_none());
+        client.reasoning_effort = Some(crate::config::ReasoningEffort::High);
+        let explicit: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
+        assert_eq!(explicit["reasoning"], json!({"effort":"high"}));
+        assert!(explicit.get("temperature").is_none());
+        assert!(explicit.get("max_output_tokens").is_none());
+        assert_eq!(client.origin(), origin, "effort does not change opaque-reasoning ownership");
         client.chatgpt = None;
         assert_ne!(client.origin(), origin);
         let body: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();

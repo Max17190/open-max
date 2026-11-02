@@ -758,7 +758,7 @@ fn trust_project_records_auto_for_a_project_it_newly_trusts() {
     let out = cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(approval_mode(&home, &project), ApprovalMode::Auto, "{stderr}");
-    assert!(stderr.contains("auto") && stderr.contains("/approvals"), "the grant must say what it recorded: {stderr}");
+    assert!(stderr.contains("auto") && stderr.contains("/permissions"), "the grant must say what it recorded: {stderr}");
 
     let earlier = project.parent().unwrap().join("earlier");
     std::fs::create_dir_all(&earlier).unwrap();
@@ -1749,6 +1749,38 @@ const TOOL_CALLS_TERMINATOR: &str = concat!(
 /// for a few requests, enough for a whole print-mode turn.
 fn spawn_stub_server() -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
     spawn_scripted_server(vec![(HELLO_SSE.to_string(), true); 4])
+}
+
+#[test]
+fn effort_flags_reach_requests_and_keep_existing_settings_during_overrides() {
+    let (project, home) = fresh_dirs("effort");
+    let (base_url, requests, _server) = spawn_scripted_server(vec![(sse_text("done"), true); 4]);
+    write_settings(&home, &base_url);
+    for level in ["high", "low", "default", "none"] {
+        let output = finish_with_deadline(cmd(&project, &home)
+            .args(["--trust-project", "--effort", level, "-p", "hello"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        assert!(output.status.success(), "{level}: {}", String::from_utf8_lossy(&output.stderr));
+        let body: serde_json::Value = serde_json::from_str(requests.lock().unwrap().last().unwrap()).unwrap();
+        if level == "default" { assert!(body.get("reasoning_effort").is_none(), "{body}"); }
+        else { assert_eq!(body["reasoning_effort"], level); }
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join(".openmax/settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["reasoning_effort"], "high", "later flags are run-only");
+    }
+    let before = std::fs::read(home.join(".openmax/settings.json")).unwrap();
+    for level in ["", "HIGH", "turbo"] {
+        let output = cmd(&project, &home).args(["--effort", level, "--stdio"]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid reasoning effort"));
+        assert_eq!(std::fs::read(home.join(".openmax/settings.json")).unwrap(), before);
+    }
+    write_settings(&home, "https://api.anthropic.com/v1");
+    let before = std::fs::read(home.join(".openmax/settings.json")).unwrap();
+    let output = cmd(&project, &home).args(["--effort", "high", "--stdio"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ignores reasoning effort"));
+    assert_eq!(std::fs::read(home.join(".openmax/settings.json")).unwrap(), before);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
 #[test]
@@ -3060,7 +3092,7 @@ fn recall_reads_history_when_settings_are_unreadable() {
     // JSON that this binary's schema does not know.
     std::fs::write(
         home.join(".openmax").join("settings.json"),
-        "{\n  \"model\": \"m\",\n  \"reasoning_effort\": \"high\"\n}\n",
+        "{\n  \"model\": \"m\",\n  \"future_setting\": \"high\"\n}\n",
     )
     .unwrap();
 
@@ -3077,7 +3109,7 @@ fn recall_reads_history_when_settings_are_unreadable() {
     );
     let warned = String::from_utf8_lossy(&searched.stderr);
     assert!(
-        warned.contains("reasoning_effort") && warned.contains("searching history anyway"),
+        warned.contains("future_setting") && warned.contains("searching history anyway"),
         "the broken file must be reported, not swallowed: {warned}"
     );
 

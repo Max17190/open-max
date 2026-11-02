@@ -189,8 +189,8 @@ pub struct Core {
 /// and applies wherever it is stricter: ask selected in one TUI reaches a
 /// sibling session on the same project at its next tool call instead of
 /// leaving it in auto. If that sibling's status line still shows the older
-/// mode, its Shift+Tab first shows ask and saves nothing; the next press
-/// steps from it. A looser choice is never read back, because the store is a
+/// mode, its permissions picker refreshes the saved choice before presenting
+/// the next selection. A looser choice is never read back, because the store is a
 /// file a tool can write and taking a wider mode from it would be
 /// self-approval; only this process's own selection loosens its modes.
 #[derive(Default)]
@@ -404,8 +404,27 @@ impl Core {
     /// is saved with the file's value until the session sets it (see
     /// `run_only`).
     pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
+        self.save_selected_settings(settings, false).map(|_| ())
+    }
+
+    /// Persist an explicit session choice, unless the endpoint is a launch override.
+    /// Returns whether the selection was persisted, rather than kept for this run.
+    pub fn set_reasoning_effort(&self, effort: Option<crate::config::ReasoningEffort>) -> Result<bool, String> {
+        let mut live = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = live.clone();
+        next.reasoning_effort = effort;
+        if let Err(crate::providers::ResolveError::ReasoningEffort(error)) = crate::providers::resolve(&next, &self.data_dir) {
+            return Err(error);
+        }
+        let persisted = self.save_selected_settings(&next, true)?;
+        *live = next;
+        Ok(persisted)
+    }
+
+    fn save_selected_settings(&self, settings: &Settings, effort_selected: bool) -> Result<bool, String> {
         let mut run_only = self.run_only.lock().unwrap_or_else(|e| e.into_inner());
-        let held = run_only.as_ref().map(|r| r.save(settings));
+        let held = run_only.as_ref().map(|r| if effort_selected { r.select_effort(settings) } else { r.save(settings) });
+        let persisted = held.as_ref().is_none_or(|(_, next)| !next.holds_endpoint(settings));
         let settings = held.as_ref().map_or(settings, |(kept, _)| kept);
         // Hold the fingerprint lock across the write so a concurrent drift
         // check cannot observe the new bytes before this process claims
@@ -421,7 +440,7 @@ impl Core {
         if let Some((_, next)) = held {
             *run_only = Some(next);
         }
-        Ok(())
+        Ok(persisted)
     }
 
     /// Apply the command line's settings flags once, at launch and before
@@ -432,6 +451,11 @@ impl Core {
         let mut live = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = live.clone();
         let (run, applied) = flags.apply(&mut file);
+        if flags.reasoning_effort.is_some() {
+            if let Err(crate::providers::ResolveError::ReasoningEffort(error)) = crate::providers::resolve(&run, &self.data_dir) {
+                return Err(error);
+            }
+        }
         if !applied.written.is_empty() {
             self.save_settings(&file)?;
         }

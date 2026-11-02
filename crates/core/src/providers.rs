@@ -61,6 +61,16 @@ pub enum WireApi {
     #[default]
     ChatCompletions,
     Responses,
+    Anthropic,
+}
+
+impl WireApi {
+    pub fn effort_levels(self) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic => &["default", "low", "medium", "high", "xhigh", "max"],
+            _ => &crate::config::ReasoningEffort::LEVELS,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +147,7 @@ pub struct ActiveEndpoint {
     pub context_tokens: usize,
     pub max_tokens: usize,
     pub temperature: Option<f32>,
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
     pub compat: CompatFlags,
     /// The provider's `idle_timeout_secs`, when it sets one.
     pub idle_timeout_secs: Option<u64>,
@@ -501,12 +512,13 @@ pub enum ResolveError {
     /// when the file itself is the problem.
     InvalidProvidersFile(String),
     Authentication(String),
+    ReasoningEffort(String),
 }
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolveError::Authentication(message) => f.write_str(message),
+            ResolveError::Authentication(message) | ResolveError::ReasoningEffort(message) => f.write_str(message),
             ResolveError::MissingEndpoint => write!(
                 f,
                 "no model endpoint configured: pass --base-url or set base_url in ~/.openmax/settings.json, or define one in ~/.openmax/providers.json and select it with --provider or settings.provider"
@@ -653,6 +665,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         if base_url.is_empty() {
             return Err(ResolveError::MissingEndpoint);
         }
+        validate_reasoning_effort(base_url, p.wire_api, settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
         let model = settings.model.trim();
         if model.is_empty() {
             // A catalog that sizes its models only lacks the choice; when
@@ -704,6 +717,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             context_tokens,
             max_tokens,
             temperature: if p.compat.omit_temperature { None } else { settings.temperature },
+            reasoning_effort: settings.reasoning_effort,
             compat: p.compat.clone(),
             idle_timeout_secs: p.idle_timeout_secs,
             key_hint,
@@ -713,6 +727,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     // Flat settings path when no provider is selected. No endpoint or model
     // means no request: there is no default server to guess at.
     let base_url = settings.base_url.trim();
+    validate_reasoning_effort(base_url, WireApi::ChatCompletions, settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
     let model = settings.model.trim();
     let missing = [base_url.is_empty(), model.is_empty(), settings.context_tokens.is_none()];
     if missing.iter().filter(|m| **m).count() > 1 {
@@ -741,10 +756,26 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         context_tokens,
         max_tokens,
         temperature: settings.temperature,
+        reasoning_effort: settings.reasoning_effort,
         compat: CompatFlags::defaults_for_missing(),
         idle_timeout_secs: None,
         key_hint: None,
     })
+}
+
+/// Known compatibility routes can accept the field while ignoring its value.
+pub fn validate_reasoning_effort(base: &str, wire: WireApi, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
+    if wire == WireApi::Anthropic {
+        if matches!(effort, Some(crate::config::ReasoningEffort::None | crate::config::ReasoningEffort::Minimal)) {
+            return Err("native Messages effort must be low, medium, high, xhigh, max or default".into());
+        }
+        return Ok(());
+    }
+    if effort.is_some()
+        && reqwest::Url::parse(base).is_ok_and(|url| url.host_str() == Some("api.anthropic.com")) {
+        return Err("this endpoint ignores reasoning effort; choose /effort default or --effort default".into());
+    }
+    Ok(())
 }
 
 fn validate_chatgpt(base: &str, wire: WireApi, extra_credentials: bool) -> Result<(), String> {

@@ -480,12 +480,8 @@ pub struct App {
     status_line: Line<'static>,
     chatgpt_account: Option<String>,
     status_width: u16,
-    /// The approval mode the user was last shown: the one `status_line`
-    /// shows, or one a note announced since, before the next frame draws it
-    /// (this TUI's own selection, or a stricter mode Shift+Tab found saved
-    /// elsewhere). A turn can tighten the live mode to one another process
-    /// saved without anything here marking the chrome, so a draw compares it
-    /// with the live mode, and Shift+Tab steps only from it.
+    /// Cached approval mode. A turn can adopt a stricter saved mode without
+    /// marking chrome, so each draw compares this with the live mode.
     status_mode: Option<config::ApprovalMode>,
 }
 
@@ -1421,8 +1417,8 @@ impl App {
         // Completion popup: navigation and acceptance take priority over the
         // composer; anything else falls through and refilters afterwards.
         if self.completion.is_some() {
-            // Shift+Tab steps back through the list here rather than switching
-            // approval modes: an open popup owns the keyboard, and the reverse
+            // Shift+Tab steps back through the list here: an open popup
+            // owns the keyboard, and the reverse
             // of "Tab picks the next item" is the only reading of it on screen.
             if is_shift_tab(&key) {
                 if let Some(popup) = &mut self.completion {
@@ -1479,11 +1475,12 @@ impl App {
             }
         }
 
-        // Shift+Tab switches the project between ask and auto. It lands here,
-        // after every modal surface has had the key, because those own the
-        // keyboard while they are open.
+        // Open surfaces own the key; otherwise cycle the requested effort.
         if is_shift_tab(&key) {
-            self.step_approval_mode();
+            let current = self.core.settings.lock().unwrap().reasoning_effort.map_or("default", config::ReasoningEffort::as_str);
+            let levels = self.effort_levels();
+            let next = levels.iter().position(|level| *level == current).map_or(0, |at| (at + 1) % levels.len());
+            self.handle_submit(format!("/effort {}", levels[next])).await?;
             return Ok(());
         }
 
@@ -1747,44 +1744,23 @@ impl App {
             Ok(()) => {
                 // The save resolved the path itself; show the project it saved for.
                 self.refresh_project_root();
-                self.note(&format!("approvals: {} for this project (saved)", mode.as_str()));
-                // Shown by that note, so a press handled before the next
-                // frame steps from it.
+                self.note(&format!("permissions: {} for this project (saved)", mode.as_str()));
                 self.status_mode = Some(mode);
                 self.dirty.mark_chrome();
                 true
             }
             Err(reason) => {
-                self.note(&format!("approval mode unchanged: {reason}"));
+                self.note(&format!("permissions unchanged: {reason}"));
                 false
             }
         }
     }
 
-    /// Step to the next mode, from the one the user was shown. When the live
-    /// mode after the read-back is another, because another session saved a
-    /// stricter one for this project or a turn took that up before the line
-    /// drew it, the press shows it and saves nothing: the user has not seen
-    /// the mode it would step from, and stepping from ask lands on auto, over
-    /// that session's ask, on a press meant to tighten. The next press steps
-    /// from it. Only the mode of the root the line was drawn for is compared;
-    /// the path is re-resolved after it, so a path that now leads to another
-    /// project steps from that project's mode.
-    fn step_approval_mode(&mut self) {
-        // Before the first frame, the mode ahead of the read-back stands in.
-        let shown = self.status_mode.unwrap_or_else(|| self.approval_mode());
-        self.core.refresh_saved_approval_modes();
-        let live = self.approval_mode();
-        if live != shown {
-            self.note(&format!("approvals: {} for this project (saved in another session)", live.as_str()));
-            // Shown by that note, so a press handled before the next frame
-            // steps from it, as after a selection.
-            self.status_mode = Some(live);
-            self.dirty.mark_chrome();
-            return;
-        }
-        self.refresh_project_root();
-        self.select_approval_mode(self.approval_mode().next());
+    fn effort_levels(&self) -> &'static [&'static str] {
+        let provider = self.core.settings.lock().unwrap().provider.clone();
+        provider.and_then(|name| open_max_core::providers::load_providers(&self.core.data_dir)
+            .get(&name).map(|provider| provider.wire_api))
+            .unwrap_or_default().effort_levels()
     }
 
     /// The mode the status line shows. Reads no filesystem.
@@ -1916,6 +1892,11 @@ impl App {
                     .map(|name| format!(" from {name}"))
                     .unwrap_or_default();
                 self.note(&format!("model set to {model}{source}"));
+                let settings = self.core.settings.lock().unwrap().clone();
+                if let Err(open_max_core::providers::ResolveError::ReasoningEffort(error)) =
+                    open_max_core::providers::resolve(&settings, &self.core.data_dir) {
+                    self.error(&error);
+                }
             }
             Err(error) => self.error(&format!("could not save model selection: {error}")),
         }
@@ -2401,7 +2382,7 @@ impl App {
     // ---------- submission and slash commands ----------
 
     async fn handle_submit(&mut self, text: String) -> std::io::Result<()> {
-        // A turn, /status, and /approvals all read the mode.
+        // A turn, /status, and /permissions all read the mode.
         self.refresh_project_root();
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
@@ -2549,6 +2530,38 @@ impl App {
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
+            "effort" => {
+                use open_max_core::config::ReasoningEffort;
+                if raw_rest.is_empty() {
+                    let current = self.core.settings.lock().unwrap().reasoning_effort.map_or("default", ReasoningEffort::as_str);
+                    let levels = self.effort_levels();
+                    let items: Vec<_> = levels.iter().map(|level| completion::Item {
+                        insert: format!("/effort {level}"),
+                        label: format!("effort {level}"),
+                        detail: if *level == "default" { "omit the request setting".into() }
+                            else { "requested level; model validates support".into() },
+                        submits: true,
+                    }).collect();
+                    self.completion = Some(completion::Popup {
+                        kind: completion::Kind::Slash, selected: levels.iter().position(|level| *level == current).unwrap_or(0),
+                        total_matches: items.len(), items, token_start: 0, token_len: 0,
+                    });
+                    self.dirty.mark_chrome();
+                    return;
+                }
+                let effort = match ReasoningEffort::parse(raw_rest) {
+                    Ok(effort) => effort,
+                    Err(error) => { self.error(&error); return; }
+                };
+                match self.core.set_reasoning_effort(effort) {
+                    Ok(persisted) => {
+                        self.dirty.mark_chrome();
+                        let scope = if persisted { "saved" } else { "for this run only (temporary endpoint)" };
+                        self.note(&format!("reasoning effort requested: {raw_rest}; {scope}; applies to the next turn (model support varies)"));
+                    }
+                    Err(error) => self.error(&format!("could not save reasoning effort: {error}")),
+                }
+            }
             "login" | "logout" => {
                 if self.running {
                     self.error("finish or cancel the current turn before changing provider credentials");
@@ -2638,9 +2651,26 @@ impl App {
                     }
                 }
             }
-            "approvals" => match rest.first().and_then(|m| config::ApprovalMode::parse(m)) {
+            "permissions" if raw_rest.is_empty() => {
+                let current = self.approval_mode();
+                let modes = [config::ApprovalMode::Auto, config::ApprovalMode::Ask, config::ApprovalMode::Readonly];
+                let items: Vec<_> = modes.iter().map(|mode| completion::Item {
+                    insert: format!("/permissions {}", mode.as_str()), label: mode.as_str().into(),
+                    detail: match mode {
+                        config::ApprovalMode::Auto => "new project default; tools run without asking",
+                        config::ApprovalMode::Ask => "approve mutating calls",
+                        config::ApprovalMode::Readonly => "refuse mutating calls",
+                    }.into(), submits: true,
+                }).collect();
+                self.completion = Some(completion::Popup {
+                    kind: completion::Kind::Slash, selected: modes.iter().position(|mode| *mode == current).unwrap_or(0),
+                    total_matches: items.len(), items, token_start: 0, token_len: 0,
+                });
+                self.dirty.mark_chrome();
+            }
+            "permissions" | "approvals" => match config::ApprovalMode::parse(raw_rest) {
                 Some(mode) => { self.select_approval_mode(mode); }
-                None => self.note("usage: /approvals auto|ask|readonly"),
+                None => self.note(&format!("usage: /{head} auto|ask|readonly")),
             },
             "resume" => match sessions::list(&self.core, &self.project.display().to_string()) {
                 Ok(items) if items.is_empty() => self.note("no sessions in this project yet"),
@@ -3990,7 +4020,10 @@ impl App {
             self.status_width = area.width;
             self.status_mode = Some(mode);
             let approvals = mode.as_str().to_string();
-            let model = self.core.settings.lock().unwrap().model.clone();
+            let (model, effort) = {
+                let settings = self.core.settings.lock().unwrap();
+                (settings.model.clone(), settings.reasoning_effort)
+            };
             let width = area.width as usize;
             let hint = self.status_hint();
             let left = if hint.is_empty() {
@@ -4001,6 +4034,8 @@ impl App {
             let short_model = extensions::short_model(&model);
             let billed_model = self.chatgpt_account.as_ref().map(|account| format!("Using ChatGPT plan ({account}) · {short_model}"));
             let short_model = billed_model.as_deref().unwrap_or(short_model);
+            let requested = effort.map(|level| format!("{short_model} · requested {}", level.as_str()));
+            let short_model = requested.as_deref().unwrap_or(short_model);
             // The widest tier labels its numbers: two unlabeled percents
             // (context fill, cache hits) would be indistinguishable. The
             // narrower tiers keep their historical shapes.
@@ -4079,7 +4114,7 @@ impl App {
         } else if self.quit_armed {
             "ctrl+c again to quit"
         } else {
-            ""
+            "shift+tab effort · /permissions"
         };
         hint.into()
     }
@@ -4120,7 +4155,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
     ("enter while working", "steer the turn: the message joins it before its next request"),
     ("tab", "focus conversation ↔ composer"),
-    ("shift+tab", "switch saved project approvals: ask ↔ auto (readonly → ask)"),
+    ("shift+tab", "cycle requested reasoning effort"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
     ("[ ] in history", "jump to previous or next user turn (shift+↑↓ too)"),
     ("g / G in history", "top of scrollback · follow latest"),
@@ -5261,47 +5296,38 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Shift+Tab is easy to press by accident and it saves per project. If it
-    /// could step into readonly, one stray press would leave the project's
-    /// next session refusing every write in a mode nobody chose on purpose.
-    /// So the key moves between ask and auto only, and it leaves readonly
-    /// without re-entering it. The saved file is what the next session reads,
-    /// so the first result is checked through a fresh Core as well.
+    /// The effort shortcut persists each level and wraps to Default without
+    /// changing the trusted project's permission mode.
     #[tokio::test]
-    async fn shift_tab_switches_between_ask_and_auto_and_never_saves_readonly() {
-        let dir = crate::test_temp_dir("openmax-app-shift-tab");
-        let project = dir.join("project");
-        fs::create_dir_all(&project).unwrap();
-        let (core, _rx) = Core::new(dir.clone()).unwrap();
-        open_max_core::trust::trust_project(&dir, &project).unwrap();
-        core.set_project_approval_mode(&project, config::ApprovalMode::Auto).unwrap();
-        let (files_tx, _files_rx) = mpsc::unbounded_channel();
-        let mut app = App::new(core, project.clone(), files_tx);
-
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
-        assert_eq!(
-            app.core.approval_mode(&project),
-            config::ApprovalMode::Ask,
-            "from auto the key must step to ask, never save readonly",
-        );
-        let (next_session, _rx) = Core::new(dir.clone()).unwrap();
-        assert_eq!(next_session.approval_mode(&project), config::ApprovalMode::Ask, "the saved file says ask");
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
-        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Auto, "from ask the key steps to auto");
-
-        app.core.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
-        render_app(&mut app, 100, 12);
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
-        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "the key leaves readonly");
-        let _ = fs::remove_dir_all(dir);
+    async fn shift_tab_cycles_effort_without_changing_saved_project_permissions() {
+        let (mut app, dir) = app_fixture();
+        app.core.set_project_approval_mode(&app.project, config::ApprovalMode::Auto).unwrap();
+        for level in config::ReasoningEffort::LEVELS.iter().skip(1).chain(config::ReasoningEffort::LEVELS.iter().take(1)) {
+            app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+            let selected = config::ReasoningEffort::parse(level).unwrap();
+            assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, selected);
+            let next = Core::new(dir.clone()).unwrap().0;
+            assert_eq!(next.settings.lock().unwrap().reasoning_effort, selected);
+            assert_eq!(next.approval_mode(&app.project), config::ApprovalMode::Auto);
+        }
+        fs::write(dir.join("providers.json"), r#"{"providers":{"native":{"base_url":"https://api.anthropic.com/v1","wire_api":"anthropic"}}}"#).unwrap();
+        app.core.settings.lock().unwrap().provider = Some("native".into());
+        app.handle_submit("/effort".into()).await.unwrap();
+        let choices: Vec<_> = app.completion.as_ref().unwrap().items.iter().map(|item| item.insert.as_str()).collect();
+        assert_eq!(choices, ["/effort default", "/effort low", "/effort medium", "/effort high", "/effort xhigh", "/effort max"]);
+        app.completion = None;
+        for level in ["low", "medium", "high", "xhigh", "max", "default"] {
+            app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+            assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, config::ReasoningEffort::parse(level).unwrap());
+            assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Turns and saves resolve the project path when they run. When the
     /// launch path comes to lead to another trusted project (the directory
-    /// moved and a symlink to another project took its place), Shift+Tab and
-    /// the status line must follow it too, or the line shows one project's
-    /// mode while turns enforce the other's, and Shift+Tab steps from the
-    /// shown mode but saves the result for the other project.
+    /// moved and a symlink to another project took its place), permission
+    /// selections and the status line must follow the project turns enforce.
     #[cfg(unix)]
     #[tokio::test]
     async fn approval_mode_follows_the_project_turns_resolve() {
@@ -5328,11 +5354,11 @@ mod tests {
             std::os::unix::fs::symlink(to, &link).unwrap();
         };
         retarget(&second);
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        app.handle_submit("/permissions auto".into()).await.unwrap();
         assert_eq!(
             app.core.approval_mode(&link),
             config::ApprovalMode::Auto,
-            "Shift+Tab must step from the mode turns enforce (ask), not the one last shown (readonly)",
+            "the explicit selection must apply to the project turns enforce",
         );
         assert_eq!(app.core.approval_mode(&first), config::ApprovalMode::Readonly);
         render_app(&mut app, 100, 12);
@@ -5371,16 +5397,19 @@ mod tests {
     }
 
     /// Every TUI on a data dir saves to one trust store, and a stricter mode
-    /// another one saved for this project gates this one's turns. Shift+Tab
-    /// on a line still showing the launch mode must show that mode first and
-    /// save nothing; only the next press steps from it. The status line must
-    /// show it once a turn has taken it up.
+    /// another one saved for this project gates this one's turns. An effort
+    /// shortcut preserves it, and an explicit permission command may replace
+    /// it. The status line shows the mode turns enforce.
     #[tokio::test]
     async fn approval_mode_follows_a_stricter_mode_another_tui_saved() {
         let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-sibling-mode");
         let saved = || Core::new(dir.clone()).unwrap().0.approval_mode(&project);
 
         sibling.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
+        app.handle_submit("/permissions".into()).await.unwrap();
+        assert_eq!(app.completion.as_ref().unwrap().selected_item().unwrap().label, "readonly",
+            "an idle sibling's saved mode must be the current picker selection");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await.unwrap();
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
         assert_eq!(saved(), config::ApprovalMode::Readonly, "the press saved over the other TUI's readonly");
@@ -5388,8 +5417,8 @@ mod tests {
         let shown = line_text(&app.status_line);
         assert!(shown.ends_with("  readonly "), "{shown:?}");
 
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
-        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "the next press steps from readonly");
+        app.handle_submit("/permissions ask".into()).await.unwrap();
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "an explicit permission selection can replace readonly");
         assert_eq!(saved(), config::ApprovalMode::Ask);
         render_app(&mut app, 100, 12);
         let stepped = line_text(&app.status_line);
@@ -5406,12 +5435,10 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A running turn reads the store back before its next call, so this
-    /// process can take up the other TUI's ask before the line draws it. A
-    /// press in that window was made on a line showing auto: it shows ask
-    /// and saves nothing, as when the press's own read-back finds it.
+    /// A running turn can adopt a sibling's stricter mode before a draw.
+    /// Changing effort must preserve that permission decision.
     #[tokio::test]
-    async fn shift_tab_steps_from_the_mode_the_line_shows_not_one_a_turn_took_up() {
+    async fn effort_shortcut_preserves_a_stricter_mode_taken_up_by_a_turn() {
         let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-turn-took-ask");
         sibling.set_project_approval_mode(&project, config::ApprovalMode::Ask).unwrap();
         app.core.refresh_saved_approval_modes();
@@ -5428,39 +5455,37 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Presses handled before a frame draws step on: each one steps from
-    /// the mode the press before it selected and announced.
+    /// Rapid presses cycle from each selected effort even before a draw.
     #[tokio::test]
-    async fn shift_tab_presses_before_a_frame_each_step() {
+    async fn effort_shortcuts_before_a_frame_each_step() {
         let (dir, project, mut app, _sibling) = app_beside_a_sibling("openmax-app-quick-presses");
         assert!(app.select_approval_mode(config::ApprovalMode::Readonly), "the fixture starts the TUI in readonly");
         for _ in 0..2 {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
-        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Auto, "readonly, then ask, then auto");
-        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Auto);
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
+        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Readonly);
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The same when the first press finds a stricter mode another TUI
-    /// saved: the second steps from the mode the first one announced.
+    /// A sibling's readonly choice survives repeated effort shortcuts.
     #[tokio::test]
-    async fn shift_tab_steps_from_a_mode_a_press_announced_before_a_frame() {
+    async fn effort_shortcuts_do_not_overwrite_a_siblings_readonly_choice() {
         let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-quick-after-sibling");
         sibling.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
         for _ in 0..2 {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
-        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Ask, "readonly shown, then ask");
-        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Ask);
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+        assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
+        assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Readonly);
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Ask steps to auto, so a press that stepped from ask another TUI saved
-    /// would save auto over it, on a press the user meant to take this TUI
-    /// from auto to ask.
+    /// Effort controls cannot widen a permission choice another session saved.
     #[tokio::test]
-    async fn shift_tab_never_saves_auto_over_ask_another_tui_saved() {
+    async fn effort_shortcut_never_saves_auto_over_a_siblings_ask_choice() {
         let (dir, project, mut app, sibling) = app_beside_a_sibling("openmax-app-sibling-ask");
         sibling.set_project_approval_mode(&project, config::ApprovalMode::Ask).unwrap();
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
@@ -5826,7 +5851,7 @@ mod tests {
     async fn selected_auto_survives_restart_for_this_project_only() {
         let (mut app, dir) = app_fixture();
         open_max_core::trust::trust_project(&dir, &dir).unwrap();
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        app.handle_submit("/permissions auto".into()).await.unwrap();
         let (restarted, _) = Core::new(dir.clone()).unwrap();
         assert_eq!(restarted.approval_mode(&app.project), config::ApprovalMode::Auto);
         assert_eq!(config::load(&dir).unwrap().approval_mode, config::ApprovalMode::Ask);
@@ -5858,22 +5883,21 @@ mod tests {
     /// Both encodings have to drive the same switch, or the binding works on
     /// one half of the terminals and silently does something else on the rest.
     #[tokio::test]
-    async fn shift_tab_switches_approvals_in_both_encodings() {
+    async fn shift_tab_cycles_effort_in_both_encodings() {
         for key in shift_tab_events() {
-            let (mut app, dir) = app_fixture();
-            let mode = |app: &App| app.core.approval_mode(&app.project);
-            assert_eq!(mode(&app), config::ApprovalMode::Ask, "fixture default");
-
-            app.on_key(key).await.unwrap();
-            assert_eq!(mode(&app), config::ApprovalMode::Auto);
-            app.on_key(key).await.unwrap();
-            assert_eq!(mode(&app), config::ApprovalMode::Ask, "from auto the key steps back to ask, never readonly");
-            let project = app.project.clone();
-            app.core.set_project_approval_mode(&project, config::ApprovalMode::Readonly).unwrap();
-            render_app(&mut app, 100, 12);
-            app.on_key(key).await.unwrap();
-            assert_eq!(mode(&app), config::ApprovalMode::Ask, "from readonly the key steps to ask");
-            fs::remove_dir_all(dir).unwrap();
+            for mode in [config::ApprovalMode::Auto, config::ApprovalMode::Ask, config::ApprovalMode::Readonly] {
+                let (mut app, dir) = app_fixture();
+                app.core.set_project_approval_mode(&app.project, mode).unwrap();
+                let draft = "keep this draft\nand its second line";
+                app.composer.load(draft);
+                app.on_key(key).await.unwrap();
+                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::None));
+                app.on_key(key).await.unwrap();
+                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+                assert_eq!(app.core.approval_mode(&app.project), mode);
+                assert_eq!(app.composer.text(), draft, "effort shortcuts must preserve a multiline draft");
+                fs::remove_dir_all(dir).unwrap();
+            }
         }
     }
 
@@ -5894,8 +5918,8 @@ mod tests {
 
         assert_eq!(
             app.core.approval_mode(&app.project),
-            config::ApprovalMode::Auto,
-            "the run should see the new mode",
+            config::ApprovalMode::Ask,
+            "effort cycling must not change project permissions",
         );
         assert_eq!(
             config::load(&dir).unwrap().approval_mode,
@@ -5994,9 +6018,7 @@ mod tests {
             app.core.save_settings(&settings).unwrap();
         }
 
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
-            .await
-            .unwrap();
+        app.handle_submit("/permissions auto".into()).await.unwrap();
         assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
 
         // Any later write of the shared settings: picking a model.
@@ -6040,13 +6062,11 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A typed choice replaces the mode selected by the step key.
+    /// A typed permission choice replaces an earlier explicit selection.
     #[tokio::test]
-    async fn typed_approvals_command_replaces_the_project_choice() {
+    async fn typed_permissions_command_replaces_the_project_choice() {
         let (mut app, dir) = app_fixture();
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
-            .await
-            .unwrap();
+        app.handle_submit("/permissions auto".into()).await.unwrap();
         assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
 
         app.handle_submit("/approvals readonly".into()).await.unwrap();

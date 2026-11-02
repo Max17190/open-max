@@ -50,6 +50,7 @@
 //! same scheme, host, and port, and one anywhere else fails the request.
 
 mod responses;
+mod anthropic;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,6 +79,8 @@ struct ChatCompletionRequest<'a> {
     // default, and a server fills in its default when the field is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<crate::config::ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,6 +230,7 @@ fn serialize_chat_request_body(
     note: Option<&str>,
     origin: &str,
     temperature: Option<f32>,
+    reasoning_effort: Option<crate::config::ReasoningEffort>,
     max_tokens: usize,
     use_max_completion_tokens: bool,
     send_stream_options: bool,
@@ -247,6 +251,7 @@ fn serialize_chat_request_body(
         model,
         messages: WireMessages { messages, note, origin },
         temperature,
+        reasoning_effort,
         max_tokens: if use_max_completion_tokens {
             None
         } else {
@@ -336,8 +341,8 @@ pub struct Usage {
     pub cached_tokens: Option<u64>,
 }
 
-/// Minimal client for any OpenAI-compatible /v1/chat/completions endpoint
-/// (Ollama, LM Studio, vLLM, llama.cpp, cloud gateways, private proxies).
+/// Streaming client for Chat Completions, Responses, and native Messages APIs,
+/// including compatible local servers, cloud gateways, and private proxies.
 pub struct ChatClient {
     wire_api: crate::providers::WireApi,
     chatgpt: Option<crate::chatgpt::Connection>,
@@ -345,6 +350,7 @@ pub struct ChatClient {
     pub api_key: Option<String>,
     pub model: String,
     pub temperature: Option<f32>,
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
     pub max_tokens: usize,
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,
@@ -462,6 +468,7 @@ impl ChatClient {
     pub fn from_endpoint(ep: &crate::providers::ActiveEndpoint) -> Self {
         Self {
             wire_api: ep.wire_api,
+            reasoning_effort: ep.reasoning_effort,
             chatgpt: ep.chatgpt.clone(),
             idle_timeout: ep.idle_timeout_secs.map_or(IDLE_TIMEOUT, |secs| std::time::Duration::from_secs(secs.max(1))),
             key_hint: ep.key_hint.clone(),
@@ -516,6 +523,7 @@ impl ChatClient {
             api_key,
             model,
             temperature,
+            reasoning_effort: None,
             max_tokens,
             headers,
             use_max_completion_tokens,
@@ -530,6 +538,7 @@ impl ChatClient {
         format!("{}/{}", self.base_url.trim_end_matches('/'), match self.wire_api {
             crate::providers::WireApi::ChatCompletions => "chat/completions",
             crate::providers::WireApi::Responses => "responses",
+            crate::providers::WireApi::Anthropic => "messages",
         })
     }
 
@@ -557,6 +566,7 @@ impl ChatClient {
     pub fn origin(&self) -> String {
         let mut key = format!("{}\n{}\n{}", self.base_url.trim_end_matches('/'), self.model, self.api_key.as_deref().unwrap_or(""));
         if self.wire_api == crate::providers::WireApi::Responses { key.push_str("\nresponses"); }
+        if self.wire_api == crate::providers::WireApi::Anthropic { key.push_str("\nanthropic"); }
         if let Some(auth) = &self.chatgpt { key.push_str(&format!("\n{}", auth.identity)); }
         for (name, value) in &self.headers {
             key.push_str(&format!("\n{}:{value}", name.to_ascii_lowercase()));
@@ -594,6 +604,13 @@ impl ChatClient {
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
+        crate::providers::validate_reasoning_effort(&self.base_url, self.wire_api, self.reasoning_effort)?;
+        if self.wire_api == crate::providers::WireApi::Anthropic {
+            let keys = self.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("x-api-key")).count();
+            if keys > usize::from(self.api_key.is_none()) {
+                return Err("native Messages requires one API key source".into());
+            }
+        }
         if self.chatgpt.is_some() && (self.wire_api != crate::providers::WireApi::Responses || self.base_url != crate::chatgpt::API
             || !self.headers.is_empty() || self.api_key.is_some()) {
             return Err("ChatGPT credentials require the fixed OpenAI endpoint without custom credentials or headers".into());
@@ -607,7 +624,9 @@ impl ChatClient {
         // long transcript into Value (and re-serializing) on every attempt is not.
         // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
-        let body = if self.wire_api == crate::providers::WireApi::Responses {
+        let body = if self.wire_api == crate::providers::WireApi::Anthropic {
+            anthropic::serialize(self, messages, note, tools_wire)?
+        } else if self.wire_api == crate::providers::WireApi::Responses {
             responses::serialize(self, messages, note, tools_wire)?
         } else { serialize_chat_request_body(
             &self.model,
@@ -615,6 +634,7 @@ impl ChatClient {
             note,
             &self.origin(),
             self.temperature,
+            self.reasoning_effort,
             self.max_tokens,
             self.use_max_completion_tokens,
             self.send_stream_options,
@@ -640,8 +660,11 @@ impl ChatClient {
             } else { None };
             if let Some(key) = access.as_deref().or(self.api_key.as_deref()) {
                 if !key.is_empty() {
-                    req = req.bearer_auth(key);
+                    req = if self.wire_api == crate::providers::WireApi::Anthropic { req.header("x-api-key", key) } else { req.bearer_auth(key) };
                 }
+            }
+            if self.wire_api == crate::providers::WireApi::Anthropic && !self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("anthropic-version")) {
+                req = req.header("anthropic-version", "2023-06-01");
             }
             for (name, value) in &self.headers {
                 req = req.header(name.as_str(), value.as_str());
@@ -732,8 +755,11 @@ impl ChatClient {
                 }
                 return Err(naming_wait(err, beyond_cap));
             }
-            if self.wire_api == crate::providers::WireApi::Responses {
-                let (reply, unfinished) = Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await;
+            if matches!(self.wire_api, crate::providers::WireApi::Responses | crate::providers::WireApi::Anthropic) {
+                let (mut reply, unfinished) = if self.wire_api == crate::providers::WireApi::Anthropic {
+                    Box::pin(anthropic::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await
+                } else { Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await };
+                if self.wire_api == crate::providers::WireApi::Anthropic { anthropic::stamp(&mut reply, &body)?; }
                 let retry = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
                 let failure = match unfinished {
                     Some(Unfinished::Interrupted(reason)) if retry => reason,
@@ -3691,7 +3717,7 @@ mod tests {
             &messages,
             None,
             "o",
-            Some(0.2),
+            Some(0.2), None,
             1024,
             false,
             true,
@@ -3745,7 +3771,7 @@ mod tests {
         );
         assert_eq!(wire(&messages, "o"), old_shape);
         assert_eq!(serde_json::to_string(&messages).unwrap(), old_shape);
-        let bytes = serialize_chat_request_body("m", &messages, None, "o", None, 64, false, false, "").unwrap();
+        let bytes = serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, false, "").unwrap();
         let body = String::from_utf8(bytes).unwrap();
         assert!(body.contains(&format!(r#""messages":{old_shape}"#)), "{body}");
 
@@ -4064,7 +4090,7 @@ mod tests {
 
     /// The whole request body `client` would send for `messages`.
     fn request_body(client: &ChatClient, messages: &[ChatMessage]) -> String {
-        let bytes = serialize_chat_request_body(&client.model, messages, None, &client.origin(), None, 64, false, false, "").unwrap();
+        let bytes = serialize_chat_request_body(&client.model, messages, None, &client.origin(), None, None, 64, false, false, "").unwrap();
         String::from_utf8(bytes).unwrap()
     }
 
@@ -4073,7 +4099,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         for tools_wire in ["", "[]"] {
             let bytes =
-                serialize_chat_request_body("m", &messages, None, "o", None, 64, false, true, tools_wire)
+                serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, true, tools_wire)
                     .unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(
@@ -4098,9 +4124,9 @@ mod tests {
             "function": { "name": "bash", "parameters": { "type": "object" } }
         }])
         .to_string();
-        let a = serialize_chat_request_body("m", &messages, None, "o", Some(0.5), 256, false, true, &tools_wire)
+        let a = serialize_chat_request_body("m", &messages, None, "o", Some(0.5), None, 256, false, true, &tools_wire)
             .unwrap();
-        let b = serialize_chat_request_body("m", &messages, None, "o", Some(0.5), 256, false, true, &tools_wire)
+        let b = serialize_chat_request_body("m", &messages, None, "o", Some(0.5), None, 256, false, true, &tools_wire)
             .unwrap();
         assert_eq!(a, b);
     }
@@ -4110,10 +4136,10 @@ mod tests {
     #[test]
     fn serialize_omits_temperature_unless_configured() {
         let messages = vec![ChatMessage::user("hi")];
-        let unset = serialize_chat_request_body("m", &messages, None, "o", None, 64, false, true, "").unwrap();
+        let unset = serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, true, "").unwrap();
         let v: Value = serde_json::from_slice(&unset).unwrap();
         assert!(v.get("temperature").is_none(), "{v}");
-        let set = serialize_chat_request_body("m", &messages, None, "o", Some(0.7), 64, false, true, "").unwrap();
+        let set = serialize_chat_request_body("m", &messages, None, "o", Some(0.7), None, 64, false, true, "").unwrap();
         let v: Value = serde_json::from_slice(&set).unwrap();
         assert!((v["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-5, "{v}");
     }
@@ -4126,7 +4152,7 @@ mod tests {
             &messages,
             None,
             "o",
-            Some(0.1),
+            Some(0.1), None,
             512,
             true,  // use_max_completion_tokens
             false, // send_stream_options
@@ -4151,7 +4177,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         let wire = registry.tool_schemas_wire();
         let bytes =
-            serialize_chat_request_body("m", &messages, None, "o", None, 64, false, true, wire).unwrap();
+            serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, true, wire).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(
             body.contains(wire),

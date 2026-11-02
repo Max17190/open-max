@@ -51,22 +51,6 @@ impl ApprovalMode {
         }
     }
 
-    /// The mode a front end's step key (Shift+Tab in the TUI) moves to. It
-    /// switches between `ask` and `auto`, the two modes a session changes
-    /// its mind about, and it leaves `readonly` but never enters it: the key
-    /// is easy to press by accident and the choice is saved per project, so
-    /// one stray press that saved `readonly` would leave the project's next
-    /// session refusing every write in a mode nobody chose on purpose.
-    /// `readonly` is chosen on purpose: at the trust prompt, with
-    /// `/approvals readonly`, or a frontend's explicit mode command. One
-    /// source of truth so a front end cannot invent its own order.
-    pub fn next(self) -> Self {
-        match self {
-            ApprovalMode::Readonly | ApprovalMode::Auto => ApprovalMode::Ask,
-            ApprovalMode::Ask => ApprovalMode::Auto,
-        }
-    }
-
     /// Whichever of the two lets the agent do less: readonly, then ask, then
     /// auto. Spelled out rather than derived from the variant order, so
     /// reordering the variants cannot quietly loosen a running gate.
@@ -75,6 +59,28 @@ impl ApprovalMode {
             (ApprovalMode::Readonly, _) | (_, ApprovalMode::Readonly) => ApprovalMode::Readonly,
             (ApprovalMode::Ask, _) | (_, ApprovalMode::Ask) => ApprovalMode::Ask,
             _ => ApprovalMode::Auto,
+        }
+    }
+}
+
+/// Explicit provider request setting. Absence leaves the model's default intact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort { None, Minimal, Low, Medium, High, XHigh, Max }
+
+impl ReasoningEffort {
+    pub const LEVELS: [&'static str; 8] = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+    pub fn parse(value: &str) -> Result<Option<Self>, String> {
+        if value == "default" { return Ok(None); }
+        serde_json::from_value(serde_json::Value::String(value.into())).map(Some)
+            .map_err(|_| format!("invalid reasoning effort {value:?}; choose {}", Self::LEVELS.join(", ")))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none", Self::Minimal => "minimal", Self::Low => "low", Self::Medium => "medium",
+            Self::High => "high", Self::XHigh => "xhigh", Self::Max => "max",
         }
     }
 }
@@ -105,6 +111,8 @@ pub struct Settings {
     /// value the user did not choose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Byte cap for bash/external tool output before truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
@@ -155,6 +163,7 @@ impl Default for Settings {
             context_tokens: None,
             max_tokens: 4096,
             temperature: None,
+            reasoning_effort: None,
             max_output_bytes: None,
             compaction_tokens: None,
             max_agent_tokens: None,
@@ -194,6 +203,7 @@ pub struct KeyFlags {
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub context_tokens: Option<usize>,
+    pub reasoning_effort: Option<Option<ReasoningEffort>>,
 }
 
 /// What [`KeyFlags::apply`] did, by settings key, in field order.
@@ -313,6 +323,8 @@ impl KeyFlags {
             &mut file.context_tokens,
             &mut run.context_tokens,
         );
+        place(&mut applied, "reasoning_effort", self.reasoning_effort.filter(|value| *value != file.reasoning_effort), write, Option::is_none,
+            &mut file.reasoning_effort, &mut run.reasoning_effort);
         (run, applied)
     }
 }
@@ -355,6 +367,21 @@ impl RunOnly {
         (!applied.overridden.is_empty()).then(|| RunOnly { file, run, keys: applied.overridden.clone() })
     }
 
+    pub(crate) fn holds_endpoint(&self, settings: &Settings) -> bool {
+        self.keys.contains(&"provider") || (selected(&settings.provider).is_none() && self.keys.contains(&"base_url"))
+    }
+
+    pub(crate) fn select_effort(&self, settings: &Settings) -> (Settings, RunOnly) {
+        let mut selected = self.clone();
+        selected.keys.retain(|key| *key != "reasoning_effort");
+        let (saved, mut next) = selected.save(settings);
+        if next.holds_endpoint(settings) {
+            next.run.reasoning_effort = settings.reasoning_effort;
+            next.keys.push("reasoning_effort");
+        }
+        (saved, next)
+    }
+
     /// What a save of `settings` writes, and the overrides that hold after
     /// it. An overridden key still at the run's value is written as the
     /// file holds it; one the session set to another value is written as
@@ -375,10 +402,10 @@ impl RunOnly {
                 }
             )*};
         }
-        keep!(provider, base_url, api_key, model, context_tokens);
-        let held = |key| next.keys.contains(&key);
-        if held("provider") || (selected(&settings.provider).is_none() && held("base_url")) {
+        keep!(provider, base_url, api_key, model, context_tokens, reasoning_effort);
+        if next.holds_endpoint(settings) {
             saved.model = self.file.model.clone();
+            saved.reasoning_effort = self.file.reasoning_effort;
         }
         if selected(&settings.provider) != selected(&self.run.provider) {
             saved.model = settings.model.clone();
@@ -566,6 +593,42 @@ mod tests {
         KeyFlags { base_url: base_url.map(Into::into), model: model.map(Into::into), ..KeyFlags::default() }
     }
 
+    #[test]
+    fn effort_overrides_survive_unrelated_saves_without_leaking_to_disk() {
+        let (_, unchanged) = KeyFlags { reasoning_effort: Some(None), ..KeyFlags::default() }.apply(&mut Settings::default());
+        assert_eq!(unchanged, Applied::default(), "Default against an unset value writes nothing");
+        for selected in [None, Some(ReasoningEffort::None), Some(ReasoningEffort::Max)] {
+            let original = Settings { reasoning_effort: Some(ReasoningEffort::High), ..Settings::default() };
+            let mut file = original.clone();
+            let (mut run, applied) = KeyFlags { reasoning_effort: Some(selected), ..KeyFlags::default() }.apply(&mut file);
+            assert_eq!(run.reasoning_effort, selected);
+            assert_eq!(file.reasoning_effort, original.reasoning_effort);
+            let overrides = RunOnly::new(file, run.clone(), &applied).unwrap();
+            run.model = "chosen-model".into();
+            let (saved, overrides) = overrides.save(&run);
+            assert_eq!(saved.reasoning_effort, original.reasoning_effort);
+            assert_eq!(saved.model, "chosen-model");
+            run.reasoning_effort = Some(ReasoningEffort::Low);
+            assert_eq!(overrides.save(&run).0.reasoning_effort, Some(ReasoningEffort::Low));
+        }
+        for flags in [KeyFlags { provider: Some("temporary".into()), ..KeyFlags::default() },
+            KeyFlags { base_url: Some("http://temporary/v1".into()), ..KeyFlags::default() }] {
+            let mut file = Settings { base_url: "http://saved/v1".into(), ..Settings::default() };
+            let (mut run, applied) = flags.apply(&mut file);
+            run.reasoning_effort = Some(ReasoningEffort::High);
+            let overrides = RunOnly::new(file, run.clone(), &applied).unwrap();
+            let (saved, next) = overrides.select_effort(&run);
+            assert!(saved.reasoning_effort.is_none(), "temporary endpoint selections must not change the saved endpoint");
+            assert!(next.holds_endpoint(&run));
+            assert!(next.save(&run).0.reasoning_effort.is_none(), "later unrelated saves keep the same scope");
+            run.provider = None;
+            run.base_url = "http://saved/v1".into();
+            let (saved, next) = next.save(&run);
+            assert!(saved.reasoning_effort.is_none(), "leaving the temporary endpoint cannot persist its effort");
+            assert!(next.save(&run).0.reasoning_effort.is_none());
+        }
+    }
+
     /// A first run configures the install: every flag whose key the file
     /// leaves unset is written. A key the file sets is overridden for the run
     /// only, and a flag equal to the file's value does nothing at all.
@@ -727,19 +790,6 @@ mod tests {
         assert!(json.contains(r#""approval_mode":"readonly""#), "{json}");
     }
 
-    /// The step key reaches `ask` and `auto` from anywhere and never lands
-    /// in `readonly`: a saved `readonly` from a stray press refuses every
-    /// write in the project's next session, so that mode is only ever chosen
-    /// on purpose.
-    #[test]
-    fn stepping_approval_modes_switches_ask_and_auto_and_never_enters_readonly() {
-        assert_eq!(ApprovalMode::Ask.next(), ApprovalMode::Auto);
-        assert_eq!(ApprovalMode::Auto.next(), ApprovalMode::Ask);
-        assert_eq!(ApprovalMode::Readonly.next(), ApprovalMode::Ask, "the key leaves readonly");
-        for mode in [ApprovalMode::Readonly, ApprovalMode::Ask, ApprovalMode::Auto] {
-            assert_ne!(mode.next(), ApprovalMode::Readonly, "{mode:?} must not step into readonly");
-        }
-    }
 
     #[test]
     fn save_atomically_replaces_settings_without_leaving_temp_files() {
