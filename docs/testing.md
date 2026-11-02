@@ -2,6 +2,10 @@
 
 CI gates the test count on every pull request and push to main. Scheduled and manual mutation runs separately gate how many mutants the tests catch. Each gate's floor is a ratchet, the value when it was last raised, kept in its script; the README states each floor and target, and `crates/tui/tests/thesis.rs` holds the README, the scripts and the workflows to each other.
 
+## Suite timing
+
+After the normal functional tests pass, `scripts/check-suite-time.sh` runs every test binary concurrently with its own thread pool. Linux enforces the existing 15-second budget. The macOS measurement retains its 20-second budget but is advisory: shared runner contention has repeatedly exceeded it while functional tests pass. Any failure in this additional macOS stress run remains visible in its log, a workflow warning, and the job summary. The earlier functional test step, Linux timing, Clippy, and release thesis gates still fail CI on errors. An advisory measurement is not evidence that those required gates passed.
+
 ## Test count
 
 `scripts/check-test-count.sh` counts the names `cargo test --workspace -- --list` lists (one line ending in `: test` per test, from every test binary and the doc tests) and takes out the ones `cargo test --workspace -- --list --ignored` lists, since no CI job runs an ignored test. Linux and macOS each compile a few tests the other does not, so the script keeps a floor for each and picks it by `uname -s`. CI's test job runs it on both runners after building the suite, and it fails under the runner's floor. On any other platform it reports the count and passes. A change that adds tests raises each floor to the count the script reports on that platform for it: a local run gives that machine's count, and the Check test count step in each runner's test job gives that runner's, naming the floor it can raise. A change that removes tests on purpose lowers the floors and says why.

@@ -96,7 +96,9 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// suite can time the suite, so CI does: its test job runs
 /// scripts/check-suite-time.sh on the suite it just built, on every runner of
 /// its matrix, with that runner's multiplier, which the script explains, in a
-/// step with a timeout. This test holds that wiring, and holds the gate to
+/// step with a timeout. Linux gates the result; macOS reports failures as an
+/// advisory warning and summary. Functional tests remain enforced on both.
+/// This test holds that wiring, and holds the gate to
 /// its job by driving it with a stand-in `cargo` that lists stand-in test
 /// binaries: it runs them at once (four of them each wait for the other
 /// three to start), each the way `cargo test` would (from its package
@@ -125,13 +127,22 @@ fn whole_suite_runs_in_five_seconds() {
     let gate_run = "scripts/check-suite-time.sh ${{ matrix.suite_time_multiplier }}";
     let (tests, gate) = (step("cargo test --workspace --locked"), step(gate_run));
     assert!(tests < gate, "the suite time gate runs before the suite is built");
-    // The gate's own step, from its first key, whichever that is, to the
-    // next step: a condition there skips the gate on some runner, and so
-    // passes the pull request that slowed the suite on it.
+    let functional = step_keys(&job, tests);
+    assert!(!functional.iter().any(|key| key.starts_with("if:") || key.starts_with("continue-on-error:")),
+        "normal functional tests must stay enforced on every runner");
     let keys = step_keys(&job, gate);
-    let soft: Vec<&&str> =
-        keys.iter().filter(|key| ["if:", "continue-on-error:"].iter().any(|soft| key.starts_with(soft))).collect();
-    assert!(soft.is_empty(), "the suite time gate can be skipped or ignored: {soft:?}");
+    assert!(!keys.iter().any(|key| key.starts_with("if:")), "a runner skips its suite timing measurement");
+    let soft: Vec<_> = keys.iter().filter(|key| key.starts_with("continue-on-error:")).copied().collect();
+    assert_eq!(soft, ["continue-on-error: ${{ matrix.os == 'macos-latest' }}"],
+        "only the macOS concurrent suite measurement is advisory");
+    assert!(keys.contains(&"id: suite_time"), "the advisory reporter cannot inspect the measurement outcome");
+    let report = job.iter().position(|line| line.trim() == "- name: Report macOS suite timing failure")
+        .expect("macOS measurement failures have no visible report");
+    let report = step_keys(&job, report);
+    assert!(report.contains(&"if: ${{ !cancelled() && matrix.os == 'macos-latest' && steps.suite_time.outcome == 'failure' }}"),
+        "the advisory report must inspect the failed step outcome, including an allowed failure");
+    assert!(report.iter().any(|line| line.contains("::warning::")) && report.iter().any(|line| line.contains("$GITHUB_STEP_SUMMARY")),
+        "macOS measurement failures must remain visible as a warning and summary");
     assert!(
         keys.iter().any(|key| key.starts_with("timeout-minutes:")),
         "a test that hangs beside the others holds the suite time gate until the job's own limit"
