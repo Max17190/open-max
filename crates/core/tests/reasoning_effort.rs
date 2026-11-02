@@ -73,6 +73,7 @@ async fn serve(replies: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle<
 
 fn completed(wire: WireApi) -> String {
     match wire {
+        WireApi::Anthropic => unreachable!("native Messages has a separate integration suite"),
         WireApi::ChatCompletions => format!(
             "data: {}\n\ndata: [DONE]\n\n",
             json!({
@@ -165,6 +166,7 @@ async fn explicit_effort_uses_each_protocol_without_changing_other_request_field
             assert_eq!(body["temperature"], 0.25);
             assert_eq!(body["model"], "fixture-model");
             match wire {
+                WireApi::Anthropic => unreachable!("native Messages has a separate integration suite"),
                 WireApi::ChatCompletions => {
                     assert_eq!(request.path, "/chat/completions");
                     assert!(body.get("reasoning").is_none());

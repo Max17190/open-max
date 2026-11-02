@@ -2434,12 +2434,12 @@ fn ensure_project_trust(
         )?;
         return Ok(Some(match recorded {
             Some(mode) => format!(
-                "openmax: trusted project {} in {} mode (change it with /approvals or Shift+Tab)",
+                "openmax: trusted project {} in {} mode (change it with /permissions)",
                 trusted.display(),
                 mode.as_str()
             ),
             None => format!(
-                "openmax: project {} was already trusted; its approval mode is unchanged (change it with /approvals or Shift+Tab)",
+                "openmax: project {} was already trusted; its approval mode is unchanged (change it with /permissions)",
                 trusted.display()
             ),
         }));
@@ -2482,7 +2482,7 @@ fn prompt_trust(
          a  yes, in ask mode: mutating calls wait for your approval\n  \
          r  yes, in readonly mode: mutating calls are refused\n  \
          N  no\n\
-         The mode is saved for this project; change it later with /approvals or Shift+Tab.\n\
+         The mode is saved for this project; change it later with /permissions.\n\
          [y/a/r/N] ",
         project.display()
     )
@@ -2831,7 +2831,7 @@ mod tests {
             let result = prompt_trust(&mut answer.as_bytes(), &mut shown, &data, &project);
             let shown = String::from_utf8(shown).unwrap();
             assert!(
-                shown.contains("auto") && shown.contains("/approvals"),
+                shown.contains("auto") && shown.contains("/permissions"),
                 "the prompt must name the mode it records and how to change it: {shown}"
             );
             let trusted = open_max_core::trust::is_trusted(&data, &project).unwrap();

@@ -50,6 +50,7 @@
 //! same scheme, host, and port, and one anywhere else fails the request.
 
 mod responses;
+mod anthropic;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -340,8 +341,8 @@ pub struct Usage {
     pub cached_tokens: Option<u64>,
 }
 
-/// Minimal client for any OpenAI-compatible /v1/chat/completions endpoint
-/// (Ollama, LM Studio, vLLM, llama.cpp, cloud gateways, private proxies).
+/// Streaming client for Chat Completions, Responses, and native Messages APIs,
+/// including compatible local servers, cloud gateways, and private proxies.
 pub struct ChatClient {
     wire_api: crate::providers::WireApi,
     chatgpt: Option<crate::chatgpt::Connection>,
@@ -537,6 +538,7 @@ impl ChatClient {
         format!("{}/{}", self.base_url.trim_end_matches('/'), match self.wire_api {
             crate::providers::WireApi::ChatCompletions => "chat/completions",
             crate::providers::WireApi::Responses => "responses",
+            crate::providers::WireApi::Anthropic => "messages",
         })
     }
 
@@ -564,6 +566,7 @@ impl ChatClient {
     pub fn origin(&self) -> String {
         let mut key = format!("{}\n{}\n{}", self.base_url.trim_end_matches('/'), self.model, self.api_key.as_deref().unwrap_or(""));
         if self.wire_api == crate::providers::WireApi::Responses { key.push_str("\nresponses"); }
+        if self.wire_api == crate::providers::WireApi::Anthropic { key.push_str("\nanthropic"); }
         if let Some(auth) = &self.chatgpt { key.push_str(&format!("\n{}", auth.identity)); }
         for (name, value) in &self.headers {
             key.push_str(&format!("\n{}:{value}", name.to_ascii_lowercase()));
@@ -601,7 +604,13 @@ impl ChatClient {
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
-        crate::providers::validate_reasoning_effort(&self.base_url, self.reasoning_effort)?;
+        crate::providers::validate_reasoning_effort(&self.base_url, self.wire_api, self.reasoning_effort)?;
+        if self.wire_api == crate::providers::WireApi::Anthropic {
+            let keys = self.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("x-api-key")).count();
+            if keys > usize::from(self.api_key.is_none()) {
+                return Err("native Messages requires one API key source".into());
+            }
+        }
         if self.chatgpt.is_some() && (self.wire_api != crate::providers::WireApi::Responses || self.base_url != crate::chatgpt::API
             || !self.headers.is_empty() || self.api_key.is_some()) {
             return Err("ChatGPT credentials require the fixed OpenAI endpoint without custom credentials or headers".into());
@@ -615,7 +624,9 @@ impl ChatClient {
         // long transcript into Value (and re-serializing) on every attempt is not.
         // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
-        let body = if self.wire_api == crate::providers::WireApi::Responses {
+        let body = if self.wire_api == crate::providers::WireApi::Anthropic {
+            anthropic::serialize(self, messages, note, tools_wire)?
+        } else if self.wire_api == crate::providers::WireApi::Responses {
             responses::serialize(self, messages, note, tools_wire)?
         } else { serialize_chat_request_body(
             &self.model,
@@ -649,8 +660,11 @@ impl ChatClient {
             } else { None };
             if let Some(key) = access.as_deref().or(self.api_key.as_deref()) {
                 if !key.is_empty() {
-                    req = req.bearer_auth(key);
+                    req = if self.wire_api == crate::providers::WireApi::Anthropic { req.header("x-api-key", key) } else { req.bearer_auth(key) };
                 }
+            }
+            if self.wire_api == crate::providers::WireApi::Anthropic && !self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("anthropic-version")) {
+                req = req.header("anthropic-version", "2023-06-01");
             }
             for (name, value) in &self.headers {
                 req = req.header(name.as_str(), value.as_str());
@@ -741,8 +755,11 @@ impl ChatClient {
                 }
                 return Err(naming_wait(err, beyond_cap));
             }
-            if self.wire_api == crate::providers::WireApi::Responses {
-                let (reply, unfinished) = Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await;
+            if matches!(self.wire_api, crate::providers::WireApi::Responses | crate::providers::WireApi::Anthropic) {
+                let (mut reply, unfinished) = if self.wire_api == crate::providers::WireApi::Anthropic {
+                    Box::pin(anthropic::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await
+                } else { Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await };
+                if self.wire_api == crate::providers::WireApi::Anthropic { anthropic::stamp(&mut reply, &body)?; }
                 let retry = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
                 let failure = match unfinished {
                     Some(Unfinished::Interrupted(reason)) if retry => reason,

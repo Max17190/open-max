@@ -189,8 +189,8 @@ pub struct Core {
 /// and applies wherever it is stricter: ask selected in one TUI reaches a
 /// sibling session on the same project at its next tool call instead of
 /// leaving it in auto. If that sibling's status line still shows the older
-/// mode, its Shift+Tab first shows ask and saves nothing; the next press
-/// steps from it. A looser choice is never read back, because the store is a
+/// mode, its permissions picker refreshes the saved choice before presenting
+/// the next selection. A looser choice is never read back, because the store is a
 /// file a tool can write and taking a wider mode from it would be
 /// self-approval; only this process's own selection loosens its modes.
 #[derive(Default)]

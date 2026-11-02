@@ -808,10 +808,21 @@ mod first_frame {
             let start = s.out.len();
             let question = begin(&mut s, &format!("/login {name}"), format!("Enter copies {env}").as_bytes());
             let output = String::from_utf8_lossy(&s.out[start..]);
-            assert_eq!(output.contains("does not provide prompt caching"), name == "anthropic");
+            assert_eq!(output.contains("native Messages API"), name == "anthropic");
+            assert!(!output.contains("uses the compatible API"), "native and unrelated connections must not be mislabeled: {output}");
             s.write(b"\x1b");
             resume(&mut s, question);
         }
+        let mut legacy: serde_json::Value = serde_json::from_slice(&original_catalog).unwrap();
+        legacy["providers"]["anthropic"] = serde_json::json!({"base_url":"https://api.anthropic.com/v1","wire_api":"chat_completions"});
+        std::fs::write(dir.join("providers.json"), legacy.to_string()).unwrap();
+        let start = s.out.len();
+        let question = begin(&mut s, "/login anthropic", b"Enter copies ANTHROPIC_API_KEY");
+        let output = String::from_utf8_lossy(&s.out[start..]);
+        assert!(output.contains("uses the compatible API") && !output.contains("native Messages API"), "legacy connection protocol was mislabeled: {output}");
+        s.write(b"\x1b");
+        resume(&mut s, question);
+        std::fs::write(dir.join("providers.json"), &original_catalog).unwrap();
         for (url, accepted) in [(open_max_core::chatgpt::API, true), ("https://example.invalid/v1", false)] {
             let mut entries: serde_json::Value = serde_json::from_slice(&original_catalog).unwrap();
             entries["providers"]["openai"] = serde_json::json!({"base_url":url});
@@ -869,7 +880,8 @@ mod first_frame {
                 s.wait_for(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
                 s.write(b"\r");
             } else {
-                s.wait_for(b"Model ID", question, Duration::from_secs(5)).expect("manual model prompt missing");
+                s.wait_for(b"Model ID", question, Duration::from_secs(5)).unwrap_or_else(||
+                    panic!("manual model prompt missing (model bytes {}, window {window:?}): {}", model.len(), s.context()));
                 s.write(format!("\x1b[200~{model}\x1b[201~\r").as_bytes());
             }
             if let Some(window) = window {
@@ -1312,6 +1324,52 @@ mod first_frame {
             }
             s.pump(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn permissions_picker_owns_explicit_project_changes_while_shift_tab_cycles_effort() {
+        let (cols, rows) = (160, 40);
+        let mut s = Session::spawn("permissions-picker", cols as u16, rows as u16);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).expect("first frame");
+        s.write(ANSWER);
+        let data = s.dir.join("home/.openmax");
+        let project = s.dir.join("project");
+        let mode = || open_max_core::state::Core::new(data.clone()).unwrap().0.approval_mode(&project);
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("stub-model"));
+        assert!(shown.contains("stub-model"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto, "new trust grants already default to Auto");
+        s.write(b"\x1b[Z");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested none"));
+        assert!(shown.contains("requested none"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
+        s.write(b"/permissions\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("new project default"));
+        assert!(shown.contains("new project default"), "{shown}");
+        s.write(b"\x1b[Z\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: readonly"));
+        assert!(shown.contains("permissions: readonly"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
+        assert_eq!(open_max_core::config::load(&data).unwrap().reasoning_effort, Some(open_max_core::config::ReasoningEffort::None));
+        s.write(b"\x1b[Z");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested minimal"));
+        assert!(shown.contains("requested minimal"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
+        s.write(b"/permissions ask\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: ask"));
+        assert!(shown.contains("permissions: ask"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Ask);
+        s.write(b"/approvals auto\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: auto"));
+        assert!(shown.contains("permissions: auto"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
+        s.write(b"/permissions invalid\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("usage: /permissions"));
+        assert!(shown.contains("usage: /permissions"), "{shown}");
+        assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
+        assert_eq!(open_max_core::config::load(&data).unwrap().approval_mode, open_max_core::config::ApprovalMode::Ask,
+            "project selections never change the legacy global fallback");
+        s.write(CTRL_C_TWICE);
+        assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
     }
 
     #[test]

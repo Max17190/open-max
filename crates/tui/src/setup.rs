@@ -191,7 +191,10 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>) -> Result<(),
         one_line(&name),
         one_line(&base)
     );
-    if name == "anthropic" {
+    let native = entry["wire_api"] == "anthropic" || (name == "anthropic" && previous.is_none());
+    if native {
+        eprintln!("This connection uses the native Messages API with model-dependent reasoning effort.");
+    } else if name == "anthropic" {
         eprintln!(
             "This connection uses the compatible API, which does not provide prompt caching."
         );
@@ -247,7 +250,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>) -> Result<(),
         }
     }
     eprintln!("Checking access and loading available models...");
-    let models = discover(&base, &key, headers, base == OPENAI).await?;
+    let models = discover(&base, &key, headers, base == OPENAI, native).await?;
     let model = if models.is_empty() {
         eprintln!("This endpoint does not expose a model catalog, so access could not be verified. Enter its exact model ID.");
         prompts.ask("Model ID", false).await?
@@ -340,6 +343,8 @@ fn api_defaults(entry: &mut Value, name: &str, new: bool) -> Result<(), String> 
     if entry.get("wire_api").is_none() {
         entry["wire_api"] = json!(if name == "openai" {
             "responses"
+        } else if name == "anthropic" {
+            "anthropic"
         } else {
             "chat_completions"
         });
@@ -381,6 +386,7 @@ async fn discover(
     key: &str,
     headers: &serde_json::Map<String, Value>,
     openai: bool,
+    native: bool,
 ) -> Result<Vec<Value>, String> {
     validate_url(base)?;
     let client = reqwest::Client::builder()
@@ -388,7 +394,11 @@ async fn discover(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| "cannot initialize model discovery")?;
-    let mut request = client.get(format!("{base}/models")).bearer_auth(key);
+    let request = client.get(format!("{base}/models"));
+    let mut request = if native { request.header("x-api-key", key) } else { request.bearer_auth(key) };
+    if native && !headers.keys().any(|name| name.eq_ignore_ascii_case("anthropic-version")) {
+        request = request.header("anthropic-version", "2023-06-01");
+    }
     if base == ANTHROPIC {
         request = request.query(&[("limit", "1000")]);
     }

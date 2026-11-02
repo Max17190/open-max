@@ -59,10 +59,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         "pick a configured provider and model",
         false,
     ),
+    command("permissions", "[auto|ask|readonly]", "choose saved project permissions", true),
     command(
         "approvals",
         "auto|ask|readonly",
-        "save this project's execution mode",
+        "alias for /permissions",
         false,
     ),
     command("new", "", "start a fresh session", true),
