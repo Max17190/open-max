@@ -50,6 +50,11 @@ session or trust flags. `--account` defaults to `main`. See
 [ChatGPT sign-in](configuration.md#chatgpt-sign-in) for selecting its provider,
 context-window configuration, and billing behavior.
 
+`--effort high` requests a reasoning effort level at launch. Choose `default`,
+`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Levels depend on
+model support; provider errors are preserved. The setting follows the same
+initial-configuration and run-only override rules as the endpoint flags below.
+
 `--base-url`, `--model`, `--api-key` (a literal or `'$ENV_VAR'`) and
 `--context-tokens` set the settings key of the same name. Each one is written
 to `~/.openmax/settings.json` when the file leaves its key unset and the run
@@ -366,6 +371,7 @@ removal) runs to its end on its own.
 | `/help` | Keybindings and commands |
 | `/model` | Search configured providers and select a model |
 | `/model <id>` | Set an exact model id on the active endpoint |
+| `/effort [level]` | Pick reasoning effort with arrow keys and Enter, or request an exact level for the next turn. `default` omits the setting; `none` is explicit. Model support varies |
 | `/copy` | Copy the latest assistant response |
 | `/provider [name]` | List or switch providers |
 | `/approvals auto\|ask\|readonly` | Save this project's execution mode |
