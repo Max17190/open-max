@@ -1,16 +1,9 @@
 name: Mutants
 
-# Mutation testing with cargo-mutants, configured in .cargo/mutants.toml. A
-# pull request's run tests the mutants in the code it changes, and fails when
-# one was missed or timed out and is not listed with its reason in
-# .cargo/mutants-allowed.txt. A run of main, the weekly run and a run by hand
-# (on any branch) test every mutant in the workspace, and fail when the
-# mutation score is under its floor. scripts/check-mutants.sh judges both and
-# says what each outcome counts for.
+# Full workspace mutation testing runs weekly and on demand. Normal PR and
+# main CI retain tests, lint, thesis gates and release builds without this
+# multi-hour sweep. scripts/check-mutants.sh enforces the mutation score floor.
 on:
-  pull_request:
-  push:
-    branches: [main]
   schedule:
     # Mondays at 04:17 UTC.
     - cron: "17 4 * * 1"
@@ -19,12 +12,10 @@ on:
 permissions:
   contents: read
 
-# A pull request's newer push cancels its older run. Runs of the whole
-# workspace queue instead: one runs, and a newer one waiting replaces an older
-# one waiting.
+# Queue full sweeps per branch; a newer pending run replaces an older one.
 concurrency:
-  group: mutants-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: false
 
 # bash with pipefail: a listing that fails must fail its step, not read as an
 # empty list.
@@ -51,12 +42,7 @@ env:
 # Every action is pinned to a full commit SHA, with its release in a trailing
 # comment, as ci.yml explains.
 jobs:
-  # Lists the mutants and splits them into shards. A mutant takes 18.5 seconds
-  # on a runner on average, its build and its tests together: 50 to a runner
-  # for a pull request, about 18 minutes with the shard's setup and its run
-  # of the unmutated tests, so a typical one finishes inside 30 minutes; 400
-  # to a runner for the whole workspace, 2 hours on average and under 3,
-  # inside GitHub's 6-hour job limit.
+  # Split the workspace into at most 40 shards of about 400 mutants each.
   plan:
     name: Plan
     runs-on: ubuntu-latest
@@ -66,10 +52,6 @@ jobs:
       shards: ${{ steps.plan.outputs.shards }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          # A pull request's run checks out its merge commit, whose first
-          # parent is the base branch: the change is the diff between them.
-          fetch-depth: 2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
@@ -85,15 +67,8 @@ jobs:
       - name: List the mutants
         id: plan
         run: |
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            git diff HEAD^1 HEAD > "$RUNNER_TEMP/change.diff"
-            set -- --in-diff "$RUNNER_TEMP/change.diff"
-            per_shard=50 most=8
-          else
-            set --
-            per_shard=400 most=40
-          fi
-          mutants=$(cargo mutants --list "$@" | wc -l)
+          per_shard=400 most=40
+          mutants=$(cargo mutants --list | wc -l)
           shards=$(( (mutants + per_shard - 1) / per_shard ))
           [ "$shards" -le "$most" ] || shards=$most
           [ "$shards" -ge 1 ] || shards=1
@@ -117,9 +92,8 @@ jobs:
     timeout-minutes: 330
     strategy:
       fail-fast: false
-      # Leaves room for every other workflow's jobs within the account's
-      # concurrent job limit (20 on GitHub's free plan).
-      max-parallel: 10
+      # Reserve runner capacity for normal PR workflows.
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     env:
@@ -128,16 +102,13 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          fetch-depth: 2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      # Only main saves this cache: one for every pull request's shards would
-      # push main's out of the repository's cache space.
+      # Only main saves this cache; manual branch runs reuse it.
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -186,10 +157,6 @@ jobs:
           # (above).
           cargo test --workspace --locked
           set -- --in-place --shard "$SHARD" --annotations none -vV
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            git diff HEAD^1 HEAD > "$RUNNER_TEMP/change.diff"
-            set -- "$@" --in-diff "$RUNNER_TEMP/change.diff"
-          fi
           # 2: a mutant was missed; 3: one timed out. The last job judges
           # those; any other failure is the run's own.
           status=0
@@ -215,7 +182,7 @@ jobs:
 
   # The shards' outcomes, merged and judged.
   judge:
-    name: ${{ github.event_name == 'pull_request' && 'Mutants in the change' || 'Mutation score' }}
+    name: Mutation score
     needs: [plan, mutants]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -235,15 +202,11 @@ jobs:
           MUTANTS: ${{ needs.plan.outputs.mutants }}
         run: |
           [ "$PLANNED" = success ] || { echo "::error::listing the mutants failed"; exit 1; }
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            [ "$MUTANTS" != 0 ] || { echo "the change has no mutants to test"; exit 0; }
-            set -- --diff
-          fi
           [ "$TESTED" = success ] || { echo "::error::a shard did not finish: $TESTED"; exit 1; }
           # A single artifact downloads into shards/ itself; more than one, each
           # into a directory of its own there.
           if [ -e shards/outcomes.json ]; then dirs=(shards); else dirs=(shards/*/); fi
-          scripts/check-mutants.sh "$@" --mutants "$MUTANTS" --missed missed.txt "${dirs[@]}"
+          scripts/check-mutants.sh --mutants "$MUTANTS" --missed missed.txt "${dirs[@]}"
 
       - name: Keep the missed mutants
         if: ${{ !cancelled() && hashFiles('missed.txt') != '' }}
