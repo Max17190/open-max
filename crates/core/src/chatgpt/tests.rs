@@ -51,32 +51,34 @@ async fn serve(
     let base = format!("http://{}", listener.local_addr().unwrap());
     let origin = base.clone();
     let job = tokio::spawn(async move {
-        for _ in 0..count {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let (head, body) = loop {
-                let mut buf = [0; 4096];
-                let n = socket.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
-                    let length: usize = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= end + 4 + length {
-                        break (head, String::from_utf8(bytes[end + 4..end + 4 + length].to_vec()).unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            for _ in 0..count {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (head, body) = loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break (head, String::from_utf8(bytes[end + 4..end + 4 + length].to_vec()).unwrap());
+                        }
                     }
-                }
-            };
-            let path = head.split_whitespace().nth(1).unwrap();
-            let (status, body) = reply(path, &body, &origin);
-            let body = body.to_string();
-            socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-        }
+                };
+                let path = head.split_whitespace().nth(1).unwrap();
+                let (status, body) = reply(path, &body, &origin);
+                let body = body.to_string();
+                socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        }).await.expect("identity-provider fixture did not finish");
     });
     (base, job)
 }
@@ -651,11 +653,11 @@ async fn refresh_without_plan_scope_persists_rotation_and_blocks_further_use() {
         auth.access_at(&client, &url).await.unwrap_err(),
         PLAN_DISABLED
     );
-    server.await.unwrap();
     let store = load(&scratch.0).unwrap();
     let credentials = store.accounts["main"].tokens.as_ref().unwrap();
     assert_eq!(credentials.refresh, "rotated-refresh");
     assert_eq!(credentials.access, "new-access");
+    server.await.unwrap();
     assert_eq!(
         auth.access_at(&client, &url).await.unwrap_err(),
         PLAN_DISABLED
