@@ -49,6 +49,8 @@
 //! leave the server the base_url names: a redirect is followed only on the
 //! same scheme, host, and port, and one anywhere else fails the request.
 
+mod responses;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -337,6 +339,8 @@ pub struct Usage {
 /// Minimal client for any OpenAI-compatible /v1/chat/completions endpoint
 /// (Ollama, LM Studio, vLLM, llama.cpp, cloud gateways, private proxies).
 pub struct ChatClient {
+    wire_api: crate::providers::WireApi,
+    chatgpt: Option<crate::chatgpt::Connection>,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
@@ -457,6 +461,8 @@ impl ChatClient {
     /// Build a client from a resolved multi-provider endpoint.
     pub fn from_endpoint(ep: &crate::providers::ActiveEndpoint) -> Self {
         Self {
+            wire_api: ep.wire_api,
+            chatgpt: ep.chatgpt.clone(),
             idle_timeout: ep.idle_timeout_secs.map_or(IDLE_TIMEOUT, |secs| std::time::Duration::from_secs(secs.max(1))),
             key_hint: ep.key_hint.clone(),
             ..Self::with_options(
@@ -504,6 +510,8 @@ impl ChatClient {
             })
             .clone();
         Self {
+            wire_api: crate::providers::WireApi::ChatCompletions,
+            chatgpt: None,
             base_url,
             api_key,
             model,
@@ -519,15 +527,18 @@ impl ChatClient {
     }
 
     fn endpoint(&self) -> String {
-        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+        format!("{}/{}", self.base_url.trim_end_matches('/'), match self.wire_api {
+            crate::providers::WireApi::ChatCompletions => "chat/completions",
+            crate::providers::WireApi::Responses => "responses",
+        })
     }
 
-    /// Whether a request carries a credential: the key, a credential header
+    /// Whether a request carries a credential: ChatGPT auth, a key or credential header
     /// among the provider's headers (see [`is_credential_header`]), or
     /// user:password in the base_url, which the HTTP client turns into a
     /// Basic Authorization header.
     fn sends_credential(&self) -> bool {
-        self.api_key.as_deref().is_some_and(|key| !key.is_empty())
+        self.chatgpt.is_some() || self.api_key.as_deref().is_some_and(|key| !key.is_empty())
             || self.headers.iter().any(|(name, _)| is_credential_header(name))
             || reqwest::Url::parse(self.base_url.trim())
                 .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
@@ -545,6 +556,8 @@ impl ChatClient {
     /// holds the URL, the key, or a header value.
     pub fn origin(&self) -> String {
         let mut key = format!("{}\n{}\n{}", self.base_url.trim_end_matches('/'), self.model, self.api_key.as_deref().unwrap_or(""));
+        if self.wire_api == crate::providers::WireApi::Responses { key.push_str("\nresponses"); }
+        if let Some(auth) = &self.chatgpt { key.push_str(&format!("\n{}", auth.identity)); }
         for (name, value) in &self.headers {
             key.push_str(&format!("\n{}:{value}", name.to_ascii_lowercase()));
         }
@@ -581,6 +594,10 @@ impl ChatClient {
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
+        if self.chatgpt.is_some() && (self.wire_api != crate::providers::WireApi::Responses || self.base_url != crate::chatgpt::API
+            || !self.headers.is_empty() || self.api_key.is_some()) {
+            return Err("ChatGPT credentials require the fixed OpenAI endpoint without custom credentials or headers".into());
+        }
         if self.sends_credential() {
             if let Some(refusal) = plain_http_refusal(&self.base_url) {
                 return Err(refusal);
@@ -590,7 +607,9 @@ impl ChatClient {
         // long transcript into Value (and re-serializing) on every attempt is not.
         // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
-        let body = serialize_chat_request_body(
+        let body = if self.wire_api == crate::providers::WireApi::Responses {
+            responses::serialize(self, messages, note, tools_wire)?
+        } else { serialize_chat_request_body(
             &self.model,
             messages,
             note,
@@ -600,7 +619,7 @@ impl ChatClient {
             self.use_max_completion_tokens,
             self.send_stream_options,
             tools_wire,
-        )?;
+        )? };
 
         let mut attempt = 0u32;
         // Attempts in a row that never reached the endpoint; any other
@@ -613,7 +632,13 @@ impl ChatClient {
                 .post(self.endpoint())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body.clone());
-            if let Some(key) = &self.api_key {
+            let access = if let Some(auth) = &self.chatgpt {
+                tokio::select! {
+                    result = auth.access() => Some(result?),
+                    _ = cancelled.cancelled() => return Ok(cancelled_response()),
+                }
+            } else { None };
+            if let Some(key) = access.as_deref().or(self.api_key.as_deref()) {
                 if !key.is_empty() {
                     req = req.bearer_auth(key);
                 }
@@ -680,11 +705,14 @@ impl ChatClient {
             let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
             if !status.is_success() {
                 let code = status.as_u16();
+                let request_id = resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(str::to_string);
                 let body = read_body(resp, &cancelled, self.idle_timeout).await
                     .map_err(|e| format!("backend returned {status}: {e}"))?;
                 let Some(body) = body else { return Ok(cancelled_response()); };
                 let text = String::from_utf8_lossy(&body);
-                let message = describe_backend(&text);
+                let message = if self.wire_api == crate::providers::WireApi::Responses {
+                    responses::http_failure(&text, request_id.as_deref())
+                } else { describe_backend(&text) };
                 let mut err = format!("backend returned {status}: {message}");
                 if let Some(hint) = temperature_hint(self.temperature, &message) {
                     err.push_str(&hint);
@@ -694,13 +722,29 @@ impl ChatClient {
                         err.push_str(hint);
                     }
                 }
-                if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !quota_exhausted(&text) && beyond_cap.is_none() {
+                let exhausted = quota_exhausted(&text)
+                    || (self.wire_api == crate::providers::WireApi::Responses && responses::plan_limit(&text));
+                if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !exhausted && beyond_cap.is_none() {
                     if !resend_after(attempt, MAX_ATTEMPTS, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
                     }
                     continue;
                 }
                 return Err(naming_wait(err, beyond_cap));
+            }
+            if self.wire_api == crate::providers::WireApi::Responses {
+                let (reply, unfinished) = Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await;
+                let retry = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
+                let failure = match unfinished {
+                    Some(Unfinished::Interrupted(reason)) if retry => reason,
+                    Some(Unfinished::Failed(f)) if f.retryable && retry && beyond_cap.is_none() => f.message,
+                    Some(Unfinished::Failed(f)) => return Err(f.message),
+                    _ => return Ok(reply),
+                };
+                if !resend_after(attempt, MAX_ATTEMPTS, &failure, backoff(attempt, asked), &cancelled, &mut on_delta).await {
+                    return Ok(cancelled_response());
+                }
+                continue;
             }
             let is_json = resp
                 .headers()
@@ -3406,7 +3450,7 @@ mod tests {
         provider_at(&url);
         let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
         let err = request(&endpoint).await.err().expect("a 401 is an error");
-        let head = heads.recv().unwrap().to_ascii_lowercase();
+        let head = heads.recv_timeout(std::time::Duration::from_secs(3)).unwrap().to_ascii_lowercase();
         assert!(!head.contains("authorization") && !head.contains("sk-settings"), "{head}");
         assert!(err.starts_with("backend returned 401 Unauthorized: missing credentials"), "{err}");
         assert!(err.contains("provider 'local'") && err.contains("api_key_env"), "{err}");
@@ -3417,7 +3461,7 @@ mod tests {
         settings.base_url = url.trim_end_matches("/v1").into();
         let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
         assert_eq!(request(&endpoint).await.unwrap().content, "all of it");
-        let head = heads.recv().unwrap().to_ascii_lowercase();
+        let head = heads.recv_timeout(std::time::Duration::from_secs(3)).unwrap().to_ascii_lowercase();
         assert!(head.contains("authorization: bearer sk-settings"), "{head}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3458,7 +3502,7 @@ mod tests {
             .await
             .expect("loopback http carries a key");
         assert_eq!(result.content, "all of it");
-        let head = heads.recv().unwrap().to_ascii_lowercase();
+        let head = heads.recv_timeout(std::time::Duration::from_secs(3)).unwrap().to_ascii_lowercase();
         assert!(head.contains("authorization: bearer sk-local"), "{head}");
     }
 
@@ -3920,6 +3964,10 @@ mod tests {
     /// and the stamp that decides it never leaves the session file.
     #[test]
     fn reasoning_goes_only_to_the_endpoint_that_produced_it() {
+        // Existing session stamps must survive adding another wire protocol.
+        let mut legacy = ChatClient::new("https://example.invalid/v1".into(), Some("fixture-key".into()), "fixture-model".into(), None, 64);
+        legacy.headers = vec![("X-Route".into(), "fixture".into())];
+        assert_eq!(legacy.origin(), "c50bd9d1e91d9ebb");
         let client = |base: &str, model: &str| ChatClient::new(base.into(), None, model.into(), None, 64);
         let deepseek = client("https://api.deepseek.com", "deepseek-reasoner");
         let mut reply = ChatMessage::assistant(None, Some(vec![bash_call()]));

@@ -46,6 +46,15 @@ impl From<CompatFlagsFile> for CompatFlags {
     }
 }
 
+/// Request protocol; omitted catalogs retain the original Chat Completions behavior.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireApi {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderModel {
     pub id: String,
@@ -60,6 +69,10 @@ pub struct ProviderModel {
 #[derive(Clone, Debug, Deserialize)]
 struct ProviderConfigFile {
     base_url: String,
+    #[serde(default)]
+    wire_api: WireApi,
+    #[serde(default)]
+    chatgpt_account: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
     /// Env var name, or list of names (first non-empty wins).
@@ -85,6 +98,8 @@ enum ApiKeyEnv {
 #[derive(Clone, Debug)]
 pub struct ProviderConfig {
     pub base_url: String,
+    pub wire_api: WireApi,
+    pub chatgpt_account: Option<String>,
     pub api_key: Option<String>,
     pub api_key_env: Vec<String>,
     pub headers: BTreeMap<String, String>,
@@ -104,6 +119,8 @@ struct ProvidersFile {
 /// Resolved endpoint used for one completion request.
 #[derive(Clone, Debug)]
 pub struct ActiveEndpoint {
+    pub wire_api: WireApi,
+    pub chatgpt: Option<crate::chatgpt::Connection>,
     pub provider: Option<String>,
     pub base_url: String,
     pub api_key: Option<String>,
@@ -203,6 +220,8 @@ fn parse_providers_file(text: &str) -> Result<BTreeMap<String, ProviderConfig>, 
                 name,
                 ProviderConfig {
                     base_url,
+                    wire_api: raw.wire_api,
+                    chatgpt_account: raw.chatgpt_account,
                     api_key: raw.api_key,
                     api_key_env,
                     headers: raw.headers,
@@ -240,6 +259,12 @@ pub(crate) fn check_file(path: &Path) -> Option<Result<(usize, Vec<String>), Str
             return Some(Err(format!(
                 "provider name '{name}' cannot have surrounding whitespace"
             )));
+        }
+        if provider.chatgpt_account.is_some() {
+            if let Err(e) = validate_chatgpt(&provider.base_url, provider.wire_api,
+                provider.api_key.is_some() || provider.api_key_env.is_some() || !provider.headers.is_empty()) {
+                return Some(Err(e));
+            }
         }
         let base_url = provider.base_url.trim();
         if base_url.is_empty() {
@@ -319,7 +344,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
         let Some(provider) = provider.as_object() else { continue };
         unknown_keys(
             provider,
-            &["base_url", "api_key", "api_key_env", "headers", "models", "compat", "idle_timeout_secs"],
+            &["base_url", "api_key", "api_key_env", "headers", "models", "compat", "idle_timeout_secs", "wire_api", "chatgpt_account"],
             &format!("in provider '{name}'"),
             &mut out,
         );
@@ -467,11 +492,13 @@ pub enum ResolveError {
     /// "add it to providers.json" sends the repair in the wrong direction
     /// when the file itself is the problem.
     InvalidProvidersFile(String),
+    Authentication(String),
 }
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ResolveError::Authentication(message) => f.write_str(message),
             ResolveError::MissingEndpoint => write!(
                 f,
                 "no model endpoint configured: pass --base-url or set base_url in ~/.openmax/settings.json, or define one in ~/.openmax/providers.json and select it with --provider or settings.provider"
@@ -606,6 +633,14 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             }
             return Err(ResolveError::UnknownProvider(name.clone()));
         };
+        let chatgpt = match &p.chatgpt_account {
+            Some(account) => {
+                validate_chatgpt(&p.base_url, p.wire_api, p.api_key.is_some() || !p.api_key_env.is_empty() || !p.headers.is_empty())
+                    .map_err(ResolveError::Authentication)?;
+                Some(crate::chatgpt::connection(data_dir, account).map_err(ResolveError::Authentication)?)
+            }
+            None => None,
+        };
         let base_url = p.base_url.trim();
         if base_url.is_empty() {
             return Err(ResolveError::MissingEndpoint);
@@ -637,16 +672,22 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
         // Sent anywhere else, it hands one server's credential to another.
-        let (api_key, key_hint) = match provider_key(p.api_key.as_deref(), &p.api_key_env) {
-            Some(key) => (Some(key), None),
-            None => match settings_key(settings.api_key.as_deref()) {
-                Some(key) if same_server(base_url, &settings.base_url) => (Some(key), None),
-                Some(_) => (None, Some(withheld_key_hint(name, p))),
-                None => (None, None),
-            },
+        let (api_key, key_hint) = if chatgpt.is_some() {
+            (None, None)
+        } else {
+            match provider_key(p.api_key.as_deref(), &p.api_key_env) {
+                Some(key) => (Some(key), None),
+                None => match settings_key(settings.api_key.as_deref()) {
+                    Some(key) if same_server(base_url, &settings.base_url) => (Some(key), None),
+                    Some(_) => (None, Some(withheld_key_hint(name, p))),
+                    None => (None, None),
+                },
+            }
         };
         let headers = expand_headers(&p.headers);
         return Ok(ActiveEndpoint {
+            wire_api: p.wire_api,
+            chatgpt,
             provider: Some(name.clone()),
             base_url: base_url.to_string(),
             api_key,
@@ -682,6 +723,8 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     let max_allowed = context_tokens.saturating_sub(2048).max(1);
     let max_tokens = settings.max_tokens.max(1).min(max_allowed);
     Ok(ActiveEndpoint {
+        wire_api: WireApi::ChatCompletions,
+        chatgpt: None,
         provider: None,
         base_url: base_url.to_string(),
         api_key: settings_key(settings.api_key.as_deref()),
@@ -694,6 +737,13 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         idle_timeout_secs: None,
         key_hint: None,
     })
+}
+
+fn validate_chatgpt(base: &str, wire: WireApi, extra_credentials: bool) -> Result<(), String> {
+    if base != crate::chatgpt::API || wire != WireApi::Responses || extra_credentials {
+        return Err("ChatGPT requires wire_api responses, base_url https://api.openai.com/v1, and no api_key, api_key_env or headers".into());
+    }
+    Ok(())
 }
 
 /// A provider's own key: its `api_key`, else the first non-empty variable
@@ -842,6 +892,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(check_file(&path).unwrap().unwrap(), (1, Vec::new()));
+
+        let plan = serde_json::json!({"base_url":crate::chatgpt::API,"wire_api":"responses","chatgpt_account":"work"});
+        std::fs::write(&path, serde_json::json!({"providers":{"plan":plan}}).to_string()).unwrap();
+        assert_eq!(check_file(&path).unwrap().unwrap(), (1, Vec::new()));
+        for (key, value) in [("api_key", serde_json::json!("fixture")), ("api_key_env", serde_json::json!("PLAN_KEY")),
+            ("headers", serde_json::json!({"X-Key":"fixture"}))] {
+            let mut invalid = plan.clone();
+            invalid[key] = value;
+            std::fs::write(&path, serde_json::json!({"providers":{"plan":invalid}}).to_string()).unwrap();
+            assert!(check_file(&path).unwrap().is_err(), "accepted {key} on a plan provider");
+        }
 
         std::fs::write(&path, r#"{"providers":{"local":{"base_url":"not a url"}}}"#)
             .unwrap();
