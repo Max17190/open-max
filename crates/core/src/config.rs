@@ -51,22 +51,6 @@ impl ApprovalMode {
         }
     }
 
-    /// The mode a front end's step key (Shift+Tab in the TUI) moves to. It
-    /// switches between `ask` and `auto`, the two modes a session changes
-    /// its mind about, and it leaves `readonly` but never enters it: the key
-    /// is easy to press by accident and the choice is saved per project, so
-    /// one stray press that saved `readonly` would leave the project's next
-    /// session refusing every write in a mode nobody chose on purpose.
-    /// `readonly` is chosen on purpose: at the trust prompt, with
-    /// `/approvals readonly`, or a frontend's explicit mode command. One
-    /// source of truth so a front end cannot invent its own order.
-    pub fn next(self) -> Self {
-        match self {
-            ApprovalMode::Readonly | ApprovalMode::Auto => ApprovalMode::Ask,
-            ApprovalMode::Ask => ApprovalMode::Auto,
-        }
-    }
-
     /// Whichever of the two lets the agent do less: readonly, then ask, then
     /// auto. Spelled out rather than derived from the variant order, so
     /// reordering the variants cannot quietly loosen a running gate.
@@ -806,19 +790,6 @@ mod tests {
         assert!(json.contains(r#""approval_mode":"readonly""#), "{json}");
     }
 
-    /// The step key reaches `ask` and `auto` from anywhere and never lands
-    /// in `readonly`: a saved `readonly` from a stray press refuses every
-    /// write in the project's next session, so that mode is only ever chosen
-    /// on purpose.
-    #[test]
-    fn stepping_approval_modes_switches_ask_and_auto_and_never_enters_readonly() {
-        assert_eq!(ApprovalMode::Ask.next(), ApprovalMode::Auto);
-        assert_eq!(ApprovalMode::Auto.next(), ApprovalMode::Ask);
-        assert_eq!(ApprovalMode::Readonly.next(), ApprovalMode::Ask, "the key leaves readonly");
-        for mode in [ApprovalMode::Readonly, ApprovalMode::Ask, ApprovalMode::Auto] {
-            assert_ne!(mode.next(), ApprovalMode::Readonly, "{mode:?} must not step into readonly");
-        }
-    }
 
     #[test]
     fn save_atomically_replaces_settings_without_leaving_temp_files() {

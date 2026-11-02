@@ -758,7 +758,7 @@ fn trust_project_records_auto_for_a_project_it_newly_trusts() {
     let out = cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(approval_mode(&home, &project), ApprovalMode::Auto, "{stderr}");
-    assert!(stderr.contains("auto") && stderr.contains("/approvals"), "the grant must say what it recorded: {stderr}");
+    assert!(stderr.contains("auto") && stderr.contains("/permissions"), "the grant must say what it recorded: {stderr}");
 
     let earlier = project.parent().unwrap().join("earlier");
     std::fs::create_dir_all(&earlier).unwrap();

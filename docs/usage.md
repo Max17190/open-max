@@ -7,7 +7,8 @@ openmax
 
 On the first interactive run, inspect the project and answer the trust
 prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
-Change the mode later with `/approvals` or **Shift+Tab**. See
+Change the mode later with `/permissions`; **Shift+Tab** cycles reasoning
+effort. See
 [configuration](configuration.md#project-trust) for headless and stdio
 trust.
 
@@ -59,7 +60,8 @@ session or trust flags. `--account` defaults to `main`. See
 [ChatGPT sign-in](configuration.md#chatgpt-sign-in) for selecting its provider,
 context-window configuration, and billing behavior.
 
-`--effort high` requests a reasoning effort level at launch. Choose `default`,
+`--effort high` requests a reasoning effort level at launch. **Shift+Tab**
+cycles the active provider's effort levels. Choose `default`,
 `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Levels depend on
 model support; provider errors are preserved. The setting follows the same
 initial-configuration and run-only override rules as the endpoint flags below.
@@ -121,7 +123,7 @@ With `--json`, each `AgentEvent` is one JSON line on stdout, `harness_note`
 included. Mutating tools honor the project's approval mode, and a print run
 declines every approval request, so unattended runs need `auto`: the mode a
 trust grant records unless you pick another. For a project in `ask`, select
-`/approvals auto` once.
+`/permissions auto` once.
 
 A print run has no overall deadline, like a TUI or stdio session. A turn keeps
 going while the endpoint sends anything, keepalives and tool call arguments
@@ -369,7 +371,7 @@ removal) runs to its end on its own.
 | **y** or **Ctrl+C** | Copy selected text (**Ctrl+C** cancels when nothing is selected) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Switch and save project approvals between `ask` and `auto`; from `readonly`, to `ask` (choose `readonly` at the trust prompt or with `/approvals readonly`) |
+| **Shift+Tab** | Cycle requested reasoning effort; inside a picker, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** twice | Quit |
 
@@ -385,7 +387,8 @@ removal) runs to its end on its own.
 | `/provider [name]` | Pick a provider/model pair, or switch to a named provider |
 | `/login [provider]` | Connect a provider through browser sign-in or hidden API-key entry |
 | `/logout [provider]` | Disconnect a provider |
-| `/approvals auto\|ask\|readonly` | Save this project's execution mode |
+| `/permissions [auto\|ask\|readonly]` | Pick or save this project's permission mode. New trust grants default to `auto`; explicit `ask` and `readonly` choices are preserved |
+| `/approvals auto\|ask\|readonly` | Alias for `/permissions` |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
 | `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
 | `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the trailing note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |

@@ -147,14 +147,18 @@ override the first two.
   chose it, delete the key.
 - `reasoning_effort` (default unset): an explicit requested level: `none`,
   `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Use `/effort` for a
-  keyboard picker, `/effort high` to select directly, or `--effort high` at
-  launch. Session choices persist, including selecting the current CLI level,
+  keyboard picker, Shift+Tab to cycle the active protocol's levels,
+  `/effort high` to select directly, or `--effort high` at launch. Session
+  choices persist, including selecting the current CLI level,
   unless the endpoint is a temporary CLI override. In that case the saved
   endpoint keeps its own effort setting. `/effort default` removes the setting
   in that same scope; `--effort default` clears it for the run when the file
   already sets it. Default omits the wire field,
   unlike explicit `none`. Responses sends `reasoning.effort`; Chat Completions
-  sends `reasoning_effort`. Supported levels depend on the model and endpoint;
+  sends `reasoning_effort`. Native Anthropic Messages sends
+  `output_config.effort` and offers `low`, `medium`, `high`, `xhigh`, and `max`
+  plus Default. It rejects `none` and `minimal`; the picker and shortcut leave
+  them out. Supported levels still depend on the model and endpoint;
   the server validates explicit selections. A rejection is reported without
   retrying at another level. Sampling and protocol settings are unchanged.
   The Anthropic compatibility endpoint ignores effort, so explicit selections
@@ -202,9 +206,9 @@ canonical path, and the trust grant records it in the same write: `auto`,
 unless you answer `a` (`ask`) or `r` (`readonly`) at the interactive trust
 prompt. `--trust-project` records `auto`. A project that is already trusted
 keeps its mode when trust is granted again, and a grant or mode selection that
-would leave `trust.json` as it is writes nothing. Change the mode with
-`/approvals auto|ask|readonly`, **Shift+Tab**, or the approval card's **Auto
-for project** choice; every selector saves the same choice. It survives new
+would leave `trust.json` as it is writes nothing. `/permissions` opens a picker;
+`/permissions auto|ask|readonly` selects directly. The approval card also offers
+**Auto for project**. Every selector saves the same choice. It survives new
 sessions and restarts, including headless and stdio runs, and does not change
 other projects. The `settings.json` `approval_mode` (default `ask`) applies
 only where neither the project nor an enclosing one has a saved mode, such as
@@ -251,9 +255,9 @@ through the mode command. Settings are read at process launch, so editing
 A running session reads `trust.json` again before each tool call but takes
 only a stricter mode from it, so editing that file from a tool never widens a
 running session's mode either. Select `ask` in one frontend and another
-session on the same project asks from its next tool call. If that session's
-status line still shows the older mode, its Shift+Tab first shows `ask` and
-saves nothing; the next press steps from it. Only that session's own
+session on the same project asks from its next tool call. Its status line
+shows that stricter mode when refreshed. Shift+Tab changes only
+reasoning effort and cannot widen permissions. Only that session's own
 selector, or a new launch, loosens it again.
 These controls govern dispatch and are not OS isolation.
 
@@ -297,6 +301,45 @@ it defaults to false and leaves other providers' settings unchanged.
 An explicit `responses` selects the Responses protocol. The ChatGPT setup
 command writes this field with `chatgpt_account`; other endpoints may use
 Responses with their own API key.
+
+An explicit `anthropic` selects the native Messages protocol. Set `base_url`
+to `https://api.anthropic.com/v1`; requests use `/v1/messages`, `x-api-key`
+authentication, and `anthropic-version: 2023-06-01` unless a custom version
+header is configured. Supply the key through `api_key` or `api_key_env`, or a
+single custom `x-api-key` header, without combining key sources. For example:
+
+```json
+{
+  "providers": {
+    "native": {
+      "base_url": "https://api.anthropic.com/v1",
+      "wire_api": "anthropic",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "compat": { "omit_temperature": true },
+      "models": []
+    }
+  }
+}
+```
+
+Populate `models` with the IDs and context windows available to the account,
+or use login to discover them. Native Messages translates the system prompt,
+text, tools, and tool results while retaining the existing agent loop and trust
+checks. Signed thinking blocks return only to their producing endpoint, model,
+and credentials, with unchanged prior system, tools, and messages, and matching
+assistant text and tool calls. Compaction, reloads, transient notes, or edits
+that change this context discard stale thinking while retaining the current
+text and tool calls. An interrupted,
+malformed, or failed stream cannot dispatch
+partial tool calls. Effort is sent as `output_config.effort`; default omits it.
+Native levels are `low`, `medium`, `high`, `xhigh`, and `max`, with model-specific
+support validated by the server. `none` and `minimal` are refused. Effort works
+with or without thinking, so the adapter leaves the model's thinking defaults
+unchanged. It also preserves configured sampling settings; omit temperature for
+models that reject it. See the official [Messages API](https://platform.claude.com/docs/en/api/messages/create),
+[effort](https://platform.claude.com/docs/en/build-with-claude/effort), and
+[thinking](https://platform.claude.com/docs/en/build-with-claude/thinking), and
+[preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking) contracts.
 
 The trailing note (the tool files, skills, and memories a session added,
 changed, or removed after its prompt and tools array were built) is appended
@@ -368,11 +411,11 @@ Run login again to add another. Choose the connection with `/model` afterward,
 or use the printed `openmax --provider ... --model ...` command. Login does not
 silently change the default provider or project trust.
 
-The Anthropic preset uses its documented
-[compatible API](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk),
-which supports streaming and tools but does not provide prompt caching.
-It uses API-key authentication with separate API billing. Setup asks for the
-workspace ID when needed; leave it empty for a workspace-scoped key. See
+New Anthropic preset connections use the native Messages API, including
+streaming, tools, usage accounting, and effort controls. Existing compatibility
+connections retain their wire protocol; select `wire_api: "anthropic"` explicitly
+to use native Messages. It uses API-key authentication with separate API billing.
+Setup asks for the workspace ID when needed; leave it empty for a workspace-scoped key. See
 [Anthropic authentication](https://platform.claude.com/docs/en/manage-claude/authentication).
 New API preset connections omit temperature, so the server chooses its supported
 default. Reconnecting an existing provider preserves its compatibility settings
@@ -533,7 +576,7 @@ code.
 
 ## Hardened profile
 
-Answer `a` at the trust prompt, or use `/approvals ask`, when you want
+Answer `a` at the trust prompt, or use `/permissions ask`, when you want
 confirmation. In `auto`, bash and valid extensions run with your account's
 host authority without a prompt. A permission `ask` rule does not override
 that choice. Use `deny` to prohibit a tool or command pattern, or switch to

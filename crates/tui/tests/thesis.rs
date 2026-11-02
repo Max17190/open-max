@@ -523,9 +523,9 @@ fn whole_suite_runs_in_five_seconds() {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // Reasoning effort selection adds 147 lines for configuration, requests and native controls;
-    // the agent loop and frozen prompt are unchanged. Measured at 43,707, plus MARGIN.
-    const RATCHET: usize = 43_907;
+    // Effort controls and native Messages support add 711 lines for configuration and translation;
+    // the agent loop and frozen prompt are unchanged. Measured at 44,271, plus MARGIN.
+    const RATCHET: usize = 44_471;
     const MARGIN: usize = 200;
     let gauge = |checkout: &Path, excluded: bool| -> Result<String, String> {
         let mut gauge = Command::new(repo().join("scripts/count-core-lines.sh"));

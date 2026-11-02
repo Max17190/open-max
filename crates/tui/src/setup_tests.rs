@@ -30,6 +30,19 @@ async fn server(
 
 #[tokio::test]
 async fn model_discovery_sends_selected_credentials_and_preserves_reported_limits() {
+    for (native, explicit) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (base, task) = server(200, "", json!({"data":[{"id":"fixture-model"}]}).to_string()).await;
+        let mut headers = serde_json::Map::new();
+        if explicit { headers.insert("AnThRoPiC-VeRsIoN".into(), json!("fixture-version")); }
+        discover(&base, "fixture-secret", &headers, false, native).await.unwrap();
+        let request = task.await.unwrap();
+        let versions: Vec<_> = request.lines().filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-version"))
+            .map(|(_, value)| value.trim()).collect();
+        let expected: &[&str] = if explicit { &["fixture-version"] } else if native { &["2023-06-01"] } else { &[] };
+        assert_eq!(versions, expected, "discovery must preserve an explicit version exactly once and default only native requests");
+    }
+    for native in [false, true] {
     let (base, task) = server(
         200,
         "",
@@ -37,17 +50,19 @@ async fn model_discovery_sends_selected_credentials_and_preserves_reported_limit
     )
     .await;
     let headers = json!({"anthropic-version":"2023-06-01","anthropic-workspace-id":"fixture-workspace","x-organization":"$$fixture-org"});
-    let catalog = discover(&base, "fixture-secret", headers.as_object().unwrap(), false)
+    let catalog = discover(&base, "fixture-secret", headers.as_object().unwrap(), false, native)
         .await
         .unwrap();
     assert_eq!(catalog[0]["max_input_tokens"], 65536);
     let request = task.await.unwrap().to_ascii_lowercase();
     assert!(request.starts_with("get /models http/1.1"));
-    assert!(request.contains("authorization: bearer fixture-secret\r\n"));
+    assert_eq!(request.contains("authorization: bearer fixture-secret\r\n"), !native);
+    assert_eq!(request.contains("x-api-key: fixture-secret\r\n"), native);
     assert!(request.contains("anthropic-workspace-id: fixture-workspace\r\n"));
     assert!(request.contains("anthropic-version: 2023-06-01\r\n"));
     assert!(request.contains("x-organization: $fixture-org\r\n"));
 
+    }
     let general = ["gpt-4.1", "gpt-4o", "o3", "fixture-future-chat",
         "ft:gpt-4.1:fixture:custom:id", "gpt-realtimehelper"];
     let specialized = ["text-embedding-3-small", "text-embedding-3-large", "omni-moderation-latest",
@@ -60,7 +75,7 @@ async fn model_discovery_sends_selected_credentials_and_preserves_reported_limit
     let body = json!({"data":all.iter().map(|id| json!({"id":id,"context_window":65536})).collect::<Vec<_>>()}).to_string();
     for openai in [true, false] {
         let (base, task) = server(200, "", body.clone()).await;
-        let catalog = discover(&base, "fixture-secret", &serde_json::Map::new(), openai).await.unwrap();
+        let catalog = discover(&base, "fixture-secret", &serde_json::Map::new(), openai, false).await.unwrap();
         let ids: Vec<_> = catalog.iter().map(|model| model["id"].as_str().unwrap()).collect();
         assert_eq!(ids, if openai { general.as_slice() } else { &all });
         assert!(catalog.iter().all(|model| model["context_window"] == 65536));
@@ -82,7 +97,7 @@ async fn model_discovery_refuses_redirects_and_does_not_echo_error_bodies() {
             "fixture-secret must never be shown".into(),
         )
         .await;
-        let error = discover(&base, "fixture-secret", &serde_json::Map::new(), false)
+        let error = discover(&base, "fixture-secret", &serde_json::Map::new(), false, false)
             .await
             .unwrap_err();
         assert!(error.contains(&format!("HTTP {status}")));
@@ -105,7 +120,7 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
         ("x".repeat(1_048_577), "exceeds its size limit"),
     ] {
         let (base, task) = server(200, "", body).await;
-        let error = discover(&base, "fixture-secret", &serde_json::Map::new(), false)
+        let error = discover(&base, "fixture-secret", &serde_json::Map::new(), false, false)
             .await
             .unwrap_err();
         assert!(error.contains(expected), "{error}");
@@ -117,7 +132,7 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
         let mut body = json!({"data":[{"id":"fixture-model"}]}).to_string();
         body.extend(std::iter::repeat_n(' ', length - body.len()));
         let (base, task) = server(200, "", body).await;
-        let result = discover(&base, "fixture-secret", &serde_json::Map::new(), false).await;
+        let result = discover(&base, "fixture-secret", &serde_json::Map::new(), false, false).await;
         if length <= 1_048_576 {
             assert_eq!(result.unwrap()[0]["id"], "fixture-model");
         } else {
@@ -130,12 +145,12 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
     let body = json!({"data":[{"id":""},{"id":"m".repeat(257)},
         {"id":"fixture\nmodel"},{"id":42},{"id":longest},{"id":"fixture-model"}]}).to_string();
     let (base, task) = server(200, "", body).await;
-    let catalog = discover(&base, "fixture-secret", &serde_json::Map::new(), false).await.unwrap();
+    let catalog = discover(&base, "fixture-secret", &serde_json::Map::new(), false, false).await.unwrap();
     assert_eq!(catalog, vec![json!({"id":longest}), json!({"id":"fixture-model"})]);
     task.await.unwrap();
     for status in [404, 405] {
         let (base, task) = server(status, "", String::new()).await;
-        assert!(discover(&base, "fixture-secret", &serde_json::Map::new(), false)
+        assert!(discover(&base, "fixture-secret", &serde_json::Map::new(), false, false)
             .await
             .unwrap()
             .is_empty());
@@ -150,14 +165,14 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
     ] {
         let mut headers = serde_json::Map::new();
         headers.insert(header.into(), json!("fixture-old-secret"));
-        let error = discover("http://127.0.0.1:9", "fixture-secret", &headers, false)
+        let error = discover("http://127.0.0.1:9", "fixture-secret", &headers, false, false)
             .await
             .unwrap_err();
         assert!(error.contains("additional credentials"));
         assert!(!error.contains("fixture-old-secret"));
     }
     let headers = json!({"x-organization":42});
-    assert!(discover("http://127.0.0.1:9", "fixture-secret", headers.as_object().unwrap(), false)
+    assert!(discover("http://127.0.0.1:9", "fixture-secret", headers.as_object().unwrap(), false, false)
         .await.unwrap_err().contains("headers must contain strings"));
     for base in [
         "http://example.com/v1",
@@ -195,7 +210,7 @@ fn reconnecting_preserves_provider_compatibility_and_wire_protocol() {
         }
         let mut new_entry = json!({});
         api_defaults(&mut new_entry, name, true).unwrap();
-        assert_eq!(new_entry["wire_api"], if name == "openai" { "responses" } else { "chat_completions" });
+        assert_eq!(new_entry["wire_api"], match name { "openai" => "responses", "anthropic" => "anthropic", _ => "chat_completions" });
         assert_eq!(new_entry["compat"]["omit_temperature"], if name == "fixture" { Value::Null } else { json!(true) });
     }
 }
