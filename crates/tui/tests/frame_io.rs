@@ -696,7 +696,7 @@ mod first_frame {
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("GET /v1/models "));
             assert!(request.to_ascii_lowercase().contains(&format!("authorization: bearer {expected_key}\r\n")));
-            let body = r#"{"data":[{"id":"fixture-model","context_window":16384},{"id":"other-model","context_window":16384},{"id":"text-embedding-fixture","context_window":16384}]}"#;
+            let body = r#"{"data":[{"id":"fixture-model","context_window":32768},{"id":"other-model","context_window":65536},{"id":"text-embedding-fixture","context_window":8192}]}"#;
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
         let mut s = Session::spawn_home("provider-setup", 80, 24, |dir, cmd, terminal, _| {
@@ -746,6 +746,10 @@ mod first_frame {
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings, "login selected a default before the user picked it");
         let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
         assert_eq!(catalog["providers"]["fixture"]["api_key"], format!("${key}"));
+        let selected = catalog["providers"]["fixture"]["models"].as_array().unwrap().iter()
+            .find(|model| model["id"] == "fixture-model").unwrap();
+        assert_eq!(selected["context_tokens"], 32768,
+            "the selected model keeps its own context window");
         close_picker(&mut s);
         let start = s.out.len();
         s.write(b"/logout fixture\r");
