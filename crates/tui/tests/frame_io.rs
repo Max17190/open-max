@@ -277,6 +277,16 @@ mod first_frame {
             }
         }
 
+        /// A title can arrive in an earlier read than the editable prompt.
+        /// Match its footer after that title, never one from an older redraw.
+        fn wait_for_prompt(&mut self, title: &[u8], from: usize, within: Duration) -> Option<usize> {
+            let deadline = Instant::now() + within;
+            let at = self.wait_for(title, from, within)?;
+            let left = deadline.checked_duration_since(Instant::now())?;
+            self.wait_for(b"Enter confirms; Esc cancels\r\n", at + title.len(), left)?;
+            Some(at)
+        }
+
         /// Keep reading for `wait`, so answers go out on schedule while the
         /// child keeps writing.
         fn pump_for(&mut self, wait: Duration) {
@@ -656,11 +666,20 @@ mod first_frame {
         fn begin(s: &mut Session, command: &str, prompt: &[u8]) -> usize {
             let start = s.out.len();
             s.write(format!("{command}\r").as_bytes());
-            s.wait_for(prompt, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup prompt missing for {command}: {}", s.context()))
+            let found = if prompt == LEAVE_ALT_SCREEN {
+                s.wait_for(prompt, start, Duration::from_secs(5))
+            } else {
+                s.wait_for_prompt(prompt, start, Duration::from_secs(5))
+            };
+            found.unwrap_or_else(|| panic!("setup prompt missing for {command}: {}", s.context()))
+        }
+        fn answer_probe(s: &mut Session, query: usize) {
+            s.write(ANSWER);
+            s.wait_for(KEYBOARD_PUSH, query, Duration::from_secs(5)).unwrap_or_else(|| panic!("chat keyboard probe did not finish: {}", s.context()));
         }
         fn resume(s: &mut Session, start: usize) {
-            s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not return to chat: {}", s.context()));
-            s.write(ANSWER);
+            let query = s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not return to chat: {}", s.context()));
+            answer_probe(s, query);
         }
         fn close_picker(s: &mut Session) {
             let start = s.out.len();
@@ -716,18 +735,18 @@ mod first_frame {
             cmd.arg("--trust-project").env("OPENAI_API_KEY", "fixture-env-key")
                 .env("ANTHROPIC_API_KEY", "fixture-env-key").stderr(terminal.try_clone().unwrap());
         });
-        s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
-        s.write(ANSWER);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
+        answer_probe(&mut s, probe);
         let dir = s.dir.join("home/.openmax");
         let original_settings = std::fs::read(dir.join("settings.json")).unwrap();
         let start = s.out.len();
         s.write(b"/login fixture\r");
         let restored = s.wait_for(LEAVE_ALT_SCREEN, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not restore terminal: {}", s.context()));
-        s.wait_for(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
+        s.wait_for_prompt(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
         // Ordinary c/d are text, not cancellation. Other modified or invalid input is inert.
         s.write(b"cd\x7f\x7f\x1b[120;1:3u\x01\x1bqX");
         s.write_bounded(format!("\x1b[200~{key}\x1b[201~\x7f\x1b[200~bad\npaste\x1b[201~\x1b[200~{key}\x1b[201~z\r").as_bytes());
-        let model = s.wait_for(b"Choose a model", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("catalog was not loaded: {}", s.context()));
+        let model = s.wait_for_prompt(b"Choose a model", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("catalog was not loaded: {}", s.context()));
         s.write(b"x");
         let filtered = s.wait_for(b"> x\r\n", model, Duration::from_secs(5)).expect("filter text was not shown");
         s.wait_for(b"Enter confirms; Esc cancels", filtered, Duration::from_secs(5)).expect("filter redraw did not finish");
@@ -740,7 +759,7 @@ mod first_frame {
         s.write(b"\x1b[B\x1b[A\r");
         let probe = s.wait_for(KEYBOARD_QUERY, model, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not resume the TUI: {}", s.context()));
         assert!(s.out[..probe].windows(b"$fixture-hidden-key".len()).all(|window| window != b"$fixture-hidden-key"), "secret appeared on terminal");
-        s.write(ANSWER);
+        answer_probe(&mut s, probe);
         let shown = screen_when(&mut s, 80, 24, Duration::from_secs(5), |shown| shown.contains("fixture-model"));
         assert!(shown.contains("fixture-model"), "model picker did not refresh: {shown}");
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings, "login selected a default before the user picked it");
@@ -753,10 +772,10 @@ mod first_frame {
         close_picker(&mut s);
         let start = s.out.len();
         s.write(b"/logout fixture\r");
-        let question = s.wait_for(b"Disconnect fixture?", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not get keyboard input: {}", s.context()));
+        let question = s.wait_for_prompt(b"Disconnect fixture?", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not get keyboard input: {}", s.context()));
         s.write(b"\x1b[B\r");
-        s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not resume TUI: {}", s.context()));
-        s.write(ANSWER);
+        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not resume TUI: {}", s.context()));
+        answer_probe(&mut s, probe);
         let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
         assert!(catalog["providers"].get("fixture").is_none());
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings);
@@ -767,7 +786,7 @@ mod first_frame {
             let output = String::from_utf8_lossy(&s.out[start..probe]);
             assert!(output.contains("account 'work' signed out"), "{output}");
             assert!(!output.contains("account 'main' signed out"), "{output}");
-            s.write(ANSWER);
+            answer_probe(&mut s, probe);
         }
         let credentials: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("chatgpt.json")).unwrap()).unwrap();
         assert_eq!(credentials["accounts"]["main"]["subject"], "main-subject");
@@ -779,18 +798,18 @@ mod first_frame {
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         let start = s.out.len();
         s.write(b"/login custom\r");
-        let question = s.wait_for(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
+        let question = s.wait_for_prompt(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
         s.write(b"openai\r");
         let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
         assert!(!String::from_utf8_lossy(&s.out[question..probe]).contains("API key (hidden)"));
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
-        s.write(ANSWER);
+        answer_probe(&mut s, probe);
         for (name, valid) in [(String::new(), false), ("x".repeat(64), true), ("x".repeat(65), false),
             ("x".repeat(66), false), ("dash-name".into(), true), ("under_score".into(), true), ("bad name".into(), false)] {
             let question = begin(&mut s, "/login custom", b"Connection name");
             s.write(format!("\x1b[200~{name}\x1b[201~\r").as_bytes());
             if valid {
-                s.wait_for(b"API base URL", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("valid connection name was refused: {}", s.context()));
+                s.wait_for_prompt(b"API base URL", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("valid connection name was refused: {}", s.context()));
                 s.write(b"\x1b");
             }
             resume(&mut s, question);
@@ -818,7 +837,7 @@ mod first_frame {
             std::fs::write(dir.join("providers.json"), entries.to_string()).unwrap();
             let question = begin(&mut s, "/login openai", LEAVE_ALT_SCREEN);
             if accepted {
-                s.wait_for(b"Enter copies OPENAI_API_KEY", question, Duration::from_secs(5)).expect("matching preset endpoint refused");
+                s.wait_for_prompt(b"Enter copies OPENAI_API_KEY", question, Duration::from_secs(5)).expect("matching preset endpoint refused");
                 s.write(b"\x1b");
             }
             resume(&mut s, question);
@@ -866,14 +885,14 @@ mod first_frame {
             let question = begin(&mut s, "/login manual", b"API key (hidden)");
             s.write(b"fixture-manual-key\r");
             if model == "reported-zero" {
-                s.wait_for(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
+                s.wait_for_prompt(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
                 s.write(b"\r");
             } else {
-                s.wait_for(b"Model ID", question, Duration::from_secs(5)).expect("manual model prompt missing");
+                s.wait_for_prompt(b"Model ID", question, Duration::from_secs(5)).expect("manual model prompt missing");
                 s.write(format!("\x1b[200~{model}\x1b[201~\r").as_bytes());
             }
             if let Some(window) = window {
-                s.wait_for(b"Context window in tokens", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("context window prompt missing: {}", s.context()));
+                s.wait_for_prompt(b"Context window in tokens", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("context window prompt missing: {}", s.context()));
                 s.write(format!("{window}\r").as_bytes());
             }
             let error_from = s.out.len();
@@ -892,18 +911,18 @@ mod first_frame {
         manual_server.join().unwrap();
         let start = s.out.len();
         s.write(b"/login\r");
-        let question = s.wait_for(b"Connect a provider", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("second login did not get input: {}", s.context()));
+        let question = s.wait_for_prompt(b"Connect a provider", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("second login did not get input: {}", s.context()));
         s.wait_for(b"manual (configured)", question, Duration::from_secs(5)).expect("configured provider was not appended");
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("OpenAI API"));
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("Anthropic API"));
         s.write(b"manual\r");
-        let key_prompt = s.wait_for(b"API key (hidden)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
+        let key_prompt = s.wait_for_prompt(b"API key (hidden)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
         s.write(b"\x04");
         resume(&mut s, key_prompt);
         let question = begin(&mut s, "/login", b"Connect a provider");
         s.write(b"\x03");
-        s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
-        s.write(ANSWER);
+        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
+        answer_probe(&mut s, probe);
         s.write(CTRL_C_TWICE);
         let status = s.wait_exit(Duration::from_secs(5));
         assert!(status.is_some_and(|status| status.success()), "{status:?}: {}", s.context());
