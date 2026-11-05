@@ -87,7 +87,7 @@ pub struct SessionData {
     /// so after a switch the plain estimate applies until the new route
     /// reports. In memory only: a resumed session runs on the plain estimate
     /// until its first response or refusal for length. See
-    /// `agent::token_factor`.
+    /// `compaction::token_factor`.
     pub prompt_ratio: Option<(String, f64)>,
 }
 
