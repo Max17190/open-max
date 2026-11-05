@@ -20,3 +20,17 @@ crates/core/src/client/responses.rs: replace + with - in read # hangs: consumed 
 crates/core/src/chatgpt.rs: replace | with ^ in load # equivalent: O_NOFOLLOW and O_NONBLOCK have disjoint bits on Linux and macOS, so OR and XOR pass identical open flags.
 crates/core/src/providers/setup.rs: replace | with ^ in open # equivalent: O_NOFOLLOW and O_NONBLOCK have disjoint bits on Linux and macOS, so OR and XOR pass identical open flags.
 crates/tui/src/setup.rs: replace | with ^ in Prompts::input # equivalent: CONTROL and ALT are disjoint modifier bits (0b10 and 0b100), so OR and XOR produce the same 0b110 mask.
+crates/core/src/tools.rs: replace <impl std::io::Read for Cancellable<'_>>::read -> std::io::Result<usize> with Ok(1) # hangs: a read that answers one byte every time never reaches the end of the file, so a streamed read_file window reads on forever.
+crates/core/src/tools.rs: replace next_line -> std::io::Result<Option<usize>> with Ok(Some(1)) # hangs: a line reader that never answers None never ends a streamed read_file window.
+crates/core/src/tools.rs: replace next_line -> std::io::Result<Option<usize>> with Ok(Some(0)) # hangs: a line reader that never answers None never ends a streamed read_file window.
+crates/core/src/tools.rs: replace > with == in next_line # hangs: at the end of a file whose last line ends in a newline the reader answers Some(0), an empty line, on every call after.
+crates/core/src/tools.rs: replace > with >= in next_line # hangs: at the end of every file the reader answers Some(0), an empty line, on every call after.
+crates/core/src/tools.rs: replace + with - in next_line # hangs: consuming i - 1 bytes leaves the newline unread, so every later call returns the byte before it as a line.
+crates/core/src/tools.rs: replace + with * in next_line # hangs: consuming i * 1 bytes leaves the newline unread, so every later call returns an empty line.
+crates/core/src/tools.rs: replace -= with += in floor_char # hangs: stepping forward from a cut past the end of a shorter kept prefix never meets a character boundary.
+crates/core/src/tools.rs: replace -= with /= in floor_char # hangs: idx /= 1 never moves off a byte inside a character.
+crates/core/src/tools.rs: replace == with != in normalize_pattern # hangs: a pattern with nothing left to trim is trimmed again forever.
+crates/core/src/tools.rs: replace + with - in grep_tool # hangs: a match on a file's first line overflows i - 1 and panics one walker thread, and the parallel walk's other threads wait for it forever.
+crates/core/src/tools.rs: replace - with + in kept_tail # hangs: a start of len + max_bytes lies past the end of the text, where no index is a character boundary.
+crates/core/src/tools.rs: replace += with *= in kept_tail # hangs: start *= 1 never moves off a byte inside a character.
+crates/core/src/tools.rs: replace -= with /= in kept_head # hangs: end /= 1 never moves off a byte inside a character.
