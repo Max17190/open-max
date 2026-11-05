@@ -991,7 +991,8 @@ fn the_workspace_has_two_thousand_tests() {
 }
 
 /// The mutation score, caught / (caught + missed) over every mutant of the
-/// workspace, reaches 95%. No test can mutate the code it runs in, so CI does:
+/// workspace, reaches 95%, and 90% over the mutants of each file, whose score
+/// the run's report lists. No test can mutate the code it runs in, so CI does:
 /// the Mutants workflow runs cargo-mutants weekly and by hand over the whole
 /// workspace, with one pinned compiler and at most four concurrent shards.
 /// Runs queue per branch. Each shard first tests the unmutated workspace in
@@ -1006,20 +1007,26 @@ fn the_workspace_has_two_thousand_tests() {
 /// cfg(true): it merges shards; leaves out the unviable mutants and the ones
 /// the run's target does not compile (read from each shard's cfg.txt), there
 /// and on macOS, keeping code that either build of a crate, with or without
-/// cfg(test), compiles; counts a listed timeout as caught, an unlisted one
-/// and a listed miss as missed; passes a score exactly at the floor and fails
-/// one a mutant under it; offers to raise the floor to a score less the
-/// margin, and only when that is above the floor; in diff mode fails on
-/// exactly the unlisted misses and timeouts, marking each on its line with
-/// its message escaped as a workflow command needs; and refuses a shard that
-/// did not finish, one whose unmutated tests failed, shards that overlap,
-/// built different targets or hold fewer mutants than the plan listed, and an
-/// allowlist entry with no reason.
+/// cfg(test), compiles; counts a listed timeout, and a listed mutant whose
+/// build or tests a signal ended, as caught, an unlisted one and a listed
+/// miss as missed, and names each mutant a signal ended with its phase and
+/// signal; passes a score exactly at the floor and fails one a mutant under
+/// it; says how many of the missed would meet the target; gives each file's
+/// score, worst first and ties by name, with the catches it needs for 90%;
+/// offers to raise the floor to a score less the margin, and only when that
+/// is above the floor; in diff mode fails on exactly the unlisted misses,
+/// timeouts and signals, marking each on its line with its message escaped
+/// as a workflow command needs; and refuses a shard that did not finish, one
+/// whose unmutated tests failed, shards that overlap, built different targets
+/// or hold fewer mutants than the plan listed, a mutant that was only checked,
+/// a Failure no signal ended, an outcome cargo-mutants does not write even in
+/// code the run did not build, and an allowlist entry with no reason.
 #[test]
 fn mutation_score_is_at_least_ninety_five_percent() {
     let gate = std::fs::read_to_string(repo().join("scripts/check-mutants.sh")).unwrap();
     let (floor, margin, target) = (assigned(&gate, "floor"), assigned(&gate, "margin"), assigned(&gate, "target"));
-    assert_eq!(target, "95", "the target is 95%");
+    let file_target = assigned(&gate, "file_target");
+    assert_eq!((target.as_str(), file_target.as_str()), ("95", "90"), "the target is 95%, and 90% in each file");
     // A percentage with two decimals, in hundredths of a point.
     let hundredths = |value: &str| {
         let (whole, part) = value.split_once('.').unwrap_or_else(|| panic!("{value} has no decimals"));
@@ -1031,7 +1038,7 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     let (floor_bp, margin_bp) = (hundredths(&floor), hundredths(&margin));
     let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
     let measured = format!("{}, less a margin of {margin} points", percent(floor_bp + margin_bp));
-    for claim in [format!("is under {floor}%"), measured, format!("The target is {target}%")] {
+    for claim in [format!("is under {floor}%"), measured, format!("The target is {target}%, and {file_target}% in each file")] {
         assert!(readme.contains(&claim), "the README does not say \"{claim}\", which scripts/check-mutants.sh gates");
     }
     let config: toml::Table = std::fs::read_to_string(repo().join(".cargo/mutants.toml")).unwrap().parse().unwrap();
@@ -1041,6 +1048,49 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     assert!(testing.contains(&timeout), "docs/testing.md does not give the timeout .cargo/mutants.toml sets: {timeout}");
     let margined = format!("less a margin of {margin} points");
     assert!(testing.contains(&margined), "docs/testing.md does not give the margin scripts/check-mutants.sh sets: {margined}");
+    // The run that set the floor, as docs/testing.md records it: its caught
+    // over its scored is its score; less the catches that cannot be told from
+    // chance, which the floor's basis leaves out, it is the basis, which less
+    // the margin is the floor, while the score less the margin is what the
+    // run's report offered; the README gives its count, its score and its
+    // basis; and the documents say how many of the basis's catches a run of
+    // unchanged code can lose before it fails.
+    let (tested, caught_then, scored_then, score_then) = testing
+        .split_once("The floor was set by the full run on ")
+        .and_then(|(_, run)| run.split_once(", which tested "))
+        .and_then(|(_, run)| run.split_once('%'))
+        .and_then(|(run, _)| run.split_once(" mutants and caught "))
+        .and_then(|(tested, run)| run.split_once(" of the ").map(|(caught, run)| (tested, caught, run)))
+        .and_then(|(tested, caught, run)| run.split_once(" it scored: ").map(|(scored, score)| (tested, caught, scored, score)))
+        .expect("docs/testing.md does not record the run that set the floor as \"..., which tested N mutants and caught N of the N it scored: S%\"");
+    let (left_out, kept, kept_of, basis) = testing
+        .split_once("The floor's basis leaves out ")
+        .and_then(|(_, basis)| basis.split_once(" of those catches"))
+        .and_then(|(left_out, basis)| basis.split_once(": ").map(|(_, basis)| (left_out, basis)))
+        .and_then(|(left_out, basis)| basis.split_once(" caught of the ").map(|(kept, basis)| (left_out, kept, basis)))
+        .and_then(|(left_out, kept, basis)| basis.split_once(", ").map(|(of, basis)| (left_out, kept, of, basis)))
+        .and_then(|(left_out, kept, of, basis)| basis.split_once('%').map(|(basis, _)| (left_out, kept, of, basis)))
+        .expect("docs/testing.md does not record the floor's basis as \"The floor's basis leaves out N of those catches, ...: N caught of the N, S%\"");
+    let record = format!("{tested} mutants, {caught_then} caught of {scored_then}, {score_then}%; {left_out} left out, {kept} of {kept_of}, {basis}%");
+    let count = |text: &str| text.replace(',', "").parse::<u64>().unwrap_or_else(|_| panic!("{text:?} is not a count: {record}"));
+    let (tested, caught_then, scored_then) = (count(tested), count(caught_then), count(scored_then));
+    let (left_out, kept, kept_of) = (count(left_out), count(kept), count(kept_of));
+    assert_eq!(format!("{score_then}%"), percent(caught_then * 10_000 / scored_then), "the score docs/testing.md gives is not its counts': {record}");
+    assert_eq!((kept + left_out, kept_of), (caught_then, scored_then), "the floor's basis is not the run's catches less those it leaves out: {record}");
+    assert_eq!(format!("{basis}%"), percent(kept * 10_000 / kept_of), "the basis docs/testing.md gives is not its counts': {record}");
+    assert_eq!(kept * 10_000 / kept_of, floor_bp + margin_bp, "the floor is not the recorded basis less the margin: {record}");
+    let offered = percent(caught_then * 10_000 / scored_then - margin_bp);
+    for claim in [format!("so the floor is {floor}%"), format!("not the {offered} the run's report offered")] {
+        assert!(testing.contains(&claim), "docs/testing.md does not say \"{claim}\": {record}");
+    }
+    let without = format!("That run scored {score_then}%, or {basis}% without the {} catches", thousands(left_out));
+    for claim in [format!("{} in the run that set the floor", thousands(tested)), without] {
+        assert!(readme.contains(&claim), "the README does not say \"{claim}\", as docs/testing.md records");
+    }
+    let header: Vec<&str> = gate.lines().take_while(|line| line.starts_with('#')).map(|line| line.trim_start_matches('#').trim()).collect();
+    let lost = kept + 1 - (floor_bp * kept_of).div_ceil(10_000);
+    let fails = format!("fails only when more than {} turn from caught to missed", lost - 1);
+    assert!(testing.contains(&fails) && header.join(" ").contains(&fails), "the documents do not say a run of unchanged code {fails}");
     assert_eq!(config["test_workspace"].as_bool(), Some(true), "a mutant is not tested by every package that can observe it");
     // Every listed mutant gives its reason, and is in a file that exists.
     let allowed = std::fs::read_to_string(repo().join(".cargo/mutants-allowed.txt")).unwrap();
@@ -1169,6 +1219,7 @@ fn mutation_score_is_at_least_ninety_five_percent() {
             format!(
                 "# Mutants allowed to survive.\n\
                  src/lib.rs: replace > with == in kept # hangs: the loop it ends never ends\n\
+                 src/lib.rs: replace > with != in kept # allocates without bound: the memory cap ends the test run\n\
                  src/lib.rs: replace + with - in split # the sum is only logged\n{extra}"
             ),
         )
@@ -1177,18 +1228,40 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     allowlist("");
     let linux = "debug_assertions\ntarget_family=\"unix\"\ntarget_os=\"linux\"\nunix\n";
     let macos = "debug_assertions\ntarget_family=\"unix\"\ntarget_os=\"macos\"\nunix\n";
+    // The summary cargo-mutants 27.1.0 writes for a mutant whose phases ended
+    // as `how` says, and those phases, for the kinds whose summary alone does
+    // not say how they ended: a signal that ends cargo, building or testing,
+    // makes a Failure, and so would a phase that ended with no exit status;
+    // a run with --check only checks each mutant, a Success.
+    fn phases(how: &str) -> (&str, serde_json::Value) {
+        let phase = |phase: &str, status: serde_json::Value| serde_json::json!({"phase": phase, "process_status": status});
+        let built = phase("Build", "Success".into());
+        match how {
+            "test signalled" => ("Failure", serde_json::json!([built, phase("Test", serde_json::json!({"Signalled": 9}))])),
+            "build signalled" => ("Failure", serde_json::json!([phase("Build", serde_json::json!({"Signalled": 9}))])),
+            "no status" => ("Failure", serde_json::json!([built, phase("Test", "Other".into())])),
+            "checked" => ("Success", serde_json::json!([phase("Check", "Success".into())])),
+            _ => (how, serde_json::Value::Null),
+        }
+    }
     // One shard's output directory, as cargo-mutants writes it, each mutant
-    // `(name, the line its function starts on, outcome)`.
+    // `(name, the line its function starts on or 0 for none, outcome)`.
     let shard = |name: &str, cfg: &str, mutants: &[(String, usize, &str)], finished: bool, baseline: &str| {
         let dir = tree.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let outcomes: Vec<serde_json::Value> = std::iter::once(serde_json::json!({"scenario": "Baseline", "summary": baseline}))
-            .chain(mutants.iter().map(|(mutant, function, summary)| {
-                let file = mutant.split(':').next().unwrap();
-                serde_json::json!({
-                    "scenario": {"Mutant": {"name": mutant, "file": file, "function": {"span": {"start": {"line": function}}}}},
-                    "summary": summary,
-                })
+            .chain(mutants.iter().map(|(mutant, function, how)| {
+                let mut found = serde_json::json!({"name": mutant});
+                if *function > 0 {
+                    found["file"] = mutant.split(':').next().unwrap().into();
+                    found["function"] = serde_json::json!({"span": {"start": {"line": function}}});
+                }
+                let (summary, ran) = phases(how);
+                let mut outcome = serde_json::json!({"scenario": {"Mutant": found}, "summary": summary});
+                if !ran.is_null() {
+                    outcome["phase_results"] = ran;
+                }
+                outcome
             }))
             .collect();
         let end = if finished { serde_json::json!("2026-10-21T00:00:00Z") } else { serde_json::Value::Null };
@@ -1198,10 +1271,11 @@ fn mutation_score_is_at_least_ninety_five_percent() {
         dir
     };
     let m = |name: &str, function: usize, summary: &'static str| (name.to_string(), function, summary);
-    // Caught: 5, one of them under cfg(true), and a listed timeout. Missed:
-    // two unlisted, one of them under cfg(not(test)), a listed one and an
-    // unlisted timeout. Unviable: 1. Not built on Linux: `apple`'s, the
-    // non-Unix statement's and the non-Unix `if`'s.
+    // Caught: 5, one of them under cfg(true), a listed timeout and a listed
+    // mutant whose tests a signal ended. Missed: two unlisted, one of them
+    // under cfg(not(test)), a listed one, an unlisted timeout and an unlisted
+    // mutant whose build a signal ended. Unviable: 1. Not built on Linux:
+    // `apple`'s, the non-Unix statement's and the non-Unix `if`'s.
     let first = [
         m("src/lib.rs:2:7: replace > with >= in kept", 1, "MissedMutant"),
         m("src/lib.rs:2:6: replace > with == in kept", 1, "Timeout"),
@@ -1219,6 +1293,8 @@ fn mutation_score_is_at_least_ninety_five_percent() {
         m("src/lib.rs:27:18: replace + with - in branch", 22, "MissedMutant"),
         m("src/lib.rs:34:15: replace % with / in quiet", 32, "MissedMutant"),
         m("src/lib.rs:40:15: replace + with - in always", 38, "CaughtMutant"),
+        m("src/lib.rs:2:7: replace > with != in kept", 1, "test signalled"),
+        m("src/lib.rs:18:11: replace + with / in split", 11, "build signalled"),
     ];
     let (one, two) = (shard("one", linux, &first, true, "Success"), shard("two", linux, &second, true, "Success"));
     let on_macos = shard("on-macos", macos, &first, true, "Success");
@@ -1226,23 +1302,44 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     let unfinished = shard("unfinished", linux, &first, false, "Success");
     let unbaselined = shard("unbaselined", linux, &first, true, "Failure");
     let other_target = shard("other-target", macos, &second, true, "Success");
-    // Scores of exactly the floor, a mutant under it, exactly the floor plus
-    // the margin, and 100%, each over the fewest mutants that score it
-    // exactly: hundredths of a point over 10,000, in lowest terms.
+    let checked = shard("checked", linux, &[m("src/lib.rs:2:7: replace > with >= in kept", 1, "checked")], true, "Success");
+    let no_status = shard("no-status", linux, &[m("src/lib.rs:2:7: replace > with >= in kept", 1, "no status")], true, "Success");
+    // An outcome cargo-mutants 27.1.0 does not write is refused even in code
+    // the run did not build, `apple`'s.
+    let unknown = shard("unknown", linux, &[m("src/lib.rs:8:7: replace > with >= in apple", 5, "Bogus")], true, "Success");
+    // Four files: two tied at a third, which come in name order, one under
+    // 90% by less than a mutant, and one at 90%. Their mutants have no
+    // function, so their files need not exist.
+    let per_file: Vec<_> = [("b.rs", 1, 2), ("a.rs", 9, 1), ("d.rs", 2, 4), ("c.rs", 8, 1)]
+        .iter()
+        .flat_map(|&(file, caught, missed)| {
+            (0..caught + missed).map(move |i| (format!("{file}:1:{}: replace > with < in f", i + 1), 0, if i < caught { "CaughtMutant" } else { "MissedMutant" }))
+        })
+        .collect();
+    let files = shard("files", linux, &per_file, true, "Success");
+    // Scores of exactly the floor and a mutant under it, each over the fewest
+    // mutants that score it exactly (hundredths of a point over 10,000, in
+    // lowest terms), of exactly the floor plus the margin as the report
+    // truncates it, over the fewest mutants that score that, and of 100%.
     fn gcd(a: u64, b: u64) -> u64 {
         if b == 0 { a } else { gcd(b, a % b) }
     }
     let exactly = |bp: u64| (bp / gcd(bp, 10_000), 10_000 / gcd(bp, 10_000));
+    let truncated = |bp: u64| {
+        let scored = (1..).find(|&scored| (bp * scored).div_ceil(10_000) * 10_000 < (bp + 1) * scored).unwrap();
+        ((bp * scored).div_ceil(10_000), scored)
+    };
+    // Each mutant with no function and its outcome alone, to keep a fixture
+    // of 10,000 quick to read.
     let boundary = |name: &str, (caught, scored): (u64, u64)| {
-        let mutants: Vec<_> = (0..scored)
-            .map(|i| m(&format!("src/lib.rs:2:{}: replace > with < in kept", 100 + i), 1, if i < caught { "CaughtMutant" } else { "MissedMutant" }))
-            .collect();
+        let mutants: Vec<_> =
+            (0..scored).map(|i| m(&format!("src/lib.rs:2:{}: m", 100 + i), 0, if i < caught { "CaughtMutant" } else { "MissedMutant" })).collect();
         shard(name, linux, &mutants, true, "Success")
     };
     let at_floor = exactly(floor_bp);
     let passing = boundary("passing", at_floor);
     let failing = (at_floor.0 > 0).then(|| boundary("failing", (at_floor.0 - 1, at_floor.1)));
-    let margin_over = (floor_bp + margin_bp <= 10_000).then(|| boundary("margin-over", exactly(floor_bp + margin_bp)));
+    let margin_over = (floor_bp + margin_bp <= 10_000).then(|| boundary("margin-over", truncated(floor_bp + margin_bp)));
     let perfect = boundary("perfect", (1, 1));
     let missed = tree.join("missed.txt");
     let summary = tree.join("summary.md");
@@ -1253,7 +1350,7 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     };
     let (score, score_report) = {
         let mut gate = script("scripts/check-mutants.sh");
-        gate.current_dir(&tree).env("GITHUB_STEP_SUMMARY", &summary).args(["--mutants", "14", "--missed"]).arg(&missed).args([&one, &two]);
+        gate.current_dir(&tree).env("GITHUB_STEP_SUMMARY", &summary).args(["--mutants", "16", "--missed"]).arg(&missed).args([&one, &two]);
         ran(&mut gate)
     };
     let (change, change_report) = {
@@ -1266,12 +1363,16 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     let under = failing.as_ref().map(|failing| judge_run(&[], &[failing]));
     let over = margin_over.as_ref().map(|margin_over| judge_run(&[], &[margin_over]));
     let (full, full_report) = judge_run(&[], &[&perfect]);
+    let (_, files_report) = judge_run(&[], &[&files]);
     let refusals: Vec<(&str, (Option<i32>, String))> = vec![
         ("did not finish", judge_run(&[], &[&unfinished])),
         ("the unmutated tests did not pass", judge_run(&[], &[&unbaselined])),
         ("the shards overlap", judge_run(&[], &[&one, &again])),
         ("the shards built different targets", judge_run(&[], &[&one, &other_target])),
-        ("a shard is missing", judge_run(&["--mutants", "15"], &[&one, &two])),
+        ("a shard is missing", judge_run(&["--mutants", "17"], &[&one, &two])),
+        ("it was only checked, never built or tested (a run with --check)", judge_run(&[], &[&checked])),
+        ("an outcome this script does not know: Failure, its test phase ending \"Other\"", judge_run(&[], &[&no_status])),
+        ("an outcome this script does not know: Bogus", judge_run(&[], &[&unknown])),
     ];
     let missed_list = std::fs::read_to_string(&missed).unwrap_or_default();
     let summary_text = std::fs::read_to_string(&summary).unwrap_or_default();
@@ -1279,40 +1380,90 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     let (unreasoned, unreasoned_report) = judge_run(&["--diff"], &[&one]);
     let _ = std::fs::remove_dir_all(&tree);
 
-    let expect_failed = 6 * 10_000 < floor_bp * 10;
-    assert_eq!(score, Some(i32::from(expect_failed)), "a score of 60.00% against the floor of {floor}%: {score_report}");
+    let expect_failed = 7 * 10_000 < floor_bp * 12;
+    assert_eq!(score, Some(i32::from(expect_failed)), "a score of 58.33% against the floor of {floor}%: {score_report}");
+    // How many of the missed must be caught for caught / scored to reach a
+    // percentage in hundredths of a point; and the report's table of files,
+    // each score truncated to hundredths as the score is.
+    let to_reach = |bp: u64, caught: u64, scored: u64| (bp * scored).saturating_sub(caught * 10_000).div_ceil(10_000);
+    let file_bp = file_target.parse::<u64>().unwrap() * 100;
+    let table = |under: usize, rows: &[(u64, u64, &str)]| {
+        let mut table = format!("per file, worst first ({under} of {} under {file_target}%):\n", rows.len());
+        table += &format!("{:>7} {:>7} {:>7} {:>7}  file\n", "score", "caught", "missed", format!("to {file_target}%"));
+        for &(caught, missed, file) in rows {
+            let (score, needed) = (percent(caught * 10_000 / (caught + missed)), to_reach(file_bp, caught, caught + missed));
+            table += &format!("{score:>7} {caught:>7} {missed:>7} {needed:>7}  {file}\n");
+        }
+        table
+    };
+    let file_table = table(1, &[(7, 5, "src/lib.rs")]);
     for line in [
-        "14 mutants in 2 shards:",
+        "16 mutants in 2 shards:",
         "      5 caught\n      3 missed\n",
-        "      2 timed out: 1 listed with a reason, counted caught; 1 not, counted missed",
+        "      2 timed out: 1 listed with a reason, counted caught; 1 not, counted missed\n",
+        "      2 ended by a signal: 1 listed with a reason, counted caught; 1 not, counted missed\n",
         "      1 unviable\n      3 not built for this target\n",
-        "score: 60.00%, 6 caught of 10 caught or missed",
-        "missed, per file:\n      4 src/lib.rs\n",
+        "score: 58.33%, 7 caught of 12 caught or missed",
+        &file_table,
+        "ended by a signal:\n  src/lib.rs:2:7: replace > with != in kept (its tests ended by signal 9, listed, counted caught)\n  \
+         src/lib.rs:18:11: replace + with / in split (its build ended by signal 9, counted missed)\n",
     ] {
         assert!(score_report.contains(line), "the report does not say {line:?}: {score_report}");
     }
+    // Worst first, a tie by name; a file under the target by a fraction of a
+    // mutant needs a whole one, and one at it needs none.
+    let files_table = table(3, &[(1, 2, "b.rs"), (2, 4, "d.rs"), (8, 1, "c.rs"), (9, 1, "a.rs")]);
+    assert!(files_report.contains(&files_table), "the files are not reported as {files_table:?}: {files_report}");
+    assert_eq!(
+        (to_reach(file_bp, 7, 12), to_reach(file_bp, 8, 9), to_reach(file_bp, 9, 10)),
+        (4, 1, 0),
+        "90% of 12 is 10.8, so 11 caught, 4 more than 7; of 9, 8.1, so 9, 1 more than 8; of 10, 9, none more"
+    );
     assert_eq!(
         missed_list,
-        "src/lib.rs:2:7: replace > with >= in kept\nsrc/lib.rs:2:8: replace > with < in kept\nsrc/lib.rs:18:11: replace + with - in split\nsrc/lib.rs:34:15: replace % with / in quiet\n",
-        "the missed list is not the misses and the unlisted timeout, in source order"
+        "src/lib.rs:2:7: replace > with >= in kept\nsrc/lib.rs:2:8: replace > with < in kept\nsrc/lib.rs:18:11: replace + with - in split\n\
+         src/lib.rs:18:11: replace + with / in split\nsrc/lib.rs:34:15: replace % with / in quiet\n",
+        "the missed list is not the misses, the unlisted timeout and the unlisted signal, in source order"
     );
-    assert!(summary_text.starts_with("## Mutation score\n") && summary_text.contains("score: 60.00%"), "{summary_text}");
+    assert!(summary_text.starts_with("## Mutation score\n") && summary_text.contains("score: 58.33%"), "{summary_text}");
 
     assert_eq!(change, Some(1), "a change with unlisted misses passes: {change_report}");
-    assert!(change_report.contains("3 missed or timed out and not listed in .cargo/mutants-allowed.txt:\n  src/lib.rs:2:7: replace > with >= in kept\n  src/lib.rs:2:8: replace > with < in kept\n  src/lib.rs:34:15: replace % with / in quiet\n"), "{change_report}");
+    assert!(
+        change_report.contains(
+            "4 missed, timed out or ended by a signal, and not listed in .cargo/mutants-allowed.txt:\n  src/lib.rs:2:7: replace > with >= in kept\n  \
+             src/lib.rs:2:8: replace > with < in kept\n  src/lib.rs:18:11: replace + with / in split\n  src/lib.rs:34:15: replace % with / in quiet\n"
+        ),
+        "{change_report}"
+    );
     // Each blocking mutant is marked on its line, its message escaped as a
     // workflow command needs (% as %25), and nothing else is marked.
-    for (line, column, what) in [(2, 7, "replace > with >= in kept"), (2, 8, "replace > with < in kept"), (34, 15, "replace %25 with / in quiet")] {
+    for (line, column, what) in [
+        (2, 7, "replace > with >= in kept"),
+        (2, 8, "replace > with < in kept"),
+        (18, 11, "replace + with / in split"),
+        (34, 15, "replace %25 with / in quiet"),
+    ] {
         let mark = format!("::error file=src/lib.rs,line={line},col={column}::Not caught, and not listed in .cargo/mutants-allowed.txt: {what}\n");
         assert!(change_report.contains(&mark), "a blocking mutant is not marked on its line as {mark:?}: {change_report}");
     }
-    assert_eq!(change_report.matches("::error").count(), 3, "a mutant that does not block the change is marked: {change_report}");
+    assert_eq!(change_report.matches("::error").count(), 4, "a mutant that does not block the change is marked: {change_report}");
     assert_eq!(macos_change, Some(1), "on macOS the macOS-only function is built, and its miss blocks: {macos_report}");
     assert!(macos_report.contains("  src/lib.rs:8:7: replace > with >= in apple\n") && macos_report.contains("      0 not built for this target"), "{macos_report}");
 
     let offer = "the floor in scripts/check-mutants.sh can be raised to";
     assert_eq!(at, Some(0), "a score of exactly the floor, {} caught of {}, fails the floor of {floor}%: {at_report}", at_floor.0, at_floor.1);
     assert!(!at_report.contains(offer), "a score at the floor offers to raise it: {at_report}");
+    let target_bp = target.parse::<u64>().unwrap() * 100;
+    if floor_bp < target_bp {
+        let short = target_bp - floor_bp;
+        let to_go = format!(
+            "{}.{:02} points under the target of {target}%; catching {} of the missed would meet it",
+            short / 100,
+            short % 100,
+            to_reach(target_bp, at_floor.0, at_floor.1)
+        );
+        assert!(at_report.contains(&to_go), "the report does not say how far the target is, {to_go:?}: {at_report}");
+    }
     if let Some((under, under_report)) = under {
         assert_eq!(under, Some(1), "a score a mutant under the floor of {floor}% passes: {under_report}");
         assert!(under_report.contains(&format!("the score is under its floor of {floor}%")), "{under_report}");

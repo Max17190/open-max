@@ -143,9 +143,11 @@ jobs:
           # make a test allocate without bound (next_line answering Some(0)
           # at the end of a file forever, to a test that keeps every line).
           # In the cgroup such a test never takes the runner's own share: the
-          # kernel kills it at the cap, and it fails or times out. Without
-          # the cgroup the runner can run out of memory and be shut down,
-          # and the shard's outcomes are lost.
+          # kernel kills one of the cgroup's processes at the cap, and the
+          # mutant is caught, times out, or, when that process is cargo
+          # itself, is signalled, which scripts/check-mutants.sh counts as it
+          # counts a timeout. Without the cgroup the runner can run out of
+          # memory and be shut down, and the shard's outcomes are lost.
           fence=/sys/fs/cgroup/mutants
           grep -qw memory /sys/fs/cgroup/cgroup.subtree_control || echo +memory | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null
           sudo mkdir -p "$fence"
