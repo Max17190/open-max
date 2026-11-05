@@ -508,17 +508,44 @@ fn whole_suite_runs_in_five_seconds() {
     assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
 }
 
+/// What scripts/count-core-lines.sh prints for `checkout` with `flags`, or,
+/// when it fails, everything it printed.
+fn gauge(checkout: &Path, flags: &[&str]) -> Result<String, String> {
+    let out = Command::new(repo().join("scripts/count-core-lines.sh"))
+        .args(flags)
+        .arg(checkout)
+        .output()
+        .map_err(|e| format!("count-core-lines.sh did not run: {e}"))?;
+    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() {
+        return Err(format!("count-core-lines.sh failed: {report}{}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(report)
+}
+
+/// What scripts/count-core-lines.sh --files prints for this checkout. Both
+/// line tests below read it, and it is the same report each time, so the
+/// script reads the workspace once per test binary instead of once per test.
+fn repo_lines() -> Result<&'static str, String> {
+    static REPORT: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    REPORT.get_or_init(|| gauge(&repo(), &["--files"])).as_deref().map_err(String::clone)
+}
+
 /// The core, production Rust without its tests, is about 37,000 lines.
 /// scripts/count-core-lines.sh measures it as core-excluding-tests (the
 /// lines of crates/*/src less test-only items, by the method its header
 /// states) beside total-including-tests (every line of Rust under crates/),
 /// so a test's lines count toward the second wherever they sit and toward
 /// the first nowhere. The target is not met yet, so this prints it beside
-/// both numbers and holds the ratchet: core-excluding-tests at most RATCHET,
-/// the count this test last measured plus MARGIN, and at least that count. A
-/// change that needs more raises RATCHET in its own diff and says why; one
-/// that removes production lines must lower it to its new count plus MARGIN,
-/// so the lines it saves stay saved. A count, so every build asserts it.
+/// both numbers and holds the ratchet: core-excluding-tests at least
+/// BASELINE, the count this test last measured, and at most RATCHET, which
+/// is BASELINE plus MARGIN but never past CEILING. A change that needs more
+/// raises BASELINE to its new count in its own diff and says why; one that
+/// removes production lines must lower BASELINE to its new count, so the
+/// lines it saves stay saved. A BASELINE past CEILING does not compile, and
+/// no change grows the core past CEILING, lines the agent loop moves into
+/// other files (agent_loop_is_under_2500_lines) included. README.md states
+/// the ratchet and CEILING, held here. A count, so every build asserts it.
 ///
 /// First the script is held to a fixture checkout
 /// (crates/tui/tests/fixtures/count-core-lines.txt) whose every source line
@@ -528,28 +555,23 @@ fn whole_suite_runs_in_five_seconds() {
 /// parameter, match arm and statement the script's header names, each with
 /// production code after it, `cfg` forms that do and do not need `test`, and
 /// test-only module files where rustc finds them. Its whole report on the
-/// fixture must match the marks, the excluded lines included. Then a
+/// fixture must match the marks, alone, with the excluded lines
+/// (--excluded), with each file's row (--files), and with both. Then a
 /// test-only item the script cannot bound must stop the count with an error
 /// that names its line, whatever follows it.
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
     // Effort controls and native Messages support add 711 lines for configuration and translation;
-    // the agent loop and frozen prompt are unchanged. Measured at 44,271, plus MARGIN.
-    const RATCHET: usize = 44_471;
+    // the agent loop and frozen prompt are unchanged.
+    const BASELINE: usize = 44_271;
     const MARGIN: usize = 200;
-    let gauge = |checkout: &Path, excluded: bool| -> Result<String, String> {
-        let mut gauge = Command::new(repo().join("scripts/count-core-lines.sh"));
-        if excluded {
-            gauge.arg("--excluded");
-        }
-        let out = gauge.arg(checkout).output().map_err(|e| format!("count-core-lines.sh did not run: {e}"))?;
-        let report = String::from_utf8_lossy(&out.stdout).into_owned();
-        if !out.status.success() {
-            return Err(format!("count-core-lines.sh failed: {report}{}", String::from_utf8_lossy(&out.stderr)));
-        }
-        Ok(report)
-    };
+    // Lines the agent loop moves into other files of the core do not grow the
+    // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
+    // CEILING.
+    const CEILING: usize = 44_523;
+    const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
+    const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 
     // The fixture's files, each with its text and its lines marked excluded.
     let fixture = std::fs::read_to_string(repo().join("crates/tui/tests/fixtures/count-core-lines.txt")).unwrap();
@@ -577,9 +599,11 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     files.sort();
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let dir = std::env::temp_dir().join(format!("openmax-line-gauge-{}-{nonce}", std::process::id()));
-    // The report the marks call for: each run of excluded lines, then a row
-    // per crate and the total.
-    let (mut expected, mut rows) = (String::new(), std::collections::BTreeMap::<&str, (usize, usize)>::new());
+    // The report the marks call for: each run of excluded lines with
+    // --excluded, then each file's row with --files, then a row per crate and
+    // the total.
+    let (mut excluded_runs, mut file_rows, mut crate_rows) = (String::new(), String::new(), String::new());
+    let mut rows = std::collections::BTreeMap::<&str, (usize, usize)>::new();
     for (path, text, excluded) in &files {
         let file = dir.join("marked").join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -589,11 +613,11 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
         if path.split('/').nth(2) == Some("target") {
             continue;
         }
-        row.1 += text.lines().count();
-        if !path.contains("/src/") {
-            continue;
-        }
-        row.0 += text.lines().count() - excluded.len();
+        let lines = text.lines().count();
+        let core = if path.contains("/src/") { lines - excluded.len() } else { 0 };
+        file_rows.push_str(&format!("core-excluding-tests={core:<6} total-including-tests={lines:<6} {path}\n"));
+        row.0 += core;
+        row.1 += lines;
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for &line in excluded {
             match runs.last_mut() {
@@ -602,13 +626,19 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
             }
         }
         for (first, last) in runs {
-            expected.push_str(&format!("{path}:{first}-{last}\n"));
+            excluded_runs.push_str(&format!("{path}:{first}-{last}\n"));
         }
     }
     let (core, total) = rows.values().fold((0, 0), |sum, row| (sum.0 + row.0, sum.1 + row.1));
     for (name, (core, total)) in rows.into_iter().chain([("TOTAL", (core, total))]) {
-        expected.push_str(&format!("{name:<6} core-excluding-tests={core:<6} total-including-tests={total}\n"));
+        crate_rows.push_str(&format!("{name:<6} core-excluding-tests={core:<6} total-including-tests={total}\n"));
     }
+    let modes = [
+        (&[][..], crate_rows.clone()),
+        (&["--excluded"][..], format!("{excluded_runs}{crate_rows}")),
+        (&["--files"][..], format!("{file_rows}{crate_rows}")),
+        (&["--excluded", "--files"][..], format!("{excluded_runs}{file_rows}{crate_rows}")),
+    ];
     // A test-only item the gauge cannot bound must stop the count at its
     // line, whatever follows it, rather than take the code after it for test
     // code: an unstable `macro` definition, read as an expression, an
@@ -628,10 +658,12 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("lib.rs"), format!("pub fn kept() {{\n    #[cfg(test)]\n    {item}\n    {after}\n}}\n")).unwrap();
     }
-    let report = gauge(&dir.join("marked"), true);
-    let stops: Vec<_> = (0..unknown.len()).map(|n| gauge(&dir.join(format!("unknown{n}")), false)).collect();
+    let reports: Vec<_> = modes.iter().map(|(flags, _)| gauge(&dir.join("marked"), flags)).collect();
+    let stops: Vec<_> = (0..unknown.len()).map(|n| gauge(&dir.join(format!("unknown{n}")), &[])).collect();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(report?, expected, "the gauge's report on its fixture differs from the fixture's marks");
+    for ((flags, expected), report) in modes.iter().zip(reports) {
+        assert_eq!(report?, *expected, "the gauge's report on its fixture with {flags:?} differs from the fixture's marks");
+    }
     for ((item, after), stop) in unknown.iter().zip(stops) {
         let Err(stop) = stop else { panic!("the gauge counted past `{item}` before `{after}`") };
         assert!(
@@ -640,7 +672,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
         );
     }
 
-    let report = gauge(&repo(), false)?;
+    let report = repo_lines()?;
     let count = |name: &str| -> usize {
         report
             .lines()
@@ -651,20 +683,94 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     let (core, total) = (count("core-excluding-tests="), count("total-including-tests="));
     println!("core source: {core} lines excluding tests (ratchet {RATCHET}, target {TARGET}), {total} including tests");
     assert!(
-        core <= RATCHET,
-        "core-excluding-tests is {core}, {} over its ratchet of {RATCHET}: trim it, or raise RATCHET to {} in this \
-         change and say why (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
-        core - RATCHET,
-        core + MARGIN
+        core <= CEILING,
+        "core-excluding-tests is {core}, {} over CEILING, {CEILING}, past which no BASELINE raises its ratchet of \
+         {RATCHET}: trim it (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
+        core - CEILING
     );
-    // Lines a change removes stay removed: it lowers RATCHET with them, so a
-    // later change cannot spend them without raising RATCHET and saying why.
     assert!(
-        core + MARGIN >= RATCHET,
-        "core-excluding-tests is {core}, {} under the count RATCHET was set from: lower RATCHET to {} in this change",
-        RATCHET - MARGIN - core,
-        core + MARGIN
+        core <= RATCHET,
+        "core-excluding-tests is {core}, {} over its ratchet of {RATCHET}: trim it, or set BASELINE to {core} in this \
+         change and say why (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
+        core - RATCHET
     );
+    // Lines a change removes stay removed: it lowers BASELINE with them, so a
+    // later change cannot spend them without raising BASELINE and saying why.
+    assert!(
+        core >= BASELINE,
+        "core-excluding-tests is {core}, {} under BASELINE, the count the ratchet was set from: lower BASELINE to \
+         {core} in this change",
+        BASELINE - core
+    );
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        format!(
+            "The ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
+            thousands(RATCHET as u64),
+            thousands((RATCHET - BASELINE) as u64),
+            thousands(BASELINE as u64),
+            thousands(TARGET as u64)
+        ),
+        format!("The core's ratchet is never raised above {}", thousands(CEILING as u64)),
+    ] {
+        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    }
+    Ok(())
+}
+
+/// The agent loop, crates/core/src/agent.rs without its tests, is at most
+/// 2,500 lines. scripts/count-core-lines.sh --files gives each file's
+/// core-excluding-tests by the method core_source_stays_under_its_line_budget
+/// holds to its fixture, so the loop is measured as the core is, not by a
+/// second counter. The target is not met yet, so this prints it beside the
+/// loop's two counts and holds a ratchet by the same rule: the loop's
+/// core-excluding-tests at least BASELINE, the count this test last
+/// measured, and at most RATCHET, BASELINE plus MARGIN. A change that needs
+/// more raises BASELINE to its new count in its own diff and says why; one
+/// that cuts the loop must lower BASELINE to its new count, so the lines it
+/// cuts stay cut. Lines the loop hands to another file of the core stay
+/// under the core's ratchet. README.md states this ratchet, held here.
+#[test]
+fn agent_loop_is_under_2500_lines() -> Result<(), String> {
+    const TARGET: usize = 2_500;
+    const BASELINE: usize = 4_930;
+    // About 1% of the loop: room for a small fix, not for a feature.
+    const MARGIN: usize = 50;
+    const RATCHET: usize = BASELINE + MARGIN;
+    const LOOP: &str = "crates/core/src/agent.rs";
+    let report = repo_lines()?;
+    let row = report
+        .lines()
+        .find(|line| line.split_whitespace().last() == Some(LOOP))
+        .ok_or_else(|| format!("no row for {LOOP} in the gauge's report: {report}"))?;
+    let count = |name: &str| -> usize {
+        row.split_whitespace()
+            .find_map(|field| field.strip_prefix(name)?.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in the gauge's row for {LOOP}: {row}"))
+    };
+    let (lines, total) = (count("core-excluding-tests="), count("total-including-tests="));
+    println!("agent loop: {lines} lines excluding tests (ratchet {RATCHET}, target {TARGET}), {total} including tests");
+    assert!(
+        lines <= RATCHET,
+        "{LOOP} has {lines} lines excluding tests, {} over its ratchet of {RATCHET}: trim it, or set BASELINE to \
+         {lines} in this change and say why (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
+        lines - RATCHET
+    );
+    assert!(
+        lines >= BASELINE,
+        "{LOOP} has {lines} lines excluding tests, {} under BASELINE, the count the ratchet was set from: lower \
+         BASELINE to {lines} in this change",
+        BASELINE - lines
+    );
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let claim = format!(
+        "The agent loop's ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
+        thousands(RATCHET as u64),
+        thousands(MARGIN as u64),
+        thousands(BASELINE as u64),
+        thousands(TARGET as u64)
+    );
+    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
     Ok(())
 }
 

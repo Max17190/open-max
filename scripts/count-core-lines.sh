@@ -1,7 +1,7 @@
 #!/bin/bash
 # Count the workspace's Rust lines two ways, per crate and in total.
 #
-# Usage: scripts/count-core-lines.sh [--excluded] [checkout]
+# Usage: scripts/count-core-lines.sh [--excluded] [--files] [checkout]
 #
 # core-excluding-tests: the lines of crates/<crate>/src/**/*.rs less those
 #   of test-only code, so the lines a build without cfg(test) reads, except
@@ -13,7 +13,10 @@
 # toward core-excluding-tests nowhere. A line is a physical line: blank lines
 # and comments count where they stand. The checkout defaults to the one this
 # script is in. --excluded also lists each run of excluded lines as
-# path:first-last.
+# path:first-last. --files also prints, after any runs and before the crate
+# rows, a row for each file a crate's row counts: the file's two counts, by
+# the same method, then its path, with 0 core-excluding-tests outside src/,
+# so a crate's file rows add up to its row.
 #
 # Method. Each file under src/ is split into tokens, so that a bracket, `#`
 # or `;` inside a literal or a comment stays part of it: line and block
@@ -78,21 +81,26 @@
 set -u -o pipefail
 
 list=0
-if [ "${1:-}" = --excluded ]; then
-  list=1
+files=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --excluded) list=1 ;;
+    --files) files=1 ;;
+    *) break ;;
+  esac
   shift
-fi
+done
 if [ $# -gt 1 ]; then
-  echo "usage: $0 [--excluded] [checkout]" >&2
+  echo "usage: $0 [--excluded] [--files] [checkout]" >&2
   exit 2
 fi
 checkout=${1:-$(dirname "$0")/..}
 
-exec perl - "$list" "$checkout" <<'PERL'
+exec perl - "$list" "$files" "$checkout" <<'PERL'
 use strict;
 use warnings;
 
-my ($list, $root) = @ARGV;
+my ($list, $files, $root) = @ARGV;
 chdir $root or die "count-core-lines: cannot enter $root: $!\n";
 -d 'crates' or die "count-core-lines: no crates/ in $root\n";
 
@@ -699,12 +707,13 @@ while (defined(my $file = shift @work)) {
 }
 
 my ($core_sum, $total_sum) = (0, 0);
-my @rows;
+my (@rows, @listing);
 for my $crate (@crates) {
-  my ($core, $total) = (0, 0);
+  my ($core, $total, %core_of) = (0, 0);
   for my $file (rust_files("$crate/src")) {
     my $excluded = $test_file{$file} ? [1 .. $lines{$file}] : $excluded{$file};
-    $core += $lines{$file} - @$excluded;
+    $core_of{$file} = $lines{$file} - @$excluded;
+    $core += $core_of{$file};
     next unless $list && @$excluded;
     my @runs = ([$excluded->[0], $excluded->[0]]);
     for (@$excluded[1 .. $#$excluded]) {
@@ -713,12 +722,16 @@ for my $crate (@crates) {
     print "$file:$_->[0]-$_->[1]\n" for @runs;
   }
   for my $file (rust_files($crate, "$crate/target")) {
-    $total += exists $lines{$file} ? $lines{$file} : line_count(slurp($file));
+    my $file_lines = exists $lines{$file} ? $lines{$file} : line_count(slurp($file));
+    push @listing, sprintf "core-excluding-tests=%-6s total-including-tests=%-6s %s\n",
+      $core_of{$file} // 0, $file_lines, $file if $files;
+    $total += $file_lines;
   }
   (my $name = $crate) =~ s{\Acrates/}{};
   push @rows, [$name, $core, $total];
   $core_sum += $core;
   $total_sum += $total;
 }
+print @listing;
 printf "%-6s core-excluding-tests=%-6s total-including-tests=%s\n", @$_ for @rows, ['TOTAL', $core_sum, $total_sum];
 PERL
