@@ -1978,7 +1978,8 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     assert!(unreasoned_report.contains("not a mutant's name, then \" # \" and the reason it may survive"), "{unreasoned_report}");
 }
 
-/// The first frame, held in CI by its ratio to a baseline binary's start.
+/// The first frame, held in CI by its ratio to a baseline binary's start,
+/// and on the reference machine by the harness's work in front of it.
 ///
 /// The target, cold start to the first painted frame in 1 ms, is a release
 /// build's on the reference machine, not CI's: timed from the spawn, a frame
@@ -1994,7 +1995,8 @@ fn mutation_score_is_at_least_ninety_five_percent() {
 /// machine's start of a release binary (the spawn, the dynamic loader, the
 /// runtime's start) and the pseudo-terminal's delivery, so the ratio is the
 /// harness's start to its first frame, its own binary's loading included,
-/// in units of that.///
+/// in units of that.
+///
 /// Method: 21 launches, after one warmup launch, each into a fresh fixture
 /// HOME (settings only, the project not yet trusted, so `--trust-project`
 /// grants it) on a fresh 80x24 pseudo-terminal. A launch is timed from just
@@ -2018,71 +2020,183 @@ fn mutation_score_is_at_least_ninety_five_percent() {
 /// runs on: the highest ratio CI's runner for that platform measured, plus a
 /// quarter, rounded up to a tenth, since a platform's process start, and so
 /// the ratio, has a scale of its own (below). A machine much unlike those
-/// runners can measure another ratio. A debug build prints the measurement
-/// and holds the ratio to 20 times the ratchet, which only a hang or a stall
-/// many times today's breaks. Neither asserts a time: they are printed.
-/// Without the baseline binary, which `cargo test` builds only when no
-/// target is selected, a release build fails and a debug build skips.
+/// runners can measure another ratio. On a machine of the reference
+/// machine's class, an Apple M5 (`first_frame::reference_machine`; CI's
+/// runners are not), a release build times 61 launches instead of 21 and
+/// also asserts the harness's work, the first frame's median less the
+/// baseline's, under its ratchet: the median the reference machine
+/// measured, plus a tenth, rounded up to 10 us. It takes the 61 so that the
+/// noise alone seldom puts a measurement over the ratchet, in none of the 44
+/// runs below. A burst of other work on the machine slows a measurement or
+/// two, while a change that adds work slows every one, so a measurement
+/// over the ratchet is taken again, up to three in all, and the work fails
+/// only when each one the ratchet reaches is over. It reaches a
+/// measurement whose baseline median is within the 90th percentile of
+/// those measured with it. Past that, on a machine busy with other work,
+/// the work rose with the baseline's start (below), so where each
+/// measurement is slower the work is reported and not asserted. The work's
+/// target, 250 us, is not met yet: it is printed, met or not, in a
+/// `MEASURE` line. A debug build prints the measurement,
+/// holds the ratio to 20 times the ratchet, which only a hang or a stall
+/// many times today's breaks, and asserts no time. Without the baseline
+/// binary, which `cargo test` builds only when no target is selected, a
+/// release build fails and a debug build skips.
 ///
 /// Measured in release builds, as the ratio of the medians (first frame;
 /// baseline). On macos-latest, seven runs: 1.38 to 1.57 (2.37 to 4.43 ms;
 /// 1.72 to 2.88 ms), so a ratchet of 2.0. On ubuntu-latest, six runs: 2.03
-/// to 2.29 (1.30 to 1.72 ms; 0.58 to 0.83 ms), so 2.9. On an Apple M5
-/// laptop (macOS 27), eleven runs with every other build stopped, at a
-/// one-minute load average of 4.7: 1.39 to 1.48 (1.60 to 2.34 ms; 1.09 to
-/// 1.68 ms). The startup a change can add and still pass is the ratchet
-/// times the baseline, less the first frame: 1.06 to 1.64 ms in the
-/// macos-latest runs above and 0.36 to 0.69 ms in the ubuntu-latest ones.
-/// Painting the frame behind the trust grant, settings and the core, the
-/// order before it came first, moved the laptop's ratio to 2.00 to 2.46 in
-/// ten runs beside other builds, the lowest past the macOS ratchet by 0.07%.
+/// to 2.29 (1.30 to 1.72 ms; 0.58 to 0.83 ms), so 2.9. The startup a change
+/// can add and still pass is the ratchet times the baseline, less the first
+/// frame: 1.06 to 1.64 ms in the macos-latest runs above and 0.36 to 0.69
+/// ms in the ubuntu-latest ones. Painting the frame behind the trust grant,
+/// settings and the core, the order before it came first, moved an Apple
+/// M5's ratio to 2.00 to 2.46 in ten runs beside other builds, the lowest
+/// past the macOS ratchet by 0.07%.
+///
+/// On the reference machine (Apple M5, macOS 27), 44 runs of 61 launches at
+/// one-minute load averages of 4.6 to 7.1: the harness's work 405 to 464
+/// us, median 426 (ratio 1.33 to 1.41; first frame 1.49 to 1.70 ms;
+/// baseline 1.08 to 1.28 ms), so a ratchet of 470 us where the baseline's
+/// median is within 1.15 ms, the 90th percentile of those runs' baseline
+/// medians. Interleaved with them, 44 runs of the build before it, which
+/// loaded libiconv, walked rebase opcodes and started the signal watcher's
+/// thread and runtime in front of the frame (crates/tui/build.rs,
+/// `route_quit_signals`): 500 to 556 us, median 517. The ratchet reaches 40
+/// of this build's runs, at 405 to 458 us, and 39 of the other's, at 500 to
+/// 556 us. With the machine busy with other work, at load averages of 5.2
+/// to 6.1, 44 more runs of each: within 1.15 ms the build before it
+/// measured 533 to 566 us, while this build had no measurement there, its
+/// work reported at 340 to 582 us with baseline medians of 1.16 to 1.64 ms.
+/// Most of what is left is the dynamic loader's, before `main` runs. It
+/// binds every symbol the binary imports, lazy ones included, and finds each
+/// by searching libSystem's 39 re-exported libraries in order, so a symbol
+/// costs more the later its library comes (libsystem_c is 14th,
+/// libsystem_kernel 32nd). The binary imports 182 symbols, all of them used,
+/// to the baseline's 68, and 115 of them the baseline does not import, each
+/// a function but one variable. Attributed by giving the baseline binary
+/// each part of the difference and timing it the same way, 41 launches of
+/// each copy interleaved, with the task's instruction counter read at
+/// `main`: 113 of those functions, imported and never called, brought `main`
+/// 257 us later and added 6.4M instructions, with no more page faults (100
+/// imports from libsystem_kernel, 284 us; 100 from libsystem_c, 116 us);
+/// 14,000 rebased pointers, about the binary's 13,636 before its fixups were
+/// chained, 65 us; 6 MB of untouched constant data, 20 us, within the noise.
+/// So the binding alone is past the target, with the linking the platform
+/// supports.
 #[cfg(unix)]
 #[test]
 fn first_frame_holds_its_ratio_to_a_baseline_binary() {
     use std::time::Duration;
-    // The highest ratio CI's runner for this platform measured, plus a
+    // The highest ratio CI's runner for each platform measured, plus a
     // quarter, rounded up to a tenth (above).
-    const RATCHET: f64 = if cfg!(target_os = "macos") { 2.0 } else { 2.9 };
+    const MACOS_RATCHET: f64 = 2.0;
+    const LINUX_RATCHET: f64 = 2.9;
+    const RATCHET: f64 = if cfg!(target_os = "macos") { MACOS_RATCHET } else { LINUX_RATCHET };
+    // The harness's work, its target on the reference machine, and the
+    // ratchet a release build of that machine's class asserts until the
+    // target is met: the median it measured, plus a tenth, rounded up to
+    // 10 us, where the baseline's median is within the 90th percentile of
+    // those measured with it (above).
+    const WORK_TARGET: Duration = Duration::from_micros(250);
+    const WORK_RATCHET: Duration = Duration::from_micros(470);
+    const WORK_RATCHET_BASELINE: Duration = Duration::from_micros(1150);
+    // The measurements that build takes before the work fails, each one
+    // over the ratchet (above).
+    const WORK_MEASUREMENTS: usize = 3;
+    // Launches, and where the work is asserted more of them, so its median
+    // holds still under a ratchet with less room (above).
     const LAUNCHES: usize = 21;
+    const ASSERTED_LAUNCHES: usize = 61;
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        format!("under a ratchet of {MACOS_RATCHET:.1} on macOS and {LINUX_RATCHET:.1} on Linux"),
+        format!("it times {ASSERTED_LAUNCHES} launches instead of {LAUNCHES}"),
+        format!("under a ratchet of {} us", WORK_RATCHET.as_micros()),
+        format!("no slower than {:.2} ms", WORK_RATCHET_BASELINE.as_secs_f64() * 1e3),
+        format!("up to {WORK_MEASUREMENTS} measurements in all"),
+        format!("The work's target of {} us is not met", WORK_TARGET.as_micros()),
+    ] {
+        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    }
     let Some(baseline) = first_frame::baseline_binary() else { return };
     if !first_frame::alone("first_frame_holds_its_ratio_to_a_baseline_binary") {
         return;
     }
-    first_frame::baseline(&baseline);
-    first_frame::launch(0);
-    let (mut starts, mut frames) = (Vec::new(), Vec::new());
-    for n in 1..=LAUNCHES {
-        starts.push(first_frame::baseline(&baseline));
-        frames.push(first_frame::launch(n));
-    }
-    let summary = |times: &mut [Duration]| {
-        times.sort();
-        let quartiles = format!(
-            "median {:?} (p25 {:?}, p75 {:?})",
-            times[LAUNCHES / 2],
-            times[LAUNCHES / 4],
-            times[3 * LAUNCHES / 4]
-        );
-        (times[LAUNCHES / 2], quartiles)
+    let reference = first_frame::reference_machine();
+    let work_asserted = reference && !cfg!(debug_assertions);
+    let launches = if work_asserted { ASSERTED_LAUNCHES } else { LAUNCHES };
+    // One measurement: the baseline's starts and the first frames, each
+    // launch after one of the baseline, sorted.
+    let measure = || {
+        first_frame::baseline(&baseline);
+        first_frame::launch(0);
+        let (mut starts, mut frames) = (Vec::new(), Vec::new());
+        for n in 1..=launches {
+            starts.push(first_frame::baseline(&baseline));
+            frames.push(first_frame::launch(n));
+        }
+        starts.sort();
+        frames.sort();
+        (starts, frames)
     };
-    let (start, start_quartiles) = summary(&mut starts);
-    let (frame, frame_quartiles) = summary(&mut frames);
+    let median = |times: &[Duration]| times[launches / 2];
+    let work = |(starts, frames): &(Vec<Duration>, Vec<Duration>)| median(frames).saturating_sub(median(starts));
+    // Whether the ratchet reaches a measurement, by its baseline's median,
+    // and whether the work there is within it.
+    let reached = |(starts, _): &(Vec<Duration>, Vec<Duration>)| median(starts) <= WORK_RATCHET_BASELINE;
+    let holds = |measurement: &(Vec<Duration>, Vec<Duration>)| reached(measurement) && work(measurement) <= WORK_RATCHET;
+    let mut measurements = vec![measure()];
+    while work_asserted && measurements.len() < WORK_MEASUREMENTS && !measurements.iter().any(holds) {
+        measurements.push(measure());
+    }
+    // The measurement reported: one the ratchet holds, else the least work
+    // it reaches, else the last.
+    let (starts, frames) = measurements
+        .iter()
+        .find(|measurement| holds(measurement))
+        .or_else(|| measurements.iter().filter(|measurement| reached(measurement)).min_by_key(|measurement| work(measurement)))
+        .unwrap_or_else(|| measurements.last().unwrap());
+    let quartiles = |times: &[Duration]| {
+        format!("median {:?} (p25 {:?}, p75 {:?})", times[launches / 2], times[launches / 4], times[3 * launches / 4])
+    };
+    let (start, frame) = (median(starts), median(frames));
     let ratio = frame.as_secs_f64() / start.as_secs_f64();
     let (bound, asserted) = if cfg!(debug_assertions) {
         (20.0 * RATCHET, "debug, asserting 20 times the ratchet")
     } else {
         (RATCHET, "release, asserting the ratchet")
     };
-    let work = frame.saturating_sub(start);
     let report = format!(
-        "first frame: {frame_quartiles} over {LAUNCHES} launches; baseline binary (process start): {start_quartiles}; \
-         harness work (first frame less baseline): {work:?}; ratio {ratio:.2} (ratchet {RATCHET}; {asserted}; \
-         the times are printed, not asserted)"
+        "first frame: {} over {launches} launches; baseline binary (process start): {}; ratio {ratio:.2} (ratchet \
+         {RATCHET}; {asserted})",
+        quartiles(frames),
+        quartiles(starts)
     );
     println!("{report}");
+    let works: Vec<Duration> = measurements.iter().map(work).collect();
+    let baselines: Vec<Duration> = measurements.iter().map(|(starts, _)| median(starts)).collect();
+    let reaches = measurements.iter().any(reached);
+    println!(
+        "MEASURE first_frame_harness_work {:?} (first frame median less baseline median; target {WORK_TARGET:?} on the \
+         reference machine, {}; ratchet {WORK_RATCHET:?} where the baseline's median is within {WORK_RATCHET_BASELINE:?}; \
+         {}; work {works:?} at baselines {baselines:?})",
+        frame.saturating_sub(start),
+        if frame.saturating_sub(start) <= WORK_TARGET { "met" } else { "not met" },
+        match (reference, work_asserted, reaches) {
+            (true, true, true) => "asserted: the reference machine's class in a release build",
+            (true, true, false) => "not asserted: each baseline median slower than the ratchet's",
+            (true, false, _) => "not asserted: a debug build",
+            (false, _, _) => "not asserted: not the reference machine's class",
+        }
+    );
     assert!(
         ratio < bound,
         "the first frame takes {ratio:.2} times the baseline binary's start, over {bound}; {report}: frames {frames:?}, baselines {starts:?}"
+    );
+    assert!(
+        !work_asserted || !reaches || measurements.iter().any(holds),
+        "the harness's work before the first frame is over its ratchet of {WORK_RATCHET:?} in each measurement the \
+         ratchet reaches: work {works:?} at baselines {baselines:?}; {report}: frames {frames:?}, baselines {starts:?}"
     );
 }
 
@@ -2104,6 +2218,81 @@ fn the_first_frame_harness_reads_what_a_run_wrote_before_it_exited() {
         "the harness lost the frame end a run wrote before it exited: {:?}",
         String::from_utf8_lossy(&out)
     );
+}
+
+/// What the dynamic loader does for the binary before `main`, so before the
+/// first frame (crates/tui/build.rs): on macOS it opens the libraries the
+/// binary names and fixes up its pointers. The binary names libSystem
+/// alone, the one library it binds symbols from, and on Apple silicon its
+/// fixups are chained, so the loader walks no rebase opcodes. Below a
+/// deployment target of macOS 12 the chains must be in DYLD_CHAINED_PTR_64,
+/// the pointer format the linker itself writes for such a target, as it
+/// writes DYLD_CHAINED_PTR_64_OFFSET only from macOS 12. That the macOS 11
+/// loader reads them rests on that choice of the linker's: no launch on
+/// macOS 11 is tested. Read from the Mach-O load commands and the chained
+/// fixups' header; a structure gate, so it asserts in every build.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_binary_loads_only_what_it_uses() {
+    use std::io::{Read, Seek, SeekFrom};
+    const LC_REQ_DYLD: u32 = 0x8000_0000;
+    const LIBRARIES: [u32; 5] = [0xc, 0x18 | LC_REQ_DYLD, 0x1f | LC_REQ_DYLD, 0x20, 0x23 | LC_REQ_DYLD];
+    const LC_BUILD_VERSION: u32 = 0x32;
+    const LC_DYLD_INFO_ONLY: u32 = 0x22 | LC_REQ_DYLD;
+    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x34 | LC_REQ_DYLD;
+    const DYLD_CHAINED_PTR_64: u16 = 2;
+    let path = env!("CARGO_BIN_EXE_openmax");
+    let mut file = std::fs::File::open(path).unwrap();
+    let mut header = [0u8; 32];
+    file.read_exact(&mut header).unwrap();
+    let word = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    assert_eq!(word(&header, 0), 0xfeed_facf, "{path} is not a 64-bit Mach-O");
+    let mut commands = vec![0u8; word(&header, 20) as usize];
+    file.read_exact(&mut commands).unwrap();
+    let (mut at, mut libraries, mut fixups, mut opcodes, mut minos) = (0, Vec::new(), None, false, 0);
+    for _ in 0..word(&header, 16) {
+        let (command, size) = (word(&commands, at), word(&commands, at + 4) as usize);
+        if LIBRARIES.contains(&command) {
+            let name = &commands[at + word(&commands, at + 8) as usize..at + size];
+            libraries.push(String::from_utf8_lossy(name.split(|&b| b == 0).next().unwrap()).into_owned());
+        }
+        if command == LC_DYLD_CHAINED_FIXUPS {
+            fixups = Some((word(&commands, at + 8), word(&commands, at + 12) as usize));
+        }
+        if command == LC_BUILD_VERSION {
+            minos = word(&commands, at + 12);
+        }
+        // A dyld_info_command's rebase opcodes, by their size.
+        opcodes |= command == LC_DYLD_INFO_ONLY && word(&commands, at + 12) > 0;
+        at += size;
+    }
+    // Each segment's pointer format: dyld_chained_starts_in_segment's, in
+    // the chained fixups' starts in image.
+    let formats: Vec<u16> = fixups.map_or_else(Vec::new, |(offset, size)| {
+        let mut data = vec![0u8; size];
+        file.seek(SeekFrom::Start(offset.into())).unwrap();
+        file.read_exact(&mut data).unwrap();
+        let starts = word(&data, 4) as usize;
+        (0..word(&data, starts) as usize)
+            .map(|segment| word(&data, starts + 4 + 4 * segment) as usize)
+            .filter(|&info| info != 0)
+            .map(|info| u16::from_le_bytes(data[starts + info + 6..starts + info + 8].try_into().unwrap()))
+            .collect()
+    });
+    let (chained, macos) = (fixups.is_some(), format!("{}.{}", minos >> 16, (minos >> 8) & 0xff));
+    println!(
+        "MEASURE binary_launch_shape libraries={libraries:?} chained_fixups={chained} pointer_formats={formats:?} \
+         rebase_opcodes={opcodes} minimum_macos={macos}"
+    );
+    assert_eq!(libraries, ["/usr/lib/libSystem.B.dylib"], "{path} names a library the loader opens for nothing");
+    if cfg!(target_arch = "aarch64") {
+        assert!(chained && !opcodes, "{path} has rebase opcodes for the loader to walk instead of chained fixups");
+        assert!(
+            minos >> 16 >= 12 || (!formats.is_empty() && formats.iter().all(|&format| format == DYLD_CHAINED_PTR_64)),
+            "{path} names macOS {macos} but chains its fixups in pointer formats {formats:?}, not {DYLD_CHAINED_PTR_64} \
+             (DYLD_CHAINED_PTR_64), the one the linker writes for that release"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -2175,6 +2364,33 @@ mod first_frame {
                 binary.display()
             ),
         }
+    }
+
+    /// Whether this machine is of the reference machine's class, where the
+    /// harness's work is asserted: its CPU is an Apple M5 (the brand macOS
+    /// reports is "Apple M5", "Apple M5 Pro" or "Apple M5 Max"). CI's
+    /// runners are not.
+    pub fn reference_machine() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let mut brand = [0u8; 64];
+            let mut len = brand.len();
+            // SAFETY: the buffer and its length outlive the call, which
+            // writes at most `len` bytes and stores how many it wrote.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"machdep.cpu.brand_string".as_ptr(),
+                    brand.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let brand = std::ffi::CStr::from_bytes_until_nul(&brand[..len.min(brand.len())]);
+            rc == 0 && brand.is_ok_and(|b| matches!(b.to_bytes(), b"Apple M5" | b"Apple M5 Pro" | b"Apple M5 Max"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
     }
 
     /// Spawn to the frame end the baseline binary writes, which is all it

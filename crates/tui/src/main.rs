@@ -740,10 +740,10 @@ fn runtime(granted: Option<&str>, workers: Option<usize>) -> tokio::runtime::Run
 
 /// The interactive session at a terminal, painted first: the terminal is set
 /// up and the shell of an empty session painted (`app::draw_shell`) before
-/// any file is read or the runtime starts its workers, so the first frame
-/// waits on no disk and on no thread but the signal watcher's. Trust,
-/// settings and the session come behind it, and the session's own first
-/// frame paints over the shell what they add. A refusal among them (a
+/// any file is read or any thread starts, the signal watcher's included
+/// (`route_quit_signals`), so the first frame waits on no disk and no thread.
+/// Trust, settings and the session come behind it, and the session's own
+/// first frame paints over the shell what they add. A refusal among them (a
 /// project that is not trusted, a grant asked for from an agent session,
 /// settings that do not parse) hands the terminal back first and prints on
 /// the shell, as it did before the session took the screen (`refuse`); the
@@ -756,14 +756,16 @@ fn runtime(granted: Option<&str>, workers: Option<usize>) -> tokio::runtime::Run
 /// session.
 fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     QUIT_UNREAD.store(true, Ordering::SeqCst);
-    // Before the terminal changes, for the reason `run` gives.
-    let quit = watch_quit_signals(true);
+    // Routed before the terminal changes, for the reason `run` gives, and
+    // watched from behind the first frame.
+    let signals = route_quit_signals();
     let mut terminal =
         init_terminal().unwrap_or_else(|e| refuse(1, &format!("failed to initialize terminal: {e}"), None));
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     if let Err(e) = app::draw_shell(&mut terminal, &project) {
         refuse(1, &format!("failed to draw the first frame: {e}"), None);
     }
+    let quit = signals.watch(true);
     signal_keys(true);
 
     let data_dir = default_data_dir();
@@ -1719,72 +1721,173 @@ fn install_panic_restore(ui: std::thread::ThreadId, restore: impl Fn() + Send + 
 /// does before a session's loop reads the quit (`QUIT_UNREAD`), where Ctrl+C
 /// and Ctrl+\ at the terminal raise SIGINT and SIGQUIT (`signal_keys`).
 ///
-/// The watcher runs on its own thread and runtime. When main returns, the
-/// main runtime drops its tasks and then waits on blocking work still
-/// running (a grep, a scan), while the handlers stay installed; a watcher
-/// on that runtime would leave every signal through that wait swallowed.
-#[cfg(unix)]
+/// The watcher is a thread of its own, outside every runtime. When main
+/// returns, the main runtime drops its tasks and then waits on blocking work
+/// still running (a grep, a scan), while the handlers stay installed; a
+/// watcher on that runtime would leave every signal through that wait
+/// swallowed. The handlers are installed before this returns, so a signal
+/// that lands during startup still ends the session cleanly.
 fn watch_quit_signals(tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
-    use futures_util::future::select_all;
-    use tokio::signal::unix::{signal, SignalKind};
-    let quit = std::sync::Arc::new(tokio::sync::Notify::new());
-    // Weak: main and then the frontend own the quit, so it is gone once the
-    // frontend has ended, and a signal from then on exits at once instead
-    // of waiting on a loop that will never read it.
-    let event_loop = std::sync::Arc::downgrade(&quit);
-    let (registered, ready) = std::sync::mpsc::channel();
-    let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_io().build() else {
-            return;
-        };
-        runtime.block_on(async move {
-            let mut signals: Vec<_> = [
-                SignalKind::terminate(),
-                SignalKind::hangup(),
-                SignalKind::interrupt(),
-                SignalKind::quit(),
-                SignalKind::user_defined1(),
-                SignalKind::user_defined2(),
-            ]
-            .into_iter()
-            .filter(|kind| !ignored(kind.as_raw_value()))
-            .filter_map(|kind| Some((kind.as_raw_value(), signal(kind).ok()?)))
-            .collect();
-            let _ = registered.send(());
-            if signals.is_empty() {
-                return;
-            }
-            let (_, first, _) =
-                select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await;
-            let last = match event_loop.upgrade().filter(|_| !QUIT_UNREAD.load(Ordering::SeqCst)) {
-                Some(quit) => {
-                    QUIT_SIGNAL.store(signals[first].0, Ordering::SeqCst);
-                    quit.notify_one();
-                    drop(quit);
-                    select_all(signals.iter_mut().map(|(_, s)| Box::pin(s.recv()))).await.1
-                }
-                None => first,
-            };
-            open_max_core::execution::kill_process_groups();
-            let _setup_input = setup::restore_input();
-            // Held until exit (the lock is reentrant, so the restore still
-            // writes): the event loop must not paint over the restored shell.
-            // A print or stdio run has no screen to restore, and its writer
-            // can be blocked on a pipe nobody reads, holding stdout; waiting
-            // for it there would hold this exit for as long.
-            let _stdout = tui.then(|| {
-                let stdout = std::io::stdout().lock();
-                restore_terminal();
-                stdout
+    route_quit_signals().watch(tui)
+}
+
+/// The read end of the socket the quit signals' handler wakes their watcher
+/// on, once `route_quit_signals` has routed them. Routing starts no thread,
+/// so a session at a terminal routes them before the terminal changes and
+/// starts their watcher behind its first frame (`session`): a signal in
+/// between stays marked for it.
+struct QuitSignals(#[cfg(unix)] Option<std::os::unix::net::UnixStream>);
+
+/// The signals `watch_quit_signals` watches.
+#[cfg(unix)]
+const QUIT_SIGNALS: [libc::c_int; 6] =
+    [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGUSR1, libc::SIGUSR2];
+
+/// One bit per quit signal received and not yet taken by the watcher, and
+/// the socket end the handler writes its wakeups to, -1 until routed.
+#[cfg(unix)]
+static PENDING_SIGNALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
+static SIGNAL_WAKE: AtomicI32 = AtomicI32::new(-1);
+
+/// Route each quit signal not inherited as ignored to `on_quit_signal`,
+/// once per process: a later routing routes nothing, and has nothing to
+/// watch. The wakeups go to a socket whose writing end never blocks and
+/// whose ends are close-on-exec, as std opens every descriptor, so neither
+/// passes to a tool.
+#[cfg(unix)]
+fn route_quit_signals() -> QuitSignals {
+    use std::os::fd::AsRawFd;
+    let Ok((wake, waker)) = std::os::unix::net::UnixStream::pair() else { return QuitSignals(None) };
+    if waker.set_nonblocking(true).is_err()
+        || SIGNAL_WAKE.compare_exchange(-1, waker.as_raw_fd(), Ordering::SeqCst, Ordering::SeqCst).is_err()
+    {
+        return QuitSignals(None);
+    }
+    // Open for the life of the process, as the handlers stay installed.
+    std::mem::forget(waker);
+    let mut routed = false;
+    for signal in QUIT_SIGNALS.into_iter().filter(|&signal| !ignored(signal)) {
+        // SAFETY: a zeroed sigaction given a handler, flags and an empty
+        // mask is a complete action, and the old one is not read.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_quit_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            // As tokio's were: a call the signal interrupts on another
+            // thread restarts instead of failing.
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            routed |= libc::sigaction(signal, &action, std::ptr::null_mut()) == 0;
+        }
+    }
+    QuitSignals(routed.then_some(wake))
+}
+
+/// The quit signals' handler, async-signal-safe: it marks `signal` and
+/// writes a byte to wake the watcher, keeping the interrupted code's errno.
+/// The mark is this process's own, so a child forked to start a tool, which
+/// runs this handler on the same socket until it execs, wakes the watcher
+/// to find no mark.
+#[cfg(unix)]
+extern "C" fn on_quit_signal(signal: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    use libc::__errno_location as errno;
+    #[cfg(not(target_os = "linux"))]
+    use libc::__error as errno;
+    // SAFETY: errno is this thread's; the descriptor is never closed.
+    unsafe {
+        let saved = *errno();
+        PENDING_SIGNALS.fetch_or(1 << signal, Ordering::SeqCst);
+        libc::write(SIGNAL_WAKE.load(Ordering::SeqCst), [0u8].as_ptr().cast(), 1);
+        *errno() = saved;
+    }
+}
+
+/// The next quit signal: the lowest-numbered marked in `pending`, the order
+/// the kernel delivers signals pending together in, which it unmarks, else
+/// the first marked from then on, waited for on `wake`, every byte of which
+/// is a wakeup. A signal received again before it is taken counts once.
+/// None once `wake` cannot be read.
+#[cfg(unix)]
+fn next_quit_signal(pending: &std::sync::atomic::AtomicU64, wake: &mut impl std::io::Read) -> Option<libc::c_int> {
+    loop {
+        let marked = pending.load(Ordering::SeqCst);
+        if marked != 0 {
+            let signal = marked.trailing_zeros();
+            pending.fetch_and(!(1u64 << signal), Ordering::SeqCst);
+            return Some(signal as libc::c_int);
+        }
+        // Takes every wakeup so far; a mark made since the load wrote one.
+        match wake.read(&mut [0; 64]) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+impl QuitSignals {
+    /// Start the watcher (see `watch_quit_signals`) and hand back the quit
+    /// it notifies. Should its thread not start, or its socket stop
+    /// reading, the signals are unrouted (`unroute_quit_signals`).
+    fn watch(self, tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
+        let quit = std::sync::Arc::new(tokio::sync::Notify::new());
+        #[cfg(unix)]
+        if let Some(mut wake) = self.0 {
+            // Weak: main and then the frontend own the quit, so it is gone
+            // once the frontend has ended, and a signal from then on exits
+            // at once instead of waiting on a loop that will never read it.
+            let event_loop = std::sync::Arc::downgrade(&quit);
+            let watcher = std::thread::Builder::new().name("signals".into()).spawn(move || {
+                let Some(first) = next_quit_signal(&PENDING_SIGNALS, &mut wake) else { return unroute_quit_signals() };
+                let last = match event_loop.upgrade().filter(|_| !QUIT_UNREAD.load(Ordering::SeqCst)) {
+                    Some(quit) => {
+                        QUIT_SIGNAL.store(first, Ordering::SeqCst);
+                        quit.notify_one();
+                        drop(quit);
+                        let Some(second) = next_quit_signal(&PENDING_SIGNALS, &mut wake) else { return unroute_quit_signals() };
+                        second
+                    }
+                    None => first,
+                };
+                open_max_core::execution::kill_process_groups();
+                let _setup_input = setup::restore_input();
+                // Held until exit (the lock is reentrant, so the restore still
+                // writes): the event loop must not paint over the restored shell.
+                // A print or stdio run has no screen to restore, and its writer
+                // can be blocked on a pipe nobody reads, holding stdout; waiting
+                // for it there would hold this exit for as long.
+                let _stdout = tui.then(|| {
+                    let stdout = std::io::stdout().lock();
+                    restore_terminal();
+                    stdout
+                });
+                std::process::exit(128 + last);
             });
-            std::process::exit(128 + signals[last].0);
-        });
-    });
-    // Return only once the handlers are registered, so a signal that lands
-    // during startup still ends the session cleanly. A watcher that never
-    // started drops its sender, which ends this wait too.
-    let _ = ready.recv();
-    quit
+            if watcher.is_err() {
+                unroute_quit_signals();
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (self, tui);
+        quit
+    }
+}
+
+/// Give each routed quit signal its default action back, for when no
+/// watcher will read their marks, and raise the lowest one already marked,
+/// so that a signal is never left marked and unread.
+#[cfg(unix)]
+fn unroute_quit_signals() {
+    for signal in QUIT_SIGNALS.into_iter().filter(|&signal| !ignored(signal)) {
+        // SAFETY: gives back the action a process starts with.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
+    if let Some(signal) = next_quit_signal(&PENDING_SIGNALS, &mut std::io::empty()) {
+        // SAFETY: raise signals the calling thread alone.
+        unsafe { libc::raise(signal) };
+    }
 }
 
 /// Whether this process inherited `signal` as ignored. That is a choice
@@ -1803,8 +1906,8 @@ fn ignored(signal: libc::c_int) -> bool {
 }
 
 #[cfg(not(unix))]
-fn watch_quit_signals(_: bool) -> std::sync::Arc<tokio::sync::Notify> {
-    std::sync::Arc::new(tokio::sync::Notify::new())
+fn route_quit_signals() -> QuitSignals {
+    QuitSignals()
 }
 
 /// The signal behind the last quit, recorded before the quit is notified.
@@ -3136,6 +3239,182 @@ mod tests {
             String::from_utf8_lossy(&child.stdout)
         );
         assert!(start.elapsed() < sleep);
+    }
+
+    /// Reads of the watcher's wakeup socket, last to first: each wakes with
+    /// the mark it makes in the pending bits, or fails, and then the socket
+    /// reads as closed.
+    #[cfg(unix)]
+    struct Wakeups<'a>(&'a std::sync::atomic::AtomicU64, Vec<Result<u64, std::io::ErrorKind>>);
+
+    #[cfg(unix)]
+    impl std::io::Read for Wakeups<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.1.pop() {
+                None => Ok(0),
+                Some(Err(kind)) => Err(kind.into()),
+                Some(Ok(mark)) => {
+                    self.0.fetch_or(mark, Ordering::SeqCst);
+                    buf[0] = 0;
+                    Ok(1)
+                }
+            }
+        }
+    }
+
+    /// The watcher takes quit signals marked together lowest-numbered first,
+    /// one at a time and each once, and reads past a wakeup with no mark (a
+    /// forked child's, see `on_quit_signal`) to the next signal marked.
+    #[cfg(unix)]
+    #[test]
+    fn quit_signals_marked_together_are_taken_lowest_first_once_each() {
+        let bit = |signal: libc::c_int| 1u64 << signal;
+        let pending = std::sync::atomic::AtomicU64::new(bit(libc::SIGINT) | bit(libc::SIGTERM));
+        let mut none = Wakeups(&pending, Vec::new());
+        assert_eq!(next_quit_signal(&pending, &mut none), Some(libc::SIGINT));
+        assert_eq!(next_quit_signal(&pending, &mut none), Some(libc::SIGTERM));
+        assert_eq!(next_quit_signal(&pending, &mut none), None, "a signal was taken twice");
+        let mut wakeups = Wakeups(&pending, vec![Ok(bit(libc::SIGUSR1)), Ok(0)]);
+        assert_eq!(next_quit_signal(&pending, &mut wakeups), Some(libc::SIGUSR1));
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+    }
+
+    /// The watcher's wait retries a read that a signal interrupted, and ends
+    /// on any other failure, which the next read would repeat.
+    #[cfg(unix)]
+    #[test]
+    fn the_quit_signal_wait_retries_only_an_interrupted_read() {
+        use std::io::ErrorKind;
+        let bit = |signal: libc::c_int| 1u64 << signal;
+        let pending = std::sync::atomic::AtomicU64::new(0);
+        let mut interrupted = Wakeups(&pending, vec![Ok(bit(libc::SIGTERM)), Err(ErrorKind::Interrupted)]);
+        assert_eq!(next_quit_signal(&pending, &mut interrupted), Some(libc::SIGTERM));
+        let mut failed = Wakeups(&pending, vec![Ok(bit(libc::SIGHUP)), Err(ErrorKind::Other)]);
+        assert_eq!(next_quit_signal(&pending, &mut failed), None, "the wait went on past a failed read");
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+    }
+
+    /// A session routes the quit signals before the terminal changes and
+    /// starts their watcher behind its first frame (`session`): a signal
+    /// that lands in between is kept, and reaches the quit once the watcher
+    /// starts. Handlers stay installed for the life of the process, so the
+    /// probe runs in a child.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_before_its_watcher_starts_reaches_the_quit() {
+        const CHILD: &str = "OPENMAX_TEST_SIGNAL_BEFORE_WATCHER";
+        if std::env::var_os(CHILD).is_some() {
+            let signals = route_quit_signals();
+            assert!(route_quit_signals().0.is_none(), "the quit signals were routed twice");
+            // SAFETY: raise delivers to this thread, whose handler has run
+            // when it returns.
+            assert_eq!(unsafe { libc::raise(libc::SIGUSR2) }, 0);
+            let quit = signals.watch(false);
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
+                    .await
+                    .expect("a SIGUSR2 before the watcher started must reach the quit")
+            });
+            assert_eq!(QUIT_SIGNAL.load(Ordering::SeqCst), libc::SIGUSR2);
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::a_signal_before_its_watcher_starts_reaches_the_quit"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        // "1 passed" rules out a filter that matched nothing and exited 0.
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "the signal before the watcher did not reach the quit ({:?}): {stdout}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    /// A child forked to start a tool runs the quit signals' handler until it
+    /// execs, and writes to the same wakeup socket, so a signal it takes then
+    /// wakes the watcher. The watcher must not take it for its own process's:
+    /// here the forked child takes SIGTERM and exits, then this process takes
+    /// SIGUSR1, and the quit is SIGUSR1's. The probe runs in a child, as the
+    /// handlers stay installed.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_a_forked_child_takes_is_not_the_parents() {
+        const CHILD: &str = "OPENMAX_TEST_SIGNAL_IN_FORKED_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let quit = watch_quit_signals(false);
+            // SAFETY: the forked child only raises a signal and exits, both
+            // async-signal-safe.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe {
+                    libc::raise(libc::SIGTERM);
+                    libc::_exit(0);
+                }
+            }
+            assert!(pid > 0, "fork: {}", std::io::Error::last_os_error());
+            let mut status = 0;
+            // SAFETY: waits on the child just forked.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the forked child: {status}");
+            // SAFETY: as above, delivered to this thread.
+            assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
+                    .await
+                    .expect("SIGUSR1 must reach the quit")
+            });
+            assert_eq!(QUIT_SIGNAL.load(Ordering::SeqCst), libc::SIGUSR1, "the forked child's SIGTERM was taken");
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::a_signal_a_forked_child_takes_is_not_the_parents"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "a forked child's signal reached the parent's quit ({:?}): {stdout}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    /// A watcher that cannot start, or whose socket stops reading, leaves
+    /// marks nothing takes: the routed signals get their default action
+    /// back, and one already marked is raised again, so it ends the process
+    /// as it would have unrouted instead of being lost. Here SIGUSR2 is
+    /// marked with no watcher, and the unrouting must end the child with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_no_watcher_takes_ends_the_process_by_default() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "OPENMAX_TEST_SIGNAL_WITHOUT_WATCHER";
+        if std::env::var_os(CHILD).is_some() {
+            let signals = route_quit_signals();
+            assert!(signals.0.is_some(), "the quit signals were not routed");
+            // SAFETY: raise delivers to this thread, whose handler has run
+            // when it returns.
+            assert_eq!(unsafe { libc::raise(libc::SIGUSR2) }, 0);
+            unroute_quit_signals();
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::a_signal_no_watcher_takes_ends_the_process_by_default"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.signal(),
+            Some(libc::SIGUSR2),
+            "the marked SIGUSR2 did not end the process once unrouted ({:?}): {}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     /// Default features are opt-out, so declaring a dependency without
