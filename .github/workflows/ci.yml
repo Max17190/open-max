@@ -226,3 +226,40 @@ jobs:
       # The budgets, and how to raise one, are in the script.
       - name: Check binary size
         run: scripts/check-binary-size.sh ${{ matrix.target }} target/${{ matrix.target }}/release/openmax
+
+  # Capability is meant to land in files, not in the core: the target is that
+  # at most 20% of the latest 50 commits of main change crates/core/.
+  # scripts/core-share.sh gives the method; it reads only git's history and
+  # builds nothing. It puts the share in the job's summary and writes one CSV
+  # row for each commit, kept as the run's core-share artifact. The share is
+  # reported, not gated, until it meets the target: the script exits 0
+  # whatever the share, so the job fails only when it cannot measure, and
+  # nothing skips the job or a step of it, or lets them fail. The checkout
+  # takes the event's own commit with the whole history, since a shallow
+  # clone's oldest commit would read as adding every file. On a pull request
+  # that commit is GitHub's test merge of the pull request into its base,
+  # whose first parent is the base, so the newest row is the pull request as a
+  # squash merge would land it; a checkout of the pull request's head would
+  # make a row of each of its commits. crates/tui/tests/thesis.rs holds this
+  # wiring.
+  core-share:
+    name: Core share
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Measure the core share
+        run: scripts/core-share.sh --csv core-share.csv
+
+      # A re-run of this job replaces the CSV its earlier attempt kept: the
+      # upload refuses a name the run already holds unless it may overwrite.
+      - name: Keep the CSV
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: core-share
+          path: core-share.csv
+          if-no-files-found: error
+          overwrite: true

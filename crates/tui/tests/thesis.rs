@@ -1096,6 +1096,347 @@ fn the_workspace_has_two_thousand_tests() {
     );
 }
 
+/// At most a fifth of the latest 50 commits of main change the core: the
+/// capability the agent needs lands in files (tools, skills, templates,
+/// hooks) instead of the core growing. No test can read the history it was
+/// built from, as CI's test job checks out one commit, so CI measures it: its
+/// core-share job runs scripts/core-share.sh on every push to main and every
+/// pull request, on the event's own commit with the whole history (for a
+/// pull request, GitHub's test merge of it into its base), keeps the CSV the
+/// script writes as an artifact and builds no Rust, and nothing skips the job
+/// or a step of it, or lets them fail. The share is reported, not gated,
+/// until it meets the target: the script exits 0 whatever the share, so the
+/// job fails only when the script cannot measure. The README states the
+/// method, the window, the artifact, the target and the gate. This test holds
+/// the wiring and the README to the script, and the script to its method on a
+/// history it builds: one row for each first-parent commit, newest first, so
+/// a merge is one commit, its diff against its first parent, and the commits
+/// it brought in are no rows, as for the test merge CI checks out for a pull
+/// request; a root commit diffed against the empty tree; a file under
+/// crates/core/ touched by an edit, a move out of the core, a binary file and
+/// a mode change, and paths that begin like the core's or hold its path
+/// further in not touching it; an empty commit; each subject quoted as CSV
+/// quotes it, in UTF-8; the rolling share over the window, empty where fewer
+/// commits remain, rounded to a tenth with a half up; the CSV replacing what
+/// its file held; the target met at exactly a fifth and missed over it; the
+/// same report under settings that change what git's porcelain prints, from a
+/// subdirectory; the report added to the job's summary; and a shallow clone,
+/// a ref that names no commit, a directory outside any repository, which git
+/// refuses with no error of the script's after it, a CSV, a job summary or a
+/// temporary file it cannot write, and each malformed argument refused; with
+/// no run leaving a temporary file behind.
+#[test]
+fn at_most_a_fifth_of_commits_touch_the_core() {
+    let method = std::fs::read_to_string(repo().join("scripts/core-share.sh")).unwrap();
+    let count_of = |name: &str| -> u64 { assigned(&method, name).parse().unwrap_or_else(|_| panic!("{name} is not a count")) };
+    let (window, target, core) = (count_of("window"), count_of("target"), assigned(&method, "core"));
+    assert_eq!((window, target), (50, 20), "the target is at most 20% of the latest 50 commits");
+    // The name CI keeps the CSV under, which the README gives.
+    let artifact = "core-share";
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        format!("of the latest {window} first-parent commits of main whose diff against their first parent changes a file under `{core}`"),
+        format!("the share over it and the {} commits before it", window - 1),
+        format!("keeps the CSV as the run's `{artifact}` artifact"),
+        format!("The target is at most {target}%"),
+        "the job reports the share and fails only when the script cannot measure it".to_string(),
+    ] {
+        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which the script and CI's core-share job hold");
+    }
+
+    let workflow = std::fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+    assert!(
+        workflow.contains("\non:\n  push:\n    branches: [main]\n  pull_request:\n\n"),
+        "CI does not run on every push to main and every pull request"
+    );
+    let job = ci_job("core-share");
+    // Every push and pull request measures the share and keeps the CSV: no
+    // `if:` skips the job or a step of it, no `needs:` skips the job whenever
+    // a job it needs fails or is skipped, and no `continue-on-error:` lets
+    // either fail while the run passes.
+    let soft: Vec<&str> = job
+        .iter()
+        .map(|line| line.trim().trim_start_matches("- "))
+        .filter(|key| ["if:", "needs:", "continue-on-error:"].iter().any(|refused| key.starts_with(refused)))
+        .collect();
+    assert!(soft.is_empty(), "the core share can be skipped, or fail to be measured or kept while the run passes: {soft:?}");
+    let at = |what: &str, wanted: &dyn Fn(&str) -> bool| {
+        job.iter().position(|line| wanted(line.trim())).unwrap_or_else(|| panic!("the core-share job has no {what}"))
+    };
+    let checkout = at("checkout", &|line| line.starts_with("- uses: actions/checkout@"));
+    let checked_out = step_keys(&job, checkout);
+    assert!(checked_out.contains(&"fetch-depth: 0"), "the core-share job does not check out the whole history");
+    // The checkout takes the event's own commit unless a `ref:` or a
+    // `repository:` names another, such as the pull request's head, which
+    // makes a row of each of the pull request's commits, not one of them all.
+    let other: Vec<&str> = checked_out.into_iter().filter(|key| key.starts_with("ref:") || key.starts_with("repository:")).collect();
+    assert!(other.is_empty(), "the core-share job does not check out the event's own commit, GitHub's test merge on a pull request: {other:?}");
+    let measured = at("step that measures", &|line| line == "run: scripts/core-share.sh --csv core-share.csv");
+    let upload = at("upload of the CSV", &|line| line.starts_with("uses: actions/upload-artifact@"));
+    let kept = step_keys(&job, upload);
+    let named = format!("name: {artifact}");
+    for key in [named.as_str(), "path: core-share.csv", "if-no-files-found: error", "overwrite: true"] {
+        assert!(kept.contains(&key), "the core-share job does not keep the CSV with `{key}`: {kept:?}");
+    }
+    assert!(checkout < measured && measured < upload, "the core-share job does not check out, measure, then keep the CSV");
+    let rust: Vec<&String> = job.iter().filter(|line| line.contains("cargo") || line.contains("rust-toolchain")).collect();
+    assert!(rust.is_empty(), "the core-share job builds Rust: {rust:?}");
+
+    /// Removes the test's files on the way out of a failed assertion too.
+    struct Removed(PathBuf);
+    impl Drop for Removed {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = scratch("core-share");
+    let _removed = Removed(dir.clone());
+    let (tree, temp) = (dir.join("repo"), dir.join("tmp"));
+    std::fs::create_dir_all(tree.join("crates")).unwrap();
+    std::fs::create_dir_all(&temp).unwrap();
+    // git and the script under no setting of this machine's: no system or
+    // global configuration, and no system or user attributes file (with no
+    // HOME, git looks for no user's); below, git init copies no template
+    // directory. Nor the GIT_DIR or other variables a git hook that runs the
+    // tests would set, which would point git at this repository instead. Their
+    // TMPDIR is the test's own, which every run must leave empty.
+    let clean = |program: &Path, cwd: &Path| {
+        let mut command = Command::new(program);
+        command.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).current_dir(cwd);
+        command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_ATTR_NOSYSTEM", "1");
+        command.env("TMPDIR", &temp);
+        command
+    };
+    let git = |args: &[&str], input: &[u8]| {
+        let mut git = clean(Path::new("git"), &tree);
+        git.args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = git.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    // The history, built by one git fast-import. Each commit is marked with
+    // the day of January 2026 it was committed on, at 13:00 an hour ahead of
+    // UTC, and authored three hours earlier, and goes on `branch` after its
+    // parents (none for a root), with its changes, each a fast-import file
+    // command and the data an inline one takes. A merge's tree is its first
+    // parent's with the changes given, so a merge gives the other parent's.
+    let mut stream = Vec::new();
+    let mut commit = |branch: &str, mark: u64, subject: &str, parents: &[u64], changes: &[(&str, &[u8])]| {
+        let (when, message) = (1_767_268_800 + 86_400 * (mark - 1), format!("{subject}\n"));
+        let head = format!(
+            "commit refs/{branch}\nmark :{mark}\nauthor Author <author@example.com> {} +0100\ncommitter Fixture <fixture@example.com> {when} +0100\n",
+            when - 3 * 3600
+        );
+        stream.extend_from_slice(format!("{head}data {}\n{message}", message.len()).as_bytes());
+        for (i, parent) in parents.iter().enumerate() {
+            stream.extend_from_slice(format!("{} :{parent}\n", if i == 0 { "from" } else { "merge" }).as_bytes());
+        }
+        for (command, data) in changes {
+            stream.extend_from_slice(format!("{command}\n").as_bytes());
+            if command.contains(" inline ") {
+                stream.extend_from_slice(format!("data {}\n", data.len()).as_bytes());
+                stream.extend_from_slice(data);
+                stream.push(b'\n');
+            }
+        }
+        stream.push(b'\n');
+    };
+    let (lib, merged, build, logo): (&[u8], &[u8], &[u8], &[u8]) =
+        (b"fn a() {}\nfn b() {}\n", b"fn a() {}\nfn b() {}\nfn c() {}\n", b"cargo build\n", b"\x89PNG\r\n\x1a\n\x00\x01");
+    let first: &[(&str, &[u8])] =
+        &[("M 100644 inline crates/core/src/lib.rs", lib), ("M 100644 inline crates/core/build.sh", build), ("M 100644 inline README.md", b"# Fixture\n")];
+    commit("heads/main", 1, "Initial commit", &[], first);
+    commit("heads/main", 2, "docs: say \"hi\", twice", &[1], &[("M 100644 inline README.md", b"# Fixture\nhi, hi\n")]);
+    // Paths that begin like the core's or hold it further in, none of them
+    // under crates/core/.
+    let near: &[(&str, &[u8])] = &[
+        ("M 100644 inline crates/core-extras/lib.rs", b"x\n"),
+        ("M 100644 inline crates/core.md", b"x\n"),
+        ("M 100644 inline vendor/crates/core/lib.rs", b"x\n"),
+    ];
+    commit("heads/main", 3, "near misses", &[2], near);
+    commit("heads/side", 4, "core: add c", &[3], &[("M 100644 inline crates/core/src/lib.rs", merged)]);
+    commit("heads/side", 5, "docs: mention c", &[4], &[("M 100644 inline docs/c.md", b"c\n")]);
+    commit("heads/main", 6, "tui: add the frame", &[3], &[("M 100644 inline crates/tui/src/main.rs", b"fn main() {}\n")]);
+    let side: &[(&str, &[u8])] = &[("M 100644 inline crates/core/src/lib.rs", merged), ("M 100644 inline docs/c.md", b"c\n")];
+    commit("heads/main", 7, "Merge branch 'side'", &[6, 5], side);
+    commit("heads/main", 8, "move lib out of the core", &[7], &[("R crates/core/src/lib.rs crates/tui/src/lib.rs", b"")]);
+    commit("heads/main", 9, "core: add the logo", &[8], &[("M 100644 inline crates/core/assets/café.png", logo)]);
+    commit("heads/main", 10, "core: make the build script executable", &[9], &[("M 100755 inline crates/core/build.sh", build)]);
+    commit("heads/main", 11, "an empty commit", &[10], &[]);
+    commit("heads/main", 12, "docs: naïve café", &[11], &[("M 100644 inline docs/café.md", b"naive\n")]);
+    for mark in 13..=17 {
+        commit("heads/main", mark, &format!("docs: note {mark}"), &[mark - 1], &[(&format!("M 100644 inline docs/note-{mark}.md"), b"note\n")]);
+    }
+    commit("heads/pr", 18, "core: add the change", &[17], &[("M 100644 inline crates/core/src/change.rs", b"fn change() {}\nfn more() {}\n")]);
+    commit("heads/pr", 19, "docs: describe the change", &[18], &[("M 100644 inline docs/change.md", b"change\n")]);
+    commit("heads/main", 20, "docs: note 20", &[17], &[("M 100644 inline docs/note-20.md", b"note\n")]);
+    // GitHub's test merge of the pull request into its base, which CI checks
+    // out, detached, for a pull request.
+    let landed: &[(&str, &[u8])] =
+        &[("M 100644 inline crates/core/src/change.rs", b"fn change() {}\nfn more() {}\n"), ("M 100644 inline docs/change.md", b"change\n")];
+    commit("pull/1/merge", 21, "Merge the pull request into main", &[20, 19], landed);
+    let marks = dir.join("marks");
+    git(&["init", "-q", "--template="], b"");
+    git(&["fast-import", "--quiet", &format!("--export-marks={}", marks.display())], &stream);
+    git(&["update-ref", "--no-deref", "HEAD", "refs/pull/1/merge"], b"");
+    let sha_of: std::collections::HashMap<u64, String> = std::fs::read_to_string(&marks)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (mark, sha) = line.split_once(' ').expect("a mark without its commit");
+            (mark.trim_start_matches(':').parse().expect("a mark that is not a number"), sha.to_string())
+        })
+        .collect();
+
+    // Each first-parent commit of the test merge, newest first: its mark, its
+    // subject, whether it touches the core, the lines it adds and removes
+    // there and elsewhere, and how many of it and the two commits before it
+    // touch the core. The side branch's commits and the pull request's are no
+    // rows of their own.
+    type Row = (u64, &'static str, u8, [u32; 4], Option<usize>);
+    let rows: [Row; 17] = [
+        (21, "Merge the pull request into main", 1, [2, 0, 1, 0], Some(1)),
+        (20, "docs: note 20", 0, [0, 0, 1, 0], Some(0)),
+        (17, "docs: note 17", 0, [0, 0, 1, 0], Some(0)),
+        (16, "docs: note 16", 0, [0, 0, 1, 0], Some(0)),
+        (15, "docs: note 15", 0, [0, 0, 1, 0], Some(0)),
+        (14, "docs: note 14", 0, [0, 0, 1, 0], Some(0)),
+        (13, "docs: note 13", 0, [0, 0, 1, 0], Some(0)),
+        (12, "docs: naïve café", 0, [0, 0, 1, 0], Some(1)),
+        (11, "an empty commit", 0, [0, 0, 0, 0], Some(2)),
+        (10, "core: make the build script executable", 1, [0, 0, 0, 0], Some(3)),
+        (9, "core: add the logo", 1, [0, 0, 0, 0], Some(3)),
+        (8, "move lib out of the core", 1, [0, 3, 3, 0], Some(2)),
+        (7, "Merge branch 'side'", 1, [1, 0, 1, 0], Some(1)),
+        (6, "tui: add the frame", 0, [0, 0, 1, 0], Some(0)),
+        (3, "near misses", 0, [0, 0, 3, 0], Some(1)),
+        (2, "docs: say \"hi\", twice", 0, [0, 0, 1, 0], None),
+        (1, "Initial commit", 1, [3, 0, 1, 0], None),
+    ];
+    // The CSV the script writes for a window of three, or of 50, where no
+    // commit has a full window.
+    let csv_of = |window: usize| {
+        let columns = "sha,date,subject,touches_core,core_added,core_removed,other_added,other_removed";
+        let mut csv = format!("{columns},rolling_{window}_core,rolling_{window}_percent\n");
+        for (mark, subject, touches, [core_added, core_removed, other_added, other_removed], of_three) in rows {
+            let share = match of_three {
+                Some(count) if window == 3 => format!("{count},{}", ["0.0", "33.3", "66.7", "100.0"][count]),
+                _ => ",".to_string(),
+            };
+            let (subject, sha) = (subject.replace('"', "\"\""), &sha_of[&mark]);
+            let lines = format!("{core_added},{core_removed},{other_added},{other_removed}");
+            csv += &format!("{sha},2026-01-{mark:02}T13:00:00+01:00,\"{subject}\",{touches},{lines},{share}\n");
+        }
+        csv
+    };
+    let script = repo().join("scripts/core-share.sh");
+    let measure = |args: &[&str], cwd: &Path| ran(clean(&script, cwd).args(args));
+    let (head, main) = (&sha_of[&21][..12], &sha_of[&20][..12]);
+    let share = |count: u32, of: u32, percent: &str| {
+        format!("core share at {head} (HEAD): {count} of the latest {of} first-parent commits touch crates/core/, {percent}%; target at most 20%\n")
+    };
+    let itself = format!("{head} itself touches crates/core/: +2 -0 there, +1 -0 elsewhere\n");
+
+    // The CSV replaces what its file held.
+    let three = dir.join("three.csv");
+    std::fs::write(&three, "an earlier run's row\n").unwrap();
+    let (code, report) = measure(&["--window", "3", "--csv", three.to_str().unwrap()], &tree);
+    assert_eq!(code, Some(0), "the script fails on a share over the target: {report}");
+    let written = std::fs::read_to_string(&three).unwrap_or_else(|err| panic!("no CSV in UTF-8 was written: {err}: {report}"));
+    assert_eq!(written, csv_of(3), "the CSV for a window of three is not the history's");
+    assert!(written.contains(",\"docs: say \"\"hi\"\", twice\","), "a subject is not quoted as CSV quotes it: {written}");
+    assert_eq!(report, format!("{}1 over the target, which allows 0 of 3\n{itself}", share(1, 3, "33.3")));
+    // The same, whatever settings change in what git's porcelain prints and
+    // from a directory under the top of the repository.
+    let settings = dir.join("gitconfig");
+    let hostile = "[diff]\n\trenames = copies\n\trelative = true\n[log]\n\tshowRoot = false\n[color]\n\tui = always\n\
+                   [core]\n\tquotePath = true\n[i18n]\n\tlogOutputEncoding = ISO-8859-1\n";
+    std::fs::write(&settings, hostile).unwrap();
+    let under = dir.join("under.csv");
+    let mut configured = clean(&script, &tree.join("crates"));
+    configured.args(["--window", "3", "--csv", under.to_str().unwrap()]).env("GIT_CONFIG_GLOBAL", &settings);
+    assert_eq!(ran(&mut configured), (Some(0), report), "git's settings change the report");
+    assert_eq!(String::from_utf8_lossy(&std::fs::read(&under).unwrap()), written, "git's settings change the CSV");
+
+    // The default window, which no commit here fills, with the report added
+    // to the job's summary in GitHub Actions.
+    let (summary, fifty) = (dir.join("summary.md"), dir.join("fifty.csv"));
+    std::fs::write(&summary, "earlier\n").unwrap();
+    let mut actions = clean(&script, &tree);
+    actions.args(["--csv", fifty.to_str().unwrap()]).env("GITHUB_ACTIONS", "true").env("GITHUB_STEP_SUMMARY", &summary);
+    let (code, report) = ran(&mut actions);
+    let unfilled =
+        format!("core share at {head} (HEAD): 17 first-parent commits, fewer than the window of 50, so no share; target at most 20%\n{itself}");
+    assert_eq!((code, report), (Some(0), unfilled.clone()), "no share is not reported for a history shorter than the window");
+    assert_eq!(std::fs::read_to_string(&fifty).unwrap(), csv_of(50), "the CSV holds a share for a commit with fewer than 50 to count");
+    let added = std::fs::read_to_string(&summary).unwrap();
+    assert_eq!(added, format!("earlier\n## Core share\n\n```text\n{unfilled}```\n"), "the report is not added to the job's summary");
+    // The target met at exactly a fifth; the share rounded to a tenth with a
+    // half up (31.25%); a window as long as the history; and a commit that
+    // does not touch the core, at most 999,999,999 commits.
+    for (args, expected) in [
+        (vec!["--window", "5"], format!("{}the target is met\n{itself}", share(1, 5, "20.0"))),
+        (vec!["--window", "16"], format!("{}2 over the target, which allows 3 of 16\n{itself}", share(5, 16, "31.3"))),
+        (vec!["--window", "17"], format!("{}3 over the target, which allows 3 of 17\n{itself}", share(6, 17, "35.3"))),
+        (
+            vec!["--window", "999999999", "main"],
+            format!(
+                "core share at {main} (main): 16 first-parent commits, fewer than the window of 999999999, so no share; target at most 20%\n\
+                 {main} itself does not touch crates/core/: +0 -0 there, +1 -0 elsewhere\n"
+            ),
+        ),
+    ] {
+        assert_eq!(measure(&args, &tree), (Some(0), expected), "the share is not reported as its method gives it for {args:?}");
+    }
+
+    // What it cannot measure: a shallow clone, a ref that names no commit,
+    // a directory outside any repository, which git refuses on its own (the
+    // script's own errors start `error: `, git's `fatal: `), and a CSV, a job
+    // summary or a temporary file it cannot write.
+    std::fs::write(tree.join(".git/shallow"), format!("{}\n", sha_of[&3])).unwrap();
+    let (shallow, shallow_report) = ran(clean(&script, &tree).env("GITHUB_ACTIONS", "true"));
+    std::fs::remove_file(tree.join(".git/shallow")).unwrap();
+    assert!(shallow == Some(1) && shallow_report.contains("::error::a shallow clone"), "a shallow clone is measured: {shallow_report}");
+    let (code, report) = measure(&["no-such-ref"], &tree);
+    assert!(code == Some(1) && report.contains("error: no-such-ref names no commit"), "a ref that names no commit is measured: {report}");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let (code, report) = ran(clean(&script, &elsewhere).env("GIT_CEILING_DIRECTORIES", &dir));
+    assert!(
+        code == Some(1) && report.contains("not a git repository") && !report.contains("error: "),
+        "a directory outside any repository is measured, or the script reports an error of its own after git's: {report}"
+    );
+    let unwritable = dir.join("missing/out.csv");
+    let (code, report) = measure(&["--csv", unwritable.to_str().unwrap()], &tree);
+    let refused = format!("error: cannot write {}", unwritable.display());
+    assert!(code == Some(1) && report.contains(&refused), "a CSV it cannot write passes: {report}");
+    let (code, report) = ran(clean(&script, &tree).env("GITHUB_STEP_SUMMARY", dir.join("missing/summary.md")));
+    assert!(code == Some(1) && report.contains("error: cannot write the job summary"), "a job summary it cannot write passes: {report}");
+    // A temporary file it cannot write in TMPDIR, which mktemp refuses on its
+    // own, naming the file.
+    let (code, report) = ran(clean(&script, &tree).env("TMPDIR", dir.join("missing")));
+    let template = format!("{}/core-share.", dir.join("missing").display());
+    assert!(
+        code == Some(1) && report.contains(&template) && !report.contains("error: "),
+        "a temporary file it cannot write in TMPDIR passes, or the script reports an error of its own after mktemp's: {report}"
+    );
+    for args in [&["--window"][..], &["--csv"], &["--csv", ""], &["--bogus"], &["HEAD", "main"]] {
+        let (code, report) = measure(args, &tree);
+        assert!(code == Some(2) && report.starts_with("usage: "), "{args:?} is not refused: {report}");
+    }
+    for window in ["0", "05", "5x", "1000000000"] {
+        let (code, report) = measure(&["--window", window], &tree);
+        let refused = format!("error: --window takes a count of commits from 1 to 999999999, not '{window}'");
+        assert!(code == Some(2) && report.contains(&refused), "a window of {window} is not refused: {report}");
+    }
+    // Every run that wrote a temporary file, a run that cannot write its CSV
+    // or job summary among them, removed it.
+    let left: Vec<_> = std::fs::read_dir(&temp).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert!(left.is_empty(), "the script leaves its temporary files behind: {left:?}");
+}
+
 /// The mutation score, caught / (caught + missed) over every mutant of the
 /// workspace, reaches 95%, and 90% over the mutants of each file, whose score
 /// the run's report lists. No test can mutate the code it runs in, so CI does:
