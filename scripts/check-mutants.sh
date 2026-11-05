@@ -9,10 +9,13 @@
 # the mutants were made from: it reads the source files they are in, and
 # .cargo/mutants-allowed.txt.
 #
-# A mutant ends one of five ways:
+# A mutant ends one of six ways:
 #   caught     a test failed;
 #   missed     every test passed;
 #   timed out  the tests ran past the timeout in .cargo/mutants.toml;
+#   signalled  a signal ended cargo while it built the mutant or ran its
+#              tests (cargo-mutants 27.1.0 sums that up as Failure), as when
+#              the kernel kills cargo at the shard's memory cap;
 #   unviable   it does not build, so there is no program to test;
 #   not built  it is in a function, or a statement, under a #[cfg(...)] that
 #              is false for the target the run built (cfg.txt in DIR, which
@@ -20,46 +23,66 @@
 #              with and without cfg(test), such as macOS-only code in a run
 #              on Linux: it changed nothing the tests ran, so it is neither
 #              caught nor missed.
-# A mutant listed in .cargo/mutants-allowed.txt that timed out counts as
-# caught: the list gives the reason a hang is how it fails. One that timed out
-# unlisted counts as missed. A listed mutant that was missed still counts as
-# missed: the list lets a change through, it does not catch anything.
+# A mutant listed in .cargo/mutants-allowed.txt that timed out or was
+# signalled counts as caught: the list gives the reason a hang, or the
+# signal, is how it fails. Unlisted, either counts as missed: neither shows a
+# test that failed. A listed mutant that was missed still counts as missed:
+# the list lets a change through, it does not catch anything. Any other
+# outcome is refused: a mutant that was only checked, never built or tested
+# (cargo-mutants' Success, from a run with --check), a Failure no signal
+# ended, or a summary cargo-mutants 27.1.0 does not write.
 #
 # Without --diff, the score is caught / (caught + missed), unviable and unbuilt
 # mutants left out, and the run fails when the score is under the floor below.
 # The floor is a ratchet that sits a margin under the score of the run that
-# last raised it, because two runs of the same code do not decide every
-# mutant alike. The one pair compared so far, the run that set the floor and
-# a run cancelled partway, shared 1,550 mutants, all in open-max-core, and
-# differed on 2 of them, decided by a test whose result under those mutants
-# turns on how two random session ids sort. If the whole workspace varies at
-# that rate, about 9 of the 6,975 scored mutants come out differently from
-# one run to the next, either way. The margin, 0.20 points, is 14 of them, so
-# a run of unchanged code fails only when more than 14 turn from caught to
-# missed. The first full run on main, set beside the one that set the floor
-# on the files neither changed, is the first pair over the whole workspace:
-# derive the margin again from it. Raise the floor, in the commit that makes
-# the tests catch more, to the score a run of that commit reports less the
-# margin, which the report gives (the workflow runs on any branch by hand);
-# lower it only in a commit that removes code and its tests on purpose, and
-# say there why. The target is 95%: under it the run reports how far there is
-# to go and passes.
+# last raised it, because two runs of the same code do not decide every mutant
+# alike: a test that fails by chance, such as a timing bound a loaded runner
+# misses, catches whichever mutant it ran under. The run that set the floor
+# (Actions run 41444364783, on 2d139e8) caught 6,783 of the 8,024 mutants it
+# scored, 84.53%. For 191 of them the only test to fail was
+# first_frame::provider_setup_hides_keys_and_returns_input_to_the_same_tui in
+# crates/tui/tests/frame_io.rs, at its deadline for the terminal's keyboard
+# probe. It failed that way for one of them that the allowlist gives as
+# equivalent, and for a mutant in code Linux does not compile, so a catch that
+# failure alone made cannot be told from chance. The floor's basis leaves those
+# 191 out, 6,592 of the 8,024, 82.15%: a fix of that test takes them away, and
+# the floor does not count on them. Two full runs on main of the same code
+# (Actions runs 39644754820 and 40304868989, of the trees of fa18395a and
+# c47ddc13 on main, which differ only in README.md) scored 7,332 and 7,331
+# mutants and decided 44 of them differently; of the 19 the second caught and
+# the first missed, a timing bound alone caught 16. Each mutant that differs
+# moves the caught count by one, either way, so the caught counts of two runs
+# of unchanged code differ by a net whose standard deviation is the square root
+# of how many differ. At the highest rate that pair allows with 95% confidence,
+# 56.6 in 7,331, 62 of the 8,024 mutants the run that set the floor scored
+# would differ: a standard deviation of 7.9. The margin, 0.26 points, is 21 of
+# them, so a run of unchanged code, those 191 aside, fails only when more than
+# 21 turn from caught to missed: about 3 runs in 1,000 at that pair's rate. The
+# pair predates the keyboard-probe test: derive the margin again from the next
+# full run on main, set beside that run on the files that did not change
+# between them. Raise the floor, in the commit that makes the tests catch more,
+# to the score a run of that commit reports less the margin, which the report
+# gives (the workflow runs on any branch by hand); lower it only in a commit
+# that removes code and its tests on purpose, and say there why. The target is
+# 95%, and 90% in each file: under them the run reports how far there is to go
+# and passes.
 #
 # With --diff (a pull request's `cargo mutants --in-diff`), the run fails when
-# any mutant was missed or timed out and is not listed.
+# any mutant was missed, timed out or was signalled and is not listed.
 #
 # --mutants N refuses a run whose shards do not hold N mutants between them,
 # the number `cargo mutants --list` gave for the run: a shard that is missing,
 # or that tested another set, would leave its mutants out of the judgement.
 #
-# --missed FILE writes the missed mutants, the timeouts counted missed among
-# them, one name per line. In GitHub Actions the report also goes to the job
-# summary.
+# --missed FILE writes the missed mutants, the timeouts and signals counted
+# missed among them, one name per line. In GitHub Actions the report also
+# goes to the job summary.
 set -u -o pipefail
 
-floor=76.60
-margin=0.20
+floor=81.89
+margin=0.26
 target=95
+file_target=90
 
 usage() {
   echo "usage: $0 [--diff] [--mutants N] [--missed FILE] DIR..." >&2
@@ -86,12 +109,13 @@ perl -MJSON::PP -e 1 2> /dev/null || {
   exit 2
 }
 
-DIFF=$diff EXPECTED=$expected MISSED=$missed FLOOR=$floor MARGIN=$margin TARGET=$target exec perl -e '
+DIFF=$diff EXPECTED=$expected MISSED=$missed FLOOR=$floor MARGIN=$margin TARGET=$target FILE_TARGET=$file_target exec perl -e '
 use strict;
 use warnings;
 use JSON::PP;
 
-my ($diff, $expected, $missed_out, $floor, $margin, $target) = @ENV{qw(DIFF EXPECTED MISSED FLOOR MARGIN TARGET)};
+my ($diff, $expected, $missed_out, $floor, $margin, $target, $file_target) =
+    @ENV{qw(DIFF EXPECTED MISSED FLOOR MARGIN TARGET FILE_TARGET)};
 my @dirs = @ARGV;
 sub refuse { print STDERR "error: $_[0]\n"; exit 2 }
 
@@ -150,6 +174,10 @@ for my $dir (@dirs) {
         refuse("$mutant->{name} is in $dir_of{$mutant->{name}} and $dir: the shards overlap")
             if exists $dir_of{$mutant->{name}};
         $here{$mutant->{name}} = $dir;
+        # cargo-mutants runs a mutant'"'"'s phases (build, then test) until one
+        # does not succeed, so the last phase is the one that ended its run.
+        my $last = ref $outcome->{phase_results} eq "ARRAY" ? $outcome->{phase_results}[-1] : undef;
+        my $status = ref $last eq "HASH" ? $last->{process_status} : undef;
         push @mutants, {
             name => $mutant->{name},
             listed_as => "$file: $what",
@@ -158,7 +186,9 @@ for my $dir (@dirs) {
             column => $column,
             what => $what,
             function => $mutant->{function} ? $mutant->{function}{span}{start}{line} : undef,
-            summary => $outcome->{summary},
+            summary => $outcome->{summary} // "",
+            phase => ref $last eq "HASH" ? lc($last->{phase} // "") : "",
+            status => $status,
         };
     }
     %dir_of = (%dir_of, %here);
@@ -270,47 +300,71 @@ sub built {
     return 1;
 }
 
-my %is = map { $_ => [] } qw(caught missed listed_timeout timeout unviable unbuilt);
+# cargo-mutants sums up a mutant whose last phase a signal ended as Failure,
+# that phase'"'"'s status written {"Signalled": N}. A Failure, or any summary,
+# that this does not describe is refused below, unbuilt mutants included: the
+# run is not one this script knows how to read.
+my %is = map { $_ => [] } qw(caught missed listed_timeout timeout listed_signalled signalled unviable unbuilt);
 for my $mutant (@mutants) {
-    my $state = !built($mutant) ? "unbuilt"
-        : $mutant->{summary} eq "CaughtMutant" ? "caught"
-        : $mutant->{summary} eq "MissedMutant" ? "missed"
-        : $mutant->{summary} eq "Unviable" ? "unviable"
-        : $mutant->{summary} eq "Timeout" ? (exists $allowed{ $mutant->{listed_as} } ? "listed_timeout" : "timeout")
-        : refuse("$mutant->{name}: an outcome this script does not know: $mutant->{summary}");
-    push @{ $is{$state} }, $mutant;
+    my ($summary, $status, $listed) = ($mutant->{summary}, $mutant->{status}, exists $allowed{ $mutant->{listed_as} });
+    $mutant->{signal} = $status->{Signalled} if ref $status eq "HASH" && ($status->{Signalled} // "") =~ /^\d+\z/;
+    my $state = $summary eq "CaughtMutant" ? "caught"
+        : $summary eq "MissedMutant" ? "missed"
+        : $summary eq "Unviable" ? "unviable"
+        : $summary eq "Timeout" ? ($listed ? "listed_timeout" : "timeout")
+        : $summary eq "Failure" && defined $mutant->{signal} ? ($listed ? "listed_signalled" : "signalled")
+        : $summary eq "Success" ? refuse("$mutant->{name}: it was only checked, never built or tested (a run with --check)")
+        : $summary eq "Failure" ? refuse("$mutant->{name}: an outcome this script does not know: Failure, "
+            . ($mutant->{phase} ? "its $mutant->{phase} phase ending " . JSON::PP->new->canonical->allow_nonref->encode($status) : "with no phase"))
+        : refuse("$mutant->{name}: an outcome this script does not know: $summary");
+    push @{ $is{ built($mutant) ? $state : "unbuilt" } }, $mutant;
 }
 my $by_place = sub { $a->{file} cmp $b->{file} || $a->{line} <=> $b->{line} || $a->{column} <=> $b->{column} || $a->{name} cmp $b->{name} };
-my @missed = sort $by_place @{ $is{missed} }, @{ $is{timeout} };
-my $caught = @{ $is{caught} } + @{ $is{listed_timeout} };
+my @missed = sort $by_place @{ $is{missed} }, @{ $is{timeout} }, @{ $is{signalled} };
+my $caught = @{ $is{caught} } + @{ $is{listed_timeout} } + @{ $is{listed_signalled} };
 my $scored = $caught + @missed;
 
+# Outcomes a listed mutant counts as caught, and an unlisted one as missed.
+my $split = sub {
+    my ($what, $listed, $unlisted) = @_;
+    sprintf("%7d %s: %d listed with a reason, counted caught; %d not, counted missed",
+        @$listed + @$unlisted, $what, scalar @$listed, scalar @$unlisted);
+};
 my @report = (
     sprintf("%d mutants in %d shard%s:", scalar @mutants, scalar @dirs, @dirs == 1 ? "" : "s"),
     sprintf("%7d caught", scalar @{ $is{caught} }),
     sprintf("%7d missed", scalar @{ $is{missed} }),
-    sprintf("%7d timed out: %d listed with a reason, counted caught; %d not, counted missed",
-        @{ $is{listed_timeout} } + @{ $is{timeout} }, scalar @{ $is{listed_timeout} }, scalar @{ $is{timeout} }),
+    $split->("timed out", $is{listed_timeout}, $is{timeout}),
+    $split->("ended by a signal", $is{listed_signalled}, $is{signalled}),
     sprintf("%7d unviable", scalar @{ $is{unviable} }),
     sprintf("%7d not built for this target", scalar @{ $is{unbuilt} }),
 );
+# A percentage with at most two decimals, in hundredths of a point.
+my $hundredths_of = sub {
+    my ($what, $value) = @_;
+    my ($whole, $hundredths) = $value =~ /^(\d+)(?:\.(\d{1,2}))?$/ or refuse("the $what $value is not a percentage");
+    $whole * 100 + ($hundredths // 0) * (length($hundredths // "00") == 1 ? 10 : 1);
+};
+my $points = sub { sprintf "%d.%02d", $_[0] / 100, $_[0] % 100 };
+my $percent = sub { $points->($_[0]) . "%" };
+my ($target_bp, $file_target_bp) = ($hundredths_of->("target", $target), $hundredths_of->("file target", $file_target));
+# The fewest of the missed that would have to be caught for caught / scored
+# to reach a percentage given in hundredths of a point.
+my $to_reach = sub {
+    my ($bp, $caught, $scored) = @_;
+    my $short = $bp * $scored - $caught * 10000;
+    $short > 0 ? int(($short + 9999) / 10000) : 0;
+};
 my $failed = 0;
 my @blocking;
 if ($diff) {
     @blocking = grep { !exists $allowed{ $_->{listed_as} } } @missed;
     $failed = @blocking > 0;
     push @report, "", @blocking
-        ? (scalar(@blocking) . " missed or timed out and not listed in .cargo/mutants-allowed.txt:", map { "  $_->{name}" } @blocking)
+        ? (scalar(@blocking) . " missed, timed out or ended by a signal, and not listed in .cargo/mutants-allowed.txt:", map { "  $_->{name}" } @blocking)
         : "every mutant in the change was caught or is listed in .cargo/mutants-allowed.txt";
 } else {
     refuse("no mutant was caught or missed, so there is no score") if $scored == 0;
-    # A percentage with at most two decimals, in hundredths of a point.
-    my $hundredths_of = sub {
-        my ($what, $value) = @_;
-        my ($whole, $hundredths) = $value =~ /^(\d+)(?:\.(\d{1,2}))?$/ or refuse("the $what $value is not a percentage");
-        $whole * 100 + ($hundredths // 0) * (length($hundredths // "00") == 1 ? 10 : 1);
-    };
-    my $percent = sub { sprintf "%d.%02d%%", $_[0] / 100, $_[0] % 100 };
     my ($floor_bp, $margin_bp) = ($hundredths_of->("floor", $floor), $hundredths_of->("margin", $margin));
     my $score_bp = int($caught * 10000 / $scored);
     $failed = $caught * 10000 < $floor_bp * $scored;
@@ -318,19 +372,34 @@ if ($diff) {
     if ($failed) {
         push @report, "the score is under its floor of $floor%";
     } else {
-        push @report, $caught * 100 >= $target * $scored ? "the target of $target% is met"
-            : sprintf("%.2f points under the target of %s%%", $target - $score_bp / 100, $target);
+        my $needed = $to_reach->($target_bp, $caught, $scored);
+        push @report, $needed == 0 ? "the target of $target% is met"
+            : $points->($target_bp - $score_bp) . " points under the target of $target%; catching $needed of the missed would meet it";
         my $raise_bp = $score_bp - $margin_bp;
         push @report, "the floor in scripts/check-mutants.sh can be raised to " . $percent->($raise_bp) . ", the score less its margin of $margin points"
             if $raise_bp > $floor_bp;
     }
 }
+# Each file'"'"'s score, worst first, and how many of its missed would have to
+# be caught for it to reach the file target.
 my %per_file;
-$per_file{ $_->{file} }++ for @missed;
-if (@missed) {
-    push @report, "", "missed, per file:";
-    push @report, map { sprintf "%7d %s", $per_file{$_}, $_ } sort { $per_file{$b} <=> $per_file{$a} || $a cmp $b } keys %per_file;
-}
+$per_file{ $_->{file} }{caught}++ for @{ $is{caught} }, @{ $is{listed_timeout} }, @{ $is{listed_signalled} };
+$per_file{ $_->{file} }{missed}++ for @missed;
+my @files = map {
+    my ($caught, $missed) = ($per_file{$_}{caught} // 0, $per_file{$_}{missed} // 0);
+    +{ file => $_, caught => $caught, missed => $missed, needed => $to_reach->($file_target_bp, $caught, $caught + $missed) }
+} keys %per_file;
+@files = sort { $a->{caught} * ($b->{caught} + $b->{missed}) <=> $b->{caught} * ($a->{caught} + $a->{missed}) || $a->{file} cmp $b->{file} } @files;
+push @report, "", sprintf("per file, worst first (%d of %d under %s%%):", scalar(grep { $_->{needed} } @files), scalar @files, $file_target),
+    sprintf("%7s %7s %7s %7s  %s", "score", "caught", "missed", "to $file_target%", "file"),
+    map { sprintf "%7s %7d %7d %7d  %s", $percent->(int($_->{caught} * 10000 / ($_->{caught} + $_->{missed}))), @$_{qw(caught missed needed file)} } @files
+    if @files;
+my %ended_as = (build => "its build", test => "its tests", check => "its check");
+my @signalled = sort $by_place @{ $is{listed_signalled} }, @{ $is{signalled} };
+push @report, "", "ended by a signal:", map {
+    sprintf "  %s (%s ended by signal %d, %s)", $_->{name}, $ended_as{ $_->{phase} } // "its run", $_->{signal},
+        exists $allowed{ $_->{listed_as} } ? "listed, counted caught" : "counted missed"
+} @signalled if @signalled;
 my @unbuilt = sort $by_place @{ $is{unbuilt} };
 push @report, "", "not built for this target:", map { "  $_->{name}" } @unbuilt if @unbuilt;
 print "$_\n" for @report;
