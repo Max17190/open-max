@@ -2112,6 +2112,73 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
     (format!("http://{addr}/v1"), served)
 }
 
+/// The recorded sessions say what providers served: `scripts/cache-report.sh
+/// <sessions dir>` reads every session's `<id>.usage.jsonl`, one line per
+/// model request whose reply reported its token usage, and reports the share
+/// of prompt tokens served from cache over the sessions with more than
+/// 100,000 prompt tokens (target 75%), the share of sessions that cached no
+/// prompt token (target 5%), and the p50 and p90 of the gaps between
+/// consecutive requests of a session, a gap over 600 s left out as idle
+/// (target p90 90 s). No test can read a user's sessions, so this one holds
+/// the method to the synthetic ones in `crates/tui/tests/fixtures/sessions`,
+/// whose every number follows from the files: `long` (four requests of
+/// 40,000 prompt tokens, 101,000 cached, gaps of 10, 90 and an idle 900 s)
+/// and `cold` (120,000, none cached, a gap of -10 s, as when the clock moves
+/// back) are the two above 100,000, so the share is 101,000 of 280,000,
+/// 36.1%; `threshold` sums to 100,000 exactly, which is not above, and its
+/// gap of 600 s is not idle; `silent` reports no cached tokens on any of its
+/// three requests, absent or null, and counts as uncached; `corrupt` has one
+/// request among a string count, a fraction and a cut line, which are
+/// skipped, and a blank one, passed over; `alone` has one request and no
+/// gap; `empty` has none and is no session; and an events log beside them is
+/// not read. So 2 of the 6 sessions cached nothing, and the six gaps, -10,
+/// 10, 30, 90, 300 and 600 s, have their p50 at rank 3 and their p90 at rank
+/// 6 (the nearest rank, ceil(q n)): 30 and 600 s, where interpolating would
+/// give 60 and 450 s. It exits 1 for a directory without a usage file and 2
+/// without one directory argument. README.md states the method, held here.
+#[test]
+fn cache_report_measures_recorded_sessions() {
+    let fixture = repo().join("crates/tui/tests/fixtures/sessions");
+    let (code, printed) = ran(script("scripts/cache-report.sh").arg(&fixture));
+    assert_eq!(code, Some(0), "{printed}");
+    assert_eq!(
+        printed,
+        "\
+session   requests  prompt tokens  cached tokens  cached unreported
+long             4        160,000        101,000   63.1%          0
+cold             2        120,000              0    0.0%          0
+threshold        2        100,000         10,000   10.0%          0
+silent           3          5,000              0    0.0%          3
+alone            1            900            500   55.6%          0
+corrupt          1            800            100   12.5%          0
+skipped: 3 lines that are not usage records, 1 file with no request
+cache: 36.1% of prompt tokens cached, 101,000 of 280,000, over 2 sessions above 100,000 prompt tokens; target 75%
+zero-cache: 2 of 6 sessions (33.3%) cached no prompt token, 1 of them reporting no cached tokens at all; target 5%
+gaps: p50 30 s, p90 600 s over 6 gaps of at most 600 s between consecutive requests of a session, 1 of them negative; \
+1 longer gap left out as idle; target p90 90 s
+",
+        "the report over the synthetic sessions changed"
+    );
+    let empty = scratch("cache-report");
+    let (code, printed) = ran(script("scripts/cache-report.sh").arg(&empty));
+    assert_eq!(code, Some(1), "{printed}");
+    assert!(printed.contains("holds no *.usage.jsonl file"), "{printed}");
+    for args in [&[][..], &[fixture.join("long.usage.jsonl")][..], &[fixture.clone(), fixture.clone()][..]] {
+        let (code, printed) = ran(script("scripts/cache-report.sh").args(args));
+        assert_eq!(code, Some(2), "{args:?}: {printed}");
+        assert!(printed.starts_with("usage: "), "{args:?}: {printed}");
+    }
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        "the share of prompt tokens served from cache over the sessions with more than 100,000 prompt tokens (target 75%)",
+        "the share of sessions that cached no prompt token (target 5%)",
+        "a gap over 600 s left out as idle (target p90 90 s)",
+    ] {
+        assert!(readme.contains(claim), "README.md does not say \"{claim}\", which scripts/cache-report.sh reports");
+    }
+    let _ = std::fs::remove_dir_all(empty);
+}
+
 /// One flag runs a sub-agent, and the flag adds nothing to any request.
 /// Method: in a git repository a human trusted in auto, an agent's bash call
 /// (the session marker set, no human present) runs
