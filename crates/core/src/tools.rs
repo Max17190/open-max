@@ -147,10 +147,6 @@ pub fn is_mutating(name: &str) -> bool {
 pub const TOOL_NAMES: &[&str] =
     &["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash"];
 
-pub fn tool_names() -> Vec<String> {
-    TOOL_NAMES.iter().map(|s| s.to_string()).collect()
-}
-
 /// One-line human summary of a call, shown in approval prompts and tool cards.
 pub fn summarize_call(name: &str, args: &Value) -> String {
     match name {
@@ -533,22 +529,10 @@ fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
         Err(e) => return ToolOutcome::err(e.message(rel)),
     };
     // The cap keeps a whole-file read of a huge file out of memory. A
-    // window of one streams instead: this refusal tells the model to
-    // ask for one, and refusing that too leaves it nothing to retry. It
+    // window of one streams instead, and the refusal below tells the model
+    // to ask for one: refusing that too would leave it nothing to retry. It
     // names nothing else, because grep skips a file this large.
-    if meta.len() > MAX_FILE_BYTES && !asked_for_window {
-        return ToolOutcome::err(format!(
-            "file too large ({} bytes); read a range of lines with offset and limit",
-            meta.len()
-        ));
-    }
-    let total = if meta.len() > MAX_FILE_BYTES {
-        match stream_window(file, &mut window, cancel) {
-            Ok(total) => total,
-            Err(_) if cancel.is_cancelled() => return ToolOutcome::err("tool cancelled by user"),
-            Err(e) => return read_error(e),
-        }
-    } else {
+    let total = if meta.len() <= MAX_FILE_BYTES {
         let text = match read_all(file) {
             Ok(t) => t,
             Err(e) => return read_error(e),
@@ -559,6 +543,17 @@ fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
             }
         }
         text.lines().count()
+    } else if asked_for_window {
+        match stream_window(file, &mut window, cancel) {
+            Ok(total) => total,
+            Err(_) if cancel.is_cancelled() => return ToolOutcome::err("tool cancelled by user"),
+            Err(e) => return read_error(e),
+        }
+    } else {
+        return ToolOutcome::err(format!(
+            "file too large ({} bytes); read a range of lines with offset and limit",
+            meta.len()
+        ));
     };
     window.finish(rel, total)
 }
@@ -3307,13 +3302,10 @@ mod tests {
         log_path: Option<PathBuf>,
         log_truncated: bool,
     ) -> ProcessOutput {
-        let status = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("exit 0")
-            .status()
-            .unwrap();
         ProcessOutput {
-            termination: Termination::Exited(status),
+            // The default status is a successful exit: no process is needed
+            // to make one.
+            termination: Termination::Exited(std::process::ExitStatus::default()),
             stdout,
             stderr,
             log_path,
@@ -4574,5 +4566,433 @@ mod tests {
         assert!(!out.ok, "{}", out.output);
         assert!(out.output.contains("cancelled"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `max_output_bytes` sets the cap a command's result is held to, and
+    /// docs/configuration.md gives its default and its floor: unset, the cap
+    /// is that default, and a setting under the floor is held to it.
+    #[test]
+    fn the_output_cap_follows_its_setting_down_to_the_documented_floor() {
+        let cap = |max_output_bytes| {
+            OutputCaps::from_settings(&crate::config::Settings { max_output_bytes, ..Default::default() }).command_bytes
+        };
+        let (default, floor) = (cap(None), cap(Some(0)));
+        let docs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/configuration.md")).unwrap();
+        let documented = format!("`max_output_bytes` (default {default}, floor {floor})");
+        assert!(docs.contains(&documented), "docs/configuration.md does not say {documented}");
+        assert_eq!(cap(Some(floor + 1)), floor + 1, "a setting over the floor is the cap");
+        assert_eq!(cap(Some(floor - 1)), floor, "a setting under the floor is held to it");
+    }
+
+    /// A cancelled command's output is not spent back into the context, but
+    /// its result still records whether there was any, so a `post_tool_use`
+    /// hook can tell a quiet command from a silenced one.
+    #[test]
+    fn a_cancelled_command_records_whether_it_printed() {
+        let cancelled = |printed: &[u8]| {
+            let output = rendered_output(stream(printed.len() as u64, b"", printed), stream(0, b"", b""), None, false);
+            ToolOutcome::from_killed_process("command cancelled by user", &output)
+        };
+        let silenced = cancelled(b"partial output\n");
+        assert_eq!((silenced.ok, silenced.output.as_str()), (false, "command cancelled by user"));
+        assert_eq!(silenced.process_bytes, Some(15));
+        assert!(silenced.process_truncated, "what it printed was dropped");
+        let quiet = cancelled(b"");
+        assert_eq!(quiet.process_bytes, Some(0));
+        assert!(!quiet.process_truncated, "a command that printed nothing lost nothing");
+    }
+
+    /// Approval prompts and tool cards show a call by its one-line summary,
+    /// and a search is summarized by its pattern.
+    #[test]
+    fn a_search_call_is_summarized_by_its_pattern() {
+        assert_eq!(summarize_call("grep", &json!({"pattern": "TODO", "path": "src"})), "TODO");
+        assert_eq!(summarize_call("glob", &json!({"pattern": "**/*.rs"})), "**/*.rs");
+        assert_eq!(summarize_call("glob", &json!({})), "?", "a call without its pattern still shows something");
+    }
+
+    /// list_dir leaves out the three names it skips (version control
+    /// internals, installed dependencies, Finder metadata) and nothing else:
+    /// other dot entries are project files the agent may need.
+    #[test]
+    fn list_dir_hides_only_the_names_it_skips() {
+        let root = temp_project();
+        let dir = root.join("listed");
+        for sub in [".git", "node_modules", ".github"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        for file in [".DS_Store", ".env.example", "README.md"] {
+            std::fs::write(dir.join(file), "x").unwrap();
+        }
+        let out = list_dir(&root, &json!({"path": "listed"}));
+        assert_eq!((out.ok, out.output.as_str()), (true, ".github/\n.env.example\nREADME.md"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A directory of exactly MAX_DIR_ENTRIES entries is listed whole: the
+    /// notice is for entries left out, and there are none.
+    #[test]
+    fn list_dir_at_its_cap_lists_every_entry_without_a_notice() {
+        let root = temp_project();
+        let dir = root.join("full");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..MAX_DIR_ENTRIES {
+            std::fs::write(dir.join(format!("file{i:03}.txt")), "x").unwrap();
+        }
+        let out = list_dir(&root, &json!({"path": "full"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output.lines().count(), MAX_DIR_ENTRIES, "{}", out.output);
+        assert!(!out.output.contains("more entries"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// MAX_FILE_BYTES is the largest file read_file reads whole and grep
+    /// searches: a file of exactly that size is read without a window and
+    /// searched, and one byte more is refused a whole read and skipped by
+    /// grep.
+    #[test]
+    fn a_file_at_the_size_cap_is_read_and_searched_whole() {
+        let root = temp_project();
+        let filler = format!("{}\n", "x".repeat(99));
+        let mut text = format!("needle{}\n", "x".repeat(93));
+        text.push_str(&filler.repeat(MAX_FILE_BYTES as usize / filler.len() - 1));
+        assert_eq!(text.len() as u64, MAX_FILE_BYTES);
+        std::fs::write(root.join("docs/cap.log"), &text).unwrap();
+        let out = read_file(&root, &json!({"path": "docs/cap.log"}));
+        assert!(out.ok && out.output.starts_with("    1 needle"), "{}", out.output.lines().next().unwrap_or_default());
+        let out = grep_tool(&root, &json!({"pattern": "needle", "path": "docs"}));
+        assert_eq!(out.output, format!("docs/cap.log:1: needle{}\n", "x".repeat(93)));
+
+        text.push('\n');
+        std::fs::write(root.join("docs/cap.log"), &text).unwrap();
+        let out = read_file(&root, &json!({"path": "docs/cap.log"}));
+        assert!(!out.ok && out.output.starts_with("file too large"), "{}", out.output);
+        let out = grep_tool(&root, &json!({"pattern": "needle", "path": "docs"}));
+        assert_eq!(out.output, "no matches\n… not searched: 1 file over 1.5 MB");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A line exactly as long as the width read_file shows is shown whole: a
+    /// clip marker on it would send the model after bytes that do not exist.
+    #[test]
+    fn a_line_as_long_as_the_clip_width_is_shown_whole() {
+        let root = temp_project();
+        let exact = "y".repeat(MAX_LINE_CHARS);
+        std::fs::write(root.join("docs/exact.txt"), format!("{exact}\n")).unwrap();
+        let out = read_file(&root, &json!({"path": "docs/exact.txt"}));
+        assert_eq!((out.ok, out.output), (true, format!("    1 {exact}\n")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The byte cap stops a read at the first line that would pass it, so
+    /// lines that fill MAX_READ_BYTES exactly are all shown.
+    #[test]
+    fn a_read_that_fills_the_byte_cap_exactly_shows_every_line() {
+        let root = temp_project();
+        // A line shows as a five-column number, a space, the line and a
+        // newline, so a hundred lines of this length fill the cap exactly.
+        let shown = MAX_READ_BYTES / 100;
+        assert_eq!(shown * 100, MAX_READ_BYTES, "the cap splits into a hundred whole lines");
+        let line = "z".repeat(shown - 7);
+        std::fs::write(root.join("docs/full.txt"), format!("{line}\n").repeat(100)).unwrap();
+        let out = read_file(&root, &json!({"path": "docs/full.txt"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output.lines().last(), Some(format!("  100 {line}").as_str()), "the last line is shown");
+        assert_eq!(out.output.len(), MAX_READ_BYTES, "and nothing follows it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A window of a file too large to load whole decodes only the lines it
+    /// shows, and one of those that is not UTF-8 refuses the read, as it does
+    /// in a file read whole: here a short line that stops partway into a
+    /// character. Only a line clipped to the prefix read_file shows may end
+    /// inside one, and that is no error.
+    #[test]
+    fn a_large_files_window_refuses_a_line_that_is_not_utf8() {
+        let root = temp_project();
+        let line = b"row of a large log\n";
+        let rows = MAX_FILE_BYTES as usize / line.len() + 1;
+        let mut bytes = line.repeat(rows);
+        let at = rows / 2 * line.len();
+        bytes.splice(at..at, b"broken \xe2\x82\n".iter().copied());
+        std::fs::write(root.join("big.log"), &bytes).unwrap();
+        let out = read_file(&root, &json!({"path": "big.log", "offset": rows / 2 + 1, "limit": 1}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "big.log is not a UTF-8 text file"));
+        let out = read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 2}));
+        assert!(out.ok, "the lines a window shows are all it decodes: {}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The hint on an edit miss names the line most like the first line of
+    /// the copied text, scored against both lengths: not a short line that
+    /// shares a letter with it, and an exact copy of that first line when
+    /// the miss is in a later one. Of lines equally close it names the first.
+    #[test]
+    fn an_edit_miss_names_the_most_similar_line() {
+        let root = temp_project();
+        for (content, old_string, line) in [
+            ("h\nhello world!\n", "hello, world", 2),
+            ("foo()\nbaz()\n", "foo()\nbar()", 1),
+            ("ba\nba\n", "ab", 1),
+        ] {
+            std::fs::write(root.join("docs/hint.txt"), content).unwrap();
+            let out = edit_file(&root, &json!({"path": "docs/hint.txt", "old_string": old_string, "new_string": "x"}));
+            assert!(!out.ok, "{}", out.output);
+            let named = format!("Closest match is at line {line}:");
+            assert!(out.output.contains(&named), "{content:?} for {old_string:?}: {}", out.output);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file with no line break has no line ending to keep, so lines an
+    /// edit adds to it end in LF.
+    #[test]
+    fn an_edit_to_a_file_without_line_breaks_adds_lf_lines() {
+        let root = temp_project();
+        std::fs::write(root.join("docs/one.txt"), "alpha").unwrap();
+        let out = edit_file(&root, &json!({"path": "docs/one.txt", "old_string": "alpha", "new_string": "alpha\nbeta"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("docs/one.txt")).unwrap(), "alpha\nbeta");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The note that line endings may explain a multi-line miss is for a
+    /// file that mixes CRLF and LF. A file that uses one of them throughout
+    /// already reads the copied text with that ending, so there the note
+    /// would blame endings for a miss they did not cause.
+    #[test]
+    fn only_a_mixed_ending_file_blames_line_endings_for_a_miss() {
+        let root = temp_project();
+        for content in ["one\ntwo\n", "one\r\ntwo\r\n"] {
+            std::fs::write(root.join("docs/plain.txt"), content).unwrap();
+            let out = edit_file(&root, &json!({"path": "docs/plain.txt", "old_string": "one\nthree", "new_string": "1\n3"}));
+            assert!(!out.ok && out.output.starts_with("old_string not found."), "{content:?}: {}", out.output);
+            assert!(!out.output.contains("line endings"), "{content:?}: {}", out.output);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A glob of exactly MAX_RESULTS matches lists them all with no notice,
+    /// and a match past the cap is counted as left out.
+    #[test]
+    fn glob_at_its_cap_lists_every_match_and_counts_any_past_it() {
+        let root = temp_project();
+        std::fs::create_dir_all(root.join("many")).unwrap();
+        for i in 0..MAX_RESULTS {
+            std::fs::write(root.join(format!("many/f{i:03}.txt")), "x").unwrap();
+        }
+        let out = glob_tool(&root, &json!({"pattern": "many/*.txt"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output.lines().count(), MAX_RESULTS, "{}", out.output);
+        assert!(!out.output.contains("more matches"), "{}", out.output);
+        std::fs::write(root.join("many/extra.txt"), "x").unwrap();
+        let out = glob_tool(&root, &json!({"pattern": "many/*.txt"}));
+        assert_eq!(out.output.lines().count(), MAX_RESULTS + 1, "{}", out.output);
+        assert!(out.output.ends_with("\n… 1 more matches not shown"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// grep names every reason it passed over files, each with its count,
+    /// files it could not read at all among them; a search that skipped
+    /// nothing carries no note.
+    #[test]
+    fn grep_counts_every_reason_it_skipped_files() {
+        assert_eq!(
+            skipped_note(1, 2, 3).as_deref(),
+            Some("… not searched: 1 file over 1.5 MB, 2 files not UTF-8 text, 3 files unreadable")
+        );
+        assert_eq!(skipped_note(0, 0, 1).as_deref(), Some("… not searched: 1 file unreadable"));
+        assert_eq!(skipped_note(0, 0, 0), None);
+    }
+
+    /// grep's glob limits the search to the files it matches, by name or by
+    /// path: a match in any other file is left out.
+    #[test]
+    fn grep_searches_only_the_files_its_glob_matches() {
+        let root = temp_project();
+        let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "*.rs"}));
+        assert!(out.ok, "{}", out.output);
+        let hits: Vec<&str> = out.output.lines().collect();
+        assert_eq!(hits, ["src/a.rs:1: fn alpha() {}", "src/a.rs:2: fn alpha_two() {}", "src/deep/b.rs:1: fn alpha_three() {}"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A cut that lands inside a character moves to the nearest character
+    /// boundary inside the budget: a kept head ends before that character
+    /// and a kept tail starts after it, so neither runs past its budget.
+    #[test]
+    fn a_cut_inside_a_character_keeps_within_its_budget() {
+        let text = "ééééé";
+        assert_eq!(kept_head(text, 5), "éé");
+        assert_eq!(kept_tail(text, 5), "éé");
+    }
+
+    /// The kept tail of a long output starts at a line when a line break is
+    /// close by, dropping at most the 200 bytes through it; a break 200
+    /// bytes in keeps the partial line rather than drop more.
+    #[test]
+    fn a_kept_tail_drops_at_most_two_hundred_bytes_to_start_a_line() {
+        let near = format!("{}\nrest", "x".repeat(199));
+        assert_eq!(from_a_line_start(&near), "rest");
+        let far = format!("{}\nrest", "x".repeat(200));
+        assert_eq!(from_a_line_start(&far), far);
+    }
+
+    /// The kept head of a long output ends at a line when its last line
+    /// break is within 200 bytes of its end, the break among them, and drops
+    /// what follows the break; a break further back keeps the partial line
+    /// rather than drop more.
+    #[test]
+    fn a_kept_head_ends_at_a_line_break_within_two_hundred_bytes_of_its_end() {
+        let near = format!("head\n{}", "x".repeat(199));
+        assert_eq!(to_a_line_end(&near), "head\n");
+        let far = format!("head\n{}", "x".repeat(200));
+        assert_eq!(to_a_line_end(&far), far);
+    }
+
+    /// A kept head with no line break in it is followed by one the output
+    /// adds, and the tail's budget leaves room for it, so the stream still
+    /// fits its share of the cap.
+    #[test]
+    fn a_head_without_a_line_break_keeps_the_output_inside_the_cap() {
+        let (head, tail) = ("h".repeat(2_000), "t".repeat(8_000));
+        let output = rendered_output(stream(100_000, head.as_bytes(), tail.as_bytes()), stream(0, b"", b""), None, false);
+        let cap = 4_000;
+        let (text, truncated) = render_process_output(&output, cap);
+        assert!(truncated);
+        let (notice, body) = text.split_once('\n').unwrap();
+        assert_eq!(notice, "[middle of output truncated]");
+        assert!(body.starts_with(&format!("{}\n[… ", &head[..cap / HEAD_SHARE_DIVISOR])), "{body}");
+        assert!(body.len() <= cap, "{} bytes past a cap of {cap}", body.len() - cap);
+    }
+
+    /// Output and errors that fit the cap together are shown whole, with no
+    /// notice that anything was cut.
+    #[test]
+    fn stdout_and_stderr_that_fit_the_cap_together_are_shown_whole() {
+        let (out, err) = ("o".repeat(500), "e".repeat(100));
+        let output = rendered_output(stream(500, b"", out.as_bytes()), stream(100, b"", err.as_bytes()), None, false);
+        let (text, truncated) = render_process_output(&output, 1_000);
+        assert!(!truncated);
+        assert_eq!(text, format!("{out}\n[stderr]\n{err}"));
+    }
+
+    /// The notice says the middle of a cut output was dropped when the text
+    /// starts as the output did, which holds when either stream kept its
+    /// head: here the output kept its head, and a short error stream beside
+    /// it was shown whole.
+    #[test]
+    fn the_notice_says_the_middle_was_cut_when_either_stream_kept_its_head() {
+        let (head, tail) = ("h\n".repeat(1_000), "t\n".repeat(4_000));
+        let output = rendered_output(stream(100_000, head.as_bytes(), tail.as_bytes()), stream(8, b"", b"warning\n"), None, false);
+        let (text, truncated) = render_process_output(&output, 4_000);
+        assert!(truncated);
+        assert_eq!(text.lines().next(), Some("[middle of output truncated]"), "{text}");
+        assert!(text.ends_with("\n[stderr]\nwarning\n"), "{text}");
+    }
+
+    /// A command whose output the result cuts names a log that holds all of
+    /// it, so the model can read what the result left out: a cut a few
+    /// kilobytes past the cap, and one of over a megabyte, inside the 16 MiB
+    /// docs/configuration.md says each stream's log keeps.
+    #[tokio::test]
+    async fn output_the_result_cuts_is_kept_whole_in_the_log_it_names() {
+        let root = temp_project();
+        let line = "0123456789abcdefghijklmnopqrstuvwxyz\n";
+        for size in [MAX_OUTPUT_BYTES + 2_000, 1_100_000] {
+            let command = format!("yes {} | head -c {size}", line.trim_end());
+            let out = bash_tool(
+                &root.join("data"),
+                &root,
+                &json!({"command": command}),
+                OutputCaps::default(),
+                Arc::new(CancelToken::default()),
+            )
+            .await;
+            assert!(out.ok, "{}", out.output);
+            let log = out.output.split("bounded output log saved to ").nth(1).and_then(|rest| rest.split(';').next());
+            let log = log.unwrap_or_else(|| panic!("a {size}-byte output names no log: {}", out.output.lines().next().unwrap_or_default()));
+            let kept = std::fs::read(log).unwrap();
+            let printed = line.repeat(size / line.len() + 1);
+            assert!(kept == printed.as_bytes()[..size], "the log of a {size}-byte output holds {} bytes", kept.len());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A write replaces a plain file through a temp file beside it, so a
+    /// failure partway leaves the old file whole: nothing about this one (no
+    /// other links, no access control list, owned by this user) calls for a
+    /// write in place instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_file_is_replaced_through_a_temp_file() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_project();
+        let path = root.join("docs/plain.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(write_regular(&path, "docs/plain.txt", b"new\n"), Ok(()));
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode, "written in place");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A directory flagged append-only takes a new file but refuses the
+    /// rename over an old one and the removal of the temp file, so the file
+    /// is written in place and the temp file, holding the new contents, is
+    /// left beside it. `uappnd` is a flag the directory's owner sets, so
+    /// this needs no privilege.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_in_an_append_only_directory_is_written_in_place() {
+        let root = temp_project();
+        let dir = root.join("journal");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("log.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let chflags = |flag: &str| {
+            let status = std::process::Command::new("/usr/bin/chflags").arg(flag).arg(&dir).status().unwrap();
+            assert!(status.success(), "chflags {flag} failed");
+        };
+        chflags("uappnd");
+        let written = write_regular(&path, "journal/log.txt", b"new\n");
+        let names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        // Clear before any assertion, so a failure leaves nothing that cannot
+        // be removed.
+        chflags("nouappnd");
+        assert_eq!(written, Ok(()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let left: Vec<&String> = names.iter().filter(|name| name.ends_with(".tmp")).collect();
+        assert_eq!(left.len(), 1, "one temp file stays beside it: {names:?}");
+        assert_eq!(std::fs::read_to_string(dir.join(left[0])).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A signal kill is named only where Linux and macOS give the signal the
+    /// same number, checked against this platform's own numbering; SIGBUS,
+    /// which they number differently, stays a bare number.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_is_named_only_where_its_number_means_the_same_everywhere() {
+        use std::os::unix::process::ExitStatusExt;
+        for (signal, name) in [
+            (libc::SIGHUP, "SIGHUP"),
+            (libc::SIGINT, "SIGINT"),
+            (libc::SIGILL, "SIGILL"),
+            (libc::SIGABRT, "SIGABRT"),
+            (libc::SIGFPE, "SIGFPE"),
+            (libc::SIGKILL, "SIGKILL"),
+            (libc::SIGSEGV, "SIGSEGV"),
+            (libc::SIGPIPE, "SIGPIPE"),
+            (libc::SIGALRM, "SIGALRM"),
+            (libc::SIGTERM, "SIGTERM"),
+            (libc::SIGXCPU, "SIGXCPU"),
+        ] {
+            let status = std::process::ExitStatus::from_raw(signal);
+            assert_eq!(describe_exit(&status), format!("killed by signal {signal} ({name})"));
+        }
+        let status = std::process::ExitStatus::from_raw(libc::SIGBUS);
+        assert_eq!(describe_exit(&status), format!("killed by signal {}", libc::SIGBUS));
     }
 }
