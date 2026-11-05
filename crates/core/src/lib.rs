@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod chatgpt;
 pub mod client;
+mod compaction;
 pub mod config;
 pub mod doctor;
 pub mod execution;
