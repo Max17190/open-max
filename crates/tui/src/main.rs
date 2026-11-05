@@ -653,6 +653,10 @@ fn settings_conflict(cli: &CliArgs, data_dir: &std::path::Path) -> Option<String
 fn main() -> std::io::Result<std::process::ExitCode> {
     let cli = match parse_args() {
         Ok(a) => a,
+        // A run's watcher: a command line no run parses (`execution::lifeline`).
+        Err(_) if open_max_core::execution::lifeline(&std::env::args_os().skip(1).collect::<Vec<_>>()) => {
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
         Err(e) => {
             eprintln!("openmax: {e}\n\n{HELP}");
             std::process::exit(2);
@@ -769,8 +773,8 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let data_dir = default_data_dir();
     // Behind the first frame, as every file read is, and before anything
     // can start a tool: as `run` does, stop the tool groups a harness killed
-    // outright left running, then record this session's own.
-    open_max_core::execution::reap_left_behind_groups(&data_dir);
+    // outright left running, then record this session's own for a watcher.
+    open_max_core::execution::reap_left_behind_groups(&data_dir, true);
     if let Some(reason) = settings_conflict(&cli, &data_dir) {
         refuse(2, &reason, None);
     }
@@ -1293,9 +1297,9 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         }
     }
 
-    // Every launch that can start a turn or a tool first stops the tool
-    // groups a harness killed outright left running, then records its own.
-    open_max_core::execution::reap_left_behind_groups(&default_data_dir());
+    // Every launch that can start a turn or a tool first stops the groups a
+    // harness killed outright left running, then records its own for a watcher.
+    open_max_core::execution::reap_left_behind_groups(&default_data_dir(), true);
 
     if cli.check {
         // With --stdio, validate a JSONL protocol stream on stdin instead of

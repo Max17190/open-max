@@ -1634,12 +1634,14 @@ mod first_frame {
 
     /// The session at a terminal starts behind its first frame, apart from
     /// every other run, and records its tool groups as they do: a session
-    /// killed outright leaves its tool's tree running and recorded, and the
-    /// next session at a terminal stops it once its first frame is up and
-    /// removes the record, before it checks its settings flags against
-    /// settings.json, asks for trust or writes settings: here a session
-    /// whose flag settings.json refuses (exit 2) still stops it. The tree
-    /// ignores SIGTERM, so only the SIGKILL after the grace stops it.
+    /// killed outright, its watcher first, leaves its tool's tree running and
+    /// recorded, and the next session at a terminal stops it once its first
+    /// frame is up and removes the record, before it checks its settings
+    /// flags against settings.json, asks for trust or writes settings: here a
+    /// session whose flag settings.json refuses (exit 2) still stops it. The
+    /// tree ignores SIGTERM, so only the SIGKILL after the grace stops it.
+    /// The watcher is the process whose command line names the record
+    /// (`openmax --lifeline <record> <start>`).
     #[test]
     fn a_session_at_a_terminal_stops_the_tools_a_killed_session_left_running() {
         let script = "trap '' TERM; echo $$ >> ../pids; sleep 6841 & echo $! >> ../pids; exec sleep 7841";
@@ -1670,6 +1672,21 @@ mod first_frame {
             }
             killed.pump(Duration::from_millis(20));
         };
+        // Started by the record's first write, so waited for.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let watcher = loop {
+            let out = Command::new("ps").args(["-A", "-ww", "-o", "pid=", "-o", "args="]).output().expect("ps runs");
+            let (listing, needle) = (String::from_utf8_lossy(&out.stdout), record.to_string_lossy());
+            let watcher: Option<i32> =
+                listing.lines().filter(|line| line.contains(&*needle)).find_map(|line| line.split_whitespace().next()?.parse().ok());
+            if watcher.is_some() || Instant::now() >= deadline {
+                break watcher;
+            }
+            killed.pump(Duration::from_millis(20));
+        };
+        if let Some(watcher) = watcher {
+            unsafe { libc::kill(watcher, libc::SIGKILL) };
+        }
         let _ = killed.child.kill();
         let deadline = Instant::now() + Duration::from_secs(10);
         while killed.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
@@ -1696,6 +1713,7 @@ mod first_frame {
             unsafe { libc::kill(*pid, libc::SIGKILL) };
         }
         let record_kept = record.exists();
+        assert!(watcher.is_some(), "the session's first tool started no watcher: {}", killed.context());
         assert!(survived_the_kill, "the tool tree did not outlive SIGKILL, so this proves nothing: {pids:?}");
         assert!(recorded, "the killed session left no record of its tool groups at {}", record.display());
         assert_eq!(status.and_then(|e| e.code()), Some(2), "the flag was not refused: {}", next.context());

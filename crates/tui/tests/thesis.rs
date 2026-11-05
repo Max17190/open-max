@@ -3448,60 +3448,153 @@ fn sse_answer(text: &str) -> String {
     )
 }
 
-/// Zero orphans after kill -9: once openmax starts again, no process of a
-/// tool tree that an openmax killed outright left running is still running.
-///
-/// Method: a print run (`-p`) on a fresh HOME and project, whose endpoint
-/// asks for one `bash` call. Its shell ignores SIGTERM, writes its pid,
-/// starts a subshell in the background, writes that pid and waits; the
-/// subshell starts a sleeper, the shell's grandchild, writes its pid and
-/// waits. Every process of the tree inherits the ignored SIGTERM, so only a
-/// SIGKILL ends it. Once the three pids are written and the run's record of
-/// its tool groups (`~/.openmax/run/<pid>.groups`) lists the shell's, the
-/// test sends openmax SIGKILL and waits for it, as the shell that started it
-/// would. (b) With nothing started since, it counts the processes of the
-/// tree still running 500 ms after the kill, and prints that count. (a) It
-/// then runs `openmax --check` on the same HOME and counts the processes of
-/// the tree still running once that has exited, waiting up to 500 ms for
-/// the process that adopted them to collect the ones it ended, since
-/// `kill(pid, 0)` finds a process until then. The gate is (a), zero, a
-/// count asserted in every build; (b) only reports.
+/// Whether a process holds `pid`: a zombie still does, until the process
+/// that adopted it collects it.
 #[cfg(unix)]
-#[test]
-fn zero_orphans_after_kill_9() {
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// A run's watchers, `openmax --lifeline <record> <start>`: the processes
+/// whose command line names its `record`, as `ps` lists them at full width,
+/// waited for up to 10 seconds, as the run starts its watcher once the
+/// record is first written.
+#[cfg(unix)]
+fn watchers_of(record: &Path) -> Vec<i32> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = Command::new("ps").args(["-A", "-ww", "-o", "pid=", "-o", "args="]).output().expect("ps runs");
+        assert!(out.status.success(), "ps failed: {}", String::from_utf8_lossy(&out.stderr));
+        let (listing, needle) = (String::from_utf8_lossy(&out.stdout), record.to_string_lossy());
+        let found: Vec<i32> =
+            listing.lines().filter(|line| line.contains(&*needle)).filter_map(|line| line.split_whitespace().next()?.parse().ok()).collect();
+        if !found.is_empty() || Instant::now() >= deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A print run (`-p`) on a fresh project whose endpoint asks for one `bash`
+/// call running `script`, then answers; with the path of the run's record
+/// of its tool groups. With `home`, HOME is a fresh directory, which holds
+/// the record (`~/.openmax/run/<pid>.groups`). Without it, the run has no
+/// HOME, so its data directory is the relative `.openmax`, which names one
+/// in the project, the directory the run runs in; the record's path then
+/// names the project as the run reads its working directory, with every
+/// symbolic link resolved (macOS's temporary directory is under one), as
+/// the run's watcher is given it.
+#[cfg(unix)]
+fn run_one_bash_call(tag: &str, home: bool, script: impl Fn(&Path) -> String) -> (std::process::Child, PathBuf, PathBuf) {
     use std::process::Stdio;
-    let (project, home) = fresh_install("orphans", 0);
-    let base = project.parent().unwrap().to_path_buf();
-    let listed = base.join("pids");
-    let script = format!(
-        "trap '' TERM; echo $$ >> '{p}'; (sleep 6845 & echo $! >> '{p}'; wait) & echo $! >> '{p}'; wait",
-        p = listed.display()
-    );
-    let arguments = serde_json::json!({ "command": script }).to_string();
+    let (project, home_dir) = fresh_install(tag, 0);
+    let arguments = serde_json::json!({ "command": script(project.parent().unwrap()) }).to_string();
     let call = serde_json::json!({"choices": [{"finish_reason": null, "delta": {"tool_calls": [
         {"index": 0, "id": "call-1", "type": "function", "function": {"name": "bash", "arguments": arguments}},
     ]}}]});
     let end = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
     let base_url = spawn_server(vec![format!("data: {call}\n\ndata: {end}\n\ndata: [DONE]\n\n")]);
-    let openmax = |args: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
-        cmd.current_dir(&project).env("HOME", &home).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
-        // Test automation is a human act with no terminal; the grant needs
-        // it said.
-        cmd.env("OPENMAX_HUMAN_ATTEST", "1").args(args).stdin(Stdio::null());
-        cmd
+    let mut run = Command::new(env!("CARGO_BIN_EXE_openmax"));
+    run.current_dir(&project).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
+    let data = if home {
+        run.env("HOME", &home_dir);
+        home_dir.join(".openmax")
+    } else {
+        run.env_remove("HOME");
+        std::fs::canonicalize(&project).unwrap().join(".openmax")
     };
-    let mut run = openmax(&["--trust-project", "--base-url", &base_url, "--model", "m", "--context-tokens", "32768"])
-        .args(["-p", "start the tree"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let record = home.join(".openmax").join("run").join(format!("{}.groups", run.id()));
-    let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+    // Test automation is a human act with no terminal; the grant needs it
+    // said.
+    run.env("OPENMAX_HUMAN_ATTEST", "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    run.args(["--trust-project", "--base-url", &base_url, "--model", "m", "--context-tokens", "32768", "-p", tag]);
+    let run = run.spawn().unwrap();
+    let record = data.join("run").join(format!("{}.groups", run.id()));
+    (run, project.parent().unwrap().to_path_buf(), record)
+}
+
+/// Where `zero_orphans_after_kill_9` lists each process it counted, under
+/// the target directory's `tmp`, which the CI test job keeps as an artifact
+/// on each runner.
+const ORPHANS_LISTING: &str = "zero-orphans-after-kill-9.txt";
+
+/// The CI test job keeps `ORPHANS_LISTING` on each of its runners: a step
+/// after the test run, which runs after a failing test too and on every
+/// runner of the matrix, uploads it from `target/tmp`, where cargo's
+/// `CARGO_TARGET_TMPDIR` points in that job, under a name per runner, fails
+/// when the file is missing once the tests have passed, and replaces it on a
+/// re-run of the job. After a failing test it only warns of a missing file:
+/// cargo stops at the first test binary that fails, and one that runs before
+/// the thesis tests leaves no listing.
+#[test]
+fn ci_keeps_the_orphan_listing_on_each_runner() {
+    let job = ci_job("test");
+    let tests = job.iter().position(|line| line.trim() == "run: cargo test --workspace --locked").expect("the test job runs no tests");
+    let path = format!("path: target/tmp/{ORPHANS_LISTING}");
+    let kept = job.iter().position(|line| line.trim() == path).expect("the test job keeps no orphan listing");
+    assert!(tests < kept, "the test job keeps the listing before its tests write it");
+    assert!(step_keys(&job, tests).contains(&"id: test"), "the step that runs the tests has no `id: test` for the listing's step to read");
+    let keys = step_keys(&job, kept);
+    let wanted = [
+        "if: ${{ !cancelled() }}",
+        "name: zero-orphans-after-kill-9-${{ matrix.os }}",
+        "if-no-files-found: ${{ steps.test.outcome == 'success' && 'error' || 'warn' }}",
+        "overwrite: true",
+    ];
+    for key in wanted {
+        assert!(keys.contains(&key), "the step that keeps the orphan listing lacks `{key}`: {keys:?}");
+    }
+    assert!(keys.iter().any(|key| key.starts_with("uses: actions/upload-artifact@")), "{keys:?}");
+}
+
+/// Zero orphans after kill -9: 500 ms after an openmax is killed outright,
+/// with no launch since, no process of a tool tree it left is running, and
+/// neither is the watcher its first tool started. The method is
+/// `assert_no_orphans_after_kill_9`'s, on a run whose HOME holds its data
+/// directory; this run's listing is the one CI keeps.
+#[cfg(unix)]
+#[test]
+fn zero_orphans_after_kill_9() {
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", true, Some(ORPHANS_LISTING));
+}
+
+/// The same for a run with no HOME, whose data directory is therefore the
+/// relative `.openmax`, in the directory it runs in, while its watcher runs
+/// in `/`: the watcher must be given the record's absolute path to find it.
+#[cfg(unix)]
+#[test]
+fn zero_orphans_after_kill_9_with_no_home() {
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_with_no_home", false, None);
+}
+
+/// Kill a print run outright in the middle of a `bash` call whose tree only
+/// SIGKILL ends, and assert that 500 ms later, with no launch since, no
+/// process of the tree is running, nor the watcher the run's first tool
+/// started, found before the kill. `name` is the run's prompt, its install's
+/// tag and its listing's first word, `home` is as `run_one_bash_call` takes
+/// it, and the listing is written to `listing_file` under the target
+/// directory's `tmp` when that is given.
+///
+/// Method: the call's shell ignores SIGTERM, writes its pid, starts a
+/// subshell in the background, writes that pid and waits; the subshell
+/// starts a sleeper, the shell's grandchild, writes its pid and waits, and
+/// each inherits the ignored SIGTERM. Once the three pids are written and the
+/// run's record lists the shell's group, this waits for the run's watcher,
+/// which the record's first write starts, then sends the run SIGKILL and
+/// waits for it, as the shell that started it would. 500 ms after the signal
+/// it counts the processes of the tree, and the watcher, that `kill(pid, 0)`
+/// still finds, a zombie its new parent has not collected among them, and
+/// lists each pid with whether it was found. The gate is zero, a count
+/// asserted in every build, and a watcher found before the kill.
+#[cfg(unix)]
+fn assert_no_orphans_after_kill_9(name: &str, home: bool, listing_file: Option<&str>) {
+    let (mut run, base, record) = run_one_bash_call(name, home, |base| {
+        let p = base.join("pids");
+        let p = p.display();
+        format!("trap '' TERM; echo $$ >> '{p}'; (sleep 6845 & echo $! >> '{p}'; wait) & echo $! >> '{p}'; wait")
+    });
     let deadline = Instant::now() + Duration::from_secs(10);
     let tree = loop {
-        let text = std::fs::read_to_string(&listed).unwrap_or_default();
+        let text = std::fs::read_to_string(base.join("pids")).unwrap_or_default();
         let tree: Vec<i32> = text.lines().filter_map(|line| line.trim().parse().ok()).collect();
         let recorded = std::fs::read_to_string(&record).unwrap_or_default();
         let shell = tree.first().map(|shell| format!("{shell} "));
@@ -3511,36 +3604,98 @@ fn zero_orphans_after_kill_9() {
         if Instant::now() >= deadline || run.try_wait().unwrap().is_some() {
             let _ = run.kill();
             let _ = run.wait();
-            for pid in tree.iter().filter(|pid| alive(pid)) {
-                unsafe { libc::kill(*pid, libc::SIGKILL) };
+            for &pid in tree.iter().filter(|&&pid| alive(pid)) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             }
             panic!("the tool tree did not start, or was not recorded: pids {tree:?}, record {recorded:?}");
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    let watcher = watchers_of(&record).first().copied();
     unsafe { libc::kill(run.id() as libc::pid_t, libc::SIGKILL) };
     let killed = Instant::now();
     run.wait().unwrap();
     std::thread::sleep(Duration::from_millis(500).saturating_sub(killed.elapsed()));
-    let unlaunched = tree.iter().filter(|pid| alive(pid)).count();
-    let check = openmax(&["--check"]).output().unwrap();
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while tree.iter().any(alive) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
+    let survivors: Vec<i32> = tree.iter().copied().filter(|&pid| alive(pid)).collect();
+    let watcher_left = watcher.is_some_and(alive);
+    let state = |pid: i32| if survivors.contains(&pid) || (watcher_left && watcher == Some(pid)) { "alive" } else { "gone" };
+    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let mut listing = format!(
+        "{name} on {}, {build} build: each process of the tool tree and the watcher of a print run that got \
+         SIGKILL, 500 ms after the signal, with no launch since\n",
+        std::env::consts::OS
+    );
+    for (n, &pid) in tree.iter().enumerate() {
+        listing.push_str(&format!("{} {pid} {}\n", if n == 0 { "shell" } else { "descendant" }, state(pid)));
     }
-    let survivors: Vec<i32> = tree.iter().copied().filter(alive).collect();
-    for pid in &survivors {
-        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    listing.push_str(&watcher.map_or("watcher none\n".into(), |pid| format!("watcher {pid} {}\n", state(pid))));
+    for &pid in survivors.iter().chain(watcher.iter().filter(|_| watcher_left)) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     let _ = std::fs::remove_dir_all(&base);
+    if let Some(file) = listing_file {
+        std::fs::write(Path::new(env!("CARGO_TARGET_TMPDIR")).join(file), &listing).unwrap();
+    }
     println!(
-        "orphans after kill -9: {unlaunched} of the tool tree's {} processes running 500 ms after the kill with no \
-         launch since; {} once `openmax --check` has run",
-        tree.len(),
-        survivors.len()
+        "{name}: {} of the tool tree's {} processes running 500 ms after the kill with no launch since",
+        survivors.len(),
+        tree.len()
     );
-    let stderr = String::from_utf8_lossy(&check.stderr);
-    assert!(survivors.is_empty(), "the next launch left the tool tree running: {survivors:?}\n{stderr}");
+    assert!(survivors.is_empty(), "the tool tree outlived its killed run by 500 ms: {survivors:?}\n{listing}");
+    assert!(watcher.is_some(), "the run's first tool started no watcher\n{listing}");
+    assert!(!watcher_left, "the watcher outlived its killed run by 500 ms\n{listing}");
+}
+
+/// A run's watcher ends with the run. A print run whose `bash` call writes
+/// its shell's pid and waits for a file to appear: while the call waits, one
+/// process names the run's record in its command line, the watcher the call
+/// started, and once the test has made the file and the run has answered
+/// and exited 0, that process is gone within 500 ms.
+#[cfg(unix)]
+#[test]
+fn a_runs_watcher_ends_with_the_run() {
+    let (mut run, base, record) = run_one_bash_call("watcher", true, |base| {
+        let (shell, go) = (base.join("shell"), base.join("go"));
+        format!("echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.01; done", shell.display(), go.display())
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let shell: i32 = loop {
+        let shell = std::fs::read_to_string(base.join("shell")).ok().and_then(|text| text.trim().parse().ok());
+        let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+        if let Some(shell) = shell.filter(|shell| recorded.lines().any(|line| line.starts_with(&format!("{shell} ")))) {
+            break shell;
+        }
+        let ended = run.try_wait().unwrap();
+        if Instant::now() >= deadline || ended.is_some() {
+            let _ = run.kill();
+            let _ = run.wait();
+            if let Some(shell) = shell {
+                unsafe { libc::kill(-shell, libc::SIGKILL) };
+            }
+            panic!("the bash call did not start, or was not recorded: run {ended:?}, record {recorded:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let watchers = watchers_of(&record);
+    std::fs::write(base.join("go"), "").unwrap();
+    let out = run.wait_with_output().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while watchers.iter().any(|&pid| alive(pid)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let left: Vec<i32> = watchers.iter().copied().filter(|&pid| alive(pid)).collect();
+    for &pid in &left {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    if alive(shell) {
+        unsafe { libc::kill(-shell, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("first answer"), "{stderr}");
+    assert_eq!(watchers.len(), 1, "the run's bash call had {} watchers, not one: {watchers:?}", watchers.len());
+    assert!(left.is_empty(), "the watcher outlived its run, which exited 0, by 500 ms: {left:?}");
 }
 
 /// One command from a fresh install to a first real answer in under 30

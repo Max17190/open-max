@@ -40,7 +40,26 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Test
+        id: test
         run: cargo test --workspace --locked
+
+      # zero_orphans_after_kill_9 lists each process of the tool tree whose
+      # run it killed, and the run's watcher, with whether each still ran
+      # 500 ms after the SIGKILL: the gate's evidence, kept on each runner,
+      # after a failing test too. A missing listing fails this step only
+      # when the tests passed: cargo stops at the first test binary that
+      # fails, and one that runs before the thesis tests leaves no listing.
+      # A re-run of the job keeps the artifacts its earlier attempt uploaded,
+      # and the upload refuses a name the run already holds unless it may
+      # overwrite it, so the re-run replaces it.
+      - name: Keep the orphan listing
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zero-orphans-after-kill-9-${{ matrix.os }}
+          path: target/tmp/zero-orphans-after-kill-9.txt
+          if-no-files-found: ${{ steps.test.outcome == 'success' && 'error' || 'warn' }}
+          overwrite: true
 
       # Run the built suite with all test binaries and their thread pools at
       # once. Linux enforces its 15-second budget. macOS keeps its 20-second
