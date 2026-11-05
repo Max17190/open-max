@@ -8,9 +8,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use common::{close, drive_turn, note_marker, recording_endpoint};
+use common::{close, drive_steered_turn, drive_turn, note_marker, recording_endpoint};
 use open_max_core::prompt::NOTE_HEADER;
+use open_max_core::providers::WireApi;
 use open_max_core::state::Core;
+use open_max_core::types::{estimate_tokens, AgentEvent};
 use serde_json::value::RawValue;
 
 /// One message's raw JSON with the trailing note cut out of its content:
@@ -450,4 +452,363 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
     }
     assert!(!last.contains(map_line), "the note repeats the prompt's index: {last}");
     let _ = std::fs::remove_dir_all(PathBuf::from(&dir));
+}
+
+/// At least 75% of what a session sends could come from a prompt cache: the
+/// target of the share `scripts/cache-report.sh` reports from recorded
+/// sessions (cached over prompt tokens, over the sessions above 100,000
+/// prompt tokens), held here offline, as the bound the harness itself sets.
+/// A provider's cache serves a request no more than the prefix it shares with
+/// one sent before it (the whole rendered prefix must match, in OpenAI's and
+/// Anthropic's prompt caching guides), so a byte the harness rewrites is lost
+/// on every provider. No provider's routing or eviction is measured here.
+///
+/// Method: one session against a scripted endpoint, in a project trusted in
+/// `ask`, with a 16,384-token window and a 1,024-token reply. Turn one writes
+/// a tool manifest, a refreeze that turns the trailing note on for every later
+/// request but the compaction's summary, and a steer sent while that write
+/// waits for approval joins the next request; it reads the README, lists the
+/// project and answers. Turn two reads fourteen small files and one of 300
+/// lines, which takes the transcript past the window's budget, so the harness
+/// compacts, with its summary request, and the turn answers. Turn three runs
+/// in a new `Core`, as a resume in a new process does: four reads and an
+/// answer. Every reply carries reasoning, as a reasoning model's does. A
+/// request's prompt is the raw wire bytes of what a prompt cache keys on, in
+/// the order the provider renders them: the tools and the system prompt (on
+/// Responses the instructions first, as its `input` sends them, and on the
+/// other two the tools first), then the conversation. Its cacheable prefix is
+/// the longest run of bytes, from its first, that it shares with any earlier
+/// request of the session: the most a cache that kept every earlier request
+/// could serve. The share sums those over the prompts, in tokens by
+/// `estimate_tokens`, the first request's prompt counted with none of it
+/// cacheable. Every body is measured with the fixture's directory written as
+/// one fixed name, as the frozen prefix gate leaves the project path out, so
+/// each count is the same on any machine.
+///
+/// The gate names the two requests the compaction makes: its summary request,
+/// which opens with instructions of its own and no tools, the only request
+/// after the first to start cold, sharing its frozen prefix (its tools and
+/// system prompt) whole with no earlier request, and the request after it,
+/// whose history the prune rewrote, so that it repeats only the frozen prefix
+/// and the opening the prune keeps. Every other request repeats every byte
+/// the request before it sent ahead of that one's trailing note, and every
+/// request after the first but the summary shares its whole frozen prefix
+/// with an earlier one. The share holds the 75% target and a ratchet, the
+/// share measured when the ratchet was set less half a point, rounded down to
+/// a tenth; README.md states the ratchet and the session's length, held here.
+/// Measured on this tree, when the ratchets were set: 85.51% (167,050 of
+/// 195,365 prompt tokens) on Chat Completions, 85.51% (168,222 of 196,730) on
+/// Responses and 84.34% (70,531 of 83,630) on native Messages. A byte count,
+/// so it holds in debug and release alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_prompt_is_75_percent_cacheable() {
+    cacheable_share_case(WireApi::ChatCompletions, 85.0).await;
+}
+
+/// The same session over the Responses API, whose `input` carries the
+/// instructions, the tools (its `additional_tools` item) and the conversation
+/// in the order sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_responses_session_prompt_is_75_percent_cacheable() {
+    cacheable_share_case(WireApi::Responses, 85.0).await;
+}
+
+/// The same session over native Messages, whose prompt cache covers `tools`,
+/// then `system`, then `messages`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_messages_session_prompt_is_75_percent_cacheable() {
+    cacheable_share_case(WireApi::Anthropic, 83.8).await;
+}
+
+/// One scripted reply of the cacheable-prefix gate's session.
+enum Reply {
+    /// A call of one tool with these arguments.
+    Call(&'static str, serde_json::Value),
+    /// The turn's answer, or the compaction's summary.
+    Answer(&'static str),
+}
+
+/// Reply `n` of the session on `wire`: its call or answer after `thought`,
+/// its reasoning.
+fn scripted_reply(wire: WireApi, n: usize, reply: &Reply, thought: &str) -> serde_json::Value {
+    use serde_json::json;
+    let id = format!("call-{n}");
+    match (wire, reply) {
+        (WireApi::ChatCompletions, Reply::Call(name, args)) => json!({ "choices": [{ "finish_reason": "tool_calls",
+            "message": { "role": "assistant", "content": "", "reasoning_content": thought,
+                "tool_calls": [{ "id": id, "type": "function", "function": { "name": name, "arguments": args.to_string() } }] } }] }),
+        (WireApi::ChatCompletions, Reply::Answer(text)) => json!({ "choices": [{ "finish_reason": "stop",
+            "message": { "role": "assistant", "content": text, "reasoning_content": thought } }] }),
+        (WireApi::Responses, _) => {
+            let item = match reply {
+                Reply::Call(name, args) => json!({ "type": "function_call", "status": "completed", "call_id": id,
+                    "name": name, "arguments": args.to_string() }),
+                Reply::Answer(text) => json!({ "type": "message", "role": "assistant", "status": "completed",
+                    "content": [{ "type": "output_text", "text": text }] }),
+            };
+            let reasoning = json!({ "type": "reasoning", "id": format!("rs-{n}"), "summary": [], "encrypted_content": thought });
+            json!({ "type": "response.completed", "response": { "status": "completed", "output": [reasoning, item] } })
+        }
+        (WireApi::Anthropic, _) => {
+            let (block, stop) = match reply {
+                Reply::Call(name, args) => (json!({ "type": "tool_use", "id": id, "name": name, "input": args }), "tool_use"),
+                Reply::Answer(text) => (json!({ "type": "text", "text": text }), "end_turn"),
+            };
+            json!({ "type": "message", "role": "assistant", "stop_reason": stop, "usage": { "input_tokens": 1, "output_tokens": 1 },
+                "content": [{ "type": "thinking", "thinking": thought, "signature": "fixture-signature" }, block] })
+        }
+    }
+}
+
+/// One request's prompt as a prefix cache sees it: the raw wire bytes of the
+/// parts the provider renders, in the order it renders them.
+struct Prompt {
+    parts: Vec<String>,
+    /// Where its frozen prefix, the tools and the system prompt, ends.
+    frozen: usize,
+    /// Where its trailing note starts, if it carries one.
+    note: Option<usize>,
+}
+
+impl Prompt {
+    /// `body`'s prompt on `wire`. Chat Completions renders `tools` ahead of
+    /// the messages (OpenAI's prompt caching guide: tools, then the developer
+    /// message, then the history); a Responses `input` holds all three, its
+    /// opening run of developer items being the instructions and the tools;
+    /// native Messages caches `tools`, then `system`, then `messages`
+    /// (Anthropic's).
+    fn of(wire: WireApi, body: &str) -> Self {
+        let fields = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(body).unwrap();
+        let raw = |key: &str| fields.get(key).map_or(String::new(), |value| value.get().to_string());
+        let items = |raw: &str| serde_json::from_str::<Vec<Box<RawValue>>>(raw).unwrap();
+        let (parts, frozen) = match wire {
+            WireApi::ChatCompletions => {
+                let (tools, messages) = (raw("tools"), raw("messages"));
+                let frozen = tools.len() + 1 + items(&messages)[0].get().len();
+                (vec![tools, messages], frozen)
+            }
+            WireApi::Responses => {
+                let input = raw("input");
+                let frozen = items(&input)
+                    .iter()
+                    .take_while(|item| serde_json::from_str::<serde_json::Value>(item.get()).unwrap()["role"] == "developer")
+                    .map(|item| item.get().len() + 1)
+                    .sum();
+                (vec![input], frozen)
+            }
+            WireApi::Anthropic => {
+                let (tools, system, messages) = (raw("tools"), raw("system"), raw("messages"));
+                let frozen = tools.len() + system.len();
+                (vec![tools, system, messages], frozen)
+            }
+        };
+        let marker = serde_json::to_string(&note_marker()).unwrap();
+        let note = parts.concat().find(&marker[1..marker.len() - 1]);
+        Self { parts, frozen, note }
+    }
+
+    fn len(&self) -> usize {
+        self.parts.iter().map(String::len).sum()
+    }
+
+    /// The bytes it shares with `earlier` from its first: each part the two
+    /// send alike, then the common start of the first part they do not.
+    fn shared(&self, earlier: &Prompt) -> usize {
+        let mut shared = 0;
+        for (mine, theirs) in self.parts.iter().zip(&earlier.parts) {
+            shared += mine.bytes().zip(theirs.bytes()).take_while(|(a, b)| a == b).count();
+            if mine != theirs {
+                break;
+            }
+        }
+        shared
+    }
+
+    /// What a request that only appends to this one repeats of it: every
+    /// byte ahead of its trailing note, or ahead of the brackets closing it.
+    fn stable(&self) -> usize {
+        self.note.unwrap_or_else(|| self.parts.concat().trim_end_matches([']', '}']).len())
+    }
+}
+
+/// The cacheable-prefix gate's session over `wire`, held to `ratchet`
+/// percent.
+async fn cacheable_share_case(wire: WireApi, ratchet: f64) {
+    use serde_json::json;
+    const TARGET_PERCENT: f64 = 75.0;
+    // The index of the compaction's summary request, the 20th; the one after
+    // it is the first whose history the prune rewrote.
+    const SUMMARY: usize = 19;
+    let name = match wire {
+        WireApi::ChatCompletions => "Chat Completions",
+        WireApi::Responses => "Responses",
+        WireApi::Anthropic => "native Messages",
+    };
+    let dir = std::env::temp_dir().join(format!("omx-thesis-{}", uuid::Uuid::new_v4()));
+    let (data, project) = (dir.join("data"), dir.join("project"));
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    // Each small file's read stays under the 600 bytes past which a prune
+    // shortens an old tool output in place, so the compaction drops whole
+    // exchanges and summarizes them; the large read is the newest message
+    // then, which a prune keeps whole. On every protocol the request before
+    // the large read is more than 1,300 estimated tokens under the window's
+    // 14,336-token budget and the read's round adds about 3,900, and after
+    // the prune the session ends more than 1,300 under it: a prompt a few
+    // kilobytes longer compacts at the same request, once.
+    for i in 0..14 {
+        let body: String = (0..12).map(|l| format!("pub fn item_{i}_{l}() -> u32 {{ {l} }}\n")).collect();
+        std::fs::write(project.join(format!("f{i}.rs")), body).unwrap();
+    }
+    let large: String = (0..300).map(|l| format!("pub const LARGE_{l}: &str = \"{l:04}\";\n")).collect();
+    std::fs::write(project.join("large.rs"), large).unwrap();
+    std::fs::write(project.join("README.md"), "# fixture\n\nBuild with cargo build.\n").unwrap();
+
+    let manifest = "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\nmutating = false\n";
+    let read = |path: String| Reply::Call("read_file", json!({ "path": path }));
+    let mut replies = vec![
+        Reply::Call("write_file", json!({ "path": ".openmax/tools/wordfreq.toml", "content": manifest })),
+        read("README.md".into()),
+        Reply::Call("list_dir", json!({ "path": "." })),
+        Reply::Answer("added the tool"),
+    ];
+    replies.extend((0..14).map(|i| read(format!("f{i}.rs"))));
+    replies.push(read("large.rs".into()));
+    replies.push(Reply::Answer("Goal: read every source file. Done: fourteen small files and large.rs. Now: answer."));
+    replies.push(Reply::Answer("read them all"));
+    replies.extend((0..4).map(|i| read(format!("f{i}.rs"))));
+    replies.push(Reply::Answer("resumed"));
+    let thought = "weighing which file to read next and why ".repeat(48);
+    let script: Vec<serde_json::Value> =
+        replies.iter().enumerate().map(|(n, reply)| scripted_reply(wire, n, reply, &thought)).collect();
+    let (base_url, bodies) = match wire {
+        WireApi::Responses => common::recording_responses(script).await,
+        _ => recording_endpoint(script).await,
+    };
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("settings.json"),
+        json!({ "provider": "fixture", "model": "scripted", "approval_mode": "ask", "context_tokens": 16384, "max_tokens": 1024 })
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("providers.json"),
+        json!({ "providers": { "fixture": { "base_url": base_url, "wire_api": wire } } }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(data.join("trust.json"), json!({ "version": 1, "projects": [project.to_string_lossy()] }).to_string())
+        .unwrap();
+
+    let steer = "read the README too";
+    let mut events = Vec::new();
+    let id = {
+        let (core, mut rx) = Core::new(data.clone()).unwrap();
+        let id = open_max_core::sessions::create(&core, project.display().to_string()).unwrap().id;
+        events.extend(drive_steered_turn(&core, &mut rx, &id, &project, "add a word count tool", Some(steer)).await);
+        assert!(
+            events.iter().any(|event| matches!(event, AgentEvent::SteerAccepted { text } if text == steer)),
+            "the steer joined turn one: {events:?}"
+        );
+        events.extend(drive_turn(&core, &mut rx, &id, &project, "read every source file").await);
+        close(&core, &id).await;
+        id
+    };
+    // A new process resumes the session from its files.
+    let (core, mut rx) = Core::new(data).unwrap();
+    events.extend(drive_turn(&core, &mut rx, &id, &project, "read four of them again").await);
+    let ends: Vec<bool> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolEnd { ok, .. } => Some(*ok),
+            _ => None,
+        })
+        .collect();
+    let calls = replies.iter().filter(|reply| matches!(reply, Reply::Call(..))).count();
+    assert!(ends.len() == calls && ends.iter().all(|ok| *ok), "every scripted call ran and succeeded: {ends:?}");
+
+    // The fixture's directory, whose name and length depend on the machine,
+    // written as one fixed name, as the frozen prefix gate leaves the path
+    // out: what two bodies share stays shared, and every count is the same
+    // on any machine. The project path rides every system prompt, and the
+    // archive's path the compaction's digest note.
+    let (canonical, plain) = (dir.canonicalize().unwrap().display().to_string(), dir.display().to_string());
+    let bodies: Vec<String> =
+        bodies.lock().unwrap().iter().map(|body| body.replace(&canonical, "/omx").replace(&plain, "/omx")).collect();
+    assert_eq!(bodies.len(), replies.len(), "the session makes one request per scripted reply");
+    assert!(bodies.iter().all(|body| !body.contains("omx-thesis-")), "a body names the fixture's own directory");
+    let prompts: Vec<Prompt> = bodies.iter().map(|body| Prompt::of(wire, body)).collect();
+    let cacheable: Vec<usize> =
+        (0..prompts.len()).map(|i| (0..i).map(|j| prompts[i].shared(&prompts[j])).max().unwrap_or(0)).collect();
+    let rewritten = SUMMARY + 1;
+    let per_request = || {
+        prompts
+            .iter()
+            .enumerate()
+            .map(|(i, prompt)| {
+                let after = i.checked_sub(1).map_or(0, |before| prompt.shared(&prompts[before]));
+                format!(
+                    "request {}: {} of {} bytes cacheable, {after} shared with the one before, frozen {}, stable {}",
+                    i + 1,
+                    cacheable[i],
+                    prompt.len(),
+                    prompt.frozen,
+                    prompt.stable()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // The fixture: the steer sent while the tool write waited for approval
+    // first rides the request after it; the write turned the note on for
+    // every later request but the summary, which carries none; the summary
+    // request sends no tools, and the request after it is the first turn
+    // request with the compaction's digest note (its persisted opening,
+    // `[context note:`).
+    assert!(!bodies[0].contains(steer) && bodies[1].contains(steer), "the steer joins request 2");
+    let unnoted: Vec<usize> = (0..prompts.len()).filter(|&i| prompts[i].note.is_none()).map(|i| i + 1).collect();
+    assert_eq!(unnoted, [1, SUMMARY + 1], "the trailing note rides every request after the tool write but the summary's");
+    assert!(
+        !bodies[SUMMARY].contains("\"tools\":"),
+        "request {} is not the compaction's summary request: the fixture's compaction moved",
+        SUMMARY + 1
+    );
+    let digests: Vec<usize> =
+        (0..bodies.len()).filter(|&i| i != SUMMARY && bodies[i].contains("[context note:")).map(|i| i + 1).collect();
+    assert_eq!(digests.first(), Some(&(rewritten + 1)), "the compaction's digest note first rides request {}", rewritten + 1);
+
+    // Every request repeats what the request before it sent ahead of its
+    // note, but the two the compaction makes.
+    let rewrote: Vec<usize> = (1..prompts.len())
+        .filter(|&i| i != SUMMARY && i != rewritten && prompts[i].shared(&prompts[i - 1]) < prompts[i - 1].stable())
+        .map(|i| i + 1)
+        .collect();
+    assert!(rewrote.is_empty(), "requests {rewrote:?} rewrote what the request before them sent:\n{}", per_request());
+    assert!(
+        prompts[rewritten].shared(&prompts[SUMMARY - 1]) < prompts[SUMMARY - 1].stable(),
+        "request {} repeats the history the request before the compaction sent, so the prune rewrote none:\n{}",
+        rewritten + 1,
+        per_request()
+    );
+    let cold: Vec<usize> = (1..prompts.len()).filter(|&i| cacheable[i] < prompts[i].frozen).map(|i| i + 1).collect();
+    assert_eq!(cold, [SUMMARY + 1], "only the compaction's summary starts cold after the first request:\n{}", per_request());
+
+    let sizes: Vec<usize> = prompts.iter().map(Prompt::len).collect();
+    let tokens = |bytes: &[usize]| bytes.iter().map(|&b| estimate_tokens(b)).sum::<usize>();
+    let (served, sent) = (tokens(&cacheable), tokens(&sizes));
+    let share = 100.0 * served as f64 / sent as f64;
+    println!(
+        "MEASURE cacheable_prefix_share {name}: {share:.2}% = {served} of {sent} prompt tokens ({} of {} bytes) over {} requests; \
+         cold after the first: {cold:?} (the compaction's summary); ratchet {ratchet:.1}%, target {TARGET_PERCENT}%",
+        cacheable.iter().sum::<usize>(),
+        sizes.iter().sum::<usize>(),
+        prompts.len(),
+    );
+    assert!(share >= ratchet, "the cacheable share {share:.2}% fell under its {ratchet:.1}% ratchet:\n{}", per_request());
+    assert!(share >= TARGET_PERCENT, "the cacheable share {share:.2}% is under the {TARGET_PERCENT}% target");
+    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    for claim in [format!("{ratchet:.1}% ({name})"), format!("drives one {}-request session", prompts.len())] {
+        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
