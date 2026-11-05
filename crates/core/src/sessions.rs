@@ -71,7 +71,8 @@ pub struct SessionMeta {
     /// the fork copied. Absent on every session that is not a fork, so an
     /// index written before forks existed parses unchanged. A binary that
     /// predates the field drops it when it rewrites the index, which loses
-    /// the picker's fork label and nothing else.
+    /// the picker's fork label and leaves the branch keying the prompt
+    /// cache by its own id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<ForkedFrom>,
     /// Where each finished turn ends: the message count once its closing
@@ -86,12 +87,29 @@ pub struct SessionMeta {
     pub turn_ends: Option<Vec<u64>>,
 }
 
-/// The session a fork branched from, and how many of that session's
-/// messages it copied: also what the stdio `forked` line reports.
+/// The session a fork branched from and how many of that session's
+/// messages it copied, which the stdio `forked` line reports, and the
+/// session its conversation began in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkedFrom {
     pub parent_id: String,
     pub message_index: u64,
+    /// The parent's root when the parent is a fork, else the parent. A
+    /// branch repeats that conversation's history, so its requests key the
+    /// provider's prompt cache as the conversation's do (`root_of`). Absent
+    /// on a fork recorded before roots were, or rewritten by a binary that
+    /// predates them, whose root is then its parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<String>,
+}
+
+/// The session whose conversation `meta`'s session continues: the root its
+/// fork recorded, the parent of a fork that recorded none, else itself.
+fn root_of(meta: &SessionMeta) -> &str {
+    match &meta.forked_from {
+        Some(from) => from.root_id.as_deref().unwrap_or(&from.parent_id),
+        None => &meta.id,
+    }
 }
 
 /// The lock file lives as long as its session: removing the session unlinks
@@ -149,10 +167,13 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
         load_messages_locked(core, id)?;
         remember_transcript(&mut memo, id, seen);
     }
-    // The one index read the session's writes cost while this claim lasts.
-    if matches!(read_index(core), IndexRead::Loaded(metas) if metas.iter().any(|m| m.id == id)) {
-        memo.listed.insert(id.to_string());
-        core.event_log.lock().unwrap_or_else(|e| e.into_inner()).pending.entry(id.to_string()).or_default();
+    // The one index read the session's writes cost while this claim lasts,
+    // and the one its prompt cache key costs (`conversation_root`).
+    if let IndexRead::Loaded(metas) = read_index(core) {
+        if let Some(meta) = metas.iter().find(|m| m.id == id) {
+            memo.listed.insert(id.to_string(), root_of(meta).to_string());
+            core.event_log.lock().unwrap_or_else(|e| e.into_inner()).pending.entry(id.to_string()).or_default();
+        }
     }
     owners.insert(id.to_string(), SessionOwner { _file: file, detach: false });
     Ok(())
@@ -166,11 +187,12 @@ fn claim_session(core: &Core, id: &str, validate: bool, reactivate: bool) -> Res
 /// a write never acts on an answer a removal has already changed.
 #[derive(Default)]
 pub(crate) struct StoreMemo {
-    /// Sessions this process holds and saw indexed when it claimed them. No
+    /// Sessions this process holds and saw indexed when it claimed them,
+    /// each with the session its conversation began in (`root_of`). No
     /// other process can remove one meanwhile, since every removal claims the
     /// session first, so only this process's own removal or its release of
     /// the claim can make an entry stale, and both take the entry out first.
-    listed: HashSet<String>,
+    listed: HashMap<String, String>,
     /// Sessions this process removed. A write still in flight when its
     /// session was removed (cancellation is cooperative) is dropped on this
     /// record alone.
@@ -778,7 +800,7 @@ fn indexed_locked(memo: &StoreMemo, core: &Core, id: &str) -> Result<bool, Strin
     if memo.removed.contains(id) {
         return Ok(false);
     }
-    if memo.listed.contains(id) {
+    if memo.listed.contains_key(id) {
         return Ok(true);
     }
     match read_index(core) {
@@ -1356,7 +1378,9 @@ pub enum ForkAt {
 /// turns are the parent's turns up to it. It gets the parent's manifest, so
 /// its first turn re-freezes the same tools, skills and prompt, and the
 /// parent's compaction records, so its first compaction carries forward
-/// what the copied digest condensed. The parent is only read. The child's
+/// what the copied digest condensed. It records the session the
+/// conversation began in, so its requests keep that conversation's prompt
+/// cache key (`conversation_root`). The parent is only read. The child's
 /// files are written before its index entry, under the store lock, so no
 /// reader ever sees it listed without its history. A cut with no message
 /// before it is refused, since that branch would have no history at all.
@@ -1396,7 +1420,11 @@ pub fn fork(core: &Core, parent_id: &str, at: ForkAt) -> Result<SessionMeta, Str
         created_at: now(),
         updated_at: now(),
         resume_points: parent.resume_points.iter().copied().filter(|p| *p < at).collect(),
-        forked_from: Some(ForkedFrom { parent_id: parent_id.to_string(), message_index: at }),
+        forked_from: Some(ForkedFrom {
+            parent_id: parent_id.to_string(),
+            message_index: at,
+            root_id: Some(root_of(parent).to_string()),
+        }),
         turn_ends: Some(ends.into_iter().filter(|&e| e <= cut).map(|e| e as u64).collect()),
     };
     write_jsonl(&messages_path(core, &child.id), &messages[..cut])?;
@@ -1451,6 +1479,17 @@ pub fn turn_ends(recorded: Option<&[u64]>, messages: &[ChatMessage]) -> Vec<usiz
 /// One session's index entry, if it exists.
 pub fn meta(core: &Core, id: &str) -> Option<SessionMeta> {
     load_index(core).into_iter().find(|m| m.id == id)
+}
+
+/// The session whose conversation `id` continues, as its claim found it
+/// indexed: `id` itself, or for a `/fork` or `/rewind` branch, which repeats
+/// that conversation's history, the session it began in. Requests key the
+/// provider's prompt cache by it (`ChatClient::for_conversation`). The claim
+/// learned it, so a turn reads no index; a session its claim did not see
+/// indexed is its own root.
+pub(crate) fn conversation_root(core: &Core, id: &str) -> String {
+    let memo = core.sessions_lock.lock().unwrap();
+    memo.listed.get(id).cloned().unwrap_or_else(|| id.to_string())
 }
 
 /// One message was inserted at index `at`, so the transcript grows by exactly
@@ -2165,9 +2204,18 @@ mod tests {
 
         let child = fork(&core, &parent, ForkAt::Turn(1)).unwrap();
         assert_ne!(child.id, parent);
-        let from = ForkedFrom { parent_id: parent.clone(), message_index: 5 };
+        let from = ForkedFrom { parent_id: parent.clone(), message_index: 5, root_id: Some(parent.clone()) };
         assert_eq!(child.forked_from.as_ref(), Some(&from));
         assert_eq!(meta(&core, &child.id).unwrap().forked_from, Some(from));
+        // A fork of a fork continues the conversation its parent began in;
+        // an entry that recorded no root (an older binary's) takes its parent.
+        let mut grandchild = fork(&core, &child.id, ForkAt::End).unwrap();
+        assert_eq!((root_of(&grandchild), root_of(&child), root_of(&meta(&core, &parent).unwrap())), (&*parent, &*parent, &*parent));
+        grandchild.forked_from.as_mut().unwrap().root_id = None;
+        assert_eq!(root_of(&grandchild), child.id);
+        assert_eq!(conversation_root(&core, &grandchild.id), grandchild.id, "a session never claimed is its own");
+        attach(&core, &grandchild.id).unwrap();
+        assert_eq!(conversation_root(&core, &grandchild.id), parent, "its claim read the root from the index");
         assert_eq!(child.resume_points, Vec::<u64>::new(), "a boundary at the cut is past the copy");
         assert_eq!(child.turn_ends, Some(vec![5]), "the copy holds turn 1 alone");
         let copied: Vec<Option<String>> =

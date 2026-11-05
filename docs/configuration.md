@@ -302,6 +302,30 @@ An explicit `responses` selects the Responses protocol. The ChatGPT setup
 command writes this field with `chatgpt_account`; other endpoints may use
 Responses with their own API key.
 
+Every Responses request carries a `prompt_cache_key`, a hash of the id of
+the session its conversation began in. A session sends the same key on every
+request, a resumed one included, and a `/fork` or `/rewind` branch keeps its
+parent's key, since it repeats the parent's history and requests under
+different keys share no cache entries. A session started on its own gets a
+key of its own, so it never reuses what another session cached, not even the
+opening every session of the project shares. On OpenAI models before GPT-5.6,
+the key also influences routing: which machine serves a request depends on
+load, a hash of the prompt's first tokens, and the key, which does not pin a
+request to a machine or guarantee a cache hit. Every session of a project
+opens with the same tokens, so without a key, sessions run side by side share
+one route, traffic past about 15 requests a minute can overflow to other
+machines, and a request served where its prompt is not cached processes its
+uncached part again. Branches run at the same time share their conversation's
+key, so together they can overflow its route the same way. From GPT-5.6,
+routing needs no key, and the key only keeps each conversation's cache
+entries apart. The key is request metadata the model never sees.
+
+The Responses translation targets OpenAI's Responses API, which defines the
+key, and already uses other constructs that API defines, such as the
+`additional_tools` input item that carries the tools. Chat Completions
+requests do not carry the key: the servers that implement that protocol vary,
+and some refuse a field they do not know. Native Messages does not define it.
+
 An explicit `anthropic` selects the native Messages protocol. Set `base_url`
 to `https://api.anthropic.com/v1`; requests use `/v1/messages`, `x-api-key`
 authentication, and `anthropic-version: 2023-06-01` unless a custom version

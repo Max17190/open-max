@@ -81,6 +81,11 @@ pub(super) fn serialize(
     if let Some(effort) = client.reasoning_effort {
         body["reasoning"] = json!({"effort": effort});
     }
+    // Both OpenAI routes take it: the subscription one refuses
+    // `prompt_cache_retention` and `user`, not this.
+    if let Some(key) = &client.cache_key {
+        body["prompt_cache_key"] = json!(key);
+    }
     // Subscription Responses rejects output-token and sampling parameters. The
     // harness's local context reservation and turn-spend admission still apply.
     if client.chatgpt.is_none() {
@@ -520,15 +525,17 @@ mod tests {
     fn subscription_request_omits_unsupported_options_without_changing_key_requests() {
         let dir = std::env::temp_dir().join(format!("openmax-response-body-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut client = ChatClient::new(crate::chatgpt::API.into(), None, "fixture".into(), Some(0.5), 4096);
+        let mut client = ChatClient::new(crate::chatgpt::API.into(), None, "fixture".into(), Some(0.5), 4096).for_conversation("session");
         client.wire_api = crate::providers::WireApi::Responses;
         client.chatgpt = Some(crate::chatgpt::tests::seeded(&dir));
         assert!(client.sends_credential());
         let messages = [ChatMessage::system("rules"), ChatMessage::user("task")];
         let body: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
-        for key in ["max_output_tokens", "temperature", "previous_response_id", "conversation", "background", "tools"] {
+        for key in ["max_output_tokens", "temperature", "previous_response_id", "conversation", "background", "tools",
+            "prompt_cache_retention", "user"] {
             assert!(body.get(key).is_none(), "{key}");
         }
+        let cache_key = body["prompt_cache_key"].as_str().expect("the subscription route takes prompt_cache_key").to_owned();
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
@@ -546,6 +553,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
         assert_eq!(body["max_output_tokens"], 4096);
         assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["prompt_cache_key"], cache_key.as_str());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
