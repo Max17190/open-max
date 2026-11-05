@@ -360,6 +360,9 @@ pub struct ChatClient {
     /// Why the settings key was withheld from this endpoint, for a 401 to
     /// report (see `ActiveEndpoint::key_hint`).
     key_hint: Option<String>,
+    /// The Responses `prompt_cache_key` of the conversation this client
+    /// serves (see `for_conversation`).
+    cache_key: Option<String>,
     http: reqwest::Client,
 }
 
@@ -530,8 +533,24 @@ impl ChatClient {
             send_stream_options,
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
+            cache_key: None,
             http,
         }
+    }
+
+    /// Key this client's requests by the conversation that began in session
+    /// `root` (`sessions::conversation_root`): a hash of its id, never the id.
+    /// Requests under different `prompt_cache_key`s share no cache entries,
+    /// so a `/fork` or `/rewind` branch keeps its parent's key. Only Responses
+    /// requests carry it: that translation targets OpenAI's Responses API,
+    /// which defines the key, while Chat Completions servers vary and some
+    /// refuse a field they do not know, and native Messages does not define
+    /// it. docs/configuration.md covers its effect on routing and its costs.
+    pub fn for_conversation(mut self, root: &str) -> Self {
+        let mut key = crate::ledger::sha256_hex(format!("prompt cache\n{root}").as_bytes());
+        key.truncate(16);
+        self.cache_key = Some(key);
+        self
     }
 
     fn endpoint(&self) -> String {

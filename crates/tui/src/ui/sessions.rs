@@ -159,7 +159,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             resume_points: vec![],
-            forked_from: Some(open_max_core::sessions::ForkedFrom { parent_id: "0123456789abcdef".into(), message_index: 3 }),
+            forked_from: Some(open_max_core::sessions::ForkedFrom { parent_id: "0123456789abcdef".into(), message_index: 3, root_id: None }),
             turn_ends: None,
         };
         let row: String = session_row(&meta, false, 0, 80).spans.iter().map(|s| s.content.as_ref()).collect();

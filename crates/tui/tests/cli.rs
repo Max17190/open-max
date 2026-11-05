@@ -2449,7 +2449,8 @@ fn rewind_and_fork_branch_a_session_and_the_next_request_carries_only_the_branch
         &std::fs::read_to_string(home.join(".openmax").join("sessions").join("index.json")).unwrap(),
     ).unwrap();
     let entry = |id: &str| index.as_array().unwrap().iter().find(|m| m["id"] == id).unwrap().clone();
-    assert_eq!(entry(&rewound)["forked_from"], serde_json::json!({"parent_id": parent, "message_index": at}));
+    assert_eq!(entry(&rewound)["forked_from"], serde_json::json!({"parent_id": parent, "message_index": at, "root_id": parent}));
+    assert_eq!(entry(&forked)["forked_from"]["root_id"], parent.as_str(), "a fork of a branch continues the parent's conversation");
     assert!(entry(&parent).get("forked_from").is_none(), "a session that is no fork writes no field");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }

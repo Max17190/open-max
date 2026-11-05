@@ -1794,7 +1794,7 @@ async fn run_compact(
     let settings = core.settings.lock().unwrap().clone();
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
-    let client = ChatClient::from_endpoint(&endpoint);
+    let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
     let (messages, registry, note, take_seq, factor) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
@@ -3016,7 +3016,7 @@ async fn run_loop(
             return "error".into();
         }
     };
-    let client = ChatClient::from_endpoint(&endpoint);
+    let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
     // Frozen wire form: every request of the session injects the same tool
     // schema bytes without re-serializing the Value array. A refreeze swaps
     // the registry and keeps these (a tool file written since rides the

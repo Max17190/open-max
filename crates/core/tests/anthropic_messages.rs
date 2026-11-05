@@ -82,7 +82,7 @@ async fn native_effort_auth_and_default_omission_preserve_request_content() {
     let levels=[None,Some(ReasoningEffort::Low),Some(ReasoningEffort::Medium),Some(ReasoningEffort::High),Some(ReasoningEffort::XHigh),Some(ReasoningEffort::Max)];
     let (base,server)=serve(levels.iter().map(|_|(200,text_response())).collect()).await;
     for effort in levels {
-        let client=client(&scratch,&base,effort); let mut shown=String::new();
+        let client=client(&scratch,&base,effort).for_conversation("native-session"); let mut shown=String::new();
         let result=client.stream_chat_with_note(&[ChatMessage::system("instructions"),ChatMessage::user("task")],Some("turn note"),&tools(),Arc::new(CancelToken::default()),|delta| if let StreamDelta::Content(text)=delta {shown.push_str(&text)}).await.unwrap();
         assert_eq!(result.content,"verified"); assert_eq!(shown,"verified"); assert_eq!(result.finish_reason,"stop"); assert!(result.tool_calls.is_empty());
         let usage=result.usage.unwrap();assert_eq!((usage.prompt_tokens,usage.completion_tokens,usage.cached_tokens),(17,7,Some(4)));
@@ -93,7 +93,7 @@ async fn native_effort_auth_and_default_omission_preserve_request_content() {
         let headers=request.head.to_ascii_lowercase();assert!(headers.contains("x-api-key: fixture-native-key\r\n"));assert!(headers.contains("anthropic-version: 2023-06-01\r\n"));assert!(!headers.contains("authorization:"));
         let mut body:Value=serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["model"],"fixture-model");assert_eq!(body["max_tokens"],128);assert_eq!(body["temperature"],0.25);assert_eq!(body["stream"],true);
-        assert!(body.get("reasoning_effort").is_none());assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());assert!(body.get("thinking").is_none());assert!(body.get("prompt_cache_key").is_none());
         if let Some(effort)=effort {assert_eq!(body["output_config"]["effort"],effort.as_str());} else {assert!(body.get("output_config").is_none());}
         assert!(body["system"].to_string().contains("instructions"));
         assert_eq!(body["messages"][0]["role"],"user");assert!(body["messages"][0]["content"].to_string().contains("turn note"));

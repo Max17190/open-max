@@ -5009,7 +5009,8 @@ mod tests {
         app.handle_submit("/rewind 1".into()).await.unwrap();
         let child = app.session_id.clone().unwrap();
         assert_ne!(child, parent);
-        let from = |parent_id: &str| Some(sessions::ForkedFrom { parent_id: parent_id.to_string(), message_index: 3 });
+        // Both branches continue the original's conversation.
+        let from = |parent_id: &str| Some(sessions::ForkedFrom { parent_id: parent_id.to_string(), message_index: 3, root_id: Some(parent.clone()) });
         assert_eq!(sessions::meta(&core, &child).unwrap().forked_from, from(&parent));
         let shown = app.transcript.export_text();
         assert!(shown.contains("first answer") && !shown.contains("second question"), "{shown}");

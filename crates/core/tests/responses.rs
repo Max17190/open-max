@@ -172,6 +172,81 @@ async fn tool_round_and_resume_case(streamed_items: bool, terminal_output: bool)
     }
 }
 
+/// Requests under different `prompt_cache_key`s share no cache entries, so a
+/// conversation keeps one key on every request it sends: both of a tool
+/// round, a /compact summary, the one a new process sends when it resumes
+/// the session, and those of a /fork branch and of a /rewind of that branch,
+/// which repeat its history. A second session of the same project, whose
+/// prompt opens with the same tokens, gets a key of its own. No key is cut
+/// from a session id, and each is 16 hex characters: the field adds 38 bytes
+/// to a request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_conversation_sends_one_prompt_cache_key_on_every_request() {
+    let scratch = Scratch::new();
+    let replies = vec![
+        done(json!([call("list_dir", json!({"path":"."}))])),
+        done(json!([message("listed")])),
+        done(json!([message("other")])),
+        done(json!([message("noted")])),
+        done(json!([message("summary")])),
+        done(json!([message("resumed")])),
+        done(json!([message("branched")])),
+        done(json!([message("rewound")])),
+    ];
+    let (url, requests, job) = server(replies).await;
+    scratch.configure(&url);
+    open_max_core::trust::grant_trust(&scratch.data(), &scratch.project(), ApprovalMode::Ask).unwrap();
+    let (core, mut rx) = Core::new(scratch.data()).unwrap();
+    let project = scratch.project().display().to_string();
+    let first = open_max_core::sessions::create(&core, project.clone()).unwrap().id;
+    let other = open_max_core::sessions::create(&core, project).unwrap().id;
+    common::drive_turn(&core, &mut rx, &first, &scratch.project(), "list").await;
+    common::drive_turn(&core, &mut rx, &other, &scratch.project(), "other").await;
+    // About 21k estimated tokens (bytes / 4): past the prune target, 70% of
+    // the 27,648 the 32k window leaves past the default 4,096 output and the
+    // 1,024 reserve, and under that budget. So no turn compacts, and /compact
+    // drops the tool round and asks for its summary.
+    common::drive_turn(&core, &mut rx, &first, &scratch.project(), &"note ".repeat(17_000)).await;
+    open_max_core::agent::compact_session(&core, &first, &scratch.project()).unwrap();
+    loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
+        match envelope.event {
+            AgentEvent::Compacted { compacted_messages, .. } => break assert!(compacted_messages > 0),
+            AgentEvent::Error { message } => panic!("/compact failed: {message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(requests.lock().unwrap().len(), 5, "/compact sent one summary request");
+    common::close(&core, &first).await;
+    drop(core);
+    let (core, mut rx) = Core::new(scratch.data()).unwrap();
+    common::drive_turn(&core, &mut rx, &first, &scratch.project(), "resume").await;
+    let branch = open_max_core::sessions::fork(&core, &first, open_max_core::sessions::ForkAt::End).unwrap().id;
+    common::close(&core, &first).await;
+    common::drive_turn(&core, &mut rx, &branch, &scratch.project(), "branch").await;
+    let rewound = open_max_core::sessions::fork(&core, &branch, open_max_core::sessions::ForkAt::Turn(1)).unwrap().id;
+    common::close(&core, &branch).await;
+    common::drive_turn(&core, &mut rx, &rewound, &scratch.project(), "rewind").await;
+    job.await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_ne!(requests[4]["input"][0], requests[0]["input"][0], "the summary opens with its own instructions");
+    let keys: Vec<&str> = requests.iter()
+        .map(|request| request["prompt_cache_key"].as_str().expect("every Responses request carries a prompt_cache_key"))
+        .collect();
+    assert_eq!(keys.len(), 8);
+    for (i, key) in keys.iter().enumerate().filter(|&(i, _)| i != 2) {
+        assert_eq!(*key, keys[0], "request {i} left the conversation's key");
+    }
+    assert_ne!(keys[2], keys[0], "two sessions share one key");
+    // A UUID's runs between dashes are at most 12 characters, fewer than a
+    // key's 16, so a cut of the id's hex digits shows only without its dashes.
+    for id in [&first, &other, &branch, &rewound] {
+        let hex = id.replace('-', "");
+        assert!(keys.iter().all(|key| !id.contains(key) && !hex.contains(key)), "a key is cut from session id {id}");
+    }
+    assert!(keys.iter().all(|key| key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit())), "a key is 16 hex characters: {keys:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrusted_project_never_reaches_responses() {
     let scratch = Scratch::new();
@@ -264,6 +339,9 @@ async fn provider_switch_withholds_opaque_responses_reasoning() {
     }
     common::drive_turn(&core, &mut rx, "switch", &scratch.project(), "second").await;
     assert!(!requests.lock().unwrap()[0].contains("private-state"));
+    // Servers that implement Chat Completions vary and some refuse a field
+    // they do not know, so the prompt cache key stays off that protocol.
+    assert!(!requests.lock().unwrap()[0].contains("prompt_cache_key"));
     job.await.unwrap();
 }
 
