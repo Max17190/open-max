@@ -1793,9 +1793,11 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
         let at = |second: u32| format!("2026-11-06T10:{:02}:{:02}Z", second / 60, second % 60);
         serde_json::json!({"name": name, "conclusion": conclusion, "started_at": span.map(|(a, _)| at(a)), "completed_at": span.map(|(_, b)| at(b))})
     };
-    // A page of runs, newest first: each run's id, its conclusion after its
-    // last attempt, and the jobs of its first.
-    let serve_page = |repo: &str, n: usize, runs: &[(u64, &str, Vec<serde_json::Value>)]| {
+    // A run: its id, its conclusion after its last attempt, and the jobs of
+    // its first.
+    type Run<'a> = (u64, &'a str, Vec<serde_json::Value>);
+    // A page of runs, newest first.
+    let serve_page = |repo: &str, n: usize, runs: &[Run]| {
         let listed: Vec<serde_json::Value> = runs
             .iter()
             .map(|(id, conclusion, _)| serde_json::json!({"id": id, "head_sha": sha(*id), "conclusion": conclusion}))
@@ -1838,7 +1840,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     );
     // Twenty passes of 1 to 20 seconds, where each percentile is a rank of
     // its own; and a pass across the turn of a year.
-    let twenty: Vec<(u64, &str, Vec<serde_json::Value>)> = (1..=20).map(|k| green(400 + k, (0, k as u32))).collect();
+    let twenty: Vec<Run> = (1..=20).map(|k| green(400 + k, (0, k as u32))).collect();
     serve_page("o/twenty", 1, &twenty);
     let new_year = serde_json::json!({
         "name": "Test (ubuntu-latest)", "conclusion": "success",
@@ -1850,7 +1852,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     serve_page("o/p99", 1, &[green(221, (0, 60)), green(222, (0, 120))]);
     serve_page("o/one", 1, &[(231, "failure", vec![job("Clippy", "failure", Some((0, 30)))]), green(232, (0, 45))]);
     // A full page of cancelled runs, then a page with one that passed.
-    let cancelled: Vec<(u64, &str, Vec<serde_json::Value>)> =
+    let cancelled: Vec<Run> =
         (1000..1100).map(|id| (id, "cancelled", vec![job("Test (ubuntu-latest)", "cancelled", Some((0, 5)))])).collect();
     serve_page("o/paged", 1, &cancelled);
     serve_page("o/paged", 2, &[green(2000, (0, 30))]);
@@ -1893,7 +1895,9 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
         (code, report, std::fs::read_to_string(&log).unwrap_or_default())
     };
     let summarize = [("GITHUB_STEP_SUMMARY", summary.display().to_string())];
-    let cases: Vec<(&str, Vec<&str>, Vec<(&str, String)>)> = vec![
+    // A run of the script: its tag, its arguments and the environment it adds.
+    type Case<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, String)>);
+    let cases: Vec<Case> = vec![
         ("five", vec!["--repo", "o/main", "--runs", "5"], vec![]),
         ("default", vec!["--repo", "o/main"], vec![]),
         ("twenty", vec!["--repo", "o/twenty"], vec![]),
