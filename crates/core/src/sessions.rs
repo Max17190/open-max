@@ -404,10 +404,6 @@ fn release(core: &Core, owners: &mut HashMap<String, SessionOwner>, id: &str) {
 
 pub const UNTITLED: &str = "New session";
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
 fn index_path(core: &Core) -> PathBuf {
     sessions_dir(core).join("index.json")
 }
@@ -449,9 +445,9 @@ pub struct CompactionRecord {
     pub digest: String,
 }
 
-/// Wall-clock seconds for compaction records (and session meta).
+/// Wall-clock seconds since the Unix epoch, for session meta, compaction records and the ledger.
 pub fn unix_now() -> u64 {
-    now()
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Append a compaction event. Best-effort: failures surface as an agent warning.
@@ -1355,8 +1351,8 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
         id: uuid::Uuid::new_v4().to_string(),
         project,
         title: UNTITLED.into(),
-        created_at: now(),
-        updated_at: now(),
+        created_at: unix_now(),
+        updated_at: unix_now(),
         resume_points: Vec::new(),
         forked_from: None,
         // Recorded from the first turn, so none is ever counted the way an
@@ -1420,8 +1416,8 @@ pub fn fork(core: &Core, parent_id: &str, at: ForkAt) -> Result<SessionMeta, Str
         id: uuid::Uuid::new_v4().to_string(),
         project: parent.project.clone(),
         title: parent.title.clone(),
-        created_at: now(),
-        updated_at: now(),
+        created_at: unix_now(),
+        updated_at: unix_now(),
         resume_points: parent.resume_points.iter().copied().filter(|p| *p < at).collect(),
         forked_from: Some(ForkedFrom {
             parent_id: parent_id.to_string(),
@@ -1496,13 +1492,8 @@ pub(crate) fn conversation_root(core: &Core, id: &str) -> String {
 }
 
 /// One message was inserted at index `at`, so the transcript grows by exactly
-/// that message and every boundary at or after it moves up one. The mirror
-/// of the boundary shift for a prune, which handles shrinkage. Hydration of
+/// that message and every boundary at or after it moves up one. Hydration of
 /// a transcript saved without its system prompt inserts that prompt at 0.
-pub fn shift_resume_points_for_insert(core: &Core, id: &str, at: u64) -> Result<(), String> {
-    apply_resume_edits(core, id, &[ResumeEdit::Insert(at)])
-}
-
 fn shift_points_for_insert(points: &mut [u64], at: u64) {
     for p in points {
         if *p >= at {
@@ -1513,7 +1504,7 @@ fn shift_points_for_insert(points: &mut [u64], at: u64) {
 
 /// One message was removed from index `at`, so the transcript shrinks by
 /// exactly that message and every boundary after it moves down one: the
-/// mirror of [`shift_resume_points_for_insert`]. A boundary on the removed
+/// mirror of [`shift_points_for_insert`]. A boundary on the removed
 /// message stays put and now marks the message that followed it, so two
 /// boundaries can meet there and become one. Hydration removes a tool reply
 /// that was saved after prompts instead of after its call.
@@ -1690,7 +1681,7 @@ pub fn set_title_if_new(core: &Core, id: &str, title: &str) {
             if m.title == UNTITLED {
                 m.title = title;
             }
-            m.updated_at = now();
+            m.updated_at = unix_now();
             metas.push(m);
         }
     });
@@ -1721,7 +1712,7 @@ fn bump(core: &Core, id: &str, ended: Option<&[ChatMessage]>) {
         // not creation.
         if let Some(i) = metas.iter().position(|m| m.id == id) {
             let mut m = metas.remove(i);
-            m.updated_at = now();
+            m.updated_at = unix_now();
             if let Some(messages) = ended {
                 let ends = m
                     .turn_ends
@@ -2029,10 +2020,10 @@ mod tests {
         record_resume_point(&core, id, 3);
         record_resume_point(&core, id, 7);
 
-        shift_resume_points_for_insert(&core, id, 2).unwrap();
+        apply_resume_edits(&core, id, &[ResumeEdit::Insert(2)]).unwrap();
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![1, 4, 8]);
         // An insert at the very front moves every boundary.
-        shift_resume_points_for_insert(&core, id, 0).unwrap();
+        apply_resume_edits(&core, id, &[ResumeEdit::Insert(0)]).unwrap();
         assert_eq!(meta(&core, id).unwrap().resume_points, vec![2, 5, 9]);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2061,8 +2052,8 @@ mod tests {
 
         // Touch recency inside the same second: touching the OLDEST session
         // must make it the latest, so the touched entry re-appends instead
-        // of keeping its creation slot. touch() stamps now(); flatten every
-        // stamp back to one value so only position can decide.
+        // of keeping its creation slot. touch() stamps unix_now(); flatten
+        // every stamp back to one value so only position can decide.
         touch(&core, &a);
         with_index(&core, |metas| {
             for m in metas.iter_mut() {
