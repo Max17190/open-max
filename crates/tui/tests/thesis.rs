@@ -2026,21 +2026,22 @@ fn mutation_score_is_at_least_ninety_five_percent() {
 /// also asserts the harness's work, the first frame's median less the
 /// baseline's, under its ratchet: the median the reference machine
 /// measured, plus a tenth, rounded up to 10 us. It takes the 61 so that the
-/// noise alone seldom puts a measurement over the ratchet, in none of the 44
+/// noise alone seldom puts a measurement over the ratchet, in none of the 20
 /// runs below. A burst of other work on the machine slows a measurement or
 /// two, while a change that adds work slows every one, so a measurement
 /// over the ratchet is taken again, up to three in all, and the work fails
 /// only when each one the ratchet reaches is over. It reaches a
 /// measurement whose baseline median is within the 90th percentile of
-/// those measured with it. Past that, on a machine busy with other work,
-/// the work rose with the baseline's start (below), so where each
+/// those measured with it, rounded up to 10 us. Past that the machine is
+/// slower than the one the ratchet was set on, and a measurement there moved
+/// the work by more than the ratchet's room (below), so where each
 /// measurement is slower the work is reported and not asserted. The work's
-/// target, 250 us, is not met yet: it is printed, met or not, in a
-/// `MEASURE` line. A debug build prints the measurement,
-/// holds the ratio to 20 times the ratchet, which only a hang or a stall
-/// many times today's breaks, and asserts no time. Without the baseline
-/// binary, which `cargo test` builds only when no target is selected, a
-/// release build fails and a debug build skips.
+/// target, 100 us, is not met: it is printed, met or not, in a `MEASURE`
+/// line. A debug build prints the measurement, holds the ratio to 20 times
+/// the ratchet, which only a hang or a stall many times today's breaks,
+/// and asserts no time. Without the baseline binary, which `cargo test`
+/// builds only when no target is selected, a release build fails and a
+/// debug build skips.
 ///
 /// Measured in release builds, as the ratio of the medians (first frame;
 /// baseline). On macos-latest, seven runs: 1.38 to 1.57 (2.37 to 4.43 ms;
@@ -2053,36 +2054,44 @@ fn mutation_score_is_at_least_ninety_five_percent() {
 /// M5's ratio to 2.00 to 2.46 in ten runs beside other builds, the lowest
 /// past the macOS ratchet by 0.07%.
 ///
-/// On the reference machine (Apple M5, macOS 27), 44 runs of 61 launches at
-/// one-minute load averages of 4.6 to 7.1: the harness's work 405 to 464
-/// us, median 426 (ratio 1.33 to 1.41; first frame 1.49 to 1.70 ms;
-/// baseline 1.08 to 1.28 ms), so a ratchet of 470 us where the baseline's
-/// median is within 1.15 ms, the 90th percentile of those runs' baseline
-/// medians. Interleaved with them, 44 runs of the build before it, which
-/// loaded libiconv, walked rebase opcodes and started the signal watcher's
-/// thread and runtime in front of the frame (crates/tui/build.rs,
-/// `route_quit_signals`): 500 to 556 us, median 517. The ratchet reaches 40
-/// of this build's runs, at 405 to 458 us, and 39 of the other's, at 500 to
-/// 556 us. With the machine busy with other work, at load averages of 5.2
-/// to 6.1, 44 more runs of each: within 1.15 ms the build before it
-/// measured 533 to 566 us, while this build had no measurement there, its
-/// work reported at 340 to 582 us with baseline medians of 1.16 to 1.64 ms.
+/// On the reference machine (Apple M5, macOS 27), 20 runs of 61 launches at
+/// one-minute load averages of 5.2 to 5.8: the harness's work 337 to 449
+/// us, median 406 (ratio 1.35 to 1.41; first frame 1.50 to 1.55 ms;
+/// baseline 1.08 to 1.29 ms), so a ratchet of 450 us where the baseline's
+/// median is within 1.19 ms, the 90th percentile of those runs' baseline
+/// medians, 1.181 ms, rounded up. Interleaved with them, 20 runs of the
+/// build before it, which loaded libiconv, walked rebase opcodes and
+/// started the signal watcher's thread and runtime in front of the frame
+/// (crates/tui/build.rs, `hold_quit_signals`): 479 to 560 us, median 512,
+/// over the ratchet in 19 runs and not asserted in the other, each of whose
+/// baseline medians was past 1.19 ms. Within that reach this build measured
+/// at most 449 us, in all 24 of its measurements there, and the build
+/// before it at least 473 us, in all 55 of its own. Past it, at baseline
+/// medians of 1.20 and 1.29 ms, this build's work measured 364 and 337 us.
+///
 /// Most of what is left is the dynamic loader's, before `main` runs. It
-/// binds every symbol the binary imports, lazy ones included, and finds each
-/// by searching libSystem's 39 re-exported libraries in order, so a symbol
-/// costs more the later its library comes (libsystem_c is 14th,
+/// binds every symbol the binary imports at launch, lazy ones included, and
+/// finds each by searching libSystem's 39 re-exported libraries in order, so
+/// a symbol costs more the later its library comes (libsystem_c is 14th,
 /// libsystem_kernel 32nd). The binary imports 182 symbols, all of them used,
 /// to the baseline's 68, and 115 of them the baseline does not import, each
-/// a function but one variable. Attributed by giving the baseline binary
-/// each part of the difference and timing it the same way, 41 launches of
-/// each copy interleaved, with the task's instruction counter read at
-/// `main`: 113 of those functions, imported and never called, brought `main`
-/// 257 us later and added 6.4M instructions, with no more page faults (100
-/// imports from libsystem_kernel, 284 us; 100 from libsystem_c, 116 us);
-/// 14,000 rebased pointers, about the binary's 13,636 before its fixups were
-/// chained, 65 us; 6 MB of untouched constant data, 20 us, within the noise.
-/// So the binding alone is past the target, with the linking the platform
-/// supports.
+/// a function but one variable. Timed the same way, to the first byte the
+/// process writes, over 1,001 launches of each copy interleaved, with the
+/// instructions each process retired read before it was reaped: a copy of
+/// the baseline built with this profile's options and chained fixups wrote
+/// 281 to 297 us later, in two such runs, given those 115 imports and
+/// calling none, and retired 6.46M more instructions, with no more page
+/// faults; given 100 functions of libsystem_kernel instead, 302 us and 7.01M
+/// more, and 100 of libsystem_c, 120 us and 2.87M. `openmax --version`,
+/// which prints from its argument parsing, wrote 344 us after the baseline,
+/// with 6.76M more instructions, so the binary's loading alone is past the
+/// work's target with the linking the platform supports; the link options
+/// (crates/tui/build.rs) took 62 us, 1.42M instructions and 30 page faults
+/// off that `--version`. The build before them rebased 13,636 pointers by
+/// opcodes before `main`: 13,455 in `__DATA_CONST,__const`, one in `__got`
+/// and its 180 lazy symbol pointers (`llvm-objdump --macho --rebase`). This
+/// one has no lazy symbol pointers, and chains the other 13,456
+/// (`dyld_info -fixups`).
 #[cfg(unix)]
 #[test]
 fn first_frame_holds_its_ratio_to_a_baseline_binary() {
@@ -2097,9 +2106,9 @@ fn first_frame_holds_its_ratio_to_a_baseline_binary() {
     // target is met: the median it measured, plus a tenth, rounded up to
     // 10 us, where the baseline's median is within the 90th percentile of
     // those measured with it (above).
-    const WORK_TARGET: Duration = Duration::from_micros(250);
-    const WORK_RATCHET: Duration = Duration::from_micros(470);
-    const WORK_RATCHET_BASELINE: Duration = Duration::from_micros(1150);
+    const WORK_TARGET: Duration = Duration::from_micros(100);
+    const WORK_RATCHET: Duration = Duration::from_micros(450);
+    const WORK_RATCHET_BASELINE: Duration = Duration::from_micros(1190);
     // The measurements that build takes before the work fails, each one
     // over the ratchet (above).
     const WORK_MEASUREMENTS: usize = 3;
