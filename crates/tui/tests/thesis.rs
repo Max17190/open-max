@@ -1052,6 +1052,8 @@ fn lossy_pipes(script: &str) -> Vec<String> {
                     end = at;
                     break;
                 }
+                // A redirection's `&` (`2>&1`, `&>`) ends no command.
+                (None, '&') if line[..at].ends_with(['>', '<']) || line[at + 1..].starts_with('>') => {}
                 (None, ';' | '&') => {
                     pipefail = set(&line[from..at], pipefail);
                     from = at + 1;
@@ -1106,6 +1108,8 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
         ("cargo test | tee log\nset -o pipefail", &["cargo test"][..]),
         ("set -o pipefail; set +o pipefail; cargo test | tee log", &["cargo test"][..]),
         ("# set -o pipefail\necho pipefail; cargo test | tee log", &["cargo test"][..]),
+        ("cargo test 2>&1 | tee log", &["cargo test 2>&1"][..]),
+        ("cargo test &> log; make check >&2 | tee log", &["make check >&2"][..]),
     ] {
         assert_eq!(lossy_pipes(script), lossy, "the pipes of {script:?} that lose a failure");
     }
