@@ -104,6 +104,25 @@ pub fn paint_line(buf: &mut Buffer, area: Rect, prefix: Option<&Span<'_>>, line:
     }
     // A span inside a line is styled over the line's own style.
     let line_style = Style::default().patch(line.style);
+    // Printable ASCII is one grapheme a cell: paint it without segmenting,
+    // the larger part of a transcript frame's own work.
+    let spans = || prefix.into_iter().chain(&line.spans);
+    if line.alignment.is_none_or(|alignment| alignment == Alignment::Left)
+        && spans().all(|span| span.content.bytes().all(|byte| matches!(byte, b' '..=b'~')))
+    {
+        let mut x = area.x;
+        for span in spans() {
+            let style = line_style.patch(span.style);
+            for i in 0..span.content.len() {
+                if x == area.right() {
+                    return;
+                }
+                buf[(x, area.y)].set_symbol(&span.content[i..i + 1]).set_style(style);
+                x += 1;
+            }
+        }
+        return;
+    }
     let graphemes = || {
         prefix
             .into_iter()
@@ -284,11 +303,13 @@ mod tests {
             Line::from("too wide to center at all here").alignment(Alignment::Center),
             Line::from(""),
             Line::default().style(on_blue),
+            Line::from(vec![Span::raw("ascii "), Span::styled("spans", red), Span::raw(" a~z")]).style(on_blue),
         ];
         let gutter = Span::styled("❯ ", Style::default().fg(Color::DarkGray));
+        let ascii_gutter = Span::styled("> ", Style::default().fg(Color::DarkGray));
         for line in &lines {
             for width in [1u16, 2, 3, 7, 12, 40, 80] {
-                for prefix in [None, Some(&gutter)] {
+                for prefix in [None, Some(&gutter), Some(&ascii_gutter)] {
                     let area = Rect::new(2, 1, width, 1);
                     let canvas = Rect::new(0, 0, width + 4, 3);
                     let mut expected = Buffer::empty(canvas);

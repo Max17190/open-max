@@ -10,7 +10,9 @@
 //! exact unless a line wraps, and never more than the wrap produces) and
 //! wraps only the blocks the viewport shows; the rest are wrapped when they
 //! scroll into view. Wrapping the whole history on each of those made them
-//! linear in the session's length.
+//! linear in the session's length. Past a budget of wrapped rows, the
+//! blocks wrapped longest ago drop their wraps again, so a frame's work and
+//! the memory beyond the history's own lines stay the same at any length.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -248,54 +250,28 @@ impl Block {
         } else {
             lower_for_search(&format!("{header_text}\n{visible}"))
         };
-        let header = compact
-            .first()
-            .cloned()
-            .unwrap_or_else(|| Line::from("tool"));
-        let mut full_lines = vec![header];
-        // The screen shows output without its escape sequences; the exact
-        // bytes stay in `full_output` for copy and export.
-        for line in full_output.lines().take(80) {
-            full_lines.push(Line::from(Span::styled(
-                format!("  {}", strip_escapes(line)),
-                Style::default().fg(theme::DIM()),
-            )));
-        }
-        let total = full_output.lines().count();
-        if total > 80 {
-            full_lines.push(Line::from(Span::styled(
-                format!("  … {} more lines", total - 80),
-                Style::default()
-                    .fg(theme::DIM())
-                    .add_modifier(Modifier::ITALIC),
-            )));
-        }
-        // The copy text is whichever view is on screen: the card while
-        // folded, the output while open.
-        let selectable = if ok {
-            header_text
-        } else {
-            lines_to_plain(&full_lines)
-        };
-        let selectable_chars = selectable.chars().count();
-        Self {
+        let mut block = Self {
             kind: BlockKind::Tool,
             id: 0,
-            raw_cells: LineCells::measure(&full_lines),
+            raw_cells: LineCells::default(),
             compact_cells: LineCells::measure(&compact),
-            raw: full_lines,
+            raw: Vec::new(),
             compact: Some(compact),
-            folded: ok,
+            folded: true,
             full_output: Some(full_output),
             search_lower,
             height: 0,
             cache_width: 0,
-            cache_folded: ok,
+            cache_folded: true,
             cache: Vec::new(),
             cache_maps: Vec::new(),
-            selectable,
-            selectable_chars,
+            selectable_chars: header_text.chars().count(),
+            selectable: header_text,
+        };
+        if !ok {
+            block.set_folded(false);
         }
+        block
     }
 
     fn source_lines(&self) -> &[Line<'static>] {
@@ -331,10 +307,18 @@ impl Block {
         cells.rows(usize::from(content_width(self.kind, width))) + 1
     }
 
-    /// Show the block folded or open. The copy text follows the view; the
-    /// wrap does too, at the next `ensure_cache`.
+    /// Show the block folded or open. The copy text follows the view (the
+    /// card while folded, the output while open); the wrap does too, at the
+    /// next `ensure_cache`. A tool's open view is built as it opens and
+    /// dropped as it folds: most cards are never opened, and every card
+    /// holding its output a second time, as styled lines, was a third of a
+    /// long session's memory.
     fn set_folded(&mut self, folded: bool) {
         self.folded = folded;
+        if let (Some(compact), Some(output)) = (&self.compact, &self.full_output) {
+            self.raw = if folded { Vec::new() } else { open_view(compact, output) };
+            self.raw_cells = LineCells::measure(&self.raw);
+        }
         self.selectable = lines_to_plain(self.source_lines());
         self.selectable_chars = self.selectable.chars().count();
         self.invalidate();
@@ -366,10 +350,13 @@ impl Block {
         self.cache_maps.push(None);
     }
 
+    /// Drop the wrap and free it. Unless the fold changed too, the height
+    /// it measured stays exact at this width, and wrapping again yields the
+    /// same rows.
     fn invalidate(&mut self) {
         self.cache_width = 0;
-        self.cache.clear();
-        self.cache_maps.clear();
+        self.cache = Vec::new();
+        self.cache_maps = Vec::new();
     }
 }
 
@@ -397,6 +384,10 @@ pub struct RowRef {
     id: u64,
     row: usize,
 }
+
+/// Rows of wrapped lines the blocks keep beyond the ones in view, about
+/// 4 MB of them: the screens a reader scrolls back over stay wrapped.
+const WRAP_BUDGET: usize = 10_000;
 
 /// Where each block's rows start: a Fenwick tree over the block heights,
 /// so a block's first row, the block holding a row, and a change of one
@@ -495,6 +486,11 @@ pub struct Transcript {
     /// navigation find the nearest prompt by binary search instead of
     /// walking back through every block since it.
     users: Vec<usize>,
+    /// Each wrap a block took, oldest first, by block id with the rows it
+    /// held, and their sum: what [`Self::settle_view`] holds to
+    /// [`WRAP_BUDGET`].
+    wraps: std::collections::VecDeque<(u64, usize)>,
+    wrapped_rows: usize,
     /// Rows across all blocks (sum of their heights), kept current by every
     /// height change.
     total: usize,
@@ -517,6 +513,12 @@ pub struct Transcript {
     /// eager shape, which tests hold the lazy one against.
     #[cfg(test)]
     pub(crate) eager: bool,
+    /// A wrap budget in place of [`WRAP_BUDGET`], so tests drop wraps
+    /// without a session's worth of rows, and the wraps dropped so far.
+    #[cfg(test)]
+    pub(crate) wrap_budget: Option<usize>,
+    #[cfg(test)]
+    pub(crate) dropped_wraps: usize,
 }
 
 impl Transcript {
@@ -556,7 +558,7 @@ impl Transcript {
         let wrap_now = wrap_now || self.eager;
         self.blocks.push(block);
         if wrap_now && self.width > 0 {
-            self.blocks[bi].ensure_cache(self.width);
+            self.ensure_wrap(bi);
         }
         let height = self.blocks[bi].measure(self.width);
         self.blocks[bi].height = height;
@@ -590,8 +592,8 @@ impl Transcript {
         let removed = self.blocks.remove(i);
         self.users.pop();
         self.total -= removed.height;
-        // The blocks after it moved up one: index them again. It was the
-        // last prompt, so that is the few blocks since it.
+        // The blocks after it moved up one: index them again, the blocks
+        // since the last prompt.
         self.index.truncate(i);
         for block in &self.blocks[i..] {
             self.index.push(block.height);
@@ -712,11 +714,22 @@ impl Transcript {
         if self.width == 0 || self.blocks[bi].is_wrapped_at(self.width) {
             return 0;
         }
-        self.blocks[bi].ensure_cache(self.width);
+        self.ensure_wrap(bi);
         let before = self.blocks[bi].height;
         let height = self.blocks[bi].cache.len();
         self.set_height(bi, height);
         height as isize - before as isize
+    }
+
+    /// Wrap block `bi` at the current width unless it already is, counting
+    /// the rows its wrap holds (see [`Self::settle_view`]).
+    fn ensure_wrap(&mut self, bi: usize) {
+        let block = &mut self.blocks[bi];
+        if !block.is_wrapped_at(self.width) {
+            block.ensure_cache(self.width);
+            self.wraps.push_back((block.id, block.cache.len()));
+            self.wrapped_rows += block.cache.len();
+        }
     }
 
     fn set_height(&mut self, bi: usize, height: usize) {
@@ -741,7 +754,7 @@ impl Transcript {
             self.text_selection = None;
         }
         if self.width > 0 {
-            self.blocks[bi].ensure_cache(self.width);
+            self.ensure_wrap(bi);
         }
         let height = self.blocks[bi].measure(self.width);
         // Still indexed at its old height: the crossing is measured in the
@@ -768,9 +781,61 @@ impl Transcript {
     /// of `tail_len` rows, holding the content on screen still while their
     /// estimates turn exact. Remembers the geometry, so a scroll before the
     /// next frame knows which rows it crosses.
+    ///
+    /// Then it holds the wraps to [`WRAP_BUDGET`] rows: past it, the blocks
+    /// wrapped longest ago drop theirs, except the ones in view, which go
+    /// to the back. A block keeps its exact height without its wrap and
+    /// wraps again when a frame shows it, so reading a whole session holds
+    /// a window of wraps rather than a second copy of the session, and a
+    /// frame frees about what it wrapped.
     pub fn settle_view(&mut self, rows: usize, tail_len: usize) {
         self.view = (rows, tail_len);
         self.settle(0, 0);
+        let view = self.window(0, 0);
+        let budget = WRAP_BUDGET;
+        #[cfg(test)]
+        let budget = self.wrap_budget.unwrap_or(budget);
+        for _ in 0..self.wraps.len() {
+            if self.wrapped_rows <= budget {
+                break;
+            }
+            let Some((id, rows)) = self.wraps.pop_front() else {
+                break;
+            };
+            match self.blocks.binary_search_by_key(&id, |block| block.id) {
+                Ok(bi) if view.is_some_and(|(first, last)| (first..=last).contains(&bi)) => {
+                    self.wraps.push_back((id, rows));
+                }
+                found => {
+                    self.wrapped_rows -= rows;
+                    if let Ok(bi) = found {
+                        self.blocks[bi].invalidate();
+                        #[cfg(test)]
+                        {
+                            self.dropped_wraps += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first and last blocks of the last settled viewport extended by
+    /// `above` rows over it and `below` rows under it; none when that range
+    /// holds no history.
+    fn window(&self, above: usize, below: usize) -> Option<(usize, usize)> {
+        let (rows, tail_len) = self.view;
+        if self.width == 0 || rows == 0 {
+            return None;
+        }
+        let total = self.total + tail_len;
+        let end = total - self.offset.min(total.saturating_sub(rows));
+        let start = end.saturating_sub(rows);
+        let (from, to) = (start.saturating_sub(above), end.saturating_add(below).min(self.total));
+        if from >= to {
+            return None;
+        }
+        Some((self.locate(from)?.0, self.locate(to - 1)?.0))
     }
 
     /// Wrap the blocks covering the last settled viewport extended by
@@ -790,24 +855,7 @@ impl Transcript {
     /// others out of the range: the loop wraps at most the blocks the first
     /// range covered, never the history beyond it.
     fn settle(&mut self, above: usize, below: usize) {
-        let (rows, tail_len) = self.view;
-        if self.width == 0 || rows == 0 {
-            return;
-        }
-        loop {
-            let total = self.total + tail_len;
-            let top_offset = total.saturating_sub(rows);
-            let end = total - self.offset.min(top_offset);
-            let start = end.saturating_sub(rows);
-            let from = start.saturating_sub(above);
-            let to = end.saturating_add(below).min(self.total);
-            if from >= to {
-                return;
-            }
-            let (Some((first, _)), Some((last, _))) = (self.locate(from), self.locate(to - 1))
-            else {
-                return;
-            };
+        while let Some((first, last)) = self.window(above, below) {
             let held = self.held_block();
             let mut wrapped = false;
             for bi in first..=last {
@@ -1618,6 +1666,30 @@ impl Transcript {
         self.selected = None;
     }
 
+}
+
+/// A tool card open: its header over the first 80 lines of output. The
+/// screen shows output without its escape sequences; the exact bytes stay
+/// in `full_output` for copy and export.
+fn open_view(compact: &[Line<'static>], output: &str) -> Vec<Line<'static>> {
+    let header = compact.first().cloned().unwrap_or_else(|| Line::from("tool"));
+    let mut lines = vec![header];
+    for line in output.lines().take(80) {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strip_escapes(line)),
+            Style::default().fg(theme::DIM()),
+        )));
+    }
+    let total = output.lines().count();
+    if total > 80 {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more lines", total - 80),
+            Style::default()
+                .fg(theme::DIM())
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines
 }
 
 fn line_is_blank(l: &Line<'_>) -> bool {
@@ -2762,6 +2834,50 @@ mod tests {
         let wide = t.len();
         t.set_width(10);
         assert!(t.len() >= wide);
+    }
+
+    /// Reading a whole session holds a window of wraps rather than a second
+    /// copy of the session: past the budget, the blocks wrapped longest ago
+    /// drop their wraps, never a block in view, and keep the heights their
+    /// wraps measured, so the total stays exact.
+    #[test]
+    fn paging_through_history_holds_wraps_to_their_budget() {
+        const BUDGET: usize = 120;
+        const ROWS: usize = 30;
+        // Three 21-column words: estimated at two rows, wrapped at three,
+        // so a height that left with its wrap would show in the total.
+        let push = |t: &mut Transcript| {
+            for i in 0..400 {
+                let reply = format!("reply{i:<16} {} {}", "b".repeat(21), "c".repeat(21));
+                t.push_assistant(vec![Line::from(reply)]);
+                t.push_user(vec![Line::from(format!("prompt {i}"))]);
+            }
+        };
+        let mut t = Transcript::new();
+        t.wrap_budget = Some(BUDGET);
+        t.set_width(40);
+        push(&mut t);
+        let mut eager = Transcript::new();
+        eager.eager = true;
+        eager.set_width(40);
+        push(&mut eager);
+        t.settle_view(ROWS, 0);
+        t.set_offset(t.len() - ROWS);
+        loop {
+            t.settle_view(ROWS, 0);
+            let (first, last) = t.window(0, 0).unwrap();
+            assert!(t.blocks[first..=last].iter().all(|b| b.is_wrapped_at(40)), "a block in view lost its wrap");
+            let in_view: usize = t.blocks[first..=last].iter().map(|b| b.height).sum();
+            let held: usize = t.blocks.iter().map(|b| b.cache.len()).sum();
+            assert!(held <= BUDGET + in_view, "{held} rows of wraps held at offset {}, budget {BUDGET}", t.offset());
+            if t.offset() == 0 {
+                break;
+            }
+            t.scroll_down(ROWS);
+        }
+        assert!(t.wrapped_rows <= BUDGET, "{} rows of wraps counted, budget {BUDGET}", t.wrapped_rows);
+        assert!(t.len() > t.blocks.len() * 5 / 2, "the replies did not wrap past their estimates");
+        assert_eq!(t.len(), eager.len(), "a dropped wrap took its exact height with it");
     }
 
     // Release-only diagnostic for the synchronous resize path: re-measuring

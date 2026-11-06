@@ -2568,6 +2568,14 @@ pub fn allocations() -> u64 {
     alloc_count::ALLOCATIONS.with(std::cell::Cell::get)
 }
 
+/// Heap bytes the calling thread holds (what it allocated less what it
+/// freed) and the most it has held at once, for tests that bound what a
+/// transcript keeps per line. Per thread, like [`allocations`].
+#[cfg(test)]
+pub fn heap_bytes() -> (isize, isize) {
+    alloc_count::BYTES.with(std::cell::Cell::get)
+}
+
 #[cfg(test)]
 mod alloc_count {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -2577,31 +2585,42 @@ mod alloc_count {
         // Const-initialized with no destructor: reading it never allocates,
         // which the allocator itself depends on.
         pub static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+        // Live bytes and their peak; see `heap_bytes`.
+        pub static BYTES: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
     }
 
-    fn count() {
+    fn count(grown: isize) {
         let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+        resize(grown);
+    }
+
+    fn resize(grown: isize) {
+        let _ = BYTES.try_with(|bytes| {
+            let live = bytes.get().0 + grown;
+            bytes.set((live, live.max(bytes.get().1)));
+        });
     }
 
     pub struct Counting;
 
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            count();
+            count(layout.size() as isize);
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            count();
+            count(layout.size() as isize);
             unsafe { System.alloc_zeroed(layout) }
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            count();
+            count(new_size as isize - layout.size() as isize);
             unsafe { System.realloc(ptr, layout, new_size) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            resize(-(layout.size() as isize));
             unsafe { System.dealloc(ptr, layout) }
         }
     }
