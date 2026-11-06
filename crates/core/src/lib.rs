@@ -16,6 +16,7 @@ pub mod permissions;
 pub mod prompt;
 pub mod providers;
 pub mod recall;
+mod refreeze;
 pub mod registry;
 pub mod sessions;
 pub mod skills;
