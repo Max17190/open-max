@@ -3593,11 +3593,20 @@ struct Kill9 {
 /// job, and the watcher, which leads a session of its own, is out of its
 /// reach. The method is `assert_no_orphans_after_kill_9`'s, on a run whose
 /// HOME holds its data directory; this run's listing is the one CI keeps.
+/// README.md states the grace and the bound, held here.
 #[cfg(unix)]
 #[test]
 fn zero_orphans_after_kill_9() {
     let kill = Kill9 { home: true, group: true, removed: false };
     assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", kill, Some(ORPHANS_LISTING));
+    let (grace, bound) = (open_max_core::execution::LEFT_BEHIND_GRACE.as_millis(), ORPHANS_GONE_WITHIN.as_millis());
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        format!("SIGKILL if it is still there {grace} ms later"),
+        format!("within {bound} ms of the signal, and none of the three before the {grace} ms grace"),
+    ] {
+        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    }
 }
 
 /// The same for `kill -9 <pid>` of a run with no HOME, whose data directory
