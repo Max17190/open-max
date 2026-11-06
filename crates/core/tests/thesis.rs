@@ -900,7 +900,7 @@ tool = "bash"
 arg_regex = 'sudo\s'
 "#;
 
-/// 100 extensions of every kind a session loads, three fifths in the project
+/// 100 extensions of every kind the harness loads, three fifths in the project
 /// and the rest global, each in the shape `openmax --spec` documents: 40 tool
 /// manifests with `TOOL_PARAMS` (every other one with `TOOL_EXAMPLE`, every
 /// third forwarding a credential, every fifth mutating), each running a script
@@ -1056,7 +1056,7 @@ fn instructions_retired() -> Option<u64> {
 /// time over the floor read just before it, each part's median, and on macOS
 /// the instructions retired per load. Reading is the part of a load no loader
 /// can skip, so the ratio is the harness's own work in units of the machine
-/// it runs on: 2.70 to 2.74 at full speed and under the utility QoS clamp,
+/// it runs on: 2.67 to 2.74 at full speed and under the utility QoS clamp,
 /// and 2.88 under the background clamp, on efficiency cores alone, where the
 /// load took 10.8 ms instead of 2.8. Other work on the same cores moves it:
 /// 3.20 when the background clamp shared them with a mutation run.
