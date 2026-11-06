@@ -3663,14 +3663,21 @@ fn gone_after(pids: &[i32], since: Instant, wait: Duration) -> Vec<Option<Durati
 /// starts a sleeper, the shell's grandchild, writes its pid and waits, and
 /// each inherits the ignored SIGTERM. Once the three pids are written and the
 /// run's record lists the shell's group, this waits for the run's watcher,
-/// which the record's first write starts, then sends SIGKILL and waits for
-/// the run, as the shell that started it would. From the signal on, it polls
-/// each process of the tree and the watcher every millisecond for up to 5
-/// seconds with `kill(pid, 0)`, which finds a zombie its new parent has not
-/// collected, so each reads as gone once it has exited and been collected,
-/// and lists each pid with when it did. A release build, as CI's thesis job
-/// runs it, asserts the bound; a debug build asserts 20 times it, as the
-/// whole suite runs beside it, and prints the times.
+/// which the record's first write starts, then reads the clock, sends
+/// SIGKILL and waits for the run, as the shell that started it would. From
+/// that reading on, it polls each process of the tree and the watcher every
+/// millisecond for up to 5 seconds with `kill(pid, 0)`, which finds a zombie
+/// its new parent has not collected, so each reads as gone once it has
+/// exited and been collected, and lists each pid with when it did. A release
+/// build, as CI's thesis job runs it, asserts the bound; a debug build
+/// asserts 20 times it, as the whole suite runs beside it, and prints the
+/// times. The clock is read before the signal, not once the call returns:
+/// the watcher's SIGTERM follows the run's death, which follows the call's
+/// start, and its SIGKILL comes no sooner than the grace after its SIGTERM,
+/// so no process of the tree can read as gone within the grace of that
+/// reading. A reading taken once the call returns can fall after the
+/// SIGTERM, as when this thread runs again late, and the grace bound would
+/// then fail on correct code.
 #[cfg(unix)]
 fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<&str>) {
     use open_max_core::execution::LEFT_BEHIND_GRACE;
@@ -3701,8 +3708,8 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
     let watcher = watchers_of(&record).first().copied();
     let session = watcher.map(|pid| unsafe { libc::getsid(pid) });
     let target = run.id() as libc::pid_t;
-    unsafe { libc::kill(if kill.group { -target } else { target }, libc::SIGKILL) };
     let killed = Instant::now();
+    unsafe { libc::kill(if kill.group { -target } else { target }, libc::SIGKILL) };
     run.wait().unwrap();
     let watched: Vec<i32> = tree.iter().copied().chain(watcher).collect();
     let gone = gone_after(&watched, killed, Duration::from_secs(5));
