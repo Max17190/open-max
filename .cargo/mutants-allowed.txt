@@ -38,3 +38,6 @@ crates/tui/src/ui/transcript.rs: replace low -> usize with 0 # hangs: with every
 crates/tui/src/ui/transcript.rs: replace -= with /= in RowIndex::push # hangs: an odd node number divided by its lowest bit, 1, stays put, so the sum of the nodes under a new block's node never ends.
 crates/tui/src/ui/transcript.rs: replace += with *= in RowIndex::add # hangs: an odd node number times its lowest bit, 1, stays put, so a height change never climbs past it.
 crates/tui/src/ui/transcript.rs: replace -= with /= in RowIndex::start # hangs: an odd node number divided by its lowest bit, 1, stays put, so the rows above a block are summed forever.
+crates/tui/src/ui/transcript.rs: replace Transcript::wrap_block -> isize with 1 # hangs: a wrap that reports a row added while wrapping nothing leaves its block unwrapped, so settle, which runs until a pass changes no height, never ends.
+crates/tui/src/ui/transcript.rs: replace Transcript::wrap_block -> isize with -1 # hangs: a wrap that reports a row removed while wrapping nothing leaves its block unwrapped, so settle, which runs until a pass changes no height, never ends.
+crates/tui/src/ui/transcript.rs: replace Transcript::wrap_held -> bool with true # hangs: settle runs until a pass changes no height, and a wrap that reports a change every time never lets it end.
