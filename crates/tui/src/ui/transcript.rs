@@ -311,8 +311,8 @@ impl Block {
     /// card while folded, the output while open); the wrap does too, at the
     /// next `ensure_cache`. A tool's open view is built as it opens and
     /// dropped as it folds: most cards are never opened, and every card
-    /// holding its output a second time, as styled lines, was a third of a
-    /// long session's memory.
+    /// holding its output a second time, as styled lines, was a third of
+    /// what the 1,000,000-line test session's transcript held.
     fn set_folded(&mut self, folded: bool) {
         self.folded = folded;
         if let (Some(compact), Some(output)) = (&self.compact, &self.full_output) {
