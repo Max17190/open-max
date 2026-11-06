@@ -559,9 +559,8 @@ impl Note {
 
 /// An index line's name in a `PromptIndex`: the first 8 bytes of its SHA-256.
 fn line_id(line: &str) -> u64 {
-    use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(line.as_bytes());
-    u64::from_le_bytes(digest[..8].try_into().expect("a SHA-256 digest is 32 bytes"))
+    let digest = ring::digest::digest(&ring::digest::SHA256, line.as_bytes());
+    u64::from_le_bytes(digest.as_ref()[..8].try_into().expect("a SHA-256 digest is 32 bytes"))
 }
 
 /// The tools trailer: the tool files the load cap kept out, never silently.

@@ -1134,8 +1134,13 @@ pub(crate) fn parse_tool_source(path: &Path, text: &str) -> Result<ToolSpec, Str
     let example = match file.example {
         None => None,
         Some(ex) => {
+            // Parsed with the parser regex compiles with, not compiled: a
+            // session never runs the example, and compiling a pattern with a
+            // Unicode class (\d, \s, \w) took 40 us of every load and every
+            // refreeze. Only `--run-examples` compiles it, and names a
+            // pattern that parses but is past the compiler's size limit.
             if let Some(pattern) = ex.expect_regex.as_deref() {
-                regex::Regex::new(pattern).map_err(|e| {
+                regex_syntax::parse(pattern).map_err(|e| {
                     crate::text::one_line(&format!("example.expect_regex is invalid: {e}"))
                 })?;
             }

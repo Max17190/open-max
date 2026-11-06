@@ -20,7 +20,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// Who wrote a record, at the strength the core can prove.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,12 +118,21 @@ fn is_false(b: &bool) -> bool {
 /// number only says which build's shape a record carries.
 const RECORD_VERSION: u32 = 2;
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Lowercase hex, two digits a byte, into one allocation: a `format!` per
+/// byte allocated 32 strings for every hash the loaders take.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 * bytes.len());
+    bytes.iter().for_each(|b| out.extend([DIGITS[usize::from(b >> 4)], DIGITS[usize::from(b & 15)]].map(char::from)));
+    out
 }
 
+/// SHA-256 from the TLS stack's implementation, which uses the CPU's SHA
+/// instructions on aarch64 and x86_64: every tool, hook and policy file a
+/// load parses, and the ledger's whole log at every approval check, is
+/// hashed here.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+    hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
 /// The per-project key every per-project store under the data dir uses:
@@ -1228,10 +1236,11 @@ impl BoundCode {
 /// upgrade. The threat here is the agent rewriting files it can write.
 pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<BoundCode> {
     let mut out = Vec::new();
+    let root = std::cell::OnceCell::new();
     let command = command.trim();
     match resolve_command(command, project_root) {
         // Agent-writable: the bytes decide.
-        Some(path) if inside_project(&path, project_root) => out.push(read_code(path)),
+        Some(path) if inside_project(&path, project_root, &root) => out.push(read_code(path)),
         // A real file outside the project: the absolute path the human read.
         Some(path) if path.exists() => {}
         // Resolved to nothing, or did not resolve at all. Either way there is
@@ -1251,7 +1260,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
             continue;
         }
         let path = absolute_from(arg, project_root);
-        if path.is_file() && inside_project(&path, project_root) {
+        if path.is_file() && inside_project(&path, project_root, &root) {
             out.push(read_code(path));
         }
     }
@@ -1284,7 +1293,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
                 continue;
             }
             let path = absolute_from(arg, project_root);
-            if inside_project(&path, project_root) && !path.is_file() {
+            if !path.is_file() && inside_project(&path, project_root, &root) {
                 out.push(BoundCode { path, sha256: None });
             }
             break; // the first script-like positional is the script
@@ -1356,6 +1365,7 @@ pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) 
         .map(|c| c.path)
         .collect();
     let mut inline = false;
+    let root = std::cell::OnceCell::new();
     for arg in args {
         let arg = arg.trim();
         if INLINE_FLAGS.contains(&arg) {
@@ -1372,7 +1382,7 @@ pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) 
                 continue;
             }
             let path = absolute_from(token, project_root);
-            if path.is_file() && inside_project(&path, project_root) && !bound.contains(&path) {
+            if path.is_file() && inside_project(&path, project_root, &root) && !bound.contains(&path) {
                 return Some(path);
             }
         }
@@ -1484,13 +1494,16 @@ fn canonical_or(path: &Path) -> PathBuf {
 /// Whether `path` sits inside the project, and is therefore agent-writable.
 /// Judged both lexically and through symlinks: a symlink inside the project
 /// cannot carry its content out of the agent's reach, and one pointing in
-/// from outside still names content the agent can rewrite.
-fn inside_project(path: &Path, project_root: &Path) -> bool {
-    let root = canonical_or(project_root);
-    if path.starts_with(&root) || path.starts_with(project_root) {
+/// from outside still names content the agent can rewrite. `root` holds the
+/// project's canonical spelling, resolved once for all of one caller's paths
+/// and only when the lexical check leaves one open: each `realpath` costs
+/// microseconds, and every hook discovery binds every hook.
+fn inside_project(path: &Path, project_root: &Path, root: &std::cell::OnceCell<PathBuf>) -> bool {
+    if path.starts_with(project_root) {
         return true;
     }
-    canonical_or(path).starts_with(&root)
+    let root = root.get_or_init(|| canonical_or(project_root));
+    path.starts_with(root) || canonical_or(path).starts_with(root)
 }
 
 // ---------- usage accounting ----------
@@ -1687,6 +1700,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openmax-ledger-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Every approval binds content by this hash, and every record a ledger
+    /// already holds was written with it, so the implementation must give
+    /// SHA-256 exactly, in lowercase hex: the FIPS 180-2 test vectors, one and
+    /// two blocks, and a million bytes.
+    #[test]
+    fn content_hashes_are_sha256_in_lowercase_hex() {
+        let vectors: [(&[u8], &str); 3] = [
+            (b"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ];
+        for (bytes, digest) in vectors {
+            assert_eq!(sha256_hex(bytes), digest, "{:?}", String::from_utf8_lossy(bytes));
+        }
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     /// Append change records the way earlier builds did on every refreeze,
@@ -2211,6 +2247,33 @@ mod tests {
         let bound = bound_code(&outside.join("into.sh").display().to_string(), &[], &root);
         assert_eq!(bound.len(), 1, "a symlink pointing into the project still names project code");
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The lexical check settles a path under the root as written; the
+    /// canonical root is resolved once, only for a path it leaves open. Code
+    /// named by its canonical path under a root spelled through a symlink,
+    /// and code named through the link under the canonical root, both bind,
+    /// and a script outside the project binds under neither.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_spelled_through_a_symlink_binds_the_same_code() {
+        let real = temp("spelled-proj").canonicalize().unwrap();
+        let link = PathBuf::from(format!("{}-link", real.display()));
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let outside = temp("spelled-outside");
+        std::fs::write(real.join("run.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::write(outside.join("host.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        let script = |dir: &Path, name: &str| vec![dir.join(name).display().to_string()];
+        let sha = Some(sha256_hex(b"#!/bin/sh\ntrue\n"));
+        for (root, spelled) in [(&link, &real), (&real, &link)] {
+            let bound = bound_code("sh", &script(spelled, "run.sh"), root);
+            assert_eq!(bound.len(), 1, "root {}, script under {}", root.display(), spelled.display());
+            assert_eq!(bound[0].sha256, sha);
+            assert!(bound_code("sh", &script(&outside, "host.sh"), root).is_empty(), "host code is the manifest's");
+        }
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
         let _ = std::fs::remove_dir_all(&outside);
     }
 

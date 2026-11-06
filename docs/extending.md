@@ -323,8 +323,11 @@ A tool file may declare one `[example]` (JSON args plus an optional
 example through the real spawn path. In `auto`, valid tools run with host
 authority without content approval, behind hook gates and permission denies.
 In `ask` or `readonly`, for an approved tool the example is the
-real command on the host, and a failed call or an output mismatch fails the
-check. An unapproved tool is probed in a sandbox that denies the network and
+real command on the host, and a failed call, an output mismatch, or an
+`expect_regex` the regex compiler refuses fails the check: a tool whose
+pattern parses but compiles past the compiler's size limit loads, and plain
+`--check` passes it, since loading parses the pattern without compiling it.
+An unapproved tool is probed in a sandbox that denies the network and
 any write outside its scratch directory, so a non-pass there is reported as a
 warning and does not fail the check: under those restrictions it is
 inconclusive, not proof the tool is broken (a passing probe approves nothing,
