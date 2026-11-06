@@ -569,7 +569,8 @@ fn repo_lines() -> Result<&'static str, String> {
     REPORT.get_or_init(|| gauge(&repo(), &["--files"])).as_deref().map_err(String::clone)
 }
 
-/// The core, production Rust without its tests, is about 37,000 lines.
+/// The core, production Rust without its tests, stays under its line
+/// ratchet, against a target of about 37,000 lines.
 /// scripts/count-core-lines.sh measures it as core-excluding-tests (the
 /// lines of crates/*/src less test-only items, by the method its header
 /// states) beside total-including-tests (every line of Rust under crates/),
@@ -582,8 +583,9 @@ fn repo_lines() -> Result<&'static str, String> {
 /// removes production lines must lower BASELINE to its new count, so the
 /// lines it saves stay saved. A BASELINE past CEILING does not compile, and
 /// no change grows the core past CEILING, lines the agent loop moves into
-/// other files (agent_loop_is_under_2500_lines) included. README.md states
-/// the ratchet and CEILING, held here. A count, so every build asserts it.
+/// other files (agent_loop_stays_under_its_line_ratchet) included.
+/// README.md states the ratchet and CEILING, held here. A count, so every
+/// build asserts it.
 ///
 /// First the script is held to a fixture checkout
 /// (crates/tui/tests/fixtures/count-core-lines.txt) whose every source line
@@ -1019,21 +1021,69 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
     );
 }
 
+/// The commands of `script`, a step's `run`, whose failure a pipe loses when
+/// the script runs as GitHub runs one that names no shell, `bash -e` without
+/// `pipefail`: the command before each `|` outside quotes that is not `||`,
+/// unless it is `echo` or `printf`, which have no failure to lose. A `|` in
+/// a `case` pattern (`Linux|Darwin)`) is no pipe.
+fn lossy_pipes(script: &str) -> Vec<String> {
+    let mut lossy = Vec::new();
+    for line in script.replace("\\\n", " ").lines() {
+        let (mut quote, mut from, mut chars) = (None, 0, line.char_indices().peekable());
+        while let Some((at, c)) = chars.next() {
+            match (quote, c) {
+                (Some(open), c) if c == open => quote = None,
+                (Some(_), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '#') if line[..at].ends_with(|c: char| c.is_whitespace()) || at == 0 => break,
+                (None, ';' | '&') => from = at + 1,
+                (None, '|') if chars.next_if(|(_, next)| *next == '|').is_some() => from = at + 2,
+                (None, '|') => {
+                    let rest = &line[at + 1..];
+                    let pattern = rest.find(')').is_some_and(|close| !rest[..close].contains(|c: char| c.is_whitespace() || c == '"' || c == '\''));
+                    let command = line[from..at].trim().trim_start_matches(['(', '{', '!', ' ']);
+                    if !pattern && !matches!(command.split_whitespace().next(), Some("echo" | "printf")) {
+                        lossy.push(command.to_string());
+                    }
+                    from = at + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    lossy
+}
+
 /// No step of a workflow that runs on pull requests can be skipped in a run
-/// that decides the gate, or fail without failing it: no `continue-on-error`
-/// anywhere, no `if:` but `if: ${{ !cancelled() }}` (which runs a step after
-/// a failed one too, and skips it only in a run that was cancelled), and no
-/// command whose failure its script swallows (`|| true`, `|| :`, `|| exit 0`).
-/// A measurement no runner meets with room leaves the pull request's gate
-/// for the Reports workflow, which runs every night and by hand, on no pull
-/// request and no push, and fails only when it cannot measure. ci.yml is the
-/// one workflow that runs on pull requests.
+/// that decides the gate, or fail without failing it, by the means this
+/// reads, each key read as YAML reads it, quoted or with space before its
+/// colon: no `continue-on-error` anywhere; no `if:` but
+/// `if: ${{ !cancelled() }}`, which runs a step after a failed one too and
+/// skips it only in a run that was cancelled; no command whose failure its
+/// script swallows with `|| true`, `|| :` or `|| exit 0`; and no pipe that
+/// loses a failure (lossy_pipes), unless the step's script sets `pipefail`
+/// or reads `PIPESTATUS`, or the step runs under `shell: bash`, which sets
+/// `pipefail`. A measurement no runner meets with room leaves the pull
+/// request's gate for the Reports workflow, which runs every night and by
+/// hand, on no pull request and no push, and fails only when it cannot
+/// measure. Of the workflows GitHub runs, `.yml` and `.yaml` files, ci.yml
+/// is the one that runs on pull requests.
 #[test]
 fn pull_request_workflows_skip_no_step_and_let_none_fail() {
+    for (script, lossy) in [
+        ("cargo test | tee log", &["cargo test"][..]),
+        ("cargo build && cargo test --list \\\n  | grep -c ': test$' > count", &["cargo test --list"][..]),
+        ("x=$(git log | head -1)", &["x=$(git log"][..]),
+        ("echo \"$sum  file\" | shasum -a 256 --check -", &[][..]),
+        ("grep -E 'a|b' log || failed=1", &[][..]),
+        ("case $os in Linux|Darwin) ok=1 ;; esac # a | b", &[][..]),
+    ] {
+        assert_eq!(lossy_pipes(script), lossy, "the pipes of {script:?} that lose a failure");
+    }
     let mut workflows: Vec<String> = std::fs::read_dir(repo().join(".github/workflows"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".yml"))
+        .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
         .collect();
     workflows.sort();
     let gating: Vec<&String> =
@@ -1042,16 +1092,42 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
     let mut soft = Vec::new();
     for workflow in gating {
         let text = std::fs::read_to_string(repo().join(".github/workflows").join(workflow)).unwrap();
-        for (at, line) in text.lines().enumerate() {
-            let key = line.trim().trim_start_matches("- ");
-            if key.starts_with('#') {
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let unquoted = |text: &str| text.trim().trim_matches(['"', '\'']).to_string();
+        for (at, line) in lines.iter().enumerate() {
+            let body = line.trim().trim_start_matches("- ");
+            if body.starts_with('#') {
                 continue;
             }
-            if key.starts_with("continue-on-error:")
-                || (key.starts_with("if:") && key != "if: ${{ !cancelled() }}")
-                || ["|| true", "|| :", "|| exit 0"].iter().any(|swallowed| key.contains(swallowed))
+            let (key, value) = body.split_once(':').map_or((String::new(), String::new()), |(key, value)| (unquoted(key), unquoted(value)));
+            let squeezed = body.replace("|| ", "||");
+            if key == "continue-on-error"
+                || (key == "if" && value != "${{ !cancelled() }}")
+                || ["||true", "||:", "||exit 0"].iter().any(|swallowed| squeezed.contains(swallowed))
             {
-                soft.push(format!("{workflow} line {}: {key}", at + 1));
+                soft.push(format!("{workflow} line {}: {body}", at + 1));
+            }
+            if key != "run" {
+                continue;
+            }
+            // The script: the value, or the block under a `|` or `>` value,
+            // every line indented past the key.
+            let indent = line.len() - line.trim_start().len() + if line.trim_start().starts_with("- ") { 2 } else { 0 };
+            let script = if value.starts_with(['|', '>']) {
+                let block = lines[at + 1..].iter().take_while(|next| next.trim().is_empty() || next.len() - next.trim_start().len() > indent);
+                block.map(String::as_str).collect::<Vec<_>>().join("\n")
+            } else {
+                value
+            };
+            let lossy = lossy_pipes(&script);
+            if lossy.is_empty() || script.contains("pipefail") || script.contains("PIPESTATUS") {
+                continue;
+            }
+            let bash = |key: &&str| key.split_once(':').is_some_and(|(key, shell)| unquoted(key) == "shell" && unquoted(shell) == "bash");
+            if !step_keys(&lines, at).iter().any(bash) {
+                for command in lossy {
+                    soft.push(format!("{workflow} line {}: a pipe loses the failure of `{command}`, with no pipefail", at + 1));
+                }
             }
         }
     }
@@ -1222,25 +1298,79 @@ fn stated_bound(name: &str) -> Option<u64> {
     None
 }
 
-/// Every thesis test whose name states a bound measures what it names and
-/// says so where CI shows it. A name states a bound with a number after a
-/// comparator (`_under_700_`, `_at_least_ninety_five_`, `_in_five_seconds`,
-/// `_has_two_thousand_`), a number before `_percent`, or `zero_`, in digits
-/// or in words (stated_bound gives the grammar). Each such test prints, with
-/// `println!` or `eprintln!`, which CI's thesis job shows, a `MEASURE` line
-/// keyed by its own name, from its body or from the function it passes its
-/// name to first, which keys the line by that parameter. The line's first
-/// number is formatted from a value, never written in the literal, and the
-/// line gives the bound the name states, in its literal or through a
-/// constant of its file that it formats. And CI's thesis job gates the test:
-/// no runner reports it instead, it is not ignored, and no cfg keeps it off
-/// both runners. What the test asserts against the bound is its own (its
-/// red record shows it failing past the bound); this holds what its name and
-/// its line say to each other and to CI, so a test named for a bound it
-/// never measures, as `mutation_score_is_at_least_ninety_five_percent` was,
-/// fails here.
+/// Whether the predicate of a `#[cfg(...)]`, `cfg`, holds in the build CI's
+/// thesis job makes on `os`, `linux` or `macos`: `unix` and `test` hold,
+/// `target_os = "..."` holds for its own os, `debug_assertions` does not
+/// hold in a release build, and `not`, `all` and `any` combine as rustc's
+/// do. Any other predicate (a feature, an architecture) is taken not to
+/// hold, so a cfg this cannot read counts as keeping a test off.
+fn cfg_holds(cfg: &str, os: &str) -> bool {
+    let cfg = cfg.trim();
+    let Some((combinator, inner)) = cfg.strip_suffix(')').and_then(|cfg| cfg.split_once('(')) else {
+        let (key, value) = cfg.split_once('=').map_or((cfg, ""), |(key, value)| (key.trim(), value.trim().trim_matches('"')));
+        return matches!(key, "unix" | "test") || (key == "target_os" && value == os);
+    };
+    let (mut parts, mut depth, mut from) = (Vec::new(), 0, 0);
+    for (at, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&inner[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[from..]);
+    let mut parts = parts.into_iter().filter(|part| !part.trim().is_empty()).map(|part| cfg_holds(part, os));
+    match combinator.trim() {
+        "not" => !parts.next().unwrap_or(false),
+        "all" => parts.all(|holds| holds),
+        "any" => parts.any(|holds| holds),
+        _ => false,
+    }
+}
+
+/// Every thesis test whose name states a bound prints what it measured
+/// beside that bound, and CI gates it. A name states a bound with a number
+/// after a comparator (`_under_700_`, `_at_least_ninety_five_`,
+/// `_in_five_seconds`, `_has_two_thousand_`), a number before `_percent`, or
+/// `zero_`, in digits or in words (stated_bound gives the grammar). Each
+/// such test prints, with `println!` or `eprintln!`, which CI's thesis job
+/// shows, a `MEASURE` line keyed by its own name, from its body or from the
+/// function it passes its name to first, which keys the line by that
+/// parameter. The line's first number is formatted from a value of the
+/// test's own, neither written in the literal nor a constant of its code or
+/// its file, and the line gives the bound the name states as a number of
+/// its own (not the 10 of `p10`), in its literal or through a constant it
+/// formats, read from the function that prints the line, then the test,
+/// then the file, so another test's constant of the same name does not
+/// answer for it. And CI's thesis job gates the test: no runner reports it
+/// instead, it is not ignored, and its cfg holds on at least one of CI's
+/// runners in a release build (cfg_holds). What the test asserts against the
+/// bound is its own, and so is whether the value it prints is a
+/// measurement of what its name states rather than a value read from
+/// elsewhere: no reading of its source settles that, and its red record
+/// shows it failing past the bound. This holds what a test's name, its line
+/// and CI say to each other, so a test named for a bound that prints
+/// nothing keyed by its name, as `mutation_score_is_at_least_ninety_five_percent`
+/// did, or one that prints the bound where a measurement belongs, fails
+/// here.
 #[test]
 fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
+    for (cfg, linux, macos) in [
+        ("unix", true, true),
+        ("not(unix)", false, false),
+        ("windows", false, false),
+        ("target_os = \"linux\"", true, false),
+        ("not(target_os = \"macos\")", true, false),
+        ("any(target_os = \"linux\", target_os = \"macos\")", true, true),
+        ("all(unix, not(debug_assertions))", true, true),
+        ("all(unix, feature = \"slow\")", false, false),
+    ] {
+        assert_eq!((cfg_holds(cfg, "linux"), cfg_holds(cfg, "macos")), (linux, macos), "where #[cfg({cfg})] holds");
+    }
     // The grammar, on names this file has had and names it has.
     for (name, bound) in [
         ("mutation_score_is_at_least_ninety_five_percent", Some(95)),
@@ -1270,15 +1400,6 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
     assert!(!reported.is_empty(), "no runner reports a thesis test, so this holds nothing about the reported ones");
     let (mut bounded, mut problems) = (Vec::new(), Vec::new());
     for (path, source) in thesis_sources() {
-        // A constant of the file, as a MEASURE line formats it.
-        let constant = |name: &str| {
-            let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-            source.lines().filter(|_| named).find_map(|line| {
-                let typed = line.trim_start().strip_prefix("const ")?.strip_prefix(name)?.strip_prefix(':')?;
-                let value = typed.split_once('=')?.1.trim().strip_suffix(';')?.replace('_', "");
-                value.parse::<f64>().is_ok().then_some(value)
-            })
-        };
         for (name, attributes) in tests_in(&source) {
             let Some(bound) = stated_bound(&name) else { continue };
             bounded.push(format!("{name} ({bound})"));
@@ -1289,9 +1410,9 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
             if attributes.iter().any(|attribute| attribute.contains("ignore")) {
                 problem("it is ignored, so no CI job runs it".to_string());
             }
-            if let Some(cfg) = attributes
-                .iter()
-                .find(|attribute| attribute.starts_with("#[cfg(") && !["unix", "linux", "macos"].iter().any(|os| attribute.contains(os)))
+            let off = |cfg: &str| !["linux", "macos"].iter().any(|os| cfg_holds(cfg, os));
+            if let Some(cfg) =
+                attributes.iter().find(|attribute| attribute.strip_prefix("#[cfg(").and_then(|cfg| cfg.strip_suffix(")]")).is_some_and(off))
             {
                 problem(format!("{cfg} keeps it off both of CI's runners"));
             }
@@ -1313,10 +1434,31 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
             if !["println!(", "eprintln!("].iter().any(|print| code[..at].trim_end().ends_with(print)) {
                 problem("its MEASURE line is not printed with println! or eprintln!".to_string());
             }
+            // A constant the line formats, as its value: a number, or the
+            // count a Duration's constructor takes. It is read from the
+            // function that prints the line, then the test, then the file.
+            let constant = |name: &str| {
+                let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                [code.as_str(), body.as_str(), source.as_str()].into_iter().filter(|_| named).find_map(|scope| {
+                    scope.lines().find_map(|line| {
+                        let typed = line.trim_start().strip_prefix("const ")?.strip_prefix(name)?.strip_prefix(':')?;
+                        let value = typed.split_once('=')?.1.trim().strip_suffix(';')?;
+                        let value = value.strip_prefix("Duration::from_").and_then(|call| call.split_once('(')?.1.strip_suffix(')')).unwrap_or(value);
+                        let value = value.replace('_', "");
+                        value.parse::<f64>().is_ok().then_some(value)
+                    })
+                })
+            };
             let literal = literal_at(&code, at);
             let line = literal.splitn(3, ' ').nth(2).unwrap_or_default();
-            if !line.find('{').is_some_and(|value| line.find(|c: char| c.is_ascii_digit()).is_none_or(|digit| value < digit)) {
-                problem(format!("its MEASURE line writes its first number instead of formatting a value: {literal}"));
+            let first = line.find('{').filter(|value| line.find(|c: char| c.is_ascii_digit()).is_none_or(|digit| *value < digit));
+            let first = first.map(|open| line[open + 1..].split(['}', ':']).next().unwrap_or_default());
+            match first {
+                None => problem(format!("its MEASURE line writes its first number instead of formatting a value: {literal}")),
+                Some(value) if constant(value).is_some() => {
+                    problem(format!("its MEASURE line's first number is the constant {value}, not a value it measured: {literal}"))
+                }
+                Some(_) => {}
             }
             // The line with each constant it formats written out, and every
             // other value left out.
@@ -1330,7 +1472,16 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
                 rest = &rest[(close + 1).min(rest.len())..];
             }
             said.push_str(rest);
-            if !said.split(|c: char| !c.is_ascii_digit()).any(|number| number == bound.to_string()) {
+            // Each number the line says, but the digits that go on a word or
+            // a number (`p10`, `x86_64`, the 0 of `85.0`).
+            let numbers = said.char_indices().filter(|(at, c)| {
+                c.is_ascii_digit() && said[..*at].chars().next_back().is_none_or(|before| !before.is_alphanumeric() && !"_.".contains(before))
+            });
+            let mut numbers = numbers.map(|(at, _)| {
+                let digits = said[at..].find(|c: char| !c.is_ascii_digit() && c != '.').map_or(&said[at..], |end| &said[at..at + end]);
+                digits.trim_end_matches('.').parse::<f64>().unwrap_or(f64::NAN)
+            });
+            if !numbers.any(|number| number == bound as f64) {
                 problem(format!("its MEASURE line does not give the bound its name states, {bound}: {literal}"));
             }
         }
@@ -4112,12 +4263,17 @@ fn a_sub_agent_is_one_flag_and_zero_prompt_tokens() {
     let bodies = bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 3, "two child requests, then the -p request");
     let child = bodies[0].replace(worktree, &root.display().to_string());
-    let differ =
-        child.bytes().zip(bodies[2].bytes()).filter(|(child, own)| child != own).count() + child.len().abs_diff(bodies[2].len());
+    // The bytes between the two requests' longest common prefix and suffix,
+    // so one byte inserted counts as one, not as every byte after it.
+    let (theirs, own) = (child.as_bytes(), bodies[2].as_bytes());
+    let same = theirs.iter().zip(own).take_while(|(theirs, own)| theirs == own).count();
+    let tail = theirs[same..].iter().rev().zip(own[same..].iter().rev()).take_while(|(theirs, own)| theirs == own).count();
+    let differ = theirs.len().max(own.len()) - same - tail;
     println!(
-        "MEASURE a_sub_agent_is_one_flag_and_zero_prompt_tokens {differ} bytes of the child's first request, its worktree \
-         read as the project, differ from the first request -p sends ({} bytes); target 0",
-        bodies[2].len()
+        "MEASURE a_sub_agent_is_one_flag_and_zero_prompt_tokens {differ} bytes differ between the child's first request, its \
+         worktree read as the project, and the first request -p sends ({} and {} bytes, the first {same} the same); target 0",
+        theirs.len(),
+        own.len()
     );
     assert_eq!(child, bodies[2], "the child's request differs from -p's");
     for body in &bodies {

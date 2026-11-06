@@ -1268,8 +1268,9 @@ fn a_hundred_extensions_load_in_under_10_ms() {
     let breakdown: Vec<String> =
         names.iter().zip(phases.iter_mut()).map(|(name, samples)| format!("{name} {:?}", median(samples))).collect();
     println!(
-        "MEASURE extension_load 100 extensions: median {total:?} over {runs} loads (p10 {:?}, p90 {:?}; {}); floor (reading their files) {read:?}, \
-         load over floor {ratio:.2} (ratchet {ratchet:.1}, {}); {} instructions per load; target {TARGET:?}, {}",
+        "MEASURE a_hundred_extensions_load_in_under_10_ms {total:?} median over {runs} loads of 100 extensions (p10 {:?}, p90 {:?}; {}); \
+         floor (reading their files) {read:?}, load over floor {ratio:.2} (ratchet {ratchet:.1}, {}); {} instructions per load; target \
+         {TARGET:?}, {}",
         totals[runs / 10],
         totals[runs * 9 / 10],
         breakdown.join(", "),
