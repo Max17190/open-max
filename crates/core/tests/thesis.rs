@@ -913,12 +913,19 @@ arg_regex = 'sudo\s'
 /// mode runs every one. Returns the fixture's directory, its data dir and its
 /// project.
 fn hundred_extensions() -> (PathBuf, PathBuf, PathBuf) {
-    use std::path::Path;
     let dir = std::env::temp_dir().join(format!("omx-extensions-{}", uuid::Uuid::new_v4()));
     let (data, project) = (dir.join("data"), dir.join("project"));
     std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(&project).unwrap();
     let (data, project) = (data.canonicalize().unwrap(), project.canonicalize().unwrap());
+    write_hundred_extensions(&data, &project);
+    (dir, data, project)
+}
+
+/// `hundred_extensions` into a data dir and a project that exist, spelled
+/// canonically, as a session's working directory is.
+fn write_hundred_extensions(data: &std::path::Path, project: &std::path::Path) {
+    use std::path::Path;
     let write = |path: &Path, body: &str| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
@@ -1004,10 +1011,9 @@ fn hundred_extensions() -> (PathBuf, PathBuf, PathBuf) {
     // the project-local code it runs.
     for path in &approved {
         let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(path).unwrap())];
-        shas.extend(open_max_core::ledger::manifest_code(path, &project).into_iter().filter_map(|c| c.sha256));
-        open_max_core::ledger::approve_capability(&data, &project, path, &shas).unwrap();
+        shas.extend(open_max_core::ledger::manifest_code(path, project).into_iter().filter_map(|c| c.sha256));
+        open_max_core::ledger::approve_capability(data, project, path, &shas).unwrap();
     }
-    (dir, data, project)
 }
 
 /// Instructions this process has retired, where the kernel counts them.
@@ -1044,23 +1050,24 @@ fn instructions_retired() -> Option<u64> {
 /// floor read just before it, each part's median, and on macOS the
 /// instructions retired per load. Reading is the part of a load no loader
 /// can skip, so the ratio is the harness's own work in units of the machine
-/// it runs on: across three runs at full speed and under the utility and
-/// background QoS clamps, which put the same work on cores three times
-/// slower, the ratio stayed within 2.78 to 2.88 while the load went from
-/// 2.97 to 10.8 ms.
+/// it runs on: 2.70 to 2.74 at full speed and under the utility QoS clamp,
+/// and 2.88 under the background clamp, on efficiency cores alone, where the
+/// load took 10.8 ms instead of 2.8. Other work on the same cores moves it:
+/// 3.20 when the background clamp shared them with a mutation run.
 ///
-/// Measured on the reference machine (Apple M5) in release, the median load
-/// was 5.47 ms before the parse checked example patterns instead of
-/// compiling them, hashing used the CPU's SHA-256 instructions, and hook
-/// reconciliation and code binding stopped resolving every path they
-/// compared (registry 2.72 ms, prompt 0.37, hooks 1.75, permissions 0.46,
-/// templates 0.17; about 100M instructions), and 2.97 ms after (registry
-/// 1.52, prompt 0.29, hooks 0.60, permissions 0.42, templates 0.14; about
-/// 58.5M instructions). A release build asserts the 10 ms target on the
-/// median everywhere and, on macOS on Apple silicon, where the ratio was
-/// measured, a ratchet on it 10% over the measurement, rounded up to a
-/// tenth; elsewhere it prints the ratio. A debug build asserts a 20x sanity
-/// bound on the median.
+/// Measured on the reference machine (Apple M5) in release, three runs each.
+/// Before the parse checked example patterns instead of compiling them,
+/// hashing used the CPU's SHA-256 instructions, and hook reconciliation and
+/// code binding stopped resolving every path they compared: a median load
+/// of 4.83 to 6.27 ms, 4.19 to 4.74 times its floor, about 97M instructions
+/// (registry 2.53 ms, prompt 0.35, hooks 1.36, permissions 0.46, templates
+/// 0.14 in a quiet run). After: 2.77 to 2.91 ms, 2.71 to 2.72 times its
+/// floor, about 55M instructions (registry 1.51 ms, prompt 0.29, hooks 0.45,
+/// permissions 0.40, templates 0.14). A release build asserts the 10 ms
+/// target on the median everywhere and, on macOS on Apple silicon, where the
+/// ratio was measured, a ratchet on it 10% over 2.88, rounded up to a tenth;
+/// elsewhere it prints the ratio. A debug build asserts a 20x sanity bound
+/// on the median.
 #[test]
 fn a_hundred_extensions_load_in_under_10_ms() {
     use open_max_core::config::ApprovalMode;
