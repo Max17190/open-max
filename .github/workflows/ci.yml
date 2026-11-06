@@ -110,7 +110,7 @@ jobs:
           - os: ubuntu-latest
             reported: harness_time_per_tool_round
           - os: macos-latest
-            reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines
+            reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -150,7 +150,9 @@ jobs:
       # 0.074 to 0.090 ms on the M5 against 0.5 ms, measured 0.157 to
       # 0.240 ms on ubuntu-latest, where it gates, and 0.151 to 0.504 ms on
       # macos-latest, past the bound in two runs and within a fifth of it in
-      # two more, while its median held at 0.118 to 0.169 ms.
+      # two more, while its median held at 0.118 to 0.169 ms. The frame at
+      # 1,000,000 lines, against 0.25 ms, gates on ubuntu-latest too and is
+      # reported on macos-latest for the same swings.
       - name: Thesis reports
         continue-on-error: true
         timeout-minutes: 5

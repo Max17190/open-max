@@ -430,12 +430,6 @@ impl RowIndex {
         self.0.push(sum);
     }
 
-    /// Keep the first `len` blocks; no node before `len` sums a block
-    /// after it.
-    fn truncate(&mut self, len: usize) {
-        self.0.truncate(len);
-    }
-
     fn add(&mut self, bi: usize, delta: isize) {
         let mut i = bi + 1;
         while i <= self.0.len() {
@@ -592,9 +586,9 @@ impl Transcript {
         let removed = self.blocks.remove(i);
         self.users.pop();
         self.total -= removed.height;
-        // The blocks after it moved up one: index them again, the blocks
-        // since the last prompt.
-        self.index.truncate(i);
+        // The blocks after it moved up one: index them again. No node
+        // before `i` sums a block after it, so the rest of the tree holds.
+        self.index.0.truncate(i);
         for block in &self.blocks[i..] {
             self.index.push(block.height);
         }
@@ -1739,31 +1733,21 @@ fn slice_block_chars(block: &Block, from: usize, to: usize) -> String {
 /// The clipboard must carry exact bytes: pasting code with a rail character
 /// on every line makes the paste useless.
 fn copy_text_without_chrome(lines: &[Line<'static>]) -> String {
-    lines
-        .iter()
-        .map(|line| {
-            let skip = usize::from(is_rail_line(line));
-            line.spans
-                .iter()
-                .skip(skip)
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    joined_text(lines, is_rail_line)
 }
 
 fn lines_to_plain(lines: &[Line<'static>]) -> String {
-    lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    joined_text(lines, |_| false)
+}
+
+/// The lines' text, a line each, without the first span of every line
+/// `chrome` picks.
+fn joined_text(lines: &[Line<'static>], chrome: fn(&Line<'static>) -> bool) -> String {
+    let text = |line: &Line<'static>| {
+        let spans = line.spans.iter().skip(usize::from(chrome(line)));
+        spans.map(|span| span.content.as_ref()).collect::<String>()
+    };
+    lines.iter().map(text).collect::<Vec<_>>().join("\n")
 }
 
 /// Line `line_idx` of a block's search text in original case, without

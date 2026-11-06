@@ -191,7 +191,11 @@ fn push_marathon(app: &mut App, from: usize, blocks: usize) {
 /// The jump puts the view a million rows above the bottom, where the prefix
 /// array the row index replaced rebuilt its entries below each block a
 /// scroll wrapped. Prints n, median, p99 and allocations per frame of each
-/// phase.
+/// phase. A release build asserts the target on each phase's p99; a phase
+/// over it is measured again, 3 times in all, and fails only when each is
+/// over, since a burst of other work on the machine slows a measurement or
+/// two where a change that adds work slows every one. A debug build asserts
+/// the 20x sanity bound on each phase's median.
 ///
 /// Also asserted in every build: the conversation's part of an idle frame
 /// allocates nothing; the heap this thread holds after the fill, counted by
@@ -205,6 +209,7 @@ fn transcript_frame_p99_at_1m_lines() {
     const TARGET_MS: f64 = 0.25;
     const FILL_TO: usize = if cfg!(debug_assertions) { 25_000 } else { 1_000_000 };
     const STEP: usize = if cfg!(debug_assertions) { 1_200 } else { 12_000 };
+    const ATTEMPTS: usize = if cfg!(debug_assertions) { 1 } else { 3 };
     let (mut app, dir) = app_fixture();
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
     let (before, _) = crate::heap_bytes();
@@ -239,25 +244,35 @@ fn transcript_frame_p99_at_1m_lines() {
     for _ in 0..50 {
         frame(&mut app, still);
     }
-    let idle: Vec<_> = (0..FRAMES).map(|_| frame(&mut app, still)).collect();
-    let scrolling: Vec<_> = (0..FRAMES).map(|_| frame(&mut app, |t| t.scroll_up(1))).collect();
-    app.transcript.set_offset(app.transcript.len());
-    for _ in 0..50 {
-        frame(&mut app, still);
-    }
-    let top: Vec<_> = (0..FRAMES).map(|_| frame(&mut app, |t| t.scroll_down(1))).collect();
     let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let phases: [(&str, fn(&mut Transcript)); 3] =
+        [("idle", still), ("scrolling", |t| t.scroll_up(1)), ("scrolling-at-top", |t| t.scroll_down(1))];
     let mut stats = Vec::new();
-    for (phase, samples) in [("idle", idle), ("scrolling", scrolling), ("scrolling-at-top", top)] {
-        let allocations = samples.iter().map(|sample| sample.1).sum::<u64>() as f64 / samples.len() as f64;
-        let mut samples: Vec<f64> = samples.into_iter().map(|sample| sample.0).collect();
-        samples.sort_by(f64::total_cmp);
-        let (median, p99) = (quantile(&samples, 0.5), quantile(&samples, 0.99));
-        println!(
-            "MEASURE transcript_frame_p99_at_1m_lines {phase} n={} median={median:.3}ms p99={p99:.3}ms allocations/frame={allocations:.1} ({blocks} blocks, {rows} rows; target {TARGET_MS}ms, {build})",
-            samples.len()
-        );
-        stats.push((phase, median, p99));
+    for (phase, scroll) in phases {
+        if phase == "scrolling-at-top" {
+            app.transcript.set_offset(app.transcript.len());
+            for _ in 0..50 {
+                frame(&mut app, still);
+            }
+        }
+        // A burst of other work on the machine slows a measurement or two,
+        // where a change that adds work slows every one: a release phase
+        // over the target is measured again, 3 times in all.
+        for _ in 0..ATTEMPTS {
+            let samples: Vec<_> = (0..FRAMES).map(|_| frame(&mut app, scroll)).collect();
+            let allocations = samples.iter().map(|sample| sample.1).sum::<u64>() as f64 / samples.len() as f64;
+            let mut samples: Vec<f64> = samples.into_iter().map(|sample| sample.0).collect();
+            samples.sort_by(f64::total_cmp);
+            let (median, p99) = (quantile(&samples, 0.5), quantile(&samples, 0.99));
+            println!(
+                "MEASURE transcript_frame_p99_at_1m_lines {phase} n={} median={median:.3}ms p99={p99:.3}ms allocations/frame={allocations:.1} ({blocks} blocks, {rows} rows; target {TARGET_MS}ms, {build})",
+                samples.len()
+            );
+            stats.push((phase, median, p99));
+            if p99 <= TARGET_MS {
+                break;
+            }
+        }
     }
     // Read every row once, a page at a time from the top.
     let page = usize::from(HEIGHT);
@@ -285,11 +300,17 @@ fn transcript_frame_p99_at_1m_lines() {
     assert_eq!(chat_allocations, 0, "an idle frame of the conversation allocated");
     assert!(per_row <= 600.0, "the transcript holds {per_row:.0} bytes a row");
     assert!(read - held <= 5_000_000, "reading every row once grew the heap by {:.1} MB", mb(read - held));
-    for (phase, median, p99) in stats {
+    for (phase, _) in phases {
+        let measured: Vec<_> = stats.iter().filter(|stat| stat.0 == phase).collect();
         if cfg!(debug_assertions) {
+            let median = measured[0].1;
             assert!(median < TARGET_MS * 20.0, "debug {phase} frame median {median:.3}ms is past the 20x sanity bound");
         } else {
-            assert!(p99 <= TARGET_MS, "{phase} frame p99 {p99:.3}ms at {rows} lines is past the {TARGET_MS}ms target");
+            let p99s: Vec<f64> = measured.iter().map(|stat| stat.2).collect();
+            assert!(
+                p99s.iter().any(|&p99| p99 <= TARGET_MS),
+                "{phase} frame p99 {p99s:.3?}ms at {rows} lines is past the {TARGET_MS}ms target in each measurement"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(dir);

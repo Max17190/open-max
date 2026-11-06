@@ -890,14 +890,14 @@ fn thesis_claims_are_gated_in_ci() {
         reported,
         [
             ("ubuntu-latest", "harness_time_per_tool_round"),
-            ("macos-latest", "harness_time_per_tool_round transcript_frame_p99_at_100k_lines"),
+            ("macos-latest", "harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines"),
         ],
         "the thesis tests a runner reports instead of gating changed"
     );
     let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
     assert!(
         readme.contains(
-            "`harness_time_per_tool_round` (target 250 us) on both runners and `transcript_frame_p99_at_100k_lines` (target 0.5 ms) on macOS"
+            "`harness_time_per_tool_round` (target 250 us) on both runners and `transcript_frame_p99_at_100k_lines` (target 0.5 ms) and `transcript_frame_p99_at_1m_lines` (target 0.25 ms) on macOS"
         ),
         "README.md does not name the thesis tests each runner reports instead of gating"
     );

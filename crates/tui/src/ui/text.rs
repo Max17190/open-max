@@ -110,16 +110,12 @@ pub fn paint_line(buf: &mut Buffer, area: Rect, prefix: Option<&Span<'_>>, line:
     if line.alignment.is_none_or(|alignment| alignment == Alignment::Left)
         && spans().all(|span| span.content.bytes().all(|byte| matches!(byte, b' '..=b'~')))
     {
-        let mut x = area.x;
-        for span in spans() {
+        let cells = spans().flat_map(|span| {
             let style = line_style.patch(span.style);
-            for i in 0..span.content.len() {
-                if x == area.right() {
-                    return;
-                }
-                buf[(x, area.y)].set_symbol(&span.content[i..i + 1]).set_style(style);
-                x += 1;
-            }
+            (0..span.content.len()).map(move |i| (&span.content[i..i + 1], style))
+        });
+        for (x, (symbol, style)) in (area.x..area.right()).zip(cells) {
+            buf[(x, area.y)].set_symbol(symbol).set_style(style);
         }
         return;
     }
