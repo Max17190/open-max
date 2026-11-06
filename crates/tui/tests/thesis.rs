@@ -3890,20 +3890,25 @@ fn zero_orphans_after_kill_9_once_its_binary_is_replaced() {
     assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_once_its_binary_is_replaced", kill, None);
 }
 
-/// When each of `pids` read as gone after `since`, polled every millisecond
-/// for up to `wait`, or None for one still found then.
+/// When each of `pids` read as gone after `since`, and when `file`, where one
+/// is given, read as removed, polled every millisecond for up to `wait`; None
+/// for one still found then.
 #[cfg(unix)]
-fn gone_after(pids: &[i32], since: Instant, wait: Duration) -> Vec<Option<Duration>> {
+fn gone_after(pids: &[i32], file: Option<&Path>, since: Instant, wait: Duration) -> (Vec<Option<Duration>>, Option<Duration>) {
     let mut gone = vec![None; pids.len()];
-    while gone.contains(&None) && since.elapsed() < wait {
+    let mut removed = None;
+    while (gone.contains(&None) || (file.is_some() && removed.is_none())) && since.elapsed() < wait {
         for (at, &pid) in gone.iter_mut().zip(pids) {
             if at.is_none() && !alive(pid) {
                 *at = Some(since.elapsed());
             }
         }
+        if removed.is_none() && file.is_some_and(|file| !file.exists()) {
+            removed = Some(since.elapsed());
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
-    gone
+    (gone, removed)
 }
 
 /// Kill a print run outright in the middle of a `bash` call whose tree only
@@ -3927,7 +3932,12 @@ fn gone_after(pids: &[i32], since: Instant, wait: Duration) -> Vec<Option<Durati
 /// that reading on, it polls each process of the tree and the watcher every
 /// millisecond for up to 5 seconds with `kill(pid, 0)`, which finds a zombie
 /// its new parent has not collected, so each reads as gone once it has
-/// exited and been collected, and lists each pid with when it did. A release
+/// exited and been collected, and lists each pid with when it did. It also
+/// lists when the run was collected, an upper bound on the time the kernel
+/// took to end it, which the watcher waits for, and when the record was
+/// removed, which the watcher does just after its SIGKILL, so a listing over
+/// the bound shows which part took the time: the kernel's end of the run, the
+/// watcher's stop, or the end of the tree its SIGKILL began. A release
 /// build, as CI's thesis job runs it, asserts the bound; a debug build
 /// asserts 20 times it, as the whole suite runs beside it, and prints the
 /// times. The clock is read before the signal, not once the call returns:
@@ -3970,13 +3980,15 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
     let killed = Instant::now();
     unsafe { libc::kill(if kill.group { -target } else { target }, libc::SIGKILL) };
     run.wait().unwrap();
+    let collected = killed.elapsed();
     let watched: Vec<i32> = tree.iter().copied().chain(watcher).collect();
-    let gone = gone_after(&watched, killed, Duration::from_secs(5));
+    let (gone, removed) = gone_after(&watched, Some(&record), killed, Duration::from_secs(5));
     let (bound, build) =
         if cfg!(debug_assertions) { (ORPHANS_GONE_WITHIN * 20, "debug") } else { (ORPHANS_GONE_WITHIN, "release") };
     let ms = |time: Duration| format!("{:.1} ms", time.as_secs_f64() * 1e3);
     let mut listing = format!(
-        "{name} on {}, {build} build: SIGKILL to a print run's {}, with no launch since; when each process of its \
+        "{name} on {}, {build} build: SIGKILL to a print run's {}, with no launch since; when the run was collected, \
+         when its record was removed, which its watcher does just after its SIGKILL, and when each process of its \
          tool tree, which ignores SIGTERM, and its watcher read as gone, exited and collected, polled every \
          millisecond; bound {}, grace {}\n",
         std::env::consts::OS,
@@ -3984,6 +3996,9 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
         ms(bound),
         ms(LEFT_BEHIND_GRACE)
     );
+    listing.push_str(&format!("run {target} collected {} after the kill\n", ms(collected)));
+    let removed = removed.map_or("kept 5 s after the kill".into(), |time| format!("removed {} after the kill", ms(time)));
+    listing.push_str(&format!("record {removed}\n"));
     for (n, (&pid, time)) in watched.iter().zip(&gone).enumerate() {
         let role = if n == tree.len() { "watcher" } else if n == 0 { "shell" } else { "descendant" };
         let when = time.map_or("running 5 s after the kill".into(), |time| format!("gone {} after the kill", ms(time)));
@@ -4057,7 +4072,7 @@ fn a_runs_watcher_ends_with_the_run() {
     });
     std::fs::write(base.join("go"), "").unwrap();
     let out = run.wait_with_output().unwrap();
-    let gone = gone_after(&watchers, Instant::now(), Duration::from_secs(5));
+    let (gone, _) = gone_after(&watchers, None, Instant::now(), Duration::from_secs(5));
     for (&pid, _) in watchers.iter().zip(&gone).filter(|(_, time)| time.is_none()) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
