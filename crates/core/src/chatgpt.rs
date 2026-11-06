@@ -11,12 +11,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use futures_util::StreamExt;
 use ring::{
+    digest,
     rand::{SecureRandom, SystemRandom},
     signature,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const API: &str = "https://api.openai.com/v1";
@@ -474,7 +474,7 @@ async fn login_at(
     let verifier = random()?;
     let state = random()?;
     let nonce = random()?;
-    let challenge = B64.encode(Sha256::digest(verifier.as_bytes()));
+    let challenge = B64.encode(digest::digest(&digest::SHA256, verifier.as_bytes()));
     let mut url = reqwest::Url::parse(AUTHORIZE).expect("static OAuth URL");
     let client = previous.as_ref().map(|a| a.client_id.as_str());
     url.query_pairs_mut().extend_pairs([
