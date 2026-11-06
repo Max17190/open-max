@@ -758,15 +758,15 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     QUIT_UNREAD.store(true, Ordering::SeqCst);
     // Held back from before the terminal changes, for the reason `run`
     // gives, until their watcher has started behind the first frame.
-    hold_quit_signals(true);
-    let mut terminal =
-        init_terminal().unwrap_or_else(|e| refuse(1, &format!("failed to initialize terminal: {e}"), None));
-    let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if let Err(e) = app::draw_shell(&mut terminal, &project) {
-        refuse(1, &format!("failed to draw the first frame: {e}"), None);
-    }
-    let quit = watch_quit_signals(true);
-    hold_quit_signals(false);
+    let (mut terminal, project, quit) = hold_quit_signals(|| {
+        let mut terminal =
+            init_terminal().unwrap_or_else(|e| refuse(1, &format!("failed to initialize terminal: {e}"), None));
+        let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if let Err(e) = app::draw_shell(&mut terminal, &project) {
+            refuse(1, &format!("failed to draw the first frame: {e}"), None);
+        }
+        (terminal, project, watch_quit_signals(true))
+    });
     signal_keys(true);
 
     let data_dir = default_data_dir();
@@ -1788,23 +1788,30 @@ fn watch_quit_signals(tui: bool) -> std::sync::Arc<tokio::sync::Notify> {
 const QUIT_SIGNALS: [libc::c_int; 6] =
     [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGUSR1, libc::SIGUSR2];
 
-/// Hold the quit signals back from this thread, and from each thread it
-/// starts while they are held, or let them through again. A session at a
-/// terminal holds them from before the terminal changes until their watcher
-/// has started behind its first frame (`session`), so the frame waits on no
-/// thread, and one sent in between stays pending until then and still ends
-/// the session cleanly. A tool starts with none held: std clears the mask.
+/// Run `f` with the quit signals held back from this thread, then give the
+/// thread back the signal mask it had. A session holds them from before the
+/// terminal changes until their watcher has started behind its first frame
+/// (`session`), so the frame waits on no thread, and one sent in between
+/// stays pending until then and still ends the session cleanly. A thread or
+/// process inherits the mask of the thread that starts it, std's included,
+/// so the watcher holds them for good and no tool may be started under the
+/// hold: one that was would never see them.
 #[cfg(unix)]
-fn hold_quit_signals(hold: bool) {
-    // SAFETY: sigemptyset makes the set valid before anything reads it.
+fn hold_quit_signals<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: sigemptyset makes the sets valid before anything reads them,
+    // and the mask restored is the one pthread_sigmask replaced.
     unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
+        let (mut held, mut mask): (libc::sigset_t, libc::sigset_t) = (std::mem::zeroed(), std::mem::zeroed());
+        libc::sigemptyset(&mut held);
         for signal in QUIT_SIGNALS {
-            libc::sigaddset(&mut set, signal);
+            libc::sigaddset(&mut held, signal);
         }
-        let how = if hold { libc::SIG_BLOCK } else { libc::SIG_UNBLOCK };
-        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+        let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &held, &mut mask) == 0;
+        let value = f();
+        if blocked {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+        }
+        value
     }
 }
 
@@ -1829,7 +1836,9 @@ fn watch_quit_signals(_: bool) -> std::sync::Arc<tokio::sync::Notify> {
 }
 
 #[cfg(not(unix))]
-fn hold_quit_signals(_: bool) {}
+fn hold_quit_signals<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
 
 /// The signal behind the last quit, recorded before the quit is notified.
 static QUIT_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -3167,33 +3176,52 @@ mod tests {
     /// between must stay pending and reach the quit once they are let
     /// through, not end the process with its default action. The signal is
     /// raised on this thread, since the test harness's other threads do not
-    /// hold it, where a session's thread is its only one at that point.
-    /// Handlers stay installed for the life of the process, so the probe
-    /// runs in a child.
+    /// hold it, where a session's thread is its only one at that point. The
+    /// hold gives back the mask it found, so a signal the thread already
+    /// held back (here SIGTERM, as a parent can pass on) stays held, which
+    /// the tools it starts would inherit. Handlers stay installed for the
+    /// life of the process, so the probe runs in a child.
     #[cfg(unix)]
     #[test]
     fn a_signal_held_back_until_its_watcher_starts_reaches_the_quit() {
         const CHILD: &str = "OPENMAX_TEST_SIGNAL_HELD_BACK";
         if std::env::var_os(CHILD).is_some() {
-            hold_quit_signals(true);
-            // SAFETY: raise signals this thread, and a held signal stays
-            // pending; sigpending fills the set sigemptyset made valid.
-            let pending = unsafe {
-                assert_eq!(libc::raise(libc::SIGUSR2), 0);
+            // SAFETY: sigemptyset makes the set valid before anything reads it.
+            let empty = || unsafe {
                 let mut set: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut set);
-                libc::sigpending(&mut set);
-                libc::sigismember(&set, libc::SIGUSR2) == 1
+                set
             };
-            assert!(pending, "SIGUSR2 was not held back");
-            let quit = watch_quit_signals(false);
-            hold_quit_signals(false);
+            let mut sigterm = empty();
+            // SAFETY: adds a signal to a valid set and blocks it on this thread.
+            unsafe {
+                libc::sigaddset(&mut sigterm, libc::SIGTERM);
+                assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &sigterm, std::ptr::null_mut()), 0);
+            }
+            let quit = hold_quit_signals(|| {
+                let mut pending = empty();
+                // SAFETY: raise signals this thread, where a held signal stays
+                // pending, and sigpending fills a valid set.
+                unsafe {
+                    assert_eq!(libc::raise(libc::SIGUSR2), 0);
+                    assert_eq!(libc::sigpending(&mut pending), 0);
+                    assert_eq!(libc::sigismember(&pending, libc::SIGUSR2), 1, "SIGUSR2 was not held back");
+                }
+                watch_quit_signals(false)
+            });
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(10), quit.notified())
                     .await
                     .expect("a SIGUSR2 held back until the watcher started must reach the quit")
             });
             assert_eq!(QUIT_SIGNAL.load(Ordering::SeqCst), libc::SIGUSR2);
+            let mut mask = empty();
+            // SAFETY: a null set only reads this thread's mask into a valid set.
+            let held = unsafe {
+                assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask), 0);
+                (libc::sigismember(&mask, libc::SIGTERM), libc::sigismember(&mask, libc::SIGUSR2))
+            };
+            assert_eq!(held, (1, 0), "the hold did not give back the mask it found (SIGTERM, SIGUSR2 held)");
             return;
         }
         let child = std::process::Command::new(std::env::current_exe().unwrap())
