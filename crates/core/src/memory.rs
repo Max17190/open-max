@@ -452,18 +452,11 @@ fn section_and_identities(scan: &MemoryScan) -> (IndexSection, Vec<(String, u64)
 }
 
 /// A fresh scan's section and identities, for tests that compare a
-/// snapshot against what a plain scan would render.
+/// snapshot against what a plain scan would render, or that read the
+/// section a scan renders, None when nothing qualifies.
 #[cfg(test)]
 fn index_and_identities(project_root: &Path, now: u64) -> (IndexSection, Vec<(String, u64)>) {
     section_and_identities(&scan(project_root, now))
-}
-
-/// The injected index section from a fresh scan, or None when nothing
-/// qualifies so the zero-memory prompt stays byte-identical to a memoryless
-/// build. The same renderer `freeze_snapshot` uses, so a registry that never
-/// scanned renders exactly what a freeze would have.
-pub fn index_section(project_root: &Path, now: u64) -> IndexSection {
-    section_and_identities(&scan(project_root, now)).0
 }
 
 #[cfg(test)]
@@ -675,7 +668,7 @@ mod tests {
         for i in 0..40 {
             write_memory(&root, &format!("fact-{i:02}"), &format!("# {}", "d".repeat(120)));
         }
-        let (section, breakdown) = index_section(&root, now).expect("index exists");
+        let (section, breakdown) = index_and_identities(&root, now).0.expect("index exists");
         assert!(
             section.len() <= MAX_MEMORY_BYTES,
             "lines plus trailer must fit the documented budget, got {}",
@@ -691,10 +684,10 @@ mod tests {
     #[test]
     fn no_memories_means_no_section() {
         let root = temp_project();
-        assert!(index_section(&root, unix_now()).is_none());
+        assert!(index_and_identities(&root, unix_now()).0.is_none());
         let empty = std::env::temp_dir().join(format!("openmax-nomem-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(index_section(&empty, unix_now()).is_none(), "no dir, no section");
+        assert!(index_and_identities(&empty, unix_now()).0.is_none(), "no dir, no section");
         let _ = std::fs::remove_dir_all(root);
     }
 

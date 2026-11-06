@@ -173,9 +173,45 @@ to 250 ms for a tool command still being started, so one that starts within that
 wait is killed with the rest. Neither stops a process that leaves its tool's
 group (one that starts a session of its own, as `setsid` does), or a tool command
 whose start outlasts that wait: it runs on after openmax has exited. SIGKILL,
-or a crash that runs no handler, stops no tool: each running tool's group runs
-on until the next openmax launch (the TUI, `-p`, `--stdio`, `--subagent`, or
-`--check`).
+or a crash that runs no handler, runs none of openmax's code, so its watcher
+stops its tools instead: each `bash` call, external tool and hook it started,
+with every process each started that is still in its group. A sub-agent's
+own git commands are not tools, and run on ([sub-agents](#sub-agents)). On
+macOS and Linux, once a run's record of its tool groups (below) is first
+written, the run starts `openmax --lifeline <record> <start>`: its own
+binary again (on Linux `/proc/self/exe`, the binary it runs; on macOS the
+file at its path), in a session of its own, whose stdin is the read
+end of a pipe the run alone holds the write end of (close-on-exec, so no tool
+inherits it). Its stdout and stderr are `/dev/null`, its environment is
+empty and its directory is `/`, and it is given the record's absolute path:
+a data directory that is relative (HOME unset, empty or relative) is made
+absolute from the run's working directory. Like every tool, it inherits each
+descriptor the run holds without close-on-exec, such as one the run was
+itself started with open across exec. Its start holds the lock that every
+tool and hook spawn takes, so once in a run, a tool or hook that starts in
+that moment waits for the watcher's fork and exec. Once the run has exited, by
+any cause, the pipe reads end of file. The watcher then waits up to 250 ms
+for the run to read as exited and does with the `run` directory what a launch
+does (below): stops the groups that each record a gone openmax left there
+lists, the run's among them, with 50 ms between SIGTERM and SIGKILL, so that
+each is gone within 100 ms of the kill; removes those records, and the
+directory once no record is left there; and exits. Its polls, for the run's
+exit and through the grace, wait on a timer that a QoS clamp the run was
+started under (`taskpolicy -c`, a background launchd job) does not stretch:
+on macOS a kevent timer marked critical, where a plain 2 ms sleep took a mean
+11 ms under a utility clamp and 98 ms under background. After a run that
+stopped its own tools, it finds no record of the run's and exits at once. A
+record whose owner still runs, such as one that a process which took the run's
+pid since wrote, is left alone. It reads no settings, trust or permissions and
+opens no connection. A watcher that is itself killed, or a run killed in
+the moment between its record's first write and its watcher's start, leaves
+the tools to the next openmax launch (the TUI, `-p`, `--stdio`,
+`--subagent`, or `--check`), as does a run whose watcher cannot start. On
+Linux the watcher starts even once an upgrade has replaced or removed the
+run's binary, whose path then reads `<path> (deleted)`. On macOS none starts
+once the file was removed before the run's first tool, and once it was
+replaced, the binary that replaced it starts, and watches only if it serves
+`--lifeline`.
 On macOS and Linux, openmax records the process groups of its running tools,
 each leader with its start time, in `~/.openmax/run/<pid>.groups`: one line
 when a group starts and one when it ends. Once the file has passed 4 KiB, it
@@ -185,7 +221,7 @@ directory once no other record is left there. A launch reads every record
 whose owner pid no process of the same user holds (none does, or another
 user's does), or names a process that has exited or started at another time,
 and sends each group the record still lists whose leader still has its
-recorded start time SIGTERM, then SIGKILL if the group is still there 250 ms
+recorded start time SIGTERM, then SIGKILL if the group is still there 50 ms
 later, before it starts anything. Neither signal goes to a group whose leader
 pid has since been taken by a process started at another time, and none goes
 to a group once it has been seen gone, since its id can then name another. It
@@ -203,15 +239,17 @@ moment leaves it unrecorded, and a home where the record cannot be written
 (read-only, or on a full disk) records nothing while it stays so. No tool and
 no exit waits on the record's file, as a home whose file server stopped
 answering would make them: one thread, started by the first tool or hook a
-launch runs, makes every write to it, and an exit waits at most 100 ms for
-that thread to remove it. The next launch removes a record so left, finding
-the groups it lists gone. A sub-agent openmax among the tools that the SIGKILL
-ends before it has stopped its own tools leaves them to the launch after. A
-group whose leader had exited and been waited for before the launch, and a
-process that left its tool's group, are not stopped.
+launch runs, makes every write to it and starts the watcher, and an exit
+waits at most 100 ms for that thread to remove it. The watcher, or failing
+that the next launch, removes a record so left. A sub-agent openmax among
+the tools that a stop kills before it has stopped its own tools leaves them
+to its own watcher. A group whose leader had exited and been waited for
+before the watch or the launch, and a process that left its tool's group, are
+not stopped.
 Nor are the tools of an openmax in another pid namespace that shares the home
-directory, as a container with the home mounted does: a launch outside it
-takes its records for a dead openmax's and removes them. While a
+directory, as a container with the home mounted does: a launch or a watcher
+outside it takes its records for a dead openmax's and removes them, and its
+own watcher then finds none. While a
 consumer that stopped reading holds stdout full, the run cannot act on the first
 signal, and only a second one ends it. A signal the run inherited as ignored, as
 under `nohup`, stays ignored. The TUI, where Ctrl+C is a key, ends the session on
@@ -352,12 +390,15 @@ session index, for example): a file tool of it, which runs inside openmax,
 can still be writing in the worktree, so the run leaves the worktree as it
 is, uncommitted, and names it on stderr. SIGKILL, or a crash, runs no
 cleanup. The child's tool processes are recorded as the tools of the openmax
-process that ran it, so the next launch stops them (see the signals above).
+process that ran it, so its watcher, or failing that the next launch, stops
+them (see the signals above).
 Nothing cleans up the worktree, the changes it holds or its branch:
 `git worktree list` names the worktree, and
 `git worktree remove --force <path>` removes it once its changes are saved. A
-git command the run had started (making the worktree, the commit, or the
-removal) runs to its end on its own.
+git command the run had started (making the worktree, with the repository's
+checkout hook, the commit, or the removal) runs to its end on its own: the
+run's git commands are not tools, so no record lists them, and neither its
+watcher nor a later launch stops them.
 
 ## Keys
 
