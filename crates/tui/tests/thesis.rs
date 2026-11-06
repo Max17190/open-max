@@ -200,6 +200,7 @@ fn the_suite_fails_over_its_time_budget() {
             "status=${PIPESTATUS[0]}",
             "{ echo \"Reported, not gated, on macos-latest; the check exited $status:\"; echo '```'; sed -n -E '/^(run [0-9]+ of 5: |median )/p' \"$RUNNER_TEMP/suite-time.log\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
             "grep -q '^median .* over 5 runs,' \"$RUNNER_TEMP/suite-time.log\" || { echo \"::error::the suite did not run 5 times, so it measured nothing\"; exit 1; }",
+            "if grep -E 'FAILED \\(stopped at |test binaries did not report' \"$RUNNER_TEMP/suite-time.log\"; then echo \"::error::a run did not finish, so its time is not the suite's\"; exit 1; fi",
         ],
         "the suite time report does not run the suite five times on macos-latest, report each run and the median, \
          and fail only when the runs did not finish"
@@ -1373,6 +1374,16 @@ fn cfg_holds(cfg: &str, os: &str) -> bool {
     }
 }
 
+/// Whether a test with these attribute lines is built on one of CI's
+/// runners at least, in a release build: rustc builds an item only where
+/// every `#[cfg(...)]` on it holds, so all of them must hold on the same
+/// runner (cfg_holds), and two that each hold on another keep it off both.
+fn built_on_a_runner(attributes: &[impl AsRef<str>]) -> bool {
+    let cfgs: Vec<&str> =
+        attributes.iter().filter_map(|attribute| attribute.as_ref().strip_prefix("#[cfg(")?.strip_suffix(")]")).collect();
+    ["linux", "macos"].iter().any(|os| cfgs.iter().all(|cfg| cfg_holds(cfg, os)))
+}
+
 /// Every thesis test whose name states a bound prints what it measured
 /// beside that bound, and CI gates it. A name states a bound with a number
 /// after a comparator (`_under_700_`, `_at_least_ninety_five_`,
@@ -1390,13 +1401,13 @@ fn cfg_holds(cfg: &str, os: &str) -> bool {
 /// formats, read from the function that prints the line, then the test,
 /// then the file, so another test's constant of the same name does not
 /// answer for it. And CI's thesis job gates the test: no runner reports it
-/// instead, it is not ignored, and its cfg holds on at least one of CI's
-/// runners in a release build (cfg_holds). What the test asserts against the
-/// bound is its own, and so is whether the value it prints is a
-/// measurement of what its name states rather than a value read from
-/// elsewhere: no reading of its source settles that, and its red record
-/// shows it failing past the bound. This holds what a test's name, its line
-/// and CI say to each other, so a test named for a bound that prints
+/// instead, it is not ignored, and its cfg attributes all hold on one of
+/// CI's runners in a release build (built_on_a_runner). What the test
+/// asserts against the bound is its own, and so is whether the value it
+/// prints is a measurement of what its name states rather than a value
+/// read from elsewhere: no reading of its source settles that, and its red
+/// record shows it failing past the bound. This holds what a test's name,
+/// its line and CI say to each other, so a test named for a bound that prints
 /// nothing keyed by its name, as `mutation_score_is_at_least_ninety_five_percent`
 /// did, or one that prints the bound where a measurement belongs, fails
 /// here, and so does a test that takes back one of the seven names retired
@@ -1414,6 +1425,13 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
         ("all(unix, feature = \"slow\")", false, false),
     ] {
         assert_eq!((cfg_holds(cfg, "linux"), cfg_holds(cfg, "macos")), (linux, macos), "where #[cfg({cfg})] holds");
+    }
+    for (attributes, built) in [
+        (&["#[test]"][..], true),
+        (&["#[cfg(unix)]", "#[cfg(target_os = \"linux\")]", "#[test]"][..], true),
+        (&["#[cfg(target_os = \"linux\")]", "#[cfg(target_os = \"macos\")]", "#[test]"][..], false),
+    ] {
+        assert_eq!(built_on_a_runner(attributes), built, "whether a test under {attributes:?} is built on one of CI's runners");
     }
     for (code, at) in [("// println!(\"M\");\n    println!(\"M\");", Some(31)), ("let a = 1; // println!(\"M\");", None)] {
         assert_eq!(code_find(code, "\"M\""), at, "where {code:?} prints \"M\" as code");
@@ -1465,11 +1483,9 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
             if attributes.iter().any(|attribute| attribute.contains("ignore")) {
                 problem("it is ignored, so no CI job runs it".to_string());
             }
-            let off = |cfg: &str| !["linux", "macos"].iter().any(|os| cfg_holds(cfg, os));
-            if let Some(cfg) =
-                attributes.iter().find(|attribute| attribute.strip_prefix("#[cfg(").and_then(|cfg| cfg.strip_suffix(")]")).is_some_and(off))
-            {
-                problem(format!("{cfg} keeps it off both of CI's runners"));
+            if !built_on_a_runner(&attributes[..]) {
+                let cfgs: Vec<&str> = attributes.iter().map(String::as_str).filter(|attribute| attribute.starts_with("#[cfg(")).collect();
+                problem(format!("{} keeps it off both of CI's runners", cfgs.join(" with ")));
             }
             let body = function_in(&source, &name).unwrap_or_else(|| panic!("{path}: {name} has no end"));
             let keyed = code_find(&body, &format!("\"MEASURE {name} ")).map(|at| (body.clone(), at)).or_else(|| {

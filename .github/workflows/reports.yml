@@ -95,6 +95,9 @@ jobs:
   # build give the median and the slowest, and each run's line counts the
   # binaries that passed only alone. The check runs as it would outside
   # GitHub Actions, so a run over the budget prints its line, not an error.
+  # A run that did not finish, with a binary stopped at three times the
+  # budget or one that never reported, timed the stop and not the suite, so
+  # it fails the report, as five runs not made do.
   suite-time:
     name: Suite time (macos-latest)
     runs-on: macos-latest
@@ -123,3 +126,4 @@ jobs:
           status=${PIPESTATUS[0]}
           { echo "Reported, not gated, on macos-latest; the check exited $status:"; echo '```'; sed -n -E '/^(run [0-9]+ of 5: |median )/p' "$RUNNER_TEMP/suite-time.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           grep -q '^median .* over 5 runs,' "$RUNNER_TEMP/suite-time.log" || { echo "::error::the suite did not run 5 times, so it measured nothing"; exit 1; }
+          if grep -E 'FAILED \(stopped at |test binaries did not report' "$RUNNER_TEMP/suite-time.log"; then echo "::error::a run did not finish, so its time is not the suite's"; exit 1; fi
