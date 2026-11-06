@@ -1115,16 +1115,18 @@ fn the_workspace_has_two_thousand_tests() {
 /// request; a root commit diffed against the empty tree; a file under
 /// crates/core/ touched by an edit, a move out of the core, a binary file and
 /// a mode change, and paths that begin like the core's or hold its path
-/// further in not touching it; an empty commit; each subject quoted as CSV
-/// quotes it, in UTF-8; the rolling share over the window, empty where fewer
-/// commits remain, rounded to a tenth with a half up; the CSV replacing what
-/// its file held; the target met at exactly a fifth and missed over it; the
-/// same report under settings that change what git's porcelain prints, from a
-/// subdirectory; the report added to the job's summary; and a shallow clone,
-/// a ref that names no commit, a directory outside any repository, which git
-/// refuses with no error of the script's after it, a CSV, a job summary or a
-/// temporary file it cannot write, and each malformed argument refused; with
-/// no run leaving a temporary file behind.
+/// further in not touching it; the lines added and removed in the core and
+/// outside it, summed over a commit's files; an empty commit; each subject
+/// quoted as CSV quotes it, in UTF-8; the rolling share over the window,
+/// empty where fewer commits remain, rounded to a tenth with a half up; the
+/// CSV replacing what its file held; the target met at exactly a fifth and
+/// missed over it; the same report under settings that change what git's
+/// porcelain prints, from a subdirectory; the report added to the job's
+/// summary; and a shallow clone, a ref that names no commit, a directory
+/// outside any repository, which git refuses with no error of the script's
+/// after it, a CSV, a job summary or a temporary file it cannot write, output
+/// of git's it does not read or a git command that fails, and each malformed
+/// argument refused; with no run leaving a temporary file behind.
 #[test]
 fn at_most_a_fifth_of_commits_touch_the_core() {
     let method = std::fs::read_to_string(repo().join("scripts/core-share.sh")).unwrap();
@@ -1244,8 +1246,12 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
     };
     let (lib, merged, build, logo): (&[u8], &[u8], &[u8], &[u8]) =
         (b"fn a() {}\nfn b() {}\n", b"fn a() {}\nfn b() {}\nfn c() {}\n", b"cargo build\n", b"\x89PNG\r\n\x1a\n\x00\x01");
-    let first: &[(&str, &[u8])] =
-        &[("M 100644 inline crates/core/src/lib.rs", lib), ("M 100644 inline crates/core/build.sh", build), ("M 100644 inline README.md", b"# Fixture\n")];
+    let first: &[(&str, &[u8])] = &[
+        ("M 100644 inline crates/core/src/lib.rs", lib),
+        ("M 100644 inline crates/core/build.sh", build),
+        ("M 100644 inline crates/core/Cargo.toml", b"[package]\n"),
+        ("M 100644 inline README.md", b"# Fixture\n"),
+    ];
     commit("heads/main", 1, "Initial commit", &[], first);
     commit("heads/main", 2, "docs: say \"hi\", twice", &[1], &[("M 100644 inline README.md", b"# Fixture\nhi, hi\n")]);
     // Paths that begin like the core's or hold it further in, none of them
@@ -1269,14 +1275,23 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
     for mark in 13..=17 {
         commit("heads/main", mark, &format!("docs: note {mark}"), &[mark - 1], &[(&format!("M 100644 inline docs/note-{mark}.md"), b"note\n")]);
     }
-    commit("heads/pr", 18, "core: add the change", &[17], &[("M 100644 inline crates/core/src/change.rs", b"fn change() {}\nfn more() {}\n")]);
-    commit("heads/pr", 19, "docs: describe the change", &[18], &[("M 100644 inline docs/change.md", b"change\n")]);
-    commit("heads/main", 20, "docs: note 20", &[17], &[("M 100644 inline docs/note-20.md", b"note\n")]);
+    // The pull request adds a file to the core and replaces a line in two
+    // others, while main adds a note and empties two: lines removed from two
+    // files in the core, and from two outside it.
+    let change: &[(&str, &[u8])] = &[
+        ("M 100644 inline crates/core/src/change.rs", b"fn change() {}\nfn more() {}\n"),
+        ("M 100755 inline crates/core/build.sh", b"cargo build --locked\n"),
+        ("M 100644 inline crates/core/Cargo.toml", b"[lib]\n"),
+    ];
+    let describe: &[(&str, &[u8])] = &[("M 100644 inline docs/change.md", b"change\n")];
+    commit("heads/pr", 18, "core: add the change", &[17], change);
+    commit("heads/pr", 19, "docs: describe the change", &[18], describe);
+    let emptied: &[(&str, &[u8])] =
+        &[("M 100644 inline docs/note-20.md", b"note\n"), ("M 100644 inline docs/note-13.md", b""), ("M 100644 inline docs/note-14.md", b"")];
+    commit("heads/main", 20, "docs: note 20, and empty notes 13 and 14", &[17], emptied);
     // GitHub's test merge of the pull request into its base, which CI checks
     // out, detached, for a pull request.
-    let landed: &[(&str, &[u8])] =
-        &[("M 100644 inline crates/core/src/change.rs", b"fn change() {}\nfn more() {}\n"), ("M 100644 inline docs/change.md", b"change\n")];
-    commit("pull/1/merge", 21, "Merge the pull request into main", &[20, 19], landed);
+    commit("pull/1/merge", 21, "Merge the pull request into main", &[20, 19], &[change, describe].concat());
     let marks = dir.join("marks");
     git(&["init", "-q", "--template="], b"");
     git(&["fast-import", "--quiet", &format!("--export-marks={}", marks.display())], &stream);
@@ -1297,8 +1312,8 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
     // rows of their own.
     type Row = (u64, &'static str, u8, [u32; 4], Option<usize>);
     let rows: [Row; 17] = [
-        (21, "Merge the pull request into main", 1, [2, 0, 1, 0], Some(1)),
-        (20, "docs: note 20", 0, [0, 0, 1, 0], Some(0)),
+        (21, "Merge the pull request into main", 1, [4, 2, 1, 0], Some(1)),
+        (20, "docs: note 20, and empty notes 13 and 14", 0, [0, 0, 1, 2], Some(0)),
         (17, "docs: note 17", 0, [0, 0, 1, 0], Some(0)),
         (16, "docs: note 16", 0, [0, 0, 1, 0], Some(0)),
         (15, "docs: note 15", 0, [0, 0, 1, 0], Some(0)),
@@ -1313,7 +1328,7 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
         (6, "tui: add the frame", 0, [0, 0, 1, 0], Some(0)),
         (3, "near misses", 0, [0, 0, 3, 0], Some(1)),
         (2, "docs: say \"hi\", twice", 0, [0, 0, 1, 0], None),
-        (1, "Initial commit", 1, [3, 0, 1, 0], None),
+        (1, "Initial commit", 1, [4, 0, 1, 0], None),
     ];
     // The CSV the script writes for a window of three, or of 50, where no
     // commit has a full window.
@@ -1337,7 +1352,7 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
     let share = |count: u32, of: u32, percent: &str| {
         format!("core share at {head} (HEAD): {count} of the latest {of} first-parent commits touch crates/core/, {percent}%; target at most 20%\n")
     };
-    let itself = format!("{head} itself touches crates/core/: +2 -0 there, +1 -0 elsewhere\n");
+    let itself = format!("{head} itself touches crates/core/: +4 -2 there, +1 -0 elsewhere\n");
 
     // The CSV replaces what its file held.
     let three = dir.join("three.csv");
@@ -1384,7 +1399,7 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
             vec!["--window", "999999999", "main"],
             format!(
                 "core share at {main} (main): 16 first-parent commits, fewer than the window of 999999999, so no share; target at most 20%\n\
-                 {main} itself does not touch crates/core/: +0 -0 there, +1 -0 elsewhere\n"
+                 {main} itself does not touch crates/core/: +0 -0 there, +1 -2 elsewhere\n"
             ),
         ),
     ] {
@@ -1422,6 +1437,35 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
         code == Some(1) && report.contains(&template) && !report.contains("error: "),
         "a temporary file it cannot write in TMPDIR passes, or the script reports an error of its own after mktemp's: {report}"
     );
+    // What git prints and the script does not read, from a git on PATH that
+    // passes one command's output through a Perl edit: a commit missing, one
+    // printed twice, a file before any commit, a file without its two counts,
+    // a count that is not a number, and a command that fails. Each is
+    // refused, never counted.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let real = std::env::split_paths(&path).map(|dir| dir.join("git")).find(|git| git.is_file()).expect("no git on PATH");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let editing_git = "#!/bin/sh\n[ \"$1\" = \"$EDITED\" ] || exec \"$REAL_GIT\" \"$@\"\n\"$REAL_GIT\" \"$@\" | perl -0777 -pe \"$EDIT\"\n";
+    executable(&bin.join("git"), editing_git);
+    let edited_path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap();
+    let unread = |after: u32, what: &str| format!("error: git diff-tree printed what this script does not read, after {after} commits: {what}\n");
+    let file = r"crates\/core\/src\/change.rs";
+    for (command, edit, refused) in [
+        ("diff-tree", r"s/\x01[^\x01]*\x01[^\x01]*\x01Initial commit\0.*//s".to_string(), "error: git diff-tree gave 16 of the 17 commits of HEAD\n".to_string()),
+        ("diff-tree", r"s/\A([^\0]*\0)/$1$1/".to_string(), unread(1, &sha_of[&21])),
+        ("diff-tree", r"s/\A/1\t0\tstray\0/".to_string(), unread(0, "1\t0\tstray")),
+        ("diff-tree", format!(r"s/2\t0\t{file}\0/2\0/"), unread(1, "2")),
+        ("diff-tree", format!(r"s/2\t0\t{file}/x\t0\t{file}/"), unread(1, "x\t0\tcrates/core/src/change.rs")),
+        ("diff-tree", format!(r"s/2\t0\t{file}/2\tx\t{file}/"), unread(1, "2\tx\tcrates/core/src/change.rs")),
+        ("diff-tree", "exit 1".to_string(), "error: git diff-tree failed on HEAD\n".to_string()),
+        ("rev-list", "exit 1".to_string(), "error: git rev-list failed on HEAD\n".to_string()),
+    ] {
+        let mut edited = clean(&script, &tree);
+        edited.env("PATH", &edited_path).env("REAL_GIT", &real).env("EDITED", command).env("EDIT", &edit);
+        let (code, report) = ran(&mut edited);
+        assert!(code == Some(1) && report.ends_with(&refused), "the script reads git {command}'s output edited by {edit:?}: {report}");
+    }
     for args in [&["--window"][..], &["--csv"], &["--csv", ""], &["--bogus"], &["HEAD", "main"]] {
         let (code, report) = measure(args, &tree);
         assert!(code == Some(2) && report.starts_with("usage: "), "{args:?} is not refused: {report}");
