@@ -2820,6 +2820,86 @@ mod tests {
         assert!(t.len() >= wide);
     }
 
+    /// `[` and `]` jump to the prompt before and after the selection, and the
+    /// sticky header names the nearest prompt that starts above the view's
+    /// top row, as a walk back through every block would find them: checked
+    /// against that walk at every row, with a prompt that starts on the top
+    /// row and a view that starts below the history.
+    #[test]
+    fn turn_jumps_and_the_sticky_prompt_find_the_nearest_prompt() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        let kinds = [0, 1, 0, 0, 1, 0, 1, 1, 0, 0];
+        for (i, &user) in kinds.iter().enumerate() {
+            let text = format!("block {i}, which wraps onto a second row at forty columns");
+            if user == 1 {
+                t.push_user(vec![Line::from(text)]);
+            } else {
+                t.push_assistant(vec![Line::from(text)]);
+            }
+        }
+        t.wrap_all();
+        let mut jumps = Vec::new();
+        for _ in 0..5 {
+            t.select_next_user();
+            jumps.push(t.selected());
+        }
+        assert_eq!(jumps, [Some(1), Some(4), Some(6), Some(7), Some(7)]);
+        jumps.clear();
+        for _ in 0..5 {
+            t.select_prev_user();
+            jumps.push(t.selected());
+        }
+        assert_eq!(jumps, [Some(6), Some(4), Some(1), Some(1), Some(1)]);
+        t.selected = Some(5);
+        t.select_prev_user();
+        assert_eq!(t.selected(), Some(4), "from a reply, the prompt above it");
+        t.selected = Some(5);
+        t.select_next_user();
+        assert_eq!(t.selected(), Some(6), "from a reply, the prompt below it");
+        t.selected = None;
+        t.select_prev_user();
+        assert_eq!(t.selected(), Some(7), "with nothing selected, the last prompt");
+
+        let starts: Vec<usize> = (0..t.blocks.len()).map(|i| t.blocks[..i].iter().map(|b| b.height).sum()).collect();
+        let total = t.len();
+        for top in 0..total + 3 {
+            let block = if top < total { starts.iter().rposition(|&start| start <= top).unwrap() } else { 0 };
+            let walked = (0..=block).rev().find(|&i| t.blocks[i].kind == BlockKind::User && starts[i] < top);
+            let walked = walked.filter(|_| top > 0);
+            assert_eq!(t.has_sticky_user(top), walked.is_some(), "top row {top}");
+            let shown = t.sticky_user_line(top).map(|line| line.spans[0].content.to_string());
+            let expected = walked.map(|i| t.blocks[i].raw[0].spans[0].content.to_string());
+            assert_eq!(shown, expected, "top row {top}");
+        }
+    }
+
+    /// The wraps a frame keeps: all of them up to the budget, then the
+    /// oldest go first, as few as bring the count back to the budget, and a
+    /// block in view goes to the back of the line instead.
+    #[test]
+    fn wraps_past_the_budget_drop_oldest_first_but_never_in_view() {
+        let mut t = Transcript::new();
+        t.wrap_budget = Some(10);
+        t.set_width(40);
+        for i in 0..20 {
+            t.push_assistant(vec![Line::from(format!("reply {i}"))]);
+        }
+        // Twenty blocks of two rows; a view of four rows shows two blocks.
+        let show = |t: &mut Transcript, first_block: usize| {
+            t.set_offset(40 - 2 * first_block - 4);
+            t.settle_view(4, 0);
+            (0..20).filter(|&bi| t.blocks[bi].is_wrapped_at(40)).collect::<Vec<_>>()
+        };
+        assert_eq!(show(&mut t, 0), [0, 1]);
+        assert_eq!(show(&mut t, 2), [0, 1, 2, 3]);
+        assert_eq!(show(&mut t, 3), [0, 1, 2, 3, 4], "ten rows of wraps, the budget, drop none");
+        assert_eq!(show(&mut t, 4), [1, 2, 3, 4, 5], "twelve drop the oldest, and only it");
+        assert_eq!(show(&mut t, 0), [0, 1, 3, 4, 5], "block 1 in view stays; block 2 goes");
+        assert_eq!(t.dropped_wraps, 2);
+        assert_eq!(t.wrapped_rows, 10);
+    }
+
     /// Reading a whole session holds a window of wraps rather than a second
     /// copy of the session: past the budget, the blocks wrapped longest ago
     /// drop their wraps, never a block in view, and keep the heights their
