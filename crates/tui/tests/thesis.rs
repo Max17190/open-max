@@ -2497,6 +2497,148 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
     (format!("http://{addr}/v1"), served)
 }
 
+/// An unattended run, with no terminal anywhere, in which the agent writes a
+/// tool and calls it on its very next step: one turn, no human input after
+/// the grant, exit 0.
+///
+/// Method: the command an unattended runner starts, `OPENMAX_HUMAN_ATTEST=1
+/// openmax --trust-project --base-url URL --model m --context-tokens N -p
+/// TASK`, on a fresh HOME and a project that ships `notes.txt`, in a session
+/// of its own (setsid, so no controlling terminal) with stdin /dev/null,
+/// against a loopback endpoint (`scripted_endpoint`) that answers the run's
+/// three requests in turn. The first gets a `write_file` of
+/// `.openmax/tools/line_count.toml`, an awk tool that counts the lines of
+/// notes.txt and prints the attestation variable as its environment holds it.
+/// The second must carry, on that write's result, the refreeze receipt naming
+/// `line_count` callable from the next step, and gets a call of `line_count`
+/// by name. The third must carry that call's output, and gets the answer. The
+/// run must exit 0 with the answer on stdout, having made exactly those
+/// requests, and its session's event log
+/// (`~/.openmax/sessions/<id>.events.jsonl`) must hold, in this order, the
+/// write's start and end, the receipt as a `harness_note` on the write's
+/// call, and the call's start and end with the tool's output; between the
+/// write's end and the call's start, the `refrozen` event naming the file;
+/// and one `done`, its last line. The manifest names `OPENMAX_HUMAN_ATTEST`
+/// in its `env`, so only the harness's strip keeps the variable from the
+/// tool, whose output must show it empty. First, the same command without the
+/// variable must exit 3 before any request: there, the variable is the one
+/// human act, and nothing else grants the run. A functional gate, asserted in
+/// every build.
+#[test]
+fn an_unattended_run_writes_a_tool_and_calls_it_on_the_next_step() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let tool = ".openmax/tools/line_count.toml";
+    let manifest = r#"name = "line_count"
+description = "Count the lines of notes.txt"
+command = "awk"
+args = ['END { printf "%d lines; attest=[%s]\n", NR, ENVIRON["OPENMAX_HUMAN_ATTEST"] }', "notes.txt"]
+env = ["OPENMAX_HUMAN_ATTEST"]
+mutating = false
+"#;
+    // A streamed reply that calls tool `name` once with `arguments`.
+    let call = |id: &str, name: &str, arguments: serde_json::Value| {
+        let one = serde_json::json!({"index": 0, "id": id, "type": "function",
+            "function": {"name": name, "arguments": arguments.to_string()}});
+        let chunk = serde_json::json!({"choices": [{"delta": {"tool_calls": [one]}, "finish_reason": null}]});
+        let end = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n")
+    };
+    let endpoint = scripted_endpoint(vec![
+        call("call_write", "write_file", serde_json::json!({"path": tool, "content": manifest})),
+        call("call_tool", "line_count", serde_json::json!({})),
+        sse_answer("notes.txt has 3 lines"),
+    ]);
+    let (project, home) = fresh_install("unattended", 0);
+    std::fs::write(project.join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+    // The run to its exit: its code, its stdout, and all it printed.
+    let run = |attested: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
+        cmd.current_dir(&project)
+            .env("HOME", &home)
+            .env_remove("OPENMAX_SESSION")
+            .env_remove("OPENMAX_API_KEY")
+            .env_remove("OPENMAX_HUMAN_ATTEST")
+            .args(["--trust-project", "--base-url", &endpoint.base_url, "--model", "m", "--context-tokens", "32768"])
+            .args(["-p", "count the lines of notes.txt with a project tool"])
+            .stdin(Stdio::null());
+        if attested {
+            cmd.env("OPENMAX_HUMAN_ATTEST", "1");
+        }
+        // SAFETY: setsid is async-signal-safe, and the closure touches
+        // nothing else between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| match libc::setsid() {
+                -1 => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            });
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let printed = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        (out.status.code(), stdout, printed)
+    };
+
+    let (code, _, printed) = run(false);
+    assert_eq!(code, Some(3), "with no terminal and no attestation the grant went through: {printed}");
+    assert!(printed.contains("OPENMAX_HUMAN_ATTEST=1"), "the refusal does not name the human act: {printed}");
+    assert!(endpoint.served.lock().unwrap().is_empty(), "a refused grant reached the endpoint");
+
+    let (code, stdout, printed) = run(true);
+    let served = std::mem::take(&mut *endpoint.served.lock().unwrap());
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(stdout.contains("notes.txt has 3 lines"), "no answer on stdout: {printed}");
+    assert_eq!(served.len(), 3, "the run made {} requests, not three: {served:?}", served.len());
+    assert_eq!(std::fs::read_to_string(project.join(tool)).unwrap(), manifest, "the tool file is not what was written");
+    let receipt = tool_result(&served[1], "call_write");
+    assert!(
+        receipt.contains("[extension refreeze: ") && receipt.contains("New tools callable from your next step: line_count."),
+        "the request after the write carries no receipt naming the tool callable: {receipt}"
+    );
+    let output = tool_result(&served[2], "call_tool");
+    assert!(
+        output.starts_with("3 lines; attest=[]"),
+        "the request after the call carries no output of the tool, or the tool received the attestation: {output}"
+    );
+
+    let logs: Vec<PathBuf> = std::fs::read_dir(home.join(".openmax/sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().ends_with(".events.jsonl"))
+        .collect();
+    assert_eq!(logs.len(), 1, "the run did not leave one event log: {logs:?}");
+    let log = std::fs::read_to_string(&logs[0]).unwrap();
+    // The events, without the format line that heads the log.
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|line| line.get("type").is_some())
+        .collect();
+    // Where the first event of `kind` that `holds` stands in the log.
+    let at = |kind: &str, holds: &dyn Fn(&serde_json::Value) -> bool| {
+        let found = events.iter().position(|event| event["type"] == kind && holds(event));
+        found.unwrap_or_else(|| panic!("the event log has no such {kind} event: {log}"))
+    };
+    let says = |event: &serde_json::Value, key: &str, text: &str| event[key].as_str().is_some_and(|s| s.contains(text));
+    let order = [
+        at("tool_start", &|e| e["call_id"] == "call_write" && e["name"] == "write_file" && e["args"]["path"] == tool),
+        at("tool_end", &|e| e["call_id"] == "call_write" && e["ok"] == true),
+        at("harness_note", &|e| {
+            e["call_id"] == "call_write" && says(e, "text", "New tools callable from your next step: line_count.")
+        }),
+        at("tool_start", &|e| e["call_id"] == "call_tool" && e["name"] == "line_count"),
+        at("tool_end", &|e| e["call_id"] == "call_tool" && e["ok"] == true && says(e, "output", "3 lines; attest=[]")),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "the write, receipt, call and result are out of order, {order:?}: {log}");
+    let added = format!("{tool} added");
+    let refrozen = at("refrozen", &|e| e["changes"].as_array().is_some_and(|c| c.iter().any(|c| c == added.as_str())));
+    assert!(order[1] < refrozen && refrozen < order[3], "the refreeze is not between the write and the call: {log}");
+    let done: Vec<usize> = (0..events.len()).filter(|&n| events[n]["type"] == "done").collect();
+    assert_eq!(done, [events.len() - 1], "the run is not one turn that ends the log: {log}");
+    assert_eq!(events[done[0]]["stop_reason"], "stop", "{log}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// The recorded sessions say what providers served: `scripts/cache-report.sh
 /// <sessions dir>` reads every session's `<id>.usage.jsonl`, one line per
 /// model request whose reply reported its token usage, and reports the share

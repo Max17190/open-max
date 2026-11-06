@@ -210,7 +210,7 @@ openmax --trust-project -p "summarize this repo"   # from a terminal
 openmax --stdio                                    # a frontend, once trusted
 ```
 
-A frontend's stdin is its protocol pipe, not a terminal, so it cannot grant trust itself. For CI and other automation a human runs, see [project trust](docs/configuration.md#project-trust).
+A frontend's stdin is its protocol pipe, not a terminal, so it cannot grant trust itself. An unattended run, in CI or a container with no terminal, takes one human act, at setup: `OPENMAX_HUMAN_ATTEST=1` on the command that grants trust, as in `OPENMAX_HUMAN_ATTEST=1 openmax --trust-project -p "<task>"`, after which the agent can write a tool and call it on its next step with no further input (see [project trust](docs/configuration.md#project-trust)). The harness strips that variable from every tool's environment, even a tool whose manifest names it, and `an_unattended_run_writes_a_tool_and_calls_it_on_the_next_step` in crates/tui/tests/thesis.rs runs that whole path with no terminal.
 
 In print mode, text goes to stdout and tool progress to stderr; with `--json`, each `AgentEvent` is one JSON line. Press **/** for slash commands and **@** to mention a project file. Full flags, keybindings, and commands are in [usage](docs/usage.md).
 
