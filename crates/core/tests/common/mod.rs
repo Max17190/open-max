@@ -81,6 +81,20 @@ pub async fn drive_turn(
     project: &Path,
     text: &str,
 ) -> Vec<AgentEvent> {
+    drive_steered_turn(core, rx, session, project, text, None).await
+}
+
+/// `drive_turn`, sending `steer` to the turn while its first card waits:
+/// the turn takes it before its next request, as a message sent while a
+/// tool waits for approval.
+pub async fn drive_steered_turn(
+    core: &Arc<Core>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    session: &str,
+    project: &Path,
+    text: &str,
+    mut steer: Option<&str>,
+) -> Vec<AgentEvent> {
     start_turn(Arc::clone(core), session.into(), project.to_path_buf(), text.into()).unwrap();
     let mut events = Vec::new();
     loop {
@@ -90,6 +104,9 @@ pub async fn drive_turn(
             .expect("event channel stays open");
         match &envelope.event {
             AgentEvent::ApprovalRequest { approval_id, .. } => {
+                if let Some(text) = steer.take() {
+                    core.steer(session, text.into()).unwrap();
+                }
                 core.respond_approval(approval_id, true);
             }
             AgentEvent::Done { .. } => break,
