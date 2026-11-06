@@ -453,7 +453,7 @@ impl RowIndex {
     /// `row` is under the total, since a block is at least one row.
     fn locate(&self, row: usize) -> (usize, usize) {
         let (mut bi, mut rest) = (0, row);
-        let mut step = (self.0.len() + 1).next_power_of_two() / 2;
+        let mut step = self.0.len().next_power_of_two();
         while step > 0 {
             if bi + step <= self.0.len() && self.0[bi + step - 1] <= rest {
                 bi += step;
