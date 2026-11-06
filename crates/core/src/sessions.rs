@@ -632,7 +632,10 @@ pub fn append_archive(core: &Core, id: &str, messages: &[ChatMessage]) -> bool {
     }
 }
 
-/// Load a session's archived (compaction-dropped) messages, corrupt lines skipped.
+/// Load a session's archived (compaction-dropped) messages, corrupt lines
+/// skipped, for the tests: recall reads archives with a bounded reader of its
+/// own, and nothing else reads one back.
+#[cfg(test)]
 pub fn load_archive(core: &Core, id: &str) -> Vec<ChatMessage> {
     let Ok(text) = std::fs::read_to_string(archive_path(core, id)) else {
         return Vec::new();
