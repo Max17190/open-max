@@ -11,7 +11,9 @@ fn repo() -> PathBuf {
 }
 
 /// The lines of one job in a workflow under .github/workflows, from its key up
-/// to the next key at the jobs' indentation or less.
+/// to the first line after it at the jobs' indentation or less that is not
+/// blank: the next job's key, or the comment above that job, which is not
+/// this one's.
 fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
     let text = std::fs::read_to_string(repo().join(".github/workflows").join(workflow)).unwrap();
     let key = format!("  {name}:");
@@ -20,7 +22,7 @@ fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
     lines
         .take_while(|line| {
             let body = line.trim_start();
-            body.is_empty() || body.starts_with('#') || line.len() - body.len() > 2
+            body.is_empty() || line.len() - body.len() > 2
         })
         .map(str::to_string)
         .collect()
@@ -29,6 +31,33 @@ fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
 /// The lines of one job in ci.yml.
 fn ci_job(name: &str) -> Vec<String> {
     workflow_job("ci.yml", name)
+}
+
+/// The test job's step that runs every test of the workspace, under nextest.
+const NEXTEST_RUN: &str = "cargo nextest run --workspace --locked --profile ci";
+/// The test job's step that runs the doc tests, which nextest does not run.
+const DOC_TESTS: &str = "cargo test --workspace --locked --doc";
+
+/// The events a workflow under .github/workflows runs on: each key of its
+/// `on:` block, in order, with the lines nested under it (its filters),
+/// blank lines and comments left out.
+fn triggers(workflow: &str) -> Vec<(String, Vec<String>)> {
+    let text = std::fs::read_to_string(repo().join(".github/workflows").join(workflow)).unwrap();
+    let mut events: Vec<(String, Vec<String>)> = Vec::new();
+    let mut block = text.lines().skip_while(|line| *line != "on:");
+    assert!(block.next().is_some(), "{workflow} has no `on:` block");
+    for line in block {
+        let body = line.trim_start();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        match line.len() - body.len() {
+            0 => break,
+            2 => events.push((body.trim_end_matches(':').to_string(), Vec::new())),
+            _ => events.last_mut().expect("a filter outside every event").1.push(body.to_string()),
+        }
+    }
+    events
 }
 
 /// The keys of the step in `job` that holds line `at`, from its first key to
@@ -125,11 +154,13 @@ fn whole_suite_runs_in_five_seconds() {
             .unwrap_or_else(|| panic!("the test job does not run `{run}`"))
     };
     let gate_run = "scripts/check-suite-time.sh ${{ matrix.suite_time_multiplier }}";
-    let (tests, gate) = (step("cargo test --workspace --locked"), step(gate_run));
+    let (tests, docs, gate) = (step(NEXTEST_RUN), step(DOC_TESTS), step(gate_run));
     assert!(tests < gate, "the suite time gate runs before the suite is built");
-    let functional = step_keys(&job, tests);
-    assert!(!functional.iter().any(|key| key.starts_with("if:") || key.starts_with("continue-on-error:")),
-        "normal functional tests must stay enforced on every runner");
+    for functional in [tests, docs] {
+        let keys = step_keys(&job, functional);
+        assert!(!keys.iter().any(|key| key.starts_with("if:") || key.starts_with("continue-on-error:")),
+            "normal functional tests must stay enforced on every runner: {keys:?}");
+    }
     let keys = step_keys(&job, gate);
     assert!(!keys.iter().any(|key| key.starts_with("if:")), "a runner skips its suite timing measurement");
     let soft: Vec<_> = keys.iter().filter(|key| key.starts_with("continue-on-error:")).copied().collect();
@@ -1004,7 +1035,7 @@ fn the_workspace_has_two_thousand_tests() {
             .position(|line| line.trim() == format!("run: {run}"))
             .unwrap_or_else(|| panic!("the test job does not run `{run}`"))
     };
-    let (tests, count) = (step("cargo test --workspace --locked"), step("scripts/check-test-count.sh"));
+    let (tests, count) = (step(NEXTEST_RUN), step("scripts/check-test-count.sh"));
     assert!(tests < count, "the tests are counted before the suite is built");
     // Every runner counts against its own platform's floor: a condition
     // skips the gate on some runner, and continue-on-error lets it fail.
@@ -1148,10 +1179,11 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
         assert!(readme.contains(&claim), "the README does not say \"{claim}\", which the script and CI's core-share job hold");
     }
 
-    let workflow = std::fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+    let events = triggers("ci.yml");
+    let on = |event: &str| events.iter().find(|(name, _)| name == event).map(|(_, filters)| filters.as_slice());
     assert!(
-        workflow.contains("\non:\n  push:\n    branches: [main]\n  pull_request:\n\n"),
-        "CI does not run on every push to main and every pull request"
+        on("push") == Some(&["branches: [main]".to_string()][..]) && on("pull_request") == Some(&[][..]),
+        "CI does not run on every push to main and every pull request: {events:?}"
     );
     let job = ci_job("core-share");
     // Every push and pull request measures the share and keeps the CSV: no
@@ -1481,6 +1513,580 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
     // or job summary among them, removed it.
     let left: Vec<_> = std::fs::read_dir(&temp).unwrap().map(|entry| entry.unwrap().file_name()).collect();
     assert!(left.is_empty(), "the script leaves its temporary files behind: {left:?}");
+}
+
+/// The pull-request gate is the CI workflow's jobs, and they start at once:
+/// none needs another, so the gate takes as long as its slowest job, and
+/// Clippy, which builds with a compiler of its own, pinned to a release, is a
+/// job of its own instead of steps after the tests. The jobs are the tests,
+/// Clippy, the thesis gates, the core share and dist's plan of the release;
+/// the six release builds are not among them (crates/tui/tests/release.rs
+/// holds their workflow and the plan). CI runs on every push to main, every
+/// pull request, every merge group of a merge queue and every night. A push
+/// to a pull request cancels the run still testing its previous head: the
+/// concurrency group is the pull request's number, and every other run's
+/// group is its own run id, so no other run is ever cancelled. Every cache
+/// step of a workflow that builds saves only on main: a pull request's copy
+/// would serve only that pull request's later runs, which main's copy serves
+/// as well unless the pull request changes Cargo.lock, since rust-cache keeps
+/// no workspace crate, and it would take the repository's cache space.
+#[test]
+fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
+    let events = triggers("ci.yml");
+    let names: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
+    assert_eq!(names, ["push", "pull_request", "merge_group", "schedule"], "CI runs on other events than these: {events:?}");
+    let filters = |event: &str| events.iter().find(|(name, _)| name == event).map(|(_, filters)| filters.clone()).unwrap();
+    assert_eq!(filters("push"), ["branches: [main]"], "CI does not run on every push to main");
+    assert!(
+        filters("pull_request").is_empty() && filters("merge_group").is_empty(),
+        "a filter keeps CI off some pull requests or merge groups: {events:?}"
+    );
+    let schedule = filters("schedule");
+    assert!(schedule.len() == 1 && schedule[0].starts_with("- cron: "), "CI does not run every night: {schedule:?}");
+
+    let ci = std::fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+    let concurrency = "\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}\n  cancel-in-progress: true\n";
+    assert!(
+        ci.contains(concurrency),
+        "a push to a pull request does not cancel the run of its previous head, or other runs can be cancelled: {concurrency}"
+    );
+    let jobs: Vec<&str> = ci
+        .lines()
+        .skip_while(|line| *line != "jobs:")
+        .skip(1)
+        .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':').filter(|key| !key.starts_with([' ', '#'])))
+        .collect();
+    assert_eq!(jobs, ["test", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
+    for job in &jobs {
+        let waits: Vec<String> = ci_job(job).into_iter().filter(|line| line.trim().starts_with("needs:")).collect();
+        assert!(waits.is_empty(), "the {job} job waits for another, so the gate takes the two one after the other: {waits:?}");
+    }
+
+    let clippy = ci_job("clippy");
+    let toolchain = clippy
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("toolchain: "))
+        .expect("the clippy job installs no toolchain");
+    assert!(
+        toolchain.split('.').count() == 3 && toolchain.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+        "Clippy's compiler {toolchain} is not a release, so a Rust release can fail an unrelated pull request"
+    );
+    let lint = format!("run: cargo +{toolchain} clippy --workspace --all-targets --locked -- -D warnings");
+    for line in ["components: clippy", lint.as_str()] {
+        assert!(clippy.iter().any(|l| l.trim() == line), "the clippy job does not hold `{line}`: {clippy:?}");
+    }
+    let soft: Vec<&String> = clippy
+        .iter()
+        .filter(|line| {
+            let key = line.trim().trim_start_matches("- ");
+            key.starts_with("if:") || key.starts_with("continue-on-error:")
+        })
+        .collect();
+    assert!(soft.is_empty(), "Clippy can be skipped or fail while the gate passes: {soft:?}");
+
+    for workflow in ["ci.yml", "release-build.yml", "mutants.yml"] {
+        let lines: Vec<String> = std::fs::read_to_string(repo().join(".github/workflows").join(workflow))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let caches: Vec<usize> =
+            (0..lines.len()).filter(|&at| lines[at].trim().starts_with("uses: Swatinem/rust-cache@")).collect();
+        assert!(!caches.is_empty(), "{workflow} caches nothing, so this test holds nothing there");
+        for at in caches {
+            let keys = step_keys(&lines, at);
+            assert!(
+                keys.contains(&"save-if: ${{ github.ref == 'refs/heads/main' }}"),
+                "a cache step of {workflow} saves on other branches too: {keys:?}"
+            );
+        }
+    }
+}
+
+/// Every test of the workspace runs under cargo-nextest in CI's test job:
+/// each test in a process of its own, as many at once as the runner has
+/// cores, where `cargo test` runs the test binaries one after another. The
+/// job installs nextest's release binary for its runner, pinned to a version
+/// and checked against the sha256 its release publishes before it is
+/// unpacked, for each runner of its matrix, and fails on a runner it pinned
+/// none for. It runs nextest under `.config/nextest.toml`'s ci profile: every
+/// failure shown rather than the first, none retried, and a hung test stopped
+/// after a bounded number of its slow periods; and no setting anywhere in
+/// that file retries a test. Nor does a failure on one runner cancel the
+/// job on the other, which would hide its failures. A lock inside one test
+/// binary keeps nothing apart across the processes nextest starts, so the
+/// harness-time tests, which thesis_rounds holds apart with a lock for their
+/// CPU-bound timing, reserve every test thread instead. The doc tests, which
+/// nextest does not run, run in a step of their own. README.md states this.
+#[test]
+fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
+    let job = ci_job("test");
+    let at = |what: &str, wanted: &dyn Fn(&str) -> bool| {
+        job.iter().position(|line| wanted(line.trim())).unwrap_or_else(|| panic!("the test job has no {what}"))
+    };
+    let install = at("step that installs cargo-nextest", &|line| line == "- name: Install cargo-nextest");
+    let run = at("step that runs nextest", &|line| line == format!("run: {NEXTEST_RUN}"));
+    at("step that runs the doc tests", &|line| line == format!("run: {DOC_TESTS}"));
+    assert!(install < run, "the tests run before nextest is installed");
+    let keys = step_keys(&job, install);
+    let version = keys.iter().find_map(|key| key.strip_prefix("NEXTEST_VERSION: ")).expect("nextest's version is not pinned");
+    assert!(
+        version.split('.').count() == 3 && version.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+        "nextest is not pinned to a release: {version}"
+    );
+    // Each runner's asset and its hash, then the line for any other runner.
+    let pins: Vec<(&str, &str, &str)> = keys
+        .iter()
+        .filter_map(|key| {
+            let (runner, rest) = key.split_once(") asset=")?;
+            let (asset, rest) = rest.split_once(" sha256=")?;
+            Some((runner, asset, rest.strip_suffix(" ;;")?))
+        })
+        .collect();
+    let pinned: Vec<(&str, &str)> = pins.iter().map(|(runner, asset, _)| (*runner, *asset)).collect();
+    assert_eq!(
+        pinned,
+        [("Linux-X64", "x86_64-unknown-linux-gnu"), ("macOS-*", "universal-apple-darwin")],
+        "nextest is not pinned for each runner of the test job, or for another one"
+    );
+    let runners = job.iter().find_map(|line| line.trim().strip_prefix("os: [")?.strip_suffix(']')).expect("the test job names no runners");
+    assert_eq!(runners, "ubuntu-latest, macos-latest", "the test job runs on a runner whose nextest is not pinned");
+    for (runner, _, sha256) in &pins {
+        assert!(
+            sha256.len() == 64 && sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{runner}'s nextest hash is not a sha256: {sha256}"
+        );
+    }
+    assert!(
+        keys.iter().any(|key| key.starts_with("*) ") && key.ends_with("exit 1 ;;")),
+        "a runner with no pinned nextest installs one unchecked: {keys:?}"
+    );
+    let line = |start: &str| {
+        keys.iter().position(|key| key.starts_with(start)).unwrap_or_else(|| panic!("the install step has no `{start}...`: {keys:?}"))
+    };
+    let fetched = line("curl -sSfL --retry 3 \"https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-$asset.tar.gz\" -o \"$RUNNER_TEMP/cargo-nextest.tar.gz\"");
+    let checked = line("echo \"$sha256  $RUNNER_TEMP/cargo-nextest.tar.gz\" | shasum -a 256 --check --strict -");
+    let unpacked = line("tar -xzf \"$RUNNER_TEMP/cargo-nextest.tar.gz\" ");
+    assert!(fetched < checked && checked < unpacked, "nextest is unpacked before its hash is checked");
+    let strategy = at("strategy", &|line| line == "strategy:");
+    assert!(
+        job[strategy + 1..].iter().take_while(|line| line.starts_with("      ")).any(|line| line.trim() == "fail-fast: false"),
+        "a failure on one runner cancels the test job on the other, so its failures go unseen"
+    );
+
+    let config: toml::Table = std::fs::read_to_string(repo().join(".config/nextest.toml")).unwrap().parse().unwrap();
+    let profiles = config.get("profile").and_then(toml::Value::as_table).expect(".config/nextest.toml has no profiles");
+    let ci = profiles.get("ci").and_then(toml::Value::as_table).expect("there is no ci profile");
+    assert_eq!(ci.get("fail-fast").and_then(toml::Value::as_bool), Some(false), "a run stops at its first failure");
+    assert_eq!(ci.get("retries").and_then(toml::Value::as_integer), Some(0), "the ci profile does not say it retries no test");
+    let slow = ci.get("slow-timeout").and_then(toml::Value::as_table).expect("the ci profile never stops a hung test");
+    assert!(
+        slow.get("period").and_then(toml::Value::as_str).is_some()
+            && slow.get("terminate-after").and_then(toml::Value::as_integer).is_some_and(|periods| periods >= 1),
+        "a hung test is never stopped: {slow:?}"
+    );
+    let mut overrides = Vec::new();
+    for (name, profile) in profiles {
+        let profile = profile.as_table().unwrap_or_else(|| panic!("the {name} profile is not a table"));
+        assert!(
+            profile.get("retries").is_none_or(|retries| retries.as_integer() == Some(0)),
+            "the {name} profile retries failed tests"
+        );
+        for each in profile.get("overrides").and_then(toml::Value::as_array).into_iter().flatten() {
+            let each = each.as_table().unwrap_or_else(|| panic!("an override of the {name} profile is not a table"));
+            assert!(each.get("retries").is_none(), "an override of the {name} profile retries the tests it selects: {each:?}");
+            overrides.push((name.as_str(), each));
+        }
+    }
+    let alone = overrides.iter().any(|(profile, each)| {
+        *profile == "default"
+            && each.get("filter").and_then(toml::Value::as_str) == Some("binary_id(=open-max-core::thesis_rounds)")
+            && each.get("threads-required").and_then(toml::Value::as_str) == Some("num-test-threads")
+    });
+    assert!(alone, "the harness-time tests run beside others under nextest: {overrides:?}");
+    let rounds = std::fs::read_to_string(repo().join("crates/core/tests/thesis_rounds.rs")).unwrap();
+    assert!(
+        rounds.contains("static SERIAL: tokio::sync::Mutex<()>"),
+        "thesis_rounds no longer holds its tests apart, the reason they reserve every thread under nextest"
+    );
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let claim = "CI's test job runs every test under cargo-nextest, each in a process of its own and none retried (`.config/nextest.toml`)";
+    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
+}
+
+/// The pull-request gate turns green in under 90 seconds at the median and
+/// under 2 minutes at the 99th percentile; it does not yet, so this is a
+/// report. No test can time the run it is part of, so CI measures the runs
+/// before: its Gate time workflow runs scripts/gate-time.sh on every push to
+/// main, every night and on demand, never on a pull request, with read access
+/// only, and nothing skips its job or lets it fail. The script reads GitHub's
+/// record of the CI workflow's latest pull-request runs with `gh api`, and
+/// for each of the latest N (20 by default) whose first attempt passed takes
+/// the wall clock from its first job's start to its last job's end, a skipped
+/// job counting at neither end, a job that began and ended in one second
+/// counting, and a new year between the two read as any other second. It
+/// prints a line for each, then the p50, p90 and p99 by the nearest rank and
+/// the slowest; then how many runs as recent failed at their first attempt (a
+/// failed job outranks a cancelled one, and a run with no job failed), how
+/// many of those passed when run again, and how many were cancelled; then the
+/// target, met only when the median is under 90 s and the p99 under 120 s
+/// over all N runs asked for and none as recent failed at its first attempt,
+/// so the N are consecutive. It reads a second page of runs only
+/// after a full first one, reads no run past the N-th that passed, says when
+/// it found fewer, adds its report to the job's summary, and names its
+/// repository by --repo, else GITHUB_REPOSITORY. It exits 0 whatever it
+/// measures, 1 when it cannot measure (gh fails or prints what the script
+/// does not read, or no run passed), and 2 on a malformed argument or a perl
+/// without its modules. README.md states the method and the target. This
+/// test drives the script with a stand-in `gh` serving runs it makes up.
+#[test]
+fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
+    let gate_script = std::fs::read_to_string(repo().join("scripts/gate-time.sh")).unwrap();
+    let default_runs: u64 = assigned(&gate_script, "runs").parse().expect("the default sample is a count");
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        "`scripts/gate-time.sh` (bash, gh and perl) measures the pull-request gate".to_string(),
+        format!("the latest {default_runs} pull-request runs of the CI workflow that passed at their first attempt"),
+        "from the start of its first job to the end of its last".to_string(),
+        format!("The target is a p50 under 90 seconds and a p99 under 120 seconds over {default_runs} consecutive runs"),
+        "The Gate time workflow runs it on every push to main and every night".to_string(),
+        "the job reports the times and fails only when the script cannot measure them".to_string(),
+    ] {
+        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which scripts/gate-time.sh and its workflow hold");
+    }
+    let events = triggers("gate-time.yml");
+    let names: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
+    assert_eq!(names, ["push", "schedule", "workflow_dispatch"], "the gate time is measured on other events: {events:?}");
+    assert_eq!(events[0].1, ["branches: [main]"], "the gate time is not measured on every push to main");
+    let workflow = std::fs::read_to_string(repo().join(".github/workflows/gate-time.yml")).unwrap();
+    assert!(
+        workflow.contains("\npermissions:\n  actions: read\n  contents: read\n"),
+        "the gate-time workflow can do more than read the runs"
+    );
+    let job = workflow_job("gate-time.yml", "gate-time");
+    let soft: Vec<&str> = job
+        .iter()
+        .map(|line| line.trim().trim_start_matches("- "))
+        .filter(|key| ["if:", "needs:", "continue-on-error:"].iter().any(|refused| key.starts_with(refused)))
+        .collect();
+    assert!(soft.is_empty(), "the gate time can go unmeasured while the run passes: {soft:?}");
+    let measured = job.iter().position(|line| line.trim() == "run: scripts/gate-time.sh").expect("the gate-time job does not run the script");
+    assert!(
+        step_keys(&job, measured).contains(&"GH_TOKEN: ${{ github.token }}"),
+        "the script runs without the run's token, so gh cannot read the runs"
+    );
+    assert!(job.iter().any(|line| line.trim().starts_with("timeout-minutes:")), "a stalled gh holds the job to GitHub's own limit");
+
+    let dir = scratch("gate-time");
+    let (bin, served) = (dir.join("bin"), dir.join("served"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&served).unwrap();
+    // `gh api PATH` as GitHub answers it: the file named after PATH, each
+    // character a file name should not hold made `_`, or a 404. It logs the
+    // paths it is asked for.
+    executable(
+        &bin.join("gh"),
+        "#!/bin/sh\n\
+         [ \"$1\" = api ] && [ $# -eq 2 ] || { echo \"unexpected: gh $*\" >&2; exit 2; }\n\
+         printf '%s\\n' \"$2\" >> \"$GH_LOG\"\n\
+         f=\"$GH_SERVED/$(printf '%s' \"$2\" | tr -c 'A-Za-z0-9.-' '_')\"\n\
+         [ -f \"$f\" ] || { echo \"gh: Not Found (HTTP 404)\" >&2; exit 1; }\n\
+         cat \"$f\"\n",
+    );
+    let file = |path: &str| -> String {
+        path.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect()
+    };
+    let page = |repo: &str, n: usize| format!("repos/{repo}/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page={n}");
+    let jobs_of = |repo: &str, id: u64| format!("repos/{repo}/actions/runs/{id}/attempts/1/jobs?per_page=100");
+    let serve = |path: &str, body: &str| std::fs::write(served.join(file(path)), body).unwrap();
+    let sha = |id: u64| format!("{id:08}{}", "a".repeat(32));
+    // A job: its name, conclusion, and the second of an hour it started and
+    // ended at, or neither.
+    let job = |name: &str, conclusion: &str, span: Option<(u32, u32)>| {
+        let at = |second: u32| format!("2026-11-06T10:{:02}:{:02}Z", second / 60, second % 60);
+        serde_json::json!({"name": name, "conclusion": conclusion, "started_at": span.map(|(a, _)| at(a)), "completed_at": span.map(|(_, b)| at(b))})
+    };
+    // A run: its id, its conclusion after its last attempt, and the jobs of
+    // its first.
+    type Run<'a> = (u64, &'a str, Vec<serde_json::Value>);
+    // A page of runs, newest first.
+    let serve_page = |repo: &str, n: usize, runs: &[Run]| {
+        let listed: Vec<serde_json::Value> = runs
+            .iter()
+            .map(|(id, conclusion, _)| serde_json::json!({"id": id, "head_sha": sha(*id), "conclusion": conclusion}))
+            .collect();
+        serve(&page(repo, n), &serde_json::json!({"total_count": runs.len(), "workflow_runs": listed}).to_string());
+        for (id, _, jobs) in runs {
+            serve(&jobs_of(repo, *id), &serde_json::json!({"total_count": jobs.len(), "jobs": jobs}).to_string());
+        }
+    };
+    let green = |id: u64, span: (u32, u32)| (id, "success", vec![job("Test (ubuntu-latest)", "success", Some(span))]);
+
+    // Newest first: a pass whose skipped job, at neither end, would widen it;
+    // a failure that passed when run again; a failure whose matrix cancelled
+    // the job beside it; a run cancelled with none failed; four passes, one
+    // ending on a job whose name holds spaces and one with a job that began
+    // and ended in the same second; a run with no job; and a fifth pass that
+    // a sample of five never reads.
+    serve_page(
+        "o/main",
+        1,
+        &[
+            (101, "success", vec![
+                job("Test (macos-latest)", "success", Some((3, 150))),
+                job("Thesis (macos-latest)", "success", Some((8, 213))),
+                job("Release plan", "skipped", Some((0, 300))),
+            ]),
+            (102, "success", vec![job("Test (ubuntu-latest)", "failure", Some((0, 100))), job("Clippy", "success", Some((0, 50)))]),
+            (103, "failure", vec![
+                job("Test (ubuntu-latest)", "failure", Some((0, 50))),
+                job("Test (macos-latest)", "cancelled", Some((0, 51))),
+            ]),
+            (104, "cancelled", vec![job("Test (ubuntu-latest)", "success", Some((0, 40))), job("Clippy", "cancelled", Some((0, 41)))]),
+            (105, "success", vec![job("Core share", "success", Some((100, 107))), job("Thesis (macos-latest)", "success", Some((100, 161)))]),
+            (106, "startup_failure", vec![]),
+            green(107, (0, 89)),
+            green(108, (10, 100)),
+            (109, "success", vec![job("Test (ubuntu-latest)", "success", Some((0, 119))), job("Core share", "success", Some((5, 5)))]),
+            green(110, (0, 120)),
+        ],
+    );
+    // Twenty passes of 1 to 20 seconds, where each percentile is a rank of
+    // its own; and a pass across the turn of a year.
+    let twenty: Vec<Run> = (1..=20).map(|k| green(400 + k, (0, k as u32))).collect();
+    serve_page("o/twenty", 1, &twenty);
+    let new_year = serde_json::json!({
+        "name": "Test (ubuntu-latest)", "conclusion": "success",
+        "started_at": "2025-12-31T23:59:30Z", "completed_at": "2026-01-01T00:00:30Z",
+    });
+    serve_page("o/newyear", 1, &[(431, "success", vec![new_year])]);
+    serve_page("o/met", 1, &[green(201, (0, 61)), green(202, (0, 89)), green(203, (0, 119))]);
+    serve_page("o/p50", 1, &[green(211, (0, 90)), green(212, (0, 100))]);
+    serve_page("o/p99", 1, &[green(221, (0, 60)), green(222, (0, 120))]);
+    serve_page("o/one", 1, &[(231, "failure", vec![job("Clippy", "failure", Some((0, 30)))]), green(232, (0, 45))]);
+    // A full page of cancelled runs, then a page with one that passed.
+    let cancelled: Vec<Run> =
+        (1000..1100).map(|id| (id, "cancelled", vec![job("Test (ubuntu-latest)", "cancelled", Some((0, 5)))])).collect();
+    serve_page("o/paged", 1, &cancelled);
+    serve_page("o/paged", 2, &[green(2000, (0, 30))]);
+    serve_page("o/nogreen", 1, &[(241, "failure", vec![job("Clippy", "failure", Some((0, 30)))]), cancelled[0].clone()]);
+    // What the script must refuse rather than misread.
+    serve(&page("o/garbled", 1), "<html>rate limited</html>");
+    serve(&page("o/nolist", 1), "{\"total_count\": 0}");
+    // Each with one field wrong, so that without its check the script would
+    // read jobs no stand-in serves and say something else.
+    serve(&page("o/badrun", 1), &format!("{{\"total_count\": 1, \"workflow_runs\": [{{\"id\": 0, \"head_sha\": \"{}\"}}]}}", sha(301)));
+    serve(&page("o/badsha", 1), "{\"total_count\": 1, \"workflow_runs\": [{\"id\": 351, \"head_sha\": \"abc\"}]}");
+    serve_page("o/partial", 1, &[green(311, (0, 30))]);
+    serve(&jobs_of("o/partial", 311), &serde_json::json!({"total_count": 2, "jobs": [job("Clippy", "success", Some((0, 30)))]}).to_string());
+    serve_page("o/badjob", 1, &[(321, "success", vec![serde_json::json!({"conclusion": "success"})])]);
+    serve_page("o/noverdict", 1, &[(361, "success", vec![serde_json::json!({"name": "Clippy"})])]);
+    serve_page("o/notime", 1, &[(331, "success", vec![job("Clippy", "success", None)])]);
+    serve_page("o/backwards", 1, &[green(341, (30, 29))]);
+    // A perl that cannot load one of the modules the script needs.
+    let broken = |module: &str| {
+        let lib = dir.join(format!("no-{}", module.replace("::", "-")));
+        let file = lib.join(module.replace("::", "/") + ".pm");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, format!("die \"Can't locate {module}\\n\";\n")).unwrap();
+        lib.display().to_string()
+    };
+    let (no_json, no_time) = (broken("JSON::PP"), broken("Time::Local"));
+    let summary = dir.join("summary.md");
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    // One run of the script with `args` and `env`: its exit code, what it
+    // printed, and the paths it asked gh for.
+    let gate = |tag: &str, args: &[&str], env: &[(&str, String)]| {
+        let log = dir.join(format!("asked-{tag}"));
+        let mut command = script("scripts/gate-time.sh");
+        command.args(args).env("PATH", &path).env("GH_SERVED", &served).env("GH_LOG", &log).env_remove("GITHUB_REPOSITORY");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let (code, report) = ran(&mut command);
+        (code, report, std::fs::read_to_string(&log).unwrap_or_default())
+    };
+    let summarize = [("GITHUB_STEP_SUMMARY", summary.display().to_string())];
+    // A run of the script: its tag, its arguments and the environment it adds.
+    type Case<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, String)>);
+    let cases: Vec<Case> = vec![
+        ("five", vec!["--repo", "o/main", "--runs", "5"], vec![]),
+        ("default", vec!["--repo", "o/main"], vec![]),
+        ("twenty", vec!["--repo", "o/twenty"], vec![]),
+        ("newyear", vec!["--repo", "o/newyear", "--runs", "1"], vec![]),
+        ("unsummarized", vec!["--repo", "o/met", "--runs", "3"], vec![("GITHUB_STEP_SUMMARY", dir.join("gone/summary.md").display().to_string())]),
+        ("met", vec!["--runs", "3"], vec![("GITHUB_REPOSITORY", "o/met".to_string()), summarize[0].clone()]),
+        ("over", vec!["--repo", "o/met", "--runs", "3"], vec![("GITHUB_REPOSITORY", "o/nowhere".to_string())]),
+        ("short", vec!["--repo", "o/met"], vec![]),
+        ("p50", vec!["--repo", "o/p50", "--runs", "2"], vec![]),
+        ("p99", vec!["--repo", "o/p99", "--runs", "2"], vec![]),
+        ("one", vec!["--repo", "o/one", "--runs", "1"], vec![]),
+        ("paged", vec!["--repo", "o/paged", "--runs", "1"], vec![]),
+        ("nogreen", vec!["--repo", "o/nogreen"], vec![]),
+        ("missing", vec!["--repo", "o/missing"], vec![]),
+        ("annotated", vec!["--repo", "o/missing"], vec![("GITHUB_ACTIONS", "true".to_string())]),
+        ("garbled", vec!["--repo", "o/garbled"], vec![]),
+        ("nolist", vec!["--repo", "o/nolist"], vec![]),
+        ("badrun", vec!["--repo", "o/badrun"], vec![]),
+        ("badsha", vec!["--repo", "o/badsha"], vec![]),
+        ("partial", vec!["--repo", "o/partial"], vec![]),
+        ("badjob", vec!["--repo", "o/badjob"], vec![]),
+        ("noverdict", vec!["--repo", "o/noverdict"], vec![]),
+        ("notime", vec!["--repo", "o/notime"], vec![]),
+        ("backwards", vec!["--repo", "o/backwards"], vec![]),
+        ("no-json", vec!["--repo", "o/met"], vec![("PERL5LIB", no_json.clone())]),
+        ("no-time", vec!["--repo", "o/met"], vec![("PERL5LIB", no_time.clone())]),
+        ("no-repo", vec![], vec![]),
+        ("bad-repo", vec!["--repo", "o/met/x"], vec![]),
+        ("runs-0", vec!["--repo", "o/met", "--runs", "0"], vec![]),
+        ("runs-07", vec!["--repo", "o/met", "--runs", "07"], vec![]),
+        ("runs-1000", vec!["--repo", "o/met", "--runs", "1000"], vec![]),
+        ("runs-x", vec!["--repo", "o/met", "--runs", "x"], vec![]),
+        ("runs-none", vec!["--repo", "o/met", "--runs"], vec![]),
+        ("repo-none", vec!["--repo"], vec![]),
+        ("unknown", vec!["--repo", "o/met", "--json"], vec![]),
+    ];
+    let results: Vec<(Option<i32>, String, String)> = std::thread::scope(|scope| {
+        let gate = &gate;
+        let running: Vec<_> = cases.iter().map(|(tag, args, env)| scope.spawn(move || gate(tag, args, env))).collect();
+        running.into_iter().map(|run| run.join().unwrap()).collect()
+    });
+    let outcome = |tag: &str| &results[cases.iter().position(|(name, _, _)| *name == tag).unwrap()];
+    let summary_written = std::fs::read_to_string(&summary).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (code, report, asked) = outcome("five");
+    assert_eq!(*code, Some(0), "{report}");
+    assert_eq!(
+        report.as_str(),
+        "gate time of the latest 5 runs of ci.yml in o/main on a pull request that passed at the first attempt, from the start of its first job to the end of its last:\n\
+         run 101 at 00000101: 210 s, Thesis (macos-latest) last\n\
+         run 105 at 00000105: 61 s, Thesis (macos-latest) last\n\
+         run 107 at 00000107: 89 s, Test (ubuntu-latest) last\n\
+         run 108 at 00000108: 90 s, Test (ubuntu-latest) last\n\
+         run 109 at 00000109: 119 s, Test (ubuntu-latest) last\n\
+         p50 90 s, p90 210 s, p99 210 s, slowest 210 s over 5 runs\n\
+         since the oldest of them, 3 runs failed at the first attempt (1 of them passed when run again) and 1 was cancelled\n\
+         target p50 under 90 s and p99 under 120 s over 5 consecutive runs that passed at the first attempt: not met\n",
+        "the gate time of five runs is not measured by its method"
+    );
+    let asked_for: Vec<&str> = asked.lines().collect();
+    let mut expected = vec![page("o/main", 1)];
+    expected.extend((101..=109).map(|id| jobs_of("o/main", id)));
+    assert_eq!(asked_for, expected, "the script reads other runs than up to the fifth that passed, or reads them otherwise");
+
+    // Every run read: the six that passed, fewer than the 20 asked for, and
+    // no second page after a first that was not full.
+    let (code, report, asked) = outcome("default");
+    assert_eq!(*code, Some(0), "{report}");
+    assert!(
+        report.starts_with("gate time of the latest 6 runs of ci.yml in o/main on a pull request that passed at the first attempt, fewer than the 20 asked for, from")
+            && report.contains("\nrun 110 at 00000110: 120 s, Test (ubuntu-latest) last\n")
+            && report.contains("\np50 90 s, p90 210 s, p99 210 s, slowest 210 s over 6 runs\n")
+            && report.ends_with("\nsince the oldest of them, 3 runs failed at the first attempt (1 of them passed when run again) and 1 was cancelled\ntarget p50 under 90 s and p99 under 120 s over 20 consecutive runs that passed at the first attempt: not met\n"),
+        "a sample smaller than the one asked for is not reported as one: {report}"
+    );
+    assert!(asked.lines().count() == 11 && !asked.contains("page=2"), "{asked}");
+    let (code, report, _) = outcome("twenty");
+    assert!(
+        *code == Some(0)
+            && report.starts_with("gate time of the latest 20 runs of ci.yml in o/twenty on a pull request that passed at the first attempt, from")
+            && report.contains("\np50 10 s, p90 18 s, p99 20 s, slowest 20 s over 20 runs\n")
+            && report.ends_with("\ntarget p50 under 90 s and p99 under 120 s over 20 consecutive runs that passed at the first attempt: met\n"),
+        "twenty runs' percentiles are not their nearest ranks: {report}"
+    );
+    let (code, report, _) = outcome("newyear");
+    assert!(*code == Some(0) && report.contains("\nrun 431 at 00000431: 60 s, Test (ubuntu-latest) last\n"), "a run across a new year: {report}");
+
+    // The target: met under 90 s at the median and 120 s at the p99 over
+    // every run asked for, none as recent failed; missed at either bound,
+    // with a failure among them, or with fewer runs than asked for.
+    let (code, report, _) = outcome("met");
+    assert_eq!(*code, Some(0), "{report}");
+    assert!(
+        report.contains("\np50 89 s, p90 119 s, p99 119 s, slowest 119 s over 3 runs\n")
+            && report.ends_with("\nsince the oldest of them, 0 runs failed at the first attempt (0 of them passed when run again) and 0 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 3 consecutive runs that passed at the first attempt: met\n")
+            && !report.contains("asked for"),
+        "a gate under both bounds does not meet the target: {report}"
+    );
+    assert_eq!(summary_written, format!("## Gate time\n\n```text\n{}```\n", report), "the report is not the job's summary");
+    let (code, over_report, _) = outcome("over");
+    assert!(*code == Some(0) && over_report == report, "--repo does not name the repository over GITHUB_REPOSITORY: {over_report}");
+    for (tag, line) in [
+        ("p50", "\np50 90 s, p90 100 s, p99 100 s, slowest 100 s over 2 runs\n"),
+        ("p99", "\np50 60 s, p90 120 s, p99 120 s, slowest 120 s over 2 runs\n"),
+    ] {
+        let (code, report, _) = outcome(tag);
+        assert!(
+            *code == Some(0)
+                && report.contains(line)
+                && report.ends_with("\ntarget p50 under 90 s and p99 under 120 s over 2 consecutive runs that passed at the first attempt: not met\n"),
+            "a gate at the {tag} bound meets the target: {report}"
+        );
+    }
+    let (code, report, _) = outcome("short");
+    assert!(
+        *code == Some(0)
+            && report.contains(", fewer than the 20 asked for, ")
+            && report.contains("\np50 89 s, p90 119 s, p99 119 s, slowest 119 s over 3 runs\n")
+            && report.ends_with(" and 0 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 20 consecutive runs that passed at the first attempt: not met\n"),
+        "fewer runs than asked for meet the target: {report}"
+    );
+    let (code, report, _) = outcome("one");
+    assert!(
+        *code == Some(0)
+            && report.starts_with("gate time of the latest 1 run of ci.yml in o/one on a pull request")
+            && report.contains("\np50 45 s, p90 45 s, p99 45 s, slowest 45 s over 1 run\n")
+            && report.ends_with("\nsince the oldest of them, 1 run failed at the first attempt (0 of them passed when run again) and 0 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 1 consecutive run that passed at the first attempt: not met\n"),
+        "a failed first attempt among the runs leaves the target met: {report}"
+    );
+    let (code, report, asked) = outcome("paged");
+    assert!(
+        *code == Some(0)
+            && report.contains("\nrun 2000 at 00002000: 30 s, Test (ubuntu-latest) last\n")
+            && report.contains(" and 100 were cancelled\n")
+            && asked.lines().last() == Some(jobs_of("o/paged", 2000).as_str())
+            && asked.contains(&page("o/paged", 2))
+            && !asked.contains("page=3"),
+        "a second page is not read after a full first one: {report}"
+    );
+    // A cancelled run gave no verdict, so it breaks no run of them.
+    assert!(
+        report.ends_with(" and 100 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 1 consecutive run that passed at the first attempt: met\n"),
+        "a cancelled run breaks the consecutive runs that passed: {report}"
+    );
+
+    // Each refusal: its exit code and what it says.
+    for (tag, wanted, said) in [
+        ("nogreen", 1, "error: no pull-request run of ci.yml in o/nogreen passed at its first attempt".to_string()),
+        ("missing", 1, format!("gh: Not Found (HTTP 404)\nerror: gh api {} failed", page("o/missing", 1))),
+        ("annotated", 1, format!("::error::gh api {} failed", page("o/missing", 1))),
+        ("garbled", 1, format!("error: gh api {} printed what this script does not read", page("o/garbled", 1))),
+        ("nolist", 1, format!("error: gh api {} printed no list of runs", page("o/nolist", 1))),
+        ("badrun", 1, format!("error: gh api {} listed a run this script does not read", page("o/badrun", 1))),
+        ("badsha", 1, format!("error: gh api {} listed a run this script does not read", page("o/badsha", 1))),
+        ("partial", 1, format!("error: gh api {} printed no whole list of jobs", jobs_of("o/partial", 311))),
+        ("badjob", 1, format!("error: gh api {} listed a job this script does not read", jobs_of("o/badjob", 321))),
+        ("noverdict", 1, format!("error: gh api {} listed a job this script does not read", jobs_of("o/noverdict", 361))),
+        ("unsummarized", 1, "error: cannot write the job summary".to_string()),
+        ("notime", 1, format!("error: gh api {} gave Clippy no start and end this script reads", jobs_of("o/notime", 331))),
+        ("backwards", 1, format!("error: gh api {} gave Test (ubuntu-latest) no start and end this script reads", jobs_of("o/backwards", 341))),
+        ("no-json", 2, "needs perl with its core modules JSON::PP and Time::Local".to_string()),
+        ("no-time", 2, "needs perl with its core modules JSON::PP and Time::Local".to_string()),
+        ("no-repo", 2, "error: name the repository as OWNER/NAME with --repo (or GITHUB_REPOSITORY), not ''".to_string()),
+        ("bad-repo", 2, "error: name the repository as OWNER/NAME with --repo (or GITHUB_REPOSITORY), not 'o/met/x'".to_string()),
+        ("runs-0", 2, "error: --runs takes a count of runs from 1 to 999, not '0'".to_string()),
+        ("runs-07", 2, "error: --runs takes a count of runs from 1 to 999, not '07'".to_string()),
+        ("runs-1000", 2, "error: --runs takes a count of runs from 1 to 999, not '1000'".to_string()),
+        ("runs-x", 2, "error: --runs takes a count of runs from 1 to 999, not 'x'".to_string()),
+        ("runs-none", 2, "usage: ".to_string()),
+        ("repo-none", 2, "usage: ".to_string()),
+        ("unknown", 2, "usage: ".to_string()),
+    ] {
+        let (code, report, _) = outcome(tag);
+        assert!(*code == Some(wanted) && report.contains(&said), "{tag}: not refused with {wanted} and \"{said}\": {code:?} {report}");
+    }
 }
 
 /// The mutation score, caught / (caught + missed) over every mutant of the

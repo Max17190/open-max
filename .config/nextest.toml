@@ -1,0 +1,26 @@
+# How cargo-nextest runs this workspace's tests. CI's test job runs every
+# test with `cargo nextest run --workspace --locked --profile ci`: each test
+# in a process of its own, as many at once as the runner has cores, where
+# `cargo test` runs the test binaries one after another. A local
+# `cargo nextest run` runs them the same way, under the default profile.
+# crates/tui/tests/thesis.rs holds the ci profile and the test job's wiring.
+
+[profile.ci]
+# Every failure is shown: the run does not stop at the first one.
+fail-fast = false
+# A test that fails fails the run. None is run again, so a test that fails
+# only sometimes cannot pass by being retried.
+retries = 0
+# Marked slow at 30 seconds; at 60 a test is stopped, with its process group,
+# and fails, naming itself, instead of holding the job to its own limit.
+slow-timeout = { period = "30s", terminate-after = 2 }
+# A failure's output prints when it happens and again at the end of the log.
+failure-output = "immediate-final"
+
+# The harness-time tests time CPU-bound tool rounds. In one process their
+# SERIAL lock keeps them apart, and `cargo test` runs no other binary beside
+# them. Each process nextest starts has a lock of its own, so each of these
+# tests reserves every test thread instead, and nothing runs beside it.
+[[profile.default.overrides]]
+filter = 'binary_id(=open-max-core::thesis_rounds)'
+threads-required = "num-test-threads"

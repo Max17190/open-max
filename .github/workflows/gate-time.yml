@@ -1,0 +1,38 @@
+name: Gate time
+
+# How long the pull-request gate takes to turn green: scripts/gate-time.sh
+# reads GitHub's record of the CI workflow's latest pull-request runs and
+# reports the p50, p90 and p99 of their wall clock, against a target of a
+# median under 90 seconds and a p99 under 2 minutes. It measures runs that
+# already finished, none of them this one's own, so it runs after every push
+# to main (each merge ends a pull request's last run), every night, and on
+# demand, and never on a pull request, whose gate it would not time. Reported,
+# not gated, until the target is met: the script exits 0 whatever it
+# measures, so the job fails only when it cannot measure.
+# crates/tui/tests/thesis.rs holds this wiring.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "53 6 * * *"
+  workflow_dispatch:
+
+# Reading the runs and their jobs is all it does.
+permissions:
+  actions: read
+  contents: read
+
+# Every action is pinned to a full commit SHA, with its release in a trailing
+# comment, as ci.yml explains.
+jobs:
+  gate-time:
+    name: Gate time
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Measure the gate time
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/gate-time.sh
