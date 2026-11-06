@@ -2840,18 +2840,19 @@ mod tests {
             }
         }
         t.wrap_all();
-        let mut jumps = Vec::new();
-        for _ in 0..5 {
-            t.select_next_user();
-            jumps.push(t.selected());
-        }
-        assert_eq!(jumps, [Some(1), Some(4), Some(6), Some(7), Some(7)]);
-        jumps.clear();
-        for _ in 0..5 {
-            t.select_prev_user();
-            jumps.push(t.selected());
-        }
-        assert_eq!(jumps, [Some(6), Some(4), Some(1), Some(1), Some(1)]);
+        let starts: Vec<usize> = (0..t.blocks.len()).map(|i| t.blocks[..i].iter().map(|b| b.height).sum()).collect();
+        let total = t.len();
+        // Each jump also puts the prompt's last row at the bottom of the view.
+        let jump = |t: &mut Transcript, next: bool| {
+            if next { t.select_next_user() } else { t.select_prev_user() }
+            let i = t.selected().unwrap();
+            assert_eq!(t.offset(), total - starts[i] - t.blocks[i].height, "the jump to block {i} left the view");
+            i
+        };
+        let forward: Vec<usize> = (0..5).map(|_| jump(&mut t, true)).collect();
+        assert_eq!(forward, [1, 4, 6, 7, 7]);
+        let back: Vec<usize> = (0..5).map(|_| jump(&mut t, false)).collect();
+        assert_eq!(back, [6, 4, 1, 1, 1]);
         t.selected = Some(5);
         t.select_prev_user();
         assert_eq!(t.selected(), Some(4), "from a reply, the prompt above it");
@@ -2862,8 +2863,6 @@ mod tests {
         t.select_prev_user();
         assert_eq!(t.selected(), Some(7), "with nothing selected, the last prompt");
 
-        let starts: Vec<usize> = (0..t.blocks.len()).map(|i| t.blocks[..i].iter().map(|b| b.height).sum()).collect();
-        let total = t.len();
         for top in 0..total + 3 {
             let block = if top < total { starts.iter().rposition(|&start| start <= top).unwrap() } else { 0 };
             let walked = (0..=block).rev().find(|&i| t.blocks[i].kind == BlockKind::User && starts[i] < top);
@@ -2886,6 +2885,21 @@ mod tests {
         t.push_assistant(vec![Line::from("one")]);
         assert!(t.anchor_at(0).is_none(), "the bottom edge anchored a row");
         assert!(t.anchor_at(1).is_some());
+    }
+
+    /// A scroll before any frame has laid out a view wraps nothing: there are
+    /// no rows on screen yet to cross.
+    #[test]
+    fn a_scroll_before_any_frame_wraps_nothing() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        for i in 0..6 {
+            t.push_assistant(vec![Line::from(format!("reply {i}, long enough to wrap onto a second row"))]);
+        }
+        t.scroll_up(3);
+        t.scroll_down(1);
+        assert!(t.blocks.iter().all(|block| block.cache.is_empty()), "a scroll with no view wrapped a block");
+        assert_eq!(t.offset(), 2);
     }
 
     /// Nothing wraps before a frame gives the transcript a width, not even
