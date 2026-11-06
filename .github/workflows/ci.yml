@@ -95,8 +95,9 @@ jobs:
 
   # The whole suite's wall time after compilation with every test binary run
   # at once, each with a thread pool of its own, which the test job, running
-  # each test in a process of its own, does not show. scripts/check-suite-time.sh
-  # gives the method and the budget: 5 seconds times this runner's multiplier.
+  # each test in a process of its own, does not show.
+  # scripts/check-suite-time.sh gives the method and the budget: 5 seconds
+  # times this runner's multiplier.
   # It gates on ubuntu-latest alone, a job of its own so that no step of the
   # test job runs on one of its runners only. macos-latest, 3 shared cores,
   # ran the suite in 12.5 to 33.7 seconds over 32 runs, over its 20-second
