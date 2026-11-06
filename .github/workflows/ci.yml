@@ -34,6 +34,9 @@ jobs:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # A failure on one runner cancels nothing on the other, so each
+      # runner's failures are all shown, as the ci profile shows a run's.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         # The suite timing budget on each runner, as a multiple of the

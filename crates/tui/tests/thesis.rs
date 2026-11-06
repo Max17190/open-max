@@ -1610,11 +1610,12 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
 /// none for. It runs nextest under `.config/nextest.toml`'s ci profile: every
 /// failure shown rather than the first, none retried, and a hung test stopped
 /// after a bounded number of its slow periods; and no setting anywhere in
-/// that file retries a test. A lock inside one test binary keeps nothing
-/// apart across the processes nextest starts, so the harness-time tests,
-/// which thesis_rounds holds apart with a lock for their CPU-bound timing,
-/// reserve every test thread instead. The doc tests, which nextest does not
-/// run, run in a step of their own. README.md states this.
+/// that file retries a test. Nor does a failure on one runner cancel the
+/// job on the other, which would hide its failures. A lock inside one test
+/// binary keeps nothing apart across the processes nextest starts, so the
+/// harness-time tests, which thesis_rounds holds apart with a lock for their
+/// CPU-bound timing, reserve every test thread instead. The doc tests, which
+/// nextest does not run, run in a step of their own. README.md states this.
 #[test]
 fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
     let job = ci_job("test");
@@ -1665,6 +1666,11 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
     let checked = line("echo \"$sha256  $RUNNER_TEMP/cargo-nextest.tar.gz\" | shasum -a 256 --check --strict -");
     let unpacked = line("tar -xzf \"$RUNNER_TEMP/cargo-nextest.tar.gz\" ");
     assert!(fetched < checked && checked < unpacked, "nextest is unpacked before its hash is checked");
+    let strategy = at("strategy", &|line| line == "strategy:");
+    assert!(
+        job[strategy + 1..].iter().take_while(|line| line.starts_with("      ")).any(|line| line.trim() == "fail-fast: false"),
+        "a failure on one runner cancels the test job on the other, so its failures go unseen"
+    );
 
     let config: toml::Table = std::fs::read_to_string(repo().join(".config/nextest.toml")).unwrap().parse().unwrap();
     let profiles = config.get("profile").and_then(toml::Value::as_table).expect(".config/nextest.toml has no profiles");
