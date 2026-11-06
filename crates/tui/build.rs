@@ -1,7 +1,8 @@
 //! Link options for the `openmax` binary on macOS, where the dynamic loader's
 //! work happens before `main` and so before the first frame
 //! (`first_frame_holds_its_ratio_to_a_baseline_binary` in
-//! crates/tui/tests/thesis.rs times it; `the_binary_loads_only_what_it_uses`
+//! crates/tui/tests/thesis.rs times it;
+//! `the_binary_names_only_libsystem_caps_its_imports_and_chains_its_fixups`
 //! holds what these change).
 //!
 //! `-dead_strip_dylibs` drops a library no symbol is bound from. The `libc`
