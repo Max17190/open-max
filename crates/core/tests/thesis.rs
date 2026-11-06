@@ -1035,6 +1035,28 @@ fn instructions_retired() -> Option<u64> {
     None
 }
 
+/// Whether this machine is of the reference machine's class, where the
+/// load's ratio to its floor was measured and its ratchet is asserted: its
+/// CPU is an Apple M5 (the brand macOS reports is "Apple M5", "Apple M5 Pro"
+/// or "Apple M5 Max"). CI's runners are not.
+#[cfg(target_os = "macos")]
+fn reference_machine() -> bool {
+    let mut brand = [0u8; 64];
+    let mut len = brand.len();
+    // SAFETY: the buffer and its length outlive the call, which writes at
+    // most `len` bytes and stores how many it wrote.
+    let rc = unsafe {
+        libc::sysctlbyname(c"machdep.cpu.brand_string".as_ptr(), brand.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    let brand = std::ffi::CStr::from_bytes_until_nul(&brand[..len.min(brand.len())]);
+    rc == 0 && brand.is_ok_and(|b| matches!(b.to_bytes(), b"Apple M5" | b"Apple M5 Pro" | b"Apple M5 Max"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reference_machine() -> bool {
+    false
+}
+
 /// 100 discovered extensions parsed and registered in under 10 ms: one pass
 /// over `hundred_extensions`, timed in process. One load, in ask mode, where
 /// the approval checks run, is the registry's build (every tool manifest and
@@ -1064,7 +1086,11 @@ fn instructions_retired() -> Option<u64> {
 /// it runs on: 2.67 to 2.74 at full speed and under the utility QoS clamp,
 /// and 2.88 under the background clamp, on efficiency cores alone, where the
 /// load took 10.8 ms instead of 2.8. Other work on the same cores moves it:
-/// 3.20 when the background clamp shared them with a mutation run.
+/// 3.20 when the background clamp shared them with a mutation run. The
+/// ratio's scale is the machine's own, not the platform's: in this test's
+/// first CI runs it measured 4.05 on macos-latest, with a median load of
+/// 6.11 ms over a floor of 1.49 ms, and 5.99 on ubuntu-latest, 2.80 ms over
+/// 0.47 ms, where reading the files costs less.
 ///
 /// Measured on the reference machine (Apple M5) in release, three runs each.
 /// Before the parse checked example patterns instead of compiling them,
@@ -1075,9 +1101,10 @@ fn instructions_retired() -> Option<u64> {
 /// 0.14 in a quiet run). After: 2.77 to 2.91 ms, 2.71 to 2.72 times its
 /// floor, about 55M instructions (registry 1.51 ms, prompt 0.29, hooks 0.45,
 /// permissions 0.40, templates 0.14). A release build asserts the 10 ms
-/// target on the median everywhere and, on macOS on Apple silicon, where the
-/// ratio was measured, a ratchet on it 10% over 2.88, its highest with no
-/// other work on the same cores, rounded up to a tenth; elsewhere it prints
+/// target on the median everywhere and, on a machine of the reference
+/// machine's class (`reference_machine`), where the ratio was measured, a
+/// ratchet on it 10% over 2.88, its highest with no other work on the same
+/// cores, rounded up to a tenth; elsewhere, CI's runners included, it prints
 /// the ratio. A debug build asserts a 20x sanity bound on the median.
 /// The test holds the README's statements of the target and the ratchet.
 #[test]
@@ -1091,7 +1118,8 @@ fn a_hundred_extensions_load_in_under_10_ms() {
     const TARGET: Duration = Duration::from_millis(10);
     const RATIO_MEASURED: f64 = 2.88;
     let ratchet = (RATIO_MEASURED * 1.1 * 10.0).ceil() / 10.0;
-    let gated = cfg!(all(target_os = "macos", target_arch = "aarch64")) && !cfg!(debug_assertions);
+    let reference = reference_machine();
+    let gated = reference && !cfg!(debug_assertions);
     let runs = if cfg!(debug_assertions) { 5 } else { 101 };
     let (dir, data, project) = hundred_extensions();
     let load = || {
@@ -1244,7 +1272,11 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         totals[runs / 10],
         totals[runs * 9 / 10],
         breakdown.join(", "),
-        if gated { "asserted" } else { "asserted only by a release build on macOS on Apple silicon" },
+        match (reference, cfg!(debug_assertions)) {
+            (true, false) => "asserted: the reference machine's class in a release build",
+            (true, true) => "not asserted: a debug build",
+            (false, _) => "not asserted: not the reference machine's class",
+        },
         instructions.map_or("uncounted".to_string(), |n| (n / runs as u64).to_string()),
         if cfg!(debug_assertions) { "debug" } else { "release" },
     );
@@ -1263,8 +1295,10 @@ fn a_hundred_extensions_load_in_under_10_ms() {
     for claim in [
         format!("Parsing and registering 100 extensions takes under {} ms", TARGET.as_millis()),
         format!(
-            "at most {ratchet:.1} times the time to read their files, 10% over the ratio of {RATIO_MEASURED} measured on efficiency cores alone, rounded up to a tenth"
+            "on a machine of the reference machine's class holds a load to at most {ratchet:.1} times the time to read their \
+             files, 10% over the ratio of {RATIO_MEASURED} measured on efficiency cores alone, rounded up to a tenth"
         ),
+        "Elsewhere, CI's runners included, a release build prints the ratio, whose scale is the machine's own.".to_string(),
     ] {
         assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
     }
