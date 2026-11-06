@@ -250,7 +250,8 @@ fn transcript_frame_p99_at_1m_lines() {
     let mut stats = Vec::new();
     for (phase, scroll) in phases {
         if phase == "scrolling-at-top" {
-            app.transcript.set_offset(app.transcript.len());
+            let top = app.transcript.len();
+            app.transcript.set_offset(top);
             for _ in 0..50 {
                 frame(&mut app, still);
             }
@@ -277,10 +278,12 @@ fn transcript_frame_p99_at_1m_lines() {
     // Read every row once, a page at a time from the top.
     let page = usize::from(HEIGHT);
     let transcript = &mut app.transcript;
-    transcript.set_offset(transcript.len());
+    let top = transcript.len();
+    transcript.set_offset(top);
     loop {
         transcript.settle_view(page, 0);
-        transcript.clamp_offset(transcript.len().saturating_sub(page));
+        let top = transcript.len().saturating_sub(page);
+        transcript.clamp_offset(top);
         if transcript.offset() == 0 {
             break;
         }
