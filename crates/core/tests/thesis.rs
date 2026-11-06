@@ -1035,20 +1035,26 @@ fn instructions_retired() -> Option<u64> {
     None
 }
 
-/// 100 discovered extensions parsed and registered in under 10 ms: what a
-/// session's first turn and `/reload` do with `hundred_extensions`, timed
-/// in process. One load is the registry's build (every tool manifest and
+/// 100 discovered extensions parsed and registered in under 10 ms: one pass
+/// over `hundred_extensions`, timed in process. One load, in ask mode, where
+/// the approval checks run, is the registry's build (every tool manifest and
 /// skill read, hashed, parsed, validated and registered as the tools array),
 /// the prompt that indexes the skills, the hook discovery with its approval
-/// check, the permission rules and the prompt templates, in ask mode, where
-/// the approval checks run. Before timing anything the test checks that a
-/// load registers every extension and that every hook and rule is in force.
+/// check and the permission rules, the parts a session runs when it starts,
+/// and the template discovery the terminal UI runs when `/` opens its
+/// completion. `/reload` runs the first two. A session's first turn does more
+/// with its extensions, and this test times none of it: its refreeze check
+/// captures the tools and skills again, `hooks_fingerprint` reads and binds
+/// every hook again, and outside auto `approval_state` reads the ledger and
+/// binds the code of each external tool, one tool at a time. Before timing
+/// anything the test checks that a load registers every extension and that
+/// every hook and rule is in force.
 ///
 /// Method: 101 loads in a release build (5 in debug), each after a read of
-/// the floor, which lists every extension directory and reads every file a
-/// load parses; the median load, the median of each load's time over the
-/// floor read just before it, each part's median, and on macOS the
-/// instructions retired per load. Reading is the part of a load no loader
+/// the floor, which lists every extension directory and reads every
+/// extension file a load parses; the median load, the median of each load's
+/// time over the floor read just before it, each part's median, and on macOS
+/// the instructions retired per load. Reading is the part of a load no loader
 /// can skip, so the ratio is the harness's own work in units of the machine
 /// it runs on: 2.70 to 2.74 at full speed and under the utility QoS clamp,
 /// and 2.88 under the background clamp, on efficiency cores alone, where the
@@ -1065,9 +1071,10 @@ fn instructions_retired() -> Option<u64> {
 /// floor, about 55M instructions (registry 1.51 ms, prompt 0.29, hooks 0.45,
 /// permissions 0.40, templates 0.14). A release build asserts the 10 ms
 /// target on the median everywhere and, on macOS on Apple silicon, where the
-/// ratio was measured, a ratchet on it 10% over 2.88, rounded up to a tenth;
-/// elsewhere it prints the ratio. A debug build asserts a 20x sanity bound
-/// on the median.
+/// ratio was measured, a ratchet on it 10% over 2.88, its highest with no
+/// other work on the same cores, rounded up to a tenth; elsewhere it prints
+/// the ratio. A debug build asserts a 20x sanity bound on the median.
+/// The test holds the README's statements of the target and the ratchet.
 #[test]
 fn a_hundred_extensions_load_in_under_10_ms() {
     use open_max_core::config::ApprovalMode;
@@ -1188,7 +1195,13 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         );
     }
     let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
-    let claim = format!("at most {ratchet:.1} times the time to read their files ({RATIO_MEASURED} when it was set)");
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    for claim in [
+        format!("Parsing and registering 100 extensions takes under {} ms", TARGET.as_millis()),
+        format!(
+            "at most {ratchet:.1} times the time to read their files, 10% over the ratio of {RATIO_MEASURED} measured on efficiency cores alone, rounded up to a tenth"
+        ),
+    ] {
+        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
