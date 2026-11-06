@@ -201,7 +201,9 @@ fn push_marathon(app: &mut App, from: usize, blocks: usize) {
 ///
 /// Also asserted in every build: the conversation's part of an idle frame
 /// allocates nothing; the heap this thread holds after the fill, counted by
-/// the test allocator, is at most 600 bytes a row; and reading the whole
+/// the test allocator, is at most 600 bytes a row, the larger of the two
+/// builds' measurements below (571, in debug) plus a twentieth, rounded up
+/// to 10 bytes; and reading the whole
 /// history once, a page at a time from the top, settled as a frame settles
 /// it but not painted, which wraps every block, adds at most 5 MB, about a
 /// wrap budget's worth, where every block keeping its wrap held a second
