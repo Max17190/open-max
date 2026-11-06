@@ -1621,13 +1621,10 @@ impl Transcript {
 
     /// Index of the nearest user block whose start is above `view_start_line`.
     fn sticky_user_block_idx(&mut self, view_start_line: usize) -> Option<usize> {
-        if view_start_line == 0 || self.blocks.is_empty() {
-            return None;
-        }
         let bi = self.locate(view_start_line).map(|(bi, _)| bi).unwrap_or(0);
         // The nearest prompt at or above block `bi` starts above the view
         // unless it is `bi` itself, starting on the view's top row; the one
-        // before it then does.
+        // before it then does. No block starts above row 0.
         let above = &self.users[..self.users.partition_point(|&u| u <= bi)];
         above.iter().rev().take(2).copied().find(|&u| self.index.start(u) < view_start_line)
     }
@@ -3094,6 +3091,21 @@ mod tests {
         t.selected = Some(2);
         assert!(t.toggle_fold_selected());
         assert_eq!(t.export_text(), exported);
+    }
+
+    /// An open tool card shows the first 80 lines of output and counts the
+    /// rest on a line after them; exactly 80 lines leave nothing to count.
+    #[test]
+    fn an_open_tool_card_shows_80_output_lines_and_counts_the_rest() {
+        for (lines, tail) in [(80, "  line 80"), (81, "  … 1 more lines"), (95, "  … 15 more lines")] {
+            let output: String = (1..=lines).map(|n| format!("line {n}\n")).collect();
+            let mut t = Transcript::new();
+            t.set_width(80);
+            t.push_tool(vec![Line::from("✗ bash cargo test")], output, false);
+            let shown = text(&t.lines());
+            assert_eq!(shown.len(), 1 + 80 + usize::from(lines > 80) + 1, "{lines} lines of output");
+            assert_eq!(shown[shown.len() - 2], tail, "{lines} lines of output");
+        }
     }
 
     #[test]
