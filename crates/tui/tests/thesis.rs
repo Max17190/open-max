@@ -2504,8 +2504,9 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
 /// Method: the command an unattended runner starts, `OPENMAX_HUMAN_ATTEST=1
 /// openmax --trust-project --base-url URL --model m --context-tokens N -p
 /// TASK`, on a fresh HOME and a project that ships `notes.txt`, in a session
-/// of its own (setsid, so no controlling terminal) with stdin /dev/null,
-/// against a loopback endpoint (`scripted_endpoint`) that answers the run's
+/// of its own (setsid, so no controlling terminal) with stdin /dev/null and
+/// none of the environment's proxy variables, so the requests go straight
+/// to a loopback endpoint (`scripted_endpoint`) that answers the run's
 /// three requests in turn. The first gets a `write_file` of
 /// `.openmax/tools/line_count.toml`, an awk tool that counts the lines of
 /// notes.txt and prints the attestation variable as its environment holds it.
@@ -2564,6 +2565,12 @@ mutating = false
             .args(["--trust-project", "--base-url", &endpoint.base_url, "--model", "m", "--context-tokens", "32768"])
             .args(["-p", "count the lines of notes.txt with a project tool"])
             .stdin(Stdio::null());
+        // The binary's HTTP client reads the proxy variables (only the core's
+        // own test build ignores them), and a proxy with no exception for
+        // loopback would take the requests meant for the endpoint.
+        for proxy in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+            cmd.env_remove(proxy);
+        }
         if attested {
             cmd.env("OPENMAX_HUMAN_ATTEST", "1");
         }
