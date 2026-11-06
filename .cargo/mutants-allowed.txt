@@ -34,3 +34,5 @@ crates/core/src/tools.rs: replace + with - in grep_tool # hangs: a match on a fi
 crates/core/src/tools.rs: replace - with + in kept_tail # hangs: a start of len + max_bytes lies past the end of the text, where no index is a character boundary.
 crates/core/src/tools.rs: replace += with *= in kept_tail # hangs: start *= 1 never moves off a byte inside a character.
 crates/core/src/tools.rs: replace -= with /= in kept_head # hangs: end /= 1 never moves off a byte inside a character.
+crates/core/src/execution.rs: replace configure_process_group with () # hangs: a command left in the harness's group gets none of the group signals that stop it, so the one reading the pseudo-terminal a_command_that_prompts_on_the_terminal_fails_at_once gives it waits forever, after the tests that stop a command's group have failed.
+crates/core/src/execution.rs: replace | with ^ in sleep_on_time # equivalent: EV_ADD and EV_ONESHOT, like NOTE_USECONDS and NOTE_CRITICAL, are disjoint bits, so OR and XOR give the same flags.

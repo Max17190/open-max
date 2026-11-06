@@ -3975,6 +3975,47 @@ fn a_sub_agent_whose_stop_outlasts_its_deadline_keeps_its_worktree() {
     assert_eq!(worktrees, 2, "{stderr}");
 }
 
+/// A flag openmax does not take is a usage error, exit 2 naming it, and
+/// never a quiet exit: a parse error is also where `main` hands a run's
+/// watcher its command line, so a line that only starts like one, without
+/// exactly `--lifeline <record> <start>`, is a usage error too.
+#[test]
+fn an_unknown_flag_is_a_usage_error() {
+    let (project, home) = fresh_dirs("unknown-flag");
+    let record = "/x/.openmax/run/42.groups";
+    for args in [&["--bogus"][..], &["--lifeline", record], &["--lifeline", record, "7", "8"]] {
+        let out = cmd(&project, &home).args(args).stdin(Stdio::null()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.starts_with(&format!("openmax: invalid option '{}'", args[0])), "{args:?}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// SIGKILL the watcher of the run whose record of its tool groups is
+/// `record`, and say whether there was one: the process whose command line
+/// names it (`openmax --lifeline <record> <start>`), which the record's
+/// first write starts, waited for up to 10 seconds. A run killed after it
+/// leaves its tools to the next launch, the backstop for a watcher that is
+/// gone too.
+fn kill_watcher(record: &Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let out = Command::new("ps").args(["-A", "-ww", "-o", "pid=", "-o", "args="]).output().expect("ps runs");
+        let (listing, needle) = (String::from_utf8_lossy(&out.stdout), record.to_string_lossy());
+        let watcher: Option<i32> =
+            listing.lines().filter(|line| line.contains(&*needle)).find_map(|line| line.split_whitespace().next()?.parse().ok());
+        if let Some(watcher) = watcher {
+            unsafe { libc::kill(watcher, libc::SIGKILL) };
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// A run whose model answered with one bash call that leaves a tree behind,
 /// the shape of a build or a dev server the agent started: the shell (which
 /// then becomes a long foreground command) and a background child each
@@ -4387,19 +4428,20 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
 }
 
 /// SIGKILL, or a crash that runs no handler, gives openmax no chance to stop
-/// its tools, and the tool tree runs on under pid 1. The run keeps a record
-/// of its live tool groups in `~/.openmax/run`, and the next launch (here
-/// `--check`) stops each group a dead run recorded and removes the record.
+/// its tools, and once its watcher is gone too, the tool tree runs on under
+/// pid 1. The run keeps a record of its live tool groups in `~/.openmax/run`,
+/// and the next launch (here `--check`) stops each group a dead run recorded
+/// and removes the record.
 #[test]
 fn the_next_launch_stops_the_tool_tree_a_killed_run_left_behind() {
     launch_after_a_kill("sigkill-reap", None, &["--check"]);
 }
 
-/// A print run and a stdio session stop the tree as well, and before they
-/// start a session, so before any tool of their own: each here is refused
-/// for a settings flag (`--api-key` beside the provider settings.json
-/// selects), which ends it before any session, and has stopped the tree all
-/// the same.
+/// A print run, a stdio session and a sub-agent stop the tree as well, and
+/// before they start a session, so before any tool of their own: each here
+/// is refused for a settings flag (`--api-key` beside the provider
+/// settings.json selects), which ends it before any session, and has stopped
+/// the tree all the same.
 #[test]
 fn a_print_run_stops_the_tool_tree_a_killed_run_left_behind_before_its_session() {
     let provider = Some(r#"{"provider":"p","model":"m"}"#);
@@ -4418,14 +4460,24 @@ fn a_stdio_session_stops_the_tool_tree_a_killed_run_left_behind_before_it_starts
     assert!(stderr.contains("--api-key is the key for settings.json's base_url"), "{stderr}");
 }
 
-/// Kill a print run outright once its record lists the group of its `bash`
-/// call, whose tree ignores SIGTERM, so only the SIGKILL after the grace
-/// stops it. Then launch openmax with `next`, on the same home and project
-/// and with `settings` as its settings.json if given, before the killed
-/// run's parent, this test, has waited for it: until then the killed run
-/// holds its pid and its start time, as an exited process. Asserts that the
-/// launch stopped the tree and removed the record and the run directory,
-/// and returns the launch's output.
+#[test]
+fn a_sub_agent_stops_the_tool_tree_a_killed_run_left_behind_before_it_starts() {
+    let provider = Some(r#"{"provider":"p","model":"m"}"#);
+    let args = ["--api-key", "sk-k", "--subagent", "go", "--worktree"];
+    let sub_agent = launch_after_a_kill("sigkill-reap-subagent", provider, &args);
+    let stderr = String::from_utf8_lossy(&sub_agent.stderr);
+    assert_eq!(sub_agent.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--api-key is the key for settings.json's base_url"), "{stderr}");
+}
+
+/// Kill a print run outright, its watcher first, once its record lists the
+/// group of its `bash` call, whose tree ignores SIGTERM, so only the SIGKILL
+/// after the grace stops it. Then launch openmax with `next`, on the same
+/// home and project and with `settings` as its settings.json if given,
+/// before the killed run's parent, this test, has waited for it: until then
+/// the killed run holds its pid and its start time, as an exited process.
+/// Asserts that the launch stopped the tree and removed the record and the
+/// run directory, and returns the launch's output.
 fn launch_after_a_kill(tag: &str, settings: Option<&str>, next: &[&str]) -> std::process::Output {
     let ToolTree { mut child, _stdin, pids, base } =
         start_tool_tree(tag, &["--json", "-p", "start the tree"], "trap '' TERM; ");
@@ -4439,6 +4491,7 @@ fn launch_after_a_kill(tag: &str, settings: Option<&str>, next: &[&str]) -> std:
     {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    let watched = kill_watcher(&record);
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
     // Returns once the run has exited, and leaves it unwaited for.
     let (mut info, options) = (unsafe { std::mem::zeroed::<libc::siginfo_t>() }, libc::WEXITED | libc::WNOWAIT);
@@ -4467,6 +4520,7 @@ fn launch_after_a_kill(tag: &str, settings: Option<&str>, next: &[&str]) -> std:
     let _ = std::fs::remove_dir_all(&base);
     let stderr = String::from_utf8_lossy(&launch.stderr);
     assert!(exited.is_ok(), "waitid: {exited:?}");
+    assert!(watched, "the run's first tool started no watcher of {}", record.display());
     assert!(survived_the_kill, "the tool tree did not outlive SIGKILL, so this proves nothing: {pids:?}");
     assert!(recorded, "the killed run left no record of its tool groups at {}", record.display());
     assert!(survivors.is_empty(), "the next launch left the tool tree running: {survivors:?}\n{stderr}");
@@ -4502,10 +4556,11 @@ fn the_next_launch_never_stops_a_process_that_took_a_recorded_pid() {
 }
 
 /// An openmax that a left-behind tool's script starts runs in that tool's
-/// group, which the killed run's record lists. A launch never signals the
-/// group it runs in, which would end it as it starts: it runs to its end and
-/// leaves the tool's group running with its record in place, so the next
-/// launch outside the group stops it and removes the record.
+/// group, which the record of the killed run, whose watcher was killed
+/// first, lists. A launch never signals the group it runs in, which would
+/// end it as it starts: it runs to its end and leaves the tool's group
+/// running with its record in place, so the next launch outside the group
+/// stops it and removes the record.
 #[test]
 fn a_launch_from_a_left_behind_tool_does_not_stop_its_own_group() {
     let preamble = format!(
@@ -4523,6 +4578,7 @@ fn a_launch_from_a_left_behind_tool_does_not_stop_its_own_group() {
     {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    let watched = kill_watcher(&record);
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
     let _ = child.wait();
     let recorded = record.exists();
@@ -4550,6 +4606,7 @@ fn a_launch_from_a_left_behind_tool_does_not_stop_its_own_group() {
     let record_left = record.exists();
     let _ = std::fs::remove_dir_all(&base);
     let stderr = String::from_utf8_lossy(&outside.stderr);
+    assert!(watched, "the run's first tool started no watcher of {}", record.display());
     assert!(recorded, "the killed run left no record of its tool groups at {}", record.display());
     assert_eq!(status.trim(), outside.status.code().unwrap().to_string(), "the launch inside the tool's group");
     assert!(tree_alive, "a launch stopped the group it runs in: {pids:?}");
@@ -4562,7 +4619,7 @@ fn a_launch_from_a_left_behind_tool_does_not_stop_its_own_group() {
 /// pipe, so the first signal never reaches the stopped turn: the run stays
 /// up. The second must still end it: waiting for stdout on the way out
 /// would hold the exit until something drained the pipe, and only SIGKILL,
-/// which stops no tool, would end it.
+/// under which the run stops none of its tools itself, would end it.
 #[test]
 fn a_second_signal_exits_while_output_is_stuck_on_a_full_pipe() {
     use std::os::fd::AsRawFd;

@@ -225,12 +225,30 @@ jobs:
       # request. Each command runs even when the one before it failed, so one
       # failing test does not hide the others' measurements.
       - name: Thesis gates
+        id: gates
         timeout-minutes: 5
         run: |
           skip=; for test in ${{ matrix.reported }}; do skip="$skip --skip $test"; done
           cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1
           cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1
           exit ${failed:-0}
+
+      # zero_orphans_after_kill_9 lists when the run it killed was collected,
+      # when the run's watcher removed its record, just after its own SIGKILL,
+      # and each process of the tool tree and the watcher with when it was
+      # gone after the SIGKILL: the 100 ms gate's evidence, kept on each
+      # runner, after a failing gate too. A missing listing fails this step
+      # only when the gates passed. A re-run of the job keeps the artifacts its
+      # earlier attempt uploaded, and the upload refuses a name the run already
+      # holds unless it may overwrite it, so the re-run replaces it.
+      - name: Keep the orphan listing
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zero-orphans-after-kill-9-${{ matrix.os }}
+          path: target/tmp/zero-orphans-after-kill-9.txt
+          if-no-files-found: ${{ steps.gates.outcome == 'success' && 'error' || 'warn' }}
+          overwrite: true
 
   # Capability is meant to land in files, not in the core: the target is that
   # at most 20% of the latest 50 commits of main change crates/core/.
