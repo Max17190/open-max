@@ -3751,16 +3751,24 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
     );
 }
 
-/// A run's watcher ends with the run. A print run whose `bash` call writes
-/// its shell's pid and waits for a file to appear: while the call waits, one
-/// process names the run's record in its command line, the watcher the call
-/// started, whose command line `ps` lists as `openmax --lifeline <record>
-/// <start>` on Linux too, where it runs `/proc/self/exe`; and once the test
-/// has made the file and the run has answered and exited 0, that process is
-/// gone within 500 ms.
+/// A run's watcher ends with the run, at once. A print run whose `bash` call
+/// writes its shell's pid and waits for a file to appear: while the call
+/// waits, one process names the run's record in its command line, the
+/// watcher the call started, whose command line `ps` lists as `openmax
+/// --lifeline <record> <start>` on Linux too, where it runs
+/// `/proc/self/exe`; and once the test has made the file and the run has
+/// answered, exited 0 and been collected, that process reads as gone,
+/// exited and collected, polled every millisecond from then, within
+/// `LEFT_BEHIND_GRACE` in a release build. So it waited out neither a
+/// stop's grace nor its wait for an owner still exiting, which is longer
+/// and, measured from the run's collection, could still read just under its
+/// own length. A debug build asserts 20 times the bound, as the whole suite
+/// runs beside it; each prints the time. README.md states the bound, held
+/// here.
 #[cfg(unix)]
 #[test]
 fn a_runs_watcher_ends_with_the_run() {
+    use open_max_core::execution::LEFT_BEHIND_GRACE;
     let (mut run, base, record) = run_one_bash_call("watcher", true, false, |base| {
         let (shell, go) = (base.join("shell"), base.join("go"));
         format!("echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.01; done", shell.display(), go.display())
@@ -3790,25 +3798,32 @@ fn a_runs_watcher_ends_with_the_run() {
     });
     std::fs::write(base.join("go"), "").unwrap();
     let out = run.wait_with_output().unwrap();
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while watchers.iter().any(|&pid| alive(pid)) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let left: Vec<i32> = watchers.iter().copied().filter(|&pid| alive(pid)).collect();
-    for &pid in &left {
+    let gone = gone_after(&watchers, Instant::now(), Duration::from_secs(5));
+    for (&pid, _) in watchers.iter().zip(&gone).filter(|(_, time)| time.is_none()) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     if alive(shell) {
         unsafe { libc::kill(-shell, libc::SIGKILL) };
     }
     let _ = std::fs::remove_dir_all(&base);
+    let (bound, build) =
+        if cfg!(debug_assertions) { (LEFT_BEHIND_GRACE * 20, "debug") } else { (LEFT_BEHIND_GRACE, "release") };
+    let ms = |time: Duration| format!("{:.1} ms", time.as_secs_f64() * 1e3);
+    for (&pid, time) in watchers.iter().zip(&gone) {
+        let when = time.map_or("running 5 s after it".into(), |time| format!("gone {} after it", ms(time)));
+        let os = std::env::consts::OS;
+        println!("a_runs_watcher_ends_with_the_run on {os}, {build} build: watcher {pid} of a run that exited 0, {when}; bound {}", ms(bound));
+    }
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("first answer"), "{stderr}");
     assert_eq!(watchers.len(), 1, "the run's bash call had {} watchers, not one: {watchers:?}", watchers.len());
     let line = format!("openmax --lifeline {} ", record.display());
     assert!(named.as_ref().is_some_and(|named| named.starts_with(&line)), "the watcher's command line is {named:?}, not {line}<start>");
-    assert!(left.is_empty(), "the watcher outlived its run, which exited 0, by 500 ms: {left:?}");
+    assert!(gone.iter().all(|time| time.is_some_and(|time| time < bound)), "the watcher outlived its run, which exited 0, by {} or more: {gone:?}", ms(bound));
+    let claim = format!("which it outlives by less than {} ms in a release build", LEFT_BEHIND_GRACE.as_millis());
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
 }
 
 /// One command from a fresh install to a first real answer in under 30
