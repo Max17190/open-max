@@ -116,6 +116,21 @@ async fn capture(core: &Core, project_root: &Path) -> Result<ExtensionSnapshot, 
     tokio::task::spawn_blocking(move || crate::registry::capture_extensions(&dd, &root)).await
 }
 
+/// The generation an automatic refreeze installs: the captured one unless
+/// `sent` froze it, activated off the runtime thread like the capture, as
+/// activation reads the memory store. A refreeze swaps the generation, never
+/// the prefix: the new registry keeps the tools array and the record of the
+/// prompt the session sends, and the note is the difference from them.
+async fn next_generation(snapshot: ExtensionSnapshot, sent: &Registry, project_root: &Path) -> Option<(Registry, Option<Arc<str>>, Vec<(String, usize)>)> {
+    if snapshot.fingerprint() == sent.ext_fingerprint {
+        return None;
+    }
+    let mut registry = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await.ok()?;
+    registry.keep_prompt_of(sent);
+    let (note, rows) = trailing_note(project_root, &registry);
+    Some((registry, note.map(Arc::from), rows))
+}
+
 /// One receipt body for both refreeze sites: what changed, what did NOT
 /// load (with the parse reason, so a broken write is never mistaken for a
 /// live capability), and which tool names became callable.
@@ -435,22 +450,14 @@ pub(crate) async fn refreeze_if_extensions_changed(
     project_root: &Path,
 ) -> Option<String> {
     let snapshot = capture(core, project_root).await.ok()?;
-    let disk_fp = snapshot.fingerprint();
     let sent = {
         let sessions_map = core.sessions.lock().await;
         sessions_map
             .get(session_id)
-            .filter(|d| !d.messages.is_empty() && d.registry.ext_fingerprint != disk_fp)
+            .filter(|d| !d.messages.is_empty())
             .map(|d| d.registry.clone())
     }?;
-    let Ok(mut registry) = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await else {
-        return None;
-    };
-    // A refreeze swaps the generation, never the prefix: the new registry
-    // keeps the tools array and the record of the prompt the session sends,
-    // and the note is the difference from them.
-    registry.keep_prompt_of(&sent);
-    let (note, rows) = trailing_note(project_root, &registry);
+    let (registry, note, rows) = next_generation(snapshot, &sent, project_root).await?;
     let mode = core.approval_mode(project_root);
     let (receipt, refrozen) = {
         let mut sessions_map = core.sessions.lock().await;
@@ -458,10 +465,10 @@ pub(crate) async fn refreeze_if_extensions_changed(
             // Re-check under the lock: this turn owns `running`, so nothing
             // else mutates the session, but stay defensive about empty
             // (taken) state.
-            Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != disk_fp => {
+            Some(data) if !data.messages.is_empty() && data.registry.ext_fingerprint != registry.ext_fingerprint => {
                 let receipts = refreeze_receipts(core, project_root, &data.registry, &registry, mode);
                 let breakdown = data.prompt_breakdown.with_note(rows);
-                apply_freeze(core, session_id, data, Arc::new(registry), None, note.map(Arc::from), breakdown);
+                apply_freeze(core, session_id, data, Arc::new(registry), None, note, breakdown);
                 receipts
             }
             _ => return None,
@@ -498,17 +505,7 @@ pub(crate) async fn refreeze_between_iterations(
     messages: &mut [ChatMessage],
 ) -> bool {
     let Ok(snapshot) = capture(core, project_root).await else { return false };
-    if snapshot.fingerprint() == registry.ext_fingerprint {
-        return false;
-    }
-    let Ok(mut new_registry) =
-        tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot)).await
-    else {
-        return false;
-    };
-    new_registry.keep_prompt_of(registry);
-    let (new_note, rows) = trailing_note(project_root, &new_registry);
-    let new_note: Option<Arc<str>> = new_note.map(Arc::from);
+    let Some((new_registry, new_note, rows)) = next_generation(snapshot, registry, project_root).await else { return false };
     let mode = core.approval_mode(project_root);
     let (receipt, refrozen) = refreeze_receipts(core, project_root, registry, &new_registry, mode);
     let new_registry = Arc::new(new_registry);
