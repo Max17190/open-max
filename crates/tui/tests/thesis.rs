@@ -2510,8 +2510,9 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
 /// `.openmax/tools/line_count.toml`, an awk tool that counts the lines of
 /// notes.txt and prints the attestation variable as its environment holds it.
 /// The second must carry, on that write's result, the refreeze receipt naming
-/// `line_count` callable from the next step, and gets a call of `line_count`
-/// by name. The third must carry that call's output, and gets the answer. The
+/// `line_count` callable from the next step and the trailing note's line
+/// giving its description and parameters, and gets a call of `line_count` by
+/// name. The third must carry that call's output, and gets the answer. The
 /// run must exit 0 with the answer on stdout, having made exactly those
 /// requests, and its session's event log
 /// (`~/.openmax/sessions/<id>.events.jsonl`) must hold, in this order, the
@@ -2522,11 +2523,12 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
 /// in its `env`, so only the harness's strip keeps the variable from the
 /// tool, whose output must show it empty. First, the same command without the
 /// variable must exit 3 before any request, leaving HOME empty: there, the
-/// variable is the one human act, and nothing else grants the run. A
-/// functional gate, asserted in every build.
+/// variable is the one human act, and nothing else grants the run. Each run
+/// that is still going 30 seconds after it started is ended and fails the
+/// test. A functional gate, asserted in every build.
 #[test]
 fn an_unattended_run_writes_a_tool_and_calls_it_on_the_next_step() {
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::Stdio;
     let tool = ".openmax/tools/line_count.toml";
     let manifest = r#"name = "line_count"
@@ -2565,17 +2567,26 @@ mutating = false
         if attested {
             cmd.env("OPENMAX_HUMAN_ATTEST", "1");
         }
-        // SAFETY: setsid is async-signal-safe, and the closure touches
-        // nothing else between fork and exec.
+        // The alarm outlives the exec, and no process openmax forks inherits
+        // it, so the kernel ends openmax, and only openmax, with SIGALRM if it
+        // is still running 30 seconds after it started, where a run here
+        // takes well under one: a hang on the unattended path fails this test
+        // instead of holding the job until its own time limit.
+        // SAFETY: alarm and setsid are async-signal-safe, and the closure
+        // touches nothing else between fork and exec.
         unsafe {
-            cmd.pre_exec(|| match libc::setsid() {
-                -1 => Err(std::io::Error::last_os_error()),
-                _ => Ok(()),
+            cmd.pre_exec(|| {
+                libc::alarm(30);
+                match libc::setsid() {
+                    -1 => Err(std::io::Error::last_os_error()),
+                    _ => Ok(()),
+                }
             });
         }
         let out = cmd.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let printed = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert_ne!(out.status.signal(), Some(libc::SIGALRM), "the run was still going after 30 seconds: {printed}");
         (out.status.code(), stdout, printed)
     };
 
@@ -2591,10 +2602,19 @@ mutating = false
     assert!(stdout.contains("notes.txt has 3 lines"), "no answer on stdout: {printed}");
     assert_eq!(served.len(), 3, "the run made {} requests, not three: {served:?}", served.len());
     assert_eq!(std::fs::read_to_string(project.join(tool)).unwrap(), manifest, "the tool file is not what was written");
-    let receipt = tool_result(&served[1], "call_write");
+    // The write's result carries the receipt, then the trailing note's line
+    // for the tool: the tools array stays as the session froze it, so that
+    // line is where the model reads the new tool's description and
+    // parameters.
+    let write_result = tool_result(&served[1], "call_write");
     assert!(
-        receipt.contains("[extension refreeze: ") && receipt.contains("New tools callable from your next step: line_count."),
-        "the request after the write carries no receipt naming the tool callable: {receipt}"
+        write_result.contains("[extension refreeze: ")
+            && write_result.contains("New tools callable from your next step: line_count."),
+        "the request after the write carries no receipt naming the tool callable: {write_result}"
+    );
+    assert!(
+        write_result.contains("\n- line_count: Count the lines of notes.txt {"),
+        "the request after the write carries no note line with the tool's description and parameters: {write_result}"
     );
     let output = tool_result(&served[2], "call_tool");
     assert!(
