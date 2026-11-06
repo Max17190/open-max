@@ -482,11 +482,6 @@ pub fn providers_status(data_dir: &Path) -> ProvidersStatus {
     }
 }
 
-/// List provider names sorted for display.
-pub fn list_provider_names(data_dir: &Path) -> Vec<String> {
-    load_providers(data_dir).into_keys().collect()
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
     /// No endpoint configured anywhere; there is no default to fall back to.

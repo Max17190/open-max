@@ -843,7 +843,8 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
 /// hold a reported one. Every command runs in release, one test at a time,
 /// printing what it measured, under a timeout, and the gate's even when the
 /// one before it failed, as does each test target after one that failed.
-/// Nothing in the job skips a step (no `if:`), and nothing turns on debug
+/// Nothing in the job skips a step (no `if:` but `if: ${{ !cancelled() }}`,
+/// which runs a step after a failed one too), and nothing turns on debug
 /// assertions for its builds, which would hold each timing test to its 20x
 /// debug bound: not the release profile in Cargo.toml, nor the workflow's
 /// or the job's environment.
@@ -862,7 +863,8 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
             None => steps.last_mut().unwrap().push(line),
         }
     }
-    let skipped: Vec<&&str> = steps.iter().flatten().filter(|line| line.starts_with("if:")).collect();
+    let skipped: Vec<&&str> =
+        steps.iter().flatten().filter(|line| line.starts_with("if:") && **line != "if: ${{ !cancelled() }}").collect();
     assert!(skipped.is_empty(), "the thesis job, or a step of it, can be skipped: {skipped:?}");
     // No step of ci.yml may fail without failing the gate:
     // pull_request_workflows_skip_no_step_and_let_none_fail holds that.
@@ -4841,60 +4843,258 @@ fn sse_answer(text: &str) -> String {
     )
 }
 
-/// Zero orphans after kill -9: once openmax starts again, no process of a
-/// tool tree that an openmax killed outright left running is still running.
-///
-/// Method: a print run (`-p`) on a fresh HOME and project, whose endpoint
-/// asks for one `bash` call. Its shell ignores SIGTERM, writes its pid,
-/// starts a subshell in the background, writes that pid and waits; the
-/// subshell starts a sleeper, the shell's grandchild, writes its pid and
-/// waits. Every process of the tree inherits the ignored SIGTERM, so only a
-/// SIGKILL ends it. Once the three pids are written and the run's record of
-/// its tool groups (`~/.openmax/run/<pid>.groups`) lists the shell's, the
-/// test sends openmax SIGKILL and waits for it, as the shell that started it
-/// would. (b) With nothing started since, it counts the processes of the
-/// tree still running 500 ms after the kill, and prints that count. (a) It
-/// then runs `openmax --check` on the same HOME and counts the processes of
-/// the tree still running once that has exited, waiting up to 500 ms for
-/// the process that adopted them to collect the ones it ended, since
-/// `kill(pid, 0)` finds a process until then. The gate is (a), zero, a
-/// count asserted in every build; (b) only reports.
+/// Whether a process holds `pid`: a zombie still does, until the process
+/// that adopted it collects it.
 #[cfg(unix)]
-#[test]
-fn zero_orphans_after_kill_9() {
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// A run's watchers, `openmax --lifeline <record> <start>`: the processes
+/// whose command line names its `record`, as `ps` lists them at full width,
+/// waited for up to 10 seconds, as the run starts its watcher once the
+/// record is first written.
+#[cfg(unix)]
+fn watchers_of(record: &Path) -> Vec<i32> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = Command::new("ps").args(["-A", "-ww", "-o", "pid=", "-o", "args="]).output().expect("ps runs");
+        assert!(out.status.success(), "ps failed: {}", String::from_utf8_lossy(&out.stderr));
+        let (listing, needle) = (String::from_utf8_lossy(&out.stdout), record.to_string_lossy());
+        let found: Vec<i32> =
+            listing.lines().filter(|line| line.contains(&*needle)).filter_map(|line| line.split_whitespace().next()?.parse().ok()).collect();
+        if !found.is_empty() || Instant::now() >= deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A print run (`-p`) on a fresh project whose endpoint asks for one `bash`
+/// call running `script`, then answers; with the path of the run's record
+/// of its tool groups. The run leads a process group of its own, as a job a
+/// shell starts does. With `home`, HOME is a fresh directory, which holds
+/// the record (`~/.openmax/run/<pid>.groups`). Without it, the run has no
+/// HOME, so its data directory is the relative `.openmax`, which names one
+/// in the project, the directory the run runs in; the record's path then
+/// names the project as the run reads its working directory, with every
+/// symbolic link resolved (macOS's temporary directory is under one), as
+/// the run's watcher is given it. With `removed`, the run starts from a hard
+/// link to the binary under the target directory's `tmp`, removed as soon as
+/// the spawn returns, as an upgrade that replaced the file leaves a run:
+/// before its first tool, which waits on its start and its endpoint.
+#[cfg(unix)]
+fn run_one_bash_call(
+    tag: &str,
+    home: bool,
+    removed: bool,
+    script: impl Fn(&Path) -> String,
+) -> (std::process::Child, PathBuf, PathBuf) {
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    let (project, home) = fresh_install("orphans", 0);
-    let base = project.parent().unwrap().to_path_buf();
-    let listed = base.join("pids");
-    let script = format!(
-        "trap '' TERM; echo $$ >> '{p}'; (sleep 6845 & echo $! >> '{p}'; wait) & echo $! >> '{p}'; wait",
-        p = listed.display()
-    );
-    let arguments = serde_json::json!({ "command": script }).to_string();
+    let (project, home_dir) = fresh_install(tag, 0);
+    let arguments = serde_json::json!({ "command": script(project.parent().unwrap()) }).to_string();
     let call = serde_json::json!({"choices": [{"finish_reason": null, "delta": {"tool_calls": [
         {"index": 0, "id": "call-1", "type": "function", "function": {"name": "bash", "arguments": arguments}},
     ]}}]});
     let end = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
     let base_url = spawn_server(vec![format!("data: {call}\n\ndata: {end}\n\ndata: [DONE]\n\n")]);
-    let openmax = |args: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmax"));
-        cmd.current_dir(&project).env("HOME", &home).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
-        // Test automation is a human act with no terminal; the grant needs
-        // it said.
-        cmd.env("OPENMAX_HUMAN_ATTEST", "1").args(args).stdin(Stdio::null());
-        cmd
+    let link = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("openmax-{tag}-{}", std::process::id()));
+    if removed {
+        let _ = std::fs::remove_file(&link);
+        std::fs::hard_link(env!("CARGO_BIN_EXE_openmax"), &link).unwrap();
+    }
+    let mut run = Command::new(if removed { link.as_path() } else { Path::new(env!("CARGO_BIN_EXE_openmax")) });
+    run.process_group(0).current_dir(&project).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
+    let data = if home {
+        run.env("HOME", &home_dir);
+        home_dir.join(".openmax")
+    } else {
+        run.env_remove("HOME");
+        std::fs::canonicalize(&project).unwrap().join(".openmax")
     };
-    let mut run = openmax(&["--trust-project", "--base-url", &base_url, "--model", "m", "--context-tokens", "32768"])
-        .args(["-p", "start the tree"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let record = home.join(".openmax").join("run").join(format!("{}.groups", run.id()));
-    let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) == 0 };
+    // Test automation is a human act with no terminal; the grant needs it
+    // said.
+    run.env("OPENMAX_HUMAN_ATTEST", "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    run.args(["--trust-project", "--base-url", &base_url, "--model", "m", "--context-tokens", "32768", "-p", tag]);
+    let run = run.spawn().unwrap();
+    if removed {
+        std::fs::remove_file(&link).unwrap();
+    }
+    let record = data.join("run").join(format!("{}.groups", run.id()));
+    (run, project.parent().unwrap().to_path_buf(), record)
+}
+
+/// Where `zero_orphans_after_kill_9` lists each process it watched, under
+/// the target directory's `tmp`, which the CI thesis job keeps as an
+/// artifact on each runner.
+const ORPHANS_LISTING: &str = "zero-orphans-after-kill-9.txt";
+
+/// The CI thesis job, which asserts the 100 ms bound in a release build,
+/// keeps `ORPHANS_LISTING` on each of its runners: a step after its gates,
+/// which runs after a failing gate too and on every runner of the matrix,
+/// uploads it from `target/tmp`, where cargo's `CARGO_TARGET_TMPDIR` points
+/// in that job, under a name per runner, fails when the file is missing once
+/// the gates have passed, and replaces it on a re-run of the job. After a
+/// failing gate it only warns of a missing file, as a release build that
+/// failed leaves none.
+#[test]
+fn ci_keeps_the_orphan_listing_on_each_runner() {
+    let job = ci_job("thesis");
+    let gate = "cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1";
+    let gates = job.iter().position(|line| line.trim() == gate).expect("the thesis job runs no thesis gates");
+    let path = format!("path: target/tmp/{ORPHANS_LISTING}");
+    let kept = job.iter().position(|line| line.trim() == path).expect("the thesis job keeps no orphan listing");
+    assert!(gates < kept, "the thesis job keeps the listing before its gates write it");
+    assert!(step_keys(&job, gates).contains(&"id: gates"), "the gates step has no `id: gates` for the listing's step to read");
+    let keys = step_keys(&job, kept);
+    let wanted = [
+        "if: ${{ !cancelled() }}",
+        "name: zero-orphans-after-kill-9-${{ matrix.os }}",
+        "if-no-files-found: ${{ steps.gates.outcome == 'success' && 'error' || 'warn' }}",
+        "overwrite: true",
+    ];
+    for key in wanted {
+        assert!(keys.contains(&key), "the step that keeps the orphan listing lacks `{key}`: {keys:?}");
+    }
+    assert!(keys.iter().any(|key| key.starts_with("uses: actions/upload-artifact@")), "{keys:?}");
+}
+
+/// The target: every process of a tool tree a killed run left, and the
+/// run's watcher, gone within 100 ms of the SIGKILL.
+const ORPHANS_GONE_WITHIN: Duration = Duration::from_millis(100);
+
+/// How `assert_no_orphans_after_kill_9` starts and kills its run.
+#[cfg(unix)]
+struct Kill9 {
+    /// HOME holds the run's data directory; without it, that is the relative
+    /// `.openmax` (`run_one_bash_call`).
+    home: bool,
+    /// SIGKILL goes to the run's whole process group, as a shell's
+    /// `kill -9 %1` sends it to a job, not to its pid alone: a watcher in
+    /// that group would die with the run.
+    group: bool,
+    /// The run starts from a binary removed before its first tool
+    /// (`run_one_bash_call`).
+    removed: bool,
+}
+
+/// Zero orphans after kill -9: within 100 ms of the SIGKILL that kills an
+/// openmax outright, with no launch since, no process of a tool tree it
+/// left is running, and neither is the watcher its first tool started. The
+/// signal goes to the run's whole process group, as a shell sends it to a
+/// job, and the watcher, which leads a session of its own, is out of its
+/// reach. The method is `assert_no_orphans_after_kill_9`'s, on a run whose
+/// HOME holds its data directory; this run's listing is the one CI keeps.
+/// README.md states the grace and the bound, held here.
+#[cfg(unix)]
+#[test]
+fn zero_orphans_after_kill_9() {
+    let kill = Kill9 { home: true, group: true, removed: false };
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", kill, Some(ORPHANS_LISTING));
+    let (grace, bound) = (open_max_core::execution::LEFT_BEHIND_GRACE.as_millis(), ORPHANS_GONE_WITHIN.as_millis());
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    for claim in [
+        format!("SIGKILL if it is still there {grace} ms later"),
+        format!("within {bound} ms of the signal, and none of the three before the {grace} ms grace"),
+    ] {
+        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    }
+}
+
+/// The same for `kill -9 <pid>` of a run with no HOME, whose data directory
+/// is therefore the relative `.openmax`, in the directory it runs in, while
+/// its watcher runs in `/`: the watcher must be given the record's absolute
+/// path to find it.
+#[cfg(unix)]
+#[test]
+fn zero_orphans_after_kill_9_with_no_home() {
+    let kill = Kill9 { home: false, group: false, removed: false };
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_with_no_home", kill, None);
+}
+
+/// The same for a run whose binary an upgrade replaced before its first
+/// tool. Its path then reads `<path> (deleted)`, which no exec finds, so the
+/// watcher runs the binary the run runs, `/proc/self/exe`. macOS has no such
+/// name: there the next launch stops such a run's tools (docs/usage.md).
+#[cfg(target_os = "linux")]
+#[test]
+fn zero_orphans_after_kill_9_once_its_binary_is_replaced() {
+    let kill = Kill9 { home: true, group: false, removed: true };
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_once_its_binary_is_replaced", kill, None);
+}
+
+/// When each of `pids` read as gone after `since`, and when `file`, where one
+/// is given, read as removed, polled every millisecond for up to `wait`; None
+/// for one still found then. The polls wait on the watcher's own timer, which
+/// a QoS clamp on this test does not stretch as it would a plain sleep.
+#[cfg(unix)]
+fn gone_after(pids: &[i32], file: Option<&Path>, since: Instant, wait: Duration) -> (Vec<Option<Duration>>, Option<Duration>) {
+    let mut gone = vec![None; pids.len()];
+    let mut removed = None;
+    while (gone.contains(&None) || (file.is_some() && removed.is_none())) && since.elapsed() < wait {
+        for (at, &pid) in gone.iter_mut().zip(pids) {
+            if at.is_none() && !alive(pid) {
+                *at = Some(since.elapsed());
+            }
+        }
+        if removed.is_none() && file.is_some_and(|file| !file.exists()) {
+            removed = Some(since.elapsed());
+        }
+        open_max_core::execution::sleep_on_time(Duration::from_millis(1));
+    }
+    (gone, removed)
+}
+
+/// Kill a print run outright in the middle of a `bash` call whose tree only
+/// SIGKILL ends, and assert that, with no launch since, each process of the
+/// tree is gone within `ORPHANS_GONE_WITHIN` of the signal, and so is the
+/// watcher the run's first tool started, found before the kill and leading
+/// a session of its own; and that none of the tree is gone before
+/// `LEFT_BEHIND_GRACE` has passed, since the watcher sends the SIGTERM the
+/// tree ignores first and SIGKILL only once that grace ends. `name` is the
+/// run's prompt, its install's tag and its listing's first word, `kill` says
+/// how the run starts and is killed, and the listing is written to
+/// `listing_file` under the target directory's `tmp` when that is given.
+///
+/// Method: the call's shell ignores SIGTERM, writes its pid, starts a
+/// subshell in the background, writes that pid and waits; the subshell
+/// starts a sleeper, the shell's grandchild, writes its pid and waits, and
+/// each inherits the ignored SIGTERM. Once the three pids are written and the
+/// run's record lists the shell's group, this waits for the run's watcher,
+/// which the record's first write starts, then reads the clock, sends
+/// SIGKILL and waits for the run, as the shell that started it would. From
+/// that reading on, it polls each process of the tree and the watcher every
+/// millisecond for up to 5 seconds with `kill(pid, 0)`, which finds a zombie
+/// its new parent has not collected, so each reads as gone once it has
+/// exited and been collected, and lists each pid with when it did. It also
+/// lists when the run was collected, an upper bound on the time the kernel
+/// took to end it, which the watcher waits for, and when the record was
+/// removed, which the watcher does just after its SIGKILL, so a listing over
+/// the bound shows which part took the time: the kernel's end of the run, the
+/// watcher's stop, or the end of the tree its SIGKILL began. A release
+/// build, as CI's thesis job runs it, asserts the bound; a debug build
+/// asserts 20 times it, as the whole suite runs beside it, and prints the
+/// times. Its `MEASURE` line, keyed by `name`, gives the count it asserts is
+/// zero: the processes still found at the bound. The clock is read before
+/// the signal, not once the call returns:
+/// the watcher's SIGTERM follows the run's death, which follows the call's
+/// start, and its SIGKILL comes no sooner than the grace after its SIGTERM,
+/// so no process of the tree can read as gone within the grace of that
+/// reading. A reading taken once the call returns can fall after the
+/// SIGTERM, as when this thread runs again late, and the grace bound would
+/// then fail on correct code.
+#[cfg(unix)]
+fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<&str>) {
+    use open_max_core::execution::LEFT_BEHIND_GRACE;
+    let (mut run, base, record) = run_one_bash_call(name, kill.home, kill.removed, |base| {
+        let p = base.join("pids");
+        let p = p.display();
+        format!("trap '' TERM; echo $$ >> '{p}'; (sleep 6845 & echo $! >> '{p}'; wait) & echo $! >> '{p}'; wait")
+    });
     let deadline = Instant::now() + Duration::from_secs(10);
     let tree = loop {
-        let text = std::fs::read_to_string(&listed).unwrap_or_default();
+        let text = std::fs::read_to_string(base.join("pids")).unwrap_or_default();
         let tree: Vec<i32> = text.lines().filter_map(|line| line.trim().parse().ok()).collect();
         let recorded = std::fs::read_to_string(&record).unwrap_or_default();
         let shell = tree.first().map(|shell| format!("{shell} "));
@@ -4904,36 +5104,147 @@ fn zero_orphans_after_kill_9() {
         if Instant::now() >= deadline || run.try_wait().unwrap().is_some() {
             let _ = run.kill();
             let _ = run.wait();
-            for pid in tree.iter().filter(|pid| alive(pid)) {
-                unsafe { libc::kill(*pid, libc::SIGKILL) };
+            for &pid in tree.iter().filter(|&&pid| alive(pid)) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             }
             panic!("the tool tree did not start, or was not recorded: pids {tree:?}, record {recorded:?}");
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    unsafe { libc::kill(run.id() as libc::pid_t, libc::SIGKILL) };
+    let watcher = watchers_of(&record).first().copied();
+    let session = watcher.map(|pid| unsafe { libc::getsid(pid) });
+    let target = run.id() as libc::pid_t;
     let killed = Instant::now();
+    unsafe { libc::kill(if kill.group { -target } else { target }, libc::SIGKILL) };
     run.wait().unwrap();
-    std::thread::sleep(Duration::from_millis(500).saturating_sub(killed.elapsed()));
-    let unlaunched = tree.iter().filter(|pid| alive(pid)).count();
-    let check = openmax(&["--check"]).output().unwrap();
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while tree.iter().any(alive) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
+    let collected = killed.elapsed();
+    let watched: Vec<i32> = tree.iter().copied().chain(watcher).collect();
+    let (gone, removed) = gone_after(&watched, Some(&record), killed, Duration::from_secs(5));
+    let (bound, build) =
+        if cfg!(debug_assertions) { (ORPHANS_GONE_WITHIN * 20, "debug") } else { (ORPHANS_GONE_WITHIN, "release") };
+    let ms = |time: Duration| format!("{:.1} ms", time.as_secs_f64() * 1e3);
+    let mut listing = format!(
+        "{name} on {}, {build} build: SIGKILL to a print run's {}, with no launch since; when the run was collected, \
+         when its record was removed, which its watcher does just after its SIGKILL, and when each process of its \
+         tool tree, which ignores SIGTERM, and its watcher read as gone, exited and collected, polled every \
+         millisecond; bound {}, grace {}\n",
+        std::env::consts::OS,
+        if kill.group { "process group" } else { "pid" },
+        ms(bound),
+        ms(LEFT_BEHIND_GRACE)
+    );
+    listing.push_str(&format!("run {target} collected {} after the kill\n", ms(collected)));
+    let removed = removed.map_or("kept 5 s after the kill".into(), |time| format!("removed {} after the kill", ms(time)));
+    listing.push_str(&format!("record {removed}\n"));
+    for (n, (&pid, time)) in watched.iter().zip(&gone).enumerate() {
+        let role = if n == tree.len() { "watcher" } else if n == 0 { "shell" } else { "descendant" };
+        let when = time.map_or("running 5 s after the kill".into(), |time| format!("gone {} after the kill", ms(time)));
+        listing.push_str(&format!("{role} {pid} {when}\n"));
     }
-    let survivors: Vec<i32> = tree.iter().copied().filter(alive).collect();
-    for pid in &survivors {
-        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    if watcher.is_none() {
+        listing.push_str("watcher none\n");
+    }
+    for (&pid, _) in watched.iter().zip(&gone).filter(|(_, time)| time.is_none()) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     let _ = std::fs::remove_dir_all(&base);
+    if let Some(file) = listing_file {
+        std::fs::write(Path::new(env!("CARGO_TARGET_TMPDIR")).join(file), &listing).unwrap();
+    }
+    print!("{listing}");
+    // The orphans: each process of the tree, and the watcher, still found
+    // at the bound. The gate's name states their count, zero, and that
+    // count is what it prints and asserts.
+    let orphans = gone.iter().filter(|time| time.is_none_or(|time| time >= bound)).count();
     println!(
-        "MEASURE zero_orphans_after_kill_9 {} of the tool tree's {} processes running once `openmax --check` has run \
-         (target 0); {unlaunched} running 500 ms after the kill with no launch since",
-        survivors.len(),
-        tree.len()
+        "MEASURE {name} {orphans} of {} processes, the tool tree's and its watcher, outlived the killed run by {} \
+         (target 0, {build} build)",
+        watched.len(),
+        ms(bound)
     );
-    let stderr = String::from_utf8_lossy(&check.stderr);
-    assert!(survivors.is_empty(), "the next launch left the tool tree running: {survivors:?}\n{stderr}");
+    assert!(watcher.is_some(), "the run's first tool started no watcher\n{listing}");
+    assert_eq!(session, watcher, "the watcher does not lead a session of its own\n{listing}");
+    assert_eq!(orphans, 0, "a process outlived its killed run by {}\n{listing}", ms(bound));
+    assert!(
+        gone[..tree.len()].iter().flatten().all(|&time| time >= LEFT_BEHIND_GRACE),
+        "a process of the tree, which ignores SIGTERM, was gone before the {} grace had passed\n{listing}",
+        ms(LEFT_BEHIND_GRACE)
+    );
+}
+
+/// A run's watcher ends with the run, at once. A print run whose `bash` call
+/// writes its shell's pid and waits for a file to appear: while the call
+/// waits, one process names the run's record in its command line, the
+/// watcher the call started, whose command line `ps` lists as `openmax
+/// --lifeline <record> <start>` on Linux too, where it runs
+/// `/proc/self/exe`; and once the test has made the file and the run has
+/// answered, exited 0 and been collected, that process reads as gone,
+/// exited and collected, polled every millisecond from then, within
+/// `LEFT_BEHIND_GRACE` in a release build. So it waited out neither a
+/// stop's grace nor its wait for an owner still exiting, which is longer
+/// and, measured from the run's collection, could still read just under its
+/// own length. A debug build asserts 20 times the bound, as the whole suite
+/// runs beside it; each prints the time. README.md states the bound, held
+/// here.
+#[cfg(unix)]
+#[test]
+fn a_runs_watcher_ends_with_the_run() {
+    use open_max_core::execution::LEFT_BEHIND_GRACE;
+    let (mut run, base, record) = run_one_bash_call("watcher", true, false, |base| {
+        let (shell, go) = (base.join("shell"), base.join("go"));
+        format!("echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.01; done", shell.display(), go.display())
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let shell: i32 = loop {
+        let shell = std::fs::read_to_string(base.join("shell")).ok().and_then(|text| text.trim().parse().ok());
+        let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+        if let Some(shell) = shell.filter(|shell| recorded.lines().any(|line| line.starts_with(&format!("{shell} ")))) {
+            break shell;
+        }
+        let ended = run.try_wait().unwrap();
+        if Instant::now() >= deadline || ended.is_some() {
+            let _ = run.kill();
+            let _ = run.wait();
+            if let Some(shell) = shell {
+                unsafe { libc::kill(-shell, libc::SIGKILL) };
+            }
+            panic!("the bash call did not start, or was not recorded: run {ended:?}, record {recorded:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let watchers = watchers_of(&record);
+    let named = watchers.first().map(|&pid| {
+        let out = Command::new("ps").args(["-ww", "-o", "args=", "-p", &pid.to_string()]).output().expect("ps runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    });
+    std::fs::write(base.join("go"), "").unwrap();
+    let out = run.wait_with_output().unwrap();
+    let (gone, _) = gone_after(&watchers, None, Instant::now(), Duration::from_secs(5));
+    for (&pid, _) in watchers.iter().zip(&gone).filter(|(_, time)| time.is_none()) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    if alive(shell) {
+        unsafe { libc::kill(-shell, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    let (bound, build) =
+        if cfg!(debug_assertions) { (LEFT_BEHIND_GRACE * 20, "debug") } else { (LEFT_BEHIND_GRACE, "release") };
+    let ms = |time: Duration| format!("{:.1} ms", time.as_secs_f64() * 1e3);
+    for (&pid, time) in watchers.iter().zip(&gone) {
+        let when = time.map_or("running 5 s after it".into(), |time| format!("gone {} after it", ms(time)));
+        let os = std::env::consts::OS;
+        println!("a_runs_watcher_ends_with_the_run on {os}, {build} build: watcher {pid} of a run that exited 0, {when}; bound {}", ms(bound));
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("first answer"), "{stderr}");
+    assert_eq!(watchers.len(), 1, "the run's bash call had {} watchers, not one: {watchers:?}", watchers.len());
+    let line = format!("openmax --lifeline {} ", record.display());
+    assert!(named.as_ref().is_some_and(|named| named.starts_with(&line)), "the watcher's command line is {named:?}, not {line}<start>");
+    assert!(gone.iter().all(|time| time.is_some_and(|time| time < bound)), "the watcher outlived its run, which exited 0, by {} or more: {gone:?}", ms(bound));
+    let claim = format!("which it outlives by less than {} ms in a release build", LEFT_BEHIND_GRACE.as_millis());
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
 }
 
 /// One command from a fresh install answers a local endpoint in under a

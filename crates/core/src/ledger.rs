@@ -481,13 +481,6 @@ fn with_lock<R>(dir: &Path, f: impl FnOnce() -> Result<R, String>) -> Result<R, 
     f()
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Put `file`'s writes on the drive itself, past its cache: its data and
 /// metadata, or (`all` false) its data and only the metadata needed to read
 /// it back. On macOS each one is a full drive barrier, which is what the
@@ -919,7 +912,7 @@ fn approve(
         }
         let record = Record {
             v: RECORD_VERSION,
-            ts: unix_now(),
+            ts: crate::sessions::unix_now(),
             path: path.unwrap_or_default(),
             sha256: shas.first().cloned(),
             actor: if session_id.is_some() { Actor::Session } else { Actor::External },
@@ -1033,7 +1026,7 @@ pub fn repair(data_dir: &Path, project_root: &Path) -> Result<Repair, String> {
                 .collect();
             let approvals = parsed.iter().filter(|r| r.kind == Kind::Approval).count();
             let records = text.lines().filter(|l| !l.trim().is_empty()).count();
-            let quarantined = free_quarantine_path(&dir, unix_now());
+            let quarantined = free_quarantine_path(&dir, crate::sessions::unix_now());
             if log.exists() {
                 std::fs::rename(&log, &quarantined)
                     .map_err(|e| format!("cannot quarantine {}: {e}", log.display()))?;
@@ -1090,7 +1083,7 @@ fn quarantine_tail_locked(dir: &Path, verified: &Verified) -> Result<Repair, Str
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = &lines[verified.pinned.min(lines.len())..];
     let approvals = verified.unpinned_authority().count();
-    let quarantined = free_quarantine_path(dir, unix_now());
+    let quarantined = free_quarantine_path(dir, crate::sessions::unix_now());
     let mut tail_text = tail.join("\n");
     tail_text.push('\n');
     crate::sessions::write_atomic(&quarantined, tail_text)?;
@@ -1169,7 +1162,7 @@ pub fn forget_capability(
         }
         let record = Record {
             v: RECORD_VERSION,
-            ts: unix_now(),
+            ts: crate::sessions::unix_now(),
             path: target,
             sha256: None,
             actor: Actor::External,
@@ -1586,10 +1579,7 @@ pub fn record_usage(
         // usage is telemetry, not policy.
         let mut file = load_usage(data_dir, project_root).unwrap_or_default();
         file.version = 1;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let ts = crate::sessions::unix_now();
         for (name, ok) in &delta.tools {
             let entry = file.tools.entry(name.clone()).or_default();
             entry.calls += 1;
@@ -1737,7 +1727,7 @@ mod tests {
                 .iter()
                 .map(|(rel, content)| Record {
                     v: RECORD_VERSION,
-                    ts: unix_now(),
+                    ts: crate::sessions::unix_now(),
                     path: root.join(rel),
                     sha256: content.map(|c| sha256_hex(c.as_bytes())),
                     actor: Actor::External,
