@@ -2873,6 +2873,19 @@ mod tests {
         }
     }
 
+    /// A resize anchors the content at the view's bottom edge only when
+    /// there is history above that edge: none in an empty history, which has
+    /// no row to name, and none at the bottom itself.
+    #[test]
+    fn a_resize_anchor_needs_history_above_the_edge() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        assert!(t.anchor_at(5).is_none(), "an empty history anchored a row");
+        t.push_assistant(vec![Line::from("one")]);
+        assert!(t.anchor_at(0).is_none(), "the bottom edge anchored a row");
+        assert!(t.anchor_at(1).is_some());
+    }
+
     /// Nothing wraps before a frame gives the transcript a width, not even
     /// in the eager shape or on a fold: a wrap at no width holds rows no
     /// frame paints, and its count would spend the wrap budget.
