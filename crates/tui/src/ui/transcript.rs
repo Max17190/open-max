@@ -398,21 +398,103 @@ pub struct RowRef {
     row: usize,
 }
 
+/// Where each block's rows start: a Fenwick tree over the block heights,
+/// so a block's first row, the block holding a row, and a change of one
+/// block's height each cost O(log n) at any depth of history. The prefix
+/// array this replaced rebuilt every entry below a block whose height
+/// changed, so each block a scroll wrapped far above the bottom cost a
+/// pass over the history under it: a frame's cost grew with how far the
+/// reader had scrolled into a long session.
+#[derive(Default)]
+struct RowIndex(Vec<usize>);
+
+/// The lowest set bit: node `i` (from 1) sums the `low(i)` heights up to
+/// and including block `i - 1`.
+fn low(i: usize) -> usize {
+    i & i.wrapping_neg()
+}
+
+impl RowIndex {
+    /// Index `heights` from scratch in O(n): each node adds its sum into
+    /// the node above it.
+    fn rebuild(&mut self, heights: impl Iterator<Item = usize>) {
+        self.0.clear();
+        self.0.extend(heights);
+        for i in 1..self.0.len() {
+            let above = i + low(i);
+            if above <= self.0.len() {
+                self.0[above - 1] += self.0[i - 1];
+            }
+        }
+    }
+
+    /// Append a block: its node sums its own height and the nodes under it.
+    fn push(&mut self, height: usize) {
+        let i = self.0.len() + 1;
+        let (mut sum, mut j) = (height, i - 1);
+        while j > i - low(i) {
+            sum += self.0[j - 1];
+            j -= low(j);
+        }
+        self.0.push(sum);
+    }
+
+    /// Keep the first `len` blocks; no node before `len` sums a block
+    /// after it.
+    fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+
+    fn add(&mut self, bi: usize, delta: isize) {
+        let mut i = bi + 1;
+        while i <= self.0.len() {
+            self.0[i - 1] = self.0[i - 1].wrapping_add_signed(delta);
+            i += low(i);
+        }
+    }
+
+    /// First row of block `bi`: the rows of every block above it.
+    fn start(&self, bi: usize) -> usize {
+        let (mut rows, mut i) = (0, bi);
+        while i > 0 {
+            rows += self.0[i - 1];
+            i -= low(i);
+        }
+        rows
+    }
+
+    /// The block holding `row`, and the row's offset into it: the last
+    /// block that starts at or above `row`, which holds it as long as
+    /// `row` is under the total, since a block is at least one row.
+    fn locate(&self, row: usize) -> (usize, usize) {
+        let (mut bi, mut rest) = (0, row);
+        let mut step = (self.0.len() + 1).next_power_of_two() / 2;
+        while step > 0 {
+            if bi + step <= self.0.len() && self.0[bi + step - 1] <= rest {
+                bi += step;
+                rest -= self.0[bi - 1];
+            }
+            step /= 2;
+        }
+        (bi, rest)
+    }
+}
+
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
     /// Id of the next block pushed.
     next_id: u64,
-    /// First wrapped line of each block; `total` closes the last range. The
-    /// per-block caches own the only copy of every wrapped line, so
-    /// re-measuring after a fold toggle or width change is index
-    /// arithmetic, never a clone of the session's lines. A block not yet
-    /// wrapped at the current width counts its estimated height.
-    block_starts: Vec<usize>,
-    /// Entries of `block_starts` from this block on are stale. A height
-    /// change marks only its own suffix, so wrapping the blocks at the
-    /// bottom of history never walks the whole index.
-    stale_from: usize,
+    /// First wrapped line of each block. The per-block caches own the only
+    /// copy of every wrapped line, so re-measuring after a fold toggle or
+    /// width change is index arithmetic, never a clone of the session's
+    /// lines. A block not yet wrapped at the current width counts its
+    /// estimated height.
+    index: RowIndex,
+    /// Indices of the user blocks, ascending: the sticky header and prompt
+    /// navigation find the nearest prompt by binary search instead of
+    /// walking back through every block since it.
+    users: Vec<usize>,
     /// Rows across all blocks (sum of their heights), kept current by every
     /// height change.
     total: usize,
@@ -479,7 +561,10 @@ impl Transcript {
         let height = self.blocks[bi].measure(self.width);
         self.blocks[bi].height = height;
         self.total += height;
-        self.mark_stale(bi);
+        self.index.push(height);
+        if self.blocks[bi].kind == BlockKind::User {
+            self.users.push(bi);
+        }
         if self.width > 0 && self.offset > 0 {
             self.offset = self.offset.saturating_add(height);
             self.unread += 1;
@@ -494,7 +579,7 @@ impl Transcript {
     /// `user_prompt_submit` before it entered the core transcript). Returns
     /// true when a user block was removed.
     pub fn pop_last_user(&mut self) -> bool {
-        let Some(i) = self.blocks.iter().rposition(|b| b.kind == BlockKind::User) else {
+        let Some(&i) = self.users.last() else {
             return false;
         };
         // The view keeps its offset (the draw path clamps it once the view
@@ -503,8 +588,14 @@ impl Transcript {
         self.wrap_held(i, held);
         self.wrap_across(i, held, -(self.blocks[i].height as isize));
         let removed = self.blocks.remove(i);
+        self.users.pop();
         self.total -= removed.height;
-        self.mark_stale(i);
+        // The blocks after it moved up one: index them again. It was the
+        // last prompt, so that is the few blocks since it.
+        self.index.truncate(i);
+        for block in &self.blocks[i..] {
+            self.index.push(block.height);
+        }
         // Selection / sticky indices past the removed block must retreat.
         if let Some(sel) = self.selected {
             if sel == i {
@@ -569,7 +660,7 @@ impl Transcript {
                 total += block.height;
             }
             self.total = total;
-            self.mark_stale(0);
+            self.index.rebuild(self.blocks.iter().map(|block| block.height));
         }
     }
 
@@ -579,7 +670,6 @@ impl Transcript {
     /// widths but bounded by one block's height. None when history is empty
     /// or the position is not above the bottom.
     pub fn anchor_at(&mut self, lines_from_bottom: usize) -> Option<WrapAnchor> {
-        self.ensure_index();
         if lines_from_bottom == 0 || self.total == 0 {
             return None;
         }
@@ -603,8 +693,7 @@ impl Transcript {
             return 0;
         }
         self.wrap_block(anchor.block);
-        self.ensure_index();
-        let start = self.block_starts[anchor.block];
+        let start = self.index.start(anchor.block);
         let end = start + self.blocks[anchor.block].height;
         let index = (start + anchor.lines_into_block).min(end.saturating_sub(1));
         self.total - index
@@ -614,29 +703,6 @@ impl Transcript {
     /// path clamps it against the current total as usual.
     pub fn set_offset(&mut self, lines_from_bottom: usize) {
         self.offset = lines_from_bottom;
-    }
-
-    fn mark_stale(&mut self, bi: usize) {
-        self.stale_from = self.stale_from.min(bi);
-    }
-
-    /// Bring `block_starts` up to date from the first stale block on.
-    fn ensure_index(&mut self) {
-        if self.stale_from >= self.blocks.len() && self.block_starts.len() == self.blocks.len() {
-            return;
-        }
-        let from = self.stale_from.min(self.block_starts.len()).min(self.blocks.len());
-        self.block_starts.truncate(from);
-        let mut row = match from.checked_sub(1) {
-            Some(prev) => self.block_starts[prev] + self.blocks[prev].height,
-            None => 0,
-        };
-        for block in &self.blocks[from..] {
-            self.block_starts.push(row);
-            row += block.height;
-        }
-        debug_assert_eq!(row, self.total, "block heights and the row total disagree");
-        self.stale_from = self.blocks.len();
     }
 
     /// Wrap block `bi` at the current width unless it already is, and
@@ -655,8 +721,8 @@ impl Transcript {
 
     fn set_height(&mut self, bi: usize, height: usize) {
         self.total = self.total - self.blocks[bi].height + height;
+        self.index.add(bi, height as isize - self.blocks[bi].height as isize);
         self.blocks[bi].height = height;
-        self.mark_stale(bi);
     }
 
     /// Fold or open block `bi`. It is wrapped at once: a fold is toggled on
@@ -729,7 +795,6 @@ impl Transcript {
             return;
         }
         loop {
-            self.ensure_index();
             let total = self.total + tail_len;
             let top_offset = total.saturating_sub(rows);
             let end = total - self.offset.min(top_offset);
@@ -761,7 +826,6 @@ impl Transcript {
         if self.offset == 0 {
             return None;
         }
-        self.ensure_index();
         let edge = (self.total + self.view.1).saturating_sub(self.offset);
         self.locate(edge).map(|(bi, _)| bi)
     }
@@ -800,17 +864,9 @@ impl Transcript {
     }
 
     /// Block owning wrapped line `idx`, and the line's offset into that
-    /// block's cache. Callers keep the index current.
+    /// block's cache.
     fn locate(&self, idx: usize) -> Option<(usize, usize)> {
-        if idx >= self.total {
-            return None;
-        }
-        debug_assert!(
-            self.stale_from >= self.blocks.len() && self.block_starts.len() == self.blocks.len(),
-            "located a line in a stale index"
-        );
-        let bi = self.block_starts.partition_point(|&start| start <= idx) - 1;
-        Some((bi, idx - self.block_starts[bi]))
+        (idx < self.total).then(|| self.index.locate(idx))
     }
 
     /// Wrap every block at the current width. Test-support only: the draw
@@ -820,7 +876,6 @@ impl Transcript {
         for bi in 0..self.blocks.len() {
             self.wrap_block(bi);
         }
-        self.ensure_index();
     }
 
     /// Test-support oracle access: `draw_chat` paints via `paint_rows`.
@@ -837,7 +892,6 @@ impl Transcript {
     /// Test-support oracle access.
     #[cfg(test)]
     pub fn line_at(&mut self, idx: usize) -> Option<&Line<'static>> {
-        self.ensure_index();
         let (bi, li) = self.locate(idx)?;
         self.wrap_block(bi);
         self.blocks[bi].cache.get(li)
@@ -864,6 +918,15 @@ impl Transcript {
         debug_assert!(
             self.total == self.blocks.iter().map(|b| b.cache.len()).sum::<usize>(),
             "wrapped-line index went stale against the block caches",
+        );
+        let mut row = 0;
+        for (bi, block) in self.blocks.iter().enumerate() {
+            debug_assert_eq!(self.index.start(bi), row, "the row index went stale at block {bi}");
+            row += block.height;
+        }
+        debug_assert!(
+            self.users.iter().copied().eq((0..self.blocks.len()).filter(|&bi| self.blocks[bi].kind == BlockKind::User)),
+            "the prompt list went stale against the blocks",
         );
         let end = end.min(self.total);
         let start = start.min(end);
@@ -901,7 +964,6 @@ impl Transcript {
         selected_bi: Option<usize>,
         painted: &mut Vec<Option<RowRef>>,
     ) {
-        self.ensure_index();
         let end = end.min(self.total).min(start.saturating_add(usize::from(area.height)));
         let Some((mut bi, mut li)) = self.locate(start) else {
             return;
@@ -945,12 +1007,10 @@ impl Transcript {
         if !block.is_wrapped_at(self.width) || at.row >= block.cache.len() {
             return None;
         }
-        self.ensure_index();
-        Some(self.block_starts[bi] + at.row)
+        Some(self.index.start(bi) + at.row)
     }
 
-    pub fn len(&mut self) -> usize {
-        self.ensure_index();
+    pub fn len(&self) -> usize {
         self.total
     }
 
@@ -1100,39 +1160,22 @@ impl Transcript {
 
     /// Jump to the next user-turn block after the current selection.
     pub fn select_next_user(&mut self) {
-        if self.blocks.is_empty() {
-            return;
-        }
-        let start = self.selected.map(|i| i + 1).unwrap_or(0);
-        if let Some(i) =
-            (start..self.blocks.len()).find(|&i| self.blocks[i].kind == BlockKind::User)
-        {
+        let start = self.selected.map_or(0, |i| i + 1);
+        if let Some(&i) = self.users.get(self.users.partition_point(|&u| u < start)) {
             self.selected = Some(i);
             self.scroll_to_block(i);
         }
     }
 
-    /// Jump to the previous user-turn block before the current selection.
+    /// Jump to the previous user-turn block before the current selection,
+    /// or, with none before it, to the selected prompt itself.
     pub fn select_prev_user(&mut self) {
-        if self.blocks.is_empty() {
-            return;
-        }
         let end = self
             .selected
             .unwrap_or_else(|| self.blocks.len().saturating_sub(1));
-        if let Some(i) = (0..=end)
-            .rev()
-            .find(|&i| self.blocks[i].kind == BlockKind::User && Some(i) != self.selected)
-        {
-            self.selected = Some(i);
-            self.scroll_to_block(i);
-            return;
-        }
-        // If nothing before selection, land on the nearest user at or before end.
-        if let Some(i) = (0..=end)
-            .rev()
-            .find(|&i| self.blocks[i].kind == BlockKind::User)
-        {
+        let upto = &self.users[..self.users.partition_point(|&u| u <= end)];
+        let pick = upto.iter().rev().copied().find(|&u| Some(u) != self.selected);
+        if let Some(i) = pick.or(upto.last().copied()) {
             self.selected = Some(i);
             self.scroll_to_block(i);
         }
@@ -1166,8 +1209,7 @@ impl Transcript {
         }
         self.wrap_block(bi);
         self.wrap_rows_from(bi + 1, self.view.1);
-        self.ensure_index();
-        let end = self.block_starts[bi] + self.blocks[bi].height;
+        let end = self.index.start(bi) + self.blocks[bi].height;
         self.offset = self.total.saturating_sub(end);
     }
 
@@ -1443,7 +1485,6 @@ impl Transcript {
     /// here from a painted frame, whose blocks are wrapped; the wrap below
     /// serves only callers that address a row no frame has shown.
     fn row(&mut self, line_idx: usize) -> Option<(usize, CachedLineMap)> {
-        self.ensure_index();
         let (block, li) = self.locate(line_idx)?;
         if !self.blocks[block].is_wrapped_at(self.width) {
             let held = self.held_block();
@@ -1537,14 +1578,15 @@ impl Transcript {
 
     /// Index of the nearest user block whose start is above `view_start_line`.
     fn sticky_user_block_idx(&mut self, view_start_line: usize) -> Option<usize> {
-        self.ensure_index();
         if view_start_line == 0 || self.blocks.is_empty() {
             return None;
         }
         let bi = self.locate(view_start_line).map(|(bi, _)| bi).unwrap_or(0);
-        (0..=bi).rev().find(|&i| {
-            self.blocks[i].kind == BlockKind::User && self.block_starts[i] < view_start_line
-        })
+        // The nearest prompt at or above block `bi` starts above the view
+        // unless it is `bi` itself, starting on the view's top row; the one
+        // before it then does.
+        let above = &self.users[..self.users.partition_point(|&u| u <= bi)];
+        above.iter().rev().take(2).copied().find(|&u| self.index.start(u) < view_start_line)
     }
 
     /// Whether a sticky user header should render for this viewport start.
@@ -1565,7 +1607,6 @@ impl Transcript {
         let Some(sel) = self.selected else {
             return false;
         };
-        self.ensure_index();
         self.locate(line_idx).map(|(bi, _)| bi) == Some(sel)
     }
 
@@ -2103,7 +2144,6 @@ mod tests {
             Some("│ literal table border")
         );
 
-        t.ensure_index();
         assert!(t.begin_text_selection_at(0, 0));
         assert!(t.update_text_selection_at(0, 21));
         t.finish_text_selection();
@@ -2129,7 +2169,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(crate::ui::markdown::render("```rust\nfn a() -> u32 { 1 }\n```"));
-        t.ensure_index();
         let li = text(&t.lines())
             .iter()
             .position(|l| l.contains("fn a"))
@@ -2159,7 +2198,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         // Double-click on the middle of "beta", release on the same cell.
         assert!(t.select_word_at(0, 7));
@@ -2179,7 +2217,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         assert!(t.select_word_at(0, 7));
         assert!(t.update_text_selection_at(0, 12));
@@ -2197,7 +2234,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         // Word gesture on "beta", release over "gamma" with no Drag events.
         assert!(t.select_word_at(0, 7));
@@ -2212,7 +2248,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         assert!(t.select_word_at(0, 7));
         assert!(t.update_text_selection_at(0, 12));
@@ -2229,7 +2264,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         assert!(t.begin_text_selection_at(0, 0));
         t.end_text_selection_at(0, 9);
@@ -2707,7 +2741,7 @@ mod tests {
             t.line_at(line).map(|line| lines_to_plain(std::slice::from_ref(line)))
         };
         let painted: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
-        let prompt = t.block_starts[1]..t.block_starts[2];
+        let prompt = t.index.start(1)..t.index.start(2);
         assert!(t.pop_last_user());
         let found: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
         // The removed prompt's rows name nothing; every other row still
