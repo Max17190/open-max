@@ -19,11 +19,11 @@
 #
 # The budget is 5 seconds times the multiplier, set for each CI runner from
 # its runs. CI's Suite time job gates a multiplier of 3 on ubuntu-latest
-# (4 cores), and the Reports workflow reports a multiplier of 4 on
-# macos-latest (3 cores, M1); the target is measured on 10 cores. The
-# suite's processes spend about 20 CPU-seconds, so on those runners the
-# CPU work alone takes 5.0 and 6.7 seconds beside the tests that wait.
-# Their first two runs took 6.9 and 8.5 seconds on
+# (4 cores), and the Reports workflow reports
+# a multiplier of 4 on macos-latest (3 cores, M1); the target is measured
+# on 10 cores. The suite's processes spend about 20 CPU-seconds, so on
+# those runners the CPU work alone takes 5.0 and 6.7 seconds beside the
+# tests that wait. Their first two runs took 6.9 and 8.5 seconds on
 # ubuntu-latest, and 13.1 and 10.4 seconds on macos-latest, where the TUI's
 # unit tests took 13.1 seconds beside the other binaries against 4.7
 # seconds run alone. A shared runner's time moved by a fifth to a quarter

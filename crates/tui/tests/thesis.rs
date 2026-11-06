@@ -198,7 +198,7 @@ fn the_suite_fails_over_its_time_budget() {
         [
             "env -u GITHUB_ACTIONS scripts/check-suite-time.sh --runs 5 4 2>&1 | tee \"$RUNNER_TEMP/suite-time.log\"",
             "status=${PIPESTATUS[0]}",
-            "{ echo \"Reported, not gated, on macos-latest; the check exited $status:\"; echo '```'; grep -E '^(run [0-9]+ of 5: |median )' \"$RUNNER_TEMP/suite-time.log\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
+            "{ echo \"Reported, not gated, on macos-latest; the check exited $status:\"; echo '```'; sed -n -E '/^(run [0-9]+ of 5: |median )/p' \"$RUNNER_TEMP/suite-time.log\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
             "grep -q '^median .* over 5 runs,' \"$RUNNER_TEMP/suite-time.log\" || { echo \"::error::the suite did not run 5 times, so it measured nothing\"; exit 1; }",
         ],
         "the suite time report does not run the suite five times on macos-latest, report each run and the median, \
