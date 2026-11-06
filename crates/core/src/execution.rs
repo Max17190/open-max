@@ -1814,14 +1814,15 @@ fn stop_groups(groups: &[(u32, u64)], grace: Duration, mut recorded: impl FnMut(
 /// there a plain 2 ms sleep took a mean 11 ms under utility and 98 ms under
 /// background on the reference machine, past the whole grace, while a kevent
 /// timer marked NOTE_CRITICAL, which keeps the real-time timers' leeway
-/// whatever the QoS, took 2.1 ms under both. A plain sleep if it cannot fire.
+/// whatever the QoS, took 2.1 ms under both. A timer the kernel refuses
+/// falls back to a plain sleep; a wait that finds no queue, or that a signal
+/// interrupts, returns at once, as each caller polls to a deadline of its own.
 #[cfg(target_os = "macos")]
 pub fn sleep_on_time(time: Duration) {
     let mut timer: libc::kevent = unsafe { std::mem::zeroed() };
     (timer.filter, timer.flags) = (libc::EVFILT_TIMER, libc::EV_ADD | libc::EV_ONESHOT);
     (timer.fflags, timer.data) = (libc::NOTE_USECONDS | libc::NOTE_CRITICAL, time.as_micros() as libc::intptr_t);
-    // A call that fails leaves the flag set; one that fires clears it.
-    let mut fired = libc::kevent { flags: libc::EV_ERROR, ..timer };
+    let mut fired = timer;
     // SAFETY: one change in, room for one event out, on a queue made and
     // closed here (kevent on a failed kqueue's -1 fails with EBADF).
     unsafe {
@@ -1829,6 +1830,7 @@ pub fn sleep_on_time(time: Duration) {
         libc::kevent(queue, &timer, 1, &mut fired, 1, std::ptr::null());
         libc::close(queue);
     }
+    // The kernel reports a change it refused as an event marked EV_ERROR.
     if fired.flags & libc::EV_ERROR != 0 {
         std::thread::sleep(time);
     }
