@@ -27,8 +27,12 @@ use crate::state::CancelToken;
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
-/// How often a group given [`TERMINATION_GRACE`] is checked for members
-/// still running.
+/// How long a tool group a harness killed outright left running has between
+/// SIGTERM and SIGKILL, from its watcher or a later launch: half the 100 ms in
+/// which each of its processes is to be gone after the kill, so that the
+/// escalation fits beside the watcher's wake and the kernel's teardown.
+pub const LEFT_BEHIND_GRACE: Duration = Duration::from_millis(50);
+/// How often a group given a grace is checked for members still running.
 const GROUP_EXIT_POLL: Duration = Duration::from_millis(2);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// The longest a cancelled command takes to settle: a SIGTERM grace for its
@@ -1537,6 +1541,12 @@ fn start_lifeline(record: &Path, own_start: u64) {
         if !SERVES_LIFELINE.load(Ordering::SeqCst) {
             return None;
         }
+        // On Linux the binary this process runs, which the child's exec finds
+        // there even once an upgrade has replaced the file and its path reads
+        // `<path> (deleted)`, as `current_exe` then gives it.
+        #[cfg(target_os = "linux")]
+        let exe = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
         let exe = std::env::current_exe().ok()?;
         // Under SPAWNING, as every tool and hook spawns: macOS has no pipe2,
         // so std sets close-on-exec just after making a pipe, and a fork in
@@ -1560,9 +1570,9 @@ fn start_lifeline(record: &Path, own_start: u64) {
 /// for end of file on stdin, then the watch, and return true; otherwise false.
 #[cfg(unix)]
 pub fn lifeline(args: &[OsString]) -> bool {
-    let Some((record, owner, start)) = watched(args) else { return false };
+    let Some((run, owner, start)) = watched(args) else { return false };
     let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
-    watch(record, owner, start);
+    watch(run, owner, start);
     true
 }
 
@@ -1571,46 +1581,33 @@ pub fn lifeline(_: &[OsString]) -> bool {
     false
 }
 
-/// The record, its owner's pid and its owner's start time that a watcher's
-/// command line names, or None for any other command line.
+/// The run directory, the owner's pid and the owner's start time that a
+/// watcher's command line names, or None for any other command line.
 #[cfg(unix)]
 fn watched(args: &[OsString]) -> Option<(&Path, u32, u64)> {
     let [flag, record, start] = args else { return None };
     let record = Path::new(record);
     let owner = record.file_name()?.to_str()?.strip_suffix(".groups").and_then(positive_pid)?;
-    (flag == LIFELINE_FLAG).then_some((record, owner, start.to_str()?.parse().ok()?))
+    (flag == LIFELINE_FLAG).then_some((record.parent()?, owner, start.to_str()?.parse().ok()?))
 }
 
 /// The watch, once the lifeline has read end of file: the owner, the only
 /// process that held its write end, is gone. Its files close as it exits, a
 /// moment before it reads as exited, so this waits up to `TERMINATION_GRACE`
 /// for that, and an end of file while the owner still runs stops nothing.
-/// Then each group the record lists whose leader still has its recorded
-/// start time is stopped as a launch stops a dead owner's ([`reap_in_boot`]),
-/// and the record is removed, with the run directory once no record is left
-/// there. A record whose first line names another start time is not the
-/// owner's but that of a process that took its pid since, and is left alone.
+/// Then it reaps the run directory as a launch does ([`reap`]): the owner's
+/// record, validated by start time, and any other a dead openmax left there.
 #[cfg(unix)]
-fn watch(record: &Path, owner: u32, owner_start: u64) {
+fn watch(run: &Path, owner: u32, owner_start: u64) {
     let start = owner_start.to_string();
     let deadline = std::time::Instant::now() + TERMINATION_GRACE;
     while owner_is_running(owner, Some(&start)) {
         if std::time::Instant::now() >= deadline {
             return;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(GROUP_EXIT_POLL);
     }
-    let Ok(text) = std::fs::read_to_string(record) else { return };
-    let mut lines = text.lines();
-    if lines.next().and_then(|line| line.split(' ').next()) != Some(start.as_str()) {
-        return;
-    }
-    let listed: Vec<_> = recorded_groups(lines).into_iter().filter(|&(pid, start)| start_time(pid) == Some(start)).collect();
-    stop_groups(&listed, is_recorded_group);
-    let _ = std::fs::remove_file(record);
-    if let Some(run) = record.parent() {
-        let _ = std::fs::remove_dir(run);
-    }
+    reap(run);
 }
 
 fn unrecord(pid: u32) {
@@ -1624,7 +1621,7 @@ fn unrecord(pid: u32) {
 /// pid, or the process that has it has exited or started at another time
 /// than the record says) names groups nothing else will stop: each whose
 /// leader still has the start time recorded for it gets SIGTERM, then
-/// SIGKILL after `TERMINATION_GRACE`, and the record is removed, with the
+/// SIGKILL after `LEFT_BEHIND_GRACE`, and the record is removed, with the
 /// run directory once no record is left there. A record from another boot
 /// is removed with nothing signalled, and one a running openmax owns is
 /// left alone. A process that left its tool's group, and a group whose
@@ -1785,24 +1782,24 @@ fn owner_is_running(pid: u32, recorded_start: Option<&str>) -> bool {
     }
 }
 
-/// SIGTERM each recorded group, then SIGKILL each still there once the
-/// grace ends. `recorded` ([`is_recorded_group`]) tells whether a group is
-/// still the one recorded, and each is dropped the first time it is not,
-/// never to be signalled again: once a group has ended, its id can name a
-/// new group, which reads as recorded when its own leader has exited.
+/// SIGTERM each recorded group, then SIGKILL each still there once
+/// `LEFT_BEHIND_GRACE` ends. `recorded` ([`is_recorded_group`]) tells whether
+/// a group is still the one recorded, and each is dropped the first time it
+/// is not, never to be signalled again: once a group has ended, its id can
+/// name a new group, which reads as recorded when its own leader has exited.
 #[cfg(unix)]
 fn stop_groups(groups: &[(u32, u64)], mut recorded: impl FnMut(u32, u64) -> bool) {
     let mut stopping: Vec<(u32, u64)> = groups.iter().copied().filter(|&(pid, start)| recorded(pid, start)).collect();
     for (pid, _) in &stopping {
         send_termination_group(Some(*pid));
     }
-    let deadline = std::time::Instant::now() + TERMINATION_GRACE;
+    let deadline = std::time::Instant::now() + LEFT_BEHIND_GRACE;
     loop {
         stopping.retain(|&(pid, start)| recorded(pid, start));
         if stopping.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(GROUP_EXIT_POLL);
     }
     for (pid, _) in stopping {
         send_kill_group(Some(pid));
@@ -2289,9 +2286,9 @@ mod tests {
         assert!(!kept, "a record whose owner pid another user holds was kept");
     }
 
-    /// A group that outlives SIGTERM gets SIGKILL once the grace ends, while
-    /// one that ends on SIGTERM is given the grace to: it is not killed
-    /// outright.
+    /// A group that outlives SIGTERM gets SIGKILL once `LEFT_BEHIND_GRACE`
+    /// ends, and not before, while one that ends on SIGTERM is given the
+    /// grace to: it is not killed outright.
     #[cfg(unix)]
     #[test]
     fn a_group_that_outlives_sigterm_is_killed_once_the_grace_ends() {
@@ -2302,7 +2299,9 @@ mod tests {
         let record = run.join(format!("{}.groups", dead_pid()));
         let lines = format!("1\n{} {stubborn_start}\n{} {graceful_start}\n", stubborn.id(), graceful.id());
         std::fs::write(&record, lines).unwrap();
+        let began = std::time::Instant::now();
         reap(&run);
+        let took = began.elapsed();
         let stubborn_stopped = stopped_within(&mut stubborn, Duration::from_millis(500));
         let graceful_stopped = stopped_within(&mut graceful, Duration::from_millis(500));
         let _ = stubborn.kill();
@@ -2310,6 +2309,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(run.parent().unwrap());
         assert!(stubborn_stopped, "a group that ignores SIGTERM outlived the reap");
         assert_eq!(stubborn.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(took >= LEFT_BEHIND_GRACE, "a group that ignores SIGTERM was killed {took:?} into its {LEFT_BEHIND_GRACE:?} grace");
         assert!(graceful_stopped, "a group that ends on SIGTERM outlived the reap");
         let graceful = graceful.wait().unwrap();
         assert_eq!(graceful.code(), Some(7), "a group that ends on SIGTERM was not given the grace: {graceful:?}");
@@ -2317,7 +2317,7 @@ mod tests {
 
     /// The grace is waited out only for a group still running: once every
     /// signalled group is gone the reap returns, so a launch that stops a
-    /// left-behind tool which ends on SIGTERM does not start 250 ms late.
+    /// left-behind tool which ends on SIGTERM does not start 50 ms late.
     /// A thread reaps the process the moment it exits, as init does for a
     /// tool whose harness died, since a zombie still counts as its group.
     #[cfg(unix)]
@@ -2345,7 +2345,7 @@ mod tests {
         let status = reaped.join().unwrap();
         let _ = std::fs::remove_dir_all(run.parent().unwrap());
         assert_eq!(status.and_then(|status| status.code()), Some(7), "the group did not end on the reap's SIGTERM");
-        assert!(took < TERMINATION_GRACE, "a reap whose group ended on SIGTERM took {took:?}, the whole grace");
+        assert!(took < LEFT_BEHIND_GRACE, "a reap whose group ended on SIGTERM took {took:?}, the whole grace");
     }
 
     /// Each signal of a stop goes only to a group still the one recorded. A
@@ -2742,7 +2742,7 @@ mod tests {
         let record = run.join(format!("{}.groups", owner.id()));
         let (l, s) = (listed.id(), struck.id());
         std::fs::write(&record, format!("{owner_start}\n{l} {listed_start}\n{s} {struck_start}\n-{s} {struck_start}\n")).unwrap();
-        let (path, pid) = (record.clone(), owner.id());
+        let (path, pid) = (run.clone(), owner.id());
         let watching = std::thread::spawn(move || watch(&path, pid, owner_start));
         drop(owner.stdin.take());
         let stopped = stopped_within(&mut listed, Duration::from_millis(1000));
@@ -2759,15 +2759,16 @@ mod tests {
         assert_eq!(left, (false, false), "the watch left its record or the run directory");
     }
 
-    /// Only `--lifeline <run>/<pid>.groups <start>` makes openmax a watcher:
-    /// a command line that names a record without the flag, or that names
-    /// no owner pid or start, runs as it says.
+    /// Only `--lifeline <run>/<pid>.groups <start>` makes openmax a watcher,
+    /// of the run directory, the owner pid and the start it names: a command
+    /// line that names a record without the flag, or that names no owner pid
+    /// or start, runs as it says.
     #[cfg(unix)]
     #[test]
     fn only_the_lifeline_command_line_makes_a_watcher() {
         let record = "/home/u/.openmax/run/42.groups";
         let line = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
-        assert_eq!(watched(&line(&["--lifeline", record, "7"])), Some((Path::new(record), 42, 7)));
+        assert_eq!(watched(&line(&["--lifeline", record, "7"])), Some((Path::new("/home/u/.openmax/run"), 42, 7)));
         for words in [
             &["-p", record, "7"][..],
             &["--lifeline", record],
@@ -2780,34 +2781,31 @@ mod tests {
         }
     }
 
-    /// A watch acts only on its owner's record, and only once the owner is
-    /// gone. An owner that still runs, as an end of file from another cause
-    /// finds it, keeps its groups and record once the grace is out, and so
-    /// does a record whose first line names another start time, as one a
-    /// process that took the gone owner's pid since would write. Each record
-    /// has a run directory of its own, so what one watch does cannot change
-    /// what the other finds, and each outcome is read as its watch returns:
-    /// a watch that went on to stop the group has removed its record by then.
+    /// A watch acts only once its owner is gone, and then only on what a gone
+    /// openmax left. An owner that still runs, as an end of file from another
+    /// cause finds it, keeps its groups and record once the grace is out. An
+    /// owner whose pid a process started at another time has taken since is
+    /// gone, and the record that process wrote under the pid, naming its own
+    /// start, is a running openmax's and is left alone too. This process
+    /// stands in for the running owner, then for the one that took the pid.
+    /// Each outcome is read as its watch returns: a watch that went on to stop
+    /// the group has removed its record by then.
     #[cfg(unix)]
     #[test]
     fn a_watch_leaves_a_running_owner_and_another_process_record_alone() {
         let (mut group, start) = left_behind_group();
         let own = (std::process::id(), start_time(std::process::id()).unwrap());
-        let running = run_dir("watch-running").join(format!("{}.groups", own.0));
-        std::fs::write(&running, format!("{}\n{} {start}\n", own.1, group.id())).unwrap();
+        let run = run_dir("watch-running");
+        let record = run.join(format!("{}.groups", own.0));
+        std::fs::write(&record, format!("{}\n{} {start}\n", own.1, group.id())).unwrap();
         let began = std::time::Instant::now();
-        watch(&running, own.0, own.1);
+        watch(&run, own.0, own.1);
         let waited = began.elapsed();
-        let running_left = (group.try_wait().unwrap().is_none(), running.exists());
-        let gone = dead_pid();
-        let taken = run_dir("watch-taken").join(format!("{gone}.groups"));
-        std::fs::write(&taken, format!("7\n{} {start}\n", group.id())).unwrap();
-        watch(&taken, gone, 8);
-        let taken_left = (group.try_wait().unwrap().is_none(), taken.exists());
+        let running_left = (group.try_wait().unwrap().is_none(), record.exists());
+        watch(&run, own.0, own.1 + 1);
+        let taken_left = (group.try_wait().unwrap().is_none(), record.exists());
         let _ = group.kill();
-        for record in [&running, &taken] {
-            let _ = std::fs::remove_dir_all(record.parent().and_then(Path::parent).unwrap());
-        }
+        let _ = std::fs::remove_dir_all(run.parent().unwrap());
         assert!(waited >= TERMINATION_GRACE, "a watch gave up on a running owner after {waited:?}, inside the grace");
         assert_eq!(running_left, (true, true), "a watch stopped a running owner's group or removed its record");
         assert_eq!(taken_left, (true, true), "a watch acted on a record another process wrote under its owner's pid");

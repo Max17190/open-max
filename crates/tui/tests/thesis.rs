@@ -797,7 +797,8 @@ fn agent_loop_is_under_2500_lines() -> Result<(), String> {
 /// hold a reported one. Every command runs in release, one test at a time,
 /// printing what it measured, under a timeout, and the gate's even when the
 /// one before it failed, as does each test target after one that failed.
-/// Nothing in the job skips a step (no `if:`), and nothing turns on debug
+/// Nothing in the job skips a step (no `if:` but `if: ${{ !cancelled() }}`,
+/// which runs a step after a failed one too), and nothing turns on debug
 /// assertions for its builds, which would hold each timing test to its 20x
 /// debug bound: not the release profile in Cargo.toml, nor the workflow's
 /// or the job's environment.
@@ -816,7 +817,8 @@ fn thesis_claims_are_gated_in_ci() {
             None => steps.last_mut().unwrap().push(line),
         }
     }
-    let skipped: Vec<&&str> = steps.iter().flatten().filter(|line| line.starts_with("if:")).collect();
+    let skipped: Vec<&&str> =
+        steps.iter().flatten().filter(|line| line.starts_with("if:") && **line != "if: ${{ !cancelled() }}").collect();
     assert!(skipped.is_empty(), "the thesis job, or a step of it, can be skipped: {skipped:?}");
     // Only the thesis reports and the test job's macOS concurrent timing
     // measurement may fail without failing their job. Keep both exceptions
@@ -3477,15 +3479,25 @@ fn watchers_of(record: &Path) -> Vec<i32> {
 
 /// A print run (`-p`) on a fresh project whose endpoint asks for one `bash`
 /// call running `script`, then answers; with the path of the run's record
-/// of its tool groups. With `home`, HOME is a fresh directory, which holds
+/// of its tool groups. The run leads a process group of its own, as a job a
+/// shell starts does. With `home`, HOME is a fresh directory, which holds
 /// the record (`~/.openmax/run/<pid>.groups`). Without it, the run has no
 /// HOME, so its data directory is the relative `.openmax`, which names one
 /// in the project, the directory the run runs in; the record's path then
 /// names the project as the run reads its working directory, with every
 /// symbolic link resolved (macOS's temporary directory is under one), as
-/// the run's watcher is given it.
+/// the run's watcher is given it. With `removed`, the run starts from a hard
+/// link to the binary under the target directory's `tmp`, removed as soon as
+/// the spawn returns, as an upgrade that replaced the file leaves a run:
+/// before its first tool, which waits on its start and its endpoint.
 #[cfg(unix)]
-fn run_one_bash_call(tag: &str, home: bool, script: impl Fn(&Path) -> String) -> (std::process::Child, PathBuf, PathBuf) {
+fn run_one_bash_call(
+    tag: &str,
+    home: bool,
+    removed: bool,
+    script: impl Fn(&Path) -> String,
+) -> (std::process::Child, PathBuf, PathBuf) {
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let (project, home_dir) = fresh_install(tag, 0);
     let arguments = serde_json::json!({ "command": script(project.parent().unwrap()) }).to_string();
@@ -3494,8 +3506,13 @@ fn run_one_bash_call(tag: &str, home: bool, script: impl Fn(&Path) -> String) ->
     ]}}]});
     let end = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
     let base_url = spawn_server(vec![format!("data: {call}\n\ndata: {end}\n\ndata: [DONE]\n\n")]);
-    let mut run = Command::new(env!("CARGO_BIN_EXE_openmax"));
-    run.current_dir(&project).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
+    let link = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("openmax-{tag}-{}", std::process::id()));
+    if removed {
+        let _ = std::fs::remove_file(&link);
+        std::fs::hard_link(env!("CARGO_BIN_EXE_openmax"), &link).unwrap();
+    }
+    let mut run = Command::new(if removed { link.as_path() } else { Path::new(env!("CARGO_BIN_EXE_openmax")) });
+    run.process_group(0).current_dir(&project).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
     let data = if home {
         run.env("HOME", &home_dir);
         home_dir.join(".openmax")
@@ -3508,36 +3525,40 @@ fn run_one_bash_call(tag: &str, home: bool, script: impl Fn(&Path) -> String) ->
     run.env("OPENMAX_HUMAN_ATTEST", "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     run.args(["--trust-project", "--base-url", &base_url, "--model", "m", "--context-tokens", "32768", "-p", tag]);
     let run = run.spawn().unwrap();
+    if removed {
+        std::fs::remove_file(&link).unwrap();
+    }
     let record = data.join("run").join(format!("{}.groups", run.id()));
     (run, project.parent().unwrap().to_path_buf(), record)
 }
 
-/// Where `zero_orphans_after_kill_9` lists each process it counted, under
-/// the target directory's `tmp`, which the CI test job keeps as an artifact
-/// on each runner.
+/// Where `zero_orphans_after_kill_9` lists each process it watched, under
+/// the target directory's `tmp`, which the CI thesis job keeps as an
+/// artifact on each runner.
 const ORPHANS_LISTING: &str = "zero-orphans-after-kill-9.txt";
 
-/// The CI test job keeps `ORPHANS_LISTING` on each of its runners: a step
-/// after the test run, which runs after a failing test too and on every
-/// runner of the matrix, uploads it from `target/tmp`, where cargo's
-/// `CARGO_TARGET_TMPDIR` points in that job, under a name per runner, fails
-/// when the file is missing once the tests have passed, and replaces it on a
-/// re-run of the job. After a failing test it only warns of a missing file:
-/// cargo stops at the first test binary that fails, and one that runs before
-/// the thesis tests leaves no listing.
+/// The CI thesis job, which asserts the 100 ms bound in a release build,
+/// keeps `ORPHANS_LISTING` on each of its runners: a step after its gates,
+/// which runs after a failing gate too and on every runner of the matrix,
+/// uploads it from `target/tmp`, where cargo's `CARGO_TARGET_TMPDIR` points
+/// in that job, under a name per runner, fails when the file is missing once
+/// the gates have passed, and replaces it on a re-run of the job. After a
+/// failing gate it only warns of a missing file, as a release build that
+/// failed leaves none.
 #[test]
 fn ci_keeps_the_orphan_listing_on_each_runner() {
-    let job = ci_job("test");
-    let tests = job.iter().position(|line| line.trim() == "run: cargo test --workspace --locked").expect("the test job runs no tests");
+    let job = ci_job("thesis");
+    let gate = "cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1";
+    let gates = job.iter().position(|line| line.trim() == gate).expect("the thesis job runs no thesis gates");
     let path = format!("path: target/tmp/{ORPHANS_LISTING}");
-    let kept = job.iter().position(|line| line.trim() == path).expect("the test job keeps no orphan listing");
-    assert!(tests < kept, "the test job keeps the listing before its tests write it");
-    assert!(step_keys(&job, tests).contains(&"id: test"), "the step that runs the tests has no `id: test` for the listing's step to read");
+    let kept = job.iter().position(|line| line.trim() == path).expect("the thesis job keeps no orphan listing");
+    assert!(gates < kept, "the thesis job keeps the listing before its gates write it");
+    assert!(step_keys(&job, gates).contains(&"id: gates"), "the gates step has no `id: gates` for the listing's step to read");
     let keys = step_keys(&job, kept);
     let wanted = [
         "if: ${{ !cancelled() }}",
         "name: zero-orphans-after-kill-9-${{ matrix.os }}",
-        "if-no-files-found: ${{ steps.test.outcome == 'success' && 'error' || 'warn' }}",
+        "if-no-files-found: ${{ steps.gates.outcome == 'success' && 'error' || 'warn' }}",
         "overwrite: true",
     ];
     for key in wanted {
@@ -3546,48 +3567,105 @@ fn ci_keeps_the_orphan_listing_on_each_runner() {
     assert!(keys.iter().any(|key| key.starts_with("uses: actions/upload-artifact@")), "{keys:?}");
 }
 
-/// Zero orphans after kill -9: 500 ms after an openmax is killed outright,
-/// with no launch since, no process of a tool tree it left is running, and
-/// neither is the watcher its first tool started. The method is
-/// `assert_no_orphans_after_kill_9`'s, on a run whose HOME holds its data
-/// directory; this run's listing is the one CI keeps.
+/// The target: every process of a tool tree a killed run left, and the
+/// run's watcher, gone within 100 ms of the SIGKILL.
+const ORPHANS_GONE_WITHIN: Duration = Duration::from_millis(100);
+
+/// How `assert_no_orphans_after_kill_9` starts and kills its run.
+#[cfg(unix)]
+struct Kill9 {
+    /// HOME holds the run's data directory; without it, that is the relative
+    /// `.openmax` (`run_one_bash_call`).
+    home: bool,
+    /// SIGKILL goes to the run's whole process group, as a shell's
+    /// `kill -9 %1` sends it to a job, not to its pid alone: a watcher in
+    /// that group would die with the run.
+    group: bool,
+    /// The run starts from a binary removed before its first tool
+    /// (`run_one_bash_call`).
+    removed: bool,
+}
+
+/// Zero orphans after kill -9: within 100 ms of the SIGKILL that kills an
+/// openmax outright, with no launch since, no process of a tool tree it
+/// left is running, and neither is the watcher its first tool started. The
+/// signal goes to the run's whole process group, as a shell sends it to a
+/// job, and the watcher, which leads a session of its own, is out of its
+/// reach. The method is `assert_no_orphans_after_kill_9`'s, on a run whose
+/// HOME holds its data directory; this run's listing is the one CI keeps.
 #[cfg(unix)]
 #[test]
 fn zero_orphans_after_kill_9() {
-    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", true, Some(ORPHANS_LISTING));
+    let kill = Kill9 { home: true, group: true, removed: false };
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", kill, Some(ORPHANS_LISTING));
 }
 
-/// The same for a run with no HOME, whose data directory is therefore the
-/// relative `.openmax`, in the directory it runs in, while its watcher runs
-/// in `/`: the watcher must be given the record's absolute path to find it.
+/// The same for `kill -9 <pid>` of a run with no HOME, whose data directory
+/// is therefore the relative `.openmax`, in the directory it runs in, while
+/// its watcher runs in `/`: the watcher must be given the record's absolute
+/// path to find it.
 #[cfg(unix)]
 #[test]
 fn zero_orphans_after_kill_9_with_no_home() {
-    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_with_no_home", false, None);
+    let kill = Kill9 { home: false, group: false, removed: false };
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_with_no_home", kill, None);
+}
+
+/// The same for a run whose binary an upgrade replaced before its first
+/// tool. Its path then reads `<path> (deleted)`, which no exec finds, so the
+/// watcher runs the binary the run runs, `/proc/self/exe`. macOS has no such
+/// name: there the next launch stops such a run's tools (docs/usage.md).
+#[cfg(target_os = "linux")]
+#[test]
+fn zero_orphans_after_kill_9_once_its_binary_is_replaced() {
+    let kill = Kill9 { home: true, group: false, removed: true };
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_once_its_binary_is_replaced", kill, None);
+}
+
+/// When each of `pids` read as gone after `since`, polled every millisecond
+/// for up to `wait`, or None for one still found then.
+#[cfg(unix)]
+fn gone_after(pids: &[i32], since: Instant, wait: Duration) -> Vec<Option<Duration>> {
+    let mut gone = vec![None; pids.len()];
+    while gone.contains(&None) && since.elapsed() < wait {
+        for (at, &pid) in gone.iter_mut().zip(pids) {
+            if at.is_none() && !alive(pid) {
+                *at = Some(since.elapsed());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    gone
 }
 
 /// Kill a print run outright in the middle of a `bash` call whose tree only
-/// SIGKILL ends, and assert that 500 ms later, with no launch since, no
-/// process of the tree is running, nor the watcher the run's first tool
-/// started, found before the kill. `name` is the run's prompt, its install's
-/// tag and its listing's first word, `home` is as `run_one_bash_call` takes
-/// it, and the listing is written to `listing_file` under the target
-/// directory's `tmp` when that is given.
+/// SIGKILL ends, and assert that, with no launch since, each process of the
+/// tree is gone within `ORPHANS_GONE_WITHIN` of the signal, and so is the
+/// watcher the run's first tool started, found before the kill and leading
+/// a session of its own; and that none of the tree is gone before
+/// `LEFT_BEHIND_GRACE` has passed, since the watcher sends the SIGTERM the
+/// tree ignores first and SIGKILL only once that grace ends. `name` is the
+/// run's prompt, its install's tag and its listing's first word, `kill` says
+/// how the run starts and is killed, and the listing is written to
+/// `listing_file` under the target directory's `tmp` when that is given.
 ///
 /// Method: the call's shell ignores SIGTERM, writes its pid, starts a
 /// subshell in the background, writes that pid and waits; the subshell
 /// starts a sleeper, the shell's grandchild, writes its pid and waits, and
 /// each inherits the ignored SIGTERM. Once the three pids are written and the
 /// run's record lists the shell's group, this waits for the run's watcher,
-/// which the record's first write starts, then sends the run SIGKILL and
-/// waits for it, as the shell that started it would. 500 ms after the signal
-/// it counts the processes of the tree, and the watcher, that `kill(pid, 0)`
-/// still finds, a zombie its new parent has not collected among them, and
-/// lists each pid with whether it was found. The gate is zero, a count
-/// asserted in every build, and a watcher found before the kill.
+/// which the record's first write starts, then sends SIGKILL and waits for
+/// the run, as the shell that started it would. From the signal on, it polls
+/// each process of the tree and the watcher every millisecond for up to 5
+/// seconds with `kill(pid, 0)`, which finds a zombie its new parent has not
+/// collected, so each reads as gone once it has exited and been collected,
+/// and lists each pid with when it did. A release build, as CI's thesis job
+/// runs it, asserts the bound; a debug build asserts 20 times it, as the
+/// whole suite runs beside it, and prints the times.
 #[cfg(unix)]
-fn assert_no_orphans_after_kill_9(name: &str, home: bool, listing_file: Option<&str>) {
-    let (mut run, base, record) = run_one_bash_call(name, home, |base| {
+fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<&str>) {
+    use open_max_core::execution::LEFT_BEHIND_GRACE;
+    let (mut run, base, record) = run_one_bash_call(name, kill.home, kill.removed, |base| {
         let p = base.join("pids");
         let p = p.display();
         format!("trap '' TERM; echo $$ >> '{p}'; (sleep 6845 & echo $! >> '{p}'; wait) & echo $! >> '{p}'; wait")
@@ -3612,38 +3690,49 @@ fn assert_no_orphans_after_kill_9(name: &str, home: bool, listing_file: Option<&
         std::thread::sleep(Duration::from_millis(5));
     };
     let watcher = watchers_of(&record).first().copied();
-    unsafe { libc::kill(run.id() as libc::pid_t, libc::SIGKILL) };
+    let session = watcher.map(|pid| unsafe { libc::getsid(pid) });
+    let target = run.id() as libc::pid_t;
+    unsafe { libc::kill(if kill.group { -target } else { target }, libc::SIGKILL) };
     let killed = Instant::now();
     run.wait().unwrap();
-    std::thread::sleep(Duration::from_millis(500).saturating_sub(killed.elapsed()));
-    let survivors: Vec<i32> = tree.iter().copied().filter(|&pid| alive(pid)).collect();
-    let watcher_left = watcher.is_some_and(alive);
-    let state = |pid: i32| if survivors.contains(&pid) || (watcher_left && watcher == Some(pid)) { "alive" } else { "gone" };
-    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let watched: Vec<i32> = tree.iter().copied().chain(watcher).collect();
+    let gone = gone_after(&watched, killed, Duration::from_secs(5));
+    let (bound, build) =
+        if cfg!(debug_assertions) { (ORPHANS_GONE_WITHIN * 20, "debug") } else { (ORPHANS_GONE_WITHIN, "release") };
+    let ms = |time: Duration| format!("{:.1} ms", time.as_secs_f64() * 1e3);
     let mut listing = format!(
-        "{name} on {}, {build} build: each process of the tool tree and the watcher of a print run that got \
-         SIGKILL, 500 ms after the signal, with no launch since\n",
-        std::env::consts::OS
+        "{name} on {}, {build} build: SIGKILL to a print run's {}, with no launch since; when each process of its \
+         tool tree, which ignores SIGTERM, and its watcher read as gone, exited and collected, polled every \
+         millisecond; bound {}, grace {}\n",
+        std::env::consts::OS,
+        if kill.group { "process group" } else { "pid" },
+        ms(bound),
+        ms(LEFT_BEHIND_GRACE)
     );
-    for (n, &pid) in tree.iter().enumerate() {
-        listing.push_str(&format!("{} {pid} {}\n", if n == 0 { "shell" } else { "descendant" }, state(pid)));
+    for (n, (&pid, time)) in watched.iter().zip(&gone).enumerate() {
+        let role = if n == tree.len() { "watcher" } else if n == 0 { "shell" } else { "descendant" };
+        let when = time.map_or("running 5 s after the kill".into(), |time| format!("gone {} after the kill", ms(time)));
+        listing.push_str(&format!("{role} {pid} {when}\n"));
     }
-    listing.push_str(&watcher.map_or("watcher none\n".into(), |pid| format!("watcher {pid} {}\n", state(pid))));
-    for &pid in survivors.iter().chain(watcher.iter().filter(|_| watcher_left)) {
+    if watcher.is_none() {
+        listing.push_str("watcher none\n");
+    }
+    for (&pid, _) in watched.iter().zip(&gone).filter(|(_, time)| time.is_none()) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     let _ = std::fs::remove_dir_all(&base);
     if let Some(file) = listing_file {
         std::fs::write(Path::new(env!("CARGO_TARGET_TMPDIR")).join(file), &listing).unwrap();
     }
-    println!(
-        "{name}: {} of the tool tree's {} processes running 500 ms after the kill with no launch since",
-        survivors.len(),
-        tree.len()
-    );
-    assert!(survivors.is_empty(), "the tool tree outlived its killed run by 500 ms: {survivors:?}\n{listing}");
+    print!("{listing}");
     assert!(watcher.is_some(), "the run's first tool started no watcher\n{listing}");
-    assert!(!watcher_left, "the watcher outlived its killed run by 500 ms\n{listing}");
+    assert_eq!(session, watcher, "the watcher does not lead a session of its own\n{listing}");
+    assert!(gone.iter().all(|time| time.is_some_and(|time| time < bound)), "a process outlived its killed run by {}\n{listing}", ms(bound));
+    assert!(
+        gone[..tree.len()].iter().flatten().all(|&time| time >= LEFT_BEHIND_GRACE),
+        "a process of the tree, which ignores SIGTERM, was gone before the {} grace had passed\n{listing}",
+        ms(LEFT_BEHIND_GRACE)
+    );
 }
 
 /// A run's watcher ends with the run. A print run whose `bash` call writes
@@ -3654,7 +3743,7 @@ fn assert_no_orphans_after_kill_9(name: &str, home: bool, listing_file: Option<&
 #[cfg(unix)]
 #[test]
 fn a_runs_watcher_ends_with_the_run() {
-    let (mut run, base, record) = run_one_bash_call("watcher", true, |base| {
+    let (mut run, base, record) = run_one_bash_call("watcher", true, false, |base| {
         let (shell, go) = (base.join("shell"), base.join("go"));
         format!("echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.01; done", shell.display(), go.display())
     });
