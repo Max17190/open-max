@@ -1172,7 +1172,7 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         totals[runs / 10],
         totals[runs * 9 / 10],
         breakdown.join(", "),
-        if gated { "asserted" } else { "printed off macOS on Apple silicon, and in debug" },
+        if gated { "asserted" } else { "asserted only by a release build on macOS on Apple silicon" },
         instructions.map_or("uncounted".to_string(), |n| (n / runs as u64).to_string()),
         if cfg!(debug_assertions) { "debug" } else { "release" },
     );
