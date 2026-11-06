@@ -1,4 +1,4 @@
-//! Thesis gates for the agent loop: one test per target, named after it.
+//! Thesis gates for the agent loop, each named for what it asserts.
 //!
 //! Byte and count gates assert unconditionally. Each test's doc comment
 //! states what it measures and how.
@@ -130,7 +130,7 @@ const REPOSITORY_TREE: [&str; 17] = [
 /// repeat file contents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frozen_prefix_is_under_700_tokens() {
-    frozen_prefix_case(false).await;
+    frozen_prefix_case("frozen_prefix_is_under_700_tokens", false).await;
 }
 
 /// The Responses prefix includes its additional_tools envelope. With the same
@@ -139,10 +139,11 @@ async fn frozen_prefix_is_under_700_tokens() {
 /// its JSON dialect has a different bytes-per-token ratio. No runtime tokenizer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_frozen_prefix_is_under_700_tokens() {
-    frozen_prefix_case(true).await;
+    frozen_prefix_case("responses_frozen_prefix_is_under_700_tokens", true).await;
 }
 
-async fn frozen_prefix_case(responses: bool) {
+/// The frozen prefix gate `gate`, over the Responses API when `responses`.
+async fn frozen_prefix_case(gate: &str, responses: bool) {
     let dir = std::env::temp_dir().join(format!("omx-thesis-{}", uuid::Uuid::new_v4()));
     let data = dir.join("data");
     let project = dir.join("project");
@@ -218,8 +219,8 @@ async fn frozen_prefix_case(responses: bool) {
     const BYTES_PER_TOKEN_TENTHS: usize = 44;
     let cap = if responses { 3046 } else { (TARGET_TOKENS - PATH_ALLOWANCE_TOKENS) * BYTES_PER_TOKEN_TENTHS / 10 };
     println!(
-        "MEASURE frozen_prefix_path_free_bytes {bytes} (responses={responses}) = {system_path_free} messages[0] without the \
-         {}-byte project path + {} tools + {} execution policy note; cap {cap}",
+        "MEASURE {gate} {bytes} path-free bytes = {system_path_free} messages[0] without the {}-byte project path + {} \
+         tools + {} execution policy note; cap {cap} bytes, the {TARGET_TOKENS}-token target's calibration",
         root.len(),
         tools.len(),
         note.len(),
@@ -502,7 +503,7 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// so it holds in debug and release alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case(WireApi::ChatCompletions, 85.0).await;
+    cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0).await;
 }
 
 /// The same session over the Responses API, whose `input` carries the
@@ -510,14 +511,14 @@ async fn a_session_prompt_is_75_percent_cacheable() {
 /// in the order sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_responses_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case(WireApi::Responses, 85.0).await;
+    cacheable_share_case("a_responses_session_prompt_is_75_percent_cacheable", WireApi::Responses, 85.0).await;
 }
 
 /// The same session over native Messages, whose prompt cache covers `tools`,
 /// then `system`, then `messages`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_messages_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case(WireApi::Anthropic, 83.8).await;
+    cacheable_share_case("a_messages_session_prompt_is_75_percent_cacheable", WireApi::Anthropic, 83.8).await;
 }
 
 /// One scripted reply of the cacheable-prefix gate's session.
@@ -631,9 +632,9 @@ impl Prompt {
     }
 }
 
-/// The cacheable-prefix gate's session over `wire`, held to `ratchet`
-/// percent.
-async fn cacheable_share_case(wire: WireApi, ratchet: f64) {
+/// The session of the cacheable-prefix gate `gate` over `wire`, held to
+/// `ratchet` percent.
+async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64) {
     use serde_json::json;
     const TARGET_PERCENT: f64 = 75.0;
     // The index of the compaction's summary request, the 20th; the one after
@@ -798,7 +799,7 @@ async fn cacheable_share_case(wire: WireApi, ratchet: f64) {
     let (served, sent) = (tokens(&cacheable), tokens(&sizes));
     let share = 100.0 * served as f64 / sent as f64;
     println!(
-        "MEASURE cacheable_prefix_share {name}: {share:.2}% = {served} of {sent} prompt tokens ({} of {} bytes) over {} requests; \
+        "MEASURE {gate} {share:.2}% ({name}) = {served} of {sent} prompt tokens ({} of {} bytes) over {} requests; \
          cold after the first: {cold:?} (the compaction's summary); ratchet {ratchet:.1}%, target {TARGET_PERCENT}%",
         cacheable.iter().sum::<usize>(),
         sizes.iter().sum::<usize>(),

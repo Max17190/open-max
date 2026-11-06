@@ -695,7 +695,7 @@ fn main() -> std::io::Result<std::process::ExitCode> {
 /// default runtime starts one worker per core, each with a stack and a run
 /// queue of its own, for work that keeps one busy: on a 10-core machine,
 /// about 240 KiB of a two-round turn's peak RSS (see
-/// `headless_turn_peak_rss_is_under_four_megabytes`).
+/// `headless_turn_peak_rss_stays_under_its_ratchet`).
 const HEADLESS_WORKERS: usize = 1;
 
 /// The worker threads of the runtime `main` starts for `cli`: one for a print

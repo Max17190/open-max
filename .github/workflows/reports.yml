@@ -1,0 +1,125 @@
+name: Reports
+
+# What CI's runners measure without gating it: the thesis tests a runner
+# does not meet with room, which ci.yml's thesis job skips there (the
+# `reported` lists of its matrix, repeated here), and the whole suite's wall
+# time on macos-latest, which ci.yml's Suite time job gates on ubuntu-latest
+# alone. Each target reports until a runner meets it with room, then gates
+# there. So this workflow measures them every night on main and on demand on
+# any branch (`gh workflow run reports.yml --ref <branch>`), and never on a
+# pull request, whose gate holds only steps that can fail it, or on a push to
+# main, where it would start two more macOS jobs beside the ones CI and the
+# Release build start, holding the macOS runners a pull request's run waits
+# for. Each job puts its numbers in its summary and fails only when it could
+# not measure, so a failed run here is a measurement that broke, not a target
+# missed. Each job repeats the build of a ci.yml job, so it restores the cache
+# that job saves on main and saves none of its own: the repository's cache
+# space holds no second copy. crates/tui/tests/thesis.rs holds this wiring.
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every action is pinned to a full commit SHA, with its release in a trailing
+# comment, as ci.yml explains.
+jobs:
+  # Over ci.yml's thesis job's first runs, six on ubuntu-latest and seven on
+  # macos-latest, the runners took about twice as long as the reference
+  # machine, an Apple M5, on the same single-threaded work, a transcript
+  # frame, and from one run to the next their times swung by more than the
+  # targets' room. The harness time per tool round, a median of 156 to 186 us
+  # on the M5 against its 250 us target, measured 237 to 374 us on
+  # ubuntu-latest and 260 to 659 us on macos-latest. The frame's p99 at
+  # 100,000 lines, 0.074 to 0.090 ms on the M5 against 0.5 ms, measured 0.157
+  # to 0.240 ms on ubuntu-latest, where it gates, and 0.151 to 0.504 ms on
+  # macos-latest, past the bound in two runs and within a fifth of it in two
+  # more, while its median held at 0.118 to 0.169 ms. In CI's last 40
+  # runs before these reports left it, a runner's reported tests missed a
+  # target in 54 of its 80 thesis jobs.
+  thesis-reports:
+    name: Thesis reports (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            reported: harness_time_per_tool_round
+          - os: macos-latest
+            reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: thesis
+          save-if: false
+
+      # What the report runs, so it builds nothing under its timeout.
+      - name: Build release tests
+        run: cargo test --release --workspace --locked --no-run --test 'thesis*' --bin openmax
+
+      # In release and one test at a time, as the thesis job runs its gates,
+      # each MEASURE line copied to the summary with cargo's exit status: a
+      # test that missed its target is reported, and one that printed no
+      # MEASURE line measured nothing and fails the step.
+      - name: Report the thesis tests this runner does not gate
+        timeout-minutes: 10
+        run: |
+          cargo test --release --workspace --locked --test 'thesis*' --bin openmax --no-fail-fast -- --test-threads=1 --nocapture ${{ matrix.reported }} 2>&1 | tee "$RUNNER_TEMP/reports.log"
+          status=${PIPESTATUS[0]}
+          sed -n 's/.*MEASURE /MEASURE /p' "$RUNNER_TEMP/reports.log" > "$RUNNER_TEMP/measured.txt"
+          { echo "Reported, not gated, on ${{ matrix.os }}; cargo test exited $status:"; echo '```'; cat "$RUNNER_TEMP/measured.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          for test in ${{ matrix.reported }}; do
+            grep -q "^MEASURE $test " "$RUNNER_TEMP/measured.txt" || { echo "::error::$test printed no MEASURE line, so it measured nothing"; missing=1; }
+          done
+          exit ${missing:-0}
+
+  # macos-latest's 3 shared cores ran the suite in 12.5 to 33.7 seconds in
+  # the 32 CI runs that measured it, over its 20-second budget
+  # (4 times the target) in 19, and in all but one some test binary failed
+  # beside the others and passed when run again alone. Five runs after one
+  # build give the median and the slowest, and each run's line counts the
+  # binaries that passed only alone. The check runs as it would outside
+  # GitHub Actions, so a run over the budget prints its line, not an error.
+  suite-time:
+    name: Suite time (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      # What the report runs, so it builds nothing under its timeout.
+      - name: Build the tests
+        run: cargo test --workspace --locked --no-run
+
+      - name: Report the suite time
+        timeout-minutes: 15
+        run: |
+          env -u GITHUB_ACTIONS scripts/check-suite-time.sh --runs 5 4 2>&1 | tee "$RUNNER_TEMP/suite-time.log"
+          status=${PIPESTATUS[0]}
+          { echo "Reported, not gated, on macos-latest; the check exited $status:"; echo '```'; grep -E '^(run [0-9]+ of 5: |median )' "$RUNNER_TEMP/suite-time.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          grep -q '^median .* over 5 runs,' "$RUNNER_TEMP/suite-time.log" || { echo "::error::the suite did not run 5 times, so it measured nothing"; exit 1; }
