@@ -309,10 +309,11 @@ impl Block {
 
     /// Show the block folded or open. The copy text follows the view (the
     /// card while folded, the output while open); the wrap does too, at the
-    /// next `ensure_cache`. A tool's open view is built as it opens and
-    /// dropped as it folds: most cards are never opened, and every card
-    /// holding its output a second time, as styled lines, was a third of
-    /// what the 1,000,000-line test session's transcript held.
+    /// next `ensure_cache`, in place of the other view's. A tool's open view
+    /// is built as it opens and dropped as it folds: most cards are never
+    /// opened, and every card holding its output a second time, as styled
+    /// lines, was a third of what the 1,000,000-line test session's
+    /// transcript held.
     fn set_folded(&mut self, folded: bool) {
         self.folded = folded;
         if let (Some(compact), Some(output)) = (&self.compact, &self.full_output) {
@@ -321,7 +322,6 @@ impl Block {
         }
         self.selectable = lines_to_plain(self.source_lines());
         self.selectable_chars = self.selectable.chars().count();
-        self.invalidate();
     }
 
     fn ensure_cache(&mut self, width: u16) {
@@ -350,9 +350,8 @@ impl Block {
         self.cache_maps.push(None);
     }
 
-    /// Drop the wrap and free it. Unless the fold changed too, the height
-    /// it measured stays exact at this width, and wrapping again yields the
-    /// same rows.
+    /// Drop the wrap and free it. A height the wrap measured at this width
+    /// stays exact: wrapping again yields the same rows.
     fn invalidate(&mut self) {
         self.cache_width = 0;
         self.cache = Vec::new();
@@ -479,10 +478,10 @@ pub struct Transcript {
     /// navigation find the nearest prompt by binary search instead of
     /// walking back through every block since it.
     users: Vec<usize>,
-    /// Each wrap a block took, oldest first, by block id with the rows it
-    /// held, and their sum: what [`Self::settle_view`] holds to
-    /// [`WRAP_BUDGET`].
-    wraps: std::collections::VecDeque<(u64, usize)>,
+    /// The blocks holding a wrap, by id, in the order they took it, and the
+    /// rows those wraps hold: what [`Self::settle_view`] holds to
+    /// [`WRAP_BUDGET`]. A block wrapped again keeps its one entry.
+    wraps: std::collections::VecDeque<u64>,
     wrapped_rows: usize,
     /// Rows across all blocks (sum of their heights), kept current by every
     /// height change.
@@ -585,6 +584,8 @@ impl Transcript {
         let removed = self.blocks.remove(i);
         self.users.pop();
         self.total -= removed.height;
+        self.wraps.retain(|&id| id != removed.id);
+        self.wrapped_rows -= removed.cache.len();
         // The blocks after it moved up one: index them again. No node
         // before `i` sums a block after it, so the rest of the tree holds.
         self.index.0.truncate(i);
@@ -640,9 +641,9 @@ impl Transcript {
             }
             self.width = width;
             #[cfg(test)]
-            if self.eager && width > 0 {
-                for block in &mut self.blocks {
-                    block.ensure_cache(width);
+            if self.eager {
+                for bi in 0..self.blocks.len() {
+                    self.ensure_wrap(bi);
                 }
             }
             // The offset is left for the draw path to clamp against the
@@ -715,16 +716,19 @@ impl Transcript {
     }
 
     /// Wrap block `bi` at the current width unless it already is or there
-    /// is no width yet, counting the rows its wrap holds (see
-    /// [`Self::settle_view`]).
+    /// is no width yet, counting the rows its wrap holds in place of any
+    /// wrap it replaces, at another width or fold (see [`Self::settle_view`]).
     fn ensure_wrap(&mut self, bi: usize) {
         let block = &mut self.blocks[bi];
         if self.width == 0 || block.is_wrapped_at(self.width) {
             return;
         }
+        let replaced = block.cache.len();
         block.ensure_cache(self.width);
-        self.wraps.push_back((block.id, block.cache.len()));
-        self.wrapped_rows += block.cache.len();
+        if replaced == 0 {
+            self.wraps.push_back(block.id);
+        }
+        self.wrapped_rows = self.wrapped_rows + block.cache.len() - replaced;
     }
 
     fn set_height(&mut self, bi: usize, height: usize) {
@@ -792,23 +796,20 @@ impl Transcript {
             if self.wrapped_rows <= budget {
                 break;
             }
-            let Some((id, rows)) = self.wraps.pop_front() else {
+            let Some(id) = self.wraps.pop_front() else {
                 break;
             };
             match self.blocks.binary_search_by_key(&id, |block| block.id) {
-                Ok(bi) if view.is_some_and(|(first, last)| (first..=last).contains(&bi)) => {
-                    self.wraps.push_back((id, rows));
-                }
-                found => {
-                    self.wrapped_rows -= rows;
-                    if let Ok(bi) = found {
-                        self.blocks[bi].invalidate();
-                        #[cfg(test)]
-                        {
-                            self.dropped_wraps += 1;
-                        }
+                Ok(bi) if view.is_some_and(|(first, last)| (first..=last).contains(&bi)) => self.wraps.push_back(id),
+                Ok(bi) => {
+                    self.wrapped_rows -= self.blocks[bi].cache.len();
+                    self.blocks[bi].invalidate();
+                    #[cfg(test)]
+                    {
+                        self.dropped_wraps += 1;
                     }
                 }
+                Err(_) => {}
             }
         }
     }
@@ -2981,6 +2982,66 @@ mod tests {
         assert!(t.wrapped_rows <= BUDGET, "{} rows of wraps counted, budget {BUDGET}", t.wrapped_rows);
         assert!(t.len() > t.blocks.len() * 5 / 2, "the replies did not wrap past their estimates");
         assert_eq!(t.len(), eager.len(), "a dropped wrap took its exact height with it");
+    }
+
+    /// The wrap budget counts exactly the rows the blocks hold, with one
+    /// entry a block, however often the blocks in view wrap again: a resize
+    /// wraps them again at the new width and a fold toggle wraps its card
+    /// again, each in place of the wrap it had, and a removed prompt takes
+    /// its wrap with it. Counting the replaced wraps too grew the count by a
+    /// view's worth at each resize with the view held still: past the
+    /// budget, every frame walked the entries left behind, and every block
+    /// leaving the view lost its wrap at once, to be wrapped again on the
+    /// way back. The budget here sits just over the 40-row view, so opening
+    /// the card, which pushes replies out of the view, drops some of theirs.
+    #[test]
+    fn wraps_taken_again_in_place_count_only_the_rows_held() {
+        let history = || {
+            let mut t = Transcript::new();
+            t.wrap_budget = Some(50);
+            t.set_width(40);
+            for i in 0..200 {
+                t.push_assistant(vec![Line::from(format!("reply {i}, long enough to wrap onto a second row at forty columns"))]);
+            }
+            t.push_user(vec![Line::from("a prompt a hook blocks")]);
+            let output: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+            t.push_tool(vec![Line::from("✓ bash cargo test")], output, true);
+            t.settle_view(40, 0);
+            t
+        };
+        let exact = |t: &Transcript, when: &str| {
+            let held: usize = t.blocks.iter().map(|b| b.cache.len()).sum();
+            let holding = t.blocks.iter().filter(|b| !b.cache.is_empty()).count();
+            assert_eq!(t.wrapped_rows, held, "rows counted against the rows held {when}");
+            assert_eq!(t.wraps.len(), holding, "entries against the blocks holding a wrap {when}");
+        };
+        let mut t = history();
+        let card = t.blocks.len() - 1;
+        exact(&t, "at the first frame");
+        for k in 0..100 {
+            t.set_width(if k % 2 == 0 { 41 } else { 40 });
+            t.settle_view(40, 0);
+            exact(&t, &format!("after resize {k}"));
+            assert!(t.toggle_fold_at(card));
+            t.settle_view(40, 0);
+            exact(&t, &format!("after fold toggle {k}"));
+        }
+        assert!(t.dropped_wraps > 0, "the budget never dropped a wrap");
+        // Two rows up and back, ten times, wraps what it wraps in a history
+        // never resized or toggled.
+        let scroll = |t: &mut Transcript| {
+            let before = block_wraps();
+            for _ in 0..10 {
+                t.scroll_up(2);
+                t.settle_view(40, 0);
+                t.scroll_down(2);
+                t.settle_view(40, 0);
+            }
+            block_wraps() - before
+        };
+        assert_eq!(scroll(&mut t), scroll(&mut history()), "the resizes and toggles cost the scroll its wraps");
+        assert!(t.pop_last_user());
+        exact(&t, "after the prompt is removed");
     }
 
     // Release-only diagnostic for the synchronous resize path: re-measuring
