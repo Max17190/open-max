@@ -762,7 +762,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 #[test]
 fn agent_loop_is_under_2500_lines() -> Result<(), String> {
     const TARGET: usize = 2_500;
-    const BASELINE: usize = 3_967;
+    const BASELINE: usize = 3_354;
     // About 1% of the loop: room for a small fix, not for a feature.
     const MARGIN: usize = 50;
     const RATCHET: usize = BASELINE + MARGIN;
