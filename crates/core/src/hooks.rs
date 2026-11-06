@@ -478,7 +478,11 @@ impl Hooks {
                 ));
                 continue;
             }
-            if considered.iter().any(|c| same_file(c, path)) {
+            // The same spelling first: approved paths are stored canonical,
+            // and so is a listing of a canonical root, so this settles the
+            // usual hook without the two `realpath` calls `same_file` makes
+            // for every listed path before the one that matches.
+            if considered.iter().any(|c| c == path) || considered.iter().any(|c| same_file(c, path)) {
                 continue;
             }
             let winner = stem_of(path)
@@ -1075,9 +1079,9 @@ fn manifest_in_dirs(path: &Path, dirs: &[PathBuf]) -> bool {
         return false;
     }
     let Some(parent) = path.parent() else { return false };
-    dirs.iter().any(|dir| {
-        parent == dir || dir.canonicalize().map(|dir| parent == dir).unwrap_or(false)
-    })
+    // Every spelling before any `realpath`: a global hook's dir is the second.
+    dirs.iter().any(|dir| parent == dir)
+        || dirs.iter().any(|dir| dir.canonicalize().map(|dir| parent == dir).unwrap_or(false))
 }
 
 /// One identity per file, so two spellings of one path compare equal. Approved
@@ -2796,6 +2800,47 @@ mod tests {
             PreToolResult::Allow
         );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Reconciliation settles an approved hook by its path's spelling first
+    /// and resolves both paths only when the spellings differ: approved paths
+    /// are stored canonical, and a listing is canonical only under a
+    /// canonical root. Through either spelling of the same hook dirs the
+    /// verdicts are one: the approved gate runs, a same-stem file nobody
+    /// approved shadows it into a fail-closed block, and deleting it fails
+    /// closed as missing.
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_reaches_one_verdict_through_either_spelling_of_the_hook_dirs() {
+        let real = tempfile_dir().canonicalize().unwrap();
+        let link = PathBuf::from(format!("{}-link", real.display()));
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let data = real.join("data");
+        let (project_hooks, global_hooks) = (real.join("project-hooks"), real.join("global-hooks"));
+        std::fs::create_dir_all(&project_hooks).unwrap();
+        std::fs::create_dir_all(&global_hooks).unwrap();
+        let gate = global_hooks.join("gate.toml");
+        std::fs::write(&gate, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+        approve_hook_file(&real, &data, &gate);
+        let verdicts = |reason: &str| {
+            for root in [&real, &link] {
+                let dirs = [root.join("project-hooks"), root.join("global-hooks")];
+                let hooks = Hooks::discover_dirs(root, &data, &dirs);
+                let closed = hooks.fail_closed_reason().unwrap_or_default();
+                let running = usize::from(reason.is_empty());
+                assert_eq!(hooks.pre_count(), running, "spelled {}: {closed}", root.display());
+                assert!(closed.contains(reason), "spelled {}: {closed:?} lacks {reason:?}", root.display());
+                assert_eq!(closed.is_empty(), reason.is_empty(), "spelled {}: {closed}", root.display());
+            }
+        };
+        verdicts("");
+        std::fs::write(project_hooks.join("gate.toml"), "event = \"post_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
+        verdicts("is shadowed by");
+        std::fs::remove_file(project_hooks.join("gate.toml")).unwrap();
+        std::fs::remove_file(&gate).unwrap();
+        verdicts("an approved hook file was deleted");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     #[test]

@@ -1235,10 +1235,11 @@ impl BoundCode {
 /// upgrade. The threat here is the agent rewriting files it can write.
 pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<BoundCode> {
     let mut out = Vec::new();
+    let root = std::cell::OnceCell::new();
     let command = command.trim();
     match resolve_command(command, project_root) {
         // Agent-writable: the bytes decide.
-        Some(path) if inside_project(&path, project_root) => out.push(read_code(path)),
+        Some(path) if inside_project(&path, project_root, &root) => out.push(read_code(path)),
         // A real file outside the project: the absolute path the human read.
         Some(path) if path.exists() => {}
         // Resolved to nothing, or did not resolve at all. Either way there is
@@ -1258,7 +1259,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
             continue;
         }
         let path = absolute_from(arg, project_root);
-        if path.is_file() && inside_project(&path, project_root) {
+        if path.is_file() && inside_project(&path, project_root, &root) {
             out.push(read_code(path));
         }
     }
@@ -1291,7 +1292,7 @@ pub fn bound_code(command: &str, args: &[String], project_root: &Path) -> Vec<Bo
                 continue;
             }
             let path = absolute_from(arg, project_root);
-            if inside_project(&path, project_root) && !path.is_file() {
+            if !path.is_file() && inside_project(&path, project_root, &root) {
                 out.push(BoundCode { path, sha256: None });
             }
             break; // the first script-like positional is the script
@@ -1363,6 +1364,7 @@ pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) 
         .map(|c| c.path)
         .collect();
     let mut inline = false;
+    let root = std::cell::OnceCell::new();
     for arg in args {
         let arg = arg.trim();
         if INLINE_FLAGS.contains(&arg) {
@@ -1379,7 +1381,7 @@ pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) 
                 continue;
             }
             let path = absolute_from(token, project_root);
-            if path.is_file() && inside_project(&path, project_root) && !bound.contains(&path) {
+            if path.is_file() && inside_project(&path, project_root, &root) && !bound.contains(&path) {
                 return Some(path);
             }
         }
@@ -1491,13 +1493,16 @@ fn canonical_or(path: &Path) -> PathBuf {
 /// Whether `path` sits inside the project, and is therefore agent-writable.
 /// Judged both lexically and through symlinks: a symlink inside the project
 /// cannot carry its content out of the agent's reach, and one pointing in
-/// from outside still names content the agent can rewrite.
-fn inside_project(path: &Path, project_root: &Path) -> bool {
-    let root = canonical_or(project_root);
-    if path.starts_with(&root) || path.starts_with(project_root) {
+/// from outside still names content the agent can rewrite. `root` holds the
+/// project's canonical spelling, resolved once for all of one caller's paths
+/// and only when the lexical check leaves one open: each `realpath` costs
+/// microseconds, and every hook discovery binds every hook.
+fn inside_project(path: &Path, project_root: &Path, root: &std::cell::OnceCell<PathBuf>) -> bool {
+    if path.starts_with(project_root) {
         return true;
     }
-    canonical_or(path).starts_with(&root)
+    let root = root.get_or_init(|| canonical_or(project_root));
+    path.starts_with(root) || canonical_or(path).starts_with(root)
 }
 
 // ---------- usage accounting ----------
@@ -2241,6 +2246,33 @@ mod tests {
         let bound = bound_code(&outside.join("into.sh").display().to_string(), &[], &root);
         assert_eq!(bound.len(), 1, "a symlink pointing into the project still names project code");
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The lexical check settles a path under the root as written; the
+    /// canonical root is resolved once, only for a path it leaves open. Code
+    /// named by its canonical path under a root spelled through a symlink,
+    /// and code named through the link under the canonical root, both bind,
+    /// and a script outside the project binds under neither.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_spelled_through_a_symlink_binds_the_same_code() {
+        let real = temp("spelled-proj").canonicalize().unwrap();
+        let link = PathBuf::from(format!("{}-link", real.display()));
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let outside = temp("spelled-outside");
+        std::fs::write(real.join("run.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::write(outside.join("host.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        let script = |dir: &Path, name: &str| vec![dir.join(name).display().to_string()];
+        let sha = Some(sha256_hex(b"#!/bin/sh\ntrue\n"));
+        for (root, spelled) in [(&link, &real), (&real, &link)] {
+            let bound = bound_code("sh", &script(spelled, "run.sh"), root);
+            assert_eq!(bound.len(), 1, "root {}, script under {}", root.display(), spelled.display());
+            assert_eq!(bound[0].sha256, sha);
+            assert!(bound_code("sh", &script(&outside, "host.sh"), root).is_empty(), "host code is the manifest's");
+        }
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
         let _ = std::fs::remove_dir_all(&outside);
     }
 
