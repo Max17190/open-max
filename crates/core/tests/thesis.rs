@@ -906,7 +906,8 @@ arg_regex = 'sudo\s'
 /// third forwarding a credential, every fifth mutating), each running a script
 /// beside it; 30 skills over a 4 KB body, a third each with a one-line, a
 /// folded and a quoted description beside a nested `metadata:` block; 10
-/// prompt templates; 10 hooks over every event, each running a script; and 10
+/// prompt templates; 10 hooks over every event, each running a script through
+/// `/bin/sh` (named whole, so no load depends on the length of PATH); and 10
 /// permission rules in the two policy files. A human approved every hook and
 /// both policy files, as `openmax --approve` records it, so a session in ask
 /// mode runs every one. Returns the fixture's directory, its data dir and its
@@ -981,7 +982,7 @@ fn hundred_extensions() -> (PathBuf, PathBuf, PathBuf) {
         let script = format!("scripts/hook-{i:02}.sh");
         write(&dir.join(&script), "#!/bin/sh\ncat > /dev/null\nexit 0\n");
         let mut manifest =
-            format!("event = \"{event}\"\ncommand = \"sh\"\nargs = [\"{}\"]\ntimeout_secs = 5\n", named.join(&script).display());
+            format!("event = \"{event}\"\ncommand = \"/bin/sh\"\nargs = [\"{}\"]\ntimeout_secs = 5\n", named.join(&script).display());
         if event.ends_with("_tool_use") {
             manifest.push_str("tool = \"bash\"\n");
         }
@@ -1028,6 +1029,38 @@ fn instructions_retired() -> Option<u64> {
     None
 }
 
+/// 100 discovered extensions parsed and registered in under 10 ms: what a
+/// session's first turn and `/reload` do with `hundred_extensions`, timed
+/// in process. One load is the registry's build (every tool manifest and
+/// skill read, hashed, parsed, validated and registered as the tools array),
+/// the prompt that indexes the skills, the hook discovery with its approval
+/// check, the permission rules and the prompt templates, in ask mode, where
+/// the approval checks run. Before timing anything the test checks that a
+/// load registers every extension and that every hook and rule is in force.
+///
+/// Method: 101 loads in a release build (5 in debug), each after a read of
+/// the floor, which lists every extension directory and reads every file a
+/// load parses; the median load, the median of each load's time over the
+/// floor read just before it, each part's median, and on macOS the
+/// instructions retired per load. Reading is the part of a load no loader
+/// can skip, so the ratio is the harness's own work in units of the machine
+/// it runs on: across three runs at full speed and under the utility and
+/// background QoS clamps, which put the same work on cores three times
+/// slower, the ratio stayed within 2.78 to 2.88 while the load went from
+/// 2.97 to 10.8 ms.
+///
+/// Measured on the reference machine (Apple M5) in release, the median load
+/// was 5.47 ms before the parse checked example patterns instead of
+/// compiling them, hashing used the CPU's SHA-256 instructions, and hook
+/// reconciliation and code binding stopped resolving every path they
+/// compared (registry 2.72 ms, prompt 0.37, hooks 1.75, permissions 0.46,
+/// templates 0.17; about 100M instructions), and 2.97 ms after (registry
+/// 1.52, prompt 0.29, hooks 0.60, permissions 0.42, templates 0.14; about
+/// 58.5M instructions). A release build asserts the 10 ms target on the
+/// median everywhere and, on macOS on Apple silicon, where the ratio was
+/// measured, a ratchet on it 10% over the measurement, rounded up to a
+/// tenth; elsewhere it prints the ratio. A debug build asserts a 20x sanity
+/// bound on the median.
 #[test]
 fn a_hundred_extensions_load_in_under_10_ms() {
     use open_max_core::config::ApprovalMode;
@@ -1036,6 +1069,9 @@ fn a_hundred_extensions_load_in_under_10_ms() {
     use open_max_core::registry::Registry;
     use std::time::{Duration, Instant};
     const TARGET: Duration = Duration::from_millis(10);
+    const RATIO_MEASURED: f64 = 2.88;
+    let ratchet = (RATIO_MEASURED * 1.1 * 10.0).ceil() / 10.0;
+    let gated = cfg!(all(target_os = "macos", target_arch = "aarch64")) && !cfg!(debug_assertions);
     let runs = if cfg!(debug_assertions) { 5 } else { 101 };
     let (dir, data, project) = hundred_extensions();
     let load = || {
@@ -1052,6 +1088,29 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         let done = Instant::now();
         let phases = [built - started, prompted - built, hooked - prompted, permitted - hooked, done - permitted];
         ((registry, prompt, hooks, permissions, templates), done - started, phases)
+    };
+    // The files a load parses, as its loaders find them: tool and hook
+    // manifests, each skill's SKILL.md, the templates, the two policy files.
+    let floor = || {
+        let started = Instant::now();
+        let mut read = 0;
+        for (tier, kinds) in [(&project, [".openmax/tools", ".agents/skills", ".agents/prompts", ".openmax/hooks"]), (&data, ["tools", "skills", "prompts", "hooks"])] {
+            for kind in kinds {
+                let mut listed: Vec<PathBuf> = std::fs::read_dir(tier.join(kind)).unwrap().map(|entry| entry.unwrap().path()).collect();
+                listed.sort();
+                for path in listed {
+                    let path = if kind.ends_with("skills") { path.join("SKILL.md") } else { path };
+                    if path.extension().is_some_and(|e| e == "toml" || e == "md") {
+                        read += std::fs::read(&path).unwrap().len();
+                    }
+                }
+            }
+        }
+        for policy in [project.join(".openmax/permissions.toml"), data.join("permissions.toml")] {
+            read += std::fs::read(policy).unwrap().len();
+        }
+        assert!(read > 100 * 300, "the floor reads every extension file: {read} bytes");
+        started.elapsed()
     };
 
     // What one load registers: every extension, live.
@@ -1074,32 +1133,40 @@ fn a_hundred_extensions_load_in_under_10_ms() {
     assert!(matches!(decide("bash", serde_json::json!({ "command": "sudo ls" })), PermissionDecision::Deny { .. }), "the global deny");
     drop((registry, prompt, hooks, permissions, templates));
 
-    let instructions_before = instructions_retired();
     let mut totals = Vec::with_capacity(runs);
+    let mut floors = Vec::with_capacity(runs);
+    let mut ratios = Vec::with_capacity(runs);
     let mut phases: [Vec<Duration>; 5] = Default::default();
+    let mut instructions = Some(0u64);
     for _ in 0..runs {
+        let read = floor();
+        let before = instructions_retired();
         let (loaded, total, phase) = load();
+        instructions = instructions.zip(before.zip(instructions_retired())).map(|(sum, (before, after))| sum + after - before);
         drop(loaded);
+        ratios.push(total.as_secs_f64() / read.as_secs_f64());
         totals.push(total);
+        floors.push(read);
         for (all, one) in phases.iter_mut().zip(phase) {
             all.push(one);
         }
     }
-    let instructions = instructions_before.zip(instructions_retired()).map(|(before, after)| (after - before) / runs as u64);
-    let median = |samples: &mut Vec<Duration>| {
-        samples.sort();
+    fn median<T: PartialOrd + Copy>(samples: &mut [T]) -> T {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
         samples[samples.len() / 2]
-    };
-    let total = median(&mut totals);
+    }
+    let (total, read, ratio) = (median(&mut totals), median(&mut floors), median(&mut ratios));
     let names = ["registry", "prompt", "hooks", "permissions", "templates"];
     let breakdown: Vec<String> =
         names.iter().zip(phases.iter_mut()).map(|(name, samples)| format!("{name} {:?}", median(samples))).collect();
     println!(
-        "MEASURE extension_load 100 extensions: median {total:?} over {runs} loads (p10 {:?}, p90 {:?}; {}); {} instructions per load; target {TARGET:?}, {}",
+        "MEASURE extension_load 100 extensions: median {total:?} over {runs} loads (p10 {:?}, p90 {:?}; {}); floor (reading their files) {read:?}, \
+         load over floor {ratio:.2} (ratchet {ratchet:.1}, {}); {} instructions per load; target {TARGET:?}, {}",
         totals[runs / 10],
         totals[runs * 9 / 10],
         breakdown.join(", "),
-        instructions.map_or("uncounted".to_string(), |n| n.to_string()),
+        if gated { "asserted" } else { "printed off macOS on Apple silicon, and in debug" },
+        instructions.map_or("uncounted".to_string(), |n| (n / runs as u64).to_string()),
         if cfg!(debug_assertions) { "debug" } else { "release" },
     );
     if cfg!(debug_assertions) {
@@ -1107,5 +1174,14 @@ fn a_hundred_extensions_load_in_under_10_ms() {
     } else {
         assert!(total <= TARGET, "a load of 100 extensions took {total:?}, past the {TARGET:?} target");
     }
+    if gated {
+        assert!(
+            ratio <= ratchet,
+            "a load of 100 extensions took {ratio:.2} times the time to read their files ({total:?} over {read:?}), over its ratchet of {ratchet:.1}"
+        );
+    }
+    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let claim = format!("at most {ratchet:.1} times the time to read their files ({RATIO_MEASURED} when it was set)");
+    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
     let _ = std::fs::remove_dir_all(&dir);
 }
