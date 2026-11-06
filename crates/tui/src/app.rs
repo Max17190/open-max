@@ -7890,8 +7890,15 @@ mod tests {
     /// same frame after every step. Only the scrollbar marker, a proportion
     /// of the estimated total, may differ.
     fn assert_lazy_paints_like_eager(history: usize, steps: &[ViewStep]) {
+        assert_lazy_holding_wraps_paints_like_eager(history, steps, None);
+    }
+
+    /// The same, with the lazy side keeping at most `wrap_budget` rows of
+    /// wraps beyond the view when one is given.
+    fn assert_lazy_holding_wraps_paints_like_eager(history: usize, steps: &[ViewStep], wrap_budget: Option<usize>) {
         let (mut lazy, lazy_dir) = app_fixture();
         let (mut eager, eager_dir) = app_fixture();
+        lazy.transcript.wrap_budget = wrap_budget;
         eager.transcript.eager = true;
         for app in [&mut lazy, &mut eager] {
             push_long_history(app, history);
@@ -7917,6 +7924,9 @@ mod tests {
                 painted(&mut eager),
                 "{history} blocks, step {index} ({step:?}) painted differently at {width}x{height}"
             );
+        }
+        if wrap_budget.is_some() {
+            assert!(lazy.transcript.dropped_wraps > 0, "the walk never dropped a wrap");
         }
         fs::remove_dir_all(lazy_dir).unwrap();
         fs::remove_dir_all(eager_dir).unwrap();
@@ -7995,6 +8005,21 @@ mod tests {
     #[test]
     fn lazy_wrapping_paints_what_eager_wrapping_paints_on_another_long_walk() {
         assert_lazy_paints_like_eager(400, &random_view_steps(2, 300, 400));
+    }
+
+    /// The long walks again with the lazy side holding about two screens of
+    /// wraps, so blocks drop their wraps as the walk leaves them and wrap
+    /// again as it comes back, across resizes, folds, arrivals and a
+    /// removed prompt: every frame still paints what wrapping every block
+    /// up front paints.
+    #[test]
+    fn lazy_wrapping_paints_what_eager_wrapping_paints_while_dropping_wraps() {
+        assert_lazy_holding_wraps_paints_like_eager(400, &random_view_steps(1, 300, 400), Some(60));
+    }
+
+    #[test]
+    fn lazy_wrapping_paints_what_eager_wrapping_paints_while_dropping_wraps_on_another_walk() {
+        assert_lazy_holding_wraps_paints_like_eager(400, &random_view_steps(2, 300, 400), Some(60));
     }
 
     /// Heap allocations of one frame that repaints the conversation, after

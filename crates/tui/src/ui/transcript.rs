@@ -10,7 +10,9 @@
 //! exact unless a line wraps, and never more than the wrap produces) and
 //! wraps only the blocks the viewport shows; the rest are wrapped when they
 //! scroll into view. Wrapping the whole history on each of those made them
-//! linear in the session's length.
+//! linear in the session's length. Past a budget of wrapped rows, the
+//! blocks wrapped longest ago drop their wraps again, so a frame's work and
+//! the memory beyond the history's own lines stay the same at any length.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -248,54 +250,28 @@ impl Block {
         } else {
             lower_for_search(&format!("{header_text}\n{visible}"))
         };
-        let header = compact
-            .first()
-            .cloned()
-            .unwrap_or_else(|| Line::from("tool"));
-        let mut full_lines = vec![header];
-        // The screen shows output without its escape sequences; the exact
-        // bytes stay in `full_output` for copy and export.
-        for line in full_output.lines().take(80) {
-            full_lines.push(Line::from(Span::styled(
-                format!("  {}", strip_escapes(line)),
-                Style::default().fg(theme::DIM()),
-            )));
-        }
-        let total = full_output.lines().count();
-        if total > 80 {
-            full_lines.push(Line::from(Span::styled(
-                format!("  … {} more lines", total - 80),
-                Style::default()
-                    .fg(theme::DIM())
-                    .add_modifier(Modifier::ITALIC),
-            )));
-        }
-        // The copy text is whichever view is on screen: the card while
-        // folded, the output while open.
-        let selectable = if ok {
-            header_text
-        } else {
-            lines_to_plain(&full_lines)
-        };
-        let selectable_chars = selectable.chars().count();
-        Self {
+        let mut block = Self {
             kind: BlockKind::Tool,
             id: 0,
-            raw_cells: LineCells::measure(&full_lines),
+            raw_cells: LineCells::default(),
             compact_cells: LineCells::measure(&compact),
-            raw: full_lines,
+            raw: Vec::new(),
             compact: Some(compact),
-            folded: ok,
+            folded: true,
             full_output: Some(full_output),
             search_lower,
             height: 0,
             cache_width: 0,
-            cache_folded: ok,
+            cache_folded: true,
             cache: Vec::new(),
             cache_maps: Vec::new(),
-            selectable,
-            selectable_chars,
+            selectable_chars: header_text.chars().count(),
+            selectable: header_text,
+        };
+        if !ok {
+            block.set_folded(false);
         }
+        block
     }
 
     fn source_lines(&self) -> &[Line<'static>] {
@@ -331,13 +307,18 @@ impl Block {
         cells.rows(usize::from(content_width(self.kind, width))) + 1
     }
 
-    /// Show the block folded or open. The copy text follows the view; the
-    /// wrap does too, at the next `ensure_cache`.
+    /// Show the block folded or open. The copy text follows the view (the
+    /// card while folded, the output while open); the wrap does too, at the
+    /// next `ensure_cache`, in place of the other view's. A tool's open view
+    /// is built as it opens and dropped as it folds: most are never opened.
     fn set_folded(&mut self, folded: bool) {
         self.folded = folded;
+        if let (Some(compact), Some(output)) = (&self.compact, &self.full_output) {
+            self.raw = if folded { Vec::new() } else { open_view(compact, output) };
+            self.raw_cells = LineCells::measure(&self.raw);
+        }
         self.selectable = lines_to_plain(self.source_lines());
         self.selectable_chars = self.selectable.chars().count();
-        self.invalidate();
     }
 
     fn ensure_cache(&mut self, width: u16) {
@@ -366,10 +347,12 @@ impl Block {
         self.cache_maps.push(None);
     }
 
+    /// Drop the wrap and free it. A height the wrap measured at this width
+    /// stays exact: wrapping again yields the same rows.
     fn invalidate(&mut self) {
         self.cache_width = 0;
-        self.cache.clear();
-        self.cache_maps.clear();
+        self.cache = Vec::new();
+        self.cache_maps = Vec::new();
     }
 }
 
@@ -398,21 +381,86 @@ pub struct RowRef {
     row: usize,
 }
 
+/// Rows of wrapped lines the blocks keep beyond the ones in view, about
+/// 4 MB of them: the screens a reader scrolls back over stay wrapped.
+const WRAP_BUDGET: usize = 10_000;
+
+/// Where each block's rows start: a Fenwick tree over the block heights,
+/// so a block's first row, the block holding a row, and a change of one
+/// block's height each cost O(log n) at any depth of history.
+#[derive(Default)]
+struct RowIndex(Vec<usize>);
+
+/// The lowest set bit: node `i` (from 1) sums the `low(i)` heights up to
+/// and including block `i - 1`.
+fn low(i: usize) -> usize {
+    i & i.wrapping_neg()
+}
+
+impl RowIndex {
+    /// Append a block: its node sums its own height and the `log2(low(i))`
+    /// nodes under it, one on average, so indexing n blocks costs O(n).
+    fn push(&mut self, height: usize) {
+        let i = self.0.len() + 1;
+        let (mut sum, mut j) = (height, i - 1);
+        while j > i - low(i) {
+            sum += self.0[j - 1];
+            j -= low(j);
+        }
+        self.0.push(sum);
+    }
+
+    fn add(&mut self, bi: usize, delta: isize) {
+        let mut i = bi + 1;
+        while i <= self.0.len() {
+            self.0[i - 1] = self.0[i - 1].wrapping_add_signed(delta);
+            i += low(i);
+        }
+    }
+
+    /// First row of block `bi`: the rows of every block above it.
+    fn start(&self, bi: usize) -> usize {
+        let (mut rows, mut i) = (0, bi);
+        while i > 0 {
+            rows += self.0[i - 1];
+            i -= low(i);
+        }
+        rows
+    }
+
+    /// The block holding `row`, and the row's offset into it: the last
+    /// block that starts at or above `row`, which holds it as long as
+    /// `row` is under the total, since a block is at least one row.
+    fn locate(&self, row: usize) -> (usize, usize) {
+        let (mut bi, mut rest) = (0, row);
+        for shift in (0..=self.0.len().checked_ilog2().unwrap_or(0)).rev() {
+            let step = 1 << shift;
+            if bi + step <= self.0.len() && self.0[bi + step - 1] <= rest {
+                bi += step;
+                rest -= self.0[bi - 1];
+            }
+        }
+        (bi, rest)
+    }
+}
+
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
     /// Id of the next block pushed.
     next_id: u64,
-    /// First wrapped line of each block; `total` closes the last range. The
-    /// per-block caches own the only copy of every wrapped line, so
-    /// re-measuring after a fold toggle or width change is index
-    /// arithmetic, never a clone of the session's lines. A block not yet
-    /// wrapped at the current width counts its estimated height.
-    block_starts: Vec<usize>,
-    /// Entries of `block_starts` from this block on are stale. A height
-    /// change marks only its own suffix, so wrapping the blocks at the
-    /// bottom of history never walks the whole index.
-    stale_from: usize,
+    /// First wrapped line of each block, by its height: estimated until the
+    /// block is wrapped at the current width. The per-block caches own the
+    /// only copy of every wrapped line.
+    index: RowIndex,
+    /// Indices of the user blocks, ascending, for the sticky header and
+    /// prompt navigation to find the nearest prompt by binary search.
+    users: Vec<usize>,
+    /// The blocks holding a wrap, by id, in the order they took it, and the
+    /// rows those wraps hold: what [`Self::settle_view`] holds to
+    /// [`WRAP_BUDGET`]. A block wrapped again keeps its one entry.
+    wraps: std::collections::VecDeque<u64>,
+    wrapped_rows: usize,
     /// Rows across all blocks (sum of their heights), kept current by every
     /// height change.
     total: usize,
@@ -435,6 +483,12 @@ pub struct Transcript {
     /// eager shape, which tests hold the lazy one against.
     #[cfg(test)]
     pub(crate) eager: bool,
+    /// A wrap budget in place of [`WRAP_BUDGET`], so tests drop wraps
+    /// without a session's worth of rows, and the wraps dropped so far.
+    #[cfg(test)]
+    pub(crate) wrap_budget: Option<usize>,
+    #[cfg(test)]
+    pub(crate) dropped_wraps: usize,
 }
 
 impl Transcript {
@@ -473,13 +527,16 @@ impl Transcript {
         #[cfg(test)]
         let wrap_now = wrap_now || self.eager;
         self.blocks.push(block);
-        if wrap_now && self.width > 0 {
-            self.blocks[bi].ensure_cache(self.width);
+        if wrap_now {
+            self.ensure_wrap(bi);
         }
         let height = self.blocks[bi].measure(self.width);
         self.blocks[bi].height = height;
         self.total += height;
-        self.mark_stale(bi);
+        self.index.push(height);
+        if self.blocks[bi].kind == BlockKind::User {
+            self.users.push(bi);
+        }
         if self.width > 0 && self.offset > 0 {
             self.offset = self.offset.saturating_add(height);
             self.unread += 1;
@@ -494,7 +551,7 @@ impl Transcript {
     /// `user_prompt_submit` before it entered the core transcript). Returns
     /// true when a user block was removed.
     pub fn pop_last_user(&mut self) -> bool {
-        let Some(i) = self.blocks.iter().rposition(|b| b.kind == BlockKind::User) else {
+        let Some(&i) = self.users.last() else {
             return false;
         };
         // The view keeps its offset (the draw path clamps it once the view
@@ -503,8 +560,16 @@ impl Transcript {
         self.wrap_held(i, held);
         self.wrap_across(i, held, -(self.blocks[i].height as isize));
         let removed = self.blocks.remove(i);
+        self.users.pop();
         self.total -= removed.height;
-        self.mark_stale(i);
+        self.wraps.retain(|&id| id != removed.id);
+        self.wrapped_rows -= removed.cache.len();
+        // The blocks after it moved up one: index them again. No node
+        // before `i` sums a block after it, so the rest of the tree holds.
+        self.index.0.truncate(i);
+        for block in &self.blocks[i..] {
+            self.index.push(block.height);
+        }
         // Selection / sticky indices past the removed block must retreat.
         if let Some(sel) = self.selected {
             if sel == i {
@@ -554,9 +619,9 @@ impl Transcript {
             }
             self.width = width;
             #[cfg(test)]
-            if self.eager && width > 0 {
-                for block in &mut self.blocks {
-                    block.ensure_cache(width);
+            if self.eager {
+                for bi in 0..self.blocks.len() {
+                    self.ensure_wrap(bi);
                 }
             }
             // The offset is left for the draw path to clamp against the
@@ -564,12 +629,13 @@ impl Transcript {
             // would move a view whose edge is in the live tail by however
             // far the estimate is off.
             let mut total = 0;
+            self.index.0.clear();
             for block in &mut self.blocks {
                 block.height = block.measure(width);
                 total += block.height;
+                self.index.push(block.height);
             }
             self.total = total;
-            self.mark_stale(0);
         }
     }
 
@@ -579,7 +645,6 @@ impl Transcript {
     /// widths but bounded by one block's height. None when history is empty
     /// or the position is not above the bottom.
     pub fn anchor_at(&mut self, lines_from_bottom: usize) -> Option<WrapAnchor> {
-        self.ensure_index();
         if lines_from_bottom == 0 || self.total == 0 {
             return None;
         }
@@ -603,8 +668,7 @@ impl Transcript {
             return 0;
         }
         self.wrap_block(anchor.block);
-        self.ensure_index();
-        let start = self.block_starts[anchor.block];
+        let start = self.index.start(anchor.block);
         let end = start + self.blocks[anchor.block].height;
         let index = (start + anchor.lines_into_block).min(end.saturating_sub(1));
         self.total - index
@@ -616,29 +680,6 @@ impl Transcript {
         self.offset = lines_from_bottom;
     }
 
-    fn mark_stale(&mut self, bi: usize) {
-        self.stale_from = self.stale_from.min(bi);
-    }
-
-    /// Bring `block_starts` up to date from the first stale block on.
-    fn ensure_index(&mut self) {
-        if self.stale_from >= self.blocks.len() && self.block_starts.len() == self.blocks.len() {
-            return;
-        }
-        let from = self.stale_from.min(self.block_starts.len()).min(self.blocks.len());
-        self.block_starts.truncate(from);
-        let mut row = match from.checked_sub(1) {
-            Some(prev) => self.block_starts[prev] + self.blocks[prev].height,
-            None => 0,
-        };
-        for block in &self.blocks[from..] {
-            self.block_starts.push(row);
-            row += block.height;
-        }
-        debug_assert_eq!(row, self.total, "block heights and the row total disagree");
-        self.stale_from = self.blocks.len();
-    }
-
     /// Wrap block `bi` at the current width unless it already is, and
     /// return the rows that added: never negative, since an estimate never
     /// exceeds the wrap.
@@ -646,17 +687,33 @@ impl Transcript {
         if self.width == 0 || self.blocks[bi].is_wrapped_at(self.width) {
             return 0;
         }
-        self.blocks[bi].ensure_cache(self.width);
+        self.ensure_wrap(bi);
         let before = self.blocks[bi].height;
         let height = self.blocks[bi].cache.len();
         self.set_height(bi, height);
         height as isize - before as isize
     }
 
+    /// Wrap block `bi` at the current width unless it already is or there
+    /// is no width yet, counting the rows its wrap holds in place of any
+    /// wrap it replaces, at another width or fold (see [`Self::settle_view`]).
+    fn ensure_wrap(&mut self, bi: usize) {
+        let block = &mut self.blocks[bi];
+        if self.width == 0 || block.is_wrapped_at(self.width) {
+            return;
+        }
+        let replaced = block.cache.len();
+        block.ensure_cache(self.width);
+        if replaced == 0 {
+            self.wraps.push_back(block.id);
+        }
+        self.wrapped_rows = self.wrapped_rows + block.cache.len() - replaced;
+    }
+
     fn set_height(&mut self, bi: usize, height: usize) {
         self.total = self.total - self.blocks[bi].height + height;
+        self.index.add(bi, height as isize - self.blocks[bi].height as isize);
         self.blocks[bi].height = height;
-        self.mark_stale(bi);
     }
 
     /// Fold or open block `bi`. It is wrapped at once: a fold is toggled on
@@ -674,9 +731,7 @@ impl Transcript {
         {
             self.text_selection = None;
         }
-        if self.width > 0 {
-            self.blocks[bi].ensure_cache(self.width);
-        }
+        self.ensure_wrap(bi);
         let height = self.blocks[bi].measure(self.width);
         // Still indexed at its old height: the crossing is measured in the
         // layout the view moves from.
@@ -702,9 +757,57 @@ impl Transcript {
     /// of `tail_len` rows, holding the content on screen still while their
     /// estimates turn exact. Remembers the geometry, so a scroll before the
     /// next frame knows which rows it crosses.
+    ///
+    /// Then it holds the wraps to [`WRAP_BUDGET`] rows: past it, the blocks
+    /// wrapped longest ago drop theirs, except the ones in view, which go
+    /// to the back. A block keeps its exact height without its wrap and
+    /// wraps again when a frame shows it, so a frame frees about what it
+    /// wrapped.
     pub fn settle_view(&mut self, rows: usize, tail_len: usize) {
         self.view = (rows, tail_len);
         self.settle(0, 0);
+        let view = self.window(0, 0);
+        let budget = WRAP_BUDGET;
+        #[cfg(test)]
+        let budget = self.wrap_budget.unwrap_or(budget);
+        for _ in 0..self.wraps.len() {
+            if self.wrapped_rows <= budget {
+                break;
+            }
+            let Some(id) = self.wraps.pop_front() else {
+                break;
+            };
+            match self.blocks.binary_search_by_key(&id, |block| block.id) {
+                Ok(bi) if view.is_some_and(|(first, last)| (first..=last).contains(&bi)) => self.wraps.push_back(id),
+                Ok(bi) => {
+                    self.wrapped_rows -= self.blocks[bi].cache.len();
+                    self.blocks[bi].invalidate();
+                    #[cfg(test)]
+                    {
+                        self.dropped_wraps += 1;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// The first and last blocks of the last settled viewport extended by
+    /// `above` rows over it and `below` rows under it; none when that range
+    /// holds no history.
+    fn window(&self, above: usize, below: usize) -> Option<(usize, usize)> {
+        let (rows, tail_len) = self.view;
+        if self.width == 0 || rows == 0 {
+            return None;
+        }
+        let total = self.total + tail_len;
+        let end = total - self.offset.min(total.saturating_sub(rows));
+        let start = end.saturating_sub(rows);
+        let (from, to) = (start.saturating_sub(above), end.saturating_add(below).min(self.total));
+        if from >= to {
+            return None;
+        }
+        Some((self.locate(from)?.0, self.locate(to - 1)?.0))
     }
 
     /// Wrap the blocks covering the last settled viewport extended by
@@ -722,33 +825,17 @@ impl Transcript {
     ///
     /// Estimates never exceed the wrap, so a growing block only pushes
     /// others out of the range: the loop wraps at most the blocks the first
-    /// range covered, never the history beyond it.
+    /// range covered, never the history beyond it. Only a height change
+    /// moves the range (the total and the offset follow heights), so a pass
+    /// that changes none has wrapped the range it covers, and is the last.
     fn settle(&mut self, above: usize, below: usize) {
-        let (rows, tail_len) = self.view;
-        if self.width == 0 || rows == 0 {
-            return;
-        }
-        loop {
-            self.ensure_index();
-            let total = self.total + tail_len;
-            let top_offset = total.saturating_sub(rows);
-            let end = total - self.offset.min(top_offset);
-            let start = end.saturating_sub(rows);
-            let from = start.saturating_sub(above);
-            let to = end.saturating_add(below).min(self.total);
-            if from >= to {
-                return;
-            }
-            let (Some((first, _)), Some((last, _))) = (self.locate(from), self.locate(to - 1))
-            else {
-                return;
-            };
+        while let Some((first, last)) = self.window(above, below) {
             let held = self.held_block();
-            let mut wrapped = false;
+            let mut grew = false;
             for bi in first..=last {
-                wrapped |= self.wrap_held(bi, held);
+                grew |= self.wrap_held(bi, held);
             }
-            if !wrapped {
+            if !grew {
                 return;
             }
         }
@@ -761,23 +848,19 @@ impl Transcript {
         if self.offset == 0 {
             return None;
         }
-        self.ensure_index();
         let edge = (self.total + self.view.1).saturating_sub(self.offset);
         self.locate(edge).map(|(bi, _)| bi)
     }
 
     /// Wrap block `bi` unless it already is, growing the offset with it when
     /// it sits at or below the `held` block, so the view holds still.
-    /// Returns whether it wrapped.
+    /// Returns whether its height changed.
     fn wrap_held(&mut self, bi: usize, held: Option<usize>) -> bool {
-        if self.width == 0 || self.blocks[bi].is_wrapped_at(self.width) {
-            return false;
-        }
         let added = self.wrap_block(bi);
         if held.is_some_and(|held| bi >= held) {
             self.offset = self.offset.saturating_add_signed(added);
         }
-        true
+        added != 0
     }
 
     /// Rows in the whole transcript, exact whenever there are at most
@@ -800,17 +883,9 @@ impl Transcript {
     }
 
     /// Block owning wrapped line `idx`, and the line's offset into that
-    /// block's cache. Callers keep the index current.
+    /// block's cache.
     fn locate(&self, idx: usize) -> Option<(usize, usize)> {
-        if idx >= self.total {
-            return None;
-        }
-        debug_assert!(
-            self.stale_from >= self.blocks.len() && self.block_starts.len() == self.blocks.len(),
-            "located a line in a stale index"
-        );
-        let bi = self.block_starts.partition_point(|&start| start <= idx) - 1;
-        Some((bi, idx - self.block_starts[bi]))
+        (idx < self.total).then(|| self.index.locate(idx))
     }
 
     /// Wrap every block at the current width. Test-support only: the draw
@@ -820,7 +895,6 @@ impl Transcript {
         for bi in 0..self.blocks.len() {
             self.wrap_block(bi);
         }
-        self.ensure_index();
     }
 
     /// Test-support oracle access: `draw_chat` paints via `paint_rows`.
@@ -837,7 +911,6 @@ impl Transcript {
     /// Test-support oracle access.
     #[cfg(test)]
     pub fn line_at(&mut self, idx: usize) -> Option<&Line<'static>> {
-        self.ensure_index();
         let (bi, li) = self.locate(idx)?;
         self.wrap_block(bi);
         self.blocks[bi].cache.get(li)
@@ -864,6 +937,15 @@ impl Transcript {
         debug_assert!(
             self.total == self.blocks.iter().map(|b| b.cache.len()).sum::<usize>(),
             "wrapped-line index went stale against the block caches",
+        );
+        let mut row = 0;
+        for (bi, block) in self.blocks.iter().enumerate() {
+            debug_assert_eq!(self.index.start(bi), row, "the row index went stale at block {bi}");
+            row += block.height;
+        }
+        debug_assert!(
+            self.users.iter().copied().eq((0..self.blocks.len()).filter(|&bi| self.blocks[bi].kind == BlockKind::User)),
+            "the prompt list went stale against the blocks",
         );
         let end = end.min(self.total);
         let start = start.min(end);
@@ -901,7 +983,6 @@ impl Transcript {
         selected_bi: Option<usize>,
         painted: &mut Vec<Option<RowRef>>,
     ) {
-        self.ensure_index();
         let end = end.min(self.total).min(start.saturating_add(usize::from(area.height)));
         let Some((mut bi, mut li)) = self.locate(start) else {
             return;
@@ -945,12 +1026,10 @@ impl Transcript {
         if !block.is_wrapped_at(self.width) || at.row >= block.cache.len() {
             return None;
         }
-        self.ensure_index();
-        Some(self.block_starts[bi] + at.row)
+        Some(self.index.start(bi) + at.row)
     }
 
-    pub fn len(&mut self) -> usize {
-        self.ensure_index();
+    pub fn len(&self) -> usize {
         self.total
     }
 
@@ -1100,39 +1179,22 @@ impl Transcript {
 
     /// Jump to the next user-turn block after the current selection.
     pub fn select_next_user(&mut self) {
-        if self.blocks.is_empty() {
-            return;
-        }
-        let start = self.selected.map(|i| i + 1).unwrap_or(0);
-        if let Some(i) =
-            (start..self.blocks.len()).find(|&i| self.blocks[i].kind == BlockKind::User)
-        {
+        let start = self.selected.map_or(0, |i| i + 1);
+        if let Some(&i) = self.users.get(self.users.partition_point(|&u| u < start)) {
             self.selected = Some(i);
             self.scroll_to_block(i);
         }
     }
 
-    /// Jump to the previous user-turn block before the current selection.
+    /// Jump to the previous user-turn block before the current selection,
+    /// or, with none before it, to the selected prompt itself.
     pub fn select_prev_user(&mut self) {
-        if self.blocks.is_empty() {
-            return;
-        }
         let end = self
             .selected
             .unwrap_or_else(|| self.blocks.len().saturating_sub(1));
-        if let Some(i) = (0..=end)
-            .rev()
-            .find(|&i| self.blocks[i].kind == BlockKind::User && Some(i) != self.selected)
-        {
-            self.selected = Some(i);
-            self.scroll_to_block(i);
-            return;
-        }
-        // If nothing before selection, land on the nearest user at or before end.
-        if let Some(i) = (0..=end)
-            .rev()
-            .find(|&i| self.blocks[i].kind == BlockKind::User)
-        {
+        let upto = &self.users[..self.users.partition_point(|&u| u <= end)];
+        let pick = upto.iter().rev().copied().find(|&u| Some(u) != self.selected);
+        if let Some(i) = pick.or(upto.last().copied()) {
             self.selected = Some(i);
             self.scroll_to_block(i);
         }
@@ -1166,8 +1228,7 @@ impl Transcript {
         }
         self.wrap_block(bi);
         self.wrap_rows_from(bi + 1, self.view.1);
-        self.ensure_index();
-        let end = self.block_starts[bi] + self.blocks[bi].height;
+        let end = self.index.start(bi) + self.blocks[bi].height;
         self.offset = self.total.saturating_sub(end);
     }
 
@@ -1443,7 +1504,6 @@ impl Transcript {
     /// here from a painted frame, whose blocks are wrapped; the wrap below
     /// serves only callers that address a row no frame has shown.
     fn row(&mut self, line_idx: usize) -> Option<(usize, CachedLineMap)> {
-        self.ensure_index();
         let (block, li) = self.locate(line_idx)?;
         if !self.blocks[block].is_wrapped_at(self.width) {
             let held = self.held_block();
@@ -1537,14 +1597,12 @@ impl Transcript {
 
     /// Index of the nearest user block whose start is above `view_start_line`.
     fn sticky_user_block_idx(&mut self, view_start_line: usize) -> Option<usize> {
-        self.ensure_index();
-        if view_start_line == 0 || self.blocks.is_empty() {
-            return None;
-        }
         let bi = self.locate(view_start_line).map(|(bi, _)| bi).unwrap_or(0);
-        (0..=bi).rev().find(|&i| {
-            self.blocks[i].kind == BlockKind::User && self.block_starts[i] < view_start_line
-        })
+        // The nearest prompt at or above block `bi` starts above the view
+        // unless it is `bi` itself, starting on the view's top row; the one
+        // before it then does. No block starts above row 0.
+        let above = &self.users[..self.users.partition_point(|&u| u <= bi)];
+        above.iter().rev().take(2).copied().find(|&u| self.index.start(u) < view_start_line)
     }
 
     /// Whether a sticky user header should render for this viewport start.
@@ -1565,7 +1623,6 @@ impl Transcript {
         let Some(sel) = self.selected else {
             return false;
         };
-        self.ensure_index();
         self.locate(line_idx).map(|(bi, _)| bi) == Some(sel)
     }
 
@@ -1577,6 +1634,23 @@ impl Transcript {
         self.selected = None;
     }
 
+}
+
+/// A tool card open: its header over the first 80 lines of output. The
+/// screen shows output without its escape sequences; the exact bytes stay
+/// in `full_output` for copy and export.
+fn open_view(compact: &[Line<'static>], output: &str) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme::DIM());
+    let mut lines = vec![compact.first().cloned().unwrap_or_else(|| Line::from("tool"))];
+    for line in output.lines().take(80) {
+        lines.push(Line::from(Span::styled(format!("  {}", strip_escapes(line)), dim)));
+    }
+    let total = output.lines().count();
+    if total > 80 {
+        let more = format!("  … {} more lines", total - 80);
+        lines.push(Line::from(Span::styled(more, dim.add_modifier(Modifier::ITALIC))));
+    }
+    lines
 }
 
 fn line_is_blank(l: &Line<'_>) -> bool {
@@ -1626,31 +1700,21 @@ fn slice_block_chars(block: &Block, from: usize, to: usize) -> String {
 /// The clipboard must carry exact bytes: pasting code with a rail character
 /// on every line makes the paste useless.
 fn copy_text_without_chrome(lines: &[Line<'static>]) -> String {
-    lines
-        .iter()
-        .map(|line| {
-            let skip = usize::from(is_rail_line(line));
-            line.spans
-                .iter()
-                .skip(skip)
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    joined_text(lines, is_rail_line)
 }
 
 fn lines_to_plain(lines: &[Line<'static>]) -> String {
-    lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    joined_text(lines, |_| false)
+}
+
+/// The lines' text, a line each, without the first span of every line
+/// `chrome` picks.
+fn joined_text(lines: &[Line<'static>], chrome: fn(&Line<'static>) -> bool) -> String {
+    let text = |line: &Line<'static>| {
+        let spans = line.spans.iter().skip(usize::from(chrome(line)));
+        spans.map(|span| span.content.as_ref()).collect::<String>()
+    };
+    lines.iter().map(text).collect::<Vec<_>>().join("\n")
 }
 
 /// Line `line_idx` of a block's search text in original case, without
@@ -2103,7 +2167,6 @@ mod tests {
             Some("│ literal table border")
         );
 
-        t.ensure_index();
         assert!(t.begin_text_selection_at(0, 0));
         assert!(t.update_text_selection_at(0, 21));
         t.finish_text_selection();
@@ -2129,7 +2192,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(crate::ui::markdown::render("```rust\nfn a() -> u32 { 1 }\n```"));
-        t.ensure_index();
         let li = text(&t.lines())
             .iter()
             .position(|l| l.contains("fn a"))
@@ -2159,7 +2221,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         // Double-click on the middle of "beta", release on the same cell.
         assert!(t.select_word_at(0, 7));
@@ -2179,7 +2240,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         assert!(t.select_word_at(0, 7));
         assert!(t.update_text_selection_at(0, 12));
@@ -2197,7 +2257,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         // Word gesture on "beta", release over "gamma" with no Drag events.
         assert!(t.select_word_at(0, 7));
@@ -2212,7 +2271,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         assert!(t.select_word_at(0, 7));
         assert!(t.update_text_selection_at(0, 12));
@@ -2229,7 +2287,6 @@ mod tests {
         let mut t = Transcript::new();
         t.set_width(60);
         t.push_assistant(vec![Line::from("alpha beta gamma")]);
-        t.ensure_index();
 
         assert!(t.begin_text_selection_at(0, 0));
         t.end_text_selection_at(0, 9);
@@ -2707,7 +2764,7 @@ mod tests {
             t.line_at(line).map(|line| lines_to_plain(std::slice::from_ref(line)))
         };
         let painted: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
-        let prompt = t.block_starts[1]..t.block_starts[2];
+        let prompt = t.index.start(1)..t.index.start(2);
         assert!(t.pop_last_user());
         let found: Vec<_> = rows.iter().map(|&at| text_of(&mut t, at)).collect();
         // The removed prompt's rows name nothing; every other row still
@@ -2728,6 +2785,231 @@ mod tests {
         let wide = t.len();
         t.set_width(10);
         assert!(t.len() >= wide);
+    }
+
+    /// `[` and `]` jump to the prompt before and after the selection, and the
+    /// sticky header names the nearest prompt that starts above the view's
+    /// top row, as a walk back through every block would find them: checked
+    /// against that walk at every row, with a prompt that starts on the top
+    /// row and a view that starts below the history.
+    #[test]
+    fn turn_jumps_and_the_sticky_prompt_find_the_nearest_prompt() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        let kinds = [0, 1, 0, 0, 1, 0, 1, 1, 0, 0];
+        for (i, &user) in kinds.iter().enumerate() {
+            let text = format!("block {i}, which wraps onto a second row at forty columns");
+            if user == 1 {
+                t.push_user(vec![Line::from(text)]);
+            } else {
+                t.push_assistant(vec![Line::from(text)]);
+            }
+        }
+        t.wrap_all();
+        let starts: Vec<usize> = (0..t.blocks.len()).map(|i| t.blocks[..i].iter().map(|b| b.height).sum()).collect();
+        let total = t.len();
+        // Each jump also puts the prompt's last row at the bottom of the view.
+        let jump = |t: &mut Transcript, next: bool| {
+            if next { t.select_next_user() } else { t.select_prev_user() }
+            let i = t.selected().unwrap();
+            assert_eq!(t.offset(), total - starts[i] - t.blocks[i].height, "the jump to block {i} left the view");
+            i
+        };
+        let forward: Vec<usize> = (0..5).map(|_| jump(&mut t, true)).collect();
+        assert_eq!(forward, [1, 4, 6, 7, 7]);
+        let back: Vec<usize> = (0..5).map(|_| jump(&mut t, false)).collect();
+        assert_eq!(back, [6, 4, 1, 1, 1]);
+        t.selected = Some(5);
+        t.select_prev_user();
+        assert_eq!(t.selected(), Some(4), "from a reply, the prompt above it");
+        t.selected = Some(5);
+        t.select_next_user();
+        assert_eq!(t.selected(), Some(6), "from a reply, the prompt below it");
+        t.selected = None;
+        t.select_prev_user();
+        assert_eq!(t.selected(), Some(7), "with nothing selected, the last prompt");
+
+        for top in 0..total + 3 {
+            let block = if top < total { starts.iter().rposition(|&start| start <= top).unwrap() } else { 0 };
+            let walked = (0..=block).rev().find(|&i| t.blocks[i].kind == BlockKind::User && starts[i] < top);
+            let walked = walked.filter(|_| top > 0);
+            assert_eq!(t.has_sticky_user(top), walked.is_some(), "top row {top}");
+            let shown = t.sticky_user_line(top).map(|line| line.spans[0].content.to_string());
+            let expected = walked.map(|i| t.blocks[i].raw[0].spans[0].content.to_string());
+            assert_eq!(shown, expected, "top row {top}");
+        }
+    }
+
+    /// A resize anchors the content at the view's bottom edge only when
+    /// there is history above that edge: none in an empty history, which has
+    /// no row to name, and none at the bottom itself.
+    #[test]
+    fn a_resize_anchor_needs_history_above_the_edge() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        assert!(t.anchor_at(5).is_none(), "an empty history anchored a row");
+        t.push_assistant(vec![Line::from("one")]);
+        assert!(t.anchor_at(0).is_none(), "the bottom edge anchored a row");
+        assert!(t.anchor_at(1).is_some());
+    }
+
+    /// A scroll before any frame has laid out a view wraps nothing: there are
+    /// no rows on screen yet to cross.
+    #[test]
+    fn a_scroll_before_any_frame_wraps_nothing() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        for i in 0..6 {
+            t.push_assistant(vec![Line::from(format!("reply {i}, long enough to wrap onto a second row"))]);
+        }
+        t.scroll_up(3);
+        t.scroll_down(1);
+        assert!(t.blocks.iter().all(|block| block.cache.is_empty()), "a scroll with no view wrapped a block");
+        assert_eq!(t.offset(), 2);
+    }
+
+    /// Nothing wraps before a frame gives the transcript a width, not even
+    /// in the eager shape or on a fold: a wrap at no width holds rows no
+    /// frame paints, and its count would spend the wrap budget.
+    #[test]
+    fn nothing_wraps_before_a_frame_gives_the_transcript_a_width() {
+        let mut t = Transcript::new();
+        t.eager = true;
+        t.push_assistant(vec![Line::from("a reply long enough to wrap at any narrow width")]);
+        t.push_tool(vec![Line::from("✓ bash")], "line one\nline two".into(), true);
+        assert!(t.toggle_fold_at(1));
+        assert!(t.blocks.iter().all(|block| block.cache.is_empty()), "a block wrapped with no width");
+        assert_eq!(t.wrapped_rows, 0);
+    }
+
+    /// The wraps a frame keeps: all of them up to the budget, then the
+    /// oldest go first, as few as bring the count back to the budget, and a
+    /// block in view goes to the back of the line instead.
+    #[test]
+    fn wraps_past_the_budget_drop_oldest_first_but_never_in_view() {
+        let mut t = Transcript::new();
+        t.wrap_budget = Some(10);
+        t.set_width(40);
+        for i in 0..20 {
+            t.push_assistant(vec![Line::from(format!("reply {i}"))]);
+        }
+        // Twenty blocks of two rows; a view of four rows shows two blocks.
+        let show = |t: &mut Transcript, first_block: usize| {
+            t.set_offset(40 - 2 * first_block - 4);
+            t.settle_view(4, 0);
+            (0..20).filter(|&bi| t.blocks[bi].is_wrapped_at(40)).collect::<Vec<_>>()
+        };
+        assert_eq!(show(&mut t, 0), [0, 1]);
+        assert_eq!(show(&mut t, 2), [0, 1, 2, 3]);
+        assert_eq!(show(&mut t, 3), [0, 1, 2, 3, 4], "ten rows of wraps, the budget, drop none");
+        assert_eq!(show(&mut t, 4), [1, 2, 3, 4, 5], "twelve drop the oldest, and only it");
+        assert_eq!(show(&mut t, 0), [0, 1, 3, 4, 5], "block 1 in view stays; block 2 goes");
+        assert_eq!(t.dropped_wraps, 2);
+        assert_eq!(t.wrapped_rows, 10);
+    }
+
+    /// Reading a whole session holds a window of wraps rather than a second
+    /// copy of the session: past the budget, the blocks wrapped longest ago
+    /// drop their wraps, never a block in view, and keep the heights their
+    /// wraps measured, so the total stays exact.
+    #[test]
+    fn paging_through_history_holds_wraps_to_their_budget() {
+        const BUDGET: usize = 120;
+        const ROWS: usize = 30;
+        // Three 21-column words: estimated at two rows, wrapped at three,
+        // so a height that left with its wrap would show in the total.
+        let push = |t: &mut Transcript| {
+            for i in 0..400 {
+                let reply = format!("reply{i:<16} {} {}", "b".repeat(21), "c".repeat(21));
+                t.push_assistant(vec![Line::from(reply)]);
+                t.push_user(vec![Line::from(format!("prompt {i}"))]);
+            }
+        };
+        let mut t = Transcript::new();
+        t.wrap_budget = Some(BUDGET);
+        t.set_width(40);
+        push(&mut t);
+        let mut eager = Transcript::new();
+        eager.eager = true;
+        eager.set_width(40);
+        push(&mut eager);
+        t.settle_view(ROWS, 0);
+        t.set_offset(t.len() - ROWS);
+        loop {
+            t.settle_view(ROWS, 0);
+            let (first, last) = t.window(0, 0).unwrap();
+            assert!(t.blocks[first..=last].iter().all(|b| b.is_wrapped_at(40)), "a block in view lost its wrap");
+            let in_view: usize = t.blocks[first..=last].iter().map(|b| b.height).sum();
+            let held: usize = t.blocks.iter().map(|b| b.cache.len()).sum();
+            assert!(held <= BUDGET + in_view, "{held} rows of wraps held at offset {}, budget {BUDGET}", t.offset());
+            if t.offset() == 0 {
+                break;
+            }
+            t.scroll_down(ROWS);
+        }
+        assert!(t.wrapped_rows <= BUDGET, "{} rows of wraps counted, budget {BUDGET}", t.wrapped_rows);
+        assert!(t.len() > t.blocks.len() * 5 / 2, "the replies did not wrap past their estimates");
+        assert_eq!(t.len(), eager.len(), "a dropped wrap took its exact height with it");
+    }
+
+    /// The wrap budget counts exactly the rows the blocks hold, with one
+    /// entry a block, however often the blocks in view wrap again: a resize
+    /// wraps them again at the new width and a fold toggle wraps its card
+    /// again, each in place of the wrap it had, and a removed prompt takes
+    /// its wrap with it. Counting the replaced wraps too grew the count by a
+    /// view's worth at each resize with the view held still: past the
+    /// budget, every frame walked the entries left behind, and every block
+    /// leaving the view lost its wrap at once, to be wrapped again on the
+    /// way back. The budget here sits just over the 40-row view, so opening
+    /// the card, which pushes replies out of the view, drops some of theirs.
+    #[test]
+    fn wraps_taken_again_in_place_count_only_the_rows_held() {
+        let history = || {
+            let mut t = Transcript::new();
+            t.wrap_budget = Some(50);
+            t.set_width(40);
+            for i in 0..200 {
+                t.push_assistant(vec![Line::from(format!("reply {i}, long enough to wrap onto a second row at forty columns"))]);
+            }
+            t.push_user(vec![Line::from("a prompt a hook blocks")]);
+            let output: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+            t.push_tool(vec![Line::from("✓ bash cargo test")], output, true);
+            t.settle_view(40, 0);
+            t
+        };
+        let exact = |t: &Transcript, when: &str| {
+            let held: usize = t.blocks.iter().map(|b| b.cache.len()).sum();
+            let holding = t.blocks.iter().filter(|b| !b.cache.is_empty()).count();
+            assert_eq!(t.wrapped_rows, held, "rows counted against the rows held {when}");
+            assert_eq!(t.wraps.len(), holding, "entries against the blocks holding a wrap {when}");
+        };
+        let mut t = history();
+        let card = t.blocks.len() - 1;
+        exact(&t, "at the first frame");
+        for k in 0..100 {
+            t.set_width(if k % 2 == 0 { 41 } else { 40 });
+            t.settle_view(40, 0);
+            exact(&t, &format!("after resize {k}"));
+            assert!(t.toggle_fold_at(card));
+            t.settle_view(40, 0);
+            exact(&t, &format!("after fold toggle {k}"));
+        }
+        assert!(t.dropped_wraps > 0, "the budget never dropped a wrap");
+        // Two rows up and back, ten times, wraps what it wraps in a history
+        // never resized or toggled.
+        let scroll = |t: &mut Transcript| {
+            let before = block_wraps();
+            for _ in 0..10 {
+                t.scroll_up(2);
+                t.settle_view(40, 0);
+                t.scroll_down(2);
+                t.settle_view(40, 0);
+            }
+            block_wraps() - before
+        };
+        assert_eq!(scroll(&mut t), scroll(&mut history()), "the resizes and toggles cost the scroll its wraps");
+        assert!(t.pop_last_user());
+        exact(&t, "after the prompt is removed");
     }
 
     // Release-only diagnostic for the synchronous resize path: re-measuring
@@ -2838,6 +3120,21 @@ mod tests {
         t.selected = Some(2);
         assert!(t.toggle_fold_selected());
         assert_eq!(t.export_text(), exported);
+    }
+
+    /// An open tool card shows the first 80 lines of output and counts the
+    /// rest on a line after them; exactly 80 lines leave nothing to count.
+    #[test]
+    fn an_open_tool_card_shows_80_output_lines_and_counts_the_rest() {
+        for (lines, tail) in [(80, "  line 80"), (81, "  … 1 more lines"), (95, "  … 15 more lines")] {
+            let output: String = (1..=lines).map(|n| format!("line {n}\n")).collect();
+            let mut t = Transcript::new();
+            t.set_width(80);
+            t.push_tool(vec![Line::from("✗ bash cargo test")], output, false);
+            let shown = text(&t.lines());
+            assert_eq!(shown.len(), 1 + 80 + usize::from(lines > 80) + 1, "{lines} lines of output");
+            assert_eq!(shown[shown.len() - 2], tail, "{lines} lines of output");
+        }
     }
 
     #[test]

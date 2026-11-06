@@ -183,7 +183,7 @@ jobs:
           - os: ubuntu-latest
             reported: harness_time_per_tool_round
           - os: macos-latest
-            reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines
+            reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
