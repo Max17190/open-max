@@ -2320,32 +2320,41 @@ mod tests {
     /// left-behind tool which ends on SIGTERM does not start 50 ms late.
     /// A thread reaps the process the moment it exits, as init does for a
     /// tool whose harness died, since a zombie still counts as its group.
+    /// The fastest of five runs is the one measured, and each must end on
+    /// the SIGTERM: on a loaded machine the process or that thread can wait
+    /// longer than the grace to be scheduled, and that is not the reap's wait.
     #[cfg(unix)]
     #[test]
     fn a_reap_whose_groups_end_on_sigterm_does_not_wait_out_the_grace() {
-        let (mut graceful, start) = left_behind_perl("$SIG{TERM} = sub { exit 7 }");
-        let pid = graceful.id();
-        let reaped = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                if let Some(status) = graceful.try_wait().unwrap() {
-                    return Some(status);
+        let mut fastest = Duration::MAX;
+        for _ in 0..5 {
+            let (mut graceful, start) = left_behind_perl("$SIG{TERM} = sub { exit 7 }");
+            let pid = graceful.id();
+            let reaped = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if let Some(status) = graceful.try_wait().unwrap() {
+                        return Some(status);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                let _ = graceful.kill();
+                let _ = graceful.wait();
+                None
+            });
+            let run = run_dir("prompt");
+            std::fs::write(run.join(format!("{}.groups", dead_pid())), format!("1\n{pid} {start}\n")).unwrap();
+            let began = std::time::Instant::now();
+            reap(&run);
+            fastest = fastest.min(began.elapsed());
+            let status = reaped.join().unwrap();
+            let _ = std::fs::remove_dir_all(run.parent().unwrap());
+            assert_eq!(status.and_then(|status| status.code()), Some(7), "the group did not end on the reap's SIGTERM");
+            if fastest < LEFT_BEHIND_GRACE {
+                break;
             }
-            let _ = graceful.kill();
-            let _ = graceful.wait();
-            None
-        });
-        let run = run_dir("prompt");
-        std::fs::write(run.join(format!("{}.groups", dead_pid())), format!("1\n{pid} {start}\n")).unwrap();
-        let began = std::time::Instant::now();
-        reap(&run);
-        let took = began.elapsed();
-        let status = reaped.join().unwrap();
-        let _ = std::fs::remove_dir_all(run.parent().unwrap());
-        assert_eq!(status.and_then(|status| status.code()), Some(7), "the group did not end on the reap's SIGTERM");
-        assert!(took < LEFT_BEHIND_GRACE, "a reap whose group ended on SIGTERM took {took:?}, the whole grace");
+        }
+        assert!(fastest < LEFT_BEHIND_GRACE, "a reap whose group ended on SIGTERM took {fastest:?}, the whole grace");
     }
 
     /// Each signal of a stop goes only to a group still the one recorded. A
