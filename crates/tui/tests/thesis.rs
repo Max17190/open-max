@@ -944,14 +944,7 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
     // A renamed test would no longer be skipped by the gate step, nor run by
     // the reports step. libtest selects and skips by substring, so a test or
     // module whose name holds a reported one would leave the gate step too.
-    let mut sources = std::fs::read_to_string(repo().join("crates/tui/src/app/thesis_frames.rs")).unwrap();
-    for tests in ["crates/core/tests", "crates/tui/tests"] {
-        for file in std::fs::read_dir(repo().join(tests)).unwrap().map(|file| file.unwrap().path()) {
-            if file.file_name().is_some_and(|name| name.to_string_lossy().starts_with("thesis")) {
-                sources.push_str(&std::fs::read_to_string(file).unwrap());
-            }
-        }
-    }
+    let sources: String = thesis_sources().into_iter().map(|(_, text)| text).collect();
     let names: Vec<&str> = ["fn ", "mod "]
         .into_iter()
         .flat_map(|item| sources.split(item).skip(1))
@@ -1343,7 +1336,10 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
         }
     }
     println!("thesis gates whose names state a bound: {}", bounded.join(", "));
-    assert!(bounded.len() >= 5, "the grammar finds too few of the thesis gates that state a bound: {bounded:?}");
+    assert!(
+        bounded.iter().any(|gate| gate == "frozen_prefix_is_under_700_tokens (700)"),
+        "the frozen prompt's gate is not among the gates found to state a bound, so the parser finds less than it should: {bounded:?}"
+    );
     assert!(problems.is_empty(), "a thesis gate's name states what it does not measure:\n{}", problems.join("\n"));
 }
 
