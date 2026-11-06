@@ -25,8 +25,8 @@
 # script reports how far there is to go and passes.
 set -u -o pipefail
 
-linux_floor=1527
-macos_floor=1526
+linux_floor=1528
+macos_floor=1527
 target=2000
 
 [ $# -eq 0 ] || { echo "usage: $0" >&2; exit 2; }

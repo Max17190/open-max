@@ -1636,4 +1636,82 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// The turn-start check reads the session's generation, activates the one
+    /// on disk, and re-checks under the lock before it installs: a `/reload`
+    /// a frontend runs while a turn starts can install that same generation
+    /// in between, and then the check stands down, keeping the registry the
+    /// reload installed and announcing nothing. The activation's memory scan
+    /// is held on a FIFO in the memory directory while the reload lands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_start_refreeze_stands_down_for_a_generation_installed_while_it_activates() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(crate::memory::MEMORY_DIR)).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            data.messages.push(ChatMessage::user("hi"));
+            core.sessions.lock().await.insert(id.clone(), data);
+        }
+        // A tool written since the session froze, and the generation a reload
+        // installs for it, activated before the FIFO exists.
+        std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+        std::fs::write(
+            project.join(".openmax/tools/deploy.toml"),
+            "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let reloaded = Arc::new(Registry::build(&core.data_dir, &project));
+        let fifo = project.join(crate::memory::MEMORY_DIR).join("held.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
+        // The shell's open of the write end waits for the scan's; then it says
+        // so, and exits once a line comes, which ends the scan's read.
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"exec 3> "$0" && echo held && read -r line"#])
+            .arg(&fifo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let (mut release, said) = (shell.stdin.take().unwrap(), shell.stdout.take().unwrap());
+        let (said_tx, said_rx) = oneshot::channel::<bool>();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(said).read_line(&mut line);
+            let _ = said_tx.send(line == "held\n");
+        });
+
+        let (checked, held) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), refreeze_if_extensions_changed(&core, &id, &project)),
+            async {
+                let held = matches!(tokio::time::timeout(Duration::from_secs(10), said_rx).await, Ok(Ok(true)));
+                if held {
+                    core.sessions.lock().await.get_mut(&id).unwrap().registry = reloaded.clone();
+                }
+                let _ = release.write_all(b"\n");
+                held
+            }
+        );
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(held, "the turn-start check never activated a generation");
+        let receipt = checked.expect("the scan was still held 10 s after the check began");
+        assert!(receipt.is_none(), "the check refroze a generation the session already held: {receipt:?}");
+        let map = core.sessions.lock().await;
+        assert!(Arc::ptr_eq(&map.get(&id).unwrap().registry, &reloaded), "the check replaced the reload's registry");
+        drop(map);
+        while let Ok(envelope) = rx.try_recv() {
+            assert!(!matches!(envelope.event, AgentEvent::Refrozen { .. }), "the check announced a refreeze it did not make");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
