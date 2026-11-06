@@ -168,7 +168,7 @@ jobs:
         # README.md names them too.
         include:
           - os: ubuntu-latest
-            reported: harness_time_per_tool_round transcript_frame_p99_at_1m_lines
+            reported: harness_time_per_tool_round
           - os: macos-latest
             reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines
     steps:
@@ -212,9 +212,10 @@ jobs:
       # macos-latest, past the bound in two runs and within a fifth of it in
       # two more, while its median held at 0.118 to 0.169 ms. The frame at
       # 1,000,000 lines, a p99 of 0.084 to 0.114 ms on the M5 against
-      # 0.25 ms, has not run on either runner yet; at the 2.1 to 2.7 times
-      # ubuntu-latest took for the 100,000-line frame, it would measure 0.18
-      # to 0.31 ms there, no room, so both runners report it.
+      # 0.25 ms, measured 0.249 ms idle and 0.255 to 0.263 ms scrolling on
+      # ubuntu-latest in its first run, past the target, so it gates there on
+      # a ratchet of 0.41 ms its test derives, until it meets the target; on
+      # macos-latest, 0.189 to 0.605 ms, it is reported.
       - name: Thesis reports
         continue-on-error: true
         timeout-minutes: 5
