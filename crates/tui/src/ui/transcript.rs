@@ -310,10 +310,7 @@ impl Block {
     /// Show the block folded or open. The copy text follows the view (the
     /// card while folded, the output while open); the wrap does too, at the
     /// next `ensure_cache`, in place of the other view's. A tool's open view
-    /// is built as it opens and dropped as it folds: most cards are never
-    /// opened, and every card holding its output a second time, as styled
-    /// lines, was a third of what the 1,000,000-line test session's
-    /// transcript held.
+    /// is built as it opens and dropped as it folds: most are never opened.
     fn set_folded(&mut self, folded: bool) {
         self.folded = folded;
         if let (Some(compact), Some(output)) = (&self.compact, &self.full_output) {
@@ -390,11 +387,7 @@ const WRAP_BUDGET: usize = 10_000;
 
 /// Where each block's rows start: a Fenwick tree over the block heights,
 /// so a block's first row, the block holding a row, and a change of one
-/// block's height each cost O(log n) at any depth of history. The prefix
-/// array this replaced rebuilt every entry below a block whose height
-/// changed, so each block a scroll wrapped far above the bottom cost a
-/// pass over the history under it: a frame's cost grew with how far the
-/// reader had scrolled into a long session.
+/// block's height each cost O(log n) at any depth of history.
 #[derive(Default)]
 struct RowIndex(Vec<usize>);
 
@@ -405,20 +398,8 @@ fn low(i: usize) -> usize {
 }
 
 impl RowIndex {
-    /// Index `heights` from scratch in O(n): each node adds its sum into
-    /// the node above it.
-    fn rebuild(&mut self, heights: impl Iterator<Item = usize>) {
-        self.0.clear();
-        self.0.extend(heights);
-        for i in 1..self.0.len() {
-            let above = i + low(i);
-            if above <= self.0.len() {
-                self.0[above - 1] += self.0[i - 1];
-            }
-        }
-    }
-
-    /// Append a block: its node sums its own height and the nodes under it.
+    /// Append a block: its node sums its own height and the `log2(low(i))`
+    /// nodes under it, one on average, so indexing n blocks costs O(n).
     fn push(&mut self, height: usize) {
         let i = self.0.len() + 1;
         let (mut sum, mut j) = (height, i - 1);
@@ -468,15 +449,12 @@ pub struct Transcript {
     blocks: Vec<Block>,
     /// Id of the next block pushed.
     next_id: u64,
-    /// First wrapped line of each block. The per-block caches own the only
-    /// copy of every wrapped line, so re-measuring after a fold toggle or
-    /// width change is index arithmetic, never a clone of the session's
-    /// lines. A block not yet wrapped at the current width counts its
-    /// estimated height.
+    /// First wrapped line of each block, by its height: estimated until the
+    /// block is wrapped at the current width. The per-block caches own the
+    /// only copy of every wrapped line.
     index: RowIndex,
-    /// Indices of the user blocks, ascending: the sticky header and prompt
-    /// navigation find the nearest prompt by binary search instead of
-    /// walking back through every block since it.
+    /// Indices of the user blocks, ascending, for the sticky header and
+    /// prompt navigation to find the nearest prompt by binary search.
     users: Vec<usize>,
     /// The blocks holding a wrap, by id, in the order they took it, and the
     /// rows those wraps hold: what [`Self::settle_view`] holds to
@@ -651,12 +629,13 @@ impl Transcript {
             // would move a view whose edge is in the live tail by however
             // far the estimate is off.
             let mut total = 0;
+            self.index.0.clear();
             for block in &mut self.blocks {
                 block.height = block.measure(width);
                 total += block.height;
+                self.index.push(block.height);
             }
             self.total = total;
-            self.index.rebuild(self.blocks.iter().map(|block| block.height));
         }
     }
 
@@ -782,9 +761,8 @@ impl Transcript {
     /// Then it holds the wraps to [`WRAP_BUDGET`] rows: past it, the blocks
     /// wrapped longest ago drop theirs, except the ones in view, which go
     /// to the back. A block keeps its exact height without its wrap and
-    /// wraps again when a frame shows it, so reading a whole session holds
-    /// a window of wraps rather than a second copy of the session, and a
-    /// frame frees about what it wrapped.
+    /// wraps again when a frame shows it, so a frame frees about what it
+    /// wrapped.
     pub fn settle_view(&mut self, rows: usize, tail_len: usize) {
         self.view = (rows, tail_len);
         self.settle(0, 0);
@@ -878,9 +856,6 @@ impl Transcript {
     /// it sits at or below the `held` block, so the view holds still.
     /// Returns whether its height changed.
     fn wrap_held(&mut self, bi: usize, held: Option<usize>) -> bool {
-        if self.width == 0 || self.blocks[bi].is_wrapped_at(self.width) {
-            return false;
-        }
         let added = self.wrap_block(bi);
         if held.is_some_and(|held| bi >= held) {
             self.offset = self.offset.saturating_add_signed(added);
@@ -1665,22 +1640,15 @@ impl Transcript {
 /// screen shows output without its escape sequences; the exact bytes stay
 /// in `full_output` for copy and export.
 fn open_view(compact: &[Line<'static>], output: &str) -> Vec<Line<'static>> {
-    let header = compact.first().cloned().unwrap_or_else(|| Line::from("tool"));
-    let mut lines = vec![header];
+    let dim = Style::default().fg(theme::DIM());
+    let mut lines = vec![compact.first().cloned().unwrap_or_else(|| Line::from("tool"))];
     for line in output.lines().take(80) {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", strip_escapes(line)),
-            Style::default().fg(theme::DIM()),
-        )));
+        lines.push(Line::from(Span::styled(format!("  {}", strip_escapes(line)), dim)));
     }
     let total = output.lines().count();
     if total > 80 {
-        lines.push(Line::from(Span::styled(
-            format!("  … {} more lines", total - 80),
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
-        )));
+        let more = format!("  … {} more lines", total - 80);
+        lines.push(Line::from(Span::styled(more, dim.add_modifier(Modifier::ITALIC))));
     }
     lines
 }

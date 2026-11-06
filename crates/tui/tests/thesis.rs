@@ -593,9 +593,10 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // Effort controls and native Messages support add 711 lines for configuration and translation;
-    // the agent loop and frozen prompt are unchanged.
-    const BASELINE: usize = 44_271;
+    // A frame that costs the same at 1,000,000 transcript lines adds 46 lines to the terminal UI (a row
+    // index over block heights, a prompt list and a budget of held wraps) where main was 10 under the
+    // ratchet; crates/core, the agent loop and the frozen prompt are unchanged.
+    const BASELINE: usize = 44_507;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

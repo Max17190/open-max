@@ -4589,17 +4589,12 @@ fn truncate_replay_output(output: &str) -> String {
     }
 }
 
-/// The text selection's highlight over the rows a frame painted; nothing to
-/// look up per row when nothing is selected.
 fn paint_text_selection(
     buffer: &mut ratatui::buffer::Buffer,
     transcript: &mut Transcript,
     line_map: &[Option<RowRef>],
     area: Rect,
 ) {
-    if !transcript.has_text_selection() {
-        return;
-    }
     let select_bg = theme::SELECT();
     for (row, painted) in line_map.iter().copied().enumerate() {
         let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else {
