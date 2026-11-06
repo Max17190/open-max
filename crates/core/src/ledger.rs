@@ -128,8 +128,9 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 /// SHA-256 from the TLS stack's implementation, which uses the CPU's SHA
-/// instructions on aarch64 and x86_64: every extension file a load parses,
-/// and the ledger's whole log at every approval check, is hashed here.
+/// instructions on aarch64 and x86_64: every tool, hook and policy file a
+/// load parses, and the ledger's whole log at every approval check, is
+/// hashed here.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
