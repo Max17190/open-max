@@ -72,6 +72,8 @@ fn transcript_frame_p99_at_100k_lines() {
         if app.transcript.len() >= LINES {
             break;
         }
+        // Every block is at least a row, so no fill needs more blocks.
+        assert!(blocks < LINES, "{blocks} blocks pushed, and the transcript counts {} rows", app.transcript.len());
         push_long_history(&mut app, FILL_STEP);
         blocks += FILL_STEP;
     }
@@ -232,6 +234,7 @@ fn transcript_frame_p99_at_1m_lines() {
         if app.transcript.len() >= FILL_TO {
             break;
         }
+        assert!(blocks < FILL_TO, "{blocks} blocks pushed, and the transcript counts {} rows", app.transcript.len());
         push_marathon(&mut app, blocks, STEP);
         blocks += STEP;
     }

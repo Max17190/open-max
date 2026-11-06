@@ -453,13 +453,12 @@ impl RowIndex {
     /// `row` is under the total, since a block is at least one row.
     fn locate(&self, row: usize) -> (usize, usize) {
         let (mut bi, mut rest) = (0, row);
-        let mut step = self.0.len().next_power_of_two();
-        while step > 0 {
+        for shift in (0..=self.0.len().checked_ilog2().unwrap_or(0)).rev() {
+            let step = 1 << shift;
             if bi + step <= self.0.len() && self.0[bi + step - 1] <= rest {
                 bi += step;
                 rest -= self.0[bi - 1];
             }
-            step /= 2;
         }
         (bi, rest)
     }
@@ -551,7 +550,7 @@ impl Transcript {
         #[cfg(test)]
         let wrap_now = wrap_now || self.eager;
         self.blocks.push(block);
-        if wrap_now && self.width > 0 {
+        if wrap_now {
             self.ensure_wrap(bi);
         }
         let height = self.blocks[bi].measure(self.width);
@@ -715,15 +714,17 @@ impl Transcript {
         height as isize - before as isize
     }
 
-    /// Wrap block `bi` at the current width unless it already is, counting
-    /// the rows its wrap holds (see [`Self::settle_view`]).
+    /// Wrap block `bi` at the current width unless it already is or there
+    /// is no width yet, counting the rows its wrap holds (see
+    /// [`Self::settle_view`]).
     fn ensure_wrap(&mut self, bi: usize) {
         let block = &mut self.blocks[bi];
-        if !block.is_wrapped_at(self.width) {
-            block.ensure_cache(self.width);
-            self.wraps.push_back((block.id, block.cache.len()));
-            self.wrapped_rows += block.cache.len();
+        if self.width == 0 || block.is_wrapped_at(self.width) {
+            return;
         }
+        block.ensure_cache(self.width);
+        self.wraps.push_back((block.id, block.cache.len()));
+        self.wrapped_rows += block.cache.len();
     }
 
     fn set_height(&mut self, bi: usize, height: usize) {
@@ -747,9 +748,7 @@ impl Transcript {
         {
             self.text_selection = None;
         }
-        if self.width > 0 {
-            self.ensure_wrap(bi);
-        }
+        self.ensure_wrap(bi);
         let height = self.blocks[bi].measure(self.width);
         // Still indexed at its old height: the crossing is measured in the
         // layout the view moves from.
@@ -2872,6 +2871,20 @@ mod tests {
             let expected = walked.map(|i| t.blocks[i].raw[0].spans[0].content.to_string());
             assert_eq!(shown, expected, "top row {top}");
         }
+    }
+
+    /// Nothing wraps before a frame gives the transcript a width, not even
+    /// in the eager shape or on a fold: a wrap at no width holds rows no
+    /// frame paints, and its count would spend the wrap budget.
+    #[test]
+    fn nothing_wraps_before_a_frame_gives_the_transcript_a_width() {
+        let mut t = Transcript::new();
+        t.eager = true;
+        t.push_assistant(vec![Line::from("a reply long enough to wrap at any narrow width")]);
+        t.push_tool(vec![Line::from("✓ bash")], "line one\nline two".into(), true);
+        assert!(t.toggle_fold_at(1));
+        assert!(t.blocks.iter().all(|block| block.cache.is_empty()), "a block wrapped with no width");
+        assert_eq!(t.wrapped_rows, 0);
     }
 
     /// The wraps a frame keeps: all of them up to the budget, then the
