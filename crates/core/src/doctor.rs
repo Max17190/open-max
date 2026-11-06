@@ -1470,12 +1470,15 @@ fn example_verdict(
     let Some(pattern) = &example.expect_regex else {
         return Ok(());
     };
-    // Tool parsing rejects an invalid expect_regex, so a mismatch is the only
-    // failure reachable here. The match sees the output trimmed the same way
-    // `detail` prints it: `$` is end of text, so against raw output
-    // `^[0-9]+$` never matches `echo 63`, and the verdict would print `63`
-    // as the output it rejected.
-    if regex::Regex::new(pattern).is_ok_and(|re| re.is_match(outcome.output.trim_end())) {
+    // Tool parsing rejects a pattern that does not parse; one that parses can
+    // still be past the compiler's size limit, and is named as that, not as
+    // a mismatch. The match sees the output trimmed the same way `detail`
+    // prints it: `$` is end of text, so against raw output `^[0-9]+$` never
+    // matches `echo 63`, and the verdict would print `63` as the output it
+    // rejected.
+    let re = regex::Regex::new(pattern)
+        .map_err(|e| crate::text::one_line(&format!("example.expect_regex does not compile: {e}")))?;
+    if re.is_match(outcome.output.trim_end()) {
         return Ok(());
     }
     Err(format!(
@@ -3686,6 +3689,24 @@ mod tests {
         let text = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n\n[example]\nexpect_regex = \"(\"\n";
         let err = crate::registry::parse_tool_file_from_text_for_tests(text).unwrap_err();
         assert!(err.contains("expect_regex"), "{err}");
+    }
+
+    /// Tool parsing checks that an example's pattern parses and does not
+    /// compile it: a session never runs the example, and a compile took 40 us
+    /// of every load for a pattern with a Unicode class. A pattern can parse
+    /// and still be past the compiler's 10 MB size limit; its tool loads, and
+    /// the example run, which compiles it, names that failure instead of
+    /// calling it a mismatch.
+    #[test]
+    fn an_example_pattern_past_the_compile_limit_loads_and_its_run_says_why() {
+        let text = "name = \"t\"\ndescription = \"d\"\ncommand = \"/bin/sh\"\n\n[example]\nexpect_regex = 'a{400000}'\n";
+        let spec = crate::registry::parse_tool_file_from_text_for_tests(text).expect("a pattern that parses loads");
+        let crate::registry::ToolKind::External(tool) = spec.kind else { panic!("an external tool") };
+        let example = tool.example.expect("the example travels with the tool");
+        let ran = crate::tools::ToolOutcome::ok("aaaa".into());
+        let verdict = example_verdict(&ran, &example).unwrap_err();
+        assert!(verdict.contains("does not compile") && verdict.contains("size limit"), "{verdict}");
+        assert!(!verdict.contains('\n'), "the reason is one line: {verdict:?}");
     }
 
     #[test]

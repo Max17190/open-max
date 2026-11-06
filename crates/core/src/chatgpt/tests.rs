@@ -339,7 +339,7 @@ async fn browser_callback_exchange_and_returning_login_validate_and_preserve_reg
                     assert_eq!(form["grant_type"], "authorization_code");
                     assert_eq!(form["redirect_uri"], auth["redirect_uri"]);
                     assert_eq!(form["resource"], API);
-                    assert_eq!(auth["code_challenge"], B64.encode(Sha256::digest(form["code_verifier"].as_bytes())));
+                    assert_eq!(auth["code_challenge"], B64.encode(digest::digest(&digest::SHA256, form["code_verifier"].as_bytes())));
                     assert!(!form.contains_key("client_secret"));
                     {
                         let mut body = token_body(&signed(&claims(&auth["nonce"])));
