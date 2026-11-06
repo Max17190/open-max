@@ -245,7 +245,9 @@ fn transcript_frame_p99_at_1m_lines() {
         terminal.draw(|f| app.draw_chat(f, chat)).unwrap();
         chat_allocations = crate::allocations() - allocations;
     }
-    let mut frame = |app: &mut App, scroll: fn(&mut Transcript)| {
+    /// What a frame does to the view before it draws.
+    type Scroll = fn(&mut Transcript);
+    let mut frame = |app: &mut App, scroll: Scroll| {
         let allocations = crate::allocations();
         let started = Instant::now();
         scroll(&mut app.transcript);
@@ -253,12 +255,12 @@ fn transcript_frame_p99_at_1m_lines() {
         terminal.draw(|f| app.draw(f)).unwrap();
         (started.elapsed().as_secs_f64() * 1e3, crate::allocations() - allocations)
     };
-    let still: fn(&mut Transcript) = |_| {};
+    let still: Scroll = |_| {};
     for _ in 0..50 {
         frame(&mut app, still);
     }
     let build = if cfg!(debug_assertions) { "debug" } else { "release" };
-    let phases: [(&str, fn(&mut Transcript)); 3] =
+    let phases: [(&str, Scroll); 3] =
         [("idle", still), ("scrolling", |t| t.scroll_up(1)), ("scrolling-at-top", |t| t.scroll_down(1))];
     let mut stats = Vec::new();
     for (phase, scroll) in phases {
