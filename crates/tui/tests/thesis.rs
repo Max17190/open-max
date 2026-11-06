@@ -2521,9 +2521,9 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
 /// and one `done`, its last line. The manifest names `OPENMAX_HUMAN_ATTEST`
 /// in its `env`, so only the harness's strip keeps the variable from the
 /// tool, whose output must show it empty. First, the same command without the
-/// variable must exit 3 before any request: there, the variable is the one
-/// human act, and nothing else grants the run. A functional gate, asserted in
-/// every build.
+/// variable must exit 3 before any request, leaving HOME empty: there, the
+/// variable is the one human act, and nothing else grants the run. A
+/// functional gate, asserted in every build.
 #[test]
 fn an_unattended_run_writes_a_tool_and_calls_it_on_the_next_step() {
     use std::os::unix::process::CommandExt;
@@ -2583,6 +2583,7 @@ mutating = false
     assert_eq!(code, Some(3), "with no terminal and no attestation the grant went through: {printed}");
     assert!(printed.contains("OPENMAX_HUMAN_ATTEST=1"), "the refusal does not name the human act: {printed}");
     assert!(endpoint.served.lock().unwrap().is_empty(), "a refused grant reached the endpoint");
+    assert!(!home.join(".openmax").exists(), "a refused grant wrote to the data dir, so the run after it is no fresh install");
 
     let (code, stdout, printed) = run(true);
     let served = std::mem::take(&mut *endpoint.served.lock().unwrap());
