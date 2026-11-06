@@ -412,8 +412,8 @@ fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Ve
 
 /// What `after` changes against `before`, each in key order: the keys it
 /// adds, the keys both hold with different values, and the keys it drops.
-/// Both deltas the receipt names come from here: the capability files, by
-/// what a capture read of each, and the memory index, by stem.
+/// Both deltas the receipt names come from here: the capability files,
+/// keyed by path, and the memory index, keyed by stem.
 fn changed_keys<K: Ord + Copy, V: PartialEq>(before: &BTreeMap<K, V>, after: &BTreeMap<K, V>) -> [Vec<K>; 3] {
     let mut changed: [Vec<K>; 3] = Default::default();
     for (&key, value) in after {
