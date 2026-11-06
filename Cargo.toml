@@ -62,9 +62,10 @@ libc = "0.2"
 # generate. The cost is that dist will no longer update the workflow for us, so
 # bumping cargo-dist-version below means regenerating by hand, re-applying every
 # `LOCAL EDIT` step, and re-pinning the installer hash in the same commit. A
-# bump can also move a target to another runner: CI's release-build matrix
-# builds each target where `dist plan --output-format=json` assigns it, so
-# re-sync it, and the default runners crates/tui/tests/release.rs records, too.
+# bump can also move a target to another runner: the Release build workflow's
+# matrix (.github/workflows/release-build.yml) builds each target where
+# `dist plan --output-format=json` assigns it, so re-sync it, and the default
+# runners crates/tui/tests/release.rs records, too.
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
@@ -77,6 +78,11 @@ installers = ["shell", "homebrew", "npm"]
 tap = "Max17190/homebrew-tap"
 publish-jobs = ["homebrew", "npm"]
 allow-dirty = ["ci"]
+# No release job runs on a pull request ("skip"; the default, "plan", runs
+# `dist plan` there and skips every other job): the tag's own plan job checks
+# this config before it builds anything, and the release builds a pull
+# request could break run in .github/workflows/release-build.yml.
+pr-run-mode = "skip"
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",

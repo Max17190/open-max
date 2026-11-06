@@ -4,7 +4,7 @@ CI gates the test count on every pull request and push to main. Scheduled and ma
 
 ## Suite timing
 
-After the normal functional tests pass, `scripts/check-suite-time.sh` runs every test binary concurrently with its own thread pool. Linux enforces the existing 15-second budget. The macOS measurement retains its 20-second budget but is advisory: shared runner contention has repeatedly exceeded it while functional tests pass. Any failure in this additional macOS stress run remains visible in its log, a workflow warning, and the job summary. The earlier functional test step, Linux timing, Clippy, and release thesis gates still fail CI on errors. An advisory measurement is not evidence that those required gates passed.
+The functional tests run under cargo-nextest, each test in a process of its own, as many at once as the runner has cores, under the ci profile of `.config/nextest.toml`, which retries no test. After they pass, `scripts/check-suite-time.sh` runs every test binary concurrently with its own thread pool. Linux enforces the existing 15-second budget. The macOS measurement retains its 20-second budget but is advisory: shared runner contention has repeatedly exceeded it while functional tests pass. Any failure in this additional macOS stress run remains visible in its log, a workflow warning, and the job summary. The earlier functional test step, Linux timing, Clippy, and release thesis gates still fail CI on errors. An advisory measurement is not evidence that those required gates passed.
 
 ## Test count
 
