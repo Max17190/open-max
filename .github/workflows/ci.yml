@@ -211,10 +211,10 @@ jobs:
       # 0.240 ms on ubuntu-latest, where it gates, and 0.151 to 0.504 ms on
       # macos-latest, past the bound in two runs and within a fifth of it in
       # two more, while its median held at 0.118 to 0.169 ms. The frame at
-      # 1,000,000 lines, a p99 of 0.092 to 0.103 ms on the M5 against
+      # 1,000,000 lines, a p99 of 0.084 to 0.114 ms on the M5 against
       # 0.25 ms, has not run on either runner yet; at the 2.1 to 2.7 times
-      # ubuntu-latest took for the 100,000-line frame, it would measure 0.19
-      # to 0.28 ms there, no room, so both runners report it.
+      # ubuntu-latest took for the 100,000-line frame, it would measure 0.18
+      # to 0.31 ms there, no room, so both runners report it.
       - name: Thesis reports
         continue-on-error: true
         timeout-minutes: 5

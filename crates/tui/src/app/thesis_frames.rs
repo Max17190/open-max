@@ -51,10 +51,10 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
 ///
 /// Target 0.5 ms. Measured on this tree on an Apple-silicon laptop with
 /// other builds running, where the fill takes 25,000 blocks for 100,000
-/// rows. Five release runs: idle median 0.054 to 0.058 ms, p99 0.062 to
-/// 0.075 ms; scrolling median 0.064 to 0.069 ms, p99 0.074 to 0.081 ms.
-/// Debug, 101 frames inside the parallel unit suite: idle median 0.184 ms,
-/// p99 0.188 ms; scrolling median 0.231 ms, p99 0.278 ms. A release build
+/// rows. Three release runs: idle median 0.066 to 0.067 ms, p99 0.075 to
+/// 0.077 ms; scrolling median 0.074 to 0.081 ms, p99 0.084 to 0.095 ms.
+/// Debug, 101 frames inside the parallel unit suite: idle median 0.299 ms,
+/// p99 0.305 ms; scrolling median 0.309 ms, p99 0.374 ms. A release build
 /// asserts the target on each phase's p99. A debug build asserts a 20x
 /// sanity bound on each phase's median, not its p99: over 101 frames the
 /// p99 is the second-slowest frame, which two scheduler preemptions in the
@@ -210,18 +210,17 @@ fn push_marathon(app: &mut App, from: usize, blocks: usize) {
 /// copy of the history. Prints those and the peak.
 ///
 /// Target 0.25 ms. Measured on this tree on an Apple M5 with other builds
-/// running, where the fill takes 228,000 blocks for 1,042,929 rows. Five
-/// release runs, every phase within the target, one at its second
-/// measurement after a burst put its first at a p99 of 0.264 ms: idle
-/// median 0.056 to 0.058 ms, p99 0.065 to 0.069 ms; scrolling median 0.078
-/// to 0.083 ms, p99 0.092 to 0.103 ms; scrolling at the top median 0.078
-/// to 0.081 ms, p99 0.093 to 0.096 ms; 580.6 MB held, 557 bytes a row, and
-/// 584.0 MB after reading every row. On the transcript before the
+/// running, where the fill takes 228,000 blocks for 1,042,929 rows. Three
+/// release runs, every phase within the target at its first measurement:
+/// idle median 0.074 to 0.075 ms, p99 0.084 ms; scrolling median 0.095 to
+/// 0.096 ms, p99 0.113 to 0.114 ms; scrolling at the top median 0.094 to
+/// 0.096 ms, p99 0.112 ms; 580.6 MB held, 557 bytes a row, and 584.0 MB
+/// after reading every row. On the transcript before the
 /// row index, with each folded tool card holding its open view and each
 /// block its wrap, scrolling at the top measured p99 1.329 to 1.430 ms,
 /// 843 bytes a row, and 1,265.8 MB after reading every row. Debug, 101
 /// frames over 27,450 rows inside the parallel unit suite: idle median
-/// 0.187 ms, scrolling 0.333 ms, at the top 0.321 ms; 571 bytes a row.
+/// 0.371 ms, scrolling 0.463 ms, at the top 0.463 ms; 571 bytes a row.
 #[test]
 fn transcript_frame_p99_at_1m_lines() {
     const TARGET_MS: f64 = 0.25;
