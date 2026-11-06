@@ -311,42 +311,38 @@ fn classify_added_tools(
         _ => None,
     };
     let mut out = AddedTools { memory, ..Default::default() };
-    if mode == ApprovalMode::Auto {
-        out.approved = added_tool_names(old_registry, new_registry);
-        return out;
-    }
-    for name in added_tool_names(old_registry, new_registry) {
-        match unapproved_capability(new_registry, data_dir, project_root, &name) {
-            Some(source) => out.unapproved.push((name, source.path)),
-            None => out.approved.push(name),
-        }
-    }
-    for spec in &new_registry.tools {
-        let crate::registry::ToolKind::External(new_ext) = &spec.kind else { continue };
-        let Some(old_spec) = old_registry.get(&spec.name) else { continue };
-        let crate::registry::ToolKind::External(old_ext) = &old_spec.kind else { continue };
-        if old_ext.source_sha256 == new_ext.source_sha256 {
-            continue;
-        }
-        if let Some(source) = unapproved_capability(new_registry, data_dir, project_root, &spec.name) {
-            out.modified_unapproved.push((spec.name.clone(), source.path));
+    for (name, _, added) in new_or_changed_tools(old_registry, new_registry) {
+        let unapproved = match mode {
+            ApprovalMode::Auto => None,
+            _ => unapproved_capability(new_registry, data_dir, project_root, name),
+        };
+        match (unapproved, added) {
+            (None, true) => out.approved.push(name.to_string()),
+            (Some(source), true) => out.unapproved.push((name.to_string(), source.path)),
+            (Some(source), false) => out.modified_unapproved.push((name.to_string(), source.path)),
+            (None, false) => {}
         }
     }
     out
 }
 
-/// Names the incoming generation adds, computed against the outgoing
-/// registry while it is still current: the tools the model does not know
-/// it has.
-fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
-    let old_names: std::collections::HashSet<&str> =
-        old.tools.iter().map(|s| s.name.as_str()).collect();
-    new.tools
-        .iter()
-        .map(|s| s.name.as_str())
-        .filter(|name| !old_names.contains(name))
-        .map(str::to_string)
-        .collect()
+/// Each external tool of the incoming generation whose manifest bytes the
+/// outgoing one does not carry under its name, in the incoming order: true
+/// when the outgoing generation has no tool of that name (added), false when
+/// it carried other bytes (changed). A name is a built-in in every registry
+/// or in none, as `Registry::assemble` drops an external tool that takes
+/// one, so the added ones are every tool the model does not know it has.
+fn new_or_changed_tools<'a>(
+    old: &'a Registry,
+    new: &'a Registry,
+) -> impl Iterator<Item = (&'a str, &'a crate::registry::ExternalTool, bool)> + 'a {
+    new.tools.iter().filter_map(move |spec| {
+        let crate::registry::ToolKind::External(ext) = &spec.kind else { return None };
+        match old.get(&spec.name).map(|before| &before.kind) {
+            Some(crate::registry::ToolKind::External(before)) if before.source_sha256 == ext.source_sha256 => None,
+            before => Some((spec.name.as_str(), ext, before.is_none())),
+        }
+    })
 }
 
 /// Each external tool the incoming generation adds or whose manifest bytes
@@ -357,16 +353,7 @@ fn added_tool_names(old: &Registry, new: &Registry) -> Vec<String> {
 /// every later request, names the changed file and any newly callable tool,
 /// never the command.
 fn tool_runs(old: &Registry, new: &Registry) -> Vec<(String, String)> {
-    new.tools
-        .iter()
-        .filter_map(|spec| {
-            let crate::registry::ToolKind::External(ext) = &spec.kind else { return None };
-            let unchanged = old.get(&spec.name).is_some_and(|before| {
-                matches!(&before.kind, crate::registry::ToolKind::External(b) if b.source_sha256 == ext.source_sha256)
-            });
-            (!unchanged).then(|| (spec.name.clone(), ext.command_line()))
-        })
-        .collect()
+    new_or_changed_tools(old, new).map(|(name, ext, _)| (name.to_string(), ext.command_line())).collect()
 }
 
 /// What the incoming generation changes against the outgoing one, a line per
@@ -973,6 +960,59 @@ mod tests {
                 ("beta".to_string(), "'./beta.sh'".to_string()),
             ]
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The receipt and the screen name the same tools: every one the new
+    /// generation adds or whose manifest an edit changed is in what the
+    /// screen shows runs, a tool with the same bytes or one that left disk is
+    /// in neither, and the mode and the ledger decide only which approval
+    /// clause names an added or edited tool. Auto reads no ledger, so every
+    /// added tool is callable and no edit is listed.
+    #[test]
+    fn the_receipt_and_the_screen_name_the_same_new_and_edited_tools() {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (data, project) = (dir.join("data"), dir.join("project"));
+        let tools = project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let write = |name: &str, command: &str| {
+            let manifest = format!("name = \"{name}\"\ndescription = \"d\"\ncommand = \"{command}\"\n");
+            std::fs::write(tools.join(format!("{name}.toml")), manifest).unwrap();
+        };
+        // A human approves the exact bytes, as `openmax --approve` does.
+        let approve = |name: &str| {
+            let manifest = tools.join(format!("{name}.toml"));
+            let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
+            shas.extend(crate::ledger::manifest_code(&manifest, &project).into_iter().filter_map(|c| c.sha256));
+            crate::ledger::approve_capability(&data, &project, &manifest, &shas).unwrap();
+        };
+        for name in ["blessed", "edited", "gone", "kept"] {
+            write(name, "/bin/echo");
+        }
+        let old = Registry::build(&data, &project);
+        std::fs::remove_file(tools.join("gone.toml")).unwrap();
+        for (name, command) in [("blessed", "/bin/cat"), ("edited", "/bin/cat"), ("fresh", "/bin/ls"), ("vetted", "/bin/ls")] {
+            write(name, command);
+        }
+        approve("blessed");
+        approve("vetted");
+        let new = Registry::build(&data, &project);
+
+        let run = |name: &str, command: &str| (name.to_string(), format!("'{command}'"));
+        assert_eq!(
+            tool_runs(&old, &new),
+            [run("blessed", "/bin/cat"), run("edited", "/bin/cat"), run("fresh", "/bin/ls"), run("vetted", "/bin/ls")]
+        );
+        let classified = |mode| {
+            let added = classify_added_tools(&old, &new, mode, &data, &project);
+            (added.approved, added.unapproved, added.modified_unapproved)
+        };
+        let listed = |name: &str| vec![(name.to_string(), format!(".openmax/tools/{name}.toml"))];
+        for mode in [ApprovalMode::Ask, ApprovalMode::Readonly] {
+            assert_eq!(classified(mode), (vec!["vetted".to_string()], listed("fresh"), listed("edited")), "{mode:?}");
+        }
+        assert_eq!(classified(ApprovalMode::Auto), (vec!["fresh".to_string(), "vetted".to_string()], Vec::new(), Vec::new()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
