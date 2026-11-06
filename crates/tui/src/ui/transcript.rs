@@ -846,15 +846,17 @@ impl Transcript {
     ///
     /// Estimates never exceed the wrap, so a growing block only pushes
     /// others out of the range: the loop wraps at most the blocks the first
-    /// range covered, never the history beyond it.
+    /// range covered, never the history beyond it. Only a height change
+    /// moves the range (the total and the offset follow heights), so a pass
+    /// that changes none has wrapped the range it covers, and is the last.
     fn settle(&mut self, above: usize, below: usize) {
         while let Some((first, last)) = self.window(above, below) {
             let held = self.held_block();
-            let mut wrapped = false;
+            let mut grew = false;
             for bi in first..=last {
-                wrapped |= self.wrap_held(bi, held);
+                grew |= self.wrap_held(bi, held);
             }
-            if !wrapped {
+            if !grew {
                 return;
             }
         }
@@ -873,7 +875,7 @@ impl Transcript {
 
     /// Wrap block `bi` unless it already is, growing the offset with it when
     /// it sits at or below the `held` block, so the view holds still.
-    /// Returns whether it wrapped.
+    /// Returns whether its height changed.
     fn wrap_held(&mut self, bi: usize, held: Option<usize>) -> bool {
         if self.width == 0 || self.blocks[bi].is_wrapped_at(self.width) {
             return false;
@@ -882,7 +884,7 @@ impl Transcript {
         if held.is_some_and(|held| bi >= held) {
             self.offset = self.offset.saturating_add_signed(added);
         }
-        true
+        added != 0
     }
 
     /// Rows in the whole transcript, exact whenever there are at most
