@@ -20,7 +20,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// Who wrote a record, at the strength the core can prove.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,12 +118,20 @@ fn is_false(b: &bool) -> bool {
 /// number only says which build's shape a record carries.
 const RECORD_VERSION: u32 = 2;
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Lowercase hex, two digits a byte, into one allocation: a `format!` per
+/// byte allocated 32 strings for every hash the loaders take.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 * bytes.len());
+    bytes.iter().for_each(|b| out.extend([DIGITS[usize::from(b >> 4)], DIGITS[usize::from(b & 15)]].map(char::from)));
+    out
 }
 
+/// SHA-256 from the TLS stack's implementation, which uses the CPU's SHA
+/// instructions on aarch64 and x86_64: every extension file a load parses,
+/// and the ledger's whole log at every approval check, is hashed here.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+    hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
 /// The per-project key every per-project store under the data dir uses:
@@ -1687,6 +1694,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("openmax-ledger-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Every approval binds content by this hash, and every record a ledger
+    /// already holds was written with it, so the implementation must give
+    /// SHA-256 exactly, in lowercase hex: the FIPS 180-2 test vectors, one and
+    /// two blocks, and a million bytes.
+    #[test]
+    fn content_hashes_are_sha256_in_lowercase_hex() {
+        let vectors: [(&[u8], &str); 3] = [
+            (b"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ];
+        for (bytes, digest) in vectors {
+            assert_eq!(sha256_hex(bytes), digest, "{:?}", String::from_utf8_lossy(bytes));
+        }
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     /// Append change records the way earlier builds did on every refreeze,

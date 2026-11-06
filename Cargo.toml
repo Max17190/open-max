@@ -34,9 +34,8 @@ ignore = "0.4"
 globset = "0.4"
 similar = "2"
 uuid = { version = "1", features = ["v4"] }
-# Content hashes for the capability ledger (objects are addressed by sha256).
-sha2 = "0.10"
-# Reuse the TLS stack's crypto and encoding for OAuth PKCE and ID-token validation.
+# The TLS stack's crypto, reused: SHA-256 for the capability ledger's content
+# hashes (with the CPU's SHA instructions), OAuth PKCE and ID-token validation.
 ring = "0.17"
 base64 = "0.22"
 # Hand-authored external-tool configs (.openmax/tools/*.toml); parse only.

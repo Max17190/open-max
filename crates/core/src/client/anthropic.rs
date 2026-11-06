@@ -1,7 +1,7 @@
 //! Native Messages translation; tool execution and trust stay in the agent loop.
 use super::*;
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 
 pub(super) fn serialize(
     client: &ChatClient,
@@ -60,7 +60,7 @@ pub(super) fn serialize(
                 // grouping can still extend. Hash that one only in the snapshot.
                 let mut at = prefix.clone();
                 if let Some(last) = input.last() { hash_message(&mut at, last); }
-                if stored["prefix"] == format!("{:x}", at.finalize()) {
+                if stored["prefix"] == crate::ledger::hex(at.finish().as_ref()) {
                     if let Some(content) = stored["content"].as_array().filter(|content| visible_matches(content, message)) {
                         validate_blocks(content)?;
                         blocks = content.clone();
@@ -129,13 +129,13 @@ pub(super) fn serialize(
 
 
 // Compact JSON contains no literal newlines, so each framed value is unambiguous.
-fn hash_message(hash: &mut Sha256, value: &Value) {
+fn hash_message(hash: &mut Context, value: &Value) {
     hash.update(value.to_string().as_bytes());
     hash.update(b"\n");
 }
 
-fn prefix_seed(system: &Value, tools: &Value) -> Sha256 {
-    let mut hash = Sha256::new();
+fn prefix_seed(system: &Value, tools: &Value) -> Context {
+    let mut hash = Context::new(&SHA256);
     hash.update(b"native-prefix-v1\n");
     hash_message(&mut hash, system);
     hash_message(&mut hash, tools);
@@ -149,7 +149,7 @@ pub(super) fn stamp(reply: &mut CompletionResult, request: &[u8]) -> Result<(), 
     let mut hash = prefix_seed(body.get("system").unwrap_or(&empty), body.get("tools").unwrap_or(&empty));
     for message in body["messages"].as_array().ok_or("invalid Messages request history")? { hash_message(&mut hash, message); }
     let content: Value = serde_json::from_str(content.get()).map_err(|_| "invalid Messages content")?;
-    reply.reasoning_details = Some(serde_json::value::to_raw_value(&json!({"prefix":format!("{:x}", hash.finalize()),"content":content}))
+    reply.reasoning_details = Some(serde_json::value::to_raw_value(&json!({"prefix":crate::ledger::hex(hash.finish().as_ref()),"content":content}))
         .map_err(|_| "cannot preserve Messages content")?);
     Ok(())
 }
