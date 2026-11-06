@@ -34,3 +34,7 @@ crates/core/src/tools.rs: replace + with - in grep_tool # hangs: a match on a fi
 crates/core/src/tools.rs: replace - with + in kept_tail # hangs: a start of len + max_bytes lies past the end of the text, where no index is a character boundary.
 crates/core/src/tools.rs: replace += with *= in kept_tail # hangs: start *= 1 never moves off a byte inside a character.
 crates/core/src/tools.rs: replace -= with /= in kept_head # hangs: end /= 1 never moves off a byte inside a character.
+crates/tui/src/ui/transcript.rs: replace low -> usize with 0 # hangs: with every lowest bit 0, RowIndex::add and RowIndex::start step their node number by nothing and never leave their loops.
+crates/tui/src/ui/transcript.rs: replace -= with /= in RowIndex::push # hangs: an odd node number divided by its lowest bit, 1, stays put, so the sum of the nodes under a new block's node never ends.
+crates/tui/src/ui/transcript.rs: replace += with *= in RowIndex::add # hangs: an odd node number times its lowest bit, 1, stays put, so a height change never climbs past it.
+crates/tui/src/ui/transcript.rs: replace -= with /= in RowIndex::start # hangs: an odd node number divided by its lowest bit, 1, stays put, so the rows above a block are summed forever.
