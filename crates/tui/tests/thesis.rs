@@ -1088,11 +1088,11 @@ fn lossy_pipes(script: &str) -> Vec<String> {
 /// script swallows with `|| true`, `|| :` or `|| exit 0`; and no pipe that
 /// loses a failure (lossy_pipes): a `set -o pipefail` before it in the
 /// step's script keeps the failure, and so does the step's `shell: bash`,
-/// which sets `pipefail`. A measurement no runner meets with room leaves the pull
-/// request's gate for the Reports workflow, which runs every night and by
-/// hand, on no pull request and no push, and fails only when it cannot
-/// measure. Of the workflows GitHub runs, `.yml` and `.yaml` files, ci.yml
-/// is the one that runs on pull requests.
+/// which sets `pipefail`. A measurement no runner meets with room leaves
+/// the pull request's gate for the Reports workflow, which runs every night
+/// and by hand, on no pull request and no push, and fails only when it
+/// cannot measure. Of the workflows GitHub runs, `.yml` and `.yaml` files,
+/// ci.yml is the one that runs on pull requests.
 #[test]
 fn pull_request_workflows_skip_no_step_and_let_none_fail() {
     for (script, lossy) in [
