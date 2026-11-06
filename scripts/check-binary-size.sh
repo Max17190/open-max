@@ -7,9 +7,9 @@
 # target a tag publishes (dist builds with a profile that inherits release
 # unchanged), on every push to main, every night and every merge group, so a
 # dependency, feature or profile change that bloats a shipped binary fails
-# main's run of the merge that lands it, on the target it bloats, long before
-# a tag. A warning would not: nothing stops a binary drifting past a limit
-# that only warns.
+# main's run of the merge that lands it, on the target it bloats. That run is
+# the only check: a tag builds with dist and reads no budget. A warning would
+# not do: nothing stops a binary drifting past a limit that only warns.
 #
 # Each budget is that target's measured size plus 10% headroom. Every size
 # started as the target's v2026.10.0 release binary; a raise replaces it with

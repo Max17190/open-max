@@ -1,8 +1,11 @@
 //! What CI has to hold for a release tag to ship, checked against the files
-//! that define it. A tag builds every target in `[workspace.metadata.dist]`,
-//! and one failed build stops the whole release, so each target has to build,
-//! and fit its size budget, on every push to main, every night and every
-//! merge group, well before a tag would find out.
+//! that define it. A tag first has dist plan the release from
+//! `[workspace.metadata.dist]`, then builds every target in it, and a failed
+//! plan or build stops the whole release, so the plan runs on every pull
+//! request and each target builds on every push to main, every night and
+//! every merge group, well before a tag would find out. Those builds also
+//! hold each binary to its size budget, which a tag does not read: there,
+//! main's run of the merge that grew a binary is the only check.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,8 +47,10 @@ fn dist_targets() -> Vec<String> {
     targets
 }
 
-/// The lines of one job in a workflow, from its key up to the next key at the
-/// jobs' indentation or less (the next job, or the end of `jobs:`).
+/// The lines of one job in a workflow, from its key up to the first line after
+/// it at the jobs' indentation or less that is not blank: the next job's key,
+/// the comment above that job, which is not this one's, or the end of
+/// `jobs:`.
 fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
     let text = read(workflow);
     let key = format!("  {name}:");
@@ -54,7 +59,7 @@ fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
     lines
         .take_while(|line| {
             let body = line.trim_start();
-            body.is_empty() || body.starts_with('#') || line.len() - body.len() > 2
+            body.is_empty() || line.len() - body.len() > 2
         })
         .map(str::to_string)
         .collect()
@@ -150,8 +155,9 @@ fn custom_runner<'a>(target: &str, entry: &'a toml::Value) -> &'a str {
 /// group, every night and on demand, and on no pull request: the slowest of
 /// them takes longer than the whole pull-request gate. The Release workflow
 /// itself runs only on a release tag, as dist's `pr-run-mode = "skip"`
-/// generates it, so no plan job, and no job it skips, runs on a pull request.
-/// README.md states where the builds run.
+/// generates it, so none of its jobs runs on a pull request, where CI's own
+/// Release plan job runs dist's plan instead. README.md states where the
+/// builds run.
 #[test]
 fn ci_builds_and_size_gates_every_release_target() {
     let events = triggers(".github/workflows/release-build.yml");
@@ -181,6 +187,13 @@ fn ci_builds_and_size_gates_every_release_target() {
     let readme = read("README.md");
     let claim = "The Release build workflow builds and size-gates every release target on every push to main, every night and every merge group, and on no pull request";
     assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
+    // So main's run is the only size check a release has, as README.md says.
+    let claim = "A release tag publishes nothing unless dist builds every target, but it reads no size budget";
+    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(
+        !read(".github/workflows/release.yml").contains("check-binary-size"),
+        "the Release workflow gates binary sizes, so README.md's \"{claim}\" no longer holds"
+    );
 
     let matrix = ci_release_matrix();
     let mut built: Vec<&str> = matrix.iter().map(|(target, _)| target.as_str()).collect();
@@ -217,8 +230,8 @@ fn ci_builds_and_size_gates_every_release_target() {
         "the release-build job does not gate each binary's size: `{gate}`"
     );
     // A condition on the job, its build step or its gate step skips the gate,
-    // so the pull request that broke the target passes. Only the musl-tools
-    // install is conditional.
+    // so main's run of the merge that broke the target passes. Only the
+    // musl-tools install is conditional.
     let conditions: Vec<&str> = job
         .iter()
         .map(|line| line.trim().trim_start_matches("- "))
@@ -230,7 +243,7 @@ fn ci_builds_and_size_gates_every_release_target() {
     assert_eq!(
         conditions,
         ["if: endsWith(matrix.target, '-musl')"],
-        "an `if:` on the release-build job or its build or gate step skips the gate, which passes the pull request that broke the target"
+        "an `if:` on the release-build job or its build or gate step skips the gate, which passes main's run of the merge that broke the target"
     );
     // On the gate's step or its job, this lets an over-budget binary pass.
     let soft = job.iter().map(|line| line.trim()).find(|line| !line.starts_with('#') && line.contains("continue-on-error"));
@@ -243,6 +256,96 @@ fn ci_builds_and_size_gates_every_release_target() {
         release,
         "[profile.dist] overrides the release profile the gate measures"
     );
+}
+
+/// The cargo-dist installers a workflow's lines download, and the sha256
+/// each `shasum` check of an installer holds it to, in order.
+fn dist_installs(lines: &[String]) -> (Vec<String>, Vec<String>) {
+    let urls = lines
+        .iter()
+        .map(|line| line.trim().trim_end_matches('\\').trim())
+        .filter(|line| line.starts_with("https://") && line.ends_with("/cargo-dist-installer.sh"))
+        .map(str::to_string)
+        .collect();
+    let hashes = lines
+        .iter()
+        .filter_map(|line| {
+            let (hash, file) = line.trim().strip_prefix("echo \"")?.split_once("  ")?;
+            file.contains("cargo-dist-installer.sh\"").then(|| hash.to_string())
+        })
+        .collect();
+    (urls, hashes)
+}
+
+/// A release tag's first job has dist plan the release from
+/// `[workspace.metadata.dist]` and stops the release when it cannot, so CI's
+/// Release plan job runs `dist plan` on every pull request, as on every push
+/// to main, merge group and night, and a config dist cannot plan fails the
+/// pull request that makes it rather than the tag. It installs dist as the
+/// Release workflow does wherever it downloads it: from cargo-dist's
+/// installer at the version Cargo.toml names, checked against the same
+/// sha256 before it runs, so a bump that re-pins one and not the other fails
+/// here. Nothing skips the job or lets it fail, and its token only reads.
+/// README.md states this.
+#[test]
+fn ci_plans_the_release_with_the_dist_a_tag_installs() {
+    let version = manifest_table("workspace.metadata.dist")
+        .get("cargo-dist-version")
+        .and_then(toml::Value::as_str)
+        .expect("[workspace.metadata.dist] names its cargo-dist-version")
+        .to_string();
+    let installer = format!("https://github.com/axodotdev/cargo-dist/releases/download/v{version}/cargo-dist-installer.sh");
+    let tag: Vec<String> = read(".github/workflows/release.yml").lines().map(str::to_string).collect();
+    let (tag_urls, tag_hashes) = dist_installs(&tag);
+    assert!(
+        !tag_urls.is_empty() && tag_urls.iter().all(|url| *url == installer),
+        "the Release workflow installs another dist than the {version} Cargo.toml names: {tag_urls:?}"
+    );
+    let sha256 = tag_hashes.first().cloned().unwrap_or_default();
+    assert!(
+        tag_hashes.len() == tag_urls.len()
+            && tag_hashes.iter().all(|hash| *hash == sha256)
+            && sha256.len() == 64
+            && sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "the Release workflow does not check every dist installer it downloads against one sha256: {tag_hashes:?}"
+    );
+
+    let job = workflow_job(".github/workflows/ci.yml", "release-plan");
+    let (urls, hashes) = dist_installs(&job);
+    assert_eq!(urls, [installer.as_str()], "the Release plan job does not install the dist a tag installs");
+    assert_eq!(hashes, [sha256.as_str()], "the Release plan job checks its installer against another hash than a tag's");
+    let at = |what: &str, wanted: &dyn Fn(&str) -> bool| {
+        job.iter().position(|line| wanted(line.trim())).unwrap_or_else(|| panic!("the Release plan job has no {what}: {job:?}"))
+    };
+    let fetched = at("download of the installer", &|line| line.starts_with(installer.as_str()));
+    let checked = at("strict sha256 check", &|line| line == "| shasum -a 256 --check --strict -");
+    let installed = at("run of the installer", &|line| line == r#"sh "$RUNNER_TEMP/cargo-dist-installer.sh""#);
+    let planned = at("step that plans the release", &|line| line == "run: dist plan --output-format=json");
+    assert!(
+        fetched < checked && checked < installed && installed < planned,
+        "the installer runs before its hash is checked, or the plan before dist is installed"
+    );
+    // Either one lets a pull request pass with a config dist cannot plan.
+    let soft: Vec<&str> = job
+        .iter()
+        .map(|line| line.trim().trim_start_matches("- "))
+        .filter(|line| {
+            let key = line.split_once(':').map_or("", |(key, _)| key.trim());
+            matches!(key.trim_matches(|c| c == '"' || c == '\''), "if" | "continue-on-error")
+        })
+        .collect();
+    assert!(soft.is_empty(), "the Release plan job can be skipped or fail while CI passes: {soft:?}");
+    let permissions = at("permissions of its own", &|line| line == "permissions:");
+    let granted: Vec<&str> = job[permissions + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("      ") && !line.trim().starts_with('-'))
+        .map(|line| line.trim())
+        .collect();
+    assert_eq!(granted, ["contents: read"], "the Release plan job's token can do more than read the repository");
+
+    let readme = read("README.md");
+    let claim = "CI's Release plan job runs `dist plan`, the plan a release tag starts with, on every pull request";
+    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
 }
 
 /// The gate passes a binary exactly at its target's budget and fails one a

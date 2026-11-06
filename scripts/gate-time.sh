@@ -25,9 +25,12 @@
 # head commit, its gate time and the job that finished last. Then the p50,
 # p90 and p99 of the gate times, each the time at rank ceil(q * n / 100) of
 # the n in the sample in ascending order (the nearest rank), so it is one of
-# them, and the slowest, against the target: a median under 90 seconds and a
-# p99 under 120. Then the counts. In GitHub Actions it adds the same lines to
-# the job's summary.
+# them, and the slowest. Then the counts. Then the target: a median under 90
+# seconds and a p99 under 120 over N consecutive runs that passed at their
+# first attempt, met only when the sample holds all N and no run as recent
+# failed at its first attempt (a cancelled one gave no verdict, so it breaks
+# no run of them). In GitHub Actions it adds the same lines to the job's
+# summary.
 #
 # A report, not a gate, until the target is met: it exits 0 whatever it
 # measures; 1 when it cannot measure (gh fails or prints what this script
@@ -159,10 +162,14 @@ my $runs = $n == 1 ? "1 run" : "$n runs";
 my $fewer = $n < $want ? ", fewer than the $want asked for" : "";
 print "gate time of the latest $runs of $workflow in $repo on a pull request that passed at the first attempt$fewer, from the start of its first job to the end of its last:\n";
 printf "run %s at %s: %d s, %s last\n", $_->{id}, $_->{sha}, $_->{time}, $_->{last} for @sample;
-printf "p50 %d s, p90 %d s, p99 %d s, slowest %d s over %s; target p50 under 90 s and p99 under 120 s: %s\n",
-  $p50, $p90, $p99, $times[-1], $runs, $p50 < 90 && $p99 < 120 ? "met" : "not met";
+printf "p50 %d s, p90 %d s, p99 %d s, slowest %d s over %s\n", $p50, $p90, $p99, $times[-1], $runs;
 printf "since the oldest of them, %d %s at the first attempt (%d of them passed when run again) and %d %s cancelled\n",
   $red, $red == 1 ? "run failed" : "runs failed", $passed_again, $cancelled, $cancelled == 1 ? "was" : "were";
+# Met over the whole sample asked for, and only when no run as recent failed
+# at its first attempt, so the runs are consecutive; a cancelled run gave no
+# verdict, so it breaks no run of them.
+printf "target p50 under 90 s and p99 under 120 s over %d consecutive %s that passed at the first attempt: %s\n",
+  $want, $want == 1 ? "run" : "runs", $n == $want && $red == 0 && $p50 < 90 && $p99 < 120 ? "met" : "not met";
 ' "$repo" "$runs") || exit $?
 
 echo "$report"

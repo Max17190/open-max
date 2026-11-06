@@ -11,7 +11,9 @@ fn repo() -> PathBuf {
 }
 
 /// The lines of one job in a workflow under .github/workflows, from its key up
-/// to the next key at the jobs' indentation or less.
+/// to the first line after it at the jobs' indentation or less that is not
+/// blank: the next job's key, or the comment above that job, which is not
+/// this one's.
 fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
     let text = std::fs::read_to_string(repo().join(".github/workflows").join(workflow)).unwrap();
     let key = format!("  {name}:");
@@ -20,7 +22,7 @@ fn workflow_job(workflow: &str, name: &str) -> Vec<String> {
     lines
         .take_while(|line| {
             let body = line.trim_start();
-            body.is_empty() || body.starts_with('#') || line.len() - body.len() > 2
+            body.is_empty() || line.len() - body.len() > 2
         })
         .map(str::to_string)
         .collect()
@@ -1515,15 +1517,17 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
 /// none needs another, so the gate takes as long as its slowest job, and
 /// Clippy, which builds with a compiler of its own, pinned to a release, is a
 /// job of its own instead of steps after the tests. The jobs are the tests,
-/// Clippy, the thesis gates and the core share; the six release builds are
-/// not among them (crates/tui/tests/release.rs holds their workflow). CI runs
-/// on every push to main, every pull request, every merge group of a merge
-/// queue and every night. A push to a pull request cancels the run still
-/// testing its previous head: the concurrency group is the pull request's
-/// number, and every other run's group is its own run id, so no other run is
-/// ever cancelled. Every cache step of a workflow that builds saves only on
-/// main, so a pull request's copy, which no other run can read, takes none of
-/// the repository's cache space.
+/// Clippy, the thesis gates, the core share and dist's plan of the release;
+/// the six release builds are not among them (crates/tui/tests/release.rs
+/// holds their workflow and the plan). CI runs on every push to main, every
+/// pull request, every merge group of a merge queue and every night. A push
+/// to a pull request cancels the run still testing its previous head: the
+/// concurrency group is the pull request's number, and every other run's
+/// group is its own run id, so no other run is ever cancelled. Every cache
+/// step of a workflow that builds saves only on main: a pull request's copy
+/// would serve only that pull request's later runs, which main's copy serves
+/// as well unless the pull request changes Cargo.lock, since rust-cache keeps
+/// no workspace crate, and it would take the repository's cache space.
 #[test]
 fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
     let events = triggers("ci.yml");
@@ -1550,7 +1554,7 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
         .skip(1)
         .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':').filter(|key| !key.starts_with([' ', '#'])))
         .collect();
-    assert_eq!(jobs, ["test", "clippy", "thesis", "core-share"], "the gate's jobs changed");
+    assert_eq!(jobs, ["test", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
     for job in &jobs {
         let waits: Vec<String> = ci_job(job).into_iter().filter(|line| line.trim().starts_with("needs:")).collect();
         assert!(waits.is_empty(), "the {job} job waits for another, so the gate takes the two one after the other: {waits:?}");
@@ -1713,12 +1717,13 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
 /// the wall clock from its first job's start to its last job's end, a skipped
 /// job counting at neither end, a job that began and ended in one second
 /// counting, and a new year between the two read as any other second. It
-/// prints a line for each, then the p50, p90
-/// and p99 by the nearest rank and the slowest, against the target, met only
-/// when the median is under 90 s and the p99 under 120 s; then how many runs
-/// as recent failed at their first attempt (a failed job outranks a cancelled
-/// one, and a run with no job failed), how many of those passed when run
-/// again, and how many were cancelled. It reads a second page of runs only
+/// prints a line for each, then the p50, p90 and p99 by the nearest rank and
+/// the slowest; then how many runs as recent failed at their first attempt (a
+/// failed job outranks a cancelled one, and a run with no job failed), how
+/// many of those passed when run again, and how many were cancelled; then the
+/// target, met only when the median is under 90 s and the p99 under 120 s
+/// over all N runs asked for and none as recent failed at its first attempt,
+/// so the N are consecutive. It reads a second page of runs only
 /// after a full first one, reads no run past the N-th that passed, says when
 /// it found fewer, adds its report to the job's summary, and names its
 /// repository by --repo, else GITHUB_REPOSITORY. It exits 0 whatever it
@@ -1735,7 +1740,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
         "`scripts/gate-time.sh` (bash, gh and perl) measures the pull-request gate".to_string(),
         format!("the latest {default_runs} pull-request runs of the CI workflow that passed at their first attempt"),
         "from the start of its first job to the end of its last".to_string(),
-        "The target is a p50 under 90 seconds and a p99 under 120 seconds".to_string(),
+        format!("The target is a p50 under 90 seconds and a p99 under 120 seconds over {default_runs} consecutive runs"),
         "The Gate time workflow runs it on every push to main and every night".to_string(),
         "the job reports the times and fails only when the script cannot measure them".to_string(),
     ] {
@@ -1905,6 +1910,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
         ("unsummarized", vec!["--repo", "o/met", "--runs", "3"], vec![("GITHUB_STEP_SUMMARY", dir.join("gone/summary.md").display().to_string())]),
         ("met", vec!["--runs", "3"], vec![("GITHUB_REPOSITORY", "o/met".to_string()), summarize[0].clone()]),
         ("over", vec!["--repo", "o/met", "--runs", "3"], vec![("GITHUB_REPOSITORY", "o/nowhere".to_string())]),
+        ("short", vec!["--repo", "o/met"], vec![]),
         ("p50", vec!["--repo", "o/p50", "--runs", "2"], vec![]),
         ("p99", vec!["--repo", "o/p99", "--runs", "2"], vec![]),
         ("one", vec!["--repo", "o/one", "--runs", "1"], vec![]),
@@ -1952,8 +1958,9 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
          run 107 at 00000107: 89 s, Test (ubuntu-latest) last\n\
          run 108 at 00000108: 90 s, Test (ubuntu-latest) last\n\
          run 109 at 00000109: 119 s, Test (ubuntu-latest) last\n\
-         p50 90 s, p90 210 s, p99 210 s, slowest 210 s over 5 runs; target p50 under 90 s and p99 under 120 s: not met\n\
-         since the oldest of them, 3 runs failed at the first attempt (1 of them passed when run again) and 1 was cancelled\n",
+         p50 90 s, p90 210 s, p99 210 s, slowest 210 s over 5 runs\n\
+         since the oldest of them, 3 runs failed at the first attempt (1 of them passed when run again) and 1 was cancelled\n\
+         target p50 under 90 s and p99 under 120 s over 5 consecutive runs that passed at the first attempt: not met\n",
         "the gate time of five runs is not measured by its method"
     );
     let asked_for: Vec<&str> = asked.lines().collect();
@@ -1968,8 +1975,8 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     assert!(
         report.starts_with("gate time of the latest 6 runs of ci.yml in o/main on a pull request that passed at the first attempt, fewer than the 20 asked for, from")
             && report.contains("\nrun 110 at 00000110: 120 s, Test (ubuntu-latest) last\n")
-            && report.contains("\np50 90 s, p90 210 s, p99 210 s, slowest 210 s over 6 runs; target")
-            && report.ends_with("\nsince the oldest of them, 3 runs failed at the first attempt (1 of them passed when run again) and 1 was cancelled\n"),
+            && report.contains("\np50 90 s, p90 210 s, p99 210 s, slowest 210 s over 6 runs\n")
+            && report.ends_with("\nsince the oldest of them, 3 runs failed at the first attempt (1 of them passed when run again) and 1 was cancelled\ntarget p50 under 90 s and p99 under 120 s over 20 consecutive runs that passed at the first attempt: not met\n"),
         "a sample smaller than the one asked for is not reported as one: {report}"
     );
     assert!(asked.lines().count() == 11 && !asked.contains("page=2"), "{asked}");
@@ -1977,19 +1984,21 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     assert!(
         *code == Some(0)
             && report.starts_with("gate time of the latest 20 runs of ci.yml in o/twenty on a pull request that passed at the first attempt, from")
-            && report.contains("\np50 10 s, p90 18 s, p99 20 s, slowest 20 s over 20 runs; target p50 under 90 s and p99 under 120 s: met\n"),
+            && report.contains("\np50 10 s, p90 18 s, p99 20 s, slowest 20 s over 20 runs\n")
+            && report.ends_with("\ntarget p50 under 90 s and p99 under 120 s over 20 consecutive runs that passed at the first attempt: met\n"),
         "twenty runs' percentiles are not their nearest ranks: {report}"
     );
     let (code, report, _) = outcome("newyear");
     assert!(*code == Some(0) && report.contains("\nrun 431 at 00000431: 60 s, Test (ubuntu-latest) last\n"), "a run across a new year: {report}");
 
-    // The target: met under 90 s at the median and 120 s at the p99, and
-    // missed at either bound.
+    // The target: met under 90 s at the median and 120 s at the p99 over
+    // every run asked for, none as recent failed; missed at either bound,
+    // with a failure among them, or with fewer runs than asked for.
     let (code, report, _) = outcome("met");
     assert_eq!(*code, Some(0), "{report}");
     assert!(
-        report.contains("\np50 89 s, p90 119 s, p99 119 s, slowest 119 s over 3 runs; target p50 under 90 s and p99 under 120 s: met\n")
-            && report.ends_with("\nsince the oldest of them, 0 runs failed at the first attempt (0 of them passed when run again) and 0 were cancelled\n")
+        report.contains("\np50 89 s, p90 119 s, p99 119 s, slowest 119 s over 3 runs\n")
+            && report.ends_with("\nsince the oldest of them, 0 runs failed at the first attempt (0 of them passed when run again) and 0 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 3 consecutive runs that passed at the first attempt: met\n")
             && !report.contains("asked for"),
         "a gate under both bounds does not meet the target: {report}"
     );
@@ -1997,29 +2006,47 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     let (code, over_report, _) = outcome("over");
     assert!(*code == Some(0) && over_report == report, "--repo does not name the repository over GITHUB_REPOSITORY: {over_report}");
     for (tag, line) in [
-        ("p50", "\np50 90 s, p90 100 s, p99 100 s, slowest 100 s over 2 runs; target p50 under 90 s and p99 under 120 s: not met\n"),
-        ("p99", "\np50 60 s, p90 120 s, p99 120 s, slowest 120 s over 2 runs; target p50 under 90 s and p99 under 120 s: not met\n"),
+        ("p50", "\np50 90 s, p90 100 s, p99 100 s, slowest 100 s over 2 runs\n"),
+        ("p99", "\np50 60 s, p90 120 s, p99 120 s, slowest 120 s over 2 runs\n"),
     ] {
         let (code, report, _) = outcome(tag);
-        assert!(*code == Some(0) && report.contains(line), "a gate at the {tag} bound meets the target: {report}");
+        assert!(
+            *code == Some(0)
+                && report.contains(line)
+                && report.ends_with("\ntarget p50 under 90 s and p99 under 120 s over 2 consecutive runs that passed at the first attempt: not met\n"),
+            "a gate at the {tag} bound meets the target: {report}"
+        );
     }
+    let (code, report, _) = outcome("short");
+    assert!(
+        *code == Some(0)
+            && report.contains(", fewer than the 20 asked for, ")
+            && report.contains("\np50 89 s, p90 119 s, p99 119 s, slowest 119 s over 3 runs\n")
+            && report.ends_with(" and 0 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 20 consecutive runs that passed at the first attempt: not met\n"),
+        "fewer runs than asked for meet the target: {report}"
+    );
     let (code, report, _) = outcome("one");
     assert!(
         *code == Some(0)
             && report.starts_with("gate time of the latest 1 run of ci.yml in o/one on a pull request")
-            && report.contains(" over 1 run; target ")
-            && report.ends_with("\nsince the oldest of them, 1 run failed at the first attempt (0 of them passed when run again) and 0 were cancelled\n"),
-        "{report}"
+            && report.contains("\np50 45 s, p90 45 s, p99 45 s, slowest 45 s over 1 run\n")
+            && report.ends_with("\nsince the oldest of them, 1 run failed at the first attempt (0 of them passed when run again) and 0 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 1 consecutive run that passed at the first attempt: not met\n"),
+        "a failed first attempt among the runs leaves the target met: {report}"
     );
     let (code, report, asked) = outcome("paged");
     assert!(
         *code == Some(0)
             && report.contains("\nrun 2000 at 00002000: 30 s, Test (ubuntu-latest) last\n")
-            && report.ends_with(" and 100 were cancelled\n")
+            && report.contains(" and 100 were cancelled\n")
             && asked.lines().last() == Some(jobs_of("o/paged", 2000).as_str())
             && asked.contains(&page("o/paged", 2))
             && !asked.contains("page=3"),
         "a second page is not read after a full first one: {report}"
+    );
+    // A cancelled run gave no verdict, so it breaks no run of them.
+    assert!(
+        report.ends_with(" and 100 were cancelled\ntarget p50 under 90 s and p99 under 120 s over 1 consecutive run that passed at the first attempt: met\n"),
+        "a cancelled run breaks the consecutive runs that passed: {report}"
     );
 
     // Each refusal: its exit code and what it says.

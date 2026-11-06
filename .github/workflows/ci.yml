@@ -51,9 +51,12 @@ jobs:
         with:
           toolchain: stable
 
-      # Only main saves this cache, as it saves every other here: a copy a
-      # pull request saves is scoped to that pull request, so it serves no
-      # other run and pushes main's out of the repository's cache space.
+      # Only main saves this cache, as it saves every other here. A copy a
+      # pull request saved would serve only that pull request's later runs,
+      # and rust-cache keeps no workspace crate in it, so main's copy, which
+      # every pull request reads, serves them as well unless the pull request
+      # changes Cargo.lock; and it would push main's out of the repository's
+      # cache space.
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -262,3 +265,36 @@ jobs:
           path: core-share.csv
           if-no-files-found: error
           overwrite: true
+
+  # dist's plan of a release from Cargo.toml's [workspace.metadata.dist], the
+  # first thing the Release workflow does when a tag is pushed, here on every
+  # pull request: a config dist cannot plan (its targets, installers, tap or
+  # publish jobs, or the package metadata they read) fails the pull request
+  # that makes it rather than the tag. dist is installed as the Release
+  # workflow installs it, from cargo-dist's installer at the version
+  # Cargo.toml names, checked against the same sha256 before it runs, and the
+  # job's token only reads; crates/tui/tests/release.rs holds the two jobs to
+  # each other. It builds nothing.
+  release-plan:
+    name: Release plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install dist
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 3 \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh \
+            -o "$RUNNER_TEMP/cargo-dist-installer.sh"
+          echo "b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5  $RUNNER_TEMP/cargo-dist-installer.sh" \
+            | shasum -a 256 --check --strict -
+          sh "$RUNNER_TEMP/cargo-dist-installer.sh"
+
+      - name: Plan the release
+        run: dist plan --output-format=json

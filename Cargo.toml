@@ -61,7 +61,9 @@ libc = "0.2"
 # fails the job because the checked-in workflow no longer matches what it would
 # generate. The cost is that dist will no longer update the workflow for us, so
 # bumping cargo-dist-version below means regenerating by hand, re-applying every
-# `LOCAL EDIT` step, and re-pinning the installer hash in the same commit. A
+# `LOCAL EDIT` step, and re-pinning the installer hash in the same commit, in
+# the Release workflow and in CI's Release plan job alike
+# (crates/tui/tests/release.rs holds both to this version and one hash). A
 # bump can also move a target to another runner: the Release build workflow's
 # matrix (.github/workflows/release-build.yml) builds each target where
 # `dist plan --output-format=json` assigns it, so re-sync it, and the default
@@ -78,10 +80,12 @@ installers = ["shell", "homebrew", "npm"]
 tap = "Max17190/homebrew-tap"
 publish-jobs = ["homebrew", "npm"]
 allow-dirty = ["ci"]
-# No release job runs on a pull request ("skip"; the default, "plan", runs
-# `dist plan` there and skips every other job): the tag's own plan job checks
-# this config before it builds anything, and the release builds a pull
-# request could break run in .github/workflows/release-build.yml.
+# No job of the Release workflow runs on a pull request ("skip"; the default,
+# "plan", runs its plan job there, with a token that can write the
+# repository, and skips every other job). CI's Release plan job runs the same
+# `dist plan` on every pull request instead, with a token that only reads,
+# and the release builds run after merge, in
+# .github/workflows/release-build.yml.
 pr-run-mode = "skip"
 targets = [
     "aarch64-apple-darwin",

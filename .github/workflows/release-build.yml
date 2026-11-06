@@ -1,19 +1,21 @@
 name: Release build
 
 # A release tag builds every target in Cargo.toml's [workspace.metadata.dist]
-# and publishes nothing unless all of them build, so each one is built here
-# and its size gated, on the runner `dist plan` assigns it and with the
-# packages the release installs there, and a target that stops building or
-# outgrows its budget fails here instead of at the next release. The six
-# builds would be the slowest part of the pull-request gate (the one on a
-# macOS Intel runner takes four to seven minutes), so they are not part of
-# it. They run on every push to main, so the merge that broke a target fails
-# within minutes of landing; every night, as a new stable Rust or runner
-# image can break a target with no commit at all; and on every merge group,
-# so that a merge queue, once the repository has one, keeps the change that
-# would break a target out of main. A pull request that changes what these
-# builds read (Cargo.toml, Cargo.lock, the size budgets) can run them on its
-# branch before it merges: `gh workflow run release-build.yml --ref <branch>`.
+# and publishes nothing unless all of them build, so each one is built here,
+# on the runner `dist plan` assigns it and with the packages the release
+# installs there, and a target that stops building fails here instead of at
+# the next release. Each binary's size is gated here too, and only here: a
+# tag reads no size budget, so cut a release from a commit whose run of this
+# workflow passed. The six builds would be the slowest part of the
+# pull-request gate (the one on a macOS Intel runner takes four to seven
+# minutes), so they are not part of it. They run on every push to main, so
+# the merge that broke a target fails within minutes of landing; every
+# night, as a new stable Rust or runner image can break a target with no
+# commit at all; and on every merge group, so that a merge queue, once the
+# repository has one, keeps the change that would break a target out of
+# main. A pull request that changes what these builds read (Cargo.toml,
+# Cargo.lock, the size budgets) can run them on its branch before it merges:
+# `gh workflow run release-build.yml --ref <branch>`.
 # crates/tui/tests/release.rs keeps this matrix equal to the published targets
 # and their runners, and holds these triggers.
 on:
