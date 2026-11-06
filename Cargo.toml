@@ -26,6 +26,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 regex = "1"
+# The parser regex compiles with, already linked through it: a tool example's
+# pattern is checked by parsing it (about 1 us), not by compiling it (40 us
+# with a Unicode class such as \d) on every load.
+regex-syntax = "0.8"
 ignore = "0.4"
 globset = "0.4"
 similar = "2"

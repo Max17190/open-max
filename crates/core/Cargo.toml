@@ -20,6 +20,7 @@ reqwest.workspace = true
 hyper-util.workspace = true
 futures-util.workspace = true
 regex.workspace = true
+regex-syntax.workspace = true
 ignore.workspace = true
 globset.workspace = true
 similar.workspace = true

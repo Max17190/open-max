@@ -935,6 +935,7 @@ dependencies = [
  "ignore",
  "libc",
  "regex",
+ "regex-syntax",
  "reqwest",
  "ring",
  "serde",
