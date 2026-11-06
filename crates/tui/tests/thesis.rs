@@ -593,9 +593,10 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // Effort controls and native Messages support add 711 lines for configuration and translation;
-    // the agent loop and frozen prompt are unchanged.
-    const BASELINE: usize = 44_271;
+    // A frame that costs the same at 1,000,000 transcript lines adds 46 lines to the terminal UI (a row
+    // index over block heights, a prompt list and a budget of held wraps) where main was 10 under the
+    // ratchet; crates/core, the agent loop and the frozen prompt are unchanged.
+    const BASELINE: usize = 44_507;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -923,14 +924,14 @@ fn thesis_claims_are_gated_in_ci() {
         reported,
         [
             ("ubuntu-latest", "harness_time_per_tool_round"),
-            ("macos-latest", "harness_time_per_tool_round transcript_frame_p99_at_100k_lines"),
+            ("macos-latest", "harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines"),
         ],
         "the thesis tests a runner reports instead of gating changed"
     );
     let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
     assert!(
         readme.contains(
-            "`harness_time_per_tool_round` (target 250 us) on both runners and `transcript_frame_p99_at_100k_lines` (target 0.5 ms) on macOS"
+            "`harness_time_per_tool_round` (target 250 us) on both runners and `transcript_frame_p99_at_100k_lines` (target 0.5 ms) and `transcript_frame_p99_at_1m_lines` (target 0.25 ms) on macOS"
         ),
         "README.md does not name the thesis tests each runner reports instead of gating"
     );
