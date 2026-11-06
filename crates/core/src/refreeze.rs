@@ -8,6 +8,7 @@
 //! survives them, and each leaves a receipt for the model and a `Refrozen`
 //! event for the screen.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -219,17 +220,13 @@ fn refreeze_receipt_text(
             approve(&added.unapproved)
         ));
     }
-    if let Some((added_m, updated_m, removed_m)) = &added.memory {
-        let mut parts = Vec::new();
-        if !added_m.is_empty() {
-            parts.push(format!("indexed: {}", added_m.join(", ")));
-        }
-        if !updated_m.is_empty() {
-            parts.push(format!("updated: {}", updated_m.join(", ")));
-        }
-        if !removed_m.is_empty() {
-            parts.push(format!("dropped: {}", removed_m.join(", ")));
-        }
+    if let Some(memory) = &added.memory {
+        let parts: Vec<String> = ["indexed", "updated", "dropped"]
+            .into_iter()
+            .zip(memory)
+            .filter(|(_, stems)| !stems.is_empty())
+            .map(|(label, stems)| format!("{label}: {}", stems.join(", ")))
+            .collect();
         if !parts.is_empty() {
             // Only a refreeze some other change caused gets here: a memory
             // write alone never refreezes, so the clause credits the rebuild,
@@ -272,7 +269,7 @@ struct AddedTools {
     /// generations know their memory files. Memory is not in the fingerprint,
     /// so this is what a refreeze caused by something else (a tool or skill
     /// change) folds into the rebuilt index.
-    memory: Option<(Vec<String>, Vec<String>, Vec<String>)>,
+    memory: Option<[Vec<String>; 3]>,
 }
 
 fn classify_added_tools(
@@ -284,29 +281,8 @@ fn classify_added_tools(
 ) -> AddedTools {
     let memory = match (&old_registry.memory_files, &new_registry.memory_files) {
         (Some(old), Some(new)) => {
-            let old_map: std::collections::HashMap<&str, u64> =
-                old.iter().map(|(n, h)| (n.as_str(), *h)).collect();
-            let new_map: std::collections::HashMap<&str, u64> =
-                new.iter().map(|(n, h)| (n.as_str(), *h)).collect();
-            let mut added: Vec<String> = Vec::new();
-            let mut updated: Vec<String> = Vec::new();
-            let mut removed: Vec<String> = Vec::new();
-            for (n, h) in &new_map {
-                match old_map.get(n) {
-                    None => added.push(n.to_string()),
-                    Some(oh) if oh != h => updated.push(n.to_string()),
-                    Some(_) => {}
-                }
-            }
-            for n in old_map.keys() {
-                if !new_map.contains_key(n) {
-                    removed.push(n.to_string());
-                }
-            }
-            added.sort();
-            updated.sort();
-            removed.sort();
-            Some((added, updated, removed))
+            let [before, after] = [old, new].map(|files| files.iter().map(|(stem, hash)| (stem.as_str(), *hash)).collect());
+            Some(changed_keys(&before, &after).map(|stems| stems.into_iter().map(str::to_string).collect()))
         }
         _ => None,
     };
@@ -370,7 +346,6 @@ fn tool_runs(old: &Registry, new: &Registry) -> Vec<(String, String)> {
 /// capture read or failed to read is still on disk, so it is never called
 /// removed: the receipt's NOT-loaded clause names one it could not read.
 fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Vec<String> {
-    use std::collections::BTreeMap;
     #[derive(PartialEq)]
     enum Identity<'a> {
         /// The hash of the bytes a capture read.
@@ -400,21 +375,14 @@ fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Ve
         (Some(old_read), Some(new_read)) => (read(old_read), read(new_read)),
         _ => (loaded(old), loaded(new)),
     };
-    let mut changes: Vec<(&Path, &str)> = Vec::new();
-    for (&path, identity) in &after {
-        match before.get(path) {
-            None => changes.push((path, "added")),
-            Some(previous) if previous != identity => changes.push((path, "modified")),
-            Some(_) => {}
-        }
-    }
-    for &path in before.keys() {
-        let still_on_disk = new.read_paths.as_ref().is_some_and(|read| read.contains_key(path))
-            || new.broken.iter().any(|(broken, _)| broken == path);
-        if !after.contains_key(path) && !still_on_disk {
-            changes.push((path, "removed"));
-        }
-    }
+    let [added, modified, removed] = changed_keys(&before, &after);
+    let still_on_disk = |path: &Path| {
+        new.read_paths.as_ref().is_some_and(|read| read.contains_key(path))
+            || new.broken.iter().any(|(broken, _)| broken == path)
+    };
+    let mut changes: Vec<(&Path, &str)> = added.into_iter().map(|path| (path, "added")).collect();
+    changes.extend(modified.into_iter().map(|path| (path, "modified")));
+    changes.extend(removed.into_iter().filter(|path| !still_on_disk(path)).map(|path| (path, "removed")));
     changes.sort();
     changes
         .into_iter()
@@ -425,6 +393,23 @@ fn generation_changes(old: &Registry, new: &Registry, project_root: &Path) -> Ve
             crate::text::one_line(&format!("{} {kind}", shown.display()))
         })
         .collect()
+}
+
+/// What `after` changes against `before`, each in key order: the keys it
+/// adds, the keys both hold with different values, and the keys it drops.
+/// Both deltas the receipt names come from here: the capability files, by
+/// what a capture read of each, and the memory index, by stem.
+fn changed_keys<K: Ord + Copy, V: PartialEq>(before: &BTreeMap<K, V>, after: &BTreeMap<K, V>) -> [Vec<K>; 3] {
+    let mut changed: [Vec<K>; 3] = Default::default();
+    for (&key, value) in after {
+        match before.get(&key) {
+            None => changed[0].push(key),
+            Some(previous) if previous != value => changed[1].push(key),
+            Some(_) => {}
+        }
+    }
+    changed[2] = before.keys().copied().filter(|key| !after.contains_key(key)).collect();
+    changed
 }
 
 /// What one automatic refreeze reports, computed against the outgoing
@@ -1104,6 +1089,37 @@ mod tests {
         for mode in [ApprovalMode::Ask, ApprovalMode::Readonly, ApprovalMode::Auto] {
             let note = receipt(mode, Vec::new(), Vec::new());
             assert!(!note.contains(registered) && !note.contains(modified) && !note.contains(disabled), "{mode:?}: {note}");
+        }
+    }
+
+    /// A refreeze something else caused names each memory its rebuilt index
+    /// added, updated or dropped against the outgoing generation's, in stem
+    /// order, and says nothing of memory that did not move. A generation that
+    /// never scanned memory is no baseline, so against it nothing is named.
+    #[test]
+    fn the_memory_clause_names_what_the_rebuilt_index_added_updated_and_dropped() {
+        let scanned = |memory: &[(&str, u64)]| {
+            let mut registry = Registry::builtin_only();
+            registry.memory_files = Some(memory.iter().map(|&(stem, hash)| (stem.to_string(), hash)).collect());
+            registry
+        };
+        let old = scanned(&[("ci-queue", 1), ("deploy-port", 2), ("rotation", 3), ("api-key-age", 4)]);
+        let new = scanned(&[("deploy-port", 5), ("ci-queue", 1), ("staging-url", 6), ("backup-window", 7)]);
+        let receipt = |old: &Registry, new: &Registry| {
+            let added = classify_added_tools(old, new, ApprovalMode::Auto, Path::new("/d"), Path::new("/p"));
+            refreeze_receipt_text(&[], &added, &[], &[], Path::new("/p"), ApprovalMode::Auto)
+        };
+        let note = receipt(&old, &new);
+        assert!(
+            note.contains(
+                " Memory index rebuilt with this refreeze (indexed: backup-window, staging-url; updated: deploy-port; \
+                 dropped: api-key-age, rotation)."
+            ),
+            "{note}"
+        );
+        for (old, new) in [(&old, &old), (&Registry::builtin_only(), &new), (&new, &Registry::builtin_only())] {
+            let note = receipt(old, new);
+            assert!(!note.contains("Memory index"), "{note}");
         }
     }
 
