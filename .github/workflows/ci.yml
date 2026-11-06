@@ -212,10 +212,10 @@ jobs:
       # macos-latest, past the bound in two runs and within a fifth of it in
       # two more, while its median held at 0.118 to 0.169 ms. The frame at
       # 1,000,000 lines, a p99 of 0.084 to 0.114 ms on the M5 against
-      # 0.25 ms, measured 0.249 ms idle and 0.255 to 0.263 ms scrolling on
-      # ubuntu-latest in its first run, past the target, so it gates there on
-      # a ratchet of 0.41 ms its test derives, until it meets the target; on
-      # macos-latest, 0.189 to 0.605 ms, it is reported.
+      # 0.25 ms, measured 0.131 to 0.305 ms on ubuntu-latest over its first
+      # three runs, past the target in two, so it gates there on a ratchet of
+      # 0.41 ms its test derives from the first, until it meets the target;
+      # on macos-latest, 0.189 to 1.820 ms over two runs, it is reported.
       - name: Thesis reports
         continue-on-error: true
         timeout-minutes: 5
