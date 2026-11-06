@@ -1026,25 +1026,45 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
 /// The commands of `script`, a step's `run`, whose failure a pipe loses when
 /// the script runs as GitHub runs one that names no shell, `bash -e` without
 /// `pipefail`: the command before each `|` outside quotes that is not `||`,
-/// unless it is `echo` or `printf`, which have no failure to lose. A `|` in
-/// a `case` pattern (`Linux|Darwin)`) is no pipe.
+/// unless it is `echo` or `printf`, which have no failure to lose, or a
+/// `set` command before it turned `pipefail` on (`set -o pipefail`,
+/// `set -euo pipefail`) and none turned it off again (`set +o pipefail`).
+/// Only such a `set` counts: a script that names `pipefail` in a comment or
+/// reads `PIPESTATUS` keeps the failure no more. A `|` in a `case` pattern
+/// (`Linux|Darwin)`) is no pipe.
 fn lossy_pipes(script: &str) -> Vec<String> {
-    let mut lossy = Vec::new();
+    let (mut lossy, mut pipefail) = (Vec::new(), false);
+    // `pipefail` once `command` has run: a `-o` (or `-euo`) before the word
+    // turns it on, a `+o` off, and the last such pair of a `set` decides.
+    let set = |command: &str, pipefail: bool| {
+        let words: Vec<&str> = command.trim().trim_start_matches(['(', '{', ' ']).split_whitespace().collect();
+        let flags = words.windows(2).filter(|pair| words[0] == "set" && pair[1] == "pipefail");
+        flags.filter(|pair| pair[0].len() > 1 && pair[0].ends_with('o') && pair[0].starts_with(['-', '+'])).fold(pipefail, |_, pair| pair[0].starts_with('-'))
+    };
     for line in script.replace("\\\n", " ").lines() {
-        let (mut quote, mut from, mut chars) = (None, 0, line.char_indices().peekable());
+        let (mut quote, mut from, mut end, mut chars) = (None, 0, line.len(), line.char_indices().peekable());
         while let Some((at, c)) = chars.next() {
             match (quote, c) {
                 (Some(open), c) if c == open => quote = None,
                 (Some(_), _) => {}
                 (None, '\'' | '"') => quote = Some(c),
-                (None, '#') if line[..at].ends_with(|c: char| c.is_whitespace()) || at == 0 => break,
-                (None, ';' | '&') => from = at + 1,
-                (None, '|') if chars.next_if(|(_, next)| *next == '|').is_some() => from = at + 2,
+                (None, '#') if line[..at].ends_with(|c: char| c.is_whitespace()) || at == 0 => {
+                    end = at;
+                    break;
+                }
+                (None, ';' | '&') => {
+                    pipefail = set(&line[from..at], pipefail);
+                    from = at + 1;
+                }
+                (None, '|') if chars.next_if(|(_, next)| *next == '|').is_some() => {
+                    pipefail = set(&line[from..at], pipefail);
+                    from = at + 2;
+                }
                 (None, '|') => {
                     let rest = &line[at + 1..];
                     let pattern = rest.find(')').is_some_and(|close| !rest[..close].contains(|c: char| c.is_whitespace() || c == '"' || c == '\''));
                     let command = line[from..at].trim().trim_start_matches(['(', '{', '!', ' ']);
-                    if !pattern && !matches!(command.split_whitespace().next(), Some("echo" | "printf")) {
+                    if !pattern && !pipefail && !matches!(command.split_whitespace().next(), Some("echo" | "printf")) {
                         lossy.push(command.to_string());
                     }
                     from = at + 1;
@@ -1052,6 +1072,7 @@ fn lossy_pipes(script: &str) -> Vec<String> {
                 _ => {}
             }
         }
+        pipefail = set(&line[from..end], pipefail);
     }
     lossy
 }
@@ -1063,9 +1084,9 @@ fn lossy_pipes(script: &str) -> Vec<String> {
 /// `if: ${{ !cancelled() }}`, which runs a step after a failed one too and
 /// skips it only in a run that was cancelled; no command whose failure its
 /// script swallows with `|| true`, `|| :` or `|| exit 0`; and no pipe that
-/// loses a failure (lossy_pipes), unless the step's script sets `pipefail`
-/// or reads `PIPESTATUS`, or the step runs under `shell: bash`, which sets
-/// `pipefail`. A measurement no runner meets with room leaves the pull
+/// loses a failure (lossy_pipes): a `set -o pipefail` before it in the
+/// step's script keeps the failure, and so does the step's `shell: bash`,
+/// which sets `pipefail`. A measurement no runner meets with room leaves the pull
 /// request's gate for the Reports workflow, which runs every night and by
 /// hand, on no pull request and no push, and fails only when it cannot
 /// measure. Of the workflows GitHub runs, `.yml` and `.yaml` files, ci.yml
@@ -1079,6 +1100,12 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
         ("echo \"$sum  file\" | shasum -a 256 --check -", &[][..]),
         ("grep -E 'a|b' log || failed=1", &[][..]),
         ("case $os in Linux|Darwin) ok=1 ;; esac # a | b", &[][..]),
+        ("set -euo pipefail\ncargo test | tee log", &[][..]),
+        ("set -e; set -o pipefail; cargo test | tee log", &[][..]),
+        ("cargo test | tee log; echo \"${PIPESTATUS[0]}\"", &["cargo test"][..]),
+        ("cargo test | tee log\nset -o pipefail", &["cargo test"][..]),
+        ("set -o pipefail; set +o pipefail; cargo test | tee log", &["cargo test"][..]),
+        ("# set -o pipefail\necho pipefail; cargo test | tee log", &["cargo test"][..]),
     ] {
         assert_eq!(lossy_pipes(script), lossy, "the pipes of {script:?} that lose a failure");
     }
@@ -1122,7 +1149,7 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
                 value
             };
             let lossy = lossy_pipes(&script);
-            if lossy.is_empty() || script.contains("pipefail") || script.contains("PIPESTATUS") {
+            if lossy.is_empty() {
                 continue;
             }
             let bash = |key: &&str| key.split_once(':').is_some_and(|(key, shell)| unquoted(key) == "shell" && unquoted(shell) == "bash");
@@ -1200,6 +1227,14 @@ fn function_in(source: &str, name: &str) -> Option<String> {
     let close = format!("{}}}", &lines[at][..lines[at].len() - lines[at].trim_start().len()]);
     let end = lines[at..].iter().position(|line| *line == close)?;
     Some(lines[at..=at + end].join("\n"))
+}
+
+/// Where `needle` first stands in `code` as code: a `//` before it on its
+/// own line comments it out, so a print commented out prints nothing. A
+/// block comment is not read.
+fn code_find(code: &str, needle: &str) -> Option<usize> {
+    let commented = |at: usize| code[code[..at].rfind('\n').map_or(0, |n| n + 1)..at].contains("//");
+    code.match_indices(needle).map(|(at, _)| at).find(|&at| !commented(at))
 }
 
 /// The string literal whose opening quote is at byte `open` of `code`, as
@@ -1342,9 +1377,11 @@ fn cfg_holds(cfg: &str, os: &str) -> bool {
 /// such test prints, with `println!` or `eprintln!`, which CI's thesis job
 /// shows, a `MEASURE` line keyed by its own name, from its body or from the
 /// function it passes its name to first, which keys the line by that
-/// parameter. The line's first number is formatted from a value of the
-/// test's own, neither written in the literal nor a constant of its code or
-/// its file, and the line gives the bound the name states as a number of
+/// parameter; a line or call that a `//` comments out does not count
+/// (code_find). The line's first number is formatted from a local of the
+/// test's own, named inline (`{orphans}`, not `{}` or `{0}`), neither
+/// written in the literal nor a constant of its code or its file, and the
+/// line gives the bound the name states as a number of
 /// its own (not the 10 of `p10`), in its literal or through a constant it
 /// formats, read from the function that prints the line, then the test,
 /// then the file, so another test's constant of the same name does not
@@ -1358,7 +1395,8 @@ fn cfg_holds(cfg: &str, os: &str) -> bool {
 /// and CI say to each other, so a test named for a bound that prints
 /// nothing keyed by its name, as `mutation_score_is_at_least_ninety_five_percent`
 /// did, or one that prints the bound where a measurement belongs, fails
-/// here.
+/// here, and so does a test that takes back one of the seven names retired
+/// for claiming a bound their tests never asserted, whatever its line says.
 #[test]
 fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
     for (cfg, linux, macos) in [
@@ -1373,15 +1411,23 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
     ] {
         assert_eq!((cfg_holds(cfg, "linux"), cfg_holds(cfg, "macos")), (linux, macos), "where #[cfg({cfg})] holds");
     }
-    // The grammar, on names this file has had and names it has.
-    for (name, bound) in [
-        ("mutation_score_is_at_least_ninety_five_percent", Some(95)),
-        ("the_workspace_has_two_thousand_tests", Some(2_000)),
-        ("whole_suite_runs_in_five_seconds", Some(5)),
-        ("at_most_a_fifth_of_commits_touch_the_core", Some(20)),
-        ("agent_loop_is_under_2500_lines", Some(2_500)),
-        ("headless_turn_peak_rss_is_under_four_megabytes", Some(4)),
-        ("one_command_from_a_fresh_install_answers_in_under_thirty_seconds", Some(30)),
+    for (code, at) in [("// println!(\"M\");\n    println!(\"M\");", Some(31)), ("let a = 1; // println!(\"M\");", None)] {
+        assert_eq!(code_find(code, "\"M\""), at, "where {code:?} prints \"M\" as code");
+    }
+    // The names seven gates had while they claimed a bound they never
+    // asserted, each with that bound. A gate that took one back would claim
+    // it again whatever its line said, so none may.
+    let retired = [
+        ("mutation_score_is_at_least_ninety_five_percent", 95),
+        ("the_workspace_has_two_thousand_tests", 2_000),
+        ("whole_suite_runs_in_five_seconds", 5),
+        ("at_most_a_fifth_of_commits_touch_the_core", 20),
+        ("agent_loop_is_under_2500_lines", 2_500),
+        ("headless_turn_peak_rss_is_under_four_megabytes", 4),
+        ("one_command_from_a_fresh_install_answers_in_under_thirty_seconds", 30),
+    ];
+    // The grammar, on those names and names the thesis sources have.
+    for (name, bound) in retired.iter().map(|&(name, bound)| (name, Some(bound))).chain([
         ("one_command_from_a_fresh_install_answers_locally_in_under_a_second", Some(1)),
         ("frozen_prefix_is_under_700_tokens", Some(700)),
         ("a_session_prompt_is_75_percent_cacheable", Some(75)),
@@ -1391,7 +1437,7 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
         ("transcript_frame_p99_at_100k_lines", None),
         ("core_source_stays_under_its_line_budget", None),
         ("the_thesis_gates_run_in_release_on_both_runners", None),
-    ] {
+    ]) {
         assert_eq!(stated_bound(name), bound, "the bound `{name}` states");
     }
     let reported: Vec<String> = ci_job("thesis")
@@ -1406,6 +1452,9 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
             let Some(bound) = stated_bound(&name) else { continue };
             bounded.push(format!("{name} ({bound})"));
             let mut problem = |what: String| problems.push(format!("{path}: {name}: {what}"));
+            if retired.iter().any(|&(old, _)| old == name) {
+                problem("it takes back a name retired for claiming a bound its test never asserted".to_string());
+            }
             if reported.contains(&name) {
                 problem("a runner reports it, so no pull request gates the bound its name states".to_string());
             }
@@ -1419,14 +1468,14 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
                 problem(format!("{cfg} keeps it off both of CI's runners"));
             }
             let body = function_in(&source, &name).unwrap_or_else(|| panic!("{path}: {name} has no end"));
-            let keyed = body.find(&format!("\"MEASURE {name} ")).map(|at| (body.clone(), at)).or_else(|| {
+            let keyed = code_find(&body, &format!("\"MEASURE {name} ")).map(|at| (body.clone(), at)).or_else(|| {
                 // The function the test passes its name to first.
-                let call = body.find(&format!("(\"{name}\""))?;
+                let call = code_find(&body, &format!("(\"{name}\""))?;
                 let callee = &body[..call];
                 let callee = &callee[callee.rfind(|c: char| !c.is_alphanumeric() && c != '_').map_or(0, |n| n + 1)..];
                 let helper = function_in(&source, callee)?;
                 let parameter = helper.split_once('(')?.1.split(':').next()?.trim().to_string();
-                let at = helper.find(&format!("\"MEASURE {{{parameter}}} "))?;
+                let at = code_find(&helper, &format!("\"MEASURE {{{parameter}}} "))?;
                 Some((helper, at))
             });
             let Some((code, at)) = keyed else {
@@ -1455,11 +1504,22 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
             let line = literal.splitn(3, ' ').nth(2).unwrap_or_default();
             let first = line.find('{').filter(|value| line.find(|c: char| c.is_ascii_digit()).is_none_or(|digit| *value < digit));
             let first = first.map(|open| line[open + 1..].split(['}', ':']).next().unwrap_or_default());
+            // A local, named inline as a format string names one: a
+            // positional `{}`, `{0}` or `{:?}` leaves the value to the call's
+            // arguments, which this does not read, and an upper-case name is
+            // a constant's or a static's.
+            let local = |value: &str| {
+                value.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                    && value.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            };
             match first {
                 None => problem(format!("its MEASURE line writes its first number instead of formatting a value: {literal}")),
                 Some(value) if constant(value).is_some() => {
                     problem(format!("its MEASURE line's first number is the constant {value}, not a value it measured: {literal}"))
                 }
+                Some(value) if !local(value) => problem(format!(
+                    "its MEASURE line's first value, {{{value}}}, is not a local named inline, so the line cannot show it is measured: {literal}"
+                )),
                 Some(_) => {}
             }
             // The line with each constant it formats written out, and every
@@ -5292,16 +5352,12 @@ fn one_command_from_a_fresh_install_answers_locally_in_under_a_second() {
     }
     runs.sort();
     let median = runs[runs.len() / 2];
-    let target = Duration::from_secs(1);
-    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    const TARGET: Duration = Duration::from_secs(1);
+    let (bound, build) = if cfg!(debug_assertions) { (TARGET * 20, "debug") } else { (TARGET, "release") };
     println!(
         "MEASURE one_command_from_a_fresh_install_answers_locally_in_under_a_second {median:?} median over {} runs \
-         ({build} build); bound under 1 s in release, 20 s in debug",
+         ({build} build); bound {bound:?}, the target {TARGET:?} in release",
         runs.len()
     );
-    if cfg!(debug_assertions) {
-        assert!(median < target * 20, "median {median:?}, runs {runs:?}");
-    } else {
-        assert!(median < target, "median {median:?}, runs {runs:?}");
-    }
+    assert!(median < bound, "median {median:?}, runs {runs:?}");
 }
