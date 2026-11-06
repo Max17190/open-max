@@ -1607,7 +1607,7 @@ fn watch(run: &Path, owner: u32, owner_start: u64) {
         if std::time::Instant::now() >= deadline {
             return;
         }
-        std::thread::sleep(GROUP_EXIT_POLL);
+        sleep_on_time(GROUP_EXIT_POLL);
     }
     reap(run);
 }
@@ -1801,11 +1801,44 @@ fn stop_groups(groups: &[(u32, u64)], grace: Duration, mut recorded: impl FnMut(
         if stopping.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(GROUP_EXIT_POLL);
+        sleep_on_time(GROUP_EXIT_POLL);
     }
     for (pid, _) in stopping {
         send_kill_group(Some(pid));
     }
+}
+
+/// Sleep `time` on a timer no QoS clamp stretches, as the polls of a watch
+/// and a stop do. A run started under a utility or background clamp
+/// (`taskpolicy -c`, a background launchd job) hands it to its watcher, and
+/// there a plain 2 ms sleep took a mean 11 ms under utility and 98 ms under
+/// background on the reference machine, past the whole grace, while a kevent
+/// timer marked NOTE_CRITICAL, which keeps the real-time timers' leeway
+/// whatever the QoS, took 2.1 ms under both. A plain sleep if it cannot fire.
+#[cfg(target_os = "macos")]
+pub fn sleep_on_time(time: Duration) {
+    let mut timer: libc::kevent = unsafe { std::mem::zeroed() };
+    (timer.filter, timer.flags) = (libc::EVFILT_TIMER, libc::EV_ADD | libc::EV_ONESHOT);
+    (timer.fflags, timer.data) = (libc::NOTE_USECONDS | libc::NOTE_CRITICAL, time.as_micros() as libc::intptr_t);
+    // A call that fails leaves the flag set; one that fires clears it.
+    let mut fired = libc::kevent { flags: libc::EV_ERROR, ..timer };
+    // SAFETY: one change in, room for one event out, on a queue made and
+    // closed here (kevent on a failed kqueue's -1 fails with EBADF).
+    unsafe {
+        let queue = libc::kqueue();
+        libc::kevent(queue, &timer, 1, &mut fired, 1, std::ptr::null());
+        libc::close(queue);
+    }
+    if fired.flags & libc::EV_ERROR != 0 {
+        std::thread::sleep(time);
+    }
+}
+
+/// Elsewhere a plain sleep: a Linux thread's timer slack stays 50 us unless
+/// it is set.
+#[cfg(not(target_os = "macos"))]
+pub fn sleep_on_time(time: Duration) {
+    std::thread::sleep(time);
 }
 
 /// Whether the group led by `pid` is still the one a record names, given
@@ -2342,6 +2375,37 @@ mod tests {
         let status = reaped.join().unwrap();
         assert_eq!(status.and_then(|status| status.code()), Some(7), "the group did not end on the stop's SIGTERM");
         assert!(took < grace, "a stop whose group ended on SIGTERM took {took:?}, the whole grace");
+    }
+
+    /// The polls of a watch and a stop keep their time where a clamp would
+    /// stretch them: ten polls take at least their time and under four times
+    /// it, room for a loaded machine's late wakeups. On macOS the thread
+    /// polling first has its timers coalesced as a utility clamp does
+    /// (latency QoS tier 3, `LATENCY_QOS_TIER_3` in mach/thread_policy.h,
+    /// which leaves its CPU priority as it is): there ten plain 2 ms sleeps
+    /// took 109 to 160 ms on the reference machine, and ten of these polls
+    /// 20.2 to 21.3 ms.
+    #[cfg(unix)]
+    #[test]
+    fn a_stops_polls_keep_their_time_where_timers_are_coalesced() {
+        let took = std::thread::spawn(|| {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                let mut tier = libc::thread_latency_qos_policy { thread_latency_qos_tier: 0xff0004 };
+                let flavor = libc::THREAD_LATENCY_QOS_POLICY as libc::thread_policy_flavor_t;
+                let thread = libc::pthread_mach_thread_np(libc::pthread_self());
+                let set = libc::thread_policy_set(thread, flavor, (&raw mut tier).cast(), libc::THREAD_LATENCY_QOS_POLICY_COUNT);
+                assert_eq!(set, libc::KERN_SUCCESS, "the polling thread's timers were not coalesced");
+            }
+            let began = std::time::Instant::now();
+            for _ in 0..10 {
+                sleep_on_time(GROUP_EXIT_POLL);
+            }
+            began.elapsed()
+        });
+        let took = took.join().unwrap();
+        assert!(took >= GROUP_EXIT_POLL * 10, "ten polls of {GROUP_EXIT_POLL:?} returned after {took:?}");
+        assert!(took < GROUP_EXIT_POLL * 40, "ten polls of {GROUP_EXIT_POLL:?} took {took:?}");
     }
 
     /// Each signal of a stop goes only to a group still the one recorded. A

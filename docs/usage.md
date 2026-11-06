@@ -195,10 +195,14 @@ for the run to read as exited and does with the `run` directory what a launch
 does (below): stops the groups that each record a gone openmax left there
 lists, the run's among them, with 50 ms between SIGTERM and SIGKILL, so that
 each is gone within 100 ms of the kill; removes those records, and the
-directory once no record is left there; and exits. After a run that stopped
-its own tools, it finds no record of the run's and exits at once. A record
-whose owner still runs, such as one that a process which took the run's pid
-since wrote, is left alone. It reads no settings, trust or permissions and
+directory once no record is left there; and exits. Its polls, for the run's
+exit and through the grace, wait on a timer that a QoS clamp the run was
+started under (`taskpolicy -c`, a background launchd job) does not stretch:
+on macOS a kevent timer marked critical, where a plain 2 ms sleep took a mean
+11 ms under a utility clamp and 98 ms under background. After a run that
+stopped its own tools, it finds no record of the run's and exits at once. A
+record whose owner still runs, such as one that a process which took the run's
+pid since wrote, is left alone. It reads no settings, trust or permissions and
 opens no connection. A watcher that is itself killed, or a run killed in
 the moment between its record's first write and its watcher's start, leaves
 the tools to the next openmax launch (the TUI, `-p`, `--stdio`,

@@ -3892,7 +3892,8 @@ fn zero_orphans_after_kill_9_once_its_binary_is_replaced() {
 
 /// When each of `pids` read as gone after `since`, and when `file`, where one
 /// is given, read as removed, polled every millisecond for up to `wait`; None
-/// for one still found then.
+/// for one still found then. The polls wait on the watcher's own timer, which
+/// a QoS clamp on this test does not stretch as it would a plain sleep.
 #[cfg(unix)]
 fn gone_after(pids: &[i32], file: Option<&Path>, since: Instant, wait: Duration) -> (Vec<Option<Duration>>, Option<Duration>) {
     let mut gone = vec![None; pids.len()];
@@ -3906,7 +3907,7 @@ fn gone_after(pids: &[i32], file: Option<&Path>, since: Instant, wait: Duration)
         if removed.is_none() && file.is_some_and(|file| !file.exists()) {
             removed = Some(since.elapsed());
         }
-        std::thread::sleep(Duration::from_millis(1));
+        open_max_core::execution::sleep_on_time(Duration::from_millis(1));
     }
     (gone, removed)
 }
