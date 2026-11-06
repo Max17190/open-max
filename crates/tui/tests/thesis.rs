@@ -3747,8 +3747,10 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
 /// A run's watcher ends with the run. A print run whose `bash` call writes
 /// its shell's pid and waits for a file to appear: while the call waits, one
 /// process names the run's record in its command line, the watcher the call
-/// started, and once the test has made the file and the run has answered
-/// and exited 0, that process is gone within 500 ms.
+/// started, whose command line `ps` lists as `openmax --lifeline <record>
+/// <start>` on Linux too, where it runs `/proc/self/exe`; and once the test
+/// has made the file and the run has answered and exited 0, that process is
+/// gone within 500 ms.
 #[cfg(unix)]
 #[test]
 fn a_runs_watcher_ends_with_the_run() {
@@ -3775,6 +3777,10 @@ fn a_runs_watcher_ends_with_the_run() {
         std::thread::sleep(Duration::from_millis(5));
     };
     let watchers = watchers_of(&record);
+    let named = watchers.first().map(|&pid| {
+        let out = Command::new("ps").args(["-ww", "-o", "args=", "-p", &pid.to_string()]).output().expect("ps runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    });
     std::fs::write(base.join("go"), "").unwrap();
     let out = run.wait_with_output().unwrap();
     let deadline = Instant::now() + Duration::from_millis(500);
@@ -3793,6 +3799,8 @@ fn a_runs_watcher_ends_with_the_run() {
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("first answer"), "{stderr}");
     assert_eq!(watchers.len(), 1, "the run's bash call had {} watchers, not one: {watchers:?}", watchers.len());
+    let line = format!("openmax --lifeline {} ", record.display());
+    assert!(named.as_ref().is_some_and(|named| named.starts_with(&line)), "the watcher's command line is {named:?}, not {line}<start>");
     assert!(left.is_empty(), "the watcher outlived its run, which exited 0, by 500 ms: {left:?}");
 }
 

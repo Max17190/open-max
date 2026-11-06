@@ -1543,7 +1543,8 @@ fn start_lifeline(record: &Path, own_start: u64) {
         }
         // On Linux the binary this process runs, which the child's exec finds
         // there even once an upgrade has replaced the file and its path reads
-        // `<path> (deleted)`, as `current_exe` then gives it.
+        // `<path> (deleted)`, as `current_exe` then gives it; named `openmax`
+        // in its command line, as `ps` lists it.
         #[cfg(target_os = "linux")]
         let exe = PathBuf::from("/proc/self/exe");
         #[cfg(not(target_os = "linux"))]
@@ -1559,6 +1560,7 @@ fn start_lifeline(record: &Path, own_start: u64) {
         }
         let (reader, writer) = std::io::pipe().ok()?;
         let mut watcher = std::process::Command::new(exe);
+        std::os::unix::process::CommandExt::arg0(&mut watcher, "openmax");
         watcher.arg(LIFELINE_FLAG).arg(record).arg(own_start.to_string()).stdin(reader);
         watcher.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).current_dir("/").env_clear();
         configure_process_group(&mut watcher, true);
