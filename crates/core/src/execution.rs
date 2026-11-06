@@ -1717,7 +1717,7 @@ fn reap_in_boot(run: &Path, boot: Option<&str>) {
         }
         stale.push(path);
     }
-    stop_groups(&groups, is_recorded_group);
+    stop_groups(&groups, LEFT_BEHIND_GRACE, is_recorded_group);
     if stale.is_empty() {
         return;
     }
@@ -1784,18 +1784,18 @@ fn owner_is_running(pid: u32, recorded_start: Option<&str>) -> bool {
     }
 }
 
-/// SIGTERM each recorded group, then SIGKILL each still there once
-/// `LEFT_BEHIND_GRACE` ends. `recorded` ([`is_recorded_group`]) tells whether
-/// a group is still the one recorded, and each is dropped the first time it
-/// is not, never to be signalled again: once a group has ended, its id can
-/// name a new group, which reads as recorded when its own leader has exited.
+/// SIGTERM each recorded group, then SIGKILL each still there once `grace`
+/// ends. `recorded` ([`is_recorded_group`]) tells whether a group is still
+/// the one recorded, and each is dropped the first time it is not, never to
+/// be signalled again: once a group has ended, its id can name a new group,
+/// which reads as recorded when its own leader has exited.
 #[cfg(unix)]
-fn stop_groups(groups: &[(u32, u64)], mut recorded: impl FnMut(u32, u64) -> bool) {
+fn stop_groups(groups: &[(u32, u64)], grace: Duration, mut recorded: impl FnMut(u32, u64) -> bool) {
     let mut stopping: Vec<(u32, u64)> = groups.iter().copied().filter(|&(pid, start)| recorded(pid, start)).collect();
     for (pid, _) in &stopping {
         send_termination_group(Some(*pid));
     }
-    let deadline = std::time::Instant::now() + LEFT_BEHIND_GRACE;
+    let deadline = std::time::Instant::now() + grace;
     loop {
         stopping.retain(|&(pid, start)| recorded(pid, start));
         if stopping.is_empty() || std::time::Instant::now() >= deadline {
@@ -2289,74 +2289,59 @@ mod tests {
     }
 
     /// A group that outlives SIGTERM gets SIGKILL once `LEFT_BEHIND_GRACE`
-    /// ends, and not before, while one that ends on SIGTERM is given the
-    /// grace to: it is not killed outright.
+    /// ends, and not before: the reap of a dead harness's record that a
+    /// launch and a watcher run.
     #[cfg(unix)]
     #[test]
     fn a_group_that_outlives_sigterm_is_killed_once_the_grace_ends() {
         use std::os::unix::process::ExitStatusExt;
         let (mut stubborn, stubborn_start) = left_behind_perl(r#"$SIG{TERM} = "IGNORE""#);
-        let (mut graceful, graceful_start) = left_behind_perl("$SIG{TERM} = sub { exit 7 }");
         let run = run_dir("grace");
         let record = run.join(format!("{}.groups", dead_pid()));
-        let lines = format!("1\n{} {stubborn_start}\n{} {graceful_start}\n", stubborn.id(), graceful.id());
-        std::fs::write(&record, lines).unwrap();
+        std::fs::write(&record, format!("1\n{} {stubborn_start}\n", stubborn.id())).unwrap();
         let began = std::time::Instant::now();
         reap(&run);
         let took = began.elapsed();
         let stubborn_stopped = stopped_within(&mut stubborn, Duration::from_millis(500));
-        let graceful_stopped = stopped_within(&mut graceful, Duration::from_millis(500));
         let _ = stubborn.kill();
-        let _ = graceful.kill();
         let _ = std::fs::remove_dir_all(run.parent().unwrap());
         assert!(stubborn_stopped, "a group that ignores SIGTERM outlived the reap");
         assert_eq!(stubborn.wait().unwrap().signal(), Some(libc::SIGKILL));
         assert!(took >= LEFT_BEHIND_GRACE, "a group that ignores SIGTERM was killed {took:?} into its {LEFT_BEHIND_GRACE:?} grace");
-        assert!(graceful_stopped, "a group that ends on SIGTERM outlived the reap");
-        let graceful = graceful.wait().unwrap();
-        assert_eq!(graceful.code(), Some(7), "a group that ends on SIGTERM was not given the grace: {graceful:?}");
     }
 
-    /// The grace is waited out only for a group still running: once every
-    /// signalled group is gone the reap returns, so a launch that stops a
-    /// left-behind tool which ends on SIGTERM does not start 50 ms late.
-    /// A thread reaps the process the moment it exits, as init does for a
-    /// tool whose harness died, since a zombie still counts as its group.
-    /// The fastest of five runs is the one measured, and each must end on
-    /// the SIGTERM: on a loaded machine the process or that thread can wait
-    /// longer than the grace to be scheduled, and that is not the reap's wait.
+    /// A group that ends on SIGTERM is given the grace to, and the grace is
+    /// waited out only for a group still running: once every signalled group
+    /// is gone the stop returns, so a launch that stops a left-behind tool
+    /// which ends on SIGTERM does not start a grace late. A thread reaps the
+    /// process the moment it exits, as init does for a tool whose harness
+    /// died, since a zombie still counts as its group. The grace here is 10
+    /// seconds, so that a stop which waited it out cannot pass for one that a
+    /// loaded machine slowed.
     #[cfg(unix)]
     #[test]
-    fn a_reap_whose_groups_end_on_sigterm_does_not_wait_out_the_grace() {
-        let mut fastest = Duration::MAX;
-        for _ in 0..5 {
-            let (mut graceful, start) = left_behind_perl("$SIG{TERM} = sub { exit 7 }");
-            let pid = graceful.id();
-            let reaped = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                while std::time::Instant::now() < deadline {
-                    if let Some(status) = graceful.try_wait().unwrap() {
-                        return Some(status);
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
+    fn a_stop_whose_groups_end_on_sigterm_does_not_wait_out_the_grace() {
+        let (mut graceful, start) = left_behind_perl("$SIG{TERM} = sub { exit 7 }");
+        let pid = graceful.id();
+        let reaped = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if let Some(status) = graceful.try_wait().unwrap() {
+                    return Some(status);
                 }
-                let _ = graceful.kill();
-                let _ = graceful.wait();
-                None
-            });
-            let run = run_dir("prompt");
-            std::fs::write(run.join(format!("{}.groups", dead_pid())), format!("1\n{pid} {start}\n")).unwrap();
-            let began = std::time::Instant::now();
-            reap(&run);
-            fastest = fastest.min(began.elapsed());
-            let status = reaped.join().unwrap();
-            let _ = std::fs::remove_dir_all(run.parent().unwrap());
-            assert_eq!(status.and_then(|status| status.code()), Some(7), "the group did not end on the reap's SIGTERM");
-            if fastest < LEFT_BEHIND_GRACE {
-                break;
+                std::thread::sleep(Duration::from_millis(1));
             }
-        }
-        assert!(fastest < LEFT_BEHIND_GRACE, "a reap whose group ended on SIGTERM took {fastest:?}, the whole grace");
+            let _ = graceful.kill();
+            let _ = graceful.wait();
+            None
+        });
+        let grace = Duration::from_secs(10);
+        let began = std::time::Instant::now();
+        stop_groups(&[(pid, start)], grace, is_recorded_group);
+        let took = began.elapsed();
+        let status = reaped.join().unwrap();
+        assert_eq!(status.and_then(|status| status.code()), Some(7), "the group did not end on the stop's SIGTERM");
+        assert!(took < grace, "a stop whose group ended on SIGTERM took {took:?}, the whole grace");
     }
 
     /// Each signal of a stop goes only to a group still the one recorded. A
@@ -2397,7 +2382,7 @@ mod tests {
             let _ = leader.wait();
             None
         });
-        stop_groups(&[(bystander.id(), earlier_start), (leader_pid, leader_start)], is_recorded_group);
+        stop_groups(&[(bystander.id(), earlier_start), (leader_pid, leader_start)], TERMINATION_GRACE, is_recorded_group);
         let member_stopped = stopped_within(&mut member, Duration::from_millis(500));
         let bystander_alive = !stopped_within(&mut bystander, Duration::from_millis(50));
         let _ = member.kill();
@@ -2424,7 +2409,7 @@ mod tests {
         let (mut stubborn, stubborn_start) = left_behind_perl(r#"$SIG{TERM} = "IGNORE""#);
         let taken_pid = taken.id();
         let mut looks = 0;
-        stop_groups(&[(taken_pid, 0), (stubborn.id(), stubborn_start)], |pid, start| {
+        stop_groups(&[(taken_pid, 0), (stubborn.id(), stubborn_start)], TERMINATION_GRACE, |pid, start| {
             if pid != taken_pid {
                 return is_recorded_group(pid, start);
             }
