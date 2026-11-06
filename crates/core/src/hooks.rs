@@ -2806,9 +2806,10 @@ mod tests {
     /// and resolves both paths only when the spellings differ: approved paths
     /// are stored canonical, and a listing is canonical only under a
     /// canonical root. Through either spelling of the same hook dirs the
-    /// verdicts are one: the approved gate runs, a same-stem file nobody
-    /// approved shadows it into a fail-closed block, and deleting it fails
-    /// closed as missing.
+    /// verdicts are one: the approved gate runs, a rewrite of it fails closed
+    /// as revoked and is never called a shadow of itself, a same-stem file
+    /// nobody approved shadows it into a fail-closed block, and deleting it
+    /// fails closed as missing.
     #[cfg(unix)]
     #[test]
     fn reconciliation_reaches_one_verdict_through_either_spelling_of_the_hook_dirs() {
@@ -2831,8 +2832,14 @@ mod tests {
                 assert_eq!(hooks.pre_count(), running, "spelled {}: {closed}", root.display());
                 assert!(closed.contains(reason), "spelled {}: {closed:?} lacks {reason:?}", root.display());
                 assert_eq!(closed.is_empty(), reason.is_empty(), "spelled {}: {closed}", root.display());
+                let shadow = "is shadowed by";
+                assert_eq!(closed.contains(shadow), reason == shadow, "spelled {}: {closed}", root.display());
             }
         };
+        verdicts("");
+        std::fs::write(&gate, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\nargs = [\"rewritten\"]\n").unwrap();
+        verdicts("its content changed since it was approved");
+        std::fs::write(&gate, "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
         verdicts("");
         std::fs::write(project_hooks.join("gate.toml"), "event = \"post_tool_use\"\ncommand = \"/bin/echo\"\n").unwrap();
         verdicts("is shadowed by");
