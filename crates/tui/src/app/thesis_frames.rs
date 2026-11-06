@@ -231,7 +231,8 @@ fn transcript_frame_p99_at_1m_lines() {
     // there: that run's largest p99 times the widest swing between runs that
     // CI's record shows for the 100,000-line frame's p99 on that runner
     // (0.157 to 0.240 ms, 1.53 times), rounded up to 10 us.
-    const BOUND_MS: f64 = if cfg!(target_os = "linux") { 0.41 } else { TARGET_MS };
+    const LINUX_RATCHET_MS: f64 = 0.41;
+    const BOUND_MS: f64 = if cfg!(target_os = "linux") { LINUX_RATCHET_MS } else { TARGET_MS };
     const FILL_TO: usize = if cfg!(debug_assertions) { 25_000 } else { 1_000_000 };
     const STEP: usize = if cfg!(debug_assertions) { 1_200 } else { 12_000 };
     const ATTEMPTS: usize = if cfg!(debug_assertions) { 1 } else { 3 };
@@ -328,6 +329,9 @@ fn transcript_frame_p99_at_1m_lines() {
         app.transcript.len(),
         mb(peak)
     );
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap();
+    let claim = format!("a release build holds it to a ratchet of {LINUX_RATCHET_MS} ms until it meets its target");
+    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
     assert_eq!(chat_allocations, 0, "an idle frame of the conversation allocated");
     assert!(per_row <= 600.0, "the transcript holds {per_row:.0} bytes a row");
     assert!(read - held <= 5_000_000, "reading every row once grew the heap by {:.1} MB", mb(read - held));
