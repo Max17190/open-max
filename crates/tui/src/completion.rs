@@ -550,6 +550,48 @@ mod tests {
         assert!(fuzzy_score("src/app.rs", "sar").is_some());
     }
 
+    /// A command name may hold `-` and `_`, as prompt templates such as
+    /// fix-issue do; any other punctuation closes the popup.
+    #[test]
+    fn slash_names_take_dashes_and_underscores_and_nothing_else() {
+        assert!(matches!(trigger("/fix-issue", 10, true), Some((Kind::Slash, 0, q)) if q == "fix-issue"));
+        assert!(matches!(trigger("/my_check", 9, true), Some((Kind::Slash, 0, q)) if q == "my_check"));
+        assert!(trigger("/a.b", 4, true).is_none());
+    }
+
+    /// The index holds every file under the root, shallowest first.
+    #[test]
+    fn scan_files_lists_every_file_shallowest_first() {
+        let dir = crate::test_temp_dir("openmax-scan-files");
+        std::fs::create_dir_all(dir.join("src/ui")).unwrap();
+        for file in ["src/ui/view.rs", "README.md", "src/main.rs"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        assert_eq!(scan_files(&dir), ["README.md", "src/main.rs", "src/ui/view.rs"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A row's detail gets the width the label leaves, less the marker and
+    /// gap, and is dropped when four cells or fewer would be left for it.
+    #[test]
+    fn a_detail_takes_the_room_its_label_leaves() {
+        let popup = Popup {
+            kind: Kind::Slash,
+            items: vec![Item { insert: "/abc".into(), label: "abc".into(), detail: "x".repeat(100), submits: false }],
+            selected: 0,
+            token_start: 0,
+            token_len: 1,
+            total_matches: 1,
+        };
+        let detail = |width: u16| {
+            let lines = render_lines(&popup, width, false);
+            lines[0].spans.get(2).map(|span| span.content.to_string())
+        };
+        assert_eq!(detail(40), Some(format!("  {}…", "x".repeat(30))));
+        assert_eq!(detail(14), Some("  xxxx…".to_string()));
+        assert_eq!(detail(13), None);
+    }
+
     #[test]
     fn popup_selection_wraps() {
         let items = slash_items("", &[]);
