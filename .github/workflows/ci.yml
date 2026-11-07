@@ -170,10 +170,11 @@ jobs:
   # profile the published binary ships with, on the test job's runners, and
   # runs them one test at a time, so no measurement runs beside another, each
   # printing what it measured: each test target named thesis* in the
-  # workspace and the binary's thesis_frames module. What each asserts is in
-  # its doc comment; the first frame is held as a ratio to a baseline
-  # binary's start, as timed from the spawn it includes the runner's own
-  # process start, which is not the harness's work.
+  # workspace, and the binary's thesis_frames module on a runner that gates
+  # one of its tests. What each asserts is in its doc comment; the first
+  # frame is held as a ratio to a baseline binary's start, as timed from the
+  # spawn it includes the runner's own process start, which is not the
+  # harness's work.
   # crates/tui/tests/thesis.rs holds this wiring.
   thesis:
     name: Thesis (${{ matrix.os }})
@@ -186,11 +187,19 @@ jobs:
         # targets with room: the gate step skips them, and the Reports
         # workflow, whose matrix lists the same tests, measures them every
         # night instead. README.md names them too.
+        # `frames` is whether the runner gates a test of the binary's
+        # thesis_frames module. Those tests live in the binary's own
+        # unit-test harness, which the release profile links as one more
+        # whole-program LTO unit, the longest of the build, so a runner that
+        # reports all of them builds no harness its gates would run no test
+        # from.
         include:
           - os: ubuntu-latest
             reported: harness_time_per_tool_round
+            frames: true
           - os: macos-latest
             reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines
+            frames: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -212,7 +221,7 @@ jobs:
       # which `cargo test` leaves unbuilt once a target is selected.
       - name: Build release tests
         run: |
-          cargo test --release --workspace --locked --no-run --test 'thesis*' --bin openmax
+          cargo test --release --workspace --locked --no-run --test 'thesis*' ${{ matrix.frames && '--bin openmax' || '' }}
           cargo build --release --workspace --locked --example startup_baseline
 
       # Every thesis test but the ones this runner reports, failing the pull
@@ -224,7 +233,9 @@ jobs:
         run: |
           skip=; for test in ${{ matrix.reported }}; do skip="$skip --skip $test"; done
           cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1
-          cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1
+          if ${{ matrix.frames }}; then
+            cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1
+          fi
           exit ${failed:-0}
 
       # zero_orphans_after_kill_9 lists when the run it killed was collected,
