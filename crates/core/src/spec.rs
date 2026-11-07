@@ -1335,8 +1335,8 @@ mod tests {
     /// The frozen prompt sends an agent to `openmax --spec <surface>` in
     /// bash before it writes a capability, so a contract the bash cap cut
     /// would lose its middle on exactly the read that needs all of it. The
-    /// cap is set to what every later request re-sends; every contract must
-    /// still fit under it whole.
+    /// cap bounds what one result adds to every later request, and every
+    /// contract must still fit under it whole.
     #[test]
     fn every_contract_fits_one_bash_result_whole() {
         let cap = crate::tools::OutputCaps::default().command_bytes;
