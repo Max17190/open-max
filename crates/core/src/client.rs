@@ -1920,9 +1920,6 @@ mod tests {
                 }
             }
             let headers = String::from_utf8_lossy(&buf).to_string();
-            if let Some(head) = head {
-                let _ = head.send(headers.clone());
-            }
             let content_length: usize = headers
                 .lines()
                 .find_map(|l| {
@@ -1933,6 +1930,9 @@ mod tests {
             let mut body = vec![0u8; content_length];
             if content_length > 0 && stream.read_exact(&mut body).is_err() {
                 return;
+            }
+            if let Some(head) = head {
+                let _ = head.send(format!("{headers}{}", String::from_utf8_lossy(&body)));
             }
             let _ = stream.write_all(response.as_bytes());
             if let Some(hold) = hold { let _ = hold.recv(); }
@@ -3499,6 +3499,32 @@ mod tests {
         assert_eq!(request(&endpoint).await.unwrap().content, "all of it");
         let head = heads.recv_timeout(std::time::Duration::from_secs(3)).unwrap().to_ascii_lowercase();
         assert!(head.contains("authorization: bearer sk-settings"), "{head}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A provider's own headers and compat flags reach its requests: the
+    /// client built from its resolved endpoint sends the headers, the token
+    /// limit under the field the provider names, and no `stream_options`
+    /// where the provider refuses them.
+    #[tokio::test]
+    async fn a_providers_headers_and_compat_flags_reach_its_requests() {
+        let dir = std::env::temp_dir().join(format!("openmax-compat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (url, requests) = spawn_recording_once(finished_response());
+        let catalog = json!({"providers": {"picky": {"base_url": url, "headers": {"X-Gateway-Route": "fixture"},
+            "compat": {"use_max_completion_tokens": true, "send_stream_options": false},
+            "models": [{"id": "m", "context_tokens": 8192}]}}});
+        std::fs::write(crate::providers::providers_path(&dir), catalog.to_string()).unwrap();
+        let settings = crate::config::Settings { provider: Some("picky".into()), model: "m".into(), ..Default::default() };
+        let client = ChatClient::from_endpoint(&crate::providers::resolve(&settings, &dir).unwrap());
+        let reply = client.stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
+        assert_eq!(reply.unwrap().content, "all of it");
+        let request = requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(head.to_ascii_lowercase().contains("x-gateway-route: fixture"), "{head}");
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert!(body["max_completion_tokens"].is_u64() && body.get("max_tokens").is_none(), "{body}");
+        assert!(body.get("stream_options").is_none(), "{body}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
