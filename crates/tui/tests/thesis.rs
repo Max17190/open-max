@@ -605,9 +605,10 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // The trailing note follows the history as a developer message on Responses instead of ending its last
-    // message, which drops the folding: 7 lines fewer, the trust dispatcher and the frozen prompt unchanged.
-    const BASELINE: usize = 44_456;
+    // The client asks each provider's prompt cache for the conversation it serves, reads every wire's usage
+    // with one parser, and builds itself without its eight-argument constructor: 8 lines fewer, the trust
+    // dispatcher and the frozen prompt unchanged.
+    const BASELINE: usize = 44_448;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

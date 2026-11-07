@@ -509,14 +509,16 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// entry ends at a request's latest user message or tool output, so the
 /// trailing note, a developer message after them, is in none. On native
 /// Messages it is Anthropic's: an entry ends at each block a request marks
-/// with `cache_control`, which the client does not send yet, so that share
-/// reports 0.00% until it does. An entry holds at least 1,024 tokens. Where a
-/// ratchet holds the billed share, every request but the two the compaction
-/// makes reads back the entry the request before it wrote, when that one was
-/// long enough to write one, and the share holds the 75% target and its
-/// ratchet, set as above; README.md states it. With the note at the end of
-/// the last message, the Responses share was 0.00%; measured when its ratchet
-/// was set, 84.74% (166,870 of 196,910 prompt tokens).
+/// with `cache_control`, the end of the system prompt and the newest stored
+/// block. An entry holds at least 1,024 tokens. The ratchet holds the billed
+/// share: every request but the two the compaction makes reads back the
+/// entry the request before it wrote, when that one was long enough to write
+/// one, and the share holds the 75% target and its ratchet, set as above;
+/// README.md states it. With the note at the end of the last message, the
+/// Responses share was 0.00%; measured when its ratchet was set, 84.74%
+/// (166,870 of 196,910 prompt tokens). With no block marked, the native
+/// Messages share was 0.00%; measured when its ratchet was set, 82.81%
+/// (69,363 of 83,762).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_prompt_is_75_percent_cacheable() {
     cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0, None).await;
@@ -534,7 +536,7 @@ async fn a_responses_session_prompt_is_75_percent_cacheable() {
 /// then `system`, then `messages`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_messages_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case("a_messages_session_prompt_is_75_percent_cacheable", WireApi::Anthropic, 83.8, None).await;
+    cacheable_share_case("a_messages_session_prompt_is_75_percent_cacheable", WireApi::Anthropic, 83.8, Some(82.3)).await;
 }
 
 /// One scripted reply of the cacheable-prefix gate's session.
