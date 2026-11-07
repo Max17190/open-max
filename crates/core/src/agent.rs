@@ -52,8 +52,8 @@ use crate::config::{ApprovalMode, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
-    novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget, settings_drift_note,
-    RepeatTracker, NOTICE_JOINER, PERMISSION_NOTE_PREFIX_CLEAN, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
+    narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
+    settings_drift_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
 };
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 pub use crate::refreeze::reload_session;
@@ -694,13 +694,8 @@ async fn run_loop(
         insert_startup_note(core, session_id, guard.messages(), text);
     }
 
-    // The provider catalog's content identity at turn start: an agent bash
-    // edit to ~/.openmax/providers.json is otherwise silent (the file is
-    // outside the project root, so no refreeze covers it), and a malformed
-    // edit would surface turns later as an unrelated-looking resolve error.
-    let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
-    let mut hooks_seen = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
-    let mut approval_seen = approval_state(core, &registry, project_root, &canonical_root);
+    // What a mutating call can change that no refreeze covers, as the turn starts.
+    let mut changes = ChangeWatch::new(core, &registry, project_root, &canonical_root);
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
@@ -1482,188 +1477,8 @@ async fn run_loop(
                     // the parse reason and the turn-scoped rule.
                     let fail_closed_now = current.fail_closed_reason().map(str::to_string);
                     permissions.reload(current);
-                    if let Some(reason) = fail_closed_now {
-                        let novel = novel_policy_notices(
-                            core,
-                            session_id,
-                            vec![format!("permissions fail-closed: {reason}")],
-                        )
-                        .await;
-                        if !novel.is_empty() {
-                            // The repair carve-out returns Default for
-                            // write/edit on this file, but an earlier
-                            // snapshot this turn may have explicitly DENIED
-                            // one of them, and the most restrictive answer
-                            // wins - so the receipt must not promise a
-                            // repair tool a rule already blocks.
-                            // Probe every path spelling a repair call could
-                            // use (an `arg_regex` matches the raw path
-                            // argument): absolute, relative, and ./relative.
-                            // A tool is allowed only if NONE is denied.
-                            let abs = project_root
-                                .join(".openmax/permissions.toml")
-                                .to_string_lossy()
-                                .into_owned();
-                            let repair_denied = |tool: &str| {
-                                [
-                                    abs.as_str(),
-                                    ".openmax/permissions.toml",
-                                    "./.openmax/permissions.toml",
-                                ]
-                                .iter()
-                                .any(|p| {
-                                    matches!(
-                                        permissions
-                                            .evaluate(tool, &serde_json::json!({ "path": p })),
-                                        crate::permissions::PermissionDecision::Deny { .. }
-                                    )
-                                })
-                            };
-                            let allowed: Vec<&str> = ["write_file", "edit_file"]
-                                .into_iter()
-                                .filter(|t| !repair_denied(t))
-                                .collect();
-                            let repair_clause = if allowed.is_empty() {
-                                "a rule earlier this turn denies write_file and edit_file on \
-                                 this file too, so even the repair waits for the START OF THE \
-                                 NEXT TURN; read_file is not allowed"
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "{} on exactly this file is still allowed and takes effect \
-                                     at the START OF THE NEXT TURN, not this one; read_file is \
-                                     NOT, so rewrite it from what you intended",
-                                    allowed.join("/")
-                                )
-                            };
-                            let note = format!(
-                                "[permissions.toml is now malformed ({reason}). Every tool \
-                                 call is DENIED for the rest of THIS turn - policy snapshots \
-                                 only narrow within a turn, never widen - and your repair \
-                                 ({repair_clause}). \
-                                 openmax --check cannot run until then (bash is denied too).]"
-                            );
-                            append_and_emit_note(core, session_id, guard.messages(), &note);
-                        }
-                    }
-                    // The agent may have just written itself an allow
-                    // rule that can never fire (#180). Say so NOW, on
-                    // this call's result, with the command that lifts
-                    // it - not silently at the next surprise prompt.
-                    let novel = novel_policy_notices(core, session_id, inert).await;
-                    if !novel.is_empty() {
-                        let note =
-                            format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A providers.json edit (bash: the file is outside
-                    // the project root) gets a receipt too: what loaded,
-                    // when it applies - or that the catalog is EMPTY,
-                    // while the author can still fix it.
-                    let status = crate::providers::providers_status(&core.data_dir);
-                    if status.content_hash != providers_seen {
-                        providers_seen = status.content_hash;
-                        let note = match &status.parse_error {
-                            Some(err) => format!(
-                                "[providers.json changed but is invalid JSON: {err}. The \
-                                 provider catalog is EMPTY until this parses; any turn using \
-                                 settings.provider will fail at its start.]"
-                            ),
-                            None => format!(
-                                "[providers.json changed: {} provider(s) ({}). Endpoint \
-                                 resolution happens at turn start, so a provider or model \
-                                 switch applies from the next turn; switching this session's \
-                                 model is /model, which the user runs.]",
-                                status.count,
-                                status.names.join(", ")
-                            ),
-                        };
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A script edit revokes the approval of the tool that
-                    // runs it, but moves no fingerprint: no refreeze, no
-                    // receipt - and the model learned only when the next
-                    // call raised a card. Diff approval state per call.
-                    let approval_now = approval_state(core, &registry, project_root, &canonical_root);
-                    let mut revoked: Vec<String> = Vec::new();
-                    for (name, state) in &approval_now {
-                        if let (Some(path), Some(None)) = (state, approval_seen.get(name)) {
-                            revoked.push(format!(
-                                "{name} (openmax --approve {})",
-                                crate::doctor::shell_quote(std::path::Path::new(path))
-                            ));
-                        }
-                    }
-                    approval_seen = approval_now;
-                    if !revoked.is_empty() {
-                        revoked.sort();
-                        let note = format!(
-                            "[approval revoked: the code these tools run changed since a human \
-                             approved it, so the next call of each stops for a card: {}. Re-approve \
-                             the exact bytes, or prove them first with openmax --check --run-examples.]",
-                            revoked.join(", ")
-                        );
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A hook file written this call: hooks are outside
-                    // the extension fingerprint, so this write got no
-                    // refreeze receipt and the inertness notice would
-                    // otherwise land a whole turn later, leaving the
-                    // agent believing its gate was live for a whole turn.
-                    let hooks_now = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
-                    if hooks_now != hooks_seen {
-                        hooks_seen = hooks_now;
-                        let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(&canonical_root));
-                        let inert: Vec<String> = discovered.notices().iter().map(|f| hook_clause(f, "")).collect();
-                        // An APPROVED gate whose bytes just changed is not
-                        // inert - it fails closed and blocks every tool
-                        // call from the next turn until restored or
-                        // re-approved. Say that, not "applies next turn".
-                        let note = if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Auto {
-                            let mut note = match discovered.fail_closed_reason() {
-                                Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}"),
-                                None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.".into(),
-                            };
-                            // Named on this write, while this turn can fix
-                            // it, not at the hook's first run next turn.
-                            let unstartable = discovered.cannot_start(project_root);
-                            if !unstartable.is_empty() {
-                                if !note.ends_with('.') {
-                                    note.push('.');
-                                }
-                                note.push_str(&format!(" These cannot start as written: {}", unstartable.join(" | ")));
-                            }
-                            note + "]"
-                        } else if let Some(blocked) = discovered.fail_closed_reason() {
-                            format!(
-                                "[hook files changed. A live gate is now failing closed: \
-                                 {blocked}. From the next turn every tool call is BLOCKED \
-                                 until the file is restored to its approved bytes or a human \
-                                 re-approves it (openmax --approve <path>, at a terminal \
-                                 outside any session).]"
-                            )
-                        } else if inert.is_empty() {
-                            "[hook files changed. Hooks are discovered at turn start; \
-                             approved hooks apply from the next turn.]"
-                                .to_string()
-                        } else {
-                            format!(
-                                "[hook files changed. Not running: {}. Hooks activate only \
-                                 after a human runs openmax --approve <path> at a terminal \
-                                 outside any session; until then the guarantee is NOT in \
-                                 force - say so if asked, do not claim it.]",
-                                inert.join(" | ")
-                            )
-                        };
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A settings.json edit (bash: outside the project
-                    // root) is inert for this session and bricks the
-                    // next launch when malformed - answered on the
-                    // writing call, while it is still repairable.
-                    if let Some(note) = settings_drift_note(core) {
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
+                    narrate_permissions_reload(core, session_id, project_root, &permissions, fail_closed_now, inert, guard.messages()).await;
+                    changes.after_mutation(core, session_id, project_root, &canonical_root, &registry, guard.messages());
                 }
             }
         }
@@ -1691,7 +1506,7 @@ async fn run_loop(
         if refrozen {
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
-            approval_seen = approval_state(core, &registry, project_root, &canonical_root);
+            changes.resync_approvals(core, &registry, project_root, &canonical_root);
         } else if memory_written {
             // A memory write changes no extension byte, so no refreeze ran,
             // and the note, sent after the history as the harness's account
@@ -1858,43 +1673,6 @@ fn nested_session_declined_message(source: &UnapprovedCapability) -> String {
          terminal, or make the tool's first call from a session a human is watching.",
         source.path
     )
-}
-
-/// Which external tools currently lack an approval covering their exact
-/// bytes (manifest + bound code). Diffed after every mutating call so a
-/// script edit - which moves no extension fingerprint and so earns no
-/// refreeze receipt - is still announced the moment it revokes an approval.
-fn unapproved_tool_map(
-    registry: &Registry,
-    data_dir: &Path,
-    project_root: &Path,
-) -> std::collections::HashMap<String, Option<String>> {
-    registry
-        .tools
-        .iter()
-        .filter(|s| matches!(s.kind, crate::registry::ToolKind::External(_)))
-        .map(|s| {
-            let state = unapproved_capability(registry, data_dir, project_root, &s.name).map(|u| u.path);
-            (s.name.clone(), state)
-        })
-        .collect()
-}
-
-/// `unapproved_tool_map` outside auto, and empty under it: auto runs every
-/// external tool without content approval, so there is no revocation to
-/// announce, and the map costs a read of the chain per external tool on
-/// every mutating call. A diff across a mode switch starts from empty and
-/// so announces nothing; the next call's card (or its absence) is accurate.
-fn approval_state(
-    core: &Core,
-    registry: &Registry,
-    project_root: &Path,
-    canonical_root: &Path,
-) -> std::collections::HashMap<String, Option<String>> {
-    if core.approval_mode_canonical(canonical_root) == ApprovalMode::Auto {
-        return std::collections::HashMap::new();
-    }
-    unapproved_tool_map(registry, &core.data_dir, project_root)
 }
 
 /// True when the harness itself spawned this process: every child it starts
