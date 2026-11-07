@@ -32,17 +32,8 @@ pub(super) fn serialize(
         .map(|text| json!({"type":"text","text":text})).collect();
     let mut prefix = prefix_seed(&json!(system), &json!(functions));
     let mut input: Vec<Value> = Vec::new();
-    let fold = messages
-        .last()
-        .is_some_and(|m| m.role == "user" || m.role == "tool");
-    for (at, message) in messages.iter().enumerate() {
-        let mut text = message.content.clone().unwrap_or_default();
-        if at + 1 == messages.len() && fold {
-            if let Some(note) = note {
-                text.push_str(NOTE_SEPARATOR);
-                text.push_str(note);
-            }
-        }
+    for message in messages {
+        let text = message.content.clone().unwrap_or_default();
         if message.role == "system" { continue; }
         let role = if message.role == "tool" {
             "user"
@@ -104,15 +95,27 @@ pub(super) fn serialize(
             }
         }
     }
-    if !fold {
-        if let Some(note) = note {
-            input.push(json!({"role":"user","content":[{"type":"text","text":note}]}));
+    // The cache is asked for at two markers: the end of the system prompt
+    // (tools and system, the prefix every request and session shares) and
+    // the newest stored block, so each request reads what the one before it
+    // wrote. The note goes after that block, in a block of its own, since the
+    // next request drops it: inside, it would void the entry. Thinking blocks
+    // take no marker.
+    let tail = input.last_mut().and_then(|m| m["content"].as_array_mut()?.last_mut());
+    if let Some(block) = tail.filter(|b| matches!(b["type"].as_str(), Some("text" | "tool_use" | "tool_result"))) {
+        block["cache_control"] = json!({"type":"ephemeral"});
+    }
+    if let Some(note) = note.map(|note| json!({"type":"text","text":note})) {
+        match input.last_mut().filter(|m| m["role"] == "user").and_then(|m| m["content"].as_array_mut()) {
+            Some(content) => content.push(note),
+            None => input.push(json!({"role":"user","content":[note]})),
         }
     }
     let mut body =
         json!({"model":client.model,"max_tokens":client.max_tokens,"stream":true,"messages":input});
     if !system.is_empty() {
         body["system"] = json!(system);
+        body["system"][system.len() - 1]["cache_control"] = json!({"type":"ephemeral"});
     }
     if !functions.is_empty() {
         body["tools"] = json!(functions);
@@ -144,7 +147,11 @@ fn prefix_seed(system: &Value, tools: &Value) -> Context {
 
 pub(super) fn stamp(reply: &mut CompletionResult, request: &[u8]) -> Result<(), String> {
     let Some(content) = reply.reasoning_details.take() else { return Ok(()); };
-    let body: Value = serde_json::from_slice(request).map_err(|_| "invalid Messages request")?;
+    let mut body: Value = serde_json::from_slice(request).map_err(|_| "invalid Messages request")?;
+    // Cache markers are request metadata, not content, and the next request
+    // moves the tail one: the hash that binds signed thinking leaves them out.
+    unmark(body.get_mut("system"));
+    for message in body["messages"].as_array_mut().ok_or("invalid Messages request history")? { unmark(message.get_mut("content")); }
     let empty = json!([]);
     let mut hash = prefix_seed(body.get("system").unwrap_or(&empty), body.get("tools").unwrap_or(&empty));
     for message in body["messages"].as_array().ok_or("invalid Messages request history")? { hash_message(&mut hash, message); }
@@ -152,6 +159,12 @@ pub(super) fn stamp(reply: &mut CompletionResult, request: &[u8]) -> Result<(), 
     reply.reasoning_details = Some(serde_json::value::to_raw_value(&json!({"prefix":crate::ledger::hex(hash.finish().as_ref()),"content":content}))
         .map_err(|_| "cannot preserve Messages content")?);
     Ok(())
+}
+
+fn unmark(blocks: Option<&mut Value>) {
+    for block in blocks.and_then(Value::as_array_mut).into_iter().flatten().filter_map(Value::as_object_mut) {
+        block.remove("cache_control");
+    }
 }
 
 fn visible_matches(blocks: &[Value], message: &ChatMessage) -> bool {
@@ -239,17 +252,7 @@ fn complete(blocks: Vec<Value>, reason: &str, usage: Value) -> Result<Completion
             serde_json::value::to_raw_value(&blocks).map_err(|_| "invalid Messages reasoning")?,
         );
     }
-    if usage.is_object() {
-        let count = |key: &str| usage[key].as_u64().unwrap_or(0);
-        let cached = count("cache_read_input_tokens");
-        reply.usage = Some(Usage {
-            prompt_tokens: count("input_tokens")
-                .saturating_add(count("cache_creation_input_tokens"))
-                .saturating_add(cached),
-            completion_tokens: count("output_tokens"),
-            cached_tokens: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
-        });
-    }
+    reply.usage = parse_usage(&usage);
     Ok(reply)
 }
 
