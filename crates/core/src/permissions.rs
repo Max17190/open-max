@@ -311,13 +311,13 @@ impl Permissions {
                 }),
             };
         }
-        let haystack = arg_haystack(tool, args);
+        let haystacks = arg_haystacks(&self.project_root, tool, args);
         for rule in &self.rules {
             if rule.tool != tool {
                 continue;
             }
             if let Some(re) = &rule.arg_regex {
-                if !re.is_match(&haystack) {
+                if !haystacks.iter().any(|(haystack, deny_only)| (!deny_only || rule.effect == Effect::Deny) && re.is_match(haystack)) {
                     continue;
                 }
             }
@@ -531,7 +531,9 @@ fn load_file(path: &Path) -> FileLoad {
         };
         let arg_regex = match raw.arg_regex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => None,
-            Some(pat) => match Regex::new(pat) {
+            // A deny ignores case: a path's case variant is the same file on a
+            // case-insensitive volume, even in a directory not created yet.
+            Some(pat) => match regex::RegexBuilder::new(pat).case_insensitive(effect == Effect::Deny).build() {
                 Ok(re) => Some(re),
                 // The regex engine's own caret block pinpoints the character;
                 // this only has to say which rule it is under.
@@ -572,15 +574,29 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Primary argument string used for optional `arg_regex` matching.
-fn arg_haystack(tool: &str, args: &Value) -> String {
-    match tool {
-        "bash" => args["command"].as_str().unwrap_or("").to_string(),
-        "write_file" | "edit_file" | "read_file" | "list_dir" => {
-            args["path"].as_str().unwrap_or("").to_string()
+/// The strings an `arg_regex` is matched against, any one sufficing, each
+/// with whether only a deny reads it. A file tool's path, and grep's beside
+/// its pattern, is the path the tool will touch as `tools::resolve` finds it,
+/// root-relative, a directory's ending in `/`: every spelling of one file
+/// (`./p`, `d/../p`, an absolute path, a link in the project) is the same
+/// string. A deny reads it absolute too, as a call could spell it before. A
+/// path the tool refuses stays as written.
+fn arg_haystacks(root: &Path, tool: &str, args: &Value) -> Vec<(String, bool)> {
+    let arg = |key: &str| args[key].as_str().unwrap_or_default().to_string();
+    let resolved = |path: String| match (crate::tools::resolve(root, &path), root.canonicalize()) {
+        (Ok(abs), Ok(root)) if abs.starts_with(&root) => {
+            let slash = if abs.is_dir() && abs != root { "/" } else { "" };
+            let rel = abs.strip_prefix(&root).unwrap_or(&abs).display();
+            vec![(format!("{rel}{slash}"), false), (format!("{}{slash}", abs.display()), true)]
         }
-        "glob" | "grep" => args["pattern"].as_str().unwrap_or("").to_string(),
-        _ => serde_json::to_string(args).unwrap_or_default(),
+        _ => vec![(path, false)],
+    };
+    match tool {
+        "bash" => vec![(arg("command"), false)],
+        "write_file" | "edit_file" | "read_file" | "list_dir" => resolved(arg("path")),
+        "grep" => [vec![(arg("pattern"), false)], resolved(arg("path"))].concat(),
+        "glob" => vec![(arg("pattern"), false)],
+        _ => vec![(serde_json::to_string(args).unwrap_or_default(), false)],
     }
 }
 
@@ -601,6 +617,83 @@ mod tests {
         ));
         assert!(matches!(load_file(&path), FileLoad::Invalid(_)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A rule decides on the file a tool will touch, not on how the call spells
+    /// it. Every spelling of a denied path is denied: `./p`, `d/../p`, the
+    /// absolute path, a case variant (in a directory that exists and in one
+    /// not created yet), and a link in the project to its directory; grep over
+    /// a denied directory is denied however its path is spelled. An allow
+    /// covers only paths that really are under its pattern: `src/../x` and a
+    /// link under `src/` to `.git` are not. A deny written for the absolute path
+    /// still denies the relative spelling, while an unanchored allow does not
+    /// match through the project's own absolute path (here under `docs/`).
+    #[cfg(unix)]
+    #[test]
+    fn rules_decide_on_the_path_a_tool_touches_not_its_spelling() {
+        let root = tempfile_dir().join("docs/project");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        for dir in [".openmax/tools", "src", "secrets", ".git", "notes"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("secrets/token.txt"), "CANARY\n").unwrap();
+        std::os::unix::fs::symlink(".openmax", root.join("lnk")).unwrap();
+        std::os::unix::fs::symlink("../.git", root.join("src/git")).unwrap();
+        let abs = root.display().to_string();
+        let rules = [
+            ("deny", "write_file", r"^\.openmax/".to_string()),
+            ("deny", "edit_file", r"^\.openmax/".into()),
+            ("deny", "write_file", "^build/".into()),
+            ("deny", "read_file", "^secrets/".into()),
+            ("deny", "read_file", format!("^{}/notes/", regex::escape(&abs))),
+            ("deny", "grep", "^secrets/".into()),
+            ("allow", "write_file", "^src/".into()),
+            ("allow", "write_file", "docs/".into()),
+        ];
+        let text: String = rules
+            .iter()
+            .map(|(effect, tool, re)| format!("[[rules]]\neffect = \"{effect}\"\ntool = \"{tool}\"\narg_regex = '{re}'\n"))
+            .collect();
+        let file = root.join("rules.toml");
+        std::fs::write(&file, text).unwrap();
+        let FileLoad::Ok(rules, _) = load_file(&file) else { panic!("the rules did not load") };
+        let policy = Permissions { rules, project_root: root.clone(), ..Default::default() };
+        let decide = |tool: &str, args: Value| policy.evaluate(tool, &args);
+        let denied = |tool: &str, args: Value| matches!(decide(tool, args), PermissionDecision::Deny { .. });
+        for path in [
+            ".openmax/tools/t.toml".to_string(),
+            "./.openmax/tools/t.toml".into(),
+            "src/../.openmax/tools/t.toml".into(),
+            format!("{abs}/.openmax/tools/t.toml"),
+            ".OPENMAX/tools/t.toml".into(),
+            ".OpenMax/new/t.toml".into(),
+            "lnk/tools/t.toml".into(),
+            "lnk/../lnk/permissions.toml".into(),
+            "BUILD/x".into(),
+            "src/../Build/x".into(),
+            format!("{abs}/build/x"),
+        ] {
+            for tool in ["write_file", "edit_file"] {
+                if tool == "write_file" || !path.to_lowercase().contains("build") {
+                    assert!(denied(tool, json!({"path": path, "content": "x"})), "{tool} {path} is not denied");
+                }
+            }
+        }
+        for path in ["secrets/token.txt".to_string(), "./secrets/token.txt".into(), "SECRETS/token.txt".into(), format!("{abs}/secrets/token.txt"), "notes/plan.md".into()] {
+            assert!(denied("read_file", json!({"path": path})), "read_file {path} is not denied");
+        }
+        for path in ["secrets", "./secrets/", "src/../SECRETS"] {
+            assert!(denied("grep", json!({"pattern": ".", "path": path})), "grep over {path} is not denied");
+        }
+        assert_eq!(decide("grep", json!({"pattern": ".", "path": "src"})), PermissionDecision::Default);
+        for path in ["src/main.rs", "./src/main.rs", "src/new/mod.rs"] {
+            assert_eq!(decide("write_file", json!({"path": path, "content": "x"})), PermissionDecision::Allow, "{path}");
+        }
+        for path in ["src/../build.sh", "src/../.git/config", "src/git/config", "src/git/hooks/pre-commit", ".git/config"] {
+            assert_eq!(decide("write_file", json!({"path": path, "content": "x"})), PermissionDecision::Default, "{path} is allowed");
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap());
     }
 
     /// Each row of the predicate that admits a path that exists (A: a regular

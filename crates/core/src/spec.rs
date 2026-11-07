@@ -587,8 +587,10 @@ Grammar: `[[rules]]` tables only; unknown keys anywhere are rejected.
 
 What the regex matches:
 - `bash` → the command string.
-- `read_file`, `write_file`, `edit_file`, `list_dir` → the path argument.
-- `glob`, `grep` → the pattern argument.
+- `read_file`, `write_file`, `edit_file`, `list_dir` → the path the tool will
+  touch, resolved and root-relative however the call spells it (a directory
+  ends in `/`); a `deny` also reads it absolute, and ignores case.
+- `glob` → the pattern; `grep` → the pattern, and the path it searches.
 - any other tool → the full serialized JSON arguments.
 
 A rule (and a `pre_tool_use` hook) sees TEXT, not effects. A `deny` on

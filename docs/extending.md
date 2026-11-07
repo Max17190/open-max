@@ -289,9 +289,26 @@ arg_regex = "^cargo (test|check|build)"
 ```
 
 `effect` is `allow`, `deny`, or `ask`. `arg_regex` is optional: command for
-`bash`, path for file tools, pattern for `glob`/`grep`. For custom tools it
-matches the full serialized JSON arguments. Omit `arg_regex` (or leave it
-empty) to match every call of that tool.
+`bash`, pattern for `glob`, and for `grep` its pattern or the path it
+searches. For custom tools it matches the full serialized JSON arguments.
+Omit `arg_regex` (or leave it empty) to match every call of that tool.
+
+For `read_file`, `write_file`, `edit_file`, `list_dir` and `grep`'s path, the
+regex reads the file the tool will touch, not the path as the call spells it:
+resolved through `..` and links, relative to the project root, a directory
+ending in `/`. `./src/x`, `lib/../src/x`, the absolute path and a link in the
+project to `src` are all `src/x`, so `^src/` matches each of them and nothing
+outside `src/`. A `deny` also reads the absolute path and ignores case, since
+a case variant names the same file on a case-insensitive volume, even in a
+directory not created yet. `allow` and `ask` read only the relative path,
+case and all. A path the tool refuses (one that leaves the project) is
+matched as written, and the tool refuses it anyway.
+
+A rule names one tool, so a `deny read_file` on `secrets/` keeps `read_file`
+out of it and nothing else. `grep` with no path searches the whole project,
+`secrets/` included, and `bash` reads anything. To keep a path's contents
+from the agent, deny `grep` too (or `grep` over it, by path, if every search
+names one) and `bash`, or move the files out of the project.
 
 `tool` is matched by exact name, so a rule naming a tool that does not exist
 never fires: a misspelled `deny` reads exactly like a `deny` that never had to
