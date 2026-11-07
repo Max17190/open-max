@@ -100,116 +100,66 @@ pub fn short_model(model: &str) -> &str {
 }
 
 pub fn tools_block(registry: &Registry, frozen: bool) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let header = if frozen {
+    let mut lines = vec![aside(if frozen {
         "tools (loaded now; the frozen tools array takes a new one at /reload)"
     } else {
         "tools (preview of the next new session)"
-    };
-    lines.push(Line::from(Span::styled(
-        header.to_string(),
-        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-    )));
-
+    })];
     for spec in &registry.tools {
         let kind = match &spec.kind {
             ToolKind::Builtin => "built-in",
             ToolKind::External(_) => "external",
         };
-        let mut flags = kind.to_string();
-        if spec.mutating {
-            flags.push_str(" · mut");
-        }
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}", super::text::pad_right(&spec.name, 14)),
-                Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{flags:<16}"),
-                Style::default().fg(theme::DIM()),
-            ),
-            Span::styled(
-                clip(&spec.description, 60),
-                Style::default().fg(theme::DIM()),
-            ),
-        ]));
+        let flags = if spec.mutating { format!("{kind} · mut") } else { kind.to_string() };
+        lines.push(entry(&spec.name, 14, &flags, 16, &spec.description, 60));
     }
-
-    let external_n = registry
-        .tools
-        .iter()
-        .filter(|t| !matches!(t.kind, ToolKind::Builtin))
-        .count();
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  {} tools · {} external · drop TOML in .openmax/tools/ or ~/.openmax/tools/",
-            registry.tools.len(),
-            external_n
-        ),
-        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+    let external_n = registry.tools.iter().filter(|t| !matches!(t.kind, ToolKind::Builtin)).count();
+    lines.push(aside(format!(
+        "  {} tools · {external_n} external · drop TOML in .openmax/tools/ or ~/.openmax/tools/",
+        registry.tools.len(),
     )));
-    lines.push(Line::from(Span::styled(
-        "  token cost: /context".to_string(),
-        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-    )));
+    lines.push(aside("  token cost: /context"));
     lines
 }
 
 pub fn skills_block(skills: &[SkillSpec], project_root: &Path, frozen: bool) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let header = if frozen {
+    let mut lines = vec![aside(if frozen {
         "skills (loaded now; the frozen prompt takes a new one at /reload)"
     } else {
         "skills (preview of the next new session)"
-    };
-    lines.push(Line::from(Span::styled(
-        header.to_string(),
-        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-    )));
-
+    })];
     if skills.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (none loaded)".to_string(),
-            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-        )));
-    } else {
-        let project_skills = project_root.join(".agents").join("skills");
-        for skill in skills {
-            let scope = if skill.path.starts_with(&project_skills) {
-                "project"
-            } else {
-                "global"
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {}", super::text::pad_right(&skill.name, 16)),
-                    Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{scope:<9}"),
-                    Style::default().fg(theme::DIM()),
-                ),
-                Span::styled(
-                    clip(&skill.description, 56),
-                    Style::default().fg(theme::DIM()),
-                ),
-            ]));
-        }
+        lines.push(aside("  (none loaded)"));
     }
-
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  {} skills · SKILL.md under .agents/skills/ or ~/.openmax/skills/",
-            skills.len()
-        ),
-        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+    let project_skills = project_root.join(".agents").join("skills");
+    for skill in skills {
+        let scope = if skill.path.starts_with(&project_skills) { "project" } else { "global" };
+        lines.push(entry(&skill.name, 16, scope, 9, &skill.description, 56));
+    }
+    lines.push(aside(format!(
+        "  {} skills · SKILL.md under .agents/skills/ or ~/.openmax/skills/",
+        skills.len()
     )));
-    lines.push(Line::from(Span::styled(
-        "  token cost: /context".to_string(),
-        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-    )));
+    lines.push(aside("  token cost: /context"));
     lines
+}
+
+/// A listing's dim italic line: its header, an empty state, its footer.
+fn aside(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(text.into(), Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)))
+}
+
+/// A listing's row: the name padded to `name_w`, a tag padded to `tag_w`,
+/// and the description clipped to `max`.
+fn entry(name: &str, name_w: usize, tag: &str, tag_w: usize, description: &str, max: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {}", super::text::pad_right(name, name_w)),
+            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{tag:<tag_w$}"), Style::default().fg(theme::DIM())),
+        Span::styled(clip(description, max), Style::default().fg(theme::DIM())),
+    ])
 }
 
 #[cfg(test)]

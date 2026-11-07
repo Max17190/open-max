@@ -16,14 +16,24 @@ use crate::theme;
 const LABEL_W: usize = 26;
 
 fn row(label: &str, tokens: usize, detail: &str) -> Line<'static> {
+    measure(label, format!("~{tokens:>5} tok"), detail)
+}
+
+/// A row of the block: its label, its value, and any dim detail after it.
+fn measure(label: &str, value: String, detail: &str) -> Line<'static> {
     let mut spans = vec![
         Span::styled(format!("  {label:<LABEL_W$}"), Style::default().fg(theme::ACCENT())),
-        Span::raw(format!("~{tokens:>5} tok")),
+        Span::raw(value),
     ];
     if !detail.is_empty() {
         spans.push(Span::styled(format!("   {detail}"), Style::default().fg(theme::DIM())));
     }
     Line::from(spans)
+}
+
+/// `name ~tokens` per item, for a row that itemizes what it counts.
+fn itemized(items: &[(String, usize)]) -> String {
+    items.iter().map(|(name, chars)| format!("{name} {}", tok(*chars))).collect::<Vec<_>>().join(" · ")
 }
 
 /// What the header may truthfully claim about the numbers below.
@@ -80,40 +90,21 @@ pub fn context_block(
     total_chars += builtin_chars;
     lines.push(row(&format!("tools ({builtin_count} built-in)"), tok(builtin_chars), ""));
 
-    let externals: Vec<&(String, usize, bool)> = breakdown.tools.iter().filter(|t| t.2).collect();
+    let externals: Vec<(String, usize)> =
+        breakdown.tools.iter().filter(|t| t.2).map(|(name, chars, _)| (name.clone(), *chars)).collect();
     if !externals.is_empty() {
         let chars: usize = externals.iter().map(|t| t.1).sum();
         total_chars += chars;
-        let detail = externals
-            .iter()
-            .map(|(name, c, _)| format!("{name} {}", tok(*c)))
-            .collect::<Vec<_>>()
-            .join(" · ");
+        let detail = itemized(&externals);
         lines.push(row(&format!("external tools ({})", externals.len()), tok(chars), &detail));
     }
 
-    if !breakdown.skills.is_empty() {
-        // Skill lines are already counted inside the "skills index" prompt
-        // component; this row just itemizes them.
-        let detail = breakdown
-            .skills
-            .iter()
-            .map(|(name, c)| format!("{name} {}", tok(*c)))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        lines.push(row(&format!("skills ({})", breakdown.skills.len()), 0, &detail));
-    }
-
-    if !breakdown.memory.is_empty() {
-        // Memory lines are already counted inside the "memory index" prompt
-        // component; this row just itemizes them.
-        let detail = breakdown
-            .memory
-            .iter()
-            .map(|(name, c)| format!("{name} {}", tok(*c)))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        lines.push(row(&format!("memory ({})", breakdown.memory.len()), 0, &detail));
+    // Skill and memory lines are already counted inside the "skills index"
+    // and "memory index" prompt components; these rows just itemize them.
+    for (what, items) in [("skills", &breakdown.skills), ("memory", &breakdown.memory)] {
+        if !items.is_empty() {
+            lines.push(row(&format!("{what} ({})", items.len()), 0, &itemized(items)));
+        }
     }
 
     if !breakdown.note.is_empty() {
@@ -134,42 +125,17 @@ pub fn context_block(
     lines.push(row("total per request", tok(total_chars), ""));
 
     if let Some(pct) = cache_pct {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<LABEL_W$}", "cache hit (last turn)"),
-                Style::default().fg(theme::ACCENT()),
-            ),
-            Span::raw(format!("{pct:>6} %")),
-        ]));
+        lines.push(measure("cache hit (last turn)", format!("{pct:>6} %"), ""));
     }
     if let Some((cached, prompt)) = session_cache.filter(|(_, p)| *p > 0) {
         let pct = (cached as f64 / prompt as f64 * 100.0).round() as u64;
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<LABEL_W$}", "cache hit (session)"),
-                Style::default().fg(theme::ACCENT()),
-            ),
-            Span::raw(format!("{pct:>6} %")),
-            Span::styled(
-                format!("   {cached} of {prompt} prompt tok"),
-                Style::default().fg(theme::DIM()),
-            ),
-        ]));
+        lines.push(measure("cache hit (session)", format!("{pct:>6} %"), &format!("{cached} of {prompt} prompt tok")));
     }
     if let Some((used, total)) = budget {
         // Transcript plus the tool schemas above, the same total the budget
         // enforces, so this row and compaction never disagree.
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<LABEL_W$}", "context used"),
-                Style::default().fg(theme::ACCENT()),
-            ),
-            Span::raw(format!("~{used:>5} tok")),
-            Span::styled(
-                format!("   of {total} ({}%)", (used as f64 / total.max(1) as f64 * 100.0) as u32),
-                Style::default().fg(theme::DIM()),
-            ),
-        ]));
+        let pct = (used as f64 / total.max(1) as f64 * 100.0) as u32;
+        lines.push(measure("context used", format!("~{used:>5} tok"), &format!("of {total} ({pct}%)")));
     }
     lines
 }
