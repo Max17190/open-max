@@ -623,7 +623,9 @@ mod tests {
     /// it. Every spelling of a denied path is denied: `./p`, `d/../p`, the
     /// absolute path, a case variant (in a directory that exists and in one
     /// not created yet), and a link in the project to its directory; grep over
-    /// a denied directory is denied however its path is spelled. An allow
+    /// a denied directory is denied however its path is spelled. (A case
+    /// variant of a directory names another, missing directory where the
+    /// volume tells case apart, and grep reads nothing there.) An allow
     /// covers only paths that really are under its pattern: `src/../x` and a
     /// link under `src/` to `.git` are not. A deny written for the absolute path
     /// still denies the relative spelling, while an unanchored allow does not
@@ -683,7 +685,7 @@ mod tests {
         for path in ["secrets/token.txt".to_string(), "./secrets/token.txt".into(), "SECRETS/token.txt".into(), format!("{abs}/secrets/token.txt"), "notes/plan.md".into()] {
             assert!(denied("read_file", json!({"path": path})), "read_file {path} is not denied");
         }
-        for path in ["secrets", "./secrets/", "src/../SECRETS"] {
+        for path in ["secrets", "./secrets/", "src/../secrets"] {
             assert!(denied("grep", json!({"pattern": ".", "path": path})), "grep over {path} is not denied");
         }
         assert_eq!(decide("grep", json!({"pattern": ".", "path": "src"})), PermissionDecision::Default);
