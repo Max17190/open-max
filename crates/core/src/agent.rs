@@ -1,7 +1,7 @@
 //! The turn loop: everything that happens between a user message and the
 //! model falling silent.
 //!
-//! Two entry points, `start_turn` and `reload_session`, in front of ~2.3k
+//! Two entry points, `start_turn` and `reload_session`, in front of ~1.7k
 //! lines. That ratio is deliberate: a turn has a fixed order that callers must
 //! not be able to reach into and reorder.
 //!
@@ -30,7 +30,8 @@
 //!    that ran out or a human who stopped the turn, and neither is a hook's to
 //!    overrule.
 //!
-//! Read-only calls batch and run concurrently; anything mutating serializes.
+//! Read-only calls batch and run concurrently (`batch.rs`); anything mutating
+//! serializes.
 //! Refreezing mid-turn is allowed between iterations but never inside one, so
 //! the schemas a model was shown are the schemas its reply is checked against.
 
