@@ -359,8 +359,9 @@ checks. Messages caches a prompt only up to a `cache_control` marker, so every
 request carries two: one on the system prompt, which caches the tools and the
 system prompt every session shares, and one on the newest stored block, which
 the next request reads back at the cache price. The trailing note follows that
-block as a text block of its own, so the entry holds without it. Signed thinking blocks return only to their producing endpoint, model,
-and credentials, with unchanged prior system, tools, and messages, and matching
+block as a text block of its own, so the entry holds without it. Signed
+thinking blocks return only to their producing endpoint, model, and
+credentials, with unchanged prior system, tools, and messages, and matching
 assistant text and tool calls. Compaction, reloads, transient notes, or edits
 that change this context discard stale thinking while retaining the current
 text and tool calls. An interrupted,
