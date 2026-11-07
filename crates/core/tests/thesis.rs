@@ -745,6 +745,71 @@ impl Prompt {
     }
 }
 
+/// The two cache rules the cacheable-prefix twins print, held to requests
+/// built by hand, since the session's own requests cannot reach every case
+/// (native Messages marks no block yet, and no session request is 20 tool
+/// outputs past the entry it reads). A later request reads back an earlier
+/// request's entry through the same bytes, at least `MIN_CACHED_TOKENS` of
+/// them: on native Messages from a marked block, its marker before or after
+/// the block's other keys, up to 19 blocks after the entry's, and on
+/// Responses at its latest user message or tool output, up to 20 such ends
+/// after the entry's. Past either lookback, after one changed byte, or under
+/// the minimum, it reads back nothing.
+#[test]
+fn the_cache_rules_read_back_an_entry_only_through_the_same_bytes_within_their_lookback() {
+    use serde_json::json;
+    let long = "x".repeat(4 * MIN_CACHED_TOKENS + 64);
+    let changed = format!("y{}", &long[1..]);
+
+    // Native Messages: the entry ends at the first block, read from a marker
+    // `gap` blocks on.
+    let text = |text: &str| json!({ "type": "text", "text": text });
+    let marked = |text: &str| json!({ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } });
+    let messages = |blocks: Vec<serde_json::Value>| {
+        Prompt::of(
+            WireApi::Anthropic,
+            &json!({ "system": [{ "type": "text", "text": "rules" }], "messages": [{ "role": "user", "content": blocks }] })
+                .to_string(),
+        )
+    };
+    let first = messages(vec![marked(&long)]);
+    assert_eq!(first.writes.len(), 1, "the marked block writes one entry: {:?}", first.writes);
+    let after = format!(
+        r#"{{"messages":[{{"content":[{{"text":"{long}","type":"text","cache_control":{{"type":"ephemeral"}}}}],"role":"user"}}],"system":[{{"text":"rules","type":"text"}}]}}"#
+    );
+    assert_eq!(Prompt::of(WireApi::Anthropic, &after).writes, first.writes, "a marker after the block's keys ends the same entry");
+    let later = |opening: &str, gap: usize| {
+        let mut blocks = vec![text(opening)];
+        blocks.extend((1..gap).map(|i| text(&format!("block {i}"))));
+        blocks.push(marked("tail"));
+        messages(blocks).billed(std::slice::from_ref(&first))
+    };
+    assert_eq!(later(&long, 1), first.writes[0], "the block after the entry's reads it back");
+    assert_eq!(later(&long, 19), first.writes[0], "19 blocks on, the lookback still reaches it");
+    assert_eq!(later(&long, 20), 0, "20 blocks on, the lookback no longer reaches it");
+    assert_eq!(later(&changed, 1), 0, "a changed byte reads back nothing");
+    assert!(messages(vec![marked("short")]).writes.is_empty(), "an entry under the minimum is not written");
+
+    // Responses: the entry ends at the user message, read from the latest of
+    // `outputs` tool outputs after it.
+    let responses = |prompt: &str, outputs: usize| {
+        let mut input = vec![json!({ "role": "developer", "content": "rules" }), json!({ "role": "user", "content": prompt })];
+        for i in 0..outputs {
+            input.push(json!({ "type": "function_call", "call_id": format!("c{i}"), "name": "read_file", "arguments": "{}" }));
+            input.push(json!({ "type": "function_call_output", "call_id": format!("c{i}"), "output": "out" }));
+        }
+        input.push(json!({ "role": "developer", "content": "note" }));
+        Prompt::of(WireApi::Responses, &json!({ "input": input }).to_string())
+    };
+    let first = responses(&long, 0);
+    assert_eq!(first.writes.len(), 1, "the user message writes one entry past the minimum: {:?}", first.writes);
+    let read = |prompt: &str, outputs: usize| responses(prompt, outputs).billed(std::slice::from_ref(&first));
+    assert_eq!(read(&long, 1), first.writes[0], "the next tool output reads it back, the note after it aside");
+    assert_eq!(read(&long, 20), first.writes[0], "20 ends on, the lookback still reaches it");
+    assert_eq!(read(&long, 21), 0, "21 ends on, the lookback no longer reaches it");
+    assert_eq!(read(&changed, 1), 0, "a changed byte reads back nothing");
+}
+
 /// The session of the cacheable-prefix gate `gate` over `wire`, held to
 /// `ratchet` percent, and its billed share, where a rule is modeled, to
 /// `billed_ratchet`.
