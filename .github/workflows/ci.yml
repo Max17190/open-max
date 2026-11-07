@@ -20,6 +20,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
+# Every step runs under bash with pipefail (bash -eo pipefail), so a pipe
+# keeps the failure of each command in it, wherever it stands in a script,
+# quoted or not. GitHub's default shell sets no pipefail.
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 

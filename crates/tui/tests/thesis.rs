@@ -1025,60 +1025,18 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
     );
 }
 
-/// The commands of `script`, a step's `run`, whose failure a pipe loses when
-/// the script runs as GitHub runs one that names no shell, `bash -e` without
-/// `pipefail`: the command before each `|` outside quotes that is not `||`,
-/// unless it is `echo` or `printf`, which have no failure to lose, or a
-/// `set` command before it turned `pipefail` on (`set -o pipefail`,
-/// `set -euo pipefail`) and none turned it off again (`set +o pipefail`).
-/// Only such a `set` counts: a script that names `pipefail` in a comment or
-/// reads `PIPESTATUS` keeps the failure no more. A `|` in a `case` pattern
-/// (`Linux|Darwin)`) is no pipe.
-fn lossy_pipes(script: &str) -> Vec<String> {
-    let (mut lossy, mut pipefail) = (Vec::new(), false);
-    // `pipefail` once `command` has run: a `-o` (or `-euo`) before the word
-    // turns it on, a `+o` off, and the last such pair of a `set` decides.
-    let set = |command: &str, pipefail: bool| {
-        let words: Vec<&str> = command.trim().trim_start_matches(['(', '{', ' ']).split_whitespace().collect();
-        let flags = words.windows(2).filter(|pair| words[0] == "set" && pair[1] == "pipefail");
-        flags.filter(|pair| pair[0].len() > 1 && pair[0].ends_with('o') && pair[0].starts_with(['-', '+'])).fold(pipefail, |_, pair| pair[0].starts_with('-'))
-    };
-    for line in script.replace("\\\n", " ").lines() {
-        let (mut quote, mut from, mut end, mut chars) = (None, 0, line.len(), line.char_indices().peekable());
-        while let Some((at, c)) = chars.next() {
-            match (quote, c) {
-                (Some(open), c) if c == open => quote = None,
-                (Some(_), _) => {}
-                (None, '\'' | '"') => quote = Some(c),
-                (None, '#') if line[..at].ends_with(|c: char| c.is_whitespace()) || at == 0 => {
-                    end = at;
-                    break;
-                }
-                // A redirection's `&` (`2>&1`, `&>`) ends no command.
-                (None, '&') if line[..at].ends_with(['>', '<']) || line[at + 1..].starts_with('>') => {}
-                (None, ';' | '&') => {
-                    pipefail = set(&line[from..at], pipefail);
-                    from = at + 1;
-                }
-                (None, '|') if chars.next_if(|(_, next)| *next == '|').is_some() => {
-                    pipefail = set(&line[from..at], pipefail);
-                    from = at + 2;
-                }
-                (None, '|') => {
-                    let rest = &line[at + 1..];
-                    let pattern = rest.find(')').is_some_and(|close| !rest[..close].contains(|c: char| c.is_whitespace() || c == '"' || c == '\''));
-                    let command = line[from..at].trim().trim_start_matches(['(', '{', '!', ' ']);
-                    if !pattern && !pipefail && !matches!(command.split_whitespace().next(), Some("echo" | "printf")) {
-                        lossy.push(command.to_string());
-                    }
-                    from = at + 1;
-                }
-                _ => {}
-            }
-        }
-        pipefail = set(&line[from..end], pipefail);
-    }
-    lossy
+/// Whether `script`, a step's `run`, swallows a failure: a `||` followed by
+/// `true`, `:` or `exit 0`, read as shell words, so no whitespace between
+/// them, a line break included, no braces or parentheses around the rest,
+/// and no `;` after it hides one.
+fn swallows_a_failure(script: &str) -> bool {
+    let spaced = script.replace("||", " || ");
+    let words: Vec<&str> = spaced
+        .split_whitespace()
+        .map(|word| word.trim_matches(['(', ')', '{', '}', ';']))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.windows(2).any(|pair| pair[0] == "||" && matches!(pair[1], "true" | ":")) || words.windows(3).any(|three| three == ["||", "exit", "0"])
 }
 
 /// No step of a workflow that runs on pull requests can be skipped in a run
@@ -1086,34 +1044,30 @@ fn lossy_pipes(script: &str) -> Vec<String> {
 /// reads, each key read as YAML reads it, quoted or with space before its
 /// colon: no `continue-on-error` anywhere; no `if:` but
 /// `if: ${{ !cancelled() }}`, which runs a step after a failed one too and
-/// skips it only in a run that was cancelled; no command whose failure its
-/// script swallows with `|| true`, `|| :` or `|| exit 0`; and no pipe that
-/// loses a failure (lossy_pipes): a `set -o pipefail` before it in the
-/// step's script keeps the failure, and so does the step's `shell: bash`,
-/// which sets `pipefail`. A measurement no runner meets with room leaves
-/// the pull request's gate for the Reports workflow, which runs every night
-/// and by hand, on no pull request and no push, and fails only when it
-/// cannot measure. Of the workflows GitHub runs, `.yml` and `.yaml` files,
-/// ci.yml is the one that runs on pull requests.
+/// skips it only in a run that was cancelled; no script that swallows a
+/// failure (swallows_a_failure); and every script runs under bash with
+/// `pipefail`, the shell the workflow's `defaults` names and no job or step
+/// replaces, so no pipe loses the failure of a command in it, wherever the
+/// command stands. A measurement no runner meets with room leaves the pull
+/// request's gate for the Reports workflow, which runs every night and by
+/// hand, on no pull request and no push, and fails only when it cannot
+/// measure. Of the workflows GitHub runs, `.yml` and `.yaml` files, ci.yml is
+/// the one that runs on pull requests.
 #[test]
 fn pull_request_workflows_skip_no_step_and_let_none_fail() {
-    for (script, lossy) in [
-        ("cargo test | tee log", &["cargo test"][..]),
-        ("cargo build && cargo test --list \\\n  | grep -c ': test$' > count", &["cargo test --list"][..]),
-        ("x=$(git log | head -1)", &["x=$(git log"][..]),
-        ("echo \"$sum  file\" | shasum -a 256 --check -", &[][..]),
-        ("grep -E 'a|b' log || failed=1", &[][..]),
-        ("case $os in Linux|Darwin) ok=1 ;; esac # a | b", &[][..]),
-        ("set -euo pipefail\ncargo test | tee log", &[][..]),
-        ("set -e; set -o pipefail; cargo test | tee log", &[][..]),
-        ("cargo test | tee log; echo \"${PIPESTATUS[0]}\"", &["cargo test"][..]),
-        ("cargo test | tee log\nset -o pipefail", &["cargo test"][..]),
-        ("set -o pipefail; set +o pipefail; cargo test | tee log", &["cargo test"][..]),
-        ("# set -o pipefail\necho pipefail; cargo test | tee log", &["cargo test"][..]),
-        ("cargo test 2>&1 | tee log", &["cargo test 2>&1"][..]),
-        ("cargo test &> log; make check >&2 | tee log", &["make check >&2"][..]),
+    for (script, swallows) in [
+        ("cargo test || true", true),
+        ("cargo test ||true", true),
+        ("cargo test ||  true", true),
+        ("cargo test ||\n  true", true),
+        ("cargo test || :", true),
+        ("cargo test || exit 0; echo done", true),
+        ("cargo test || { true; }", true),
+        ("cargo test || failed=1", false),
+        ("cargo test || exit 1", false),
+        ("x=\"${a:-b}\" || exit", false),
     ] {
-        assert_eq!(lossy_pipes(script), lossy, "the pipes of {script:?} that lose a failure");
+        assert_eq!(swallows_a_failure(script), swallows, "whether {script:?} swallows a failure");
     }
     let mut workflows: Vec<String> = std::fs::read_dir(repo().join(".github/workflows"))
         .unwrap()
@@ -1127,6 +1081,9 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
     let mut soft = Vec::new();
     for workflow in gating {
         let text = std::fs::read_to_string(repo().join(".github/workflows").join(workflow)).unwrap();
+        if !text.contains("\ndefaults:\n  run:\n    shell: bash\n") {
+            soft.push(format!("{workflow} names no `defaults: run: shell: bash`, so its pipes run without pipefail"));
+        }
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
         let unquoted = |text: &str| text.trim().trim_matches(['"', '\'']).to_string();
         for (at, line) in lines.iter().enumerate() {
@@ -1135,34 +1092,20 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
                 continue;
             }
             let (key, value) = body.split_once(':').map_or((String::new(), String::new()), |(key, value)| (unquoted(key), unquoted(value)));
-            let squeezed = body.replace("|| ", "||");
-            if key == "continue-on-error"
-                || (key == "if" && value != "${{ !cancelled() }}")
-                || ["||true", "||:", "||exit 0"].iter().any(|swallowed| squeezed.contains(swallowed))
-            {
+            if key == "continue-on-error" || (key == "if" && value != "${{ !cancelled() }}") || (key == "shell" && value != "bash") {
                 soft.push(format!("{workflow} line {}: {body}", at + 1));
             }
             if key != "run" {
                 continue;
             }
-            // The script: the value, or the block under a `|` or `>` value,
-            // every line indented past the key.
+            // The script: the value with every line under it indented past
+            // the key, which continue a plain value as they make a `|` or
+            // `>` value's block.
             let indent = line.len() - line.trim_start().len() + if line.trim_start().starts_with("- ") { 2 } else { 0 };
-            let script = if value.starts_with(['|', '>']) {
-                let block = lines[at + 1..].iter().take_while(|next| next.trim().is_empty() || next.len() - next.trim_start().len() > indent);
-                block.map(String::as_str).collect::<Vec<_>>().join("\n")
-            } else {
-                value
-            };
-            let lossy = lossy_pipes(&script);
-            if lossy.is_empty() {
-                continue;
-            }
-            let bash = |key: &&str| key.split_once(':').is_some_and(|(key, shell)| unquoted(key) == "shell" && unquoted(shell) == "bash");
-            if !step_keys(&lines, at).iter().any(bash) {
-                for command in lossy {
-                    soft.push(format!("{workflow} line {}: a pipe loses the failure of `{command}`, with no pipefail", at + 1));
-                }
+            let block = lines[at + 1..].iter().take_while(|next| next.trim().is_empty() || next.len() - next.trim_start().len() > indent);
+            let script = std::iter::once(value.as_str()).chain(block.map(String::as_str)).collect::<Vec<_>>().join("\n");
+            if swallows_a_failure(&script) {
+                soft.push(format!("{workflow} line {}: the step's script swallows a failure", at + 1));
             }
         }
     }
