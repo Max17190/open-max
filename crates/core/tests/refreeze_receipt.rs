@@ -443,6 +443,54 @@ async fn a_script_only_edit_announces_the_revocation_on_the_writing_call() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The manifest-edit path, one call later: the refreeze receipt already said
+/// the approved tool's new bytes are unapproved, so the next mutating call's
+/// approval diff, which starts from the state the refreeze left, must not
+/// announce the same revocation again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refreeze_receipt_is_not_repeated_as_a_revocation_on_the_next_call() {
+    let dir = std::env::temp_dir().join(format!("omx-receipt-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest_path = project.join(".openmax/tools/echoer.toml");
+    std::fs::write(&manifest_path, "name = \"echoer\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\nmutating = false\n").unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let sha = open_max_core::ledger::sha256_hex(&std::fs::read(&manifest_path).unwrap());
+    open_max_core::ledger::approve_capability(&data, &project, &manifest_path, &[sha]).unwrap();
+
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({
+                "path": ".openmax/tools/echoer.toml",
+                "content": "name = \"echoer\"\ndescription = \"edited\"\ncommand = \"/bin/echo\"\nmutating = false\n",
+            }),
+        ),
+        completion_with_tool_call("write_file", serde_json::json!({ "path": "notes.txt", "content": "n\n" })),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "manifest-then-write", &project, "edit the tool, then write notes").await;
+    let bodies = bodies.lock().unwrap();
+    let last_tool = |body: &str| -> String {
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let edit = last_tool(&bodies[1]);
+    assert!(edit.contains("[extension refreeze:"), "{edit}");
+    assert!(edit.contains("echoer (openmax --approve"), "the receipt names the unapproved bytes: {edit}");
+    let next = last_tool(&bodies[2]);
+    assert!(!next.contains("[approval revoked:"), "the receipt's revocation is announced once: {next}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// If the approval cannot be recorded (the manifest changed while the card
 /// was open), the receipt must NOT claim later calls run without a card -
 /// the next call asks again. It says the recording failed.

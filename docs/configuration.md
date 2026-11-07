@@ -377,21 +377,28 @@ models that reject it. See the official [Messages API](https://platform.claude.c
 [preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking) contracts.
 
 The trailing note (the tool files, skills, and memories a session added,
-changed, or removed after its prompt and tools array were built) is appended
-to the content of the request's last message, the user's prompt or the newest
-tool result, after a blank line and a header that names the harness as its
-source (on native Messages, as a text block of its own in that message), and
-it is never stored. Every endpoint, a flat `base_url` or a named
-provider, therefore sees the stored transcript's role order, the same as with
-no note, and the system prompt stays the only system message. A note of its
-own after the history is what picky servers refuse: some hosted validators
+changed, or removed after its prompt and tools array were built) opens with a
+header that names the harness as its source, and it is never stored. On Chat
+Completions and native Messages it is appended to the content of the
+request's last message, the user's prompt or the newest tool result, after a
+blank line (on native Messages, as a text block of its own in that message,
+after the cache marker). On Responses it is a developer message after the
+history, which the Responses API takes anywhere in its `input`: OpenAI's
+prompt cache on
+GPT-5.6 and later ends each entry at a request's newest user message or tool
+output, so an entry then holds no note byte, and the next request, which
+drops the note, reads back the whole history. Every Chat Completions and
+native Messages endpoint, a flat `base_url` or a named provider, therefore
+sees the stored transcript's role order, the same as with no note, and the
+system prompt stays the only system message. A note of its own after the
+history is what picky Chat Completions servers refuse: some hosted validators
 reject a system or a user message after a tool message, a chat template that
 enforces user/assistant alternation rejects a user message after the prompt,
 and some gateways hoist every system message into the system prompt, which
-would move the cached prefix on every capability write. Only a history that
-ends with an assistant reply gets the note as a user message of its own,
-which those servers take there. A prefix cache keeps every stored byte before
-the note.
+would move the cached prefix on every capability write. On those two
+protocols, only a history that ends with an assistant reply gets the note as
+a user message of its own, which those servers take there. A prefix cache
+keeps every stored byte before the note.
 
 A provider takes its key from its own `api_key` or `api_key_env`. Without one,
 it uses the settings `api_key` (or `OPENMAX_API_KEY`) only when its `base_url`
