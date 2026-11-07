@@ -1026,10 +1026,12 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
 }
 
 /// Whether `script`, a step's `run`, swallows a failure: a `||` followed by
-/// `true`, `:` or `exit 0`, or flags that turn `errexit` or `pipefail` off
-/// (`set +e`, `set +euo pipefail`, `set +o errexit`), read as shell words, so
-/// no whitespace between them, a line break included, no braces or
-/// parentheses around the rest, and no `;` after them hides one.
+/// `true`, `:` or `exit 0`, read as shell words, so no whitespace between
+/// them, a line break included, no braces or parentheses around the rest,
+/// and no `;` after them hides one; or a `set` command whose flags turn
+/// `errexit` or `pipefail` off (`set +e`, `set +euo pipefail`,
+/// `set +o errexit`). A `+` word of another command (`cargo +stable test`)
+/// is no such flag.
 fn swallows_a_failure(script: &str) -> bool {
     let spaced = script.replace("||", " || ");
     let words: Vec<&str> = spaced
@@ -1037,13 +1039,17 @@ fn swallows_a_failure(script: &str) -> bool {
         .map(|word| word.trim_matches(['(', ')', '{', '}', ';']))
         .filter(|word| !word.is_empty())
         .collect();
-    let turns_off = |at: usize| {
-        let flags = words[at].strip_prefix('+').filter(|flags| !flags.is_empty() && flags.chars().all(|c| c.is_ascii_alphabetic()));
-        flags.is_some_and(|flags| flags.contains('e') || (flags.ends_with('o') && matches!(words.get(at + 1), Some(&("pipefail" | "errexit")))))
+    let turns_off = |command: &str| {
+        let words: Vec<&str> = command.split_whitespace().map(|word| word.trim_matches(['(', ')', '{', '}'])).filter(|word| !word.is_empty()).collect();
+        words.first() == Some(&"set")
+            && words.iter().enumerate().any(|(at, word)| {
+                let flags = word.strip_prefix('+').filter(|flags| !flags.is_empty() && flags.chars().all(|c| c.is_ascii_alphabetic()));
+                flags.is_some_and(|flags| flags.contains('e') || (flags.ends_with('o') && matches!(words.get(at + 1), Some(&("pipefail" | "errexit")))))
+            })
     };
     words.windows(2).any(|pair| pair[0] == "||" && matches!(pair[1], "true" | ":"))
         || words.windows(3).any(|three| three == ["||", "exit", "0"])
-        || (0..words.len()).any(turns_off)
+        || script.split(['\n', ';', '&', '|']).any(turns_off)
 }
 
 /// No step of a workflow that runs on pull requests can be skipped in a run
@@ -1078,6 +1084,10 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
         ("set +euo pipefail", true),
         ("set +o errexit", true),
         ("set -euo pipefail\nchmod +x scripts/a.sh", false),
+        ("cargo +stable test", false),
+        ("cargo +nightly test || exit 1", false),
+        ("cargo build && set +e", true),
+        ("{ set +o pipefail; }", true),
     ] {
         assert_eq!(swallows_a_failure(script), swallows, "whether {script:?} swallows a failure");
     }
