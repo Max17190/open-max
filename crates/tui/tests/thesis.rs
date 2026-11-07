@@ -1030,8 +1030,9 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
 /// them, a line break included, no braces or parentheses around the rest,
 /// and no `;` after them hides one; or a `set` command whose flags turn
 /// `errexit` or `pipefail` off (`set +e`, `set +euo pipefail`,
-/// `set +o errexit`). A `+` word of another command (`cargo +stable test`)
-/// is no such flag.
+/// `set +o errexit`), shell keywords and command prefixes before it
+/// (`then set +e`, `builtin set +e`) skipped. A `+` word of another command
+/// (`cargo +stable test`) is no such flag.
 fn swallows_a_failure(script: &str) -> bool {
     let spaced = script.replace("||", " || ");
     let words: Vec<&str> = spaced
@@ -1040,7 +1041,12 @@ fn swallows_a_failure(script: &str) -> bool {
         .filter(|word| !word.is_empty())
         .collect();
     let turns_off = |command: &str| {
-        let words: Vec<&str> = command.split_whitespace().map(|word| word.trim_matches(['(', ')', '{', '}'])).filter(|word| !word.is_empty()).collect();
+        let words: Vec<&str> = command
+            .split_whitespace()
+            .map(|word| word.trim_matches(['(', ')', '{', '}']))
+            .filter(|word| !word.is_empty())
+            .skip_while(|word| matches!(*word, "!" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "time" | "builtin" | "command"))
+            .collect();
         words.first() == Some(&"set")
             && words.iter().enumerate().any(|(at, word)| {
                 let flags = word.strip_prefix('+').filter(|flags| !flags.is_empty() && flags.chars().all(|c| c.is_ascii_alphabetic()));
@@ -1088,6 +1094,9 @@ fn pull_request_workflows_skip_no_step_and_let_none_fail() {
         ("cargo +nightly test || exit 1", false),
         ("cargo build && set +e", true),
         ("{ set +o pipefail; }", true),
+        ("if true; then set +e; fi", true),
+        ("while read -r line; do builtin set +o pipefail; done", true),
+        ("if cargo test; then echo set +e; fi", false),
     ] {
         assert_eq!(swallows_a_failure(script), swallows, "whether {script:?} swallows a failure");
     }
