@@ -148,11 +148,10 @@ password, an ssh host key) fails at once. When the tool exits, any
 process still in that group is terminated (`&`, `nohup` and `disown` leave a
 process there), and the result carries a note saying so. Cleanup reaches only
 that group: a process that moved itself to a new session or group is neither
-stopped nor reported. A
-helper that must outlive the call, such as a long-lived server, belongs in a
-named tmux session. The process is a
-native host process with the network and filesystem authority of Open Max;
-its environment is the scrubbed baseline plus the manifest's `env` list.
+stopped nor reported. A helper that must outlive the call, such as a
+long-lived server, belongs in a named tmux session. The process is a native
+host process with the network and filesystem authority of Open Max; its
+environment is the scrubbed baseline plus the manifest's `env` list.
 
 Execution policy: in auto, valid tools run without confirmation or content
 grants, including after edits. Deny rules and hook gates still apply. In ask,
@@ -1332,6 +1331,20 @@ git log --stat -1 subagent/make-the-flaky-retry-test-1a2b3c4d
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frozen prompt sends an agent to `openmax --spec <surface>` in
+    /// bash before it writes a capability, so a contract the bash cap cut
+    /// would lose its middle on exactly the read that needs all of it. The
+    /// cap is set to what every later request re-sends; every contract must
+    /// still fit under it whole.
+    #[test]
+    fn every_contract_fits_one_bash_result_whole() {
+        let cap = crate::tools::OutputCaps::default().command_bytes;
+        for surface in SURFACES {
+            let Some(text) = render(surface) else { continue };
+            assert!(text.len() < cap, "--spec {surface} is {} bytes, over the {cap}-byte bash cap", text.len());
+        }
+    }
 
     /// No authoring surface claims the refreeze needs a SUCCESSFUL call:
     /// #242 activates on any executed mutating call (a failed writer
