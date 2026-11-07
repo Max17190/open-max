@@ -593,10 +593,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // A frame that costs the same at 1,000,000 transcript lines adds 46 lines to the terminal UI (a row
-    // index over block heights, a prompt list and a budget of held wraps) where main was 10 under the
-    // ratchet; crates/core, the agent loop and the frozen prompt are unchanged.
-    const BASELINE: usize = 44_507;
+    // The agent loop hands its transcript, its notes and its stream batching to files of their own and
+    // ends a call through one helper: 29 lines fewer, the trust dispatcher and the frozen prompt unchanged.
+    const BASELINE: usize = 44_478;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -765,7 +764,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 #[test]
 fn agent_loop_is_under_2500_lines() -> Result<(), String> {
     const TARGET: usize = 2_500;
-    const BASELINE: usize = 3_354;
+    const BASELINE: usize = 2_299;
     // About 1% of the loop: room for a small fix, not for a feature.
     const MARGIN: usize = 50;
     const RATCHET: usize = BASELINE + MARGIN;

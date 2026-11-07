@@ -21,11 +21,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::agent::{report_hook_failures, save_messages};
 use crate::client::{ChatClient, CompletionResult, TRUNCATED};
 use crate::hooks::Hooks;
+use crate::notes::report_hook_failures;
 use crate::sessions;
 use crate::state::{CancelToken, Core};
+use crate::transcript::save_messages;
 use crate::types::{estimate_tokens, AgentEvent, ChatMessage};
 
 pub(crate) const DIGEST_PREFIX: &str = "[context note:";
@@ -983,7 +984,7 @@ fn prune_transcript(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::agent::execution_policy_note;
+    use crate::notes::execution_policy_note;
     use crate::config::ApprovalMode;
     use crate::types::{ToolCall, ToolCallFunction};
 
