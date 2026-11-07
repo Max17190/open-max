@@ -180,10 +180,7 @@ pub(crate) async fn execute_readonly_batch(
                         args: serde_json::from_str(&pending.function.arguments).unwrap_or(Value::Null),
                     });
                 }
-                ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                    call_id: pending.id.clone(), ok: false, output: POLICY_CHANGED_DURING_HOOK.into(),
-                });
-                messages.push(ChatMessage::tool(pending.id.clone(), format!("Error: {POLICY_CHANGED_DURING_HOOK}")));
+                end_call(ctx.core, ctx.session_id, &pending.id, &tools::ToolOutcome::err(POLICY_CHANGED_DURING_HOOK), messages);
             }
             return false;
         }
@@ -206,12 +203,9 @@ pub(crate) async fn execute_readonly_batch(
                 PermissionDecision::Deny { reason } => Some(tools::ToolOutcome::err(reason)),
                 // Ask is excluded from batching (see batchable_call); if it
                 // still lands here outside auto, refuse the batch call.
-                PermissionDecision::Ask if ctx.core.approval_mode_canonical(ctx.canonical_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
-                    ok: false,
-                    output: "permission rule requires approval; re-run outside a concurrent batch"
-                        .into(),
-                    diff: None, ..Default::default()
-                }),
+                PermissionDecision::Ask if ctx.core.approval_mode_canonical(ctx.canonical_root) != ApprovalMode::Auto => Some(
+                    tools::ToolOutcome::err("permission rule requires approval; re-run outside a concurrent batch"),
+                ),
                 // Allow/Default: readonly batch tools are non-mutating.
                 PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
             },
@@ -223,14 +217,8 @@ pub(crate) async fn execute_readonly_batch(
         let auto = ctx.core.approval_mode_canonical(ctx.canonical_root) == ApprovalMode::Auto;
         let block = block.or_else(|| {
             if auto { return None; }
-            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
-                |source| tools::ToolOutcome {
-                    ok: false,
-                    output: declined_message(Some(&source)),
-                    diff: None,
-                    ..Default::default()
-                },
-            )
+            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name)
+                .map(|source| tools::ToolOutcome::err(declined_message(Some(&source))))
         });
         unasked.push(auto && block.is_none());
         blocked.push(block);
@@ -268,12 +256,7 @@ pub(crate) async fn execute_readonly_batch(
                     if core.approval_mode_canonical(canonical_root) != ApprovalMode::Auto
                         && unapproved_capability(&registry, data_dir, &root, &name).is_some()
                     {
-                        let refused = tools::ToolOutcome {
-                            ok: false,
-                            output: MODE_LEFT_AUTO_BEFORE_START.into(),
-                            ..Default::default()
-                        };
-                        return (refused, false);
+                        return (tools::ToolOutcome::err(MODE_LEFT_AUTO_BEFORE_START), false);
                     }
                 }
                 (registry.execute(&name, &args, data_dir, &root, caps, cancel).await, true)

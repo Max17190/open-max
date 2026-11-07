@@ -735,30 +735,14 @@ impl ChangeWatch {
 }
 
 /// Which external tools currently lack an approval covering their exact
-/// bytes (manifest + bound code). Diffed after every mutating call so a
-/// script edit - which moves no extension fingerprint and so earns no
-/// refreeze receipt - is still announced the moment it revokes an approval.
-fn unapproved_tool_map(
-    registry: &Registry,
-    data_dir: &Path,
-    project_root: &Path,
-) -> std::collections::HashMap<String, Option<String>> {
-    registry
-        .tools
-        .iter()
-        .filter(|s| matches!(s.kind, crate::registry::ToolKind::External(_)))
-        .map(|s| {
-            let state = unapproved_capability(registry, data_dir, project_root, &s.name).map(|u| u.path);
-            (s.name.clone(), state)
-        })
-        .collect()
-}
-
-/// `unapproved_tool_map` outside auto, and empty under it: auto runs every
-/// external tool without content approval, so there is no revocation to
-/// announce, and the map costs a read of the chain per external tool on
-/// every mutating call. A diff across a mode switch starts from empty and
-/// so announces nothing; the next call's card (or its absence) is accurate.
+/// bytes (manifest + bound code): each one's name, with its manifest's path
+/// while it does. Diffed after every mutating call so a script edit - which
+/// moves no extension fingerprint and so earns no refreeze receipt - is still
+/// announced the moment it revokes an approval. Empty under auto: auto runs
+/// every external tool without content approval, so there is no revocation
+/// to announce, and the map costs a read of the chain per external tool on
+/// every mutating call. A diff across a mode switch starts from empty and so
+/// announces nothing; the next call's card (or its absence) is accurate.
 fn approval_state(
     core: &Core,
     registry: &Registry,
@@ -768,5 +752,13 @@ fn approval_state(
     if core.approval_mode_canonical(canonical_root) == ApprovalMode::Auto {
         return std::collections::HashMap::new();
     }
-    unapproved_tool_map(registry, &core.data_dir, project_root)
+    registry
+        .tools
+        .iter()
+        .filter(|s| matches!(s.kind, crate::registry::ToolKind::External(_)))
+        .map(|s| {
+            let state = unapproved_capability(registry, &core.data_dir, project_root, &s.name).map(|u| u.path);
+            (s.name.clone(), state)
+        })
+        .collect()
 }

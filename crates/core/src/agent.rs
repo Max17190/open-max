@@ -138,6 +138,16 @@ pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &t
     messages.push(ChatMessage::tool(call_id, tool_message_content(outcome)));
 }
 
+/// What a call the user cancelled answers, on the wire and to the model.
+const USER_CANCELLED: &str = "The user cancelled this turn.";
+
+/// End a started call the user cancelled. Its reply carries no "Error:"
+/// prefix: nothing failed, and the turn stops here.
+fn end_cancelled(core: &Core, session_id: &str, call_id: &str, messages: &mut Vec<ChatMessage>) {
+    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: false, output: USER_CANCELLED.into() });
+    messages.push(ChatMessage::tool(call_id, USER_CANCELLED));
+}
+
 /// Turn-local accumulators the dispatcher fills and turn end flushes: ledger
 /// usage feeds `--spec usage`, memory accesses feed the activation log.
 #[derive(Default)]
@@ -184,6 +194,31 @@ pub(crate) fn count_usage(
     }
 }
 
+/// Claim `session_id` in a trusted project for a turn or a compaction, and
+/// return the claim's cancel token. `running` is the outer lock for every
+/// piece of turn state: claiming the session and publishing its token (and,
+/// for a turn, opening its steer queue) under one hold is what makes "a
+/// running session always has a live token" true, so work is always
+/// cancellable and nothing can start into a half-claimed session. `before`
+/// names the work in the refusal an untrusted project gets.
+fn claim_session(core: &Arc<Core>, session_id: &str, project_root: &Path, before: &str, steers: bool) -> Result<Arc<CancelToken>, String> {
+    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
+        return Err(format!("project {} is not trusted; establish trust before {before}", project_root.display()));
+    }
+    let cancelled = Arc::new(CancelToken::default());
+    let mut running = core.running.lock().unwrap();
+    if running.contains(session_id) {
+        return Err("the agent is already working in this session".into());
+    }
+    sessions::attach(core, session_id)?;
+    core.cancel_flags.lock().unwrap().insert(session_id.to_string(), cancelled.clone());
+    if steers {
+        core.steers.lock().unwrap().insert(session_id.to_string(), Vec::new());
+    }
+    running.insert(session_id.to_string());
+    Ok(cancelled)
+}
+
 /// Kick off one agent turn in a session. Errors if that session is already running.
 pub fn start_turn(
     core: Arc<Core>,
@@ -191,31 +226,7 @@ pub fn start_turn(
     project_root: PathBuf,
     user_text: String,
 ) -> Result<(), String> {
-    if !crate::trust::is_trusted(&core.data_dir, &project_root)? {
-        return Err(format!(
-            "project {} is not trusted; establish trust before starting a turn",
-            project_root.display()
-        ));
-    }
-    let cancelled = Arc::new(CancelToken::default());
-    {
-        // `running` is the outer lock for both pieces of turn state. Claiming
-        // the session and publishing its cancel token under one hold is what
-        // makes "a running session always has a live token" true, so a turn
-        // can never be started into a state where cancel does nothing.
-        let mut running = core.running.lock().unwrap();
-        if running.contains(&session_id) {
-            return Err("the agent is already working in this session".into());
-        }
-        sessions::attach(&core, &session_id)?;
-        core.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), cancelled.clone());
-        core.steers.lock().unwrap().insert(session_id.clone(), Vec::new());
-        running.insert(session_id.clone());
-    }
-
+    let cancelled = claim_session(&core, &session_id, &project_root, "starting a turn", true)?;
     let settings = core.settings.lock().unwrap().clone();
     // Title is set after user_prompt_submit accepts the text (see run_loop).
     // Titling here would fail-open secret/PII gates into the session index.
@@ -247,9 +258,7 @@ where
         let stop_reason = match tokio::spawn(turn).await {
             Ok(reason) => reason,
             Err(join) => {
-                let detail = if join.is_cancelled() {
-                    "the turn task was dropped".to_string()
-                } else { panic_detail(join.into_panic()) };
+                let detail = join_failure(join, "turn");
                 core.send_agent(&session_id, AgentEvent::Error {
                     message: format!("the turn ended unexpectedly: {detail}"),
                 });
@@ -327,8 +336,13 @@ async fn accept_steers(
     true
 }
 
-/// Recover the message a panic carried, for the error event that replaces it.
-fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
+/// Why a guarded `what` task ended without its result, for the error event
+/// that replaces it: the message its panic carried, or that it was dropped.
+fn join_failure(join: tokio::task::JoinError, what: &str) -> String {
+    if join.is_cancelled() {
+        return format!("the {what} task was dropped");
+    }
+    let payload = join.into_panic();
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return (*s).to_string();
     }
@@ -361,28 +375,7 @@ pub fn compact_session(
     session_id: &str,
     project_root: &Path,
 ) -> Result<(), String> {
-    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
-        return Err(format!(
-            "project {} is not trusted; establish trust before compacting",
-            project_root.display()
-        ));
-    }
-    let cancelled = Arc::new(CancelToken::default());
-    {
-        // Same claim discipline as start_turn: session and cancel token under
-        // one hold, so a running compaction is always cancellable and a turn
-        // can never start into a half-claimed session.
-        let mut running = core.running.lock().unwrap();
-        if running.contains(session_id) {
-            return Err("the agent is already working in this session".into());
-        }
-        sessions::attach(core, session_id)?;
-        core.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), cancelled.clone());
-        running.insert(session_id.to_string());
-    }
+    let cancelled = claim_session(core, session_id, project_root, "compacting", false)?;
     let core = core.clone();
     let session_id = session_id.to_string();
     let project_root = project_root.to_path_buf();
@@ -401,11 +394,7 @@ pub fn compact_session(
         let outcome = match work.await {
             Ok(outcome) => outcome,
             Err(join) => {
-                let detail = if join.is_cancelled() {
-                    "the compaction task was dropped".to_string()
-                } else {
-                    panic_detail(join.into_panic())
-                };
+                let detail = join_failure(join, "compaction");
                 Err(format!("compaction ended unexpectedly: {detail}"))
             }
         };
@@ -1165,8 +1154,7 @@ async fn run_loop(
                 if name.is_empty() {
                     let msg = "tool call has an empty function name; use a known tool name from the schema";
                     core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: String::new(), args: Value::Null });
-                    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                    guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                    end_call(core, session_id, &call.id, &tools::ToolOutcome::err(msg), guard.messages());
                     continue;
                 }
                 let args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -1191,8 +1179,7 @@ async fn run_loop(
                         };
                         let msg = format!("{cause} Arguments sent: {sent}");
                         core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
-                        core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
-                        guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                        end_call(core, session_id, &call.id, &tools::ToolOutcome::err(msg), guard.messages());
                         continue;
                     }
                 };
@@ -1227,15 +1214,7 @@ async fn run_loop(
                         // pushed here keeps the transcript pairing visible in
                         // the same place instead of leaning on the post-loop
                         // orphan stubs.
-                        core.send_agent(session_id, AgentEvent::ToolEnd {
-                            call_id: call.id.clone(),
-                            ok: false,
-                            output: "The user cancelled this turn.".into(),
-                        });
-                        guard.messages().push(ChatMessage::tool(
-                            call.id.clone(),
-                            "The user cancelled this turn.",
-                        ));
+                        end_cancelled(core, session_id, &call.id, guard.messages());
                         stop_reason = "cancelled".into();
                         break 'turns;
                     }
@@ -1258,19 +1237,11 @@ async fn run_loop(
                     .flatten();
                 let mut executed = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
-                    (tools::ToolOutcome {
-                        ok: false,
-                        output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
-                        diff: None, ..Default::default()
-                    }, false)
+                    (tools::ToolOutcome::err("This session is read-only; mutating tools are disabled. Explain what you would do instead."), false)
                 } else if approval_mode == ApprovalMode::Readonly
                     && (unapproved_source.is_some() || force_ask)
                 {
-                    (tools::ToolOutcome {
-                        ok: false,
-                        output: "This session is read-only; calls requiring approval are disabled.".into(),
-                        ..Default::default()
-                    }, false)
+                    (tools::ToolOutcome::err("This session is read-only; calls requiring approval are disabled."), false)
                 } else if approval_mode == ApprovalMode::Ask
                     && (unapproved_source.is_some() || (!force_allow && (force_ask || registry.is_mutating(name))))
                 {
@@ -1284,11 +1255,7 @@ async fn run_loop(
                     core.refresh_saved_approval_modes();
                     match answer {
                         ApprovalOutcome::Approved if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Readonly => {
-                            (tools::ToolOutcome {
-                                ok: false,
-                                output: "This session is now read-only; the pending action was not executed.".into(),
-                                ..Default::default()
-                            }, false)
+                            (tools::ToolOutcome::err("This session is now read-only; the pending action was not executed."), false)
                         }
                         ApprovalOutcome::Approved => {
                             let source = source.filter(|_| core.approval_mode_canonical(&canonical_root) != ApprovalMode::Auto);
@@ -1384,26 +1351,12 @@ async fn run_loop(
                             }
                             (outcome, false)
                         }
-                        ApprovalOutcome::Declined => (tools::ToolOutcome {
-                            ok: false,
-                            output: match source {
-                                Some(source) if agent_spawned() => {
-                                    nested_session_declined_message(source)
-                                }
-                                _ => declined_message(source),
-                            },
-                            diff: None, ..Default::default()
-                        }, false),
-                        ApprovalOutcome::TimedOut => (tools::ToolOutcome {
-                            ok: false,
-                            output: APPROVAL_TIMEOUT_MESSAGE.into(),
-                            diff: None, ..Default::default()
-                        }, false),
-                        ApprovalOutcome::Cancelled => (tools::ToolOutcome {
-                            ok: false,
-                            output: "The user cancelled this turn.".into(),
-                            diff: None, ..Default::default()
-                        }, true),
+                        ApprovalOutcome::Declined => (tools::ToolOutcome::err(match source {
+                            Some(source) if agent_spawned() => nested_session_declined_message(source),
+                            _ => declined_message(source),
+                        }), false),
+                        ApprovalOutcome::TimedOut => (tools::ToolOutcome::err(APPROVAL_TIMEOUT_MESSAGE), false),
+                        ApprovalOutcome::Cancelled => (tools::ToolOutcome::err(USER_CANCELLED), true),
                     }
                 } else {
                     executed = true;
@@ -1416,12 +1369,7 @@ async fn run_loop(
                 };
 
                 if turn_cancelled {
-                    core.send_agent(session_id, AgentEvent::ToolEnd {
-                        call_id: call.id.clone(),
-                        ok: false,
-                        output: "The user cancelled this turn.".into(),
-                    });
-                    guard.messages().push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
+                    end_cancelled(core, session_id, &call.id, guard.messages());
                     stop_reason = "cancelled".into();
                     break 'turns;
                 }
@@ -1521,7 +1469,7 @@ async fn run_loop(
     // before tools ran), or a truncated response whose calls were refused.
     // Stub the orphans so resume templates stay well-formed.
     let unanswered_note = if stop_reason == "cancelled" || cancelled.is_cancelled() {
-        Some("The user cancelled this turn.")
+        Some(USER_CANCELLED)
     } else if stop_reason == TRUNCATED {
         Some("The provider stream ended before this call could run; it was not executed.")
     } else {
