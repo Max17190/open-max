@@ -605,10 +605,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // The agent loop hands its read-only batches and its after-mutation receipts to files of their own and
-    // merges its duplicated refusals, session claims and closings: 15 lines fewer, every approval and trust
-    // decision and the frozen prompt unchanged.
-    const BASELINE: usize = 44_463;
+    // The trailing note follows the history as a developer message on Responses instead of ending its last
+    // message, which drops the folding: 7 lines fewer, the trust dispatcher and the frozen prompt unchanged.
+    const BASELINE: usize = 44_456;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

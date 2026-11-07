@@ -11,16 +11,8 @@ pub(super) fn serialize(
 ) -> Result<Vec<u8>, String> {
     let origin = client.origin();
     let mut input = Vec::new();
-    let last = messages.len().saturating_sub(1);
-    let fold_note = messages.last().is_some_and(|m| m.role == "user" || m.role == "tool");
-    for (index, m) in messages.iter().enumerate() {
-        let mut content = m.content.clone().unwrap_or_default();
-        if index == last && fold_note {
-            if let Some(note) = note {
-                content.push_str(NOTE_SEPARATOR);
-                content.push_str(note);
-            }
-        }
+    for m in messages {
+        let content = m.content.as_deref().unwrap_or_default();
         if m.role == "assistant" && m.reasoning_origin.as_deref() == Some(&origin) {
             if let Some(raw) = &m.reasoning_details {
                 let items: Vec<Value> =
@@ -45,10 +37,11 @@ pub(super) fn serialize(
             }
         }
     }
-    if !fold_note {
-        if let Some(note) = note {
-            input.push(json!({"role":"user","content":note}));
-        }
+    // The note is a developer message after the history: a prompt cache that
+    // ends its entry at the newest user message or tool output then holds no
+    // note byte, so the next request, which drops the note, reads it back.
+    if let Some(note) = note {
+        input.push(json!({"role":"developer","content":note}));
     }
     let schemas: Vec<Value> = serde_json::from_str(tools).map_err(|_| "invalid frozen tools")?;
     let mut functions = Vec::new();
@@ -482,25 +475,22 @@ mod tests {
     }
 
     #[test]
-    fn notes_stay_at_the_transcript_tail_and_complex_tool_schemas_keep_their_shape() {
+    fn notes_follow_the_transcript_as_a_developer_message_and_complex_tool_schemas_keep_their_shape() {
         let client = ChatClient::new("http://127.0.0.1".into(), None, "fixture".into(), None, 64);
-        for (last, key, folded) in [
-            (ChatMessage::user("task"), "content", true),
-            (ChatMessage::tool("call-1", "result"), "output", true),
-            (ChatMessage::assistant(Some("answer".into()), None), "content", false),
+        // A prompt cache that ends its entry at the newest user message or
+        // tool output holds the stored text alone, as the next request sends it.
+        for (last, key) in [
+            (ChatMessage::user("task"), "content"),
+            (ChatMessage::tool("call-1", "result"), "output"),
+            (ChatMessage::assistant(Some("answer".into()), None), "content"),
         ] {
             let messages = [ChatMessage::system("rules"), last.clone()];
             let body: Value = serde_json::from_slice(&serialize(&client, &messages, Some("live note"), "[]").unwrap()).unwrap();
             assert_eq!(body["input"][0]["content"], "rules");
             let input = body["input"].as_array().unwrap();
-            if folded {
-                assert_eq!(input.len(), 2);
-                assert_eq!(input[1][key], format!("{}{NOTE_SEPARATOR}live note", last.content.unwrap()));
-            } else {
-                assert_eq!(input.len(), 3);
-                assert_eq!(input[1]["content"], "answer");
-                assert_eq!(input[2], json!({"role":"user","content":"live note"}));
-            }
+            assert_eq!(input.len(), 3);
+            assert_eq!(input[1][key], last.content.unwrap());
+            assert_eq!(input[2], json!({"role":"developer","content":"live note"}));
         }
         for parameters in [
             json!({"type":"object","properties":{"value":{"type":"string"}},"required":[],"additionalProperties":false}),

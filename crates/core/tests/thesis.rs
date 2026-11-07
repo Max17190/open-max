@@ -501,9 +501,25 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// 195,365 prompt tokens) on Chat Completions, 85.51% (168,222 of 196,730) on
 /// Responses and 84.34% (70,531 of 83,630) on native Messages. A byte count,
 /// so it holds in debug and release alike.
+///
+/// Where a provider's cache ends its entries at message or block boundaries
+/// rather than at any byte, the Responses and native Messages twins also
+/// print what its documented rule reads back, the share it bills as cached.
+/// On Responses that is OpenAI's implicit caching on GPT-5.6 and later: an
+/// entry ends at a request's latest user message or tool output, so the
+/// trailing note, a developer message after them, is in none. On native
+/// Messages it is Anthropic's: an entry ends at each block a request marks
+/// with `cache_control`, which the client does not send yet, so that share
+/// reports 0.00% until it does. An entry holds at least 1,024 tokens. Where a
+/// ratchet holds the billed share, every request but the two the compaction
+/// makes reads back the entry the request before it wrote, when that one was
+/// long enough to write one, and the share holds the 75% target and its
+/// ratchet, set as above; README.md states it. With the note at the end of
+/// the last message, the Responses share was 0.00%; measured when its ratchet
+/// was set, 84.74% (166,870 of 196,910 prompt tokens).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0).await;
+    cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0, None).await;
 }
 
 /// The same session over the Responses API, whose `input` carries the
@@ -511,14 +527,14 @@ async fn a_session_prompt_is_75_percent_cacheable() {
 /// in the order sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_responses_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case("a_responses_session_prompt_is_75_percent_cacheable", WireApi::Responses, 85.0).await;
+    cacheable_share_case("a_responses_session_prompt_is_75_percent_cacheable", WireApi::Responses, 85.0, Some(84.2)).await;
 }
 
 /// The same session over native Messages, whose prompt cache covers `tools`,
 /// then `system`, then `messages`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_messages_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case("a_messages_session_prompt_is_75_percent_cacheable", WireApi::Anthropic, 83.8).await;
+    cacheable_share_case("a_messages_session_prompt_is_75_percent_cacheable", WireApi::Anthropic, 83.8, None).await;
 }
 
 /// One scripted reply of the cacheable-prefix gate's session.
@@ -561,14 +577,90 @@ fn scripted_reply(wire: WireApi, n: usize, reply: &Reply, thought: &str) -> serd
     }
 }
 
+/// A native Messages cache marker as a body carries it, ahead of its block's
+/// other keys or after them. It is no content: the cache matches the prefix
+/// without it.
+const MARKS: [&str; 2] = [r#""cache_control":{"type":"ephemeral"},"#, r#","cache_control":{"type":"ephemeral"}"#];
+
+/// The fewest tokens a cache entry holds: 1,024 on OpenAI's GPT-5.6 and
+/// later, and on the Anthropic models that set that minimum.
+const MIN_CACHED_TOKENS: usize = 1024;
+
 /// One request's prompt as a prefix cache sees it: the raw wire bytes of the
 /// parts the provider renders, in the order it renders them.
 struct Prompt {
     parts: Vec<String>,
+    /// The parts in one string.
+    text: String,
     /// Where its frozen prefix, the tools and the system prompt, ends.
     frozen: usize,
     /// Where its trailing note starts, if it carries one.
     note: Option<usize>,
+    /// Where the provider's cache writes this request's entries, of at least
+    /// `MIN_CACHED_TOKENS`, and where it looks for an earlier request's, by
+    /// its documented rule: none on Chat Completions, whose servers cache a
+    /// byte prefix in fixed blocks.
+    writes: Vec<usize>,
+    lookups: Vec<usize>,
+}
+
+/// The end of each element of `array`, a JSON array sliced from `base`, as
+/// an offset into `base`.
+fn element_ends<'a>(base: &str, array: &'a str) -> Vec<(usize, &'a str)> {
+    let elements: Vec<&RawValue> = serde_json::from_str(array).unwrap();
+    elements.iter().map(|e| (e.get().as_ptr() as usize - base.as_ptr() as usize + e.get().len(), e.get())).collect()
+}
+
+/// OpenAI's implicit caching on GPT-5.6 and later (its prompt caching guide):
+/// a request writes an entry through its latest eligible message (a user
+/// message, or the last of a run of tool outputs) and through its opening
+/// developer messages, and looks for one at those two ends and at the 20
+/// eligible ends before its latest. A developer message after the opening
+/// is no eligible end. `input` is the request's `input` array.
+fn implicit_breakpoints(input: &str) -> (Vec<usize>, Vec<usize>) {
+    let items = element_ends(input, input);
+    let kinds: Vec<serde_json::Value> = items.iter().map(|(_, item)| serde_json::from_str(item).unwrap()).collect();
+    let output = |i: usize| kinds.get(i).is_some_and(|item| item["type"] == "function_call_output");
+    let opening = kinds.iter().take_while(|item| item["role"] == "developer").count().checked_sub(1).map(|i| items[i].0);
+    let eligible: Vec<usize> =
+        (0..items.len()).filter(|&i| kinds[i]["role"] == "user" || output(i) && !output(i + 1)).map(|i| items[i].0).collect();
+    let writes = opening.into_iter().chain(eligible.last().copied()).collect();
+    (writes, eligible.iter().rev().take(21).copied().chain(opening).collect())
+}
+
+/// Anthropic's prompt caching on native Messages: a request writes an entry
+/// through each block it marks, and each mark looks for one at the ends of
+/// the 20 blocks that end at it. Its tools, system blocks and content blocks
+/// are blocks; offsets are into the prompt without its marks. `body` is the
+/// request as sent.
+fn marked_breakpoints(body: &str) -> (Vec<usize>, Vec<usize>) {
+    let fields = serde_json::from_str::<BTreeMap<String, &RawValue>>(body).unwrap();
+    let (mut blocks, mut base) = (Vec::new(), 0);
+    for key in ["tools", "system", "messages"] {
+        let Some(part) = fields.get(key).map(|part| part.get()) else { continue };
+        let units: Vec<(usize, &str)> = if key == "messages" {
+            element_ends(part, part)
+                .into_iter()
+                .flat_map(|(_, message)| {
+                    let content = serde_json::from_str::<BTreeMap<String, &RawValue>>(message).unwrap()["content"].get();
+                    element_ends(part, content)
+                })
+                .collect()
+        } else {
+            element_ends(part, part)
+        };
+        let marked = |block: &str| serde_json::from_str::<serde_json::Value>(block).unwrap().get("cache_control").is_some();
+        blocks.extend(units.into_iter().map(|(end, block)| (base + end, marked(block))));
+        base += part.len();
+    }
+    let mut marks = 0;
+    let ends: Vec<usize> = blocks.iter().map(|&(end, marked)| {
+        marks += usize::from(marked);
+        end - marks * MARKS[0].len()
+    }).collect();
+    let marked: Vec<usize> = (0..blocks.len()).filter(|&i| blocks[i].1).collect();
+    let lookups = marked.iter().flat_map(|&k| ends[k.saturating_sub(19)..=k].to_vec()).collect();
+    (marked.iter().map(|&k| ends[k]).collect(), lookups)
 }
 
 impl Prompt {
@@ -577,9 +669,10 @@ impl Prompt {
     /// message, then the history); a Responses `input` holds all three, its
     /// opening run of developer items being the instructions and the tools;
     /// native Messages caches `tools`, then `system`, then `messages`
-    /// (Anthropic's).
-    fn of(wire: WireApi, body: &str) -> Self {
-        let fields = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(body).unwrap();
+    /// (Anthropic's), and its breakpoint marks are left out.
+    fn of(wire: WireApi, marked: &str) -> Self {
+        let body = MARKS.iter().fold(marked.to_string(), |body, mark| body.replace(mark, ""));
+        let fields = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(&body).unwrap();
         let raw = |key: &str| fields.get(key).map_or(String::new(), |value| value.get().to_string());
         let items = |raw: &str| serde_json::from_str::<Vec<Box<RawValue>>>(raw).unwrap();
         let (parts, frozen) = match wire {
@@ -603,13 +696,33 @@ impl Prompt {
                 (vec![tools, system, messages], frozen)
             }
         };
-        let marker = serde_json::to_string(&note_marker()).unwrap();
-        let note = parts.concat().find(&marker[1..marker.len() - 1]);
-        Self { parts, frozen, note }
+        let (writes, lookups) = match wire {
+            WireApi::ChatCompletions => (Vec::new(), Vec::new()),
+            WireApi::Responses => implicit_breakpoints(&parts[0]),
+            WireApi::Anthropic => marked_breakpoints(marked),
+        };
+        // The note starts at its separator where it ends a message, and at
+        // the comma ahead of the item or block that holds it alone.
+        let text = parts.concat();
+        let header = serde_json::to_string(NOTE_HEADER).unwrap();
+        let note = text.find(&header[1..header.len() - 1]).map(|at| match text[..at].strip_suffix(r"\n\n") {
+            Some(ahead) => ahead.len(),
+            None => text[..at].rfind('{').map(|open| open - usize::from(text[..open].ends_with(','))).unwrap(),
+        });
+        let writes = writes.into_iter().filter(|&at| estimate_tokens(at) >= MIN_CACHED_TOKENS).collect();
+        Self { parts, text, frozen, note, writes, lookups }
     }
 
     fn len(&self) -> usize {
-        self.parts.iter().map(String::len).sum()
+        self.text.len()
+    }
+
+    /// The bytes of it the provider's cache serves by its rule: the longest
+    /// prefix ending where it looks for an entry that an earlier request
+    /// wrote through the same bytes.
+    fn billed(&self, earlier: &[Prompt]) -> usize {
+        let written = |at: usize| earlier.iter().any(|e| e.writes.contains(&at) && e.text.get(..at) == Some(&self.text[..at]));
+        self.lookups.iter().copied().filter(|&at| written(at)).max().unwrap_or(0)
     }
 
     /// The bytes it shares with `earlier` from its first: each part the two
@@ -628,13 +741,79 @@ impl Prompt {
     /// What a request that only appends to this one repeats of it: every
     /// byte ahead of its trailing note, or ahead of the brackets closing it.
     fn stable(&self) -> usize {
-        self.note.unwrap_or_else(|| self.parts.concat().trim_end_matches([']', '}']).len())
+        self.note.unwrap_or_else(|| self.text.trim_end_matches([']', '}']).len())
     }
 }
 
+/// The two cache rules the cacheable-prefix twins print, held to requests
+/// built by hand, since the session's own requests cannot reach every case
+/// (native Messages marks no block yet, and no session request is 20 tool
+/// outputs past the entry it reads). A later request reads back an earlier
+/// request's entry through the same bytes, at least `MIN_CACHED_TOKENS` of
+/// them: on native Messages from a marked block, its marker before or after
+/// the block's other keys, up to 19 blocks after the entry's, and on
+/// Responses at its latest user message or tool output, up to 20 such ends
+/// after the entry's. Past either lookback, after one changed byte, or under
+/// the minimum, it reads back nothing.
+#[test]
+fn the_cache_rules_read_back_an_entry_only_through_the_same_bytes_within_their_lookback() {
+    use serde_json::json;
+    let long = "x".repeat(4 * MIN_CACHED_TOKENS + 64);
+    let changed = format!("y{}", &long[1..]);
+
+    // Native Messages: the entry ends at the first block, read from a marker
+    // `gap` blocks on.
+    let text = |text: &str| json!({ "type": "text", "text": text });
+    let marked = |text: &str| json!({ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } });
+    let messages = |blocks: Vec<serde_json::Value>| {
+        Prompt::of(
+            WireApi::Anthropic,
+            &json!({ "system": [{ "type": "text", "text": "rules" }], "messages": [{ "role": "user", "content": blocks }] })
+                .to_string(),
+        )
+    };
+    let first = messages(vec![marked(&long)]);
+    assert_eq!(first.writes.len(), 1, "the marked block writes one entry: {:?}", first.writes);
+    let after = format!(
+        r#"{{"messages":[{{"content":[{{"text":"{long}","type":"text","cache_control":{{"type":"ephemeral"}}}}],"role":"user"}}],"system":[{{"text":"rules","type":"text"}}]}}"#
+    );
+    assert_eq!(Prompt::of(WireApi::Anthropic, &after).writes, first.writes, "a marker after the block's keys ends the same entry");
+    let later = |opening: &str, gap: usize| {
+        let mut blocks = vec![text(opening)];
+        blocks.extend((1..gap).map(|i| text(&format!("block {i}"))));
+        blocks.push(marked("tail"));
+        messages(blocks).billed(std::slice::from_ref(&first))
+    };
+    assert_eq!(later(&long, 1), first.writes[0], "the block after the entry's reads it back");
+    assert_eq!(later(&long, 19), first.writes[0], "19 blocks on, the lookback still reaches it");
+    assert_eq!(later(&long, 20), 0, "20 blocks on, the lookback no longer reaches it");
+    assert_eq!(later(&changed, 1), 0, "a changed byte reads back nothing");
+    assert!(messages(vec![marked("short")]).writes.is_empty(), "an entry under the minimum is not written");
+
+    // Responses: the entry ends at the user message, read from the latest of
+    // `outputs` tool outputs after it.
+    let responses = |prompt: &str, outputs: usize| {
+        let mut input = vec![json!({ "role": "developer", "content": "rules" }), json!({ "role": "user", "content": prompt })];
+        for i in 0..outputs {
+            input.push(json!({ "type": "function_call", "call_id": format!("c{i}"), "name": "read_file", "arguments": "{}" }));
+            input.push(json!({ "type": "function_call_output", "call_id": format!("c{i}"), "output": "out" }));
+        }
+        input.push(json!({ "role": "developer", "content": "note" }));
+        Prompt::of(WireApi::Responses, &json!({ "input": input }).to_string())
+    };
+    let first = responses(&long, 0);
+    assert_eq!(first.writes.len(), 1, "the user message writes one entry past the minimum: {:?}", first.writes);
+    let read = |prompt: &str, outputs: usize| responses(prompt, outputs).billed(std::slice::from_ref(&first));
+    assert_eq!(read(&long, 1), first.writes[0], "the next tool output reads it back, the note after it aside");
+    assert_eq!(read(&long, 20), first.writes[0], "20 ends on, the lookback still reaches it");
+    assert_eq!(read(&long, 21), 0, "21 ends on, the lookback no longer reaches it");
+    assert_eq!(read(&changed, 1), 0, "a changed byte reads back nothing");
+}
+
 /// The session of the cacheable-prefix gate `gate` over `wire`, held to
-/// `ratchet` percent.
-async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64) {
+/// `ratchet` percent, and its billed share, where a rule is modeled, to
+/// `billed_ratchet`.
+async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ratchet: Option<f64>) {
     use serde_json::json;
     const TARGET_PERCENT: f64 = 75.0;
     // The index of the compaction's summary request, the 20th; the one after
@@ -741,6 +920,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64) {
     let prompts: Vec<Prompt> = bodies.iter().map(|body| Prompt::of(wire, body)).collect();
     let cacheable: Vec<usize> =
         (0..prompts.len()).map(|i| (0..i).map(|j| prompts[i].shared(&prompts[j])).max().unwrap_or(0)).collect();
+    let billed: Vec<usize> = (0..prompts.len()).map(|i| prompts[i].billed(&prompts[..i])).collect();
     let rewritten = SUMMARY + 1;
     let per_request = || {
         prompts
@@ -749,12 +929,15 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64) {
             .map(|(i, prompt)| {
                 let after = i.checked_sub(1).map_or(0, |before| prompt.shared(&prompts[before]));
                 format!(
-                    "request {}: {} of {} bytes cacheable, {after} shared with the one before, frozen {}, stable {}",
+                    "request {}: {} of {} bytes cacheable, {after} shared with the one before, frozen {}, stable {}, \
+                     billed {} (writes {:?})",
                     i + 1,
                     cacheable[i],
                     prompt.len(),
                     prompt.frozen,
-                    prompt.stable()
+                    prompt.stable(),
+                    billed[i],
+                    prompt.writes
                 )
             })
             .collect::<Vec<_>>()
@@ -808,7 +991,38 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64) {
     assert!(share >= ratchet, "the cacheable share {share:.2}% fell under its {ratchet:.1}% ratchet:\n{}", per_request());
     assert!(share >= TARGET_PERCENT, "the cacheable share {share:.2}% is under the {TARGET_PERCENT}% target");
     let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
-    for claim in [format!("{ratchet:.1}% ({name})"), format!("drives one {}-request session", prompts.len())] {
+    let mut claims = vec![format!("{ratchet:.1}% ({name})"), format!("drives one {}-request session", prompts.len())];
+    // A modeled rule's share reports until a ratchet holds it.
+    let billed_share = 100.0 * tokens(&billed) as f64 / sent as f64;
+    if wire != WireApi::ChatCompletions {
+        println!(
+            "MEASURE {gate} billed {billed_share:.2}% ({name}) = {} of {sent} prompt tokens ({} bytes) read back by the \
+             provider's rule; {}, target {TARGET_PERCENT}%",
+            tokens(&billed),
+            billed.iter().sum::<usize>(),
+            billed_ratchet.map_or("no ratchet yet".to_string(), |ratchet| format!("ratchet {ratchet:.1}%")),
+        );
+    }
+    if let Some(billed_ratchet) = billed_ratchet {
+        // Where a provider's rule ends entries at message or block
+        // boundaries, every request but the two the compaction makes reads
+        // back the entry the request before it, when long enough to cache,
+        // wrote through its history.
+        let unread: Vec<usize> = (1..prompts.len())
+            .filter(|&i| i != SUMMARY && i != rewritten && estimate_tokens(prompts[i - 1].len()) >= MIN_CACHED_TOKENS)
+            .filter(|&i| prompts[i - 1].writes.iter().max().is_none_or(|&w| billed[i] < w))
+            .map(|i| i + 1)
+            .collect();
+        assert!(unread.is_empty(), "requests {unread:?} read back no entry the request before them wrote:\n{}", per_request());
+        assert!(
+            billed_share >= billed_ratchet,
+            "the billed share {billed_share:.2}% fell under its {billed_ratchet:.1}% ratchet:\n{}",
+            per_request()
+        );
+        assert!(billed_share >= TARGET_PERCENT, "the billed share {billed_share:.2}% is under the {TARGET_PERCENT}% target");
+        claims.push(format!("{billed_ratchet:.1}% billed ({name})"));
+    }
+    for claim in claims {
         assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
     }
     let _ = std::fs::remove_dir_all(&dir);
