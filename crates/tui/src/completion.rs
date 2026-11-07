@@ -544,6 +544,18 @@ mod tests {
         assert!(text.contains("… 94 more"), "{text}");
     }
 
+    /// One match over the cap: the selection keeps exactly the cap, the
+    /// best ranked, and the total still counts the one it dropped.
+    #[test]
+    fn one_match_over_the_cap_drops_only_the_lowest_ranked() {
+        let keep = MAX_VISIBLE * 3;
+        let files = Arc::new((0..=keep).map(|i| format!("src/file_{i:03}.rs")).collect::<Vec<_>>());
+        let (items, total) = file_items(&files, "file");
+        assert_eq!(total, keep + 1);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, files[..keep]);
+    }
+
     #[test]
     fn fuzzy_rejects_non_subsequences() {
         assert!(fuzzy_score("src/app.rs", "zzz").is_none());

@@ -2026,8 +2026,9 @@ mod tests {
     }
 
     /// In a draft taller than the box the view follows the cursor, keeping it
-    /// on the top row going up and on the bottom row going down; a cursor the
-    /// wheel left out of view is drawn on the box's bottom edge.
+    /// on the top row going up and on the bottom row going down, also when
+    /// the cursor stops short of the last row; a cursor the wheel left out of
+    /// view is drawn on the box's bottom edge.
     #[test]
     fn the_view_follows_the_cursor_through_a_tall_draft() {
         let mut composer = Composer::blank();
@@ -2043,7 +2044,15 @@ mod tests {
             press(&mut composer, KeyCode::Up);
         }
         assert_eq!(view(&mut composer), ("… line 3".to_string(), 0));
-        for _ in 0..6 {
+        for _ in 0..3 {
+            press(&mut composer, KeyCode::Up);
+        }
+        assert_eq!(view(&mut composer), ("❯ line 0".to_string(), 0));
+        for _ in 0..7 {
+            press(&mut composer, KeyCode::Down);
+        }
+        assert_eq!(view(&mut composer), ("… line 2".to_string(), 5));
+        for _ in 0..2 {
             press(&mut composer, KeyCode::Down);
         }
         assert_eq!(view(&mut composer), ("… line 4".to_string(), 5));
