@@ -39,7 +39,8 @@ const MAX_RESULTS: usize = 200;
 /// tokens) into a 16k window in one call, and every one of those tokens is
 /// re-prefilled on every subsequent turn. 50 is plenty to act on.
 const MAX_GREP_RESULTS: usize = 50;
-const MAX_OUTPUT_BYTES: usize = 30_000;
+/// Every later request re-sends a result; past this the spill log keeps the rest.
+const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 /// bash keeps one part in this many of each stream's share from its start,
 /// and the rest from its end. A compiler prints the error that broke the
 /// build first and the errors that follow from it after, so a tail alone
@@ -3847,7 +3848,7 @@ mod tests {
     #[tokio::test]
     async fn a_line_past_the_redraw_limit_reaches_the_model_whole() {
         let root = temp_project();
-        let cmd = "head -c 20000 /dev/zero | tr '\\0' L; printf '\\rmid\\rnext\\nshort\\rlast\\n'";
+        let cmd = "head -c 12000 /dev/zero | tr '\\0' L; printf '\\rmid\\rnext\\nshort\\rlast\\n'";
         let out = bash_tool(
             &root.join("data"),
             &root,
@@ -3858,7 +3859,7 @@ mod tests {
         .await;
         assert!(out.ok, "{}", out.output);
         assert!(!out.process_truncated);
-        assert_eq!(out.output, format!("{}\rnext\nlast\n", "L".repeat(20_000)));
+        assert_eq!(out.output, format!("{}\rnext\nlast\n", "L".repeat(12_000)));
         let _ = std::fs::remove_dir_all(root);
     }
 

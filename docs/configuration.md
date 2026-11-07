@@ -164,7 +164,7 @@ override the first two.
   The Anthropic compatibility endpoint ignores effort, so explicit selections
   there are refused before saving or sending. See the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
   and [compatibility documentation](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk).
-- `max_output_bytes` (default 30000, floor 1000): per tool-result cap; bash
+- `max_output_bytes` (default 16384, floor 1000): per tool-result cap; bash
   keeps up to a quarter of each stream's share of the cap from its start and
   the rest from its end, marks the cut with the bytes it dropped, and spills
   up to 16 MiB of each stream to `~/.openmax/cmd-logs`. Before any of that,
