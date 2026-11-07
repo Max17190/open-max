@@ -12,12 +12,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::agent::{append_and_emit_note, ensure_session_hydrated, land_deferred_resume_edits, unapproved_capability};
+use crate::agent::unapproved_capability;
 use crate::config::ApprovalMode;
+use crate::notes::append_and_emit_note;
 use crate::prompt::{session_context, trailing_note, PromptBreakdown};
 use crate::registry::{ExtensionSnapshot, Registry};
 use crate::sessions;
 use crate::state::{Core, SessionData};
+use crate::transcript::{ensure_session_hydrated, land_deferred_resume_edits};
 use crate::types::{AgentEvent, ChatMessage};
 
 /// Re-freeze a live session's registry, system prompt, and tools array from
@@ -555,7 +557,7 @@ pub(crate) async fn refresh_note_after_memory_write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{build_session_data, take_messages};
+    use crate::transcript::{build_session_data, take_messages};
     use crate::tools;
     use serde_json::Value;
     use std::time::Duration;
