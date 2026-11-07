@@ -240,8 +240,10 @@ for a bare script name on PATH). In `auto`:
   blocking `turn_end` gate is in that state the model is also told at turn
   start, once per session for each distinct failure.
 
-Manifest changes activate at the next turn; a script runs from disk, so an
-edit to it applies at the hook's next run.
+Manifest changes activate at the next turn, with no reload: in print mode
+(`openmax -p`) the run's next `-p` prompt, and any run started later, including
+one the agent starts now from `bash` with `openmax -p`. A script runs from
+disk, so an edit to it applies at the hook's next run.
 
 In `ask` and `readonly`, unknown keys in a hook file are rejected, and a hook file that a human approved
 and that no longer parses blocks every tool call until it is fixed or removed
