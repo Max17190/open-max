@@ -540,7 +540,7 @@ impl ChatClient {
         let url = reqwest::Url::parse(self.base_url.trim()).ok()?;
         let (_, name) = crate::providers::CACHE_ROUTES.iter().find(|(host, _)| url.host_str() == Some(*host))?;
         let own = self.headers.iter().any(|(header, _)| header.eq_ignore_ascii_case(name));
-        Some((*name, self.cache_key.as_deref()?)).filter(|_| self.wire_api == crate::providers::WireApi::ChatCompletions && !own)
+        (self.wire_api == crate::providers::WireApi::ChatCompletions && !own).then_some((*name, self.cache_key.as_deref()?))
     }
 
     fn endpoint(&self) -> String {

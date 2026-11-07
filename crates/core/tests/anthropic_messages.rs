@@ -267,7 +267,7 @@ async fn native_requests_mark_the_shared_prefix_and_the_tail_the_next_request_re
         let reply=native.stream_chat_with_note(&history,Some("live note"),&tools(),Arc::new(CancelToken::default()),|_|{}).await.unwrap();
         let mut assistant=ChatMessage::assistant(Some(reply.content),Some(reply.tool_calls));
         assistant.reasoning_details=reply.reasoning_details;assistant.reasoning_origin=Some(native.origin());
-        history.push(assistant);history.push(ChatMessage::tool("call-fixture",&format!("result {step}")));
+        history.push(assistant);history.push(ChatMessage::tool("call-fixture",format!("result {step}")));
     }
     let bodies:Vec<Value>=server.await.unwrap().iter().map(|r| serde_json::from_slice(&r.body).unwrap()).collect();
     let unmarked=|mut messages:Value| {
