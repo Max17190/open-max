@@ -583,7 +583,7 @@ fn scripted_reply(wire: WireApi, n: usize, reply: &Reply, thought: &str) -> serd
 const MARKS: [&str; 2] = [r#""cache_control":{"type":"ephemeral"},"#, r#","cache_control":{"type":"ephemeral"}"#];
 
 /// The fewest tokens a cache entry holds: 1,024 on OpenAI's GPT-5.6 and
-/// later, and on the Claude models that set that minimum.
+/// later, and on the Anthropic models that set that minimum.
 const MIN_CACHED_TOKENS: usize = 1024;
 
 /// One request's prompt as a prefix cache sees it: the raw wire bytes of the
