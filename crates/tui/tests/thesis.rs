@@ -390,9 +390,11 @@ fn the_suite_fails_over_its_time_budget() {
         let failed = scope.spawn(|| {
             run_gate("failed", &["1"], &[("broken", Some(failing.as_path())), ("crashing", Some(crashing.as_path()))], None)
         });
-        // A twenty-fifth of the target is a fifth of a second, so the bound
-        // is three fifths.
-        let stopped = scope.spawn(|| run_gate("stopped", &["0.04"], &[("hanging", Some(hanging.as_path()))], None));
+        // A tenth of the target is half a second, so the bound is a second
+        // and a half: room for the hanging binary to start what it leaves
+        // running on a busy runner, beside a dozen other gates, before the
+        // bound stops it, while its `sleep 5` still outlasts the bound.
+        let stopped = scope.spawn(|| run_gate("stopped", &["0.1"], &[("hanging", Some(hanging.as_path()))], None));
         let usage = scope.spawn(|| run_gate("usage", &["twice"], &[], None));
         let leftover = scope.spawn(|| run_gate("leftover", &["1", "--runs", "2"], &[], None));
         let retried = scope.spawn(|| run_gate("retried", &["1"], &[("contended", Some(contended.as_path()))], None));
@@ -470,12 +472,12 @@ fn the_suite_fails_over_its_time_budget() {
     );
     assert!(!outlived, "the processes the stopped binary left running outlived it: {stopped_report}");
     let unfinished: Vec<&str> = stopped_report
-        .split_once("hanging (test) failed beside the other binaries and passed alone:\nstill running at 0.60s, when it was stopped:\n")
+        .split_once("hanging (test) failed beside the other binaries and passed alone:\nstill running at 1.50s, when it was stopped:\n")
         .map_or(Vec::new(), |(_, rest)| rest.lines().take_while(|line| !line.is_empty() && !line.contains(' ')).collect());
     assert!(
-        stopped_report.contains("hanging (test) FAILED (stopped at 0.60s)")
+        stopped_report.contains("hanging (test) FAILED (stopped at 1.50s)")
             && unfinished == ["hangs"]
-            && stopped_report.contains("over its 0.20s budget"),
+            && stopped_report.contains("over its 0.50s budget"),
         "the binary stopped at its bound, or the test it had not finished, is not named: {stopped_report}"
     );
     assert_eq!(usage, Some(2), "a multiplier that is not a number is not refused");
@@ -828,10 +830,13 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
 /// release, on each of the test job's runners, every test target named
 /// thesis* in the workspace (cargo matches the glob against target names,
 /// and a file under a crate's tests/ is a target named after its stem), the
-/// binary's `thesis_frames` module and the first-frame test's baseline
-/// binary, an example that `cargo test` leaves unbuilt once a target is
-/// selected. Its gate step runs exactly every thesis test but the ones its
-/// runner reports, and fails the pull request when one fails. The Reports
+/// binary's `thesis_frames` module where the runner gates one of its tests,
+/// and the first-frame test's baseline binary, an example that `cargo test`
+/// leaves unbuilt once a target is selected. The module's tests run from
+/// the binary's own unit-test harness, one more whole-program LTO unit, so
+/// a runner whose matrix entry reports them all (`frames: false`) neither
+/// builds nor runs it. Its gate step runs exactly every thesis test but the
+/// ones its runner reports, and fails the pull request when one fails. The Reports
 /// workflow runs the reported tests instead, every night, in release and one
 /// at a time on the same runners, from a matrix that lists the same tests;
 /// it copies each `MEASURE` line to its job's summary and fails only when a
@@ -909,20 +914,23 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
         "a thesis test that hangs holds the gate step until the job's own limit: {:?}",
         steps[gates]
     );
-    // What each runner reports, from its matrix entry: the thesis job's,
-    // whose gate step skips them, and the Reports workflow's, which runs them.
-    let reported_by = |job: &[String]| {
-        let mut reported = Vec::new();
+    // A key of each runner's matrix entry, one value each: `reported`, what
+    // the runner reports, in the thesis job, whose gate step skips them, and
+    // in the Reports workflow, which runs them; and the thesis job's
+    // `frames`.
+    let by_runner = |job: &[String], key: &str| {
+        let mut values = Vec::new();
         let mut entry = None;
         for line in job.iter().map(|line| line.trim().to_string()) {
             if let Some(runner) = line.strip_prefix("- os: ") {
                 entry = Some(runner.to_string());
-            } else if let Some(tests) = line.strip_prefix("reported: ") {
-                reported.push((entry.take().expect("a reported list outside a runner's entry"), tests.to_string()));
+            } else if let Some(value) = line.strip_prefix(&format!("{key}: ")) {
+                values.push((entry.take().unwrap_or_else(|| panic!("a `{key}` outside a runner's entry")), value.to_string()));
             }
         }
-        reported
+        values
     };
+    let reported_by = |job: &[String]| by_runner(job, "reported");
     let reports_job = workflow_job("reports.yml", "thesis-reports");
     assert_eq!(runners(&reports_job), runners(&job), "the thesis reports do not run on the thesis job's runners");
     assert_eq!(
@@ -940,6 +948,31 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
         ],
         "the thesis tests a runner reports instead of gating changed"
     );
+    // The binary's thesis_frames tests run from its own unit-test harness,
+    // one more whole-program LTO unit of the release build: a runner builds
+    // and runs it exactly when it gates one of them, a test built there, not
+    // ignored and not reported. So no runner skips one it gates, nor builds
+    // a harness its gate step would run no test from.
+    let frames_tests = tests_in(&std::fs::read_to_string(repo().join("crates/tui/src/app/thesis_frames.rs")).unwrap());
+    assert!(!frames_tests.is_empty(), "the binary's thesis_frames module holds no test");
+    let gates_frames = |os: &str, reported: &str| {
+        let platform = if os.starts_with("macos") { "macos" } else { "linux" };
+        frames_tests.iter().any(|(name, attributes)| {
+            let cfgs = attributes.iter().filter_map(|line| line.strip_prefix("#[cfg(")?.strip_suffix(")]"));
+            !reported.split(' ').any(|test| test == name.as_str())
+                && !attributes.iter().any(|line| line.starts_with("#[ignore"))
+                && cfgs.into_iter().all(|cfg| cfg_holds(cfg, platform))
+        })
+    };
+    let frames: Vec<(&str, bool)> = reported.iter().map(|(os, tests)| (*os, gates_frames(os, tests))).collect();
+    let listed = by_runner(&job, "frames");
+    let listed: Vec<(&str, bool)> = listed
+        .iter()
+        .map(|(os, value)| {
+            (os.as_str(), value.parse::<bool>().unwrap_or_else(|_| panic!("{os}'s `frames` is not true or false: {value}")))
+        })
+        .collect();
+    assert_eq!(listed, frames, "a runner's `frames` is not whether it gates a test of the binary's thesis_frames module");
     let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
     assert!(
         readme.contains(
@@ -968,7 +1001,9 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
         [
             "skip=; for test in ${{ matrix.reported }}; do skip=\"$skip --skip $test\"; done",
             "cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1",
+            "if ${{ matrix.frames }}; then",
             "cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1",
+            "fi",
             "exit ${failed:-0}",
         ],
         "the gate step does not run, in release, one at a time and printing what it measured, every thesis test but the \
@@ -1012,7 +1047,7 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
     assert_eq!(
         commands(build),
         [
-            "cargo test --release --workspace --locked --no-run --test 'thesis*' --bin openmax",
+            "cargo test --release --workspace --locked --no-run --test 'thesis*' ${{ matrix.frames && '--bin openmax' || '' }}",
             "cargo build --release --workspace --locked --example startup_baseline",
         ],
         "the thesis job does not build in release what its steps run and the baseline binary"
