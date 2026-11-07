@@ -416,6 +416,17 @@ mod tests {
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
+    /// A lone star opens italic even when a double star comes later on the
+    /// line: bold needs two stars where it starts.
+    #[test]
+    fn italic_before_bold_keeps_both() {
+        let spans = inline("*a* and **b**", Style::default());
+        let texts: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(texts, ["a", " and ", "b"]);
+        assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
+
     /// Either spelling of a rule draws one, and a paragraph keeps the indent
     /// it was written with and gains none it was not.
     #[test]
