@@ -3,6 +3,7 @@
 //! single event channel.
 
 pub mod agent;
+mod batch;
 pub mod chatgpt;
 pub mod client;
 mod compaction;

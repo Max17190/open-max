@@ -1,7 +1,7 @@
 //! The turn loop: everything that happens between a user message and the
 //! model falling silent.
 //!
-//! Two entry points, `start_turn` and `reload_session`, in front of ~2.3k
+//! Two entry points, `start_turn` and `reload_session`, in front of ~1.7k
 //! lines. That ratio is deliberate: a turn has a fixed order that callers must
 //! not be able to reach into and reorder.
 //!
@@ -30,19 +30,19 @@
 //!    that ran out or a human who stopped the turn, and neither is a hook's to
 //!    overrule.
 //!
-//! Read-only calls batch and run concurrently; anything mutating serializes.
+//! Read-only calls batch and run concurrently (`batch.rs`); anything mutating
+//! serializes.
 //! Refreezing mid-turn is allowed between iterations but never inside one, so
 //! the schemas a model was shown are the schemas its reply is checked against.
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use crate::batch::{batchable_call, execute_readonly_batch, parallel_tool_limit, partition_concurrent_runs, ReadonlyBatchCtx};
 use crate::client::{ChatClient, CompletionResult, TRUNCATED};
 use crate::compaction::{
     achievable_target, compact_messages, compaction_trigger, observed_prompt_ratio, over_budget_error_context, refusal_ratio,
@@ -53,8 +53,8 @@ use crate::config::{ApprovalMode, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
-    novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget, settings_drift_note,
-    RepeatTracker, NOTICE_JOINER, PERMISSION_NOTE_PREFIX_CLEAN, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
+    narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
+    settings_drift_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
 };
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 pub use crate::refreeze::reload_session;
@@ -68,11 +68,7 @@ use crate::transcript::{complete_pending_tool_replies, ensure_session_hydrated, 
 use crate::types::{AgentEvent, ChatMessage, ToolCall};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
-const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
-/// A batched call that auto admitted without asking about its content, still
-/// waiting for a slot when the mode left auto. Not declined: requested
-/// again, it takes the serial path, which raises the card.
-const MODE_LEFT_AUTO_BEFORE_START: &str = "Execution mode changed before this call started; this call was not executed. Request it again under the current mode.";
+pub(crate) const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
 /// Outcome of a mutating-tool approval prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApprovalOutcome {
@@ -80,79 +76,6 @@ enum ApprovalOutcome {
     Declined,
     Cancelled,
     TimedOut,
-}
-
-/// One consecutive run of tool calls: `[start, end)`; `concurrent` when length >= 2
-/// and every call in the run is batchable.
-struct ToolCallSegment {
-    start: usize,
-    end: usize,
-    concurrent: bool,
-}
-
-/// Split tool calls into maximal consecutive runs that are eligible for concurrent
-/// read-only execution. Single-call runs and non-batchable calls use the serial path.
-fn partition_concurrent_runs<F>(tool_calls: &[ToolCall], is_batchable: F) -> Vec<ToolCallSegment>
-where
-    F: Fn(&ToolCall) -> bool,
-{
-    let mut segments = Vec::new();
-    let mut i = 0;
-    while i < tool_calls.len() {
-        if !is_batchable(&tool_calls[i]) {
-            segments.push(ToolCallSegment { start: i, end: i + 1, concurrent: false });
-            i += 1;
-            continue;
-        }
-        let start = i;
-        i += 1;
-        while i < tool_calls.len() && is_batchable(&tool_calls[i]) {
-            i += 1;
-        }
-        let end = i;
-        segments.push(ToolCallSegment {
-            start,
-            end,
-            concurrent: end - start >= 2,
-        });
-    }
-    segments
-}
-
-fn batchable_call(
-    call: &ToolCall,
-    registry: &Registry,
-    permissions: &TurnPermissions,
-    mode: ApprovalMode,
-    data_dir: &Path,
-    project_root: &Path,
-) -> bool {
-    let name = call.function.name.as_str();
-    if name.is_empty() {
-        return false;
-    }
-    let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments) else {
-        return false;
-    };
-    if registry.get(name).is_none() || registry.is_mutating(name) {
-        return false;
-    }
-    // Ask needs the serial path so the approval UI runs; Deny stays serial for
-    // a single clear error path (batch still handles Deny if it ever arrives).
-    match permissions.evaluate(name, &args) {
-        PermissionDecision::Ask | PermissionDecision::Deny { .. } => return false,
-        PermissionDecision::Allow | PermissionDecision::Default => {}
-    }
-    // Same principle as Ask: outside auto, a tool whose content no human has
-    // approved needs the serial path, which is where the prompt and its
-    // actionable event live. This check is load-bearing rather than
-    // defensive - batching selects for external non-mutating tools, which is
-    // exactly the population the content gate exists to catch, so an
-    // unapproved tool called twice in one message would otherwise run
-    // unattended. Auto runs it unattended anyway, so there the question is
-    // never asked and the ledger never read. Kept last because it is the only
-    // check that touches disk, and built-ins return before the ledger is read.
-    mode == ApprovalMode::Auto || unapproved_capability(registry, data_dir, project_root, name).is_none()
 }
 
 /// Whether the provider stopped this reply at the output cap. Most servers say
@@ -207,7 +130,7 @@ fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
 /// End a call: its diff and `ToolEnd` on the wire, then its reply in the
 /// transcript. Approval timeouts are not model errors, so that reply carries
 /// no "Error:" prefix, which would push small models into pointless retries.
-fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &tools::ToolOutcome, messages: &mut Vec<ChatMessage>) {
+pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &tools::ToolOutcome, messages: &mut Vec<ChatMessage>) {
     if let Some(d) = &outcome.diff {
         let (path, diff, added, removed) = (d.path.clone(), d.diff.clone(), d.added, d.removed);
         core.send_agent(session_id, AgentEvent::Diff { call_id: call_id.into(), path, diff, added, removed });
@@ -216,27 +139,20 @@ fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &tools::ToolO
     messages.push(ChatMessage::tool(call_id, tool_message_content(outcome)));
 }
 
-struct ReadonlyBatchCtx<'a> {
-    core: &'a Arc<Core>,
-    session_id: &'a str,
-    registry: &'a Arc<Registry>,
-    project_root: &'a Path,
-    /// `project_root` as the turn resolved it once, so a mode read walks no path.
-    canonical_root: &'a Path,
-    caps: tools::OutputCaps,
-    cancelled: Arc<CancelToken>,
-    hooks: &'a mut Hooks,
-    permissions: &'a mut TurnPermissions,
-    policy_mode: &'a mut ApprovalMode,
-    parallelism: usize,
-    /// Turn-local usage accumulator, flushed once at turn end.
-    usage: &'a std::sync::Mutex<TurnUsage>,
+/// What a call the user cancelled answers, on the wire and to the model.
+const USER_CANCELLED: &str = "The user cancelled this turn.";
+
+/// End a started call the user cancelled. Its reply carries no "Error:"
+/// prefix: nothing failed, and the turn stops here.
+fn end_cancelled(core: &Core, session_id: &str, call_id: &str, messages: &mut Vec<ChatMessage>) {
+    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: false, output: USER_CANCELLED.into() });
+    messages.push(ChatMessage::tool(call_id, USER_CANCELLED));
 }
 
 /// Turn-local accumulators the dispatcher fills and turn end flushes: ledger
 /// usage feeds `--spec usage`, memory accesses feed the activation log.
 #[derive(Default)]
-struct TurnUsage {
+pub(crate) struct TurnUsage {
     ledger: crate::ledger::UsageDelta,
     memory: Vec<(String, String)>,
 }
@@ -244,7 +160,7 @@ struct TurnUsage {
 /// Count what only the dispatcher sees: external tool calls (by outcome),
 /// skill-body reads (a read_file whose path is a frozen skill's SKILL.md),
 /// and memory accesses (file tools on `.openmax/memory/*.md`).
-fn count_usage(
+pub(crate) fn count_usage(
     usage: &std::sync::Mutex<TurnUsage>,
     registry: &Registry,
     project_root: &Path,
@@ -279,189 +195,29 @@ fn count_usage(
     }
 }
 
-fn parallel_tool_limit(configured: usize) -> usize {
-    configured.clamp(1, 32)
-}
-
-async fn collect_bounded<F>(futures: Vec<F>, parallelism: usize) -> Vec<F::Output>
-where
-    F: Future,
-{
-    let mut completed: Vec<_> = futures_util::stream::iter(
-        futures
-            .into_iter()
-            .enumerate()
-            .map(|(index, future)| async move { (index, future.await) }),
-    )
-    .buffer_unordered(parallel_tool_limit(parallelism))
-    .collect()
-    .await;
-    completed.sort_unstable_by_key(|(index, _)| *index);
-    completed.into_iter().map(|(_, output)| output).collect()
-}
-
-/// Returns true when the user cancelled mid-gate so the turn should stop
-/// before more tools run (matches the serial tool path).
-async fn execute_readonly_batch(
-    ctx: &mut ReadonlyBatchCtx<'_>,
-    calls: &[ToolCall],
-    messages: &mut Vec<ChatMessage>,
-) -> bool {
-    let mut parsed: Vec<Value> = Vec::with_capacity(calls.len());
-    let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
-    // Per call: admitted by auto without the content question being asked.
-    let mut unasked: Vec<bool> = Vec::with_capacity(calls.len());
-    for call in calls {
-        let name = call.function.name.as_str();
-        // batchable_call already validated the JSON; Null (impossible) would
-        // just surface as a missing-argument tool error.
-        let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-        parsed.push(args.clone());
-        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
-            call_id: call.id.clone(),
-            name: name.into(),
-            args: args.clone(),
-        });
-        // hooks pre → permissions → content gate. approval_mode is skipped
-        // because batchable_call excludes mutating tools.
-        let mode = *ctx.policy_mode;
-        let pre = ctx.hooks.pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled).await;
-        refresh_approval_policy_canonical(ctx.core, ctx.session_id, ctx.project_root, ctx.canonical_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
-        if mode != *ctx.policy_mode && !matches!(pre, PreToolResult::Cancelled) {
-            // Nothing has executed. Refuse the batch without replaying hooks,
-            // which may have side effects even for a non-mutating tool.
-            for (index, pending) in calls.iter().enumerate() {
-                if index >= parsed.len() {
-                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
-                        call_id: pending.id.clone(),
-                        name: pending.function.name.clone(),
-                        args: serde_json::from_str(&pending.function.arguments).unwrap_or(Value::Null),
-                    });
-                }
-                ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                    call_id: pending.id.clone(), ok: false, output: POLICY_CHANGED_DURING_HOOK.into(),
-                });
-                messages.push(ChatMessage::tool(pending.id.clone(), format!("Error: {POLICY_CHANGED_DURING_HOOK}")));
-            }
-            return false;
-        }
-        let block = match pre {
-            PreToolResult::Block { reason } => Some(tools::ToolOutcome::err(reason)),
-            PreToolResult::Cancelled => {
-                // Close every ToolStart already emitted in this batch so the
-                // transcript stays well-formed, then stop the turn.
-                for prior in calls.iter().take(parsed.len()) {
-                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                        call_id: prior.id.clone(),
-                        ok: false,
-                        output: "cancelled".to_string(),
-                    });
-                    messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
-                }
-                return true;
-            }
-            PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
-                PermissionDecision::Deny { reason } => Some(tools::ToolOutcome::err(reason)),
-                // Ask is excluded from batching (see batchable_call); if it
-                // still lands here outside auto, refuse the batch call.
-                PermissionDecision::Ask if ctx.core.approval_mode_canonical(ctx.canonical_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
-                    ok: false,
-                    output: "permission rule requires approval; re-run outside a concurrent batch"
-                        .into(),
-                    diff: None, ..Default::default()
-                }),
-                // Allow/Default: readonly batch tools are non-mutating.
-                PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
-            },
-        };
-        // Unapproved content is excluded from batching (see batchable_call) so
-        // the serial path can prompt; if one still lands here, block rather
-        // than run unapproved host code outside auto. The sites share one
-        // predicate, so the batch path cannot drift away from the gate again.
-        let auto = ctx.core.approval_mode_canonical(ctx.canonical_root) == ApprovalMode::Auto;
-        let block = block.or_else(|| {
-            if auto { return None; }
-            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
-                |source| tools::ToolOutcome {
-                    ok: false,
-                    output: declined_message(Some(&source)),
-                    diff: None,
-                    ..Default::default()
-                },
-            )
-        });
-        unasked.push(auto && block.is_none());
-        blocked.push(block);
+/// Claim `session_id` in a trusted project for a turn or a compaction, and
+/// return the claim's cancel token. `running` is the outer lock for every
+/// piece of turn state: claiming the session and publishing its token (and,
+/// for a turn, opening its steer queue) under one hold is what makes "a
+/// running session always has a live token" true, so work is always
+/// cancellable and nothing can start into a half-claimed session. `before`
+/// names the work in the refusal an untrusted project gets.
+fn claim_session(core: &Arc<Core>, session_id: &str, project_root: &Path, before: &str, steers: bool) -> Result<Arc<CancelToken>, String> {
+    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
+        return Err(format!("project {} is not trusted; establish trust before {before}", project_root.display()));
     }
-
-    let core = ctx.core;
-    let data_dir = &ctx.core.data_dir;
-    let canonical_root = ctx.canonical_root;
-    let futures: Vec<_> = calls
-        .iter()
-        .zip(parsed.iter())
-        .zip(blocked.iter())
-        .zip(unasked.iter().copied())
-        .map(|(((call, args), block), unasked)| {
-            let name = call.function.name.clone();
-            let args = args.clone();
-            let root = ctx.project_root.to_path_buf();
-            let cancel = ctx.cancelled.clone();
-            let registry = ctx.registry.clone();
-            let caps = ctx.caps;
-            let blocked_outcome = block.clone();
-            async move {
-                if let Some(outcome) = blocked_outcome {
-                    return (outcome, false);
-                }
-                // Calls past the parallelism cap start only as earlier ones
-                // end, long after admission. Auto admitted this one without
-                // asking about its content; if the mode has left auto since,
-                // here or in another frontend that saved it, unapproved
-                // content must not start on that admission, or it runs under
-                // ask with no card. Read the store back, then the live mode,
-                // as the serial path does right before each call.
-                if unasked {
-                    core.refresh_saved_approval_modes();
-                    if core.approval_mode_canonical(canonical_root) != ApprovalMode::Auto
-                        && unapproved_capability(&registry, data_dir, &root, &name).is_some()
-                    {
-                        let refused = tools::ToolOutcome {
-                            ok: false,
-                            output: MODE_LEFT_AUTO_BEFORE_START.into(),
-                            ..Default::default()
-                        };
-                        return (refused, false);
-                    }
-                }
-                (registry.execute(&name, &args, data_dir, &root, caps, cancel).await, true)
-            }
-        })
-        .collect();
-    let outcomes = collect_bounded(futures, ctx.parallelism).await;
-
-    for (i, call) in calls.iter().enumerate() {
-        let (outcome, ran) = &outcomes[i];
-        let name = call.function.name.as_str();
-        let args = &parsed[i];
-        if *ran {
-            count_usage(ctx.usage, ctx.registry, ctx.project_root, name, args, outcome.ok);
-            let failures = ctx
-                .hooks
-                .post_tool_use(
-                    ctx.session_id,
-                    name,
-                    args,
-                    ctx.project_root,
-                    outcome,
-                    &ctx.cancelled,
-                )
-                .await;
-            report_hook_failures(ctx.core, ctx.session_id, failures);
-        }
-        end_call(ctx.core, ctx.session_id, &call.id, outcome, messages);
+    let cancelled = Arc::new(CancelToken::default());
+    let mut running = core.running.lock().unwrap();
+    if running.contains(session_id) {
+        return Err("the agent is already working in this session".into());
     }
-    false
+    sessions::attach(core, session_id)?;
+    core.cancel_flags.lock().unwrap().insert(session_id.to_string(), cancelled.clone());
+    if steers {
+        core.steers.lock().unwrap().insert(session_id.to_string(), Vec::new());
+    }
+    running.insert(session_id.to_string());
+    Ok(cancelled)
 }
 
 /// Kick off one agent turn in a session. Errors if that session is already running.
@@ -471,31 +227,7 @@ pub fn start_turn(
     project_root: PathBuf,
     user_text: String,
 ) -> Result<(), String> {
-    if !crate::trust::is_trusted(&core.data_dir, &project_root)? {
-        return Err(format!(
-            "project {} is not trusted; establish trust before starting a turn",
-            project_root.display()
-        ));
-    }
-    let cancelled = Arc::new(CancelToken::default());
-    {
-        // `running` is the outer lock for both pieces of turn state. Claiming
-        // the session and publishing its cancel token under one hold is what
-        // makes "a running session always has a live token" true, so a turn
-        // can never be started into a state where cancel does nothing.
-        let mut running = core.running.lock().unwrap();
-        if running.contains(&session_id) {
-            return Err("the agent is already working in this session".into());
-        }
-        sessions::attach(&core, &session_id)?;
-        core.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), cancelled.clone());
-        core.steers.lock().unwrap().insert(session_id.clone(), Vec::new());
-        running.insert(session_id.clone());
-    }
-
+    let cancelled = claim_session(&core, &session_id, &project_root, "starting a turn", true)?;
     let settings = core.settings.lock().unwrap().clone();
     // Title is set after user_prompt_submit accepts the text (see run_loop).
     // Titling here would fail-open secret/PII gates into the session index.
@@ -527,9 +259,7 @@ where
         let stop_reason = match tokio::spawn(turn).await {
             Ok(reason) => reason,
             Err(join) => {
-                let detail = if join.is_cancelled() {
-                    "the turn task was dropped".to_string()
-                } else { panic_detail(join.into_panic()) };
+                let detail = join_failure(join, "turn");
                 core.send_agent(&session_id, AgentEvent::Error {
                     message: format!("the turn ended unexpectedly: {detail}"),
                 });
@@ -607,8 +337,13 @@ async fn accept_steers(
     true
 }
 
-/// Recover the message a panic carried, for the error event that replaces it.
-fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
+/// Why a guarded `what` task ended without its result, for the error event
+/// that replaces it: the message its panic carried, or that it was dropped.
+fn join_failure(join: tokio::task::JoinError, what: &str) -> String {
+    if join.is_cancelled() {
+        return format!("the {what} task was dropped");
+    }
+    let payload = join.into_panic();
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return (*s).to_string();
     }
@@ -641,28 +376,7 @@ pub fn compact_session(
     session_id: &str,
     project_root: &Path,
 ) -> Result<(), String> {
-    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
-        return Err(format!(
-            "project {} is not trusted; establish trust before compacting",
-            project_root.display()
-        ));
-    }
-    let cancelled = Arc::new(CancelToken::default());
-    {
-        // Same claim discipline as start_turn: session and cancel token under
-        // one hold, so a running compaction is always cancellable and a turn
-        // can never start into a half-claimed session.
-        let mut running = core.running.lock().unwrap();
-        if running.contains(session_id) {
-            return Err("the agent is already working in this session".into());
-        }
-        sessions::attach(core, session_id)?;
-        core.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), cancelled.clone());
-        running.insert(session_id.to_string());
-    }
+    let cancelled = claim_session(core, session_id, project_root, "compacting", false)?;
     let core = core.clone();
     let session_id = session_id.to_string();
     let project_root = project_root.to_path_buf();
@@ -681,11 +395,7 @@ pub fn compact_session(
         let outcome = match work.await {
             Ok(outcome) => outcome,
             Err(join) => {
-                let detail = if join.is_cancelled() {
-                    "the compaction task was dropped".to_string()
-                } else {
-                    panic_detail(join.into_panic())
-                };
+                let detail = join_failure(join, "compaction");
                 Err(format!("compaction ended unexpectedly: {detail}"))
             }
         };
@@ -844,7 +554,7 @@ fn reload_approval_policy(
 /// another process saved since applies from here, like a selection made in
 /// this one.
 #[allow(clippy::too_many_arguments)]
-async fn refresh_approval_policy_canonical(
+pub(crate) async fn refresh_approval_policy_canonical(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
@@ -974,13 +684,8 @@ async fn run_loop(
         insert_startup_note(core, session_id, guard.messages(), text);
     }
 
-    // The provider catalog's content identity at turn start: an agent bash
-    // edit to ~/.openmax/providers.json is otherwise silent (the file is
-    // outside the project root, so no refreeze covers it), and a malformed
-    // edit would surface turns later as an unrelated-looking resolve error.
-    let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
-    let mut hooks_seen = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
-    let mut approval_seen = approval_state(core, &registry, project_root, &canonical_root);
+    // What a mutating call can change that no refreeze covers, as the turn starts.
+    let mut changes = ChangeWatch::new(core, &registry, project_root, &canonical_root);
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
@@ -1450,8 +1155,7 @@ async fn run_loop(
                 if name.is_empty() {
                     let msg = "tool call has an empty function name; use a known tool name from the schema";
                     core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: String::new(), args: Value::Null });
-                    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                    guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                    end_call(core, session_id, &call.id, &tools::ToolOutcome::err(msg), guard.messages());
                     continue;
                 }
                 let args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -1476,8 +1180,7 @@ async fn run_loop(
                         };
                         let msg = format!("{cause} Arguments sent: {sent}");
                         core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
-                        core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
-                        guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                        end_call(core, session_id, &call.id, &tools::ToolOutcome::err(msg), guard.messages());
                         continue;
                     }
                 };
@@ -1512,15 +1215,7 @@ async fn run_loop(
                         // pushed here keeps the transcript pairing visible in
                         // the same place instead of leaning on the post-loop
                         // orphan stubs.
-                        core.send_agent(session_id, AgentEvent::ToolEnd {
-                            call_id: call.id.clone(),
-                            ok: false,
-                            output: "The user cancelled this turn.".into(),
-                        });
-                        guard.messages().push(ChatMessage::tool(
-                            call.id.clone(),
-                            "The user cancelled this turn.",
-                        ));
+                        end_cancelled(core, session_id, &call.id, guard.messages());
                         stop_reason = "cancelled".into();
                         break 'turns;
                     }
@@ -1543,19 +1238,11 @@ async fn run_loop(
                     .flatten();
                 let mut executed = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
-                    (tools::ToolOutcome {
-                        ok: false,
-                        output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
-                        diff: None, ..Default::default()
-                    }, false)
+                    (tools::ToolOutcome::err("This session is read-only; mutating tools are disabled. Explain what you would do instead."), false)
                 } else if approval_mode == ApprovalMode::Readonly
                     && (unapproved_source.is_some() || force_ask)
                 {
-                    (tools::ToolOutcome {
-                        ok: false,
-                        output: "This session is read-only; calls requiring approval are disabled.".into(),
-                        ..Default::default()
-                    }, false)
+                    (tools::ToolOutcome::err("This session is read-only; calls requiring approval are disabled."), false)
                 } else if approval_mode == ApprovalMode::Ask
                     && (unapproved_source.is_some() || (!force_allow && (force_ask || registry.is_mutating(name))))
                 {
@@ -1569,11 +1256,7 @@ async fn run_loop(
                     core.refresh_saved_approval_modes();
                     match answer {
                         ApprovalOutcome::Approved if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Readonly => {
-                            (tools::ToolOutcome {
-                                ok: false,
-                                output: "This session is now read-only; the pending action was not executed.".into(),
-                                ..Default::default()
-                            }, false)
+                            (tools::ToolOutcome::err("This session is now read-only; the pending action was not executed."), false)
                         }
                         ApprovalOutcome::Approved => {
                             let source = source.filter(|_| core.approval_mode_canonical(&canonical_root) != ApprovalMode::Auto);
@@ -1669,26 +1352,12 @@ async fn run_loop(
                             }
                             (outcome, false)
                         }
-                        ApprovalOutcome::Declined => (tools::ToolOutcome {
-                            ok: false,
-                            output: match source {
-                                Some(source) if agent_spawned() => {
-                                    nested_session_declined_message(source)
-                                }
-                                _ => declined_message(source),
-                            },
-                            diff: None, ..Default::default()
-                        }, false),
-                        ApprovalOutcome::TimedOut => (tools::ToolOutcome {
-                            ok: false,
-                            output: APPROVAL_TIMEOUT_MESSAGE.into(),
-                            diff: None, ..Default::default()
-                        }, false),
-                        ApprovalOutcome::Cancelled => (tools::ToolOutcome {
-                            ok: false,
-                            output: "The user cancelled this turn.".into(),
-                            diff: None, ..Default::default()
-                        }, true),
+                        ApprovalOutcome::Declined => (tools::ToolOutcome::err(match source {
+                            Some(source) if agent_spawned() => nested_session_declined_message(source),
+                            _ => declined_message(source),
+                        }), false),
+                        ApprovalOutcome::TimedOut => (tools::ToolOutcome::err(APPROVAL_TIMEOUT_MESSAGE), false),
+                        ApprovalOutcome::Cancelled => (tools::ToolOutcome::err(USER_CANCELLED), true),
                     }
                 } else {
                     executed = true;
@@ -1701,12 +1370,7 @@ async fn run_loop(
                 };
 
                 if turn_cancelled {
-                    core.send_agent(session_id, AgentEvent::ToolEnd {
-                        call_id: call.id.clone(),
-                        ok: false,
-                        output: "The user cancelled this turn.".into(),
-                    });
-                    guard.messages().push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
+                    end_cancelled(core, session_id, &call.id, guard.messages());
                     stop_reason = "cancelled".into();
                     break 'turns;
                 }
@@ -1762,188 +1426,8 @@ async fn run_loop(
                     // the parse reason and the turn-scoped rule.
                     let fail_closed_now = current.fail_closed_reason().map(str::to_string);
                     permissions.reload(current);
-                    if let Some(reason) = fail_closed_now {
-                        let novel = novel_policy_notices(
-                            core,
-                            session_id,
-                            vec![format!("permissions fail-closed: {reason}")],
-                        )
-                        .await;
-                        if !novel.is_empty() {
-                            // The repair carve-out returns Default for
-                            // write/edit on this file, but an earlier
-                            // snapshot this turn may have explicitly DENIED
-                            // one of them, and the most restrictive answer
-                            // wins - so the receipt must not promise a
-                            // repair tool a rule already blocks.
-                            // Probe every path spelling a repair call could
-                            // use (an `arg_regex` matches the raw path
-                            // argument): absolute, relative, and ./relative.
-                            // A tool is allowed only if NONE is denied.
-                            let abs = project_root
-                                .join(".openmax/permissions.toml")
-                                .to_string_lossy()
-                                .into_owned();
-                            let repair_denied = |tool: &str| {
-                                [
-                                    abs.as_str(),
-                                    ".openmax/permissions.toml",
-                                    "./.openmax/permissions.toml",
-                                ]
-                                .iter()
-                                .any(|p| {
-                                    matches!(
-                                        permissions
-                                            .evaluate(tool, &serde_json::json!({ "path": p })),
-                                        crate::permissions::PermissionDecision::Deny { .. }
-                                    )
-                                })
-                            };
-                            let allowed: Vec<&str> = ["write_file", "edit_file"]
-                                .into_iter()
-                                .filter(|t| !repair_denied(t))
-                                .collect();
-                            let repair_clause = if allowed.is_empty() {
-                                "a rule earlier this turn denies write_file and edit_file on \
-                                 this file too, so even the repair waits for the START OF THE \
-                                 NEXT TURN; read_file is not allowed"
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "{} on exactly this file is still allowed and takes effect \
-                                     at the START OF THE NEXT TURN, not this one; read_file is \
-                                     NOT, so rewrite it from what you intended",
-                                    allowed.join("/")
-                                )
-                            };
-                            let note = format!(
-                                "[permissions.toml is now malformed ({reason}). Every tool \
-                                 call is DENIED for the rest of THIS turn - policy snapshots \
-                                 only narrow within a turn, never widen - and your repair \
-                                 ({repair_clause}). \
-                                 openmax --check cannot run until then (bash is denied too).]"
-                            );
-                            append_and_emit_note(core, session_id, guard.messages(), &note);
-                        }
-                    }
-                    // The agent may have just written itself an allow
-                    // rule that can never fire (#180). Say so NOW, on
-                    // this call's result, with the command that lifts
-                    // it - not silently at the next surprise prompt.
-                    let novel = novel_policy_notices(core, session_id, inert).await;
-                    if !novel.is_empty() {
-                        let note =
-                            format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A providers.json edit (bash: the file is outside
-                    // the project root) gets a receipt too: what loaded,
-                    // when it applies - or that the catalog is EMPTY,
-                    // while the author can still fix it.
-                    let status = crate::providers::providers_status(&core.data_dir);
-                    if status.content_hash != providers_seen {
-                        providers_seen = status.content_hash;
-                        let note = match &status.parse_error {
-                            Some(err) => format!(
-                                "[providers.json changed but is invalid JSON: {err}. The \
-                                 provider catalog is EMPTY until this parses; any turn using \
-                                 settings.provider will fail at its start.]"
-                            ),
-                            None => format!(
-                                "[providers.json changed: {} provider(s) ({}). Endpoint \
-                                 resolution happens at turn start, so a provider or model \
-                                 switch applies from the next turn; switching this session's \
-                                 model is /model, which the user runs.]",
-                                status.count,
-                                status.names.join(", ")
-                            ),
-                        };
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A script edit revokes the approval of the tool that
-                    // runs it, but moves no fingerprint: no refreeze, no
-                    // receipt - and the model learned only when the next
-                    // call raised a card. Diff approval state per call.
-                    let approval_now = approval_state(core, &registry, project_root, &canonical_root);
-                    let mut revoked: Vec<String> = Vec::new();
-                    for (name, state) in &approval_now {
-                        if let (Some(path), Some(None)) = (state, approval_seen.get(name)) {
-                            revoked.push(format!(
-                                "{name} (openmax --approve {})",
-                                crate::doctor::shell_quote(std::path::Path::new(path))
-                            ));
-                        }
-                    }
-                    approval_seen = approval_now;
-                    if !revoked.is_empty() {
-                        revoked.sort();
-                        let note = format!(
-                            "[approval revoked: the code these tools run changed since a human \
-                             approved it, so the next call of each stops for a card: {}. Re-approve \
-                             the exact bytes, or prove them first with openmax --check --run-examples.]",
-                            revoked.join(", ")
-                        );
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A hook file written this call: hooks are outside
-                    // the extension fingerprint, so this write got no
-                    // refreeze receipt and the inertness notice would
-                    // otherwise land a whole turn later, leaving the
-                    // agent believing its gate was live for a whole turn.
-                    let hooks_now = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
-                    if hooks_now != hooks_seen {
-                        hooks_seen = hooks_now;
-                        let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(&canonical_root));
-                        let inert: Vec<String> = discovered.notices().iter().map(|f| hook_clause(f, "")).collect();
-                        // An APPROVED gate whose bytes just changed is not
-                        // inert - it fails closed and blocks every tool
-                        // call from the next turn until restored or
-                        // re-approved. Say that, not "applies next turn".
-                        let note = if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Auto {
-                            let mut note = match discovered.fail_closed_reason() {
-                                Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}"),
-                                None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.".into(),
-                            };
-                            // Named on this write, while this turn can fix
-                            // it, not at the hook's first run next turn.
-                            let unstartable = discovered.cannot_start(project_root);
-                            if !unstartable.is_empty() {
-                                if !note.ends_with('.') {
-                                    note.push('.');
-                                }
-                                note.push_str(&format!(" These cannot start as written: {}", unstartable.join(" | ")));
-                            }
-                            note + "]"
-                        } else if let Some(blocked) = discovered.fail_closed_reason() {
-                            format!(
-                                "[hook files changed. A live gate is now failing closed: \
-                                 {blocked}. From the next turn every tool call is BLOCKED \
-                                 until the file is restored to its approved bytes or a human \
-                                 re-approves it (openmax --approve <path>, at a terminal \
-                                 outside any session).]"
-                            )
-                        } else if inert.is_empty() {
-                            "[hook files changed. Hooks are discovered at turn start; \
-                             approved hooks apply from the next turn.]"
-                                .to_string()
-                        } else {
-                            format!(
-                                "[hook files changed. Not running: {}. Hooks activate only \
-                                 after a human runs openmax --approve <path> at a terminal \
-                                 outside any session; until then the guarantee is NOT in \
-                                 force - say so if asked, do not claim it.]",
-                                inert.join(" | ")
-                            )
-                        };
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A settings.json edit (bash: outside the project
-                    // root) is inert for this session and bricks the
-                    // next launch when malformed - answered on the
-                    // writing call, while it is still repairable.
-                    if let Some(note) = settings_drift_note(core) {
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
+                    narrate_permissions_reload(core, session_id, project_root, &permissions, fail_closed_now, inert, guard.messages()).await;
+                    changes.after_mutation(core, session_id, project_root, &canonical_root, &registry, guard.messages());
                 }
             }
         }
@@ -1971,7 +1455,7 @@ async fn run_loop(
         if refrozen {
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
-            approval_seen = approval_state(core, &registry, project_root, &canonical_root);
+            changes.resync_approvals(core, &registry, project_root, &canonical_root);
         } else if memory_written {
             // A memory write changes no extension byte, so no refreeze ran,
             // and the note, sent after the history as the harness's account
@@ -1986,7 +1470,7 @@ async fn run_loop(
     // before tools ran), or a truncated response whose calls were refused.
     // Stub the orphans so resume templates stay well-formed.
     let unanswered_note = if stop_reason == "cancelled" || cancelled.is_cancelled() {
-        Some("The user cancelled this turn.")
+        Some(USER_CANCELLED)
     } else if stop_reason == TRUNCATED {
         Some("The provider stream ended before this call could run; it was not executed.")
     } else {
@@ -2113,7 +1597,7 @@ pub(crate) fn unapproved_capability(
 /// gate is not a user decision, so saying "the user declined" would be false
 /// and would leave the agent with nothing to relay: name the boundary and the
 /// exact command that lifts it.
-fn declined_message(source: Option<&UnapprovedCapability>) -> String {
+pub(crate) fn declined_message(source: Option<&UnapprovedCapability>) -> String {
     match source {
         Some(source) => format!(
             "This tool's content has not been approved by a human, so the harness declined the call. \
@@ -2138,43 +1622,6 @@ fn nested_session_declined_message(source: &UnapprovedCapability) -> String {
          terminal, or make the tool's first call from a session a human is watching.",
         source.path
     )
-}
-
-/// Which external tools currently lack an approval covering their exact
-/// bytes (manifest + bound code). Diffed after every mutating call so a
-/// script edit - which moves no extension fingerprint and so earns no
-/// refreeze receipt - is still announced the moment it revokes an approval.
-fn unapproved_tool_map(
-    registry: &Registry,
-    data_dir: &Path,
-    project_root: &Path,
-) -> std::collections::HashMap<String, Option<String>> {
-    registry
-        .tools
-        .iter()
-        .filter(|s| matches!(s.kind, crate::registry::ToolKind::External(_)))
-        .map(|s| {
-            let state = unapproved_capability(registry, data_dir, project_root, &s.name).map(|u| u.path);
-            (s.name.clone(), state)
-        })
-        .collect()
-}
-
-/// `unapproved_tool_map` outside auto, and empty under it: auto runs every
-/// external tool without content approval, so there is no revocation to
-/// announce, and the map costs a read of the chain per external tool on
-/// every mutating call. A diff across a mode switch starts from empty and
-/// so announces nothing; the next call's card (or its absence) is accurate.
-fn approval_state(
-    core: &Core,
-    registry: &Registry,
-    project_root: &Path,
-    canonical_root: &Path,
-) -> std::collections::HashMap<String, Option<String>> {
-    if core.approval_mode_canonical(canonical_root) == ApprovalMode::Auto {
-        return std::collections::HashMap::new();
-    }
-    unapproved_tool_map(registry, &core.data_dir, project_root)
 }
 
 /// True when the harness itself spawned this process: every child it starts
@@ -2317,6 +1764,7 @@ fn approval_detail(args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch::{collect_bounded, MODE_LEFT_AUTO_BEFORE_START};
     use crate::client::StreamDelta;
     use crate::compaction::tests::msg;
     use crate::compaction::{
