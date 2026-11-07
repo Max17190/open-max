@@ -509,46 +509,26 @@ pub(crate) async fn narrate_permissions_reload(
     messages: &mut [ChatMessage],
 ) {
     if let Some(reason) = fail_closed_now {
-        let novel = novel_policy_notices(
-            core,
-            session_id,
-            vec![format!("permissions fail-closed: {reason}")],
-        )
-        .await;
+        let novel = novel_policy_notices(core, session_id, vec![format!("permissions fail-closed: {reason}")]).await;
         if !novel.is_empty() {
-            // The repair carve-out returns Default for
-            // write/edit on this file, but an earlier
-            // snapshot this turn may have explicitly DENIED
-            // one of them, and the most restrictive answer
-            // wins - so the receipt must not promise a
-            // repair tool a rule already blocks.
-            // Probe every path spelling a repair call could
-            // use (an `arg_regex` matches the raw path
-            // argument): absolute, relative, and ./relative.
-            // A tool is allowed only if NONE is denied.
-            let abs = project_root
-                .join(".openmax/permissions.toml")
-                .to_string_lossy()
-                .into_owned();
+            // The repair carve-out returns Default for write/edit on this
+            // file, but an earlier snapshot this turn may have explicitly
+            // DENIED one of them, and the most restrictive answer wins - so
+            // the receipt must not promise a repair tool a rule already
+            // blocks. Probe every path spelling a repair call could use (an
+            // `arg_regex` matches the raw path argument): absolute,
+            // relative, and ./relative. A tool is allowed only if NONE is
+            // denied.
+            let abs = project_root.join(".openmax/permissions.toml").to_string_lossy().into_owned();
             let repair_denied = |tool: &str| {
-                [
-                    abs.as_str(),
-                    ".openmax/permissions.toml",
-                    "./.openmax/permissions.toml",
-                ]
-                .iter()
-                .any(|p| {
+                [abs.as_str(), ".openmax/permissions.toml", "./.openmax/permissions.toml"].iter().any(|p| {
                     matches!(
-                        permissions
-                            .evaluate(tool, &serde_json::json!({ "path": p })),
+                        permissions.evaluate(tool, &serde_json::json!({ "path": p })),
                         crate::permissions::PermissionDecision::Deny { .. }
                     )
                 })
             };
-            let allowed: Vec<&str> = ["write_file", "edit_file"]
-                .into_iter()
-                .filter(|t| !repair_denied(t))
-                .collect();
+            let allowed: Vec<&str> = ["write_file", "edit_file"].into_iter().filter(|t| !repair_denied(t)).collect();
             let repair_clause = if allowed.is_empty() {
                 "a rule earlier this turn denies write_file and edit_file on \
                  this file too, so even the repair waits for the START OF THE \
@@ -572,14 +552,12 @@ pub(crate) async fn narrate_permissions_reload(
             append_and_emit_note(core, session_id, messages, &note);
         }
     }
-    // The agent may have just written itself an allow
-    // rule that can never fire (#180). Say so NOW, on
-    // this call's result, with the command that lifts
-    // it - not silently at the next surprise prompt.
+    // The agent may have just written itself an allow rule that can never
+    // fire (#180). Say so NOW, on this call's result, with the command that
+    // lifts it - not silently at the next surprise prompt.
     let novel = novel_policy_notices(core, session_id, inert).await;
     if !novel.is_empty() {
-        let note =
-            format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
+        let note = format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
         append_and_emit_note(core, session_id, messages, &note);
     }
 }
@@ -623,10 +601,9 @@ impl ChangeWatch {
         registry: &Registry,
         messages: &mut [ChatMessage],
     ) {
-        // A providers.json edit (bash: the file is outside
-        // the project root) gets a receipt too: what loaded,
-        // when it applies - or that the catalog is EMPTY,
-        // while the author can still fix it.
+        // A providers.json edit (bash: the file is outside the project root)
+        // gets a receipt too: what loaded, when it applies - or that the
+        // catalog is EMPTY, while the author can still fix it.
         let status = crate::providers::providers_status(&core.data_dir);
         if status.content_hash != self.providers {
             self.providers = status.content_hash;
@@ -647,10 +624,10 @@ impl ChangeWatch {
             };
             append_and_emit_note(core, session_id, messages, &note);
         }
-        // A script edit revokes the approval of the tool that
-        // runs it, but moves no fingerprint: no refreeze, no
-        // receipt - and the model learned only when the next
-        // call raised a card. Diff approval state per call.
+        // A script edit revokes the approval of the tool that runs it, but
+        // moves no fingerprint: no refreeze, no receipt - and the model
+        // learned only when the next call raised a card. Diff approval state
+        // per call.
         let approval_now = approval_state(core, registry, project_root, canonical_root);
         let mut revoked: Vec<String> = Vec::new();
         for (name, state) in &approval_now {
@@ -672,27 +649,26 @@ impl ChangeWatch {
             );
             append_and_emit_note(core, session_id, messages, &note);
         }
-        // A hook file written this call: hooks are outside
-        // the extension fingerprint, so this write got no
-        // refreeze receipt and the inertness notice would
-        // otherwise land a whole turn later, leaving the
-        // agent believing its gate was live for a whole turn.
+        // A hook file written this call: hooks are outside the extension
+        // fingerprint, so this write got no refreeze receipt and the
+        // inertness notice would otherwise land a whole turn later, leaving
+        // the agent believing its gate was live for a whole turn.
         let hooks_now = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
         if hooks_now != self.hooks {
             self.hooks = hooks_now;
             let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(canonical_root));
             let inert: Vec<String> = discovered.notices().iter().map(|f| hook_clause(f, "")).collect();
-            // An APPROVED gate whose bytes just changed is not
-            // inert - it fails closed and blocks every tool
-            // call from the next turn until restored or
-            // re-approved. Say that, not "applies next turn".
+            // An APPROVED gate whose bytes just changed is not inert - it
+            // fails closed and blocks every tool call from the next turn
+            // until restored or re-approved. Say that, not "applies next
+            // turn".
             let note = if core.approval_mode_canonical(canonical_root) == ApprovalMode::Auto {
                 let mut note = match discovered.fail_closed_reason() {
                     Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}"),
                     None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.".into(),
                 };
-                // Named on this write, while this turn can fix
-                // it, not at the hook's first run next turn.
+                // Named on this write, while this turn can fix it, not at
+                // the hook's first run next turn.
                 let unstartable = discovered.cannot_start(project_root);
                 if !unstartable.is_empty() {
                     if !note.ends_with('.') {
@@ -724,10 +700,9 @@ impl ChangeWatch {
             };
             append_and_emit_note(core, session_id, messages, &note);
         }
-        // A settings.json edit (bash: outside the project
-        // root) is inert for this session and bricks the
-        // next launch when malformed - answered on the
-        // writing call, while it is still repairable.
+        // A settings.json edit (bash: outside the project root) is inert for
+        // this session and bricks the next launch when malformed - answered
+        // on the writing call, while it is still repairable.
         if let Some(note) = settings_drift_note(core) {
             append_and_emit_note(core, session_id, messages, &note);
         }
