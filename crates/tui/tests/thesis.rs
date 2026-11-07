@@ -390,9 +390,11 @@ fn the_suite_fails_over_its_time_budget() {
         let failed = scope.spawn(|| {
             run_gate("failed", &["1"], &[("broken", Some(failing.as_path())), ("crashing", Some(crashing.as_path()))], None)
         });
-        // A twenty-fifth of the target is a fifth of a second, so the bound
-        // is three fifths.
-        let stopped = scope.spawn(|| run_gate("stopped", &["0.04"], &[("hanging", Some(hanging.as_path()))], None));
+        // A tenth of the target is half a second, so the bound is a second
+        // and a half: room for the hanging binary to start what it leaves
+        // running on a busy runner, beside a dozen other gates, before the
+        // bound stops it, while its `sleep 5` still outlasts the bound.
+        let stopped = scope.spawn(|| run_gate("stopped", &["0.1"], &[("hanging", Some(hanging.as_path()))], None));
         let usage = scope.spawn(|| run_gate("usage", &["twice"], &[], None));
         let leftover = scope.spawn(|| run_gate("leftover", &["1", "--runs", "2"], &[], None));
         let retried = scope.spawn(|| run_gate("retried", &["1"], &[("contended", Some(contended.as_path()))], None));
@@ -470,12 +472,12 @@ fn the_suite_fails_over_its_time_budget() {
     );
     assert!(!outlived, "the processes the stopped binary left running outlived it: {stopped_report}");
     let unfinished: Vec<&str> = stopped_report
-        .split_once("hanging (test) failed beside the other binaries and passed alone:\nstill running at 0.60s, when it was stopped:\n")
+        .split_once("hanging (test) failed beside the other binaries and passed alone:\nstill running at 1.50s, when it was stopped:\n")
         .map_or(Vec::new(), |(_, rest)| rest.lines().take_while(|line| !line.is_empty() && !line.contains(' ')).collect());
     assert!(
-        stopped_report.contains("hanging (test) FAILED (stopped at 0.60s)")
+        stopped_report.contains("hanging (test) FAILED (stopped at 1.50s)")
             && unfinished == ["hangs"]
-            && stopped_report.contains("over its 0.20s budget"),
+            && stopped_report.contains("over its 0.50s budget"),
         "the binary stopped at its bound, or the test it had not finished, is not named: {stopped_report}"
     );
     assert_eq!(usage, Some(2), "a multiplier that is not a number is not refused");
