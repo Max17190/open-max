@@ -18,16 +18,20 @@
 # other on a 4-core runner while the cores sit idle.
 #
 # The budget is 5 seconds times the multiplier, set for each CI runner from
-# its runs. CI passes a multiplier of 3 on ubuntu-latest (4 cores) and
-# a multiplier of 4 on macos-latest (3 cores, M1), where the target is
-# measured on 10 cores. The suite's processes spend about 20 CPU-seconds,
-# so on those runners the CPU work alone takes 5.0 and 6.7 seconds beside
-# the tests that wait. Their first two runs took 6.9 and 8.5 seconds on
+# its runs. CI's Suite time job gates a multiplier of 3 on ubuntu-latest
+# (4 cores), and the Reports workflow reports
+# a multiplier of 4 on macos-latest (3 cores, M1); the target is measured
+# on 10 cores. The suite's processes spend about 20 CPU-seconds, so on
+# those runners the CPU work alone takes 5.0 and 6.7 seconds beside the
+# tests that wait. Their first two runs took 6.9 and 8.5 seconds on
 # ubuntu-latest, and 13.1 and 10.4 seconds on macos-latest, where the TUI's
 # unit tests took 13.1 seconds beside the other binaries against 4.7
 # seconds run alone. A shared runner's time moved by a fifth to a quarter
-# between those two runs, so each budget is at least half again its
-# runner's slowest run.
+# between those two runs, so each budget was set at least half again its
+# runner's slowest run. Over 29 later runs ubuntu-latest took 6.0 to 12.0
+# seconds, a fifth under its budget at the slowest, and macos-latest 12.5
+# to 33.7 seconds over 32, over its budget in 19, so only ubuntu-latest
+# gates.
 #
 # Run it after `cargo test --workspace --locked` (or with `--no-run`): it
 # asks cargo for the test executables before the clock starts, which builds

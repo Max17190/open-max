@@ -20,6 +20,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
+# Every step runs under bash with pipefail (bash -eo pipefail), so a pipe
+# keeps the failure of each command in it, wherever it stands in a script,
+# quoted or not. GitHub's default shell sets no pipefail.
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -39,13 +46,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # The suite timing budget on each runner, as a multiple of the
-        # 5-second target. scripts/check-suite-time.sh gives the reasons.
-        include:
-          - os: ubuntu-latest
-            suite_time_multiplier: 3
-          - os: macos-latest
-            suite_time_multiplier: 4
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -54,8 +54,8 @@ jobs:
         with:
           toolchain: stable
 
-      # Only main saves this cache, as it saves every other here. A copy a
-      # pull request saved would serve only that pull request's later runs,
+      # Only main saves this cache, as it saves every other cache here. A copy
+      # a pull request saved would serve only that pull request's later runs,
       # and rust-cache keeps no workspace crate in it, so main's copy, which
       # every pull request reads, serves them as well unless the pull request
       # changes Cargo.lock; and it would push main's out of the repository's
@@ -93,30 +93,49 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --locked --doc
 
-      # Run the built suite with all test binaries and their thread pools at
-      # once. Linux enforces its 15-second budget. macOS keeps its 20-second
-      # measurement advisory: shared runner contention repeatedly exceeds it
-      # while functional tests pass. Failures remain visible below; the normal
-      # Test step and release thesis gates still fail the job on both runners.
-      - name: ${{ matrix.os == 'macos-latest' && 'Measure suite time (advisory)' || 'Check suite time' }}
-        id: suite_time
-        continue-on-error: ${{ matrix.os == 'macos-latest' }}
-        run: scripts/check-suite-time.sh ${{ matrix.suite_time_multiplier }}
-        timeout-minutes: 5
-
-      - name: Report macOS suite timing failure
-        if: ${{ !cancelled() && matrix.os == 'macos-latest' && steps.suite_time.outcome == 'failure' }}
-        run: |
-          echo "::warning::The advisory macOS concurrent suite measurement failed. See its log; functional tests and release thesis gates remain enforced."
-          echo "### Advisory macOS suite timing" >> "$GITHUB_STEP_SUMMARY"
-          echo "The concurrent suite measurement did not pass its unchanged 20-second budget or its stress-run checks. See the Measure suite time (advisory) log. Normal functional tests, Linux timing, and release thesis gates remain enforced separately." >> "$GITHUB_STEP_SUMMARY"
-
       # Hard gate: a change that deletes tests fails under the floor. The
       # script counts the tests the suite just built lists, against the floor
       # of the runner's platform (each compiles a few tests the other does
       # not); it gives the method and how the floors move.
       - name: Check test count
         run: scripts/check-test-count.sh
+
+  # The whole suite's wall time after compilation with every test binary run
+  # at once, each with a thread pool of its own, which the test job, running
+  # each test in a process of its own, does not show.
+  # scripts/check-suite-time.sh gives the method and the budget: 5 seconds
+  # times this runner's multiplier.
+  # It gates on ubuntu-latest alone, a job of its own so that no step of the
+  # test job runs on one of its runners only. macos-latest, 3 shared cores,
+  # ran the suite in 12.5 to 33.7 seconds over 32 runs, over its 20-second
+  # budget in 19, so the Reports workflow measures it there every night
+  # instead. The job repeats the test job's build, so it restores the cache
+  # that job saves on main and saves none of its own: the repository's cache
+  # space holds no second copy. crates/tui/tests/thesis.rs holds this wiring.
+  suite-time:
+    name: Suite time
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      # What the check runs, so it builds nothing under its timeout.
+      - name: Build the tests
+        run: cargo test --workspace --locked --no-run
+
+      - name: Check suite time
+        run: scripts/check-suite-time.sh 3
+        timeout-minutes: 5
 
   # The zero-warning baseline is only real if something checks it. It was set
   # deliberately, then drifted back to three warnings because nothing did. A
@@ -151,10 +170,11 @@ jobs:
   # profile the published binary ships with, on the test job's runners, and
   # runs them one test at a time, so no measurement runs beside another, each
   # printing what it measured: each test target named thesis* in the
-  # workspace and the binary's thesis_frames module. What each asserts is in
-  # its doc comment; the first frame is held as a ratio to a baseline
-  # binary's start, as timed from the spawn it includes the runner's own
-  # process start, which is not the harness's work.
+  # workspace, and the binary's thesis_frames module on a runner that gates
+  # one of its tests. What each asserts is in its doc comment; the first
+  # frame is held as a ratio to a baseline binary's start, as timed from the
+  # spawn it includes the runner's own process start, which is not the
+  # harness's work.
   # crates/tui/tests/thesis.rs holds this wiring.
   thesis:
     name: Thesis (${{ matrix.os }})
@@ -163,14 +183,23 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # The thesis tests a runner reports instead of gating, as it does not
-        # meet their targets with room; the reports step gives the numbers.
-        # README.md names them too.
+        # The thesis tests a runner does not gate, as it does not meet their
+        # targets with room: the gate step skips them, and the Reports
+        # workflow, whose matrix lists the same tests, measures them every
+        # night instead. README.md names them too.
+        # `frames` is whether the runner gates a test of the binary's
+        # thesis_frames module. Those tests live in the binary's own
+        # unit-test harness, which the release profile links as one more
+        # whole-program LTO unit, the longest of the build, so a runner that
+        # reports all of them builds no harness its gates would run no test
+        # from.
         include:
           - os: ubuntu-latest
             reported: harness_time_per_tool_round
+            frames: true
           - os: macos-latest
             reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines
+            frames: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -187,44 +216,13 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # What the two steps below run, so they build nothing under their
-      # timeouts, and the first-frame test's baseline binary, an example,
+      # What the gate step below runs, so it builds nothing under its
+      # timeout, and the first-frame test's baseline binary, an example,
       # which `cargo test` leaves unbuilt once a target is selected.
       - name: Build release tests
         run: |
-          cargo test --release --workspace --locked --no-run --test 'thesis*' --bin openmax
+          cargo test --release --workspace --locked --no-run --test 'thesis*' ${{ matrix.frames && '--bin openmax' || '' }}
           cargo build --release --workspace --locked --example startup_baseline
-
-      # The tests this runner reports, run to print their numbers, which also
-      # go to the job's summary, and allowed to fail, until it meets their
-      # targets with room. A step after a failed one is skipped, so this one
-      # runs before the gate step and prints its numbers whatever the gates
-      # do; its own failure, allowed, skips nothing. Over this job's first
-      # runs, six on ubuntu-latest and seven on macos-latest, the runners
-      # took about twice as long as the reference machine, an Apple M5, on
-      # the same single-threaded work, a transcript frame, and from one run
-      # to the next their times swung by more than the targets' room. The
-      # harness time per tool round, a median of 156 to 186 us on the M5
-      # against its 250 us target, measured 237 to 374 us on ubuntu-latest
-      # and 260 to 659 us on macos-latest. The frame's p99 at 100,000 lines,
-      # 0.074 to 0.090 ms on the M5 against 0.5 ms, measured 0.157 to
-      # 0.240 ms on ubuntu-latest, where it gates, and 0.151 to 0.504 ms on
-      # macos-latest, past the bound in two runs and within a fifth of it in
-      # two more, while its median held at 0.118 to 0.169 ms. The frame at
-      # 1,000,000 lines, a p99 of 0.084 to 0.114 ms on the M5 against
-      # 0.25 ms, measured 0.131 to 0.305 ms on ubuntu-latest over its first
-      # three runs, past the target in two, so it gates there on a ratchet of
-      # 0.41 ms its test derives from the first, until it meets the target;
-      # on macos-latest, 0.189 to 1.820 ms over two runs, it is reported.
-      - name: Thesis reports
-        continue-on-error: true
-        timeout-minutes: 5
-        run: |
-          [ -n "${{ matrix.reported }}" ] || exit 0
-          cargo test --release --workspace --locked --test 'thesis*' --bin openmax --no-fail-fast -- --test-threads=1 --nocapture ${{ matrix.reported }} 2>&1 | tee "$RUNNER_TEMP/thesis-reports.log"
-          status=${PIPESTATUS[0]}
-          { echo "Reported, not gated, on ${{ matrix.os }}; cargo test exited $status:"; echo '```'; sed -n 's/.*MEASURE /MEASURE /p' "$RUNNER_TEMP/thesis-reports.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
 
       # Every thesis test but the ones this runner reports, failing the pull
       # request. Each command runs even when the one before it failed, so one
@@ -235,7 +233,9 @@ jobs:
         run: |
           skip=; for test in ${{ matrix.reported }}; do skip="$skip --skip $test"; done
           cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1
-          cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1
+          if ${{ matrix.frames }}; then
+            cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1
+          fi
           exit ${failed:-0}
 
       # zero_orphans_after_kill_9 lists when the run it killed was collected,
