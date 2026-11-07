@@ -607,7 +607,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
     // The trailing note follows the history as a developer message on Responses instead of ending its last
     // message, which drops the folding: 7 lines fewer, the trust dispatcher and the frozen prompt unchanged.
-    const BASELINE: usize = 44_471;
+    const BASELINE: usize = 44_456;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -762,7 +762,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 }
 
 /// The agent loop, crates/core/src/agent.rs without its tests, stays under
-/// its line ratchet, against a target of 2,500 lines.
+/// its line ratchet, against a target of 2,000 lines.
 /// scripts/count-core-lines.sh --files gives each file's
 /// core-excluding-tests by the method core_source_stays_under_its_line_budget
 /// holds to its fixture, so the loop is measured as the core is, not by a
@@ -776,8 +776,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 /// under the core's ratchet. README.md states this ratchet, held here.
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
-    const TARGET: usize = 2_500;
-    const BASELINE: usize = 2_299;
+    const TARGET: usize = 2_000;
+    const BASELINE: usize = 1_746;
     // About 1% of the loop: room for a small fix, not for a feature.
     const MARGIN: usize = 50;
     const RATCHET: usize = BASELINE + MARGIN;
