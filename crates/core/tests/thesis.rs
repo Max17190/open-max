@@ -577,9 +577,11 @@ impl Prompt {
     /// message, then the history); a Responses `input` holds all three, its
     /// opening run of developer items being the instructions and the tools;
     /// native Messages caches `tools`, then `system`, then `messages`
-    /// (Anthropic's).
+    /// (Anthropic's), keyed on content and not on the `cache_control`
+    /// markers that ask for it, which move to the newest block each request.
     fn of(wire: WireApi, body: &str) -> Self {
-        let fields = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(body).unwrap();
+        let body = body.replace(r#""cache_control":{"type":"ephemeral"},"#, "").replace(r#","cache_control":{"type":"ephemeral"}"#, "");
+        let fields = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(&body).unwrap();
         let raw = |key: &str| fields.get(key).map_or(String::new(), |value| value.get().to_string());
         let items = |raw: &str| serde_json::from_str::<Vec<Box<RawValue>>>(raw).unwrap();
         let (parts, frozen) = match wire {
@@ -603,8 +605,11 @@ impl Prompt {
                 (vec![tools, system, messages], frozen)
             }
         };
-        let marker = serde_json::to_string(&note_marker()).unwrap();
-        let note = parts.concat().find(&marker[1..marker.len() - 1]);
+        // The note ends the last message's text, or on native Messages rides
+        // after its blocks as a text block of its own.
+        let (marker, header) = (serde_json::to_string(&note_marker()).unwrap(), serde_json::to_string(NOTE_HEADER).unwrap());
+        let block = format!(",{{\"text\":{}", &header[..header.len() - 1]);
+        let note = parts.concat().find(&marker[1..marker.len() - 1]).or_else(|| parts.concat().find(&block));
         Self { parts, frozen, note }
     }
 
