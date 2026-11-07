@@ -416,7 +416,7 @@ impl RequestSpend {
 }
 
 /// What settling a compaction digest needs from its caller. Borrowed whole,
-/// like `agent::ReadonlyBatchCtx`, so the budget path and the forced `/compact`
+/// like `batch::ReadonlyBatchCtx`, so the budget path and the forced `/compact`
 /// share one settlement instead of drifting copies.
 pub(crate) struct CompactionCtx<'a> {
     pub(crate) core: &'a Arc<Core>,
