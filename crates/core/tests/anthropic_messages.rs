@@ -120,7 +120,7 @@ async fn native_tool_round_trip_preserves_signed_blocks_only_for_the_same_origin
     run(&client,&messages).await.unwrap();client.model="different-model".into();run(&client,&messages).await.unwrap();
     let records=server.await.unwrap();let second:Value=serde_json::from_slice(&records[1].body).unwrap();
     assert_eq!(second["messages"][1]["content"],json!([{"type":"thinking","thinking":"inspect first","signature":"fixture-signature"},{"type":"tool_use","id":"call-fixture","name":"inspect","input":{"path":"note.txt"}}]));
-    assert_eq!(second["messages"][2]["content"][0],json!({"type":"tool_result","tool_use_id":"call-fixture","content":"file contents"}));
+    assert_eq!(second["messages"][2]["content"][0],json!({"type":"tool_result","tool_use_id":"call-fixture","content":"file contents","cache_control":{"type":"ephemeral"}}));
     let switched=String::from_utf8(records[2].body.clone()).unwrap();assert!(!switched.contains("fixture-signature"));assert!(!switched.contains("inspect first"));assert!(switched.contains("call-fixture"));
 }
 
@@ -239,15 +239,54 @@ async fn native_history_groups_tool_results_and_places_notes_at_the_tail() {
     native.stream_chat(&history[..2],"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
     let records=server.await.unwrap();let body:Value=serde_json::from_slice(&records[0].body).unwrap();
     assert!(body.get("tools").is_none());assert!(body.get("tool_choice").is_none());
-    assert_eq!(body["system"],json!([{"type":"text","text":"instructions"}]));
+    assert_eq!(body["system"],json!([{"type":"text","text":"instructions","cache_control":{"type":"ephemeral"}}]));
     assert_eq!(body["messages"][0]["content"],json!([{"type":"text","text":"first"},{"type":"text","text":"second"}]));
     assert_eq!(body["messages"][1]["content"][1]["input"],json!({}));
     assert_eq!(body["messages"][2]["content"][0]["content"],"result one");
-    assert!(body["messages"][2]["content"][1]["content"].as_str().unwrap().starts_with("result two"));
-    assert!(body["messages"][2]["content"][1]["content"].as_str().unwrap().ends_with("fresh note"));
+    assert_eq!(body["messages"][2]["content"][1],json!({"type":"tool_result","tool_use_id":"two","content":"result two","cache_control":{"type":"ephemeral"}}));
+    assert_eq!(body["messages"][2]["content"][2],json!({"type":"text","text":"fresh note"}));
     let body:Value=serde_json::from_slice(&records[1].body).unwrap();
+    assert_eq!(body["messages"][1]["content"][2]["cache_control"],json!({"type":"ephemeral"}));
     assert_eq!(body["messages"].as_array().unwrap().last().unwrap(),&json!({"role":"user","content":[{"type":"text","text":"after assistant"}]}));
     let body:Value=serde_json::from_slice(&records[2].body).unwrap();assert_eq!(body["messages"],json!([]));
+}
+
+/// Messages caches a prompt only up to a `cache_control` marker, and a
+/// request reads only what an earlier one wrote at its markers. So each
+/// request marks the end of the system prompt and its newest stored block,
+/// and sends the trailing note after that block: what one request marked is
+/// then, markers and note aside, the head of the next, so the next reads it
+/// at the cache price. Before, no request carried a marker and nothing was
+/// ever read from the cache.
+#[tokio::test]
+async fn native_requests_mark_the_shared_prefix_and_the_tail_the_next_request_reads() {
+    let scratch=Scratch::new();let(base,server)=serve(vec![(200,tool_response()),(200,tool_response()),(200,text_response())]).await;
+    let native=client(&scratch,&base,None);
+    let mut history=vec![ChatMessage::system("instructions"),ChatMessage::user("inspect")];
+    for step in 0..3 {
+        let reply=native.stream_chat_with_note(&history,Some("live note"),&tools(),Arc::new(CancelToken::default()),|_|{}).await.unwrap();
+        let mut assistant=ChatMessage::assistant(Some(reply.content),Some(reply.tool_calls));
+        assistant.reasoning_details=reply.reasoning_details;assistant.reasoning_origin=Some(native.origin());
+        history.push(assistant);history.push(ChatMessage::tool("call-fixture",&format!("result {step}")));
+    }
+    let bodies:Vec<Value>=server.await.unwrap().iter().map(|r| serde_json::from_slice(&r.body).unwrap()).collect();
+    let unmarked=|mut messages:Value| {
+        for block in messages.as_array_mut().unwrap().iter_mut().flat_map(|m| m["content"].as_array_mut().unwrap()) { block.as_object_mut().unwrap().remove("cache_control"); }
+        messages
+    };
+    for (step,body) in bodies.iter().enumerate() {
+        assert_eq!(body.to_string().matches("cache_control").count(),2,"request {step}: {body}");
+        assert_eq!(body["system"],json!([{"type":"text","text":"instructions","cache_control":{"type":"ephemeral"}}]));
+        let tail=body["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(tail[tail.len()-1],json!({"type":"text","text":"live note"}),"request {step}");
+        assert_eq!(tail[tail.len()-2]["cache_control"],json!({"type":"ephemeral"}),"request {step}");
+        if step>0 {
+            let mut previous=unmarked(bodies[step-1]["messages"].clone());
+            previous.as_array_mut().unwrap().last_mut().unwrap()["content"].as_array_mut().unwrap().pop();
+            let previous=previous.as_array().unwrap();
+            assert_eq!(&unmarked(body["messages"].clone()).as_array().unwrap()[..previous.len()],previous.as_slice(),"request {step}");
+        }
+    }
 }
 
 #[tokio::test]

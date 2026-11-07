@@ -222,7 +222,7 @@ struct WireToolCall<'a> {
 /// the server's KV cache without re-walking a `Value` tree. `origin` is the
 /// receiving endpoint's `ChatClient::origin`, which decides whose reasoning
 /// goes out.
-// One argument per request field, as in `with_options`.
+// One argument per request field.
 #[allow(clippy::too_many_arguments)]
 fn serialize_chat_request_body(
     model: &str,
@@ -360,8 +360,8 @@ pub struct ChatClient {
     /// Why the settings key was withheld from this endpoint, for a 401 to
     /// report (see `ActiveEndpoint::key_hint`).
     key_hint: Option<String>,
-    /// The Responses `prompt_cache_key` of the conversation this client
-    /// serves (see `for_conversation`).
+    /// The prompt cache key of the conversation this client serves (see
+    /// `for_conversation`).
     cache_key: Option<String>,
     http: reqwest::Client,
 }
@@ -392,7 +392,14 @@ struct StreamChunk {
     error: Option<Value>,
 }
 
-/// The usage a reply reports, or None without a usage object. Each count is
+/// The usage a reply reports on any wire, or None without a usage object.
+/// Chat Completions counts `prompt_tokens` and `completion_tokens`; Responses
+/// and Messages count `input_tokens` and `output_tokens`, except that
+/// Messages leaves the prompt it read from the cache or wrote to it out of
+/// `input_tokens`, so those are added back. Cache hits come as
+/// `prompt_tokens_details.cached_tokens`, a top-level
+/// `prompt_cache_hit_tokens`, `input_tokens_details.cached_tokens`, or
+/// `cache_read_input_tokens`, the first one present counting. Each count is
 /// read on its own, so a value of a shape this client does not expect under
 /// one key costs nothing under the others: a count that is not a whole
 /// number (a string, a fraction, a negative) reads as not reported, and a
@@ -401,13 +408,13 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
     if !usage.is_object() {
         return None;
     }
-    let count = |v: &Value| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64));
+    let count = |key: &str| usage.pointer(key).and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64)));
+    let input = ["/input_tokens", "/cache_creation_input_tokens", "/cache_read_input_tokens"];
     Some(Usage {
-        prompt_tokens: count(&usage["prompt_tokens"]).unwrap_or(0),
-        completion_tokens: count(&usage["completion_tokens"]).unwrap_or(0),
-        // Some servers report cache hits as a top-level
-        // `prompt_cache_hit_tokens` instead of (or beside) the details field.
-        cached_tokens: count(&usage["prompt_tokens_details"]["cached_tokens"]).or_else(|| count(&usage["prompt_cache_hit_tokens"])),
+        prompt_tokens: count("/prompt_tokens").unwrap_or_else(|| input.iter().filter_map(|k| count(k)).fold(0, u64::saturating_add)),
+        completion_tokens: count("/completion_tokens").or_else(|| count("/output_tokens")).unwrap_or(0),
+        cached_tokens: ["/prompt_tokens_details/cached_tokens", "/prompt_cache_hit_tokens", "/input_tokens_details/cached_tokens", input[2]]
+            .iter().find_map(|k| count(k)),
     })
 }
 
@@ -455,52 +462,6 @@ struct ToolCallFnDelta {
 
 impl ChatClient {
     pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: Option<f32>, max_tokens: usize) -> Self {
-        Self::with_options(
-            base_url,
-            api_key,
-            model,
-            temperature,
-            max_tokens,
-            Vec::new(),
-            false,
-            true,
-        )
-    }
-
-    /// Build a client from a resolved multi-provider endpoint.
-    pub fn from_endpoint(ep: &crate::providers::ActiveEndpoint) -> Self {
-        Self {
-            wire_api: ep.wire_api,
-            reasoning_effort: ep.reasoning_effort,
-            chatgpt: ep.chatgpt.clone(),
-            idle_timeout: ep.idle_timeout_secs.map_or(IDLE_TIMEOUT, |secs| std::time::Duration::from_secs(secs.max(1))),
-            key_hint: ep.key_hint.clone(),
-            ..Self::with_options(
-                ep.base_url.clone(),
-                ep.api_key.clone(),
-                ep.model.clone(),
-                ep.temperature,
-                ep.max_tokens,
-                ep.headers.clone(),
-                ep.compat.use_max_completion_tokens,
-                ep.compat.send_stream_options,
-            )
-        }
-    }
-
-    // One argument per endpoint option; the call sites build it straight from
-    // a resolved Endpoint, so a builder would add ceremony without clarity.
-    #[allow(clippy::too_many_arguments)]
-    fn with_options(
-        base_url: String,
-        api_key: Option<String>,
-        model: String,
-        temperature: Option<f32>,
-        max_tokens: usize,
-        headers: Vec<(String, String)>,
-        use_max_completion_tokens: bool,
-        send_stream_options: bool,
-    ) -> Self {
         // One client (and connection pool) for the process lifetime: ChatClient
         // is rebuilt every turn, and rebuilding the pool with it would redo the
         // TCP/TLS handshake per turn on remote endpoints.
@@ -528,9 +489,9 @@ impl ChatClient {
             temperature,
             reasoning_effort: None,
             max_tokens,
-            headers,
-            use_max_completion_tokens,
-            send_stream_options,
+            headers: Vec::new(),
+            use_max_completion_tokens: false,
+            send_stream_options: true,
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
             cache_key: None,
@@ -538,19 +499,48 @@ impl ChatClient {
         }
     }
 
+    /// Build a client from a resolved multi-provider endpoint.
+    pub fn from_endpoint(ep: &crate::providers::ActiveEndpoint) -> Self {
+        Self {
+            wire_api: ep.wire_api,
+            reasoning_effort: ep.reasoning_effort,
+            chatgpt: ep.chatgpt.clone(),
+            idle_timeout: ep.idle_timeout_secs.map_or(IDLE_TIMEOUT, |secs| std::time::Duration::from_secs(secs.max(1))),
+            key_hint: ep.key_hint.clone(),
+            headers: ep.headers.clone(),
+            use_max_completion_tokens: ep.compat.use_max_completion_tokens,
+            send_stream_options: ep.compat.send_stream_options,
+            ..Self::new(ep.base_url.clone(), ep.api_key.clone(), ep.model.clone(), ep.temperature, ep.max_tokens)
+        }
+    }
+
     /// Key this client's requests by the conversation that began in session
     /// `root` (`sessions::conversation_root`): a hash of its id, never the id.
     /// Requests under different `prompt_cache_key`s share no cache entries,
-    /// so a `/fork` or `/rewind` branch keeps its parent's key. Only Responses
-    /// requests carry it: that translation targets OpenAI's Responses API,
-    /// which defines the key, while Chat Completions servers vary and some
-    /// refuse a field they do not know, and native Messages does not define
-    /// it. docs/configuration.md covers its effect on routing and its costs.
+    /// so a `/fork` or `/rewind` branch keeps its parent's key. Responses
+    /// requests carry it as `prompt_cache_key`: that translation targets
+    /// OpenAI's Responses API, which defines the key. Chat Completions servers
+    /// vary and some refuse a field they do not know, so there it goes only to
+    /// a host that routes by it, in its header (see `cache_route`); native
+    /// Messages does not define it. docs/configuration.md covers its effect on
+    /// routing and its costs.
     pub fn for_conversation(mut self, root: &str) -> Self {
         let mut key = crate::ledger::sha256_hex(format!("prompt cache\n{root}").as_bytes());
         key.truncate(16);
         self.cache_key = Some(key);
         self
+    }
+
+    /// The header a Chat Completions host routes a conversation by to the
+    /// server that holds its prompt cache (`providers::CACHE_ROUTES`), with
+    /// this conversation's key: a request served elsewhere prefills the whole
+    /// history again, at the uncached price. None where the provider's own
+    /// headers set it.
+    fn cache_route(&self) -> Option<(&'static str, &str)> {
+        let url = reqwest::Url::parse(self.base_url.trim()).ok()?;
+        let (_, name) = crate::providers::CACHE_ROUTES.iter().find(|(host, _)| url.host_str() == Some(*host))?;
+        let own = self.headers.iter().any(|(header, _)| header.eq_ignore_ascii_case(name));
+        Some((*name, self.cache_key.as_deref()?)).filter(|_| self.wire_api == crate::providers::WireApi::ChatCompletions && !own)
     }
 
     fn endpoint(&self) -> String {
@@ -688,6 +678,7 @@ impl ChatClient {
             for (name, value) in &self.headers {
                 req = req.header(name.as_str(), value.as_str());
             }
+            if let Some((name, key)) = self.cache_route() { req = req.header(name, key); }
             // An endpoint can spend a long time in prompt processing before the
             // first byte arrives, and a large prompt makes that worse wherever
             // it runs; keep cancellation responsive throughout. Only silence
@@ -4205,5 +4196,53 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["tool_choice"], "auto");
         assert!(v["tools"].as_array().is_some_and(|a| !a.is_empty()));
+    }
+
+    /// Each wire names its counts its own way, and the cost of a request
+    /// turns on the cached share, so one reader takes them all: Messages adds
+    /// what it read from the cache or wrote to it back to `input_tokens`, and
+    /// a whole count typed as a float is a count on every wire.
+    #[test]
+    fn every_wires_usage_counts_its_prompt_and_its_cache_hits() {
+        for (usage, counts) in [
+            (json!({"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80}}), (100, 7, Some(80))),
+            (json!({"prompt_tokens":100,"completion_tokens":7,"prompt_cache_hit_tokens":64}), (100, 7, Some(64))),
+            (json!({"input_tokens":120,"output_tokens":15,"input_tokens_details":{"cached_tokens":90}}), (120, 15, Some(90))),
+            (json!({"input_tokens":10,"output_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":4}), (17, 7, Some(4))),
+            (json!({"input_tokens":10.0,"output_tokens":7.0,"cache_read_input_tokens":4.0}), (14, 7, Some(4))),
+            (json!({"input_tokens":u64::MAX,"cache_read_input_tokens":1}), (u64::MAX, 0, Some(1))),
+            (json!({"prompt_tokens":100,"input_tokens":5,"cache_read_input_tokens":60}), (100, 0, Some(60))),
+            (json!({"input_tokens":10,"output_tokens":7}), (10, 7, None)),
+            (json!({}), (0, 0, None)),
+        ] {
+            let u = parse_usage(&usage).expect("a usage object is usage");
+            assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), counts, "{usage}");
+        }
+        assert!(parse_usage(&Value::Null).is_none());
+    }
+
+    /// The vendor table is pinned: a host joins it only with its header. A
+    /// conversation's requests to a host there carry its key in that header,
+    /// one key per conversation, and nothing goes anywhere else, to another
+    /// wire, or over a value the provider's own headers set.
+    #[test]
+    fn a_host_that_routes_by_conversation_gets_the_key_in_its_header() {
+        assert_eq!(crate::providers::CACHE_ROUTES, [("api.x.ai", "x-grok-conv-id")]);
+        let routed = |url: &str, root: &str| ChatClient::new(url.into(), None, "m".into(), None, 64).for_conversation(root);
+        let xai = routed("https://api.x.ai/v1", "root");
+        let key = xai.cache_key.clone().unwrap();
+        assert_eq!(xai.cache_route(), Some(("x-grok-conv-id", key.as_str())));
+        assert_eq!(routed(" https://API.x.ai/v1/ ", "root").cache_route(), Some(("x-grok-conv-id", key.as_str())));
+        assert_ne!(routed("https://api.x.ai/v1", "other").cache_route(), xai.cache_route(), "one key per conversation");
+        assert_eq!(ChatClient::new("https://api.x.ai/v1".into(), None, "m".into(), None, 64).cache_route(), None);
+        for elsewhere in ["http://127.0.0.1:8080/v1", "https://openrouter.ai/api/v1", "https://api.x.ai.example/v1", "not a url"] {
+            assert_eq!(routed(elsewhere, "root").cache_route(), None, "{elsewhere}");
+        }
+        let mut responses = routed("https://api.x.ai/v1", "root");
+        responses.wire_api = crate::providers::WireApi::Responses;
+        assert_eq!(responses.cache_route(), None, "Responses carries the key in its body");
+        let mut own = routed("https://api.x.ai/v1", "root");
+        own.headers = vec![("X-Grok-Conv-Id".into(), "configured".into())];
+        assert_eq!(own.cache_route(), None);
     }
 }
