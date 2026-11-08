@@ -1283,15 +1283,19 @@ fn a_scrolled_view_pins_its_prompt_and_places_the_marker_by_position() {
 #[tokio::test]
 async fn pointer_positions_map_to_the_draft_and_drags_extend_the_selection() {
     let (mut app, dir) = app_fixture();
-    app.composer.load("alpha beta");
+    app.composer.load("alpha beta\ngamma delta");
     let (rows, _) = frame(&mut app, 40, 12);
     let area = app.composer_draw_area;
     let draft = &rows[area.y as usize];
     let alpha = draft[..draft.find("alpha").unwrap()].chars().count() as u16;
-    // The last letter of a word picks that word, not the next one.
+    // The last letter of a word on the first row picks that word, not the
+    // next one and not one on the row below.
     click(&mut app, alpha + 4, area.y).await;
     click(&mut app, alpha + 4, area.y).await;
     assert_eq!(app.composer.selected_text().as_deref(), Some("alpha"));
+    click(&mut app, alpha + 1, area.y + 1).await;
+    click(&mut app, alpha + 1, area.y + 1).await;
+    assert_eq!(app.composer.selected_text().as_deref(), Some("gamma"));
 
     // A press then a drag past the end of the draft takes everything after
     // the press, however far the pointer goes.
