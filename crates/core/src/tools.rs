@@ -41,6 +41,11 @@ const MAX_RESULTS: usize = 200;
 const MAX_GREP_RESULTS: usize = 50;
 /// Every later request re-sends a result; past this the spill log keeps the rest.
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+/// A command result over the cap uses this fraction of the cap when its
+/// complete output is available in the spill log. Later model requests
+/// resend the preview, and the full cap remains available when the log
+/// is incomplete or could not be written.
+const PREVIEW_DIVISOR: usize = 4;
 /// bash keeps one part in this many of each stream's share from its start,
 /// and the rest from its end. A compiler prints the error that broke the
 /// build first and the errors that follow from it after, so a tail alone
@@ -108,13 +113,7 @@ impl ToolOutcome {
     /// can tell a quiet command from a silenced one.
     pub(crate) fn from_killed_process(output: impl Into<String>, process: &ProcessOutput) -> Self {
         let produced = process.stdout.total_bytes.saturating_add(process.stderr.total_bytes);
-        Self {
-            ok: false,
-            output: output.into(),
-            diff: None,
-            process_bytes: Some(produced),
-            process_truncated: produced > 0,
-        }
+        Self::from_process(false, output.into(), process, produced > 0)
     }
 
     /// Record what the process behind this result produced, so a
@@ -1930,10 +1929,11 @@ fn stream_was_truncated(stream: &execution::CapturedStream) -> bool {
 /// Format native-process output identically for bash and external tools.
 /// The supervisor has already bounded each stream and owns any spill log.
 ///
-/// Over the cap, each stream is cut within its own share, so a flood of
+/// Over the cap, each stream is cut within its own share of the cap, or of the
+/// preview when the log holds the rest (`PREVIEW_DIVISOR`), so a flood of
 /// warnings on stderr cannot evict all of stdout, which is usually the result
-/// the command ran for. A stream that needs less than half of the cap keeps
-/// all of it and leaves the rest to the other. A stream whose capture kept a
+/// the command ran for. A stream that needs less than half of it keeps all of
+/// it and leaves the rest to the other. A stream whose capture kept a
 /// head keeps its start and its end around a counted cut; one that did not
 /// keeps its tail behind a `…`.
 pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) -> (String, bool) {
@@ -1949,8 +1949,8 @@ pub(crate) fn render_process_output(output: &ProcessOutput, max_bytes: usize) ->
         || stream_was_truncated(&output.stdout)
         || stream_was_truncated(&output.stderr)
         || over_cap;
-
-    let budget = max_bytes.saturating_sub(label.len());
+    let shown = if needs_notice && !output.log_truncated && output.log_path.is_some() { max_bytes / PREVIEW_DIVISOR } else { max_bytes };
+    let budget = shown.saturating_sub(label.len());
     let stdout_share = stdout.len().min((budget / 2).max(budget.saturating_sub(stderr.len())));
     let (mut text, mut head_kept) = kept_stream(&output.stdout, &stdout, stdout_share);
     if !label.is_empty() {
@@ -4909,6 +4909,24 @@ mod tests {
         assert!(text.ends_with("\n[stderr]\nwarning\n"), "{text}");
     }
 
+    /// The preview stands in for a result only while a log holds the rest:
+    /// with an incomplete or missing log, the result keeps all the cap allows.
+    #[test]
+    fn a_result_without_a_complete_log_keeps_what_the_cap_allows() {
+        let tail = format!("{}final error details\n{}", "t\n".repeat(3_000), "t\n".repeat(1_000));
+        let render = |log: Option<PathBuf>, log_truncated| {
+            let output = rendered_output(stream(100_000, b"", tail.as_bytes()), stream(0, b"", b""), log, log_truncated);
+            render_process_output(&output, 4_000).0
+        };
+        let without = render(None, false);
+        let complete = render(Some("/logs/cmd.log".into()), false);
+        let incomplete = render(Some("/logs/cmd.log".into()), true);
+        assert!(without.len() > 3_900 && complete.len() < 1_200);
+        assert!(!complete.contains("final error details"));
+        assert_eq!(incomplete.split_once('\n').unwrap().1, without.split_once('\n').unwrap().1);
+        assert!(incomplete.contains("final error details"));
+    }
+
     /// A command whose output the result cuts names a log that holds all of
     /// it, so the model can read what the result left out: a cut a few
     /// kilobytes past the cap, and one of over a megabyte, inside the 16 MiB
@@ -4934,6 +4952,33 @@ mod tests {
             let printed = line.repeat(size / line.len() + 1);
             assert!(kept == printed.as_bytes()[..size], "the log of a {size}-byte output holds {} bytes", kept.len());
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A result over the cap went out at the cap's size and rode every later
+    /// request, though the next call narrows a flood rather than reading it.
+    /// It is a preview a quarter of the cap now, its start and end around a
+    /// counted cut, and the log it names holds every byte. A result that
+    /// fits the cap still goes whole.
+    #[tokio::test]
+    async fn a_result_over_the_cap_is_a_quarter_cap_preview_of_its_log() {
+        let root = temp_project();
+        let caps = OutputCaps { command_bytes: 4_000 };
+        let data = root.join("data");
+        let fill = json!({"command": "head -c 4000 /dev/zero | tr '\\0' a"});
+        let fits = bash_tool(&data, &root, &fill, caps, Arc::new(CancelToken::default())).await;
+        assert_eq!((fits.output.len(), fits.process_truncated), (4_000, false), "{}", fits.output);
+        let flood = json!({"command": "seq 1 3000"});
+        let out = bash_tool(&data, &root, &flood, caps, Arc::new(CancelToken::default())).await;
+        let (notice, body) = out.output.split_once('\n').unwrap();
+        let log = notice.split("bounded output log saved to ").nth(1).and_then(|rest| rest.split(';').next());
+        let printed: String = (1..=3000).map(|i| format!("{i}\n")).collect();
+        assert_eq!(std::fs::read_to_string(log.expect(notice)).unwrap(), printed, "the log holds every byte");
+        assert!(body.len() <= 1_000, "a {}-byte preview of a 4000-byte cap", body.len());
+        assert!(body.starts_with("1\n2\n") && body.ends_with("2999\n3000\n"), "{body}");
+        let (head, rest) = body.split_once("[… ").expect(body);
+        let (omitted, tail) = rest.split_once(" bytes omitted …]\n").expect(body);
+        assert_eq!(head.len() + omitted.parse::<usize>().unwrap() + tail.len(), printed.len());
         let _ = std::fs::remove_dir_all(root);
     }
 
