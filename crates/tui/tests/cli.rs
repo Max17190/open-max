@@ -2274,6 +2274,58 @@ fn the_model_flag_names_the_model_a_run_asks_for() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// Hooks are discovered at turn start, so one written mid-turn applies from
+/// the next turn, and print mode runs only the turns its command line names.
+/// The receipt on the write that made the hook names the two runs that apply
+/// it before this one ends: the run's next `-p` prompt, and a run the agent
+/// starts from bash. Both run it, and it does not run on a write later in the
+/// turn that made it.
+#[test]
+fn a_print_runs_hook_receipt_names_the_runs_that_apply_the_hook() {
+    let (project, home) = fresh_dirs("hook-next-turn");
+    let hook = "event = \"post_tool_use\"\ntool = \"write_file\"\ncommand = \"sh\"\nargs = [\"-c\", \"cat >> seen.jsonl\"]\n";
+    let write = |path: &str| sse_tool_call("write_file", serde_json::json!({ "path": path, "content": "x\n" }));
+    let (base_url, requests, _server) = spawn_scripted_server(vec![
+        // The first prompt's turn writes the hook, then a file.
+        (sse_tool_call("write_file", serde_json::json!({ "path": ".openmax/hooks/seen.toml", "content": hook })), true),
+        (write("same-turn.txt"), true),
+        (sse_text("hook written"), true),
+        // The second prompt's turn writes a file, then starts a run from
+        // bash, whose two requests come next.
+        (write("next-prompt.txt"), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": "openmax -p 'write later-run.txt'" })), true),
+        (write("later-run.txt"), true),
+        (sse_text("written"), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings(&home, &base_url);
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+
+    let out = cmd(&project, &home).args(["-p", "add the hook", "-p", "use it"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 8, "both runs made every scripted request: {requests:#?}");
+    let sent: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+    let receipt = sent["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        receipt.ends_with(
+            "\n[hook files changed. Valid hooks apply from the next turn (in print mode, the run's next -p prompt) \
+             under auto without content approval; a run started now from bash (openmax -p ...) runs them too.]"
+        ),
+        "the hook's write names the runs that apply it: {receipt}"
+    );
+    let seen: Vec<String> = std::fs::read_to_string(project.join("seen.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["args"]["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(seen, ["next-prompt.txt", "later-run.txt"], "the hook ran on exactly these writes");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Run `openmax` with `args` and `commands` on stdin, then EOF, which quits a
 /// stdio session once its turn in flight drains, and hand back its stdout
 /// lines with the session's id, taken from `hello`, replaced by `S`.

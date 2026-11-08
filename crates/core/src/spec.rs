@@ -160,8 +160,7 @@ content approval, even under a permission allow rule. Later calls of the same
 bytes need no content approval, but the mutating/permission gate still applies.
 Readonly refuses mutating calls and calls requiring confirmation.
 
-Select /permissions auto|ask|readonly in a
-human-controlled frontend.
+Select /permissions auto|ask|readonly in a human-controlled frontend.
 The choice persists for this exact trusted project across launches, including
 headless/stdio. A subdirectory, including a worktree placed under the project,
 without its own choice follows the nearest enclosing project's. A worktree
@@ -488,8 +487,10 @@ path is missing or has no executable bit, whose command is not on PATH, or
 whose interpreter's script does not exist; while a blocking `turn_end` gate
 is in that state, the model is also told at turn start, once per session for
 each distinct failure.
-Manifest edits apply from the next turn; a script runs from disk, so an edit
-to it applies at the hook's next run. Explicit mode changes refresh policy
+Manifest edits apply from the next turn, with no reload: in print mode
+(`openmax -p`) the run's next `-p` prompt, and any run started later, including
+one started now from bash (`openmax -p ...`). A script runs from disk, so an
+edit to it applies at the hook's next run. Explicit mode changes refresh policy
 before subsequent calls. Execution failures are reported and no hashes are
 automatically granted. Removing a hook in auto removes that policy.
 
@@ -553,8 +554,7 @@ reported by `openmax --check`:
 
 A hook whose content was never approved is inert rather than blocking: it never
 ran, so it removes no policy. It is not silent - each turn reports it, and
-`openmax --check` names it. Hooks are re-discovered every turn; no reload is
-needed.
+`openmax --check` names it.
 
 Example (`.openmax/hooks/deny-rm.toml`):
 
@@ -1444,6 +1444,16 @@ mod tests {
             HOOKS.contains(&format!("At most {} hooks", crate::hooks::MAX_HOOKS_PER_EVENT)),
             "--spec hooks names the least visible cap: hooks have no prompt trailer"
         );
+    }
+
+    /// Hooks are discovered at turn start and print mode runs only the turns
+    /// its command line names, so a hook written in a one-prompt run has no
+    /// next turn there: the contract names the runs that apply it.
+    #[test]
+    fn spec_hooks_names_the_runs_that_apply_a_new_hook() {
+        for run in ["(`openmax -p`) the run's next `-p` prompt", "one started now from bash (`openmax -p ...`)"] {
+            assert!(HOOKS.contains(run), "--spec hooks must name {run}");
+        }
     }
 
     #[test]

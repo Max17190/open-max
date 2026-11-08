@@ -1814,6 +1814,252 @@ mod tests {
         assert_eq!(composer.text(), "");
     }
 
+    fn press(composer: &mut Composer, code: KeyCode) -> ComposerAction {
+        composer.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ctrl(composer: &mut Composer, c: char) {
+        composer.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    /// Backspace at the start of a line joins it onto the line above, and
+    /// Delete at the end of a line pulls up the line below; at the very start
+    /// and end of the draft there is nothing to join and both do nothing.
+    #[test]
+    fn backspace_and_delete_join_lines_only_at_their_edges() {
+        let mut composer = Composer::blank();
+        composer.insert_str("ab\ncd\nef");
+        press(&mut composer, KeyCode::Home);
+        assert_eq!((composer.row, composer.col), (2, 0));
+        press(&mut composer, KeyCode::Backspace);
+        assert_eq!(composer.text(), "ab\ncdef");
+        assert_eq!((composer.row, composer.col), (1, 2));
+        press(&mut composer, KeyCode::End);
+        assert_eq!(composer.col, 4);
+        press(&mut composer, KeyCode::Delete);
+        assert_eq!(composer.text(), "ab\ncdef", "the end of the draft has nothing after it");
+        press(&mut composer, KeyCode::Up);
+        assert_eq!((composer.row, composer.col), (0, 2));
+        press(&mut composer, KeyCode::Delete);
+        assert_eq!(composer.text(), "abcdef");
+        assert_eq!((composer.row, composer.col), (0, 2));
+        press(&mut composer, KeyCode::Delete);
+        assert_eq!(composer.text(), "abdef", "mid-line, Delete takes the character after the cursor");
+        press(&mut composer, KeyCode::Home);
+        press(&mut composer, KeyCode::Backspace);
+        assert_eq!(composer.text(), "abdef", "the start of the draft has nothing before it");
+        assert_eq!((composer.row, composer.col), (0, 0));
+    }
+
+    /// Left and Right step over the break between two lines, Up and Down
+    /// move between them, and neither end of the draft lets the cursor off.
+    #[test]
+    fn arrow_keys_cross_line_breaks_and_stop_at_the_ends() {
+        let mut composer = Composer::blank();
+        composer.insert_str("ab\ncd");
+        let at = |composer: &Composer| (composer.row, composer.col);
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(at(&composer), (1, 2), "Right at the end of the draft stays");
+        press(&mut composer, KeyCode::Home);
+        press(&mut composer, KeyCode::Left);
+        assert_eq!(at(&composer), (0, 2));
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(at(&composer), (1, 0));
+        press(&mut composer, KeyCode::Up);
+        assert_eq!(at(&composer), (0, 0));
+        press(&mut composer, KeyCode::Left);
+        assert_eq!(at(&composer), (0, 0), "Left at the start of the draft stays");
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(at(&composer), (0, 1));
+        press(&mut composer, KeyCode::Down);
+        assert_eq!(at(&composer), (1, 1));
+        assert_eq!(composer.text(), "ab\ncd");
+    }
+
+    /// Ctrl+A and Ctrl+E jump to the ends of the line and Ctrl+K cuts to its
+    /// end, while a control chord with no binding types nothing.
+    #[test]
+    fn control_chords_move_and_cut_and_an_unbound_one_types_nothing() {
+        let mut composer = Composer::blank();
+        composer.insert_str("hello world");
+        ctrl(&mut composer, 'a');
+        assert_eq!(composer.col, 0);
+        ctrl(&mut composer, 'b');
+        assert_eq!(composer.text(), "hello world");
+        ctrl(&mut composer, 'e');
+        assert_eq!(composer.col, 11);
+        press(&mut composer, KeyCode::Home);
+        for _ in 0..5 {
+            press(&mut composer, KeyCode::Right);
+        }
+        ctrl(&mut composer, 'k');
+        assert_eq!(composer.text(), "hello");
+    }
+
+    /// Ctrl+W deletes back over the spaces before the cursor, then the word
+    /// before them, wherever the cursor is in the line.
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor() {
+        let mut composer = Composer::blank();
+        composer.insert_str("one two  ");
+        ctrl(&mut composer, 'w');
+        assert_eq!((composer.text().as_str(), composer.col), ("one ", 4));
+        ctrl(&mut composer, 'w');
+        assert_eq!(composer.text(), "");
+        ctrl(&mut composer, 'w');
+        assert_eq!(composer.text(), "");
+
+        composer.insert_str("alpha beta gamma");
+        press(&mut composer, KeyCode::Home);
+        for _ in 0.."alpha beta".len() {
+            press(&mut composer, KeyCode::Right);
+        }
+        ctrl(&mut composer, 'w');
+        assert_eq!((composer.text().as_str(), composer.col), ("alpha  gamma", 6));
+    }
+
+    /// Up walks back through the submitted prompts from the newest, Down
+    /// walks forward again and, past the newest, restores the unsent draft.
+    /// A prompt sent twice in a row is kept once, and the history outlives
+    /// the composer that kept it.
+    #[test]
+    fn history_walks_both_ways_and_gives_back_the_draft() {
+        let dir = crate::test_temp_dir("openmax-composer-history");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut composer = Composer::new(&dir, &dir);
+        for prompt in ["one", "two", "three", "three"] {
+            composer.insert_str(prompt);
+            let sent = press(&mut composer, KeyCode::Enter);
+            assert!(matches!(sent, ComposerAction::Submit(text) if text == prompt));
+        }
+        assert_eq!(composer.history_entries(), ["one", "two", "three"]);
+
+        composer.insert_str("draft");
+        let mut walk = |code| {
+            press(&mut composer, code);
+            composer.text()
+        };
+        let walked: Vec<String> = [
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Down,
+        ]
+        .into_iter()
+        .map(&mut walk)
+        .collect();
+        assert_eq!(walked, ["three", "two", "one", "one", "two", "three", "draft", "draft"]);
+        assert_eq!(Composer::new(&dir, &dir).history_entries(), ["one", "two", "three"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// History keeps the newest 200 prompts: a longer file trims to them on
+    /// the next prompt kept, which `take` keeps as Enter does.
+    #[test]
+    fn history_keeps_the_newest_two_hundred_prompts() {
+        let dir = crate::test_temp_dir("openmax-composer-history-cap");
+        std::fs::create_dir_all(dir.join("history")).unwrap();
+        let file = dir
+            .join("history")
+            .join(format!("{}.json", open_max_core::ledger::project_key(&dir)));
+        let older: Vec<String> = (0..300).map(|i| format!("old {i}")).collect();
+        std::fs::write(&file, serde_json::to_string(&older).unwrap()).unwrap();
+        let mut composer = Composer::new(&dir, &dir);
+        assert_eq!(composer.history_entries().len(), 300);
+
+        composer.insert_str("  newest  ");
+        assert_eq!(composer.take(), "newest");
+        assert!(composer.is_empty());
+        let kept = composer.history_entries();
+        assert_eq!(kept.len(), MAX_HISTORY);
+        assert_eq!((kept[0].as_str(), kept[MAX_HISTORY - 1].as_str()), ("old 101", "newest"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Accepting a completion leaves the cursor right after what it put in.
+    #[test]
+    fn a_replaced_token_leaves_the_cursor_after_the_replacement() {
+        let mut composer = Composer::blank();
+        composer.insert_str("see @src/ma");
+        composer.replace_token(4, 7, "@src/main.rs ");
+        assert_eq!(composer.text(), "see @src/main.rs ");
+        assert_eq!(composer.cursor_context().1, "see @src/main.rs ".len());
+    }
+
+    /// A plain `a` or `e` is text, not the Ctrl+A or Ctrl+E cursor move, so
+    /// typing it re-wraps the draft.
+    #[test]
+    fn typing_the_letter_of_a_cursor_chord_rewraps_the_draft() {
+        let mut composer = Composer::blank();
+        assert_eq!(composer.height(10), 1);
+        for _ in 0..12 {
+            press(&mut composer, KeyCode::Char('a'));
+        }
+        assert_eq!(composer.height(10), 2, "twelve cells of text wrap at eight");
+    }
+
+    /// A wrap point belongs to the row that starts there: the cursor on it is
+    /// drawn at the start of the lower row, not past the end of the upper.
+    #[test]
+    fn a_cursor_on_a_wrap_point_starts_the_next_row() {
+        let mut composer = Composer::blank();
+        composer.insert_str("abcde fgh");
+        // Five cells of text: the rows are "abcde" and " fgh".
+        let cursor = |composer: &mut Composer| {
+            let (_, x, y) = composer.render(7, 6);
+            (x, y)
+        };
+        assert_eq!(cursor(&mut composer), (6, 1));
+        press(&mut composer, KeyCode::Home);
+        assert_eq!(cursor(&mut composer), (2, 0));
+        press(&mut composer, KeyCode::Right);
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(cursor(&mut composer), (4, 0));
+        for _ in 0..3 {
+            press(&mut composer, KeyCode::Right);
+        }
+        assert_eq!(cursor(&mut composer), (2, 1));
+    }
+
+    /// In a draft taller than the box the view follows the cursor, keeping it
+    /// on the top row going up and on the bottom row going down, also when
+    /// the cursor stops short of the last row; a cursor the wheel left out of
+    /// view is drawn on the box's bottom edge.
+    #[test]
+    fn the_view_follows_the_cursor_through_a_tall_draft() {
+        let mut composer = Composer::blank();
+        let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        composer.insert_str(&lines.join("\n"));
+        let (width, height) = (20, 6);
+        let view = |composer: &mut Composer| {
+            let (lines, _, y) = composer.render(width, height);
+            (plain(&lines[0]), y)
+        };
+        assert_eq!(view(&mut composer), ("… line 4".to_string(), 5));
+        for _ in 0..6 {
+            press(&mut composer, KeyCode::Up);
+        }
+        assert_eq!(view(&mut composer), ("… line 3".to_string(), 0));
+        for _ in 0..3 {
+            press(&mut composer, KeyCode::Up);
+        }
+        assert_eq!(view(&mut composer), ("❯ line 0".to_string(), 0));
+        for _ in 0..7 {
+            press(&mut composer, KeyCode::Down);
+        }
+        assert_eq!(view(&mut composer), ("… line 2".to_string(), 5));
+        for _ in 0..2 {
+            press(&mut composer, KeyCode::Down);
+        }
+        assert_eq!(view(&mut composer), ("… line 4".to_string(), 5));
+        composer.scroll_by(width, height, -10);
+        assert_eq!(view(&mut composer), ("❯ line 0".to_string(), 5));
+    }
+
     /// Insertion cost of a paste, the case the segment splice in
     /// `insert_str` exists for. Not a correctness test; run with:
     ///   cargo test -p openmax --bin openmax --release -- --ignored --nocapture measure_paste
