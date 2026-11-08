@@ -974,7 +974,7 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     same
 }
 
-/// The numbered lines one read_file call returns.
+/// The lines one read_file call returns, each as `<n> <text>`.
 struct ReadWindow {
     /// First line to show, 1-based.
     offset: usize,
@@ -999,9 +999,9 @@ impl ReadWindow {
         // model into edit_file with an old_string that can never match.
         let formatted = if len > MAX_LINE_CHARS {
             let end = floor_char(line, MAX_LINE_CHARS);
-            format!("{n:>5} {}… [line clipped; {} more bytes]\n", &line[..end], len - end)
+            format!("{n} {}… [line clipped; {} more bytes]\n", &line[..end], len - end)
         } else {
-            format!("{n:>5} {line}\n")
+            format!("{n} {line}\n")
         };
         if self.out.len() + formatted.len() > MAX_READ_BYTES {
             self.cut_at = Some(n);
@@ -4117,7 +4117,7 @@ mod tests {
         assert!(first.contains("[line clipped;"), "{first}");
         assert!(first.contains("more bytes]"), "{first}");
         assert!(!first.contains("suffix-END"), "the tail is dropped, not hidden: {first}");
-        assert!(out.output.contains("    2 short"), "ordinary lines stay unmarked: {}", out.output);
+        assert!(out.output.contains("\n2 short\n"), "ordinary lines stay unmarked: {}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4206,7 +4206,7 @@ mod tests {
 
         // The final line is reachable, and an offset past it says so.
         let out = read_file(&root, &json!({"path": "big.log", "offset": total}));
-        assert_eq!(out.output, format!("{total:>5} row {total} of a large log\n"));
+        assert_eq!(out.output, format!("{total} row {total} of a large log\n"));
         let out = read_file(&root, &json!({"path": "big.log", "offset": total + 1}));
         assert!(!out.ok && out.output.contains(&format!("past the end of big.log ({total} lines)")), "{}", out.output);
         // A whole-file read is still refused, and the refusal names only the
@@ -4310,7 +4310,7 @@ mod tests {
         std::fs::write(root.join("three.txt"), "one\ntwo\nthree\n").unwrap();
         let out = read_file(&root, &json!({"path": "three.txt", "offset": "2", "limit": " 1 "}));
         assert!(out.ok, "{}", out.output);
-        assert!(out.output.starts_with("    2 two\n"), "offset as a string: {}", out.output);
+        assert!(out.output.starts_with("2 two\n"), "offset as a string: {}", out.output);
         assert!(!out.output.contains("three\n"), "limit as a string: {}", out.output);
 
         std::fs::write(root.join("twice.txt"), "x\nx\n").unwrap();
@@ -4660,7 +4660,7 @@ mod tests {
         assert_eq!(text.len() as u64, MAX_FILE_BYTES);
         std::fs::write(root.join("docs/cap.log"), &text).unwrap();
         let out = read_file(&root, &json!({"path": "docs/cap.log"}));
-        assert!(out.ok && out.output.starts_with("    1 needle"), "{}", out.output.lines().next().unwrap_or_default());
+        assert!(out.ok && out.output.starts_with("1 needle"), "{}", out.output.lines().next().unwrap_or_default());
         let out = grep_tool(&root, &json!({"pattern": "needle", "path": "docs"}));
         assert_eq!(out.output, format!("docs/cap.log:1: needle{}\n", "x".repeat(93)));
 
@@ -4681,7 +4681,7 @@ mod tests {
         let exact = "y".repeat(MAX_LINE_CHARS);
         std::fs::write(root.join("docs/exact.txt"), format!("{exact}\n")).unwrap();
         let out = read_file(&root, &json!({"path": "docs/exact.txt"}));
-        assert_eq!((out.ok, out.output), (true, format!("    1 {exact}\n")));
+        assert_eq!((out.ok, out.output), (true, format!("1 {exact}\n")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4690,16 +4690,33 @@ mod tests {
     #[test]
     fn a_read_that_fills_the_byte_cap_exactly_shows_every_line() {
         let root = temp_project();
-        // A line shows as a five-column number, a space, the line and a
-        // newline, so a hundred lines of this length fill the cap exactly.
-        let shown = MAX_READ_BYTES / 100;
-        assert_eq!(shown * 100, MAX_READ_BYTES, "the cap splits into a hundred whole lines");
-        let line = "z".repeat(shown - 7);
-        std::fs::write(root.join("docs/full.txt"), format!("{line}\n").repeat(100)).unwrap();
+        // A line shows as its number, a space, the line and a newline: 99
+        // lines of one length, then a 100th sized to fill the cap exactly.
+        let line = "z".repeat(MAX_READ_BYTES / 100 - 4);
+        let used: usize = (1..100).map(|n| format!("{n} {line}\n").len()).sum();
+        let last = "z".repeat(MAX_READ_BYTES - used - "100 \n".len());
+        std::fs::write(root.join("docs/full.txt"), format!("{line}\n").repeat(99) + &last + "\n").unwrap();
         let out = read_file(&root, &json!({"path": "docs/full.txt"}));
         assert!(out.ok, "{}", out.output);
-        assert_eq!(out.output.lines().last(), Some(format!("  100 {line}").as_str()), "the last line is shown");
+        assert_eq!(out.output.lines().last(), Some(format!("100 {last}").as_str()), "the last line is shown");
         assert_eq!(out.output.len(), MAX_READ_BYTES, "and nothing follows it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A line's number is not padded to a column. Every later request
+    /// re-sends a read whole, and five-column padding cost about two tokens a
+    /// line in each of them (13.7 to 16.3% of the tokens of recorded reads)
+    /// while telling the model nothing the number and its one space do not:
+    /// the text still starts right after the first space.
+    #[test]
+    fn read_file_numbers_lines_without_padding() {
+        let root = temp_project();
+        let text: String = (1..=12).map(|n| format!("  line {n}\n")).collect();
+        std::fs::write(root.join("docs/twelve.txt"), &text).unwrap();
+        let out = read_file(&root, &json!({"path": "docs/twelve.txt"}));
+        let lines: Vec<&str> = out.output.lines().collect();
+        assert_eq!((out.ok, lines[0], lines[9], lines[11]), (true, "1   line 1", "10   line 10", "12   line 12"));
+        assert_eq!(out.output.len(), text.len() + 9 * 2 + 3 * 3, "each line adds its digits and one space");
         let _ = std::fs::remove_dir_all(root);
     }
 
