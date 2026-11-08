@@ -313,6 +313,11 @@ impl<P: Copy + Ord> Selection<P> {
         (self.anchor.min(self.head), self.anchor.max(self.head))
     }
 
+    /// The endpoints as (low, high), or None when this covers no text.
+    pub fn bounds(&self) -> Option<(P, P)> {
+        (!self.is_empty()).then(|| self.ordered())
+    }
+
     /// The same selection with every point moved by `f`.
     pub fn map(self, f: impl Fn(P) -> P) -> Self {
         let (lo, hi) = self.origin;

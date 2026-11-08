@@ -1456,29 +1456,15 @@ impl Transcript {
 
     /// Highlight columns for an absolute wrapped history line.
     pub fn selection_columns(&mut self, line_idx: usize) -> Option<(usize, usize)> {
-        let selection = self.text_selection?;
-        if selection.is_empty() {
-            return None;
-        }
-        let (start, end) = selection.ordered();
+        let (start, end) = self.text_selection?.bounds()?;
         let (block, map) = self.row(line_idx)?;
         if block < start.block || block > end.block {
             return None;
         }
         let text = self.row_text(block, map)?;
-        let block_len = self.blocks.get(block)?.selectable_chars;
-        let range_start = if block == start.block {
-            start.offset
-        } else {
-            0
-        };
-        let range_end = if block == end.block {
-            // Inclusive of the release cell, matching selected_text: the
-            // highlight must cover exactly what a copy would carry.
-            end.offset.saturating_add(1).min(block_len)
-        } else {
-            block_len
-        };
+        // The same chars selected_text copies: the highlight must cover
+        // exactly what a copy would carry.
+        let (range_start, range_end) = covered_chars(start, end, block, self.blocks.get(block)?.selectable_chars);
         let local_start = range_start.max(map.start).min(map.end);
         let local_end = range_end.min(map.end).max(map.start);
         if local_start >= local_end {
@@ -1492,30 +1478,14 @@ impl Transcript {
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        let selection = self.text_selection?;
-        if selection.is_empty() {
-            return None;
-        }
-        let (start, end) = selection.ordered();
+        let (start, end) = self.text_selection?.bounds()?;
         if start.block >= self.blocks.len() || end.block >= self.blocks.len() {
             return None;
         }
         let mut parts = Vec::new();
         for block_index in start.block..=end.block {
             let block = &self.blocks[block_index];
-            let char_len = block.selectable_chars;
-            let from = if block_index == start.block {
-                start.offset.min(char_len)
-            } else {
-                0
-            };
-            let to = if block_index == end.block {
-                // Inclusive of the character under the release cell: a drag
-                // that ends ON the closing brace must copy the brace.
-                end.offset.saturating_add(1).min(char_len)
-            } else {
-                char_len
-            };
+            let (from, to) = covered_chars(start, end, block_index, block.selectable_chars);
             parts.push(slice_block_chars(block, from, to));
         }
         Some(parts.join("\n\n"))
@@ -1930,6 +1900,15 @@ fn surface_line(
         ));
     }
     line
+}
+
+/// The chars `from..to` of block `block`, `len` chars long, that the
+/// selection `start..=end` covers. Inclusive of the character under the
+/// release cell: a drag that ends ON the closing brace must copy the brace.
+fn covered_chars(start: TextPoint, end: TextPoint, block: usize, len: usize) -> (usize, usize) {
+    let from = if block == start.block { start.offset.min(len) } else { 0 };
+    let to = if block == end.block { end.offset.saturating_add(1).min(len) } else { len };
+    (from, to)
 }
 
 fn selection_contains_block(selection: Selection<TextPoint>, block: usize) -> bool {

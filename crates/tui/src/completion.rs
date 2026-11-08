@@ -34,30 +34,85 @@ const fn command(
     description: &'static str,
     submits: bool,
 ) -> CommandSpec {
-    CommandSpec { name, args, description, submits }
+    CommandSpec {
+        name,
+        args,
+        description,
+        submits,
+    }
 }
 
 pub const COMMANDS: &[CommandSpec] = &[
     command("help", "", "keybindings and commands", true),
     command("login", "[provider]", "sign in or configure a provider", true),
     command("logout", "[provider]", "remove saved provider credentials", true),
-    command("model", "[id]", "pick a configured model or use an exact id", true),
+    command(
+        "model",
+        "[id]",
+        "pick a configured model or use an exact id",
+        true,
+    ),
     command("effort", "[level]", "choose reasoning effort (model-dependent)", true),
-    command("provider", "[name]", "pick a configured provider and model", false),
+    command(
+        "provider",
+        "[name]",
+        "pick a configured provider and model",
+        false,
+    ),
     command("permissions", "[auto|ask|readonly]", "choose saved project permissions", true),
-    command("approvals", "auto|ask|readonly", "alias for /permissions", false),
+    command(
+        "approvals",
+        "auto|ask|readonly",
+        "alias for /permissions",
+        false,
+    ),
     command("new", "", "start a fresh session", true),
     command("fork", "", "branch this session into a new one and switch to it", true),
-    command("rewind", "<turn>", "branch this session at the end of a turn and switch to it", false),
-    command("resume", "", "pick an earlier session in this project", true),
+    command(
+        "rewind",
+        "<turn>",
+        "branch this session at the end of a turn and switch to it",
+        false,
+    ),
+    command(
+        "resume",
+        "",
+        "pick an earlier session in this project",
+        true,
+    ),
     command("copy", "", "copy the latest assistant response", true),
-    command("export", "[path]", "write the whole transcript to a markdown file", true),
+    command(
+        "export",
+        "[path]",
+        "write the whole transcript to a markdown file",
+        true,
+    ),
     command("tools", "", "list tools frozen for this session", true),
     command("skills", "", "list skills frozen for this session", true),
-    command("reload", "", "re-freeze tools, skills, and prompt from current config", true),
-    command("compact", "", "prune history to the compacted target now", true),
-    command("context", "", "prompt token costs, cache hits, and budget", true),
-    command("status", "", "endpoint, cache, performance, privacy, and network details", true),
+    command(
+        "reload",
+        "",
+        "re-freeze tools, skills, and prompt from current config",
+        true,
+    ),
+    command(
+        "compact",
+        "",
+        "prune history to the compacted target now",
+        true,
+    ),
+    command(
+        "context",
+        "",
+        "prompt token costs, cache hits, and budget",
+        true,
+    ),
+    command(
+        "status",
+        "",
+        "endpoint, cache, performance, privacy, and network details",
+        true,
+    ),
     command("quit", "", "exit", true),
 ];
 

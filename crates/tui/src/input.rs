@@ -895,7 +895,7 @@ impl Composer {
 
     /// Selection as (low, high) logical points, or `None` when it is empty.
     fn selection_bounds(&self) -> Option<(Point, Point)> {
-        self.selection.filter(|selection| !selection.is_empty()).map(|selection| selection.ordered())
+        self.selection?.bounds()
     }
 
     /// The highlighted text, newline-joined across logical lines.
@@ -1023,38 +1023,19 @@ fn boundary_iter(s: &str) -> impl Iterator<Item = usize> + '_ {
     }))
 }
 
+/// The last boundary before `col`, or 0 at the start of `s`.
 fn previous_grapheme_boundary(s: &str, col: usize) -> usize {
-    let mut prev = 0;
-    for boundary in boundary_iter(s) {
-        if boundary >= col {
-            break;
-        }
-        prev = boundary;
-    }
-    prev
+    boundary_iter(s).take_while(|&boundary| boundary < col).last().unwrap_or(0)
 }
 
+/// The first boundary after `col`, or the final one, the char count of `s`.
 fn next_grapheme_boundary(s: &str, col: usize) -> usize {
-    // Falls through to the final boundary, which is the char count of `s`.
-    let mut last = 0;
-    for boundary in boundary_iter(s) {
-        if boundary > col {
-            return boundary;
-        }
-        last = boundary;
-    }
-    last
+    boundary_iter(s).find(|&boundary| boundary > col).unwrap_or_else(|| s.chars().count())
 }
 
+/// The last boundary at or before `col`.
 fn floor_grapheme_boundary(s: &str, col: usize) -> usize {
-    let mut prev = 0;
-    for boundary in boundary_iter(s) {
-        if boundary > col {
-            break;
-        }
-        prev = boundary;
-    }
-    prev
+    boundary_iter(s).take_while(|&boundary| boundary <= col).last().unwrap_or(0)
 }
 
 #[cfg(test)]
