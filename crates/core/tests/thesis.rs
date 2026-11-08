@@ -469,7 +469,7 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// 195,365 prompt tokens) on Chat Completions, 85.51% (168,222 of 196,730) on
 /// Responses and 84.34% (70,531 of 83,630) on native Messages. A byte count,
 /// so it holds in debug and release alike. Once the note was stored where it
-/// changes rather than sent after the history, they were 86.60%, 86.62% and
+/// changes rather than sent after the history, they were 86.61%, 86.62% and
 /// 87.02%.
 ///
 /// Where a provider's cache ends its entries at message or block boundaries
@@ -488,7 +488,7 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// (166,870 of 196,910 prompt tokens). With no block marked, the native
 /// Messages share was 0.00%; measured when its ratchet was set, 82.81%
 /// (69,363 of 83,762). Once the note was stored where it changes, the two
-/// read back 85.84% and 86.14%.
+/// read back 85.85% and 86.14%.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_prompt_is_75_percent_cacheable() {
     cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0, None).await;
@@ -1014,7 +1014,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
 /// every request after the second short of repeating the one before it,
 /// native Messages replaying 8 of 36 thinking blocks, and 74.59%
 /// (Responses) and 74.33% (native Messages) billed; stored, 36 of 36,
-/// 76.72% and 76.64%. A byte count, so it holds in debug and release.
+/// 76.74% and 76.67%. A byte count, so it holds in debug and release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_note_is_stored_once_where_it_changes() {
     let mut failures = Vec::new();

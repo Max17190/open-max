@@ -1,8 +1,8 @@
 //! The /context block: where each request of the session spends its tokens
-//! (the frozen prompt and tools, then any note of changes stored in the
-//! history), plus the live cache-hit and budget state. Every line here is
-//! sent on every request, so the point is to make the cost of each component
-//! visible.
+//! (the frozen prompt and tools, then the latest note of changes, stored in
+//! the history the budget counts), plus the live cache-hit and budget state.
+//! Every line here is sent on every request, so the point is to make the
+//! cost of each component visible.
 
 use open_max_core::prompt::PromptBreakdown;
 use open_max_core::types::estimate_tokens as tok;
@@ -118,11 +118,10 @@ pub fn context_block(
 
     if !breakdown.note.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  note (changes since the prompt, stored in the history when they change)".to_string(),
+            "  latest note (changes since the prompt; history, counted in the budget, not here)".to_string(),
             Style::default().fg(theme::DIM()),
         )));
         for (label, chars) in &breakdown.note {
-            total_chars += chars;
             lines.push(row(label, tok(*chars), ""));
         }
     }
@@ -192,13 +191,14 @@ mod tests {
         assert_eq!(a.find('~'), b.find('~'), "{a:?} vs {b:?}");
     }
 
-    /// The note's components are rows of their own after the prompt's and
-    /// count toward the per-request total once, as a tool file's entry in the
-    /// tools array does; a skill's and a memory's index lines are already
-    /// inside the prompt's sections, so their rows only itemize them, and are
-    /// absent when there are none.
+    /// The latest note's components are rows of their own after the prompt's
+    /// and stay out of the per-request total: the note is history, stored
+    /// once per change, which the budget line counts with every earlier note.
+    /// A skill's and a memory's index lines are already inside the prompt's
+    /// sections, so their rows only itemize them, and are absent when there
+    /// are none.
     #[test]
-    fn the_note_rows_count_once_toward_the_total() {
+    fn the_note_rows_follow_the_prompt_and_stay_out_of_the_total() {
         let bd = PromptBreakdown {
             components: vec![("base rules".into(), 400)],
             note: vec![("note header".into(), 52), ("tool files changes".into(), 100)],
@@ -208,10 +208,10 @@ mod tests {
         };
         let lines: Vec<String> = context_block(&bd, Provenance::Frozen, None, None, None).iter().map(plain).collect();
         let at = |label: &str| lines.iter().position(|l| l.trim_start().starts_with(label)).unwrap_or_else(|| panic!("no {label} row: {lines:#?}"));
-        assert!(at("memory (1)") < at("note (changes") && at("note (changes") < at("note header"), "{lines:#?}");
+        assert!(at("memory (1)") < at("latest note (") && at("latest note (") < at("note header"), "{lines:#?}");
         assert!(lines[at("tool files changes")].contains("~   25 tok"), "{lines:#?}");
         assert!(lines[at("external tools (1)")].contains("~   15 tok"), "{lines:#?}");
-        assert!(lines[at("total per request")].contains(&format!("~{:>5} tok", (400 + 200 + 60 + 52 + 100) / 4)), "{lines:#?}");
+        assert!(lines[at("total per request")].contains(&format!("~{:>5} tok", (400 + 200 + 60) / 4)), "{lines:#?}");
         assert!(lines[at("skills (1)")].contains("~    0 tok") && lines[at("skills (1)")].contains("release 10"), "{lines:#?}");
         assert!(lines[at("memory (1)")].contains("~    0 tok") && lines[at("memory (1)")].contains("build 8"), "{lines:#?}");
         let none = PromptBreakdown { skills: Vec::new(), memory: Vec::new(), ..bd.clone() };
@@ -219,7 +219,7 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("skills (") || l.contains("memory (")), "no rows for none: {lines:#?}");
         let without = PromptBreakdown { note: Vec::new(), ..bd };
         let lines: Vec<String> = context_block(&without, Provenance::Frozen, None, None, None).iter().map(plain).collect();
-        assert!(!lines.iter().any(|l| l.contains("note (changes")), "no note, no note heading: {lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("latest note (")), "no note, no note heading: {lines:#?}");
     }
 
     /// Three provenances, three true sentences. A resumed session's next

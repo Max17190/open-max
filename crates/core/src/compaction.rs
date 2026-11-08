@@ -506,11 +506,15 @@ pub(crate) async fn compact_messages(
     }
     // The head the prune pins, and so the index its digest note takes.
     let head = pinned_head(messages);
+    // A prune that drops or shortens the stored note stores it again after
+    // it, so the prune keeps room for it.
+    let note = ctx.core.sessions.lock().await.get(ctx.session_id).and_then(|data| data.trailing_note.clone());
+    let room = note.as_deref().map_or(0, |note| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + note.len()));
     let mut candidate = messages.clone();
     let (changed, digest) = if force {
-        prune_transcript(&mut candidate, trigger, schema_tokens, total)
+        prune_transcript(&mut candidate, trigger, schema_tokens + room, total + room)
     } else {
-        enforce_budget(&mut candidate, trigger, schema_tokens)
+        enforce_budget(&mut candidate, trigger, schema_tokens + room)
     };
     if !changed { return Ok(0); }
     // A hydration repair still waiting for a save lands first, with its
@@ -532,8 +536,6 @@ pub(crate) async fn compact_messages(
         Some(digest) => prepare_compaction_digest(ctx, &mut candidate, digest, spend).await,
         None => (Vec::new(), None),
     };
-    // A prune that dropped or shortened the stored note stores it again.
-    let note = ctx.core.sessions.lock().await.get(ctx.session_id).and_then(|data| data.trailing_note.clone());
     crate::notes::store_note(&mut candidate, note.as_deref());
     sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, record.as_ref(), messages.len(), head)?;
     if let Some(data) = ctx.core.sessions.lock().await.get_mut(ctx.session_id) {
@@ -1260,6 +1262,55 @@ pub(crate) mod tests {
             "an empty record would make last_compaction return it and kill the \
              structured carry-forward absorb_prior depends on"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The note is stored in the history, so a prune that shortens or drops
+    /// the message holding it stores it again at the end, and keeps room for
+    /// it: the transcript it leaves, the note restored, still meets its
+    /// target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prune_keeps_room_for_the_note_it_stores_again() {
+        use crate::state::{CancelToken, Core};
+
+        let dir = std::env::temp_dir().join(format!("openmax-note-room-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let settings = {
+            // A refused connection: the summary falls back to the digest.
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.context_tokens = Some(16384);
+            s.clone()
+        };
+        let note = format!("{}\n\n{}", crate::prompt::NOTE_HEADER, "- wordfreq: top-n words {}\n".repeat(150));
+        let mut data = crate::transcript::build_session_data(&core, &id, &project).unwrap();
+        data.trailing_note = Some(Arc::from(note.as_str()));
+        core.sessions.lock().await.insert(id.clone(), data);
+        let mut messages = vec![msg("system", 100), msg("user", 100)];
+        for i in 0..12 {
+            messages.push(assistant_with_tools("read_file", &format!(r#"{{"path":"src/{i}.rs"}}"#)));
+            messages.push(msg("tool", 2500));
+        }
+        let stored = messages[3].content.take().unwrap();
+        messages[3].content = Some(format!("{stored}{}{note}", crate::prompt::NOTE_SEPARATOR));
+
+        let endpoint = crate::providers::resolve(&settings, &core.data_dir).unwrap();
+        let client = ChatClient::from_endpoint(&endpoint);
+        let hooks = Hooks::discover(&project, &core.data_dir);
+        let cancelled = Arc::new(CancelToken::default());
+        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &project, client: &client, hooks: &hooks, cancelled: &cancelled };
+        let budget = 6000;
+        compact_messages(&ctx, &mut messages, budget, 0, false, &mut RequestSpend::new(None)).await.unwrap();
+        let carried: Vec<&str> = messages.iter().filter_map(|m| m.content.as_deref()).filter(|c| c.contains(crate::prompt::NOTE_HEADER)).collect();
+        assert_eq!(carried.len(), 1, "the note is stored again, once");
+        assert!(messages.last().unwrap().content.as_deref().unwrap().ends_with(&note), "at the end");
+        let total: usize = messages.iter().map(ChatMessage::estimated_tokens).sum();
+        assert!(total <= achievable_target(budget, 0), "the transcript is {total} tokens, past the prune's target {}", achievable_target(budget, 0));
 
         let _ = std::fs::remove_dir_all(dir);
     }
