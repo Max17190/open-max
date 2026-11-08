@@ -107,9 +107,8 @@ pub(crate) struct CompactionDigest {
     dropped_text: String,
     /// Total chars `dropped_text` may hold, budget-scaled by the caller.
     text_cap: usize,
-    /// Every dropped message in full, for the lossless archive the digest
-    /// note's address points at. Transient: held only until the prune's
-    /// archive append, never sent to the model.
+    /// Every message as dropped, held until the archive append. Originals
+    /// of tool outputs shortened before the drop are in `truncated`.
     dropped: Vec<ChatMessage>,
     /// Pre-truncation originals of tool outputs phase 1 cut in place: that
     /// edit is as destructive as a drop, so the archive covers it too.
@@ -126,7 +125,7 @@ impl CompactionDigest {
         !self.dropped.is_empty() || !self.truncated.is_empty()
     }
 
-    fn record_message(&mut self, msg: &ChatMessage) {
+    fn record_message(&mut self, msg: &ChatMessage, original_index: Option<usize>) {
         self.message_count += 1;
         self.dropped.push(msg.clone());
         // Cap by bytes so a single tool-call-heavy assistant message cannot
@@ -134,7 +133,17 @@ impl CompactionDigest {
         let remaining = self.text_cap.saturating_sub(self.dropped_text.len());
         if remaining > 0 {
             let mut line = format!("{}: ", msg.role);
-            if let Some(c) = msg.content.as_deref() {
+            let source = original_index.map_or(msg, |index| &self.truncated[index]);
+            if let Some(c) = source.content.as_deref() {
+                // An original tool result can end with a toolbox note.
+                // The live transcript carries the current note separately.
+                let c = if original_index.is_some() {
+                    c.split_once(crate::prompt::NOTE_HEADER)
+                        .filter(|(body, _)| body.ends_with(crate::prompt::NOTE_SEPARATOR))
+                        .map_or(c, |(body, _)| body)
+                } else {
+                    c
+                };
                 line.push_str(&excerpt(c.trim()));
             }
             if let Some(calls) = &msg.tool_calls {
@@ -881,14 +890,16 @@ fn prune_transcript(
     // Fixed for the whole prune: once an exchange is dropped, later user
     // messages would join the opening run and pin themselves.
     let head = pinned_head(messages);
-    let keep_tail = messages.len().saturating_sub(6);
+    let original_len = messages.len();
+    let keep_tail = original_len.saturating_sub(6);
     // What the transcript will still be about once this prune is done: the
     // original request plus the surviving tail. Truncation keeps the slice of
     // each old tool output that speaks to *this*, so the bytes that stay are
     // the ones the live conversation refers to.
     let live_context = live_context(messages, head, keep_tail);
     let mut digest = CompactionDigest::new(dropped_text_cap(budget));
-    let mut truncated = false;
+    // Sorted by transcript position, in the same order as digest.truncated.
+    let mut truncated_positions = Vec::new();
     // Room for the note a truncation-only prune leaves below, so meeting the
     // target and then gaining the note cannot end above it. Zero when the
     // slot after the head already holds a real digest note: that note carries
@@ -900,10 +911,11 @@ fn prune_transcript(
         TRUNCATION_NOTE_ALLOWANCE_TOKENS
     };
     let mut reached = false;
-    for msg in messages.iter_mut().take(keep_tail).skip(1) {
+    for (index, msg) in messages.iter_mut().enumerate().take(keep_tail).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
                 if c.len() > 600 {
+                    truncated_positions.push(index);
                     digest.truncated.push(msg.clone());
                     let window = crate::recall::salient_window(c, &live_context, TRUNCATED_WIDTH);
                     let lead = if window.start > 0 { "…" } else { "" };
@@ -913,7 +925,6 @@ fn prune_transcript(
                         &c[window.clone()]
                     ));
                     total = total.saturating_sub(old).saturating_add(msg.estimated_tokens());
-                    truncated = true;
                 }
             }
         }
@@ -931,16 +942,25 @@ fn prune_transcript(
         }
         return (true, Some(digest).filter(CompactionDigest::has_archive_material));
     }
+    let remove_and_record =
+        |messages: &mut Vec<ChatMessage>, digest: &mut CompactionDigest, slot| {
+            // Match by original position, since tool call IDs can repeat.
+            // From the drop slot onward, the messages are still a suffix
+            // of the original transcript after inserting or replacing a note.
+            let position = original_len - (messages.len() - slot);
+            let removed = messages.remove(slot);
+            let original_index = truncated_positions.binary_search(&position).ok();
+            digest.record_message(&removed, original_index);
+            removed
+        };
     // Drop whole exchanges starting after the pinned head. Keep tool
     // replies consistent with the assistant message that requested them.
     while total > target && messages.len() > head + 4 {
-        let removed = messages.remove(head);
-        digest.record_message(&removed);
+        let removed = remove_and_record(messages, &mut digest, head);
         total = total.saturating_sub(removed.estimated_tokens());
         if removed.role == "assistant" && removed.tool_calls.is_some() {
             while messages.len() > head && messages[head].role == "tool" {
-                let tool = messages.remove(head);
-                digest.record_message(&tool);
+                let tool = remove_and_record(messages, &mut digest, head);
                 total = total.saturating_sub(tool.estimated_tokens());
             }
         }
@@ -959,13 +979,11 @@ fn prune_transcript(
         // faithful summary of everything removed (not only the first pass).
         total = schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
         while total > target && messages.len() > head + 4 {
-            let removed = messages.remove(head + 1);
-            digest.record_message(&removed);
+            let removed = remove_and_record(messages, &mut digest, head + 1);
             total = total.saturating_sub(removed.estimated_tokens());
             if removed.role == "assistant" && removed.tool_calls.is_some() {
                 while messages.len() > head + 1 && messages[head + 1].role == "tool" {
-                    let tool = messages.remove(head + 1);
-                    digest.record_message(&tool);
+                    let tool = remove_and_record(messages, &mut digest, head + 1);
                     total = total.saturating_sub(tool.estimated_tokens());
                 }
             }
@@ -977,7 +995,7 @@ fn prune_transcript(
         }
         (true, Some(digest))
     } else {
-        (truncated, Some(digest).filter(CompactionDigest::has_archive_material))
+        (!digest.truncated.is_empty(), Some(digest).filter(CompactionDigest::has_archive_material))
     }
 }
 
@@ -1005,6 +1023,88 @@ pub(crate) mod tests {
                 extra_content: None,
             }]),
         )
+    }
+
+    #[tokio::test]
+    async fn summary_reads_originals_when_inserting_a_digest_note() {
+        assert_summary_reads_originals(false).await;
+    }
+
+    #[tokio::test]
+    async fn summary_reads_originals_when_replacing_a_digest_note() {
+        assert_summary_reads_originals(true).await;
+    }
+
+    async fn assert_summary_reads_originals(replace_note: bool) {
+        const BUDGET: usize = 4_000;
+        let mut messages = vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("Find the build result."),
+        ];
+        let tails = [
+            "the first build failed",
+            "the second build passed",
+            "the third build timed out",
+        ];
+        let mut originals = tails.map(|tail| format!("build result\n{}\n{tail}", "x".repeat(4_000)));
+        let (separator, header) = (crate::prompt::NOTE_SEPARATOR, crate::prompt::NOTE_HEADER);
+        originals[2].push_str(&format!("{separator}{header}\n{}", "n".repeat(300)));
+        for (index, original) in originals.iter().enumerate() {
+            if index == 2 && replace_note {
+                messages.push(ChatMessage::user("[context note: previous]"));
+            }
+            messages.push(assistant_with_tools("bash", r#"{"command":"make"}"#));
+            // IDs can be reused across exchanges or missing in a saved transcript.
+            let mut tool = ChatMessage::tool("call_1", original);
+            if index == 2 {
+                tool.tool_call_id = None;
+            }
+            messages.push(tool);
+        }
+        // After two exchanges drop, the third fits until the digest note is
+        // added. This puts a shortened output in the second drop pass.
+        messages.extend((0..6).map(|_| msg("assistant", 1_760)));
+
+        let (url, requests) = crate::client::tests::spawn_recording_once(concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Build results recorded.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ).into());
+        let dir = std::env::temp_dir().join(format!("openmax-summary-{}", uuid::Uuid::new_v4()));
+        let (core, _) = Core::new(dir.clone()).unwrap();
+        let session_id = sessions::create(&core, dir.display().to_string()).unwrap().id;
+        let ctx = CompactionCtx {
+            core: &core,
+            session_id: &session_id,
+            project_root: &dir,
+            client: &ChatClient::new(url, None, "fixture".into(), None, 512),
+            hooks: &Hooks::default(),
+            cancelled: &Arc::new(CancelToken::default()),
+        };
+        assert!(sessions::save_messages(&core, &session_id, &messages, &mut 0, true));
+        let dropped = compact_messages(
+            &ctx, &mut messages, BUDGET, 0, false, &mut RequestSpend::new(None),
+        ).await.unwrap();
+        let archive = sessions::load_archive(&core, &session_id);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(dropped, 6, "all three exchanges must be dropped");
+        let archived_outputs: Vec<_> = archive.iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert_eq!(archived_outputs.len(), 6, "the archive holds the originals and the stubs");
+        assert_eq!(archived_outputs[..3], originals);
+        assert!(archived_outputs[3..].iter().all(|stub| !tails.iter().any(|tail| stub.contains(tail))));
+        assert_eq!(messages[1].content.as_deref(), Some("Find the build result."));
+        assert!(messages[2].content.as_deref().unwrap().contains("Summary: Build results recorded."));
+        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let wire: Value = serde_json::from_str(body).unwrap();
+        let input = wire["messages"][1]["content"].as_str().unwrap();
+        assert!(!input.contains(header), "the toolbox note stays out of the summary");
+        let positions = tails.map(|tail| input.find(tail).unwrap_or_else(|| panic!("missing {tail:?}")));
+        assert!(positions[0] < positions[1] && positions[1] < positions[2], "the summary follows transcript order");
+        assert!(input.len() <= dropped_text_cap(BUDGET));
     }
 
     #[test]
@@ -1491,16 +1591,16 @@ pub(crate) mod tests {
     #[test]
     fn digest_captures_dropped_text_for_summarization() {
         let mut digest = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
-        digest.record_message(&ChatMessage::user("implement the auth flow"));
-        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/auth.rs"}"#));
-        digest.record_message(&msg("tool", 5000));
+        digest.record_message(&ChatMessage::user("implement the auth flow"), None);
+        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/auth.rs"}"#), None);
+        digest.record_message(&msg("tool", 5000), None);
         let text = &digest.dropped_text;
         assert!(text.contains("user: implement the auth flow"), "{text}");
         assert!(text.contains("[called read_file"), "{text}");
         // Hard char cap: a tool-call-heavy message and many follow-ups stay in bound.
         assert!(digest.dropped_text.chars().count() <= DROPPED_TEXT_CAP_FLOOR);
         for _ in 0..100 {
-            digest.record_message(&msg("assistant", 500));
+            digest.record_message(&msg("assistant", 500), None);
         }
         assert!(
             digest.dropped_text.chars().count() <= DROPPED_TEXT_CAP_FLOOR,
@@ -1525,7 +1625,7 @@ pub(crate) mod tests {
             ),
         );
         let mut heavy = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
-        heavy.record_message(&many_calls);
+        heavy.record_message(&many_calls, None);
         assert!(
             heavy.dropped_text.chars().count() <= DROPPED_TEXT_CAP_FLOOR,
             "tool-call flood must respect cap, got {}",
@@ -1548,7 +1648,7 @@ pub(crate) mod tests {
         let mut digest = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
         let mut body = "x".repeat(4_000);
         body.push_str("\nerror[E0716]: temporary value dropped while borrowed at src/agent.rs:99");
-        digest.record_message(&ChatMessage::tool("c1", body));
+        digest.record_message(&ChatMessage::tool("c1", body), None);
         let text = &digest.dropped_text;
         assert!(text.contains("error[E0716]"), "tail needle must survive: {text}");
         assert!(text.contains("chars elided"), "elision must be visible: {text}");
@@ -1571,7 +1671,7 @@ pub(crate) mod tests {
     #[test]
     fn digest_absorbs_prior_record_within_caps() {
         let mut digest = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
-        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/new.rs"}"#));
+        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/new.rs"}"#), None);
         let prior = sessions::CompactionRecord {
             ts: 1,
             message_count: 4,
@@ -1898,18 +1998,18 @@ pub(crate) mod tests {
         digest.record_message(&assistant_with_tools(
             &"t".repeat(MAX_DIGEST_TOOL_BYTES + 1),
             &format!("{{\"path\":\"{}\"}}", "p".repeat(MAX_DIGEST_PATH_BYTES * 40)),
-        ));
+        ), None);
         // Multibyte entries under the old char caps but over the byte caps:
         // the allowance is bytes/4, so these must be rejected too.
         digest.record_message(&assistant_with_tools(
             &"Ā".repeat(40),
             &format!("{{\"path\":\"{}\"}}", "€".repeat(100)),
-        ));
-        digest.record_message(&ChatMessage::user("€".repeat(400)));
+        ), None);
+        digest.record_message(&ChatMessage::user("€".repeat(400)), None);
         digest.record_message(&assistant_with_tools(
             "read_file",
             "{\"path\":\"src/lib.rs\"}",
-        ));
+        ), None);
         digest.absorb_prior(&sessions::CompactionRecord {
             ts: 0,
             message_count: 9,
