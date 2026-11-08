@@ -122,21 +122,27 @@ impl ChatMessage {
             .map(|digest| (digest, self.tool_call_id.as_deref()))
     }
 
-    /// Rough size estimate used for context budgeting, plus a small constant
-    /// for the role/envelope bytes every message pays. Reasoning and the
-    /// provider data beside it count: they ride every later request, and a
-    /// server that leaves them out of the prompt only makes this an
-    /// overestimate, which compacts a little early.
+    /// Rough size estimate of the stored message, including reasoning.
     pub fn estimated_tokens(&self) -> usize {
+        self.estimated_tokens_with_replay(true, true)
+    }
+
+    pub(crate) fn estimated_tokens_with_replay(&self, replay: bool, plain: bool) -> usize {
         let mut chars = self.content.as_deref().map(str::len).unwrap_or(0);
-        for reasoning in [&self.reasoning_content, &self.reasoning].into_iter().flatten() {
-            chars += reasoning.len();
+        if plain {
+            for reasoning in [&self.reasoning_content, &self.reasoning].into_iter().flatten() {
+                chars += reasoning.len();
+            }
         }
-        chars += self.reasoning_details.as_deref().map_or(0, |d| d.get().len());
+        if replay {
+            chars += self.reasoning_details.as_deref().map_or(0, |d| d.get().len());
+        }
         if let Some(calls) = &self.tool_calls {
             for c in calls {
                 chars += c.function.name.len() + c.function.arguments.len() + 16;
-                chars += c.extra_content.as_deref().map_or(0, |e| e.get().len());
+                if replay {
+                    chars += c.extra_content.as_deref().map_or(0, |e| e.get().len());
+                }
             }
         }
         estimate_tokens(chars) + 8

@@ -446,6 +446,7 @@ pub(crate) struct CompactionCtx<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) project_root: &'a Path,
     pub(crate) client: &'a ChatClient,
+    pub(crate) estimate: &'a (dyn Fn(&ChatMessage) -> usize + Sync),
     pub(crate) hooks: &'a Hooks,
     pub(crate) cancelled: &'a Arc<CancelToken>,
 }
@@ -520,7 +521,7 @@ pub(crate) async fn compact_messages(
     force: bool,
     spend: &mut RequestSpend,
 ) -> Result<usize, String> {
-    let total = schema_tokens + messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+    let total = schema_tokens + messages.iter().map(ctx.estimate).sum::<usize>();
     if (!force && total <= trigger) || schemas_exceed_budget(trigger, schema_tokens) {
         return Ok(0);
     }
@@ -535,9 +536,9 @@ pub(crate) async fn compact_messages(
     let room = note.as_deref().map_or(0, |note| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + note.len()));
     let mut candidate = messages.clone();
     let (changed, digest) = if force {
-        prune_transcript(&mut candidate, trigger, schema_tokens + room, total + room)
+        prune_transcript(&mut candidate, trigger, schema_tokens + room, total + room, ctx.estimate)
     } else {
-        enforce_budget(&mut candidate, trigger, schema_tokens + room)
+        enforce_budget(&mut candidate, trigger, schema_tokens + room, ctx.estimate)
     };
     if !changed { return Ok(0); }
     // A hydration repair still waiting for a save lands first, with its
@@ -739,6 +740,7 @@ pub(crate) fn compaction_trigger(
     ceiling: usize,
     ratio: Option<f64>,
     messages: &[ChatMessage],
+    estimate: &dyn Fn(&ChatMessage) -> usize,
 ) -> usize {
     let trigger = requested_trigger(ceiling, ratio, budget);
     if trigger == budget || schemas_outgrow_budget(trigger, schema_tokens) {
@@ -751,7 +753,7 @@ pub(crate) fn compaction_trigger(
         + messages[..head]
             .iter()
             .chain(&messages[tail..])
-            .map(ChatMessage::estimated_tokens)
+            .map(estimate)
             .sum::<usize>();
     if prune_target(trigger) < irreducible {
         budget
@@ -886,9 +888,10 @@ pub(crate) fn enforce_budget(
     messages: &mut Vec<ChatMessage>,
     budget: usize,
     schema_tokens: usize,
+    estimate: &dyn Fn(&ChatMessage) -> usize,
 ) -> (bool, Option<CompactionDigest>) {
     let total: usize =
-        schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        schema_tokens + messages.iter().map(estimate).sum::<usize>();
     if total <= budget {
         return (false, None);
     }
@@ -899,7 +902,7 @@ pub(crate) fn enforce_budget(
     if schemas_exceed_budget(budget, schema_tokens) {
         return (false, None);
     }
-    prune_transcript(messages, budget, schema_tokens, total)
+    prune_transcript(messages, budget, schema_tokens, total, estimate)
 }
 
 /// The prune itself, shared by the budget path and the forced `/compact`,
@@ -912,6 +915,7 @@ fn prune_transcript(
     budget: usize,
     schema_tokens: usize,
     mut total: usize,
+    estimate: &dyn Fn(&ChatMessage) -> usize,
 ) -> (bool, Option<CompactionDigest>) {
     let target = achievable_target(budget, schema_tokens);
     // Fixed for the whole prune: once an exchange is dropped, later user
@@ -945,12 +949,12 @@ fn prune_transcript(
                     digest.truncated.push(msg.clone());
                     let window = crate::recall::salient_window(c, &live_context, TRUNCATED_WIDTH);
                     let lead = if window.start > 0 { "…" } else { "" };
-                    let old = msg.estimated_tokens();
+                    let old = estimate(msg);
                     msg.content = Some(format!(
                         "{lead}{}\n…[older tool output truncated]",
                         &c[window.clone()]
                     ));
-                    total = total.saturating_sub(old).saturating_add(msg.estimated_tokens());
+                    total = total.saturating_sub(old).saturating_add(estimate(msg));
                 }
             }
         }
@@ -978,11 +982,11 @@ fn prune_transcript(
     // replies consistent with the assistant message that requested them.
     while total > target && messages.len() > head + 4 {
         let removed = remove_and_record(messages, &mut digest, head);
-        total = total.saturating_sub(removed.estimated_tokens());
+        total = total.saturating_sub(estimate(&removed));
         if removed.role == "assistant" && removed.tool_calls.is_some() {
             while messages.len() > head && messages[head].role == "tool" {
                 let tool = remove_and_record(messages, &mut digest, head);
-                total = total.saturating_sub(tool.estimated_tokens());
+                total = total.saturating_sub(estimate(&tool));
             }
         }
     }
@@ -998,14 +1002,14 @@ fn prune_transcript(
         // append-only and does not re-mutate history for another prune.
         // Record dropped messages into the same digest so the note stays a
         // faithful summary of everything removed (not only the first pass).
-        total = schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        total = schema_tokens + messages.iter().map(estimate).sum::<usize>();
         while total > target && messages.len() > head + 4 {
             let removed = remove_and_record(messages, &mut digest, head + 1);
-            total = total.saturating_sub(removed.estimated_tokens());
+            total = total.saturating_sub(estimate(&removed));
             if removed.role == "assistant" && removed.tool_calls.is_some() {
                 while messages.len() > head + 1 && messages[head + 1].role == "tool" {
                     let tool = remove_and_record(messages, &mut digest, head + 1);
-                    total = total.saturating_sub(tool.estimated_tokens());
+                    total = total.saturating_sub(estimate(&tool));
                 }
             }
         }
@@ -1099,6 +1103,7 @@ pub(crate) mod tests {
             session_id: &session_id,
             project_root: &dir,
             client: &ChatClient::new(url, None, "fixture".into(), None, 512),
+            estimate: &ChatMessage::estimated_tokens,
             hooks: &Hooks::default(),
             cancelled: &Arc::new(CancelToken::default()),
         };
@@ -1151,7 +1156,7 @@ pub(crate) mod tests {
         }
         messages.extend((0..6).map(|_| msg("assistant", 400)));
         assert!(sessions::save_messages(&core, &id, &messages, &mut 0, true));
-        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, hooks: &hooks, cancelled: &cancelled };
+        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled };
         let mut spend = RequestSpend::new(None);
         assert_eq!(compact_messages(&ctx, &mut messages, BUDGET, 0, false, &mut spend).await.unwrap(), 0);
         let archive = sessions::archive_display(&core, &id);
@@ -1170,7 +1175,7 @@ pub(crate) mod tests {
             assert!(!tails.iter().any(|tail| content.contains(tail)));
         }
         messages.extend((0..2).map(|_| msg("assistant", 3_000)));
-        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, hooks: &hooks, cancelled: &cancelled };
+        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled };
         assert!(compact_messages(&ctx, &mut messages, BUDGET, 0, false, &mut spend).await.unwrap() > 0);
         assert!(std::fs::read(&archive).unwrap().starts_with(&first_archive));
         let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1205,7 +1210,7 @@ pub(crate) mod tests {
             messages.push(msg("assistant", 2000));
             messages.push(msg("user", 2000));
         }
-        let _ = enforce_budget(&mut messages, 2000, 0);
+        let _ = enforce_budget(&mut messages, 2000, 0, &ChatMessage::estimated_tokens);
         // Floor is system + first user + digest + a short tail (post-digest
         // drops may trim one more exchange when the digest itself overshoots).
         assert!(messages.len() >= 6 && messages.len() <= 7, "len={}", messages.len());
@@ -1231,7 +1236,7 @@ pub(crate) mod tests {
             // Truncation keeps the slice of old output that speaks to what
             // stays, so the relevance signal must read the request too.
             assert!(live_context(&messages, pinned_head(&messages), messages.len() - 6).contains("the task"));
-            let (changed, digest) = enforce_budget(&mut messages, 2000, 0);
+            let (changed, digest) = enforce_budget(&mut messages, 2000, 0, &ChatMessage::estimated_tokens);
             assert!(changed && digest.is_some_and(|d| d.message_count > 0));
             assert_eq!(messages[1].content.as_deref(), Some(note.as_str()));
             assert_eq!(messages[2].content.as_deref(), Some("the task"));
@@ -1262,7 +1267,7 @@ pub(crate) mod tests {
                 messages.push(msg("assistant", 2000));
                 messages.push(msg("user", 2000));
             }
-            let (changed, digest) = enforce_budget(&mut messages, 2000, 0);
+            let (changed, digest) = enforce_budget(&mut messages, 2000, 0, &ChatMessage::estimated_tokens);
             assert!(changed && digest.is_some_and(|d| d.message_count > 0));
             assert_eq!(messages[1].content.as_deref(), Some(note.as_str()));
             assert_eq!(messages[2].content.as_deref(), Some(saved.as_str()));
@@ -1291,7 +1296,7 @@ pub(crate) mod tests {
             messages.push(msg("user", 100));
             messages.push(msg("assistant", 100));
         }
-        let (changed, digest) = enforce_budget(&mut messages, 700, 0);
+        let (changed, digest) = enforce_budget(&mut messages, 700, 0, &ChatMessage::estimated_tokens);
         assert!(changed);
         let digest = digest.expect("truncation is destructive, so it must reach the archive");
         assert_eq!(digest.message_count, 0, "no exchanges dropped, so no digest note");
@@ -1332,7 +1337,7 @@ pub(crate) mod tests {
         messages.push(msg("user", 100));
         messages.push(msg("assistant", 2640));
 
-        let (changed, digest) = enforce_budget(&mut messages, budget, 0);
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
         assert!(changed);
         assert!(
             digest.is_some_and(|d| d.message_count == 0),
@@ -1345,7 +1350,7 @@ pub(crate) mod tests {
             achievable_target(budget, 0)
         );
         assert!(
-            !enforce_budget(&mut messages, budget, 0).0,
+            !enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens).0,
             "and the hysteresis gap survives, same as after a drop-prune"
         );
     }
@@ -1364,7 +1369,7 @@ pub(crate) mod tests {
             messages.push(msg("user", 100));
             messages.push(msg("assistant", 100));
         }
-        let (changed, digest) = enforce_budget(&mut messages, 700, 0);
+        let (changed, digest) = enforce_budget(&mut messages, 700, 0, &ChatMessage::estimated_tokens);
         assert!(changed);
         let digest = digest.expect("truncation is destructive, so it must reach the archive");
         assert_eq!(digest.message_count, 0, "nothing dropped: this is the truncation-only path");
@@ -1420,7 +1425,7 @@ pub(crate) mod tests {
             messages.push(msg("user", 100));
             messages.push(msg("assistant", 100));
         }
-        let (_, digest) = enforce_budget(&mut messages, 700, 0);
+        let (_, digest) = enforce_budget(&mut messages, 700, 0, &ChatMessage::estimated_tokens);
         let digest = digest.expect("truncation must reach the archive");
         assert_eq!(digest.message_count, 0, "the truncation-only path");
 
@@ -1433,6 +1438,7 @@ pub(crate) mod tests {
             session_id: &id,
             project_root: &project,
             client: &client,
+            estimate: &ChatMessage::estimated_tokens,
             hooks: &hooks,
             cancelled: &cancelled,
         };
@@ -1492,7 +1498,7 @@ pub(crate) mod tests {
         let client = ChatClient::from_endpoint(&endpoint);
         let hooks = Hooks::discover(&project, &core.data_dir);
         let cancelled = Arc::new(CancelToken::default());
-        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &project, client: &client, hooks: &hooks, cancelled: &cancelled };
+        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &project, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled };
         let budget = 6000;
         compact_messages(&ctx, &mut messages, budget, 0, false, &mut RequestSpend::new(None)).await.unwrap();
         let carried: Vec<&str> = messages.iter().filter_map(|m| m.content.as_deref()).filter(|c| c.contains(crate::prompt::NOTE_HEADER)).collect();
@@ -1517,7 +1523,7 @@ pub(crate) mod tests {
             messages.push(assistant_with_tools("read_file", &format!(r#"{{"path":"src/{i}.rs"}}"#)));
             messages.push(msg("tool", 2500));
         }
-        let (_, dropped) = enforce_budget(&mut messages, budget, 0);
+        let (_, dropped) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
         assert!(dropped.is_some_and(|d| d.message_count > 0), "the first prune drops exchanges");
         let real_note = messages[2].content.clone().expect("the real note lands at index 2");
         assert!(real_note.contains("Files touched:"), "{real_note}");
@@ -1532,7 +1538,7 @@ pub(crate) mod tests {
             messages.push(msg("user", 60));
             messages.push(msg("assistant", 60));
         }
-        let (changed, digest) = enforce_budget(&mut messages, budget, 0);
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
         assert!(changed);
         let digest = digest.expect("the truncated originals must reach the archive");
         assert_eq!(digest.message_count, 0, "the second prune truncates only");
@@ -1566,6 +1572,7 @@ pub(crate) mod tests {
             session_id: &id,
             project_root: &project,
             client: &client,
+            estimate: &ChatMessage::estimated_tokens,
             hooks: &hooks,
             cancelled: &cancelled,
         };
@@ -1606,7 +1613,7 @@ pub(crate) mod tests {
             messages.push(ChatMessage::user("still chasing checkout_timeout_msecs"));
             messages.push(msg("assistant", 100));
         }
-        let (changed, _) = enforce_budget(&mut messages, 700, 0);
+        let (changed, _) = enforce_budget(&mut messages, 700, 0, &ChatMessage::estimated_tokens);
         assert!(changed);
         let kept = messages
             .iter()
@@ -1633,7 +1640,7 @@ pub(crate) mod tests {
         }
         let budget = 4000;
         let schema_tokens = 300;
-        assert!(enforce_budget(&mut messages, budget, schema_tokens).0);
+        assert!(enforce_budget(&mut messages, budget, schema_tokens, &ChatMessage::estimated_tokens).0);
         let total: usize =
             schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
         assert!(
@@ -1643,7 +1650,7 @@ pub(crate) mod tests {
 
         let snapshot: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
         assert!(
-            !enforce_budget(&mut messages, budget, schema_tokens).0,
+            !enforce_budget(&mut messages, budget, schema_tokens, &ChatMessage::estimated_tokens).0,
             "second pass must be a no-op"
         );
         let after: Vec<Option<String>> = messages.iter().map(|m| m.content.clone()).collect();
@@ -1658,19 +1665,19 @@ pub(crate) mod tests {
             messages.push(msg("tool", 2500));
         }
         let budget = 3000;
-        let (changed, digest) = enforce_budget(&mut messages, budget, 0);
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
         assert!(changed);
         assert!(digest.is_some());
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
         let first_digest = messages[2].content.clone();
-        assert!(!enforce_budget(&mut messages, budget, 0).0, "second pass must be a no-op");
+        assert!(!enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens).0, "second pass must be a no-op");
         assert_eq!(messages[2].content, first_digest, "digest must not be replaced on no-op");
 
         for _ in 0..6 {
             messages.push(assistant_with_tools("edit_file", r#"{"path":"src/new.rs"}"#));
             messages.push(msg("tool", 2500));
         }
-        assert!(enforce_budget(&mut messages, budget, 0).0);
+        assert!(enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens).0);
         let digest_count = messages
             .iter()
             .filter(|m| m.content.as_deref().is_some_and(|c| c.starts_with(DIGEST_PREFIX)))
@@ -1794,7 +1801,7 @@ pub(crate) mod tests {
             messages.push(msg("user", 2000));
         }
         let before = messages.len();
-        let (_, digest) = enforce_budget(&mut messages, 2500, 0);
+        let (_, digest) = enforce_budget(&mut messages, 2500, 0, &ChatMessage::estimated_tokens);
         let digest = digest.expect("exchange drop should produce a digest");
         assert_eq!(
             digest.dropped.len(),
@@ -1816,7 +1823,7 @@ pub(crate) mod tests {
             messages.push(msg("assistant", 2000));
             messages.push(msg("user", 2000));
         }
-        let (_, digest) = enforce_budget(&mut messages, 2500, 0);
+        let (_, digest) = enforce_budget(&mut messages, 2500, 0, &ChatMessage::estimated_tokens);
         let digest = digest.expect("exchange drop should produce a digest");
         let text = digest.format(None);
         assert!(text.contains("read_file"), "{text}");
@@ -1839,7 +1846,7 @@ pub(crate) mod tests {
         let budget = 3500;
         let schema_tokens = 300;
         let target = budget * PRUNE_TARGET_PCT / 100;
-        let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens);
+        let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens, &ChatMessage::estimated_tokens);
         assert!(changed);
         assert!(digest.is_some());
         let total: usize =
@@ -1850,7 +1857,7 @@ pub(crate) mod tests {
         );
         assert!(messages[2].content.as_deref().unwrap().starts_with(DIGEST_PREFIX));
         assert!(
-            !enforce_budget(&mut messages, budget, schema_tokens).0,
+            !enforce_budget(&mut messages, budget, schema_tokens, &ChatMessage::estimated_tokens).0,
             "second pass must be a no-op"
         );
     }
@@ -1872,7 +1879,7 @@ pub(crate) mod tests {
         // Messages alone exactly fill the window: nothing to do.
         let mut without = messages.clone();
         assert!(
-            !enforce_budget(&mut without, message_tokens, 0).0,
+            !enforce_budget(&mut without, message_tokens, 0, &ChatMessage::estimated_tokens).0,
             "message-only total at budget must be a no-op"
         );
 
@@ -1880,7 +1887,7 @@ pub(crate) mod tests {
         // fires. This is the case the old message-only sum missed entirely.
         let mut with = messages.clone();
         assert!(
-            enforce_budget(&mut with, message_tokens, schema_tokens).0,
+            enforce_budget(&mut with, message_tokens, schema_tokens, &ChatMessage::estimated_tokens).0,
             "schema overhead must push an at-budget transcript over"
         );
         let pruned: usize = with.iter().map(|m| m.estimated_tokens()).sum();
@@ -1909,7 +1916,7 @@ pub(crate) mod tests {
             messages.push(assistant_with_tools("read_file", r#"{"path":"src/a.rs"}"#));
             messages.push(msg("tool", 4000));
             let before = messages.clone();
-            let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens);
+            let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens, &ChatMessage::estimated_tokens);
             assert!(!changed, "turn {turn}: futile compaction must not run");
             assert!(digest.is_none(), "turn {turn}: no digest, so no summarization request");
             let unchanged: Vec<Option<String>> =
@@ -1925,7 +1932,7 @@ pub(crate) mod tests {
         // Just under the target the normal machinery still runs.
         let workable = prune_target(budget) - 1;
         assert!(!schemas_outgrow_budget(budget, workable));
-        assert!(enforce_budget(&mut messages, budget, workable).0);
+        assert!(enforce_budget(&mut messages, budget, workable, &ChatMessage::estimated_tokens).0);
     }
 
     /// Between the prune target and the window, schemas crowd the transcript
@@ -1957,7 +1964,7 @@ pub(crate) mod tests {
             messages.push(msg("tool", 200));
         }
 
-        let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens);
+        let (changed, digest) = enforce_budget(&mut messages, budget, schema_tokens, &ChatMessage::estimated_tokens);
         assert!(changed, "a prune that would work must not be skipped");
         assert!(digest.is_some());
         let total: usize =
@@ -1968,7 +1975,7 @@ pub(crate) mod tests {
         // And the reduced target still leaves a gap, so the next turns append
         // instead of re-compacting: this is the thrash the skip guarded against.
         assert!(
-            !enforce_budget(&mut messages, budget, schema_tokens).0,
+            !enforce_budget(&mut messages, budget, schema_tokens, &ChatMessage::estimated_tokens).0,
             "second pass must be a no-op"
         );
         let headroom = budget - total;
@@ -1989,9 +1996,9 @@ pub(crate) mod tests {
             messages.push(msg("assistant", 2_000));
             messages.push(msg("user", 2_000));
         }
-        let trigger = compaction_trigger(budget, schema_tokens, 30_000, None, &messages);
+        let trigger = compaction_trigger(budget, schema_tokens, 30_000, None, &messages, &ChatMessage::estimated_tokens);
         assert_eq!(trigger, 30_000);
-        let (changed, _) = enforce_budget(&mut messages, trigger, schema_tokens);
+        let (changed, _) = enforce_budget(&mut messages, trigger, schema_tokens, &ChatMessage::estimated_tokens);
         assert!(changed, "over the setting must prune with the window budget still far away");
         let total: usize =
             schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
@@ -2000,7 +2007,7 @@ pub(crate) mod tests {
             "the prune aims at the setting's own hysteresis target: {total}"
         );
         assert!(
-            !enforce_budget(&mut messages, trigger, schema_tokens).0,
+            !enforce_budget(&mut messages, trigger, schema_tokens, &ChatMessage::estimated_tokens).0,
             "and the gap buys append-only turns, same as at the window"
         );
     }
@@ -2010,7 +2017,7 @@ pub(crate) mod tests {
     /// endpoint.
     #[test]
     fn the_compaction_setting_never_raises_the_trigger() {
-        assert_eq!(compaction_trigger(50_000, 500, 400_000, None, &[]), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, 400_000, None, &[], &ChatMessage::estimated_tokens), 50_000);
     }
 
     /// A setting whose prune target the frozen schemas outgrow can never be
@@ -2022,7 +2029,7 @@ pub(crate) mod tests {
         let budget = 150_000;
         let schema_tokens = 18_000;
         assert!(schemas_outgrow_budget(20_000, schema_tokens));
-        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &[]), budget);
+        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &[], &ChatMessage::estimated_tokens), budget);
     }
 
     /// The other unachievable shape: a protected tail the setting's target
@@ -2042,13 +2049,13 @@ pub(crate) mod tests {
             messages.push(msg("tool", 30_000));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, 20_000, None, &messages),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &messages, &ChatMessage::estimated_tokens),
             budget,
             "an unreachable target must not arm per-iteration compaction"
         );
         // The same setting over a lean transcript stays in force.
         let lean = vec![msg("system", 400), msg("user", 400)];
-        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &lean), 20_000);
+        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &lean, &ChatMessage::estimated_tokens), 20_000);
 
         // And the floor counts only what a maximal prune actually leaves:
         // the pinned head, the note, and the newest three. Six mid-sized
@@ -2059,7 +2066,7 @@ pub(crate) mod tests {
             boundary.push(msg("assistant", 9_600));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, 20_000, None, &boundary),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &boundary, &ChatMessage::estimated_tokens),
             20_000,
             "a reachable target must keep the setting in force"
         );
@@ -2073,7 +2080,7 @@ pub(crate) mod tests {
             note_first.push(msg("assistant", 400));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, 20_000, None, &note_first),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &note_first, &ChatMessage::estimated_tokens),
             budget,
             "the floor must count the whole pinned head"
         );
@@ -2167,7 +2174,7 @@ pub(crate) mod tests {
     #[test]
     fn a_tiny_compaction_setting_is_floored() {
         assert_eq!(
-            compaction_trigger(100_000, 500, 1_000, None, &[]),
+            compaction_trigger(100_000, 500, 1_000, None, &[], &ChatMessage::estimated_tokens),
             COMPACTION_TOKENS_FLOOR
         );
     }
@@ -2186,12 +2193,12 @@ pub(crate) mod tests {
             transcript.push(msg("assistant", 2_000));
             transcript.push(msg("user", 2_000));
         }
-        let trigger = compaction_trigger(100_000, 500, 30_000, ratio, &transcript);
+        let trigger = compaction_trigger(100_000, 500, 30_000, ratio, &transcript, &ChatMessage::estimated_tokens);
         assert_eq!(trigger, 7_500);
         assert_eq!(requested_trigger(30_000, ratio, 100_000), trigger);
-        assert!(enforce_budget(&mut transcript, trigger, 500).0, "compaction fires at 30k real");
+        assert!(enforce_budget(&mut transcript, trigger, 500, &ChatMessage::estimated_tokens).0, "compaction fires at 30k real");
         assert_eq!(
-            compaction_trigger(100_000, 500, 1_000, ratio, &[]),
+            compaction_trigger(100_000, 500, 1_000, ratio, &[], &ChatMessage::estimated_tokens),
             to_estimate(COMPACTION_TOKENS_FLOOR, token_factor(ratio))
         );
         assert_eq!(requested_trigger(1_000, Some(0.5), 100_000), 40_000);
@@ -2304,8 +2311,8 @@ pub(crate) mod tests {
             total > prune_target(budget) && total <= budget,
             "the fixture must sit inside the gap: {total}"
         );
-        assert!(!enforce_budget(&mut messages, budget, 0).0, "the budget path holds here");
-        let (changed, digest) = prune_transcript(&mut messages, budget, 0, total);
+        assert!(!enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens).0, "the budget path holds here");
+        let (changed, digest) = prune_transcript(&mut messages, budget, 0, total, &ChatMessage::estimated_tokens);
         assert!(changed, "the forced prune fires where the budget path held");
         assert!(digest.is_some_and(|d| d.message_count > 0));
         let after: usize = messages.iter().map(|m| m.estimated_tokens()).sum();

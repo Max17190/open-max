@@ -350,6 +350,10 @@ model picker. Optional `compat` flags cover picky
 gateways (for example `max_completion_tokens` versus `max_tokens`).
 `compat.omit_temperature: true` leaves sampling temperature to that provider;
 it defaults to false and leaves other providers' settings unchanged.
+`compat.prefer_reasoning_details: true` omits plaintext reasoning when the
+unchanged structured reasoning blocks contain the same text. OpenRouter's Chat
+Completions endpoint uses this format automatically. Enable it for a proxy
+only if it accepts structured reasoning blocks on their own.
 
 `wire_api` defaults to `chat_completions`, preserving existing requests.
 An explicit `responses` selects the Responses protocol. The ChatGPT setup
