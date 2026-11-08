@@ -1126,3 +1126,181 @@ async fn only_a_scrollback_focus_highlights_the_selected_block() {
     assert!(highlighted(&mut app), "the scrollback has focus");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_popup_gets_no_row_the_composer_needs() {
+    let full = super::conversation_layout(Rect::new(0, 0, 40, 3), true, 3, 0, 2);
+    assert_eq!((full.popup.height, full.status.height, full.chat.height), (0, 0, 0));
+    let one_spare = super::conversation_layout(Rect::new(0, 0, 40, 4), true, 3, 0, 2);
+    assert_eq!((one_spare.popup.height, one_spare.status.height), (1, 0));
+}
+
+#[tokio::test]
+async fn a_resumed_session_replays_its_prompts_and_leaves_nothing_to_discard() {
+    use open_max_core::sessions;
+    use open_max_core::types::ChatMessage;
+    let (mut app, dir) = app_fixture();
+    let core = app.core.clone();
+    let id = sessions::create(&core, dir.display().to_string()).unwrap().id;
+    sessions::attach(&core, &id).unwrap();
+    let history = vec![
+        ChatMessage::system("rules"),
+        ChatMessage::user("the first question"),
+        ChatMessage::assistant(Some("the first answer".into()), None),
+    ];
+    assert!(sessions::save_messages(&core, &id, &history, &mut 0, true));
+    sessions::end_turn(&core, &id, &history);
+    sessions::detach(&core, &id).unwrap();
+    app.left_running = vec![id.clone(), "another".into()];
+    app.handle_submit("/resume".into()).await.unwrap();
+    press(&mut app, key(KeyCode::Enter)).await;
+    assert_eq!(app.session_id.as_deref(), Some(id.as_str()));
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("the first question") && shown.contains("the first answer"), "{shown}");
+    assert_eq!(app.left_running, ["another"], "resumed, it is no longer the app's to discard");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn resume_with_no_sessions_says_so_instead_of_opening_an_empty_list() {
+    let (mut app, dir) = app_fixture();
+    app.handle_submit("/resume".into()).await.unwrap();
+    assert!(app.mode == Mode::Chat && app.sessions_panel.is_none());
+    assert!(app.transcript.export_text().contains("no sessions in this project yet"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn built_in_commands_win_over_templates_of_the_same_name() {
+    let (mut app, dir) = app_fixture();
+    let prompts = dir.join(".agents").join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    for (name, body) in [("greet", "Say hello to the team"), ("status", "Template status body"), ("exit", "Template exit body")] {
+        std::fs::write(prompts.join(format!("{name}.md")), body).unwrap();
+    }
+    app.handle_submit("/status".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("throughput") && !shown.contains("Template status body"), "{shown}");
+    app.handle_submit("/greet".into()).await.unwrap();
+    assert!(app.transcript.export_text().contains("Say hello to the team"), "a template expands into a prompt");
+    app.handle_submit("/exit".into()).await.unwrap();
+    assert!(app.should_quit);
+    assert!(!app.transcript.export_text().contains("Template exit body"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn status_reports_throughput_only_once_there_is_some() {
+    let throughput = |app: &App| {
+        let shown = app.transcript.export_text();
+        shown.lines().rev().find(|line| line.contains("throughput")).unwrap().to_string()
+    };
+    let (mut app, dir) = app_fixture();
+    app.handle_submit("/status".into()).await.unwrap();
+    assert!(throughput(&app).ends_with("throughput not available"), "{}", throughput(&app));
+    app.first_token = Some(Instant::now() - Duration::from_secs(2));
+    app.stream_chars = 800;
+    app.handle_submit("/status".into()).await.unwrap();
+    assert!(throughput(&app).ends_with(" tokens/s"), "{}", throughput(&app));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_header_is_laid_out_again_for_a_new_width() {
+    let (mut app, dir) = app_fixture();
+    app.project = std::path::PathBuf::from("/a/long/parent/directory/proj");
+    let (rows, _) = frame(&mut app, 60, 12);
+    assert!(rows[0].starts_with("/a/long/parent/directory/proj"), "{:?}", rows[0]);
+    app.dirty = Dirty::default();
+    let (rows, _) = frame(&mut app, 14, 12);
+    assert!(rows[0].trim_end().ends_with("proj"), "{:?}", rows[0]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn queued_messages_show_three_rows_at_most_and_count_the_rest() {
+    let queue_rows = |n: usize| {
+        let (mut app, dir) = app_fixture();
+        app.queued = (1..=n).map(|i| format!("queued {i}")).collect();
+        let (rows, _) = frame(&mut app, 40, 16);
+        let _ = std::fs::remove_dir_all(dir);
+        rows.into_iter().filter(|row| row.starts_with("↳ ")).map(|row| row.trim_end().to_string()).collect::<Vec<_>>()
+    };
+    assert_eq!(queue_rows(2), ["↳ queued 1", "↳ queued 2"]);
+    assert_eq!(queue_rows(3), ["↳ queued 1", "↳ queued 2", "↳ queued 3"]);
+    assert_eq!(queue_rows(5), ["↳ queued 1", "↳ queued 2", "↳ … 3 more queued"]);
+}
+
+#[test]
+fn a_scrolled_view_pins_its_prompt_and_places_the_marker_by_position() {
+    let (mut app, dir) = app_fixture();
+    app.insert_user_block("question");
+    // Rows: the prompt, a blank, eighteen reply lines, a blank: 21 in a
+    // view of nine.
+    app.transcript.push_assistant((1..=18).map(|i| Line::from(format!("answer line {i}"))).collect());
+    let rows = chat_rows(&mut app);
+    assert_eq!(rows.len(), 9);
+    assert!(!rows[0].starts_with("❯ question"), "following, nothing is pinned: {rows:#?}");
+
+    // Four rows up: the view ends on reply line 14 and the prompt takes the
+    // first row from line 6.
+    app.transcript.scroll_up(4);
+    let (all, _) = frame(&mut app, 30, 14);
+    let rows = chat_rows(&mut app);
+    assert!(rows[0].starts_with("❯ question"), "{rows:#?}");
+    assert!(rows[1].starts_with("answer line 7 "), "{rows:#?}");
+    assert!(rows[8].starts_with("answer line 14 "), "{rows:#?}");
+    let border = all.iter().position(|row| row.starts_with('╭')).unwrap();
+    assert!(all[border - 1].contains("esc follow"), "the status row is intact: {all:#?}");
+    // Six of twelve rows from the top: the marker is mid-track.
+    app.transcript.scroll_up(2);
+    let rows = chat_rows(&mut app);
+    let marked: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].ends_with('▐')).collect();
+    assert_eq!(marked, [4], "{rows:#?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn pointer_positions_map_to_the_draft_and_drags_extend_the_selection() {
+    let (mut app, dir) = app_fixture();
+    app.composer.load("alpha beta");
+    let (rows, _) = frame(&mut app, 40, 12);
+    let area = app.composer_draw_area;
+    let draft = &rows[area.y as usize];
+    let alpha = draft[..draft.find("alpha").unwrap()].chars().count() as u16;
+    // The last letter of a word picks that word, not the next one.
+    click(&mut app, alpha + 4, area.y).await;
+    click(&mut app, alpha + 4, area.y).await;
+    assert_eq!(app.composer.selected_text().as_deref(), Some("alpha"));
+
+    // A press then a drag past the end of the draft takes everything after
+    // the press, however far the pointer goes.
+    let (_, _) = frame(&mut app, 40, 12);
+    let drag = |kind, column| TermEvent::Mouse(MouseEvent { kind, column, row: area.y, modifiers: KeyModifiers::NONE });
+    app.last_click = None;
+    app.on_term_event(drag(MouseEventKind::Down(MouseButton::Left), alpha + 6)).await.unwrap();
+    app.on_term_event(drag(MouseEventKind::Drag(MouseButton::Left), 39)).await.unwrap();
+    app.on_term_event(drag(MouseEventKind::Up(MouseButton::Left), 39)).await.unwrap();
+    assert_eq!(app.composer.selected_text().as_deref(), Some("beta"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_transcript_selection_paints_on_the_row_it_selected() {
+    let (mut app, dir) = app_fixture();
+    for i in 0..6 {
+        app.note(&format!("line {i}"));
+    }
+    let (rows, _) = frame(&mut app, 30, 14);
+    let row = rows.iter().position(|row| row.contains("line 3")).unwrap();
+    for _ in 0..3 {
+        click(&mut app, 4, row as u16).await;
+    }
+    let mut terminal = Terminal::new(TestBackend::new(30, 14)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let selected: Vec<u16> =
+        (0..14).filter(|&y| (0..30).any(|x| buffer[(x, y)].bg == crate::theme::SELECT())).collect();
+    assert_eq!(selected, [row as u16]);
+    let _ = std::fs::remove_dir_all(dir);
+}
