@@ -1526,12 +1526,12 @@ mod tests {
             }
         }
         let local = "http://127.0.0.1:8080/v1";
-        assert_eq!(effort_levels(local, WireApi::Anthropic, "claude-opus-5-5"), ["default", "low", "medium", "high", "xhigh", "max"]);
-        assert!(validate_reasoning_effort(local, WireApi::Anthropic, "claude-opus-5-5", Some(E::Minimal)).unwrap_err().ends_with("xhigh or max"));
-        assert!(validate_reasoning_effort(local, WireApi::Anthropic, "claude-opus-5-5", Some(E::Max)).is_ok());
+        assert_eq!(effort_levels(local, WireApi::Anthropic, "model"), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert!(validate_reasoning_effort(local, WireApi::Anthropic, "model", Some(E::Minimal)).unwrap_err().ends_with("xhigh or max"));
+        assert!(validate_reasoning_effort(local, WireApi::Anthropic, "model", Some(E::Max)).is_ok());
         let compat = "https://api.anthropic.com/v1";
-        assert_eq!(effort_levels(compat, WireApi::ChatCompletions, "claude-opus-5-5"), ["default"]);
-        assert!(validate_reasoning_effort(compat, WireApi::ChatCompletions, "claude-opus-5-5", Some(E::Low)).unwrap_err().contains("ignores reasoning effort"));
+        assert_eq!(effort_levels(compat, WireApi::ChatCompletions, "model"), ["default"]);
+        assert!(validate_reasoning_effort(compat, WireApi::ChatCompletions, "model", Some(E::Low)).unwrap_err().contains("ignores reasoning effort"));
         assert_eq!(effort_levels(local, WireApi::Responses, "grok-3-mini"), crate::config::ReasoningEffort::LEVELS);
         assert!(validate_reasoning_effort(local, WireApi::ChatCompletions, "grok-3-mini", Some(E::None)).is_ok());
     }
