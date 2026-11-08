@@ -12,6 +12,8 @@ use crate::config::Settings;
 mod setup;
 pub use setup::{edit_catalog, read_catalog};
 
+const DEFAULT_COMPACTION_TOKENS: usize = 150_000;
+
 /// Wire quirks for picky OpenAI-compatible servers.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -63,6 +65,8 @@ pub struct ProviderModel {
     pub context_tokens: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_tokens: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -127,6 +131,8 @@ pub struct ActiveEndpoint {
     pub model: String,
     pub context_tokens: usize,
     pub max_tokens: usize,
+    /// Compaction ceiling in real tokens, before the window cap and calibration.
+    pub compaction_tokens: usize,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<crate::config::ReasoningEffort>,
     pub compat: CompatFlags,
@@ -352,7 +358,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
             let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("?");
             unknown_keys(
                 model,
-                &["id", "name", "context_tokens", "max_tokens"],
+                &["id", "name", "context_tokens", "max_tokens", "compaction_tokens"],
                 &format!("in provider '{name}' model '{id}'"),
                 &mut out,
             );
@@ -683,6 +689,9 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             model: model.to_string(),
             context_tokens,
             max_tokens,
+            compaction_tokens: settings.compaction_tokens
+                .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
+                .unwrap_or(DEFAULT_COMPACTION_TOKENS),
             temperature: if p.compat.omit_temperature { None } else { settings.temperature },
             reasoning_effort: settings.reasoning_effort,
             compat: p.compat.clone(),
@@ -722,6 +731,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         model: model.to_string(),
         context_tokens,
         max_tokens,
+        compaction_tokens: settings.compaction_tokens.unwrap_or(DEFAULT_COMPACTION_TOKENS),
         temperature: settings.temperature,
         reasoning_effort: settings.reasoning_effort,
         compat: CompatFlagsFile::default().into(),
@@ -1025,7 +1035,7 @@ mod tests {
             concat!(
                 r#"{"providers":{"orl":{"base_url":"http://localhost/v1","modles":[],"#,
                 r#""compat":{"use_max_completion_token":true},"#,
-                r#""models":[{"id":"m","contex_tokens":9000}]}}}"#,
+                r#""models":[{"id":"m","contex_tokens":9000,"compaction_tokens":30000}]}}}"#,
             ),
         )
         .unwrap();

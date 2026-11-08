@@ -116,11 +116,11 @@ pub struct Settings {
     /// Byte cap for bash/external tool output before truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
-    /// Compact when the estimated request (transcript plus frozen tool
-    /// schemas) crosses this many tokens, instead of waiting for the
-    /// window-derived budget. One-directional: it can only fire compaction
-    /// earlier. Values above the budget, below the built-in floor, or
-    /// unreachable under the frozen schemas fall back to the budget.
+    /// Global compaction ceiling for transcript plus frozen tool schemas.
+    /// Unset uses the active model's ceiling or the built-in default.
+    /// The ceiling is floored at 20,000 tokens, capped by the window budget,
+    /// and falls back to that budget when an automatic prune cannot reach its target.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_tokens: Option<usize>,
     /// Ceiling on the tokens one turn may spend across the agent requests it
     /// makes, counted as a provider bills them: prompt plus completion, with
@@ -480,6 +480,7 @@ mod tests {
     fn compaction_tokens_parses_and_defaults_to_none() {
         let defaulted: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(defaulted.compaction_tokens, None);
+        assert!(serde_json::to_value(&defaulted).unwrap().get("compaction_tokens").is_none());
         let configured: Settings =
             serde_json::from_str(r#"{"compaction_tokens":150000}"#).unwrap();
         assert_eq!(configured.compaction_tokens, Some(150_000));

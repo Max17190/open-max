@@ -450,18 +450,10 @@ async fn run_compact(
         endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024),
         factor,
     );
-    // Manual semantics: aim at the configured trigger itself, not through
-    // `compaction_trigger`, whose tail-feasibility fallback exists to stop
-    // the budget path refiring every iteration. A one-shot user command
-    // cannot thrash, and inheriting the fallback made /compact answer
-    // "already compact" at 27k against a 20k setting whenever two fat
-    // messages sat in the protected tail (measured), while
-    // the next turn's automatic pass compacted the same transcript. The
-    // schema futility guard below still applies to both paths.
-    let trigger = settings
-        .compaction_tokens
-        .map(|requested| requested_trigger(requested, factor, budget))
-        .unwrap_or(budget);
+    // A one-shot command can prune even when the protected tail will not fit
+    // its target. Fall back only when schemas leave no room at the trigger.
+    let trigger = requested_trigger(endpoint.compaction_tokens, factor, budget);
+    let trigger = if schemas_exceed_budget(trigger, schema_tokens) { budget } else { trigger };
     let tokens_before =
         schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
     if schemas_exceed_budget(trigger, schema_tokens) {
@@ -796,7 +788,7 @@ async fn run_loop(
                 .await;
         }
         let trigger = compaction_trigger(
-            budget, schema_tokens, settings.compaction_tokens, factor, guard.messages(),
+            budget, schema_tokens, endpoint.compaction_tokens, factor, guard.messages(),
         );
         let ctx = CompactionCtx {
             core, session_id, project_root, client: &client, hooks: &hooks, cancelled: &cancelled,
@@ -7367,13 +7359,14 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let id = sessions::create(&core, project.display().to_string()).unwrap().id;
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        std::fs::write(
+            crate::providers::providers_path(&dir),
+            r#"{"providers":{"local":{"base_url":"http://127.0.0.1:9","models":[{"id":"m","context_tokens":400000,"max_tokens":2048,"compaction_tokens":20000}]}}}"#,
+        ).unwrap();
         {
             let mut s = core.settings.lock().unwrap();
-            s.base_url = "http://127.0.0.1:9".into();
+            s.provider = Some("local".into());
             s.model = "m".into();
-            s.context_tokens = Some(400_000);
-            s.max_tokens = 2_048;
-            s.compaction_tokens = Some(20_000);
         }
         {
             let mut data = build_session_data(&core, &id, &project).unwrap();
@@ -7386,7 +7379,7 @@ mod tests {
             let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
-                compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &data.messages),
+                compaction_trigger(budget, schema_tokens, 20_000, 1.0, &data.messages),
                 budget,
                 "fixture must sit in the fallback band"
             );

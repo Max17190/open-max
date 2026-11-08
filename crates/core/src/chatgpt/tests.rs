@@ -746,7 +746,7 @@ async fn invalid_refresh_responses_preserve_the_previous_credentials() {
 }
 
 #[tokio::test]
-async fn catalog_creates_a_provider_and_preserves_only_positive_model_limits() {
+async fn catalog_creates_a_provider_and_preserves_configured_model_limits() {
     let scratch = Scratch::new();
     let catalog = json!({"models":[
         {"slug":"zero-window","visibility":"list","context_window":0},
@@ -762,12 +762,14 @@ async fn catalog_creates_a_provider_and_preserves_only_positive_model_limits() {
     let saved = &mut file["providers"]["chatgpt-main"]["models"];
     saved[2]["context_tokens"] = json!(4096);
     saved[2]["max_tokens"] = json!(1);
+    saved[2]["compaction_tokens"] = json!(120_000);
     saved[3]["context_tokens"] = json!(0);
     saved[3]["max_tokens"] = json!(0);
     std::fs::write(&path, file.to_string()).unwrap();
     let models = save_catalog(&scratch.0, "main", &catalog).await.unwrap();
     assert_eq!(models[2].context_tokens, Some(4096));
     assert_eq!(models[2].max_tokens, Some(1));
+    assert_eq!(models[2].compaction_tokens, Some(120_000));
     assert_eq!(models[3].context_tokens, None);
     assert_eq!(models[3].max_tokens, None);
     std::fs::remove_file(&path).unwrap();
