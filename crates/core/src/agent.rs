@@ -43,7 +43,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::batch::{batchable_call, execute_readonly_batch, parallel_tool_limit, partition_concurrent_runs, ReadonlyBatchCtx};
-use crate::client::{ChatClient, CompletionResult, TRUNCATED};
+use crate::client::{ChatClient, TRUNCATED};
 use crate::compaction::{
     achievable_target, compact_messages, compaction_trigger, over_budget_error_context, refusal_ratio,
     request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
@@ -76,16 +76,6 @@ enum ApprovalOutcome {
     Declined,
     Cancelled,
     TimedOut,
-}
-
-/// Whether the provider stopped this reply at the output cap. Most servers say
-/// so with finish_reason `length`. Some report every reply that carries calls
-/// as `tool_calls`, and then the cut shows only in the usage, as a reply of
-/// exactly `max_tokens`. A provider that ignores the cap can return more than
-/// that, so only the exact count reads as a cut.
-fn reply_hit_output_cap(result: &CompletionResult, max_tokens: usize) -> bool {
-    result.finish_reason == "length"
-        || result.usage.is_some_and(|u| u.completion_tokens == max_tokens as u64)
 }
 
 /// The reply for a call the output cap cut off partway through its
@@ -953,11 +943,9 @@ async fn run_loop(
         // The output cap is different: the reply is the model's own, and the
         // calls it finished before the cut run as usual. Only the last call,
         // the one it was still writing, is refused with the cause, so the
-        // model can split the work. A cut that lands before the first
-        // argument byte is not caught: the client reads no arguments as `{}`,
-        // so that call runs and gets the tool's own missing-argument error
-        // instead.
-        let capped = reply_hit_output_cap(&result, max_tokens);
+        // model can split the work. The client keeps its raw arguments even
+        // when the cut lands before the first byte.
+        let capped = result.hit_output_cap(max_tokens);
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
