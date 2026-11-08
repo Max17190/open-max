@@ -8,20 +8,19 @@
 <h3 align="center">Most powerful & token efficient harness for agents</h3>
 
 <p align="center">
-  A coding agent for your terminal. Its prompt is under a thousand tokens and<br>
-  never changes mid-session, so the cache keeps serving it.
+  A coding agent for your terminal. Its built-in prompt is under a thousand tokens and<br>
+  stays stable across turns so providers can cache it.
 </p>
 
 <p align="center">
-  <a href="https://github.com/Max17190/open-max/releases/latest"><img src="https://img.shields.io/github/v/release/Max17190/open-max?label=release&color=155e3d" alt="Latest release"></a>
+  <a href="https://github.com/Max17190/open-max/releases/latest"><img src="docs/assets/release-badge.svg" alt="Latest release"></a>
   <a href="https://github.com/Max17190/open-max/actions/workflows/ci.yml"><img src="https://github.com/Max17190/open-max/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-155e3d" alt="MIT license"></a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/demo.svg" width="780" alt="An Open Max session in the terminal: the agent runs the failing tests, reads and edits the file, and runs them again until they pass. Then it writes itself a tool that searches docs/ and calls it on its next step.">
+  <img src="docs/assets/demo.svg" width="780" alt="Terminal demo: Open Max fixes a failing test, then writes and runs a tool that searches the docs.">
 </p>
-<p align="center"><sub>A real session. Only the model's replies are scripted.</sub></p>
 
 Open Max is one Rust binary: an agent loop, seven tools, a terminal UI that streams every step, and a core that keeps the trust decisions. When it needs a new capability, the agent writes it as a file, such as a [tool](docs/extending.md) or a skill, and can call a tool it wrote on its very next step.
 
