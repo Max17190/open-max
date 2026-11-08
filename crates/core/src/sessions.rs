@@ -2805,7 +2805,12 @@ mod tests {
         );
         let first = format!("{}\n", json(&partial));
         let padding = ARCHIVE_RECOVERY_BYTES as usize - first.len() - tail.len();
-        let bytes = format!("partial prefix {first}{}\n{tail}", " ".repeat(padding - 1));
+        // Start the scan within this row. The suffix would parse as JSON
+        // after its leading spaces if the reader treated the cut as a boundary.
+        let mut bytes = b"partial prefix ".to_vec();
+        bytes.resize(bytes.len() + padding, b' ');
+        bytes.extend(first.bytes());
+        bytes.extend(tail.bytes());
         std::fs::write(archive_path(&core, &id), bytes).unwrap();
         let recovered = archived_tool_outputs(&core, &id, &wanted);
         assert_eq!(recovered, HashMap::from([(missing_id.archived_tool_key().unwrap(), "valid output".into())]));
