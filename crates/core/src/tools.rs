@@ -42,7 +42,9 @@ const MAX_GREP_RESULTS: usize = 50;
 /// Every later request re-sends a result; past this the spill log keeps the rest.
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 /// A command result over the cap uses this fraction of the cap when its
-/// complete output is available in the spill log.
+/// complete output is available in the spill log. Later model requests
+/// resend the preview, and the full cap remains available when the log
+/// is incomplete or could not be written.
 const PREVIEW_DIVISOR: usize = 4;
 /// bash keeps one part in this many of each stream's share from its start,
 /// and the rest from its end. A compiler prints the error that broke the
