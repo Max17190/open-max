@@ -103,15 +103,9 @@ pub fn human_name(name: &str) -> String {
         "glob" => "Find".into(),
         "bash" => "Shell".into(),
         other => {
-            let mut words = other.split('_');
-            let first = words.next().unwrap_or("Tool");
-            let mut label = first.to_string();
+            let mut label = other.replace('_', " ");
             if let Some(initial) = label.get_mut(0..1) {
                 initial.make_ascii_uppercase();
-            }
-            for word in words {
-                label.push(' ');
-                label.push_str(word);
             }
             label
         }
