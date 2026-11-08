@@ -665,7 +665,7 @@ impl ChangeWatch {
             let note = if core.approval_mode_canonical(canonical_root) == ApprovalMode::Auto {
                 let mut note = match discovered.fail_closed_reason() {
                     Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}"),
-                    None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.".into(),
+                    None => "[hook files changed. Valid hooks apply from the next turn (in print mode, the run's next -p prompt) under auto without content approval; a run started now from bash (openmax -p ...) runs them too.".into(),
                 };
                 // Named on this write, while this turn can fix it, not at
                 // the hook's first run next turn.
