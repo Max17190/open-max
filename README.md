@@ -33,6 +33,8 @@ brew install Max17190/tap/openmax                    # Homebrew
 npm install -g openmax-cli                           # or: bun install -g openmax-cli
 ```
 
+The script adds `openmax` to your `PATH` for new shells; open one, or run `source ~/.openmax/bin/env`.
+
 ## Get started
 
 ```sh
