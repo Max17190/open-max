@@ -270,15 +270,10 @@ async fn run_turn_events(
                     exit_code = 1;
                 } else if matches!(
                     stop_reason.as_str(),
-                    "max_iterations" | "budget_exhausted" | "unverified"
+                    "length" | "max_iterations" | "budget_exhausted" | "unverified"
                 ) {
-                    // The turn ran out of room rather than finishing, so a
-                    // script that reads exit 0 as "the work is done" would be
-                    // wrong. Its own code: 1 is an operational failure and
-                    // nothing failed, 3 is a human boundary and no human was
-                    // asked. Resubmitting continues the work, except after an
-                    // `unverified` from a completion gate that could not
-                    // start, which repeats until the hook is repaired.
+                    // The turn stopped short. Resubmitting continues the
+                    // work, except when a completion gate could not start.
                     exit_code = 4;
                 }
                 return stopping.unwrap_or(exit_code);

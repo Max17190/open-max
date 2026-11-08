@@ -153,7 +153,7 @@ the prompts after it.
 | 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
 | 2 | A usage or configuration error before any turn, or `--continue` found no prior session here |
 | 3 | The project is not trusted, or trust cannot be granted from this process |
-| 4 | A turn stopped short (`max_iterations`, `budget_exhausted`, or `unverified`); resubmit to continue, though an `unverified` from a gate that could not start repeats until the hook is repaired |
+| 4 | A turn stopped short (`length` for a provider output limit, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start repeats until the hook is repaired |
 
 Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches
 openmax and not them. SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 to a

@@ -247,13 +247,15 @@ The process exit code is 1 when any turn ended with `stop_reason` `error` or
 the session could not be opened, 2 on a usage or configuration error or when
 `--continue` finds no prior session in the directory, 3 when the project is
 not trusted or trust cannot be granted from this process, and 0
-otherwise, including `max_iterations`, `budget_exhausted`, and `unverified`:
-over this wire the client reads `done` and decides for itself, unlike `-p`,
-which exits 4 on those three. SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, or
-SIGUSR2 cancels the running turn instead of draining it, declines pending
-approvals, and exits 128 plus the signal number once that turn's `done` is
-written and, for a new session that nothing was saved to, its index entry is
-removed, or after 3 seconds if either has not finished, plus up to 100 ms
+otherwise, including `length`, `max_iterations`, `budget_exhausted`, and
+`unverified`. The client reads `done` and decides for itself. See the
+[print mode exit codes](usage.md#command-line) for `-p`.
+
+SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 cancels the running turn
+instead of draining it, declines pending approvals, and exits 128 plus the
+signal number once that turn's `done` is written and, for a new session that
+nothing was saved to, its index entry is removed, or after 3 seconds if either
+has not finished, plus up to 100 ms
 to check that the session is empty
 and up to 250 ms for a tool command still being started; an entry still in
 place then stays, and a warning says so on stderr. A tool command whose start
