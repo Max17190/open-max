@@ -107,9 +107,8 @@ pub(crate) struct CompactionDigest {
     dropped_text: String,
     /// Total chars `dropped_text` may hold, budget-scaled by the caller.
     text_cap: usize,
-    /// Every dropped message in full, for the lossless archive the digest
-    /// note's address points at. Transient: held only until the prune's
-    /// archive append, never sent to the model.
+    /// Every message as dropped, held until the archive append. Originals
+    /// of tool outputs shortened before the drop are in `truncated`.
     dropped: Vec<ChatMessage>,
     /// Pre-truncation originals of tool outputs phase 1 cut in place: that
     /// edit is as destructive as a drop, so the archive covers it too.
@@ -126,7 +125,7 @@ impl CompactionDigest {
         !self.dropped.is_empty() || !self.truncated.is_empty()
     }
 
-    fn record_message(&mut self, msg: &ChatMessage) {
+    fn record_message(&mut self, msg: &ChatMessage, original_index: Option<usize>) {
         self.message_count += 1;
         self.dropped.push(msg.clone());
         // Cap by bytes so a single tool-call-heavy assistant message cannot
@@ -134,7 +133,17 @@ impl CompactionDigest {
         let remaining = self.text_cap.saturating_sub(self.dropped_text.len());
         if remaining > 0 {
             let mut line = format!("{}: ", msg.role);
-            if let Some(c) = msg.content.as_deref() {
+            let source = original_index.map_or(msg, |index| &self.truncated[index]);
+            if let Some(c) = source.content.as_deref() {
+                // An original tool result can end with a toolbox note.
+                // The live transcript carries the current note separately.
+                let c = if original_index.is_some() {
+                    c.split_once(crate::prompt::NOTE_HEADER)
+                        .filter(|(body, _)| body.ends_with(crate::prompt::NOTE_SEPARATOR))
+                        .map_or(c, |(body, _)| body)
+                } else {
+                    c
+                };
                 line.push_str(&excerpt(c.trim()));
             }
             if let Some(calls) = &msg.tool_calls {
@@ -665,9 +674,11 @@ const COMPACTION_TOKENS_FLOOR: usize = 20_000;
 
 /// The trigger a `compaction_tokens` setting asks for, in estimator units:
 /// floored in the setting's real tokens, then converted, then capped by the
-/// budget. Flooring after the conversion would floor the estimate instead,
-/// and under a 4x factor a 30k setting would compact at 80k real tokens.
-pub(crate) fn requested_trigger(requested: usize, factor: f64, budget: usize) -> usize {
+/// budget. The observed ratio can relax this soft trigger within the window.
+pub(crate) fn requested_trigger(requested: usize, ratio: Option<f64>, budget: usize) -> usize {
+    let factor = ratio
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .map_or(1.0, |r| r.min(MAX_TOKEN_FACTOR));
     to_estimate(requested.max(COMPACTION_TOKENS_FLOOR), factor).min(budget)
 }
 
@@ -690,11 +701,10 @@ const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_300;
 /// land exactly on target, gain the note, and re-fire next iteration.
 const TRUNCATION_NOTE_ALLOWANCE_TOKENS: usize = 120;
 
-/// The token total at which compaction fires. Defaults to the window-derived
-/// `budget`; the `compaction_tokens` setting can only pull it lower, never
-/// past the budget, because the budget is what guarantees the request still
-/// fits the endpoint. Two unachievable shapes fall back to the budget rather
-/// than leaving the loop stuck: a setting the frozen schemas outgrow (pruning
+/// The token total at which compaction fires. The resolved ceiling can only
+/// lower the window-derived `budget`, which keeps requests within the
+/// endpoint's context window. Two unachievable shapes fall back to the budget
+/// rather than leaving the loop stuck: a setting the frozen schemas outgrow (pruning
 /// cannot get under it, and the futility guard would disarm compaction while
 /// the transcript grows toward the window), and a setting whose target the
 /// irreducible transcript outgrows; a prune would end at the floor still
@@ -707,28 +717,27 @@ const TRUNCATION_NOTE_ALLOWANCE_TOKENS: usize = 120;
 /// what the target must contain. Counting more would fall back while a
 /// configured prune could in fact succeed, silently disabling the setting.
 ///
-/// `setting` is in the user's real tokens; `budget`, `schema_tokens`, and the
-/// result are estimator units under `factor`.
+/// `ceiling` is in real tokens. The budget, schema cost, and trigger use
+/// estimator units so the window can cap the trigger independently.
 pub(crate) fn compaction_trigger(
     budget: usize,
     schema_tokens: usize,
-    setting: Option<usize>,
-    factor: f64,
+    ceiling: usize,
+    ratio: Option<f64>,
     messages: &[ChatMessage],
 ) -> usize {
-    let Some(requested) = setting else { return budget };
-    let trigger = requested_trigger(requested, factor, budget);
-    if schemas_outgrow_budget(trigger, schema_tokens) {
+    let trigger = requested_trigger(ceiling, ratio, budget);
+    if trigger == budget || schemas_outgrow_budget(trigger, schema_tokens) {
         return budget;
     }
-    let head = pinned_head(messages);
+    let head = pinned_head(messages).min(messages.len());
+    let tail = head.max(messages.len().saturating_sub(3));
     let irreducible: usize = schema_tokens
         + DIGEST_NOTE_ALLOWANCE_TOKENS
-        + messages
+        + messages[..head]
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *i < head || i + 3 >= messages.len())
-            .map(|(_, m)| m.estimated_tokens())
+            .chain(&messages[tail..])
+            .map(ChatMessage::estimated_tokens)
             .sum::<usize>();
     if prune_target(trigger) < irreducible {
         budget
@@ -757,11 +766,23 @@ pub(crate) fn over_budget_error_context(
     )
 }
 
-/// The server's `prompt_tokens` over the estimate of the same request, when
-/// the server reported a prompt size at all.
-pub(crate) fn observed_prompt_ratio(result: &CompletionResult, estimated: usize) -> Option<f64> {
-    let prompt_tokens = result.usage?.prompt_tokens;
-    (prompt_tokens > 0 && estimated > 0).then(|| prompt_tokens as f64 / estimated as f64)
+/// Calibrate against the reported size of the same prompt. A ratio below
+/// one needs a complete response with usable usage. If the response cannot
+/// calibrate, keep any prior ratio that tightened the budget.
+pub(crate) fn updated_prompt_ratio(
+    previous: Option<f64>,
+    result: &CompletionResult,
+    estimated: usize,
+) -> Option<f64> {
+    let complete = !matches!(result.finish_reason.as_str(), TRUNCATED | "cancelled");
+    result.usage
+        .filter(|usage| usage.prompt_tokens > 0 && estimated > 0)
+        .and_then(|usage| {
+            let ratio = usage.prompt_tokens as f64 / estimated as f64;
+            let cache_count_fits = usage.cached_tokens.is_none_or(|cached| cached <= usage.prompt_tokens);
+            (ratio >= 1.0 || (complete && cache_count_fits)).then_some(ratio)
+        })
+        .or(previous.filter(|&ratio| ratio >= 1.0))
 }
 
 /// The ratio a refusal for length proves, when it proves more than `factor`
@@ -835,8 +856,7 @@ pub(crate) fn to_estimate(tokens: usize, factor: f64) -> usize {
     (tokens as f64 / factor) as usize
 }
 
-/// An estimate in real tokens, for every number shown against the window:
-/// what the UI reports and where compaction fires stay one quantity.
+/// A conservative estimate in real tokens for display and request admission.
 pub(crate) fn to_real(estimate: usize, factor: f64) -> usize {
     (estimate as f64 * factor).round() as usize
 }
@@ -883,14 +903,16 @@ fn prune_transcript(
     // Fixed for the whole prune: once an exchange is dropped, later user
     // messages would join the opening run and pin themselves.
     let head = pinned_head(messages);
-    let keep_tail = messages.len().saturating_sub(6);
+    let original_len = messages.len();
+    let keep_tail = original_len.saturating_sub(6);
     // What the transcript will still be about once this prune is done: the
     // original request plus the surviving tail. Truncation keeps the slice of
     // each old tool output that speaks to *this*, so the bytes that stay are
     // the ones the live conversation refers to.
     let live_context = live_context(messages, head, keep_tail);
     let mut digest = CompactionDigest::new(dropped_text_cap(budget));
-    let mut truncated = false;
+    // Sorted by transcript position, in the same order as digest.truncated.
+    let mut truncated_positions = Vec::new();
     // Room for the note a truncation-only prune leaves below, so meeting the
     // target and then gaining the note cannot end above it. Zero when the
     // slot after the head already holds a real digest note: that note carries
@@ -902,10 +924,11 @@ fn prune_transcript(
         TRUNCATION_NOTE_ALLOWANCE_TOKENS
     };
     let mut reached = false;
-    for msg in messages.iter_mut().take(keep_tail).skip(1) {
+    for (index, msg) in messages.iter_mut().enumerate().take(keep_tail).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
                 if c.len() > 600 {
+                    truncated_positions.push(index);
                     digest.truncated.push(msg.clone());
                     let window = crate::recall::salient_window(c, &live_context, TRUNCATED_WIDTH);
                     let lead = if window.start > 0 { "…" } else { "" };
@@ -915,7 +938,6 @@ fn prune_transcript(
                         &c[window.clone()]
                     ));
                     total = total.saturating_sub(old).saturating_add(msg.estimated_tokens());
-                    truncated = true;
                 }
             }
         }
@@ -933,16 +955,25 @@ fn prune_transcript(
         }
         return (true, Some(digest).filter(CompactionDigest::has_archive_material));
     }
+    let remove_and_record =
+        |messages: &mut Vec<ChatMessage>, digest: &mut CompactionDigest, slot| {
+            // Match by original position, since tool call IDs can repeat.
+            // From the drop slot onward, the messages are still a suffix
+            // of the original transcript after inserting or replacing a note.
+            let position = original_len - (messages.len() - slot);
+            let removed = messages.remove(slot);
+            let original_index = truncated_positions.binary_search(&position).ok();
+            digest.record_message(&removed, original_index);
+            removed
+        };
     // Drop whole exchanges starting after the pinned head. Keep tool
     // replies consistent with the assistant message that requested them.
     while total > target && messages.len() > head + 4 {
-        let removed = messages.remove(head);
-        digest.record_message(&removed);
+        let removed = remove_and_record(messages, &mut digest, head);
         total = total.saturating_sub(removed.estimated_tokens());
         if removed.role == "assistant" && removed.tool_calls.is_some() {
             while messages.len() > head && messages[head].role == "tool" {
-                let tool = messages.remove(head);
-                digest.record_message(&tool);
+                let tool = remove_and_record(messages, &mut digest, head);
                 total = total.saturating_sub(tool.estimated_tokens());
             }
         }
@@ -961,13 +992,11 @@ fn prune_transcript(
         // faithful summary of everything removed (not only the first pass).
         total = schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
         while total > target && messages.len() > head + 4 {
-            let removed = messages.remove(head + 1);
-            digest.record_message(&removed);
+            let removed = remove_and_record(messages, &mut digest, head + 1);
             total = total.saturating_sub(removed.estimated_tokens());
             if removed.role == "assistant" && removed.tool_calls.is_some() {
                 while messages.len() > head + 1 && messages[head + 1].role == "tool" {
-                    let tool = messages.remove(head + 1);
-                    digest.record_message(&tool);
+                    let tool = remove_and_record(messages, &mut digest, head + 1);
                     total = total.saturating_sub(tool.estimated_tokens());
                 }
             }
@@ -979,7 +1008,7 @@ fn prune_transcript(
         }
         (true, Some(digest))
     } else {
-        (truncated, Some(digest).filter(CompactionDigest::has_archive_material))
+        (!digest.truncated.is_empty(), Some(digest).filter(CompactionDigest::has_archive_material))
     }
 }
 
@@ -1007,6 +1036,88 @@ pub(crate) mod tests {
                 extra_content: None,
             }]),
         )
+    }
+
+    #[tokio::test]
+    async fn summary_reads_originals_when_inserting_a_digest_note() {
+        assert_summary_reads_originals(false).await;
+    }
+
+    #[tokio::test]
+    async fn summary_reads_originals_when_replacing_a_digest_note() {
+        assert_summary_reads_originals(true).await;
+    }
+
+    async fn assert_summary_reads_originals(replace_note: bool) {
+        const BUDGET: usize = 4_000;
+        let mut messages = vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("Find the build result."),
+        ];
+        let tails = [
+            "the first build failed",
+            "the second build passed",
+            "the third build timed out",
+        ];
+        let mut originals = tails.map(|tail| format!("build result\n{}\n{tail}", "x".repeat(4_000)));
+        let (separator, header) = (crate::prompt::NOTE_SEPARATOR, crate::prompt::NOTE_HEADER);
+        originals[2].push_str(&format!("{separator}{header}\n{}", "n".repeat(300)));
+        for (index, original) in originals.iter().enumerate() {
+            if index == 2 && replace_note {
+                messages.push(ChatMessage::user("[context note: previous]"));
+            }
+            messages.push(assistant_with_tools("bash", r#"{"command":"make"}"#));
+            // IDs can be reused across exchanges or missing in a saved transcript.
+            let mut tool = ChatMessage::tool("call_1", original);
+            if index == 2 {
+                tool.tool_call_id = None;
+            }
+            messages.push(tool);
+        }
+        // After two exchanges drop, the third fits until the digest note is
+        // added. This puts a shortened output in the second drop pass.
+        messages.extend((0..6).map(|_| msg("assistant", 1_760)));
+
+        let (url, requests) = crate::client::tests::spawn_recording_once(concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Build results recorded.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ).into());
+        let dir = std::env::temp_dir().join(format!("openmax-summary-{}", uuid::Uuid::new_v4()));
+        let (core, _) = Core::new(dir.clone()).unwrap();
+        let session_id = sessions::create(&core, dir.display().to_string()).unwrap().id;
+        let ctx = CompactionCtx {
+            core: &core,
+            session_id: &session_id,
+            project_root: &dir,
+            client: &ChatClient::new(url, None, "fixture".into(), None, 512),
+            hooks: &Hooks::default(),
+            cancelled: &Arc::new(CancelToken::default()),
+        };
+        assert!(sessions::save_messages(&core, &session_id, &messages, &mut 0, true));
+        let dropped = compact_messages(
+            &ctx, &mut messages, BUDGET, 0, false, &mut RequestSpend::new(None),
+        ).await.unwrap();
+        let archive = sessions::load_archive(&core, &session_id);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(dropped, 6, "all three exchanges must be dropped");
+        let archived_outputs: Vec<_> = archive.iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert_eq!(archived_outputs.len(), 6, "the archive holds the originals and the stubs");
+        assert_eq!(archived_outputs[..3], originals);
+        assert!(archived_outputs[3..].iter().all(|stub| !tails.iter().any(|tail| stub.contains(tail))));
+        assert_eq!(messages[1].content.as_deref(), Some("Find the build result."));
+        assert!(messages[2].content.as_deref().unwrap().contains("Summary: Build results recorded."));
+        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let wire: Value = serde_json::from_str(body).unwrap();
+        let input = wire["messages"][1]["content"].as_str().unwrap();
+        assert!(!input.contains(header), "the toolbox note stays out of the summary");
+        let positions = tails.map(|tail| input.find(tail).unwrap_or_else(|| panic!("missing {tail:?}")));
+        assert!(positions[0] < positions[1] && positions[1] < positions[2], "the summary follows transcript order");
+        assert!(input.len() <= dropped_text_cap(BUDGET));
     }
 
     #[test]
@@ -1493,16 +1604,16 @@ pub(crate) mod tests {
     #[test]
     fn digest_captures_dropped_text_for_summarization() {
         let mut digest = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
-        digest.record_message(&ChatMessage::user("implement the auth flow"));
-        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/auth.rs"}"#));
-        digest.record_message(&msg("tool", 5000));
+        digest.record_message(&ChatMessage::user("implement the auth flow"), None);
+        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/auth.rs"}"#), None);
+        digest.record_message(&msg("tool", 5000), None);
         let text = &digest.dropped_text;
         assert!(text.contains("user: implement the auth flow"), "{text}");
         assert!(text.contains("[called read_file"), "{text}");
         // Hard char cap: a tool-call-heavy message and many follow-ups stay in bound.
         assert!(digest.dropped_text.chars().count() <= DROPPED_TEXT_CAP_FLOOR);
         for _ in 0..100 {
-            digest.record_message(&msg("assistant", 500));
+            digest.record_message(&msg("assistant", 500), None);
         }
         assert!(
             digest.dropped_text.chars().count() <= DROPPED_TEXT_CAP_FLOOR,
@@ -1527,7 +1638,7 @@ pub(crate) mod tests {
             ),
         );
         let mut heavy = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
-        heavy.record_message(&many_calls);
+        heavy.record_message(&many_calls, None);
         assert!(
             heavy.dropped_text.chars().count() <= DROPPED_TEXT_CAP_FLOOR,
             "tool-call flood must respect cap, got {}",
@@ -1550,7 +1661,7 @@ pub(crate) mod tests {
         let mut digest = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
         let mut body = "x".repeat(4_000);
         body.push_str("\nerror[E0716]: temporary value dropped while borrowed at src/agent.rs:99");
-        digest.record_message(&ChatMessage::tool("c1", body));
+        digest.record_message(&ChatMessage::tool("c1", body), None);
         let text = &digest.dropped_text;
         assert!(text.contains("error[E0716]"), "tail needle must survive: {text}");
         assert!(text.contains("chars elided"), "elision must be visible: {text}");
@@ -1573,7 +1684,7 @@ pub(crate) mod tests {
     #[test]
     fn digest_absorbs_prior_record_within_caps() {
         let mut digest = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
-        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/new.rs"}"#));
+        digest.record_message(&assistant_with_tools("read_file", r#"{"path":"src/new.rs"}"#), None);
         let prior = sessions::CompactionRecord {
             ts: 1,
             message_count: 4,
@@ -1800,7 +1911,7 @@ pub(crate) mod tests {
             messages.push(msg("assistant", 2_000));
             messages.push(msg("user", 2_000));
         }
-        let trigger = compaction_trigger(budget, schema_tokens, Some(30_000), 1.0, &messages);
+        let trigger = compaction_trigger(budget, schema_tokens, 30_000, None, &messages);
         assert_eq!(trigger, 30_000);
         let (changed, _) = enforce_budget(&mut messages, trigger, schema_tokens);
         assert!(changed, "over the setting must prune with the window budget still far away");
@@ -1818,11 +1929,10 @@ pub(crate) mod tests {
 
     /// One direction only: a setting above the budget must not delay
     /// compaction past the point where the request stops fitting the
-    /// endpoint, and unset means the budget exactly.
+    /// endpoint.
     #[test]
     fn the_compaction_setting_never_raises_the_trigger() {
-        assert_eq!(compaction_trigger(50_000, 500, Some(400_000), 1.0, &[]), 50_000);
-        assert_eq!(compaction_trigger(50_000, 500, None, 1.0, &[]), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, 400_000, None, &[]), 50_000);
     }
 
     /// A setting whose prune target the frozen schemas outgrow can never be
@@ -1834,7 +1944,7 @@ pub(crate) mod tests {
         let budget = 150_000;
         let schema_tokens = 18_000;
         assert!(schemas_outgrow_budget(20_000, schema_tokens));
-        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &[]), budget);
+        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &[]), budget);
     }
 
     /// The other unachievable shape: a protected tail the setting's target
@@ -1854,13 +1964,13 @@ pub(crate) mod tests {
             messages.push(msg("tool", 30_000));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &messages),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &messages),
             budget,
             "an unreachable target must not arm per-iteration compaction"
         );
         // The same setting over a lean transcript stays in force.
         let lean = vec![msg("system", 400), msg("user", 400)];
-        assert_eq!(compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &lean), 20_000);
+        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &lean), 20_000);
 
         // And the floor counts only what a maximal prune actually leaves:
         // the pinned head, the note, and the newest three. Six mid-sized
@@ -1871,7 +1981,7 @@ pub(crate) mod tests {
             boundary.push(msg("assistant", 9_600));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &boundary),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &boundary),
             20_000,
             "a reachable target must keep the setting in force"
         );
@@ -1885,7 +1995,7 @@ pub(crate) mod tests {
             note_first.push(msg("assistant", 400));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &note_first),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &note_first),
             budget,
             "the floor must count the whole pinned head"
         );
@@ -1901,18 +2011,18 @@ pub(crate) mod tests {
         digest.record_message(&assistant_with_tools(
             &"t".repeat(MAX_DIGEST_TOOL_BYTES + 1),
             &format!("{{\"path\":\"{}\"}}", "p".repeat(MAX_DIGEST_PATH_BYTES * 40)),
-        ));
+        ), None);
         // Multibyte entries under the old char caps but over the byte caps:
         // the allowance is bytes/4, so these must be rejected too.
         digest.record_message(&assistant_with_tools(
             &"Ā".repeat(40),
             &format!("{{\"path\":\"{}\"}}", "€".repeat(100)),
-        ));
-        digest.record_message(&ChatMessage::user("€".repeat(400)));
+        ), None);
+        digest.record_message(&ChatMessage::user("€".repeat(400)), None);
         digest.record_message(&assistant_with_tools(
             "read_file",
             "{\"path\":\"src/lib.rs\"}",
-        ));
+        ), None);
         digest.absorb_prior(&sessions::CompactionRecord {
             ts: 0,
             message_count: 9,
@@ -1979,7 +2089,7 @@ pub(crate) mod tests {
     #[test]
     fn a_tiny_compaction_setting_is_floored() {
         assert_eq!(
-            compaction_trigger(100_000, 500, Some(1_000), 1.0, &[]),
+            compaction_trigger(100_000, 500, 1_000, None, &[]),
             COMPACTION_TOKENS_FLOOR
         );
     }
@@ -1991,21 +2101,25 @@ pub(crate) mod tests {
     /// rides the floor in real tokens too. `/compact` aims at the same mark.
     #[test]
     fn a_calibrated_setting_is_floored_in_real_tokens() {
-        let factor = token_factor(Some(4.0));
+        let ratio = Some(4.0);
         let mut transcript = vec![msg("system", 200), msg("user", 200)];
         // ~12k estimated, ~48k real: past the 30k the setting asks for.
         while transcript.iter().map(ChatMessage::estimated_tokens).sum::<usize>() < 12_000 {
             transcript.push(msg("assistant", 2_000));
             transcript.push(msg("user", 2_000));
         }
-        let trigger = compaction_trigger(100_000, 500, Some(30_000), factor, &transcript);
+        let trigger = compaction_trigger(100_000, 500, 30_000, ratio, &transcript);
         assert_eq!(trigger, 7_500);
-        assert_eq!(requested_trigger(30_000, factor, 100_000), trigger);
+        assert_eq!(requested_trigger(30_000, ratio, 100_000), trigger);
         assert!(enforce_budget(&mut transcript, trigger, 500).0, "compaction fires at 30k real");
         assert_eq!(
-            compaction_trigger(100_000, 500, Some(1_000), factor, &[]),
-            to_estimate(COMPACTION_TOKENS_FLOOR, factor)
+            compaction_trigger(100_000, 500, 1_000, ratio, &[]),
+            to_estimate(COMPACTION_TOKENS_FLOOR, token_factor(ratio))
         );
+        assert_eq!(requested_trigger(1_000, Some(0.5), 100_000), 40_000);
+        for invalid in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(requested_trigger(1_000, Some(invalid), 100_000), 20_000);
+        }
     }
 
     /// What the server reports can only tighten the budget: no observation
@@ -2035,9 +2149,22 @@ pub(crate) mod tests {
         let reported = |prompt_tokens| {
             completion(Some(crate::client::Usage { prompt_tokens, ..Default::default() }))
         };
-        assert_eq!(observed_prompt_ratio(&reported(1_200), 1_000), Some(1.2));
-        assert_eq!(observed_prompt_ratio(&reported(0), 1_000), None, "an unreported prompt size");
-        assert_eq!(observed_prompt_ratio(&completion(None), 1_000), None);
+        assert_eq!(updated_prompt_ratio(None, &reported(1_200), 1_000), Some(1.2));
+        assert_eq!(updated_prompt_ratio(Some(0.6), &reported(0), 1_000), None);
+        assert_eq!(updated_prompt_ratio(Some(1.2), &completion(None), 1_000), Some(1.2));
+        let mut limited = reported(600);
+        limited.finish_reason = "length".into();
+        assert_eq!(updated_prompt_ratio(None, &limited, 1_000), Some(0.6));
+        for reason in [TRUNCATED, "cancelled"] {
+            limited.finish_reason = reason.into();
+            assert_eq!(updated_prompt_ratio(Some(0.6), &limited, 1_000), None);
+            assert_eq!(updated_prompt_ratio(Some(1.2), &limited, 1_000), Some(1.2));
+        }
+        let inconsistent = |prompt_tokens| completion(Some(crate::client::Usage {
+            prompt_tokens, cached_tokens: Some(prompt_tokens + 1), ..Default::default()
+        }));
+        assert_eq!(updated_prompt_ratio(Some(0.6), &inconsistent(600), 1_000), None);
+        assert_eq!(updated_prompt_ratio(None, &inconsistent(1_200), 1_000), Some(1.2));
     }
 
     /// A refusal for length is a floor on the ratio: what the window leaves

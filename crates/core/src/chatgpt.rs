@@ -696,6 +696,7 @@ pub async fn save_catalog(
                 name: m["display_name"].as_str().map(str::to_string),
                 context_tokens: m["context_window"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0),
                 max_tokens: None,
+                compaction_tokens: None,
             })
         })
         .collect();
@@ -718,6 +719,7 @@ pub async fn save_catalog(
                         old["context_tokens"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0)
                     });
                     m.max_tokens = old["max_tokens"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0);
+                    m.compaction_tokens = old["compaction_tokens"].as_u64().and_then(|n| usize::try_from(n).ok());
                 }
                 m
             })

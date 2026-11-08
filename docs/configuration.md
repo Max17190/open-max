@@ -123,9 +123,8 @@ and the run that writes a key already uses it.
 
 ## Context window and compaction
 
-Five more settings shape the context budget and each turn; all but
-`context_tokens` are optional, and a named provider's per-model entries
-override the first two.
+`context_tokens` is required. A named provider's model entry can override
+`context_tokens` and `max_tokens`. The other settings are optional.
 
 - `context_tokens` (required, here or in the model's `providers.json`
   entry): the model's context window. Ordinary turns do not query it from the server,
@@ -139,6 +138,11 @@ override the first two.
   length limit. When the server reports the cut (finish_reason `length`, or
   a usage count at the limit), a tool call cut off at that limit does not
   run; the model is told why and to send large content in parts.
+- `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
+  Max uses the explicit value in `settings.json` first, then the selected
+  model's value in `providers.json`, then the shared default of 150,000
+  tokens. To keep more history on a large-window model, raise the cap in
+  that model's entry and leave the global setting unset.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's
@@ -207,17 +211,33 @@ override the first two.
   record the same way; `tr '\r' '\n' < file` shows every record.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
 
-Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript
-plus the frozen tool schemas every request re-sends beside it (estimated at ~4 bytes per token, scaled up when
-the server reported more `prompt_tokens` than estimated for the session's last
-request, as BPE tokenizers do on code, or refused a request for length
-(recognized by the error's wording) that the estimate said fit). Both are kept
-in memory, so a resumed session starts on the plain estimate. Over budget,
-compaction prunes hard to 70% of the budget in one pass and then leaves
-history untouched until it is crossed again, so the prompt prefix stays
-byte-stable between prunes and the server-side prompt cache stays warm. A
-prune truncates old tool outputs first, then drops the oldest exchanges;
-everything dropped is appended verbatim to
+The input budget for the transcript and frozen tool schemas is
+`context_tokens - (max_tokens + 1024)`, leaving room for the reply and 1024
+tokens of headroom. Open Max estimates the input at about four bytes per
+token and scales the estimate up when the server reports more prompt tokens
+than estimated or refuses a request for length that the estimate said fit.
+Calibration stays in memory, so a resumed session starts on the plain
+estimate.
+
+Open Max estimates the current input against the selected `compaction_tokens`
+value, with a 20,000-token floor on that value. It calibrates this soft trigger
+and its 70% prune target with the prompt count from the same route. A lower
+reported count can allow more history within the conservative input budget.
+This is a best-effort estimate because providers may count prompt tokens
+differently. A normal turn request that fails or returns no usable prompt
+count discards a lower calibration.
+
+The input budget always bounds the trigger. With the defaults before
+calibration, a 128,000-token window triggers at 122,880 tokens and a
+500,000-token window triggers at 150,000 tokens. If the frozen schemas or the
+messages a prune must keep make the target unreachable, automatic compaction
+falls back to the input budget. The `/compact` command aims for 70% of the
+calibrated trigger and uses the input budget if the frozen schemas alone
+fill the trigger.
+
+Between prunes the history stays byte-stable so the server can reuse its
+prompt cache. A prune truncates old tool outputs first, then drops the oldest
+exchanges. Everything dropped is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note that replaces
 the dropped span names that path, so compaction stays reversible: the model
 summary (or its heuristic fallback) is the bounded view, the archive is the
@@ -316,6 +336,9 @@ requests.
   }
 }
 ```
+
+Add `"compaction_tokens": 220000` to a model object to set that model's
+compaction cap. See [context window and compaction](#context-window-and-compaction).
 
 Set `"provider"` in settings, use the provider CLI option, or use `/provider <name>`
 when you only want to change the endpoint. Bare `/provider` opens the searchable
@@ -559,8 +582,9 @@ model with `/model` or `openmax --provider chatgpt-main --model <model-id>`.
 The picker reads the local catalog; `--chatgpt models` refreshes it explicitly.
 When the service omits a context window, set the model's documented
 `context_tokens` in its catalog entry or pass `--context-tokens`. The existing
-global `context_tokens` fallback still applies; verify it for the selected model. Refreshing
-the catalog retains a manually supplied window when the service omits one.
+global `context_tokens` fallback still applies; verify it for the selected model.
+Refreshing the catalog retains a manually supplied window when the service
+omits one and preserves the model's configured `compaction_tokens`.
 No model name, availability, or context limit is guessed.
 
 ChatGPT credentials live only in `~/.openmax/chatgpt.json`, an owner-only
