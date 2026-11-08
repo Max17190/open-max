@@ -336,6 +336,18 @@ a server that never saw the conversation and prefill the whole history again
 at the uncached price. A provider whose own `headers` set that header keeps
 its value. Native Messages does not define the key.
 
+A Chat Completions route that caches a model's prompt only up to a
+`cache_control` marker reads nothing back from a request without one, so
+every request would pay its whole prompt at the uncached price. One such route
+is known, by its host and the model id: `openrouter.ai` serving an Anthropic
+model (`anthropic/...`). Each request there carries two markers, as on native
+Messages: one on the system prompt, which caches the tools and the system
+prompt every session shares, and one on the newest stored message, which the
+next request reads back at the cache price. The system prompt and a user
+message carry theirs on their text, sent as one text part; a tool result or
+an assistant reply carries its own beside its role, a note stored on it
+included.
+
 An explicit `anthropic` selects the native Messages protocol. Set `base_url`
 to `https://api.anthropic.com/v1`; requests use `/v1/messages`, `x-api-key`
 authentication, and `anthropic-version: 2023-06-01` unless a custom version
