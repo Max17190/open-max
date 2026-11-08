@@ -1443,3 +1443,19 @@ async fn choosing_a_chatgpt_plan_model_names_the_plan_on_the_status_row() {
     assert!(rows[border - 1].contains("Using ChatGPT plan (me@example.com) · plan-model"), "{:?}", rows[border - 1]);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn a_compact_approval_card_sits_on_the_bottom_row() {
+    let (mut app, dir) = app_fixture();
+    let mut turn = waiting_turn(&app, "ap");
+    app.on_agent_event(approval("ap", "bash"));
+    // Four rows: the card takes them all and shows its three lines at the
+    // bottom, the choices last.
+    let (rows, _) = frame(&mut app, 60, 4);
+    assert!(rows[0].trim().is_empty(), "{rows:#?}");
+    assert!(rows[3].contains("Allow once"), "{rows:#?}");
+    let column = rows[3][..rows[3].find("Allow once").unwrap()].chars().count() as u16;
+    click(&mut app, column, 3).await;
+    assert_eq!(turn.try_recv(), Ok(true));
+    let _ = std::fs::remove_dir_all(dir);
+}
