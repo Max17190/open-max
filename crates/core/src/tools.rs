@@ -2009,7 +2009,7 @@ fn bash_shell() -> &'static str {
 /// occurs in the shell's own argument list (its path, `-c` and this fixed
 /// script, so `bash`, `eval` or `OPENMAX_COMMAND`) still matches the shell.
 /// `$0` stays the shell's path and there are no positional parameters, as
-/// under `-c`; the README lists what `eval` changes that a command can see
+/// under `-c`; docs/execution.md lists what `eval` changes that a command can see
 /// (`set -x` lines, `$_`, `BASH_EXECUTION_STRING`, syntax error text).
 /// Two exit statuses change, in bash and in dash as `/bin/sh`. A syntax
 /// error is reported by `eval` where it was by `-c`, and bash 3.2 exits 1

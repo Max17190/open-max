@@ -1,6 +1,6 @@
 # Testing
 
-CI gates the test count on every pull request and push to main. Scheduled and manual mutation runs separately gate how many mutants the tests catch. Each gate's floor is a ratchet, the value when it was last raised, kept in its script; the README states each floor and target, and `crates/tui/tests/thesis.rs` holds the README, the scripts and the workflows to each other.
+CI gates the test count on every pull request and push to main. Scheduled and manual mutation runs separately gate how many mutants the tests catch. Each gate's floor is a ratchet, the value when it was last raised, kept in its script; [development](development.md) states each floor and target, and `crates/tui/tests/thesis.rs` holds that page, the scripts and the workflows to each other.
 
 ## Suite timing
 
