@@ -241,7 +241,11 @@ exchanges. Everything dropped is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note that replaces
 the dropped span names that path, so compaction stays reversible: the model
 summary (or its heuristic fallback) is the bounded view, the archive is the
-lossless record. The `compaction` hook observes each prune.
+lossless record. If a later compaction drops a shortened tool result, its
+summary uses the original when it can verify that record in the last 8 MiB of
+the session's archive. When that record is unavailable, or the shortened
+result predates archive references, the summary uses the retained excerpt.
+The `compaction` hook observes each prune.
 
 ## Approvals
 
