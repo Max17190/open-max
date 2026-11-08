@@ -216,10 +216,10 @@ skips() { [ -z "$1" ] || { printf -- '--exact'; printf -- ' --skip %s' $1; }; }
 
 # Run number $1 of the suite: every test binary at once, then the tests that
 # run alone, then each one's time and the failures of any that failed. Sets
-# `elapsed_ms`, `slowest` (the slowest binary's time and name, or
-# `unknown`) and `retried` (how many binaries passed only when run again
-# alone), and returns 1 when a binary did not report, a test failed or the
-# run took longer than its budget.
+# `elapsed_ms`, `slowest` (the time and name of the slowest binary or test
+# run alone, or `unknown`) and `retried` (how many binaries passed only when
+# run again alone), and returns 1 when a binary did not report, a test
+# failed or the run took longer than its budget.
 run_suite() {
   local out="$logs/$1" count=0 start failed=0
   mkdir "$out" "$out/alone"
@@ -254,7 +254,7 @@ EOF
 
   reported=$(find "$out" -name '*.status' | wc -l | tr -d ' ')
   [ "$reported" -eq "$count" ] || { echo "error: $((count - reported)) of $count test binaries did not report" >&2; return 1; }
-  slowest=$(cat "$out"/*.status | sort -rn | head -n 1 | { IFS="$tab" read -r ms _ name _; echo "$(secs "$ms") $name"; })
+  slowest=$(find "$out" -name '*.status' -exec cat {} + | sort -rn | head -n 1 | { IFS="$tab" read -r ms _ name _; echo "$(secs "$ms") $name"; })
   cat "$out"/*.status | sort -rn | while IFS="$tab" read -r ms status name _; do
     printf '%9s  %s%s\n' "$(secs "$ms")" "$name" "$(ended "$status")"
   done

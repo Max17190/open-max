@@ -144,8 +144,9 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// the binary and showing its failures, and passes one whose binary failed
 /// only beside the others. A test the script runs alone, as it times its
 /// own work, is left out of its binary's run beside the others and then runs
-/// alone once they have ended, on the clock, and fails the gate when it
-/// fails there, with no second run; each such test is one the suite holds.
+/// alone once they have ended, on the clock (a run names it when it is
+/// the slowest), and fails the gate when it fails there, with no second
+/// run; each such test is one the suite holds.
 /// A binary still running at three times the budget
 /// is stopped, with every process still under it (a grandchild and one in a
 /// session of its own among them; on Linux, with no `ps` on the PATH), and
@@ -321,8 +322,9 @@ fn the_suite_fails_over_its_time_budget() {
     // A binary that holds a test the gate runs alone, and a binary beside it
     // that marks when it ended: beside the others the first must be run
     // without that test, then alone with only it, with libtest's own pool,
-    // once every other binary has ended, and once only. Alone, its test
-    // takes 0.3 seconds and ends with `code`.
+    // once every other binary has ended, once a run. Alone, its test takes
+    // 0.6 seconds, a fifth of a second longer than the binary beside it, and
+    // ends with `code`.
     let held_alone = |name: &str, code: u8| {
         let (path, ended, runs) = (dir.join(name), dir.join(format!("{name}-lagging-ended")), dir.join(format!("{name}-alone-runs")));
         executable(
@@ -335,7 +337,7 @@ fn the_suite_fails_over_its_time_budget() {
                  *) echo \"run with $*\"; exit 1 ;;\n\
                  esac\n\
                  [ -e '{ended}' ] || {{ echo 'run alone beside another binary'; exit 1; }}\n\
-                 sleep 0.3\n\
+                 sleep 0.6\n\
                  [ {code} = 0 ] || printf 'failures:\\n\\n---- harness_time_per_tool_round stdout ----\\npast its bound\\n'\n\
                  exit {code}\n",
                 runs = runs.display(),
@@ -343,7 +345,7 @@ fn the_suite_fails_over_its_time_budget() {
             ),
         );
         let lagging = dir.join(format!("{name}-lagging"));
-        executable(&lagging, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nsleep 0.4\n: > '{}'\n", ended.display()));
+        executable(&lagging, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nrm -f '{0}'\nsleep 0.4\n: > '{0}'\n", ended.display()));
         (path, lagging, runs)
     };
     let (timed, timed_lagging, timed_runs) = held_alone("timed", 0);
@@ -459,7 +461,8 @@ fn the_suite_fails_over_its_time_budget() {
             scope.spawn(|| run_gate("unreported", &["--runs", "2", "1"], &[("vanishing", Some(vanishing.as_path()))], None));
         let no_runs = scope.spawn(|| run_gate("no-runs", &["--runs", "0", "1"], &[], None));
         let alone = scope.spawn(|| {
-            run_gate("alone", &["1"], &[("timed", Some(timed.as_path())), ("lagging", Some(timed_lagging.as_path()))], None)
+            let binaries = [("timed", Some(timed.as_path())), ("lagging", Some(timed_lagging.as_path()))];
+            run_gate("alone", &["--runs", "2", "1"], &binaries, None)
         });
         let alone_failed = scope.spawn(|| {
             let binaries = [("slow-alone", Some(slow_alone.as_path())), ("lagging", Some(slow_lagging.as_path()))];
@@ -609,17 +612,24 @@ fn the_suite_fails_over_its_time_budget() {
     assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
     // A test that times its own work runs alone: beside the others its
     // binary runs without it, then it runs alone, once every other binary
-    // has ended, and its time counts toward the suite's. Alone, its failure
-    // fails the gate, with no second run.
-    let took = alone_report
-        .lines()
-        .find_map(|line| line.strip_prefix("the test suite took ")?.strip_suffix("s of its 5.00s budget")?.parse::<f64>().ok());
+    // has ended, and its time counts toward the run's, which names it when
+    // it is the slowest. Alone, its failure fails the gate, with no second
+    // run.
+    let timed_runs_reported = (1..=2)
+        .filter(|n| {
+            let line = alone_report.lines().find_map(|line| line.strip_prefix(&format!("run {n} of 2: ")));
+            line.and_then(|line| line.split_once("s, slowest binary ")).is_some_and(|(took, slowest)| {
+                took.parse::<f64>().is_ok_and(|took| took >= 1.0)
+                    && slowest.split_once(", load ").is_some_and(|(slowest, _)| {
+                        slowest.ends_with("s harness_time_per_tool_round in timed (test), alone")
+                    })
+            })
+        })
+        .count();
     assert!(
-        alone == Some(0)
-            && alone_report.contains("harness_time_per_tool_round in timed (test), alone\n")
-            && timed_ran == 1
-            && took.is_some_and(|took| took >= 0.7),
-        "a test that runs alone did not run once, alone, after the others and on the clock: {alone_report}"
+        alone == Some(0) && timed_ran == 2 && timed_runs_reported == 2,
+        "a test that runs alone did not run once a run, alone, after the others and on the clock, \
+         or the run did not name it as its slowest: {alone_report}"
     );
     assert!(
         alone_failed == Some(1)
