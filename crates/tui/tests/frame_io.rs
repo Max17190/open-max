@@ -673,13 +673,12 @@ mod first_frame {
             };
             found.unwrap_or_else(|| panic!("setup prompt missing for {command}: {}", s.context()))
         }
-        fn answer_probe(s: &mut Session, query: usize) {
-            s.write(ANSWER);
-            s.wait_for(KEYBOARD_PUSH, query, Duration::from_secs(5)).unwrap_or_else(|| panic!("chat keyboard probe did not finish: {}", s.context()));
-        }
+        // The terminal is asked about the keyboard protocol once a run: setup
+        // hands it back with the flags its one answer allows pushed again,
+        // then the chat paints.
         fn resume(s: &mut Session, start: usize) {
-            let query = s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not return to chat: {}", s.context()));
-            answer_probe(s, query);
+            let push = s.wait_for(KEYBOARD_PUSH, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not return to chat: {}", s.context()));
+            s.wait_for(FRAME_END, push, Duration::from_secs(5)).unwrap_or_else(|| panic!("chat did not paint after setup: {}", s.context()));
         }
         fn close_picker(s: &mut Session) {
             let start = s.out.len();
@@ -736,7 +735,8 @@ mod first_frame {
                 .env("ANTHROPIC_API_KEY", "fixture-env-key").stderr(terminal.try_clone().unwrap());
         });
         let probe = s.wait_for(KEYBOARD_QUERY, 0, Duration::from_secs(10)).expect("initial keyboard probe");
-        answer_probe(&mut s, probe);
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, Duration::from_secs(5)).unwrap_or_else(|| panic!("chat keyboard probe did not finish: {}", s.context()));
         let dir = s.dir.join("home/.openmax");
         let original_settings = std::fs::read(dir.join("settings.json")).unwrap();
         let start = s.out.len();
@@ -757,9 +757,8 @@ mod first_frame {
         let shown: Vec<_> = screen(&s.out[model..], 80, 24).into_iter().filter(|row| !row.is_empty()).collect();
         assert_eq!(shown, ["Choose a model (type to filter)", ">", "> fixture-model", "  other-model", "  text-embedding-fixture", "Enter confirms; Esc cancels"]);
         s.write(b"\x1b[B\x1b[A\r");
-        let probe = s.wait_for(KEYBOARD_QUERY, model, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not resume the TUI: {}", s.context()));
-        assert!(s.out[..probe].windows(b"$fixture-hidden-key".len()).all(|window| window != b"$fixture-hidden-key"), "secret appeared on terminal");
-        answer_probe(&mut s, probe);
+        let push = s.wait_for(KEYBOARD_PUSH, model, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not resume the TUI: {}", s.context()));
+        assert!(s.out[..push].windows(b"$fixture-hidden-key".len()).all(|window| window != b"$fixture-hidden-key"), "secret appeared on terminal");
         let shown = screen_when(&mut s, 80, 24, Duration::from_secs(5), |shown| shown.contains("fixture-model"));
         assert!(shown.contains("fixture-model"), "model picker did not refresh: {shown}");
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings, "login selected a default before the user picked it");
@@ -774,19 +773,17 @@ mod first_frame {
         s.write(b"/logout fixture\r");
         let question = s.wait_for_prompt(b"Disconnect fixture?", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not get keyboard input: {}", s.context()));
         s.write(b"\x1b[B\r");
-        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not resume TUI: {}", s.context()));
-        answer_probe(&mut s, probe);
+        s.wait_for(KEYBOARD_PUSH, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("logout did not resume TUI: {}", s.context()));
         let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
         assert!(catalog["providers"].get("fixture").is_none());
         assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original_settings);
         for target in ["chatgpt", "plan-work"] {
             let start = s.out.len();
             s.write(format!("/logout {target}\r").as_bytes());
-            let probe = s.wait_for(KEYBOARD_QUERY, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("account logout did not resume TUI: {}", s.context()));
-            let output = String::from_utf8_lossy(&s.out[start..probe]);
+            let push = s.wait_for(KEYBOARD_PUSH, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("account logout did not resume TUI: {}", s.context()));
+            let output = String::from_utf8_lossy(&s.out[start..push]);
             assert!(output.contains("account 'work' signed out"), "{output}");
             assert!(!output.contains("account 'main' signed out"), "{output}");
-            answer_probe(&mut s, probe);
         }
         let credentials: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("chatgpt.json")).unwrap()).unwrap();
         assert_eq!(credentials["accounts"]["main"]["subject"], "main-subject");
@@ -800,10 +797,9 @@ mod first_frame {
         s.write(b"/login custom\r");
         let question = s.wait_for_prompt(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
         s.write(b"openai\r");
-        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
-        assert!(!String::from_utf8_lossy(&s.out[question..probe]).contains("API key (hidden)"));
+        let push = s.wait_for(KEYBOARD_PUSH, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
+        assert!(!String::from_utf8_lossy(&s.out[question..push]).contains("API key (hidden)"));
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
-        answer_probe(&mut s, probe);
         for (name, valid) in [(String::new(), false), ("x".repeat(64), true), ("x".repeat(65), false),
             ("x".repeat(66), false), ("dash-name".into(), true), ("under_score".into(), true), ("bad name".into(), false)] {
             let question = begin(&mut s, "/login custom", b"Connection name");
@@ -933,12 +929,13 @@ mod first_frame {
         resume(&mut s, key_prompt);
         let question = begin(&mut s, "/login", b"Connect a provider");
         s.write(b"\x03");
-        let probe = s.wait_for(KEYBOARD_QUERY, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
-        answer_probe(&mut s, probe);
+        s.wait_for(KEYBOARD_PUSH, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("cancel did not resume TUI: {}", s.context()));
         s.write(CTRL_C_TWICE);
         let status = s.wait_exit(Duration::from_secs(5));
         assert!(status.is_some_and(|status| status.success()), "{status:?}: {}", s.context());
         assert!(!s.out.windows(b"$fixture-hidden-key".len()).any(|window| window == b"$fixture-hidden-key"));
+        let asked = s.out.windows(KEYBOARD_QUERY.len()).filter(|window| *window == KEYBOARD_QUERY).count();
+        assert_eq!(asked, 1, "the terminal was asked about the keyboard protocol again: {}", s.context());
         for entry in std::fs::read_dir(dir.join("history")).unwrap() {
             assert!(!std::fs::read_to_string(entry.unwrap().path()).unwrap().contains("$fixture-hidden-key"));
         }
