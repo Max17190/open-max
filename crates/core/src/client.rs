@@ -127,13 +127,17 @@ fn has_reasoning_blocks(raw: &RawValue) -> bool {
         .is_some_and(|body| body.trim_start().starts_with('{'))
 }
 
+fn chat_replay(message: &ChatMessage, origin: &str, prefer_details: bool) -> (bool, bool) {
+    let replay = message.reasoning_origin.as_deref() == Some(origin);
+    let plain = replay && !(prefer_details && message.reasoning_details.as_deref().is_some_and(has_reasoning_blocks));
+    (replay, plain)
+}
+
 impl Serialize for WireMessages<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let last = self.messages.len().saturating_sub(1);
         serializer.collect_seq(self.messages.iter().enumerate().map(|(at, m)| {
-            let replay = m.reasoning_origin.as_deref() == Some(self.origin);
-            let details = m.reasoning_details.as_deref().filter(|_| replay);
-            let plain = replay && !(self.prefer_reasoning_details && details.is_some_and(has_reasoning_blocks));
+            let (replay, plain) = chat_replay(m, self.origin, self.prefer_reasoning_details);
             let mark = self.marks && (at == last || m.role == "system");
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             WireMessage {
@@ -143,7 +147,7 @@ impl Serialize for WireMessages<'_> {
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| plain),
                 reasoning: m.reasoning.as_deref().filter(|_| plain),
-                reasoning_details: details,
+                reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
                 cache_control: (mark && !text_mark).then(|| serde_json::json!({"type": "ephemeral"})),
             }
         }))
@@ -526,6 +530,24 @@ impl ChatClient {
         self.wire_api == crate::providers::WireApi::ChatCompletions
             && (self.prefer_reasoning_details || reqwest::Url::parse(self.base_url.trim())
                 .is_ok_and(|url| url.host_str() == Some("openrouter.ai")))
+    }
+
+    /// Key calibration by the replay format as well as the route. Changing
+    /// a proxy's compatibility setting changes the estimate, but stored
+    /// reasoning still belongs to the same endpoint.
+    pub(crate) fn message_estimator<'a>(&self, origin: &'a str) -> (String, impl Fn(&ChatMessage) -> usize + 'a) {
+        let chat = self.wire_api == crate::providers::WireApi::ChatCompletions;
+        let prefer_details = self.prefers_reasoning_details();
+        let ratio_origin = if prefer_details { format!("{origin}:details") } else { origin.to_owned() };
+        let estimate = move |message: &ChatMessage| {
+            if chat {
+                let (replay, plain) = chat_replay(message, origin, prefer_details);
+                message.estimated_tokens_with_replay(replay, plain)
+            } else {
+                message.estimated_tokens()
+            }
+        };
+        (ratio_origin, estimate)
     }
 
     /// The header a Chat Completions provider this client serves
@@ -4103,6 +4125,17 @@ pub(crate) mod tests {
             reply.reasoning_details = None;
             assert!(request_body(&client, &[reply]).contains(r#""reasoning_content":"reasoning text""#));
         }
+    }
+
+    #[test]
+    fn changing_proxy_replay_format_discards_incompatible_calibration() {
+        let mut client = ChatClient::new("http://127.0.0.1/v1".into(), None, "fixture".into(), None, 512);
+        let origin = client.origin();
+        let (plain_ratio_origin, _) = client.message_estimator(&origin);
+        client.prefer_reasoning_details = true;
+        let (details_ratio_origin, _) = client.message_estimator(&origin);
+        assert_ne!(plain_ratio_origin, details_ratio_origin);
+        assert_eq!(client.origin(), origin, "stored reasoning still belongs to the route");
     }
 
     /// The whole request body `client` would send for `messages`.

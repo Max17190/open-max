@@ -427,6 +427,8 @@ async fn run_compact(
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    let origin = client.origin();
+    let (ratio_origin, estimate) = client.message_estimator(&origin);
     let (messages, registry, take_seq, prompt_ratio) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
@@ -438,7 +440,7 @@ async fn run_compact(
             return Err("a turn is in flight; run /compact after it finishes".into());
         }
         let registry = data.registry.clone();
-        let prompt_ratio = route_ratio(data.prompt_ratio.as_ref(), &client.origin());
+        let prompt_ratio = route_ratio(data.prompt_ratio.as_ref(), &ratio_origin);
         let (messages, seq) = take_messages(data);
         (messages, registry, seq, prompt_ratio)
     };
@@ -456,7 +458,7 @@ async fn run_compact(
     let trigger = requested_trigger(endpoint.compaction_tokens, prompt_ratio, budget);
     let trigger = if schemas_exceed_budget(trigger, schema_tokens) { budget } else { trigger };
     let tokens_before =
-        schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>();
     if schemas_exceed_budget(trigger, schema_tokens) {
         guard.commit().await;
         return Err(
@@ -478,7 +480,7 @@ async fn run_compact(
         });
     }
     let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-    let ctx = CompactionCtx { core, session_id, project_root, client: &client, hooks: &hooks, cancelled };
+    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
     let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, schema_tokens, true, &mut spend).await {
         Ok(count) => count,
@@ -488,7 +490,7 @@ async fn run_compact(
         }
     };
     let tokens_after =
-        schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>();
     sessions::touch(core, session_id);
     guard.commit().await;
     Ok(CompactReceipt {
@@ -753,9 +755,10 @@ async fn run_loop(
     // with what the earlier requests on this route taught, a request the
     // provider refused for length included (see `refusal_ratio`).
     let origin = client.origin();
+    let (ratio_origin, estimate) = client.message_estimator(&origin);
     let mut prompt_ratio = route_ratio(
         core.sessions.lock().await.get(session_id).and_then(|d| d.prompt_ratio.as_ref()),
-        &origin,
+        &ratio_origin,
     );
     let max_iterations = settings.max_agent_iterations.max(1);
     let mut repeats = RepeatTracker::default();
@@ -787,10 +790,10 @@ async fn run_loop(
                 .await;
         }
         let trigger = compaction_trigger(
-            budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(),
+            budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(), &estimate,
         );
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, hooks: &hooks, cancelled: &cancelled,
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled,
         };
         if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, schema_tokens, false, &mut spend).await {
             core.send_agent(session_id, AgentEvent::Error { message });
@@ -798,7 +801,7 @@ async fn run_loop(
             break 'turns;
         }
         let used = schema_tokens
-            + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+            + guard.messages().iter().map(&estimate).sum::<usize>();
         let used_real = to_real(used, factor);
         // The ceiling refuses the request it cannot afford, not just the one
         // after it: what the turn has spent plus the request-side size of the
@@ -835,7 +838,7 @@ async fn run_loop(
                     .or(prompt_ratio.filter(|&ratio| ratio >= 1.0));
                 if next_ratio != prompt_ratio {
                     if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                        data.prompt_ratio = next_ratio.map(|ratio| (origin.clone(), ratio));
+                        data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
                     }
                 }
                 // A knowingly oversized request that then fails owes the user
@@ -859,7 +862,7 @@ async fn run_loop(
         if next_ratio != prompt_ratio {
             prompt_ratio = next_ratio;
             if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                data.prompt_ratio = next_ratio.map(|ratio| (origin.clone(), ratio));
+                data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
             }
         }
 
@@ -3445,7 +3448,7 @@ mod tests {
         }
         let id = sessions::create(&core, project.display().to_string()).unwrap().id;
         start_turn(core.clone(), id, project, "Read a.txt".into()).unwrap();
-        let (stop, _) = budgets_until_done(&mut rx).await;
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
         assert_eq!(stop, "stop");
 
         let bodies = bodies.lock().unwrap();
@@ -3459,6 +3462,10 @@ mod tests {
         ]));
         let second: Value = serde_json::from_str(&bodies[1]).unwrap();
         assert_eq!(second["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], reply["tool_calls"][0]["id"]);
+        let messages: Vec<ChatMessage> = serde_json::from_value(second["messages"].clone()).unwrap();
+        let sent_estimate = request_overhead(&second["tools"].to_string())
+            + messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+        assert_eq!(budgets[1], sent_estimate, "budget must price the reasoning representation sent");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -7567,7 +7574,7 @@ mod tests {
             let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
-                compaction_trigger(budget, schema_tokens, 20_000, None, &data.messages),
+                compaction_trigger(budget, schema_tokens, 20_000, None, &data.messages, &ChatMessage::estimated_tokens),
                 budget,
                 "fixture must sit in the fallback band"
             );

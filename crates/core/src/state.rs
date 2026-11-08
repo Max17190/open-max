@@ -82,11 +82,11 @@ pub struct SessionData {
     /// estimator under-counts BPE tokenizers on code, by far more than the
     /// budget's headroom, so the send budget is scaled by this ratio and
     /// compaction fires before the provider refuses the request for length.
-    /// Keyed by the route that taught it (`ChatClient::origin`): another
-    /// model, URL, key, or header set tokenizes and templates differently,
-    /// so after a switch the plain estimate applies until the new route
-    /// reports. In memory only: a resumed session runs on the plain estimate
-    /// until its first response or refusal for length. See
+    /// Keyed by the route and reasoning replay format that taught it. A
+    /// switch can change what the request contains and how it is tokenized,
+    /// so it uses the plain estimate until the new route reports. In memory
+    /// only: a resumed session runs on the plain estimate until its first
+    /// response or refusal for length. See
     /// `compaction::token_factor`.
     pub prompt_ratio: Option<(String, f64)>,
 }
