@@ -1030,6 +1030,137 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A session that writes two capabilities, a tool and then a skill, over each
+/// wire: nine requests in two turns, every reply with reasoning, each read
+/// long enough that a request past the second can write a cache entry. Each
+/// write changes the note, the harness's account of what the session changed
+/// since its prompt was built. The gate holds that the note is stored where
+/// it changes and never moved: every request repeats every byte the request
+/// before it sent, the last request carries each of the two notes once, and
+/// on native Messages every request replays the thinking of every reply
+/// before it, which the client sends back only while the history that reply
+/// answered is unchanged. It prints, per wire, the share of prompt tokens an
+/// earlier request's bytes could serve, where a provider's rule is modeled
+/// the share it bills as cached (as `a_session_prompt_is_75_percent_cacheable`
+/// models it), and on native Messages the thinking blocks replayed of those
+/// a request could replay. A byte count, so it holds in debug and release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_note_is_stored_once_where_it_changes() {
+    let mut failures = Vec::new();
+    for wire in [WireApi::ChatCompletions, WireApi::Responses, WireApi::Anthropic] {
+        failures.extend(note_storage_case(wire).await.into_iter().map(|failure| format!("{wire:?}: {failure}")));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The session of `a_note_is_stored_once_where_it_changes` over `wire`: what
+/// it measures printed, and each way it fails the gate.
+async fn note_storage_case(wire: WireApi) -> Vec<String> {
+    use serde_json::json;
+    let dir = std::env::temp_dir().join(format!("omx-thesis-{}", uuid::Uuid::new_v4()));
+    let (data, project) = (dir.join("data"), dir.join("project"));
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    for i in 0..5 {
+        let body: String = (0..96).map(|l| format!("pub fn item_{i}_{l}() -> u32 {{ {l} }}\n")).collect();
+        std::fs::write(project.join(format!("f{i}.rs")), body).unwrap();
+    }
+    let tool = "name = \"wordfreq\"\ndescription = \"top-n words\"\ncommand = \"/bin/echo\"\nmutating = false\n";
+    let skill = "---\nname: lint\ndescription: lint the sources\n---\nRun the linter.\n";
+    let read = |i: usize| Reply::Call("read_file", json!({ "path": format!("f{i}.rs") }));
+    let replies = [
+        Reply::Call("write_file", json!({ "path": ".openmax/tools/wordfreq.toml", "content": tool })),
+        read(0),
+        Reply::Call("write_file", json!({ "path": ".agents/skills/lint/SKILL.md", "content": skill })),
+        read(1),
+        read(2),
+        Reply::Answer("added both"),
+        read(3),
+        read(4),
+        Reply::Answer("read them"),
+    ];
+    let thought = "weighing which file to read next and why ".repeat(48);
+    let script: Vec<serde_json::Value> =
+        replies.iter().enumerate().map(|(n, reply)| scripted_reply(wire, n, reply, &thought)).collect();
+    let (base_url, bodies) = match wire {
+        WireApi::Responses => common::recording_responses(script).await,
+        _ => recording_endpoint(script).await,
+    };
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("settings.json"),
+        json!({ "provider": "fixture", "model": "scripted", "approval_mode": "ask", "context_tokens": 65536, "max_tokens": 1024 })
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("providers.json"),
+        json!({ "providers": { "fixture": { "base_url": base_url, "wire_api": wire } } }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(data.join("trust.json"), json!({ "version": 1, "projects": [project.to_string_lossy()] }).to_string())
+        .unwrap();
+    let (core, mut rx) = Core::new(data).unwrap();
+    let id = open_max_core::sessions::create(&core, project.display().to_string()).unwrap().id;
+    let mut events = drive_turn(&core, &mut rx, &id, &project, "add a word count tool and a lint skill").await;
+    events.extend(drive_turn(&core, &mut rx, &id, &project, "read two more").await);
+    let ends: Vec<bool> =
+        events.iter().filter_map(|event| if let AgentEvent::ToolEnd { ok, .. } = event { Some(*ok) } else { None }).collect();
+    assert!(ends.len() == 7 && ends.iter().all(|ok| *ok), "every scripted call ran and succeeded: {ends:?}");
+
+    let (canonical, plain) = (dir.canonicalize().unwrap().display().to_string(), dir.display().to_string());
+    let bodies: Vec<String> =
+        bodies.lock().unwrap().iter().map(|body| body.replace(&canonical, "/omx").replace(&plain, "/omx")).collect();
+    assert_eq!(bodies.len(), replies.len(), "the session makes one request per scripted reply");
+    let prompts: Vec<Prompt> = bodies.iter().map(|body| Prompt::of(wire, body)).collect();
+    let tokens = |bytes: &[usize]| bytes.iter().map(|&b| estimate_tokens(b)).sum::<usize>();
+    let sizes: Vec<usize> = prompts.iter().map(Prompt::len).collect();
+    let cacheable: Vec<usize> =
+        (0..prompts.len()).map(|i| (0..i).map(|j| prompts[i].shared(&prompts[j])).max().unwrap_or(0)).collect();
+    let billed: Vec<usize> = (0..prompts.len()).map(|i| prompts[i].billed(&prompts[..i])).collect();
+    let percent = |served: &[usize]| 100.0 * tokens(served) as f64 / tokens(&sizes) as f64;
+    // A thinking block per reply on native Messages; a request can replay
+    // one for each reply before it.
+    let replayed: Vec<usize> = bodies.iter().map(|body| body.matches("\"signature\":\"fixture-signature\"").count()).collect();
+    let header = serde_json::to_string(NOTE_HEADER).unwrap();
+    let copies = bodies.last().unwrap().matches(&header[1..header.len() - 1]).count();
+    println!(
+        "MEASURE a_note_is_stored_once_where_it_changes ({}) {:.2}% cacheable, {} = {} of {} prompt tokens; thinking \
+         replayed {} of {}; the last request carries {copies} notes",
+        match wire {
+            WireApi::ChatCompletions => "Chat Completions",
+            WireApi::Responses => "Responses",
+            WireApi::Anthropic => "native Messages",
+        },
+        percent(&cacheable),
+        if wire == WireApi::ChatCompletions { "billed by the byte".to_string() } else { format!("{:.2}% billed", percent(&billed)) },
+        tokens(if wire == WireApi::ChatCompletions { &cacheable } else { &billed }),
+        tokens(&sizes),
+        replayed.iter().sum::<usize>(),
+        if wire == WireApi::Anthropic { (0..prompts.len()).sum::<usize>() } else { 0 },
+    );
+    let ahead = |prompt: &Prompt| prompt.text.trim_end_matches([']', '}']).len();
+    let rewrote: Vec<usize> =
+        (1..prompts.len()).filter(|&i| prompts[i].shared(&prompts[i - 1]) < ahead(&prompts[i - 1])).map(|i| i + 1).collect();
+    let unread: Vec<usize> = (1..prompts.len())
+        .filter(|&i| prompts[i - 1].writes.iter().max().is_some_and(|&w| billed[i] < w))
+        .map(|i| i + 1)
+        .collect();
+    let dropped: Vec<usize> =
+        (0..prompts.len()).filter(|&i| wire == WireApi::Anthropic && replayed[i] < i).map(|i| i + 1).collect();
+    close(&core, &id).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    [
+        (!rewrote.is_empty()).then(|| format!("requests {rewrote:?} do not repeat every byte the request before them sent")),
+        (!unread.is_empty()).then(|| format!("requests {unread:?} read back no entry the request before them wrote")),
+        (copies != 2).then(|| format!("the last request carries {copies} notes, not each of the two once")),
+        (!dropped.is_empty()).then(|| format!("requests {dropped:?} replay the thinking of fewer replies than came before them")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// A tool manifest's parameter schema: a required path, an integer, an enum
 /// and an array of strings, the shapes `openmax --spec tools` documents.
 const TOOL_PARAMS: &str = r#"
