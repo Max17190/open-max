@@ -505,20 +505,13 @@ impl ChatClient {
         self
     }
 
-    /// Whether this client serves the provider known by `host`, or by a model
-    /// id `prefix` after any `vendor/` prefix (so behind a proxy or gateway too).
-    fn serves(&self, host: &str, prefix: &str) -> bool {
-        reqwest::Url::parse(self.base_url.trim()).is_ok_and(|url| url.host_str() == Some(host))
-            || self.model.rsplit('/').next().is_some_and(|model| model.to_ascii_lowercase().starts_with(prefix))
-    }
-
-    /// The header a Chat Completions provider this client `serves` routes a
-    /// conversation by to the server that holds its prompt cache
-    /// (`providers::CACHE_ROUTES`), with this conversation's key: a request
-    /// served elsewhere prefills the whole history again, at the uncached
-    /// price. None where the provider's own headers set it.
+    /// The header a Chat Completions provider this client serves
+    /// (`providers::CACHE_ROUTES`) routes a conversation by to the server that
+    /// holds its prompt cache, with this conversation's key: a request served
+    /// elsewhere prefills the whole history again, at the uncached price.
+    /// None where the provider's own headers set it.
     fn cache_route(&self) -> Option<(&'static str, &str)> {
-        let (.., name) = crate::providers::CACHE_ROUTES.iter().find(|(host, prefix, _)| self.serves(host, prefix))?;
+        let (.., name) = crate::providers::CACHE_ROUTES.iter().find(|(host, prefix, _)| crate::providers::serves(&self.base_url, &self.model, host, prefix))?;
         let own = self.headers.iter().any(|(header, _)| header.eq_ignore_ascii_case(name));
         (self.wire_api == crate::providers::WireApi::ChatCompletions && !own).then_some((*name, self.cache_key.as_deref()?))
     }
@@ -590,7 +583,7 @@ impl ChatClient {
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
-        crate::providers::validate_reasoning_effort(&self.base_url, self.wire_api, self.reasoning_effort)?;
+        crate::providers::validate_reasoning_effort(&self.base_url, self.wire_api, &self.model, self.reasoning_effort)?;
         if self.wire_api == crate::providers::WireApi::Anthropic {
             let keys = self.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("x-api-key")).count();
             if keys > usize::from(self.api_key.is_none()) {

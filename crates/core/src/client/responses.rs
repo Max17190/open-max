@@ -60,7 +60,7 @@ pub(super) fn serialize(
     // unchanged. It joins the frozen prefix immediately after the instructions.
     // A server whose input defines no such item refuses the whole request
     // over it (`providers::TOOLS_FIELD`): there the tools go in `tools`.
-    if !functions.is_empty() && !crate::providers::TOOLS_FIELD.iter().any(|(host, prefix)| client.serves(host, prefix)) {
+    if !functions.is_empty() && !crate::providers::TOOLS_FIELD.iter().any(|(host, prefix)| crate::providers::serves(&client.base_url, &client.model, host, prefix)) {
         let at = usize::from(input.first().is_some_and(|item| item["role"] == "developer"));
         input.insert(at, json!({"type":"additional_tools","role":"developer","tools":std::mem::take(&mut functions)}));
     }
