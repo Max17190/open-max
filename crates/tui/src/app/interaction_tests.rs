@@ -801,6 +801,14 @@ async fn a_settled_turn_sends_the_queue_and_returns_what_cannot_start() {
     app.on_core_event(envelope()).await;
     assert_eq!(app.queued, ["next question"]);
     assert_eq!(app.composer.text(), "");
+    // So does an approval still waiting.
+    app.running = false;
+    app.on_agent_event(approval("ap", "bash"));
+    app.flush_queue = true;
+    app.on_core_event(envelope()).await;
+    assert_eq!(app.queued, ["next question"]);
+    assert_eq!((app.composer.text().as_str(), app.transcript.block_count()), ("", 0));
+    app.pending_approval = None;
 
     // Settled: the queue goes out. A session another turn still holds
     // refuses the next one before it starts, so the message comes back to
