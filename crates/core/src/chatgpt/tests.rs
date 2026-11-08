@@ -205,17 +205,24 @@ async fn cancelling_a_refresh_waiter_does_not_discard_rotated_credentials() {
             .await
             .unwrap();
     });
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    // The harness's own client, with its deadlines: 10 seconds to connect and
+    // 30 for a request. No wait below has a deadline of the test's own: a
+    // refresh request that stalls ends at the client's, a waiter that ends
+    // before its refresh reaches the server fails the test at once, and the
+    // second refresh waits on the credential lock, which gives up after 35
+    // seconds. 2-second deadlines here timed the runner instead, failing
+    // beside every other test binary on CI.
+    let client = http().unwrap();
     let (other, other_http, other_url) = (auth.clone(), client.clone(), url.clone());
-    let waiter = tokio::spawn(async move { other.access_at(&other_http, &other_url).await });
-    tokio::time::timeout(Duration::from_secs(2), received).await.unwrap().unwrap();
+    let mut waiter = tokio::spawn(async move { other.access_at(&other_http, &other_url).await });
+    tokio::select! {
+        reached = received => reached.unwrap(),
+        ended = &mut waiter => panic!("the waiter ended before its refresh reached the server: {ended:?}"),
+    }
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     release.send(()).unwrap();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), auth.access_at(&client, &url)).await.unwrap().unwrap(),
-        "new-access"
-    );
+    assert_eq!(auth.access_at(&client, &url).await.unwrap(), "new-access");
     assert_eq!(load(&scratch.0).unwrap().accounts["main"].tokens.as_ref().unwrap().refresh, "rotated-refresh");
     server.await.unwrap();
 }
