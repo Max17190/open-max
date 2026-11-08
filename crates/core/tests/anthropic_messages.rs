@@ -103,6 +103,35 @@ async fn native_effort_auth_and_default_omission_preserve_request_content() {
     }
 }
 
+/// A Claude model that takes an effort change inside the conversation
+/// (`providers::EFFORT_UPDATES`) keeps the effort the conversation opened
+/// with in `output_config` and sends each later choice as an effort-only
+/// system message just ahead of the prompt it was made for, under the beta
+/// that defines it. A request with no change sends no beta, and a model that
+/// takes none names the current effort at the top, as before.
+#[tokio::test]
+async fn native_effort_change_rides_the_history_under_its_beta() {
+    let scratch=Scratch::new();
+    let (base,server)=serve(vec![(200,text_response());3]).await;
+    let prompt=|text: &str, effort: &str| ChatMessage { effort:Some(effort.into()), ..ChatMessage::user(text) };
+    let changed=[ChatMessage::system("instructions"),prompt("task","default"),ChatMessage::assistant(Some("done".into()),None),prompt("again","high")];
+    let mut opus=client(&scratch,&base,Some(ReasoningEffort::High)); opus.model="claude-opus-5-5".into();
+    run(&opus,&changed).await.unwrap();
+    run(&opus,&[ChatMessage::system("instructions"),ChatMessage::user("task")]).await.unwrap();
+    run(&client(&scratch,&base,Some(ReasoningEffort::High)),&changed).await.unwrap();
+    let requests=server.await.unwrap();
+    let beta=|request: &Request| request.head.to_ascii_lowercase().contains(&format!("\r\nanthropic-beta: {}", providers::EFFORT_BETA));
+    let bodies: Vec<Value>=requests.iter().map(|request| serde_json::from_slice(&request.body).unwrap()).collect();
+    assert!(beta(&requests[0]) && bodies[0].get("output_config").is_none(), "the top keeps the default the conversation opened with: {}", bodies[0]);
+    assert_eq!(bodies[0]["messages"][2],json!({"role":"system","content":[],"output_config":{"effort":"high"}}));
+    assert_eq!((&bodies[0]["messages"][1]["role"],&bodies[0]["messages"][3]["role"]),(&json!("assistant"),&json!("user")),"the change goes just ahead of its prompt");
+    for (request,body) in requests.iter().zip(&bodies).skip(1) {
+        assert!(!beta(request),"{}",request.head);
+        assert_eq!(body["output_config"],json!({"effort":"high"}));
+        assert!(body["messages"].as_array().unwrap().iter().all(|message| message["role"]!="system"),"{body}");
+    }
+}
+
 #[tokio::test]
 async fn native_tool_round_trip_preserves_signed_blocks_only_for_the_same_origin() {
     let scratch=Scratch::new();let(base,server)=serve(vec![(200,tool_response()),(200,text_response()),(200,text_response())]).await;

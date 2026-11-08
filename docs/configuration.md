@@ -158,7 +158,17 @@ override the first two.
   sends `reasoning_effort`. Native Anthropic Messages sends
   `output_config.effort` and offers `low`, `medium`, `high`, `xhigh`, and `max`
   plus Default. It rejects `none` and `minimal`; the picker and shortcut leave
-  them out. Supported levels still depend on the model and endpoint;
+  them out. Both providers render that field ahead of the conversation, so
+  changing it mid-session makes the whole history a prompt cache miss once.
+  Where the model takes an effort change inside the conversation (GPT-6 and
+  later over Responses, not on a ChatGPT plan; Claude Opus 5 and 5.5, Sonnet
+  5.5, Haiku 5.5, Fable 5.1 and Mythos 5.1 over native Messages), the field
+  keeps the effort the session opened with and each later choice goes just
+  ahead of the prompt of the turn it was made for: a `configuration_update`
+  input item, or an effort-only system message under the
+  `mid-conversation-output-config-2026-07-01` beta header. Each prompt records
+  its turn's effort in the session file. A return to Default, which no such
+  change can name, sends the field as before. Supported levels still depend on the model and endpoint;
   the server validates explicit selections. A rejection is reported without
   retrying at another level. Sampling and protocol settings are unchanged.
   The Anthropic compatibility endpoint ignores effort, so explicit selections

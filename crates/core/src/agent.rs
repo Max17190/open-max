@@ -49,7 +49,7 @@ use crate::compaction::{
     request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
     to_estimate, to_real, token_factor, CompactionCtx, RequestSpend,
 };
-use crate::config::{ApprovalMode, Settings};
+use crate::config::{ApprovalMode, ReasoningEffort, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
@@ -635,7 +635,7 @@ async fn run_loop(
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map.get_mut(session_id).expect("session was hydrated");
         let first_turn = data.messages.len() <= 1;
-        data.messages.push(ChatMessage::user(user_text));
+        data.messages.push(ChatMessage { effort: Some(settings.reasoning_effort.map_or("default", ReasoningEffort::as_str).into()), ..ChatMessage::user(user_text) });
         store_note(&mut data.messages, data.trailing_note.as_deref());
         let (messages, seq) = take_messages(data);
         (messages, data.registry.clone(), data.trailing_note.clone(), seq, first_turn)

@@ -8,10 +8,13 @@ pub(super) fn serialize(
     messages: &[ChatMessage],
     tools: &str,
 ) -> Result<Vec<u8>, String> {
-    let origin = client.origin();
+    let (origin, (effort, changes)) = (client.origin(), client.effort_plan(messages));
     let mut input = Vec::new();
-    for m in messages {
+    for (i, m) in messages.iter().enumerate() {
         let content = m.content.as_deref().unwrap_or_default();
+        if let Some((_, level)) = changes.iter().find(|(at, _)| *at == i) {
+            input.push(json!({"type":"configuration_update","reasoning":{"effort":level}}));
+        }
         if m.role == "assistant" && m.reasoning_origin.as_deref() == Some(&origin) {
             if let Some(raw) = &m.reasoning_details {
                 let items: Vec<Value> =
@@ -69,7 +72,7 @@ pub(super) fn serialize(
     if !functions.is_empty() {
         body["tools"] = json!(functions);
     }
-    if let Some(effort) = client.reasoning_effort {
+    if let Some(effort) = effort {
         body["reasoning"] = json!({"effort": effort});
     }
     // Both OpenAI routes take it: the subscription one refuses
@@ -516,6 +519,66 @@ mod tests {
             assert_eq!((&item["input"][1]["tools"], item.get("tools")), (functions, None), "{model} at {url}");
             assert_eq!(body(url, model, "[]")["input"], messages, "{model} at {url}");
         }
+    }
+
+    /// A GPT-6 conversation keeps the effort it opened with at the top of
+    /// every request and sends each later choice as a `configuration_update`
+    /// just ahead of the prompt it was made for, so a change appends to what
+    /// the requests before it sent. Where the model, the wire or the route
+    /// documents no such item, or the prompts in the history do not end on
+    /// the current effort or return to the default, the top names the current
+    /// effort and no item goes, as before.
+    #[test]
+    fn an_effort_change_rides_the_history_where_the_model_takes_it() {
+        use crate::config::ReasoningEffort::{High, Medium};
+        let prompt = |text: &str, effort: &str| ChatMessage { effort: Some(effort.into()), ..ChatMessage::user(text) };
+        let history = |efforts: &[&str]| {
+            let mut messages = vec![ChatMessage::system("rules")];
+            for (turn, effort) in efforts.iter().enumerate() {
+                messages.push(ChatMessage::user("note"));
+                messages.push(prompt(&format!("task {turn}"), effort));
+                messages.push(ChatMessage::assistant(Some(format!("done {turn}")), None));
+            }
+            messages
+        };
+        let body = |client: &ChatClient, messages: &[ChatMessage]| -> Value {
+            serde_json::from_slice(&serialize(client, messages, "[]").unwrap()).unwrap()
+        };
+        let update = |effort: &str| json!({"type":"configuration_update","reasoning":{"effort":effort}});
+        let mut client = ChatClient::new("https://api.openai.com/v1".into(), None, "gpt-6.1-sol".into(), None, 64);
+        client.wire_api = crate::providers::WireApi::Responses;
+        client.reasoning_effort = Some(High);
+        let sent = body(&client, &history(&["default", "high"]));
+        assert!(sent.get("reasoning").is_none(), "the top keeps the default the conversation opened with: {sent}");
+        assert_eq!(sent["input"][5], update("high"));
+        assert_eq!(sent["input"][6], json!({"role":"user","content":"task 1"}), "the change goes just ahead of its prompt");
+        let messages = history(&["high", "medium", "high"]);
+        let sent = body(&client, &messages);
+        assert_eq!(sent["reasoning"], json!({"effort":"high"}));
+        let updates: Vec<&Value> = sent["input"].as_array().unwrap().iter().filter(|item| item["type"] == "configuration_update").collect();
+        assert_eq!(updates, [&update("medium"), &update("high")]);
+        assert_eq!(client.effort_plan(&messages), (Some(High), vec![(5, Medium), (8, High)]));
+        assert_eq!(client.effort_plan(&history(&["high", "high"])), (Some(High), vec![]), "an unchanged effort sends no item");
+        client.model = "openai/GPT-6.1-sol".into();
+        assert_eq!(client.effort_plan(&messages).1.len(), 2, "a gateway's vendor prefix names the same model");
+        let current = (Some(High), vec![]);
+        assert_eq!(client.effort_plan(&history(&["high", "medium"])), current, "the history does not end on the current effort");
+        assert_eq!(client.effort_plan(&messages[..1]), current, "no prompt says the effort");
+        client.reasoning_effort = None;
+        assert_eq!(client.effort_plan(&history(&["high", "default"])), (None, vec![]), "no item names the default");
+        client.reasoning_effort = Some(High);
+        for (model, wire) in [("gpt-5.6", crate::providers::WireApi::Responses), ("gpt-6.1-sol", crate::providers::WireApi::ChatCompletions)] {
+            (client.model, client.wire_api) = (model.into(), wire);
+            assert_eq!(client.effort_plan(&messages), current, "{model} over {wire:?}");
+        }
+        client.wire_api = crate::providers::WireApi::Responses;
+        let dir = std::env::temp_dir().join(format!("openmax-effort-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        client.chatgpt = Some(crate::chatgpt::tests::seeded(&dir));
+        let sent = body(&client, &messages);
+        assert_eq!(sent["reasoning"], json!({"effort":"high"}));
+        assert!(!sent.to_string().contains("configuration_update"), "a ChatGPT plan's route documents no such item: {sent}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

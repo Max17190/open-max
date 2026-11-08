@@ -762,6 +762,16 @@ pub const CACHE_MARKS: &[(&str, &str)] = &[("openrouter.ai", "anthropic/")];
 /// the request that carries one: host, model id prefix, as in `CACHE_ROUTES`.
 pub const TOOLS_FIELD: &[(&str, &str)] = &[("api.x.ai", "grok-")];
 
+/// Models that take a reasoning effort change inside the conversation, so
+/// the effort at a request's top, rendered ahead of the history, need never
+/// change: wire, model id prefix after any `vendor/`. GPT-6 and later take a
+/// `configuration_update` input item, these Claude models an effort-only
+/// system message under the `EFFORT_BETA` header.
+pub const EFFORT_UPDATES: &[(WireApi, &str)] = &[(WireApi::Responses, "gpt-6"), (WireApi::Anthropic, "claude-opus-5"),
+    (WireApi::Anthropic, "claude-sonnet-5-5"), (WireApi::Anthropic, "claude-haiku-5-5"), (WireApi::Anthropic, "claude-fable-5-1"),
+    (WireApi::Anthropic, "claude-mythos-5-1")];
+pub const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
+
 /// Known compatibility routes can accept the field while ignoring its value.
 pub fn validate_reasoning_effort(base: &str, wire: WireApi, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
     if wire == WireApi::Anthropic {
