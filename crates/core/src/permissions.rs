@@ -596,20 +596,26 @@ enum RuleArgument {
     OriginalPath(String),
 }
 
-/// Match the target that `tools::resolve` finds, with `/` after a directory.
+/// Match the target that `tools::resolve` finds, including a directory's
+/// form with a trailing `/` so path-prefix rules also match the directory.
 /// Denies can also match an absolute target. Denies and asks keep matching
 /// the supplied spelling so existing rules continue to apply.
 fn arg_haystacks(root: &Path, tool: &str, args: &Value) -> Vec<RuleArgument> {
     let arg = |key: &str| args[key].as_str().unwrap_or_default().to_string();
     let resolved = |path: String| match (crate::tools::resolve(root, &path), root.canonicalize()) {
         (Ok(abs), Ok(root)) if abs.starts_with(&root) => {
-            let slash = if abs.is_dir() && abs != root { "/" } else { "" };
-            let rel = abs.strip_prefix(&root).unwrap_or(&abs).display();
-            vec![
-                RuleArgument::RelativePath(format!("{rel}{slash}")),
-                RuleArgument::AbsolutePath(format!("{}{slash}", abs.display())),
+            let rel = abs.strip_prefix(&root).unwrap_or(&abs);
+            let rel = if rel.as_os_str().is_empty() { Path::new(".") } else { rel }.display();
+            let mut arguments = vec![
+                RuleArgument::RelativePath(rel.to_string()),
+                RuleArgument::AbsolutePath(abs.display().to_string()),
                 RuleArgument::OriginalPath(path),
-            ]
+            ];
+            if abs.is_dir() {
+                arguments.push(RuleArgument::RelativePath(format!("{rel}/")));
+                arguments.push(RuleArgument::AbsolutePath(format!("{}/", abs.display().to_string().trim_end_matches('/'))));
+            }
+            arguments
         }
         _ => vec![RuleArgument::Text(path)],
     };
@@ -675,6 +681,9 @@ mod tests {
             ("deny", "write_file", "^build/".into()),
             ("deny", "read_file", "^secrets/".into()),
             ("deny", "read_file", format!("^{}/notes/", regex::escape(&abs))),
+            ("deny", "list_dir", "^secrets$".into()),
+            ("deny", "list_dir", format!("^{}/notes$", regex::escape(&abs))),
+            ("deny", "list_dir", r"^\.$".into()),
             ("deny", "grep", "^secrets/".into()),
             ("deny", "grep", "^testpattern$".into()),
             ("allow", "grep", "^$".into()),
@@ -720,6 +729,9 @@ mod tests {
         for path in ["secrets", "./secrets/", "src/../secrets"] {
             assert!(denied("grep", json!({"pattern": ".", "path": path})), "grep over {path} is not denied");
         }
+        assert!(denied("list_dir", json!({"path": "./secrets/"})));
+        assert!(denied("list_dir", json!({"path": "./notes/"})));
+        assert!(denied("list_dir", json!({"path": abs})));
         assert_eq!(decide("grep", json!({"pattern": ".", "path": "src"})), PermissionDecision::Default);
         assert!(denied("grep", json!({"pattern": "testpattern", "path": "src"})));
         assert_eq!(decide("grep", json!({"pattern": "TESTPATTERN", "path": "src"})), PermissionDecision::Default);

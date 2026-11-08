@@ -699,7 +699,7 @@ fn repo_lines() -> Result<&'static str, String> {
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
     // Resolve file paths for permission rules and keep matching existing restrictive spellings.
-    const BASELINE: usize = 43_703;
+    const BASELINE: usize = 43_709;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

@@ -297,9 +297,9 @@ Omit `arg_regex` (or leave it empty) to match every call of that tool.
 
 For `read_file`, `write_file`, `edit_file`, `list_dir` and `grep`'s path, the
 regex reads the file the tool will touch, not the path as the call spells it:
-resolved through `..` and links, relative to the project root, a directory
-ending in `/`. `./src/x`, `lib/../src/x`, the absolute path and a link in the
-project to `src` are all `src/x`, so `^src/` matches each of them and nothing
+resolved through `..` and links, relative to the project root. A directory
+also matches with a trailing `/`. `./src/x`, `lib/../src/x`, the absolute path
+and a link in the project to `src` are all `src/x`, so `^src/` matches each of them and nothing
 outside `src/`. A `deny` also reads the absolute path and ignores case, since
 a case variant names the same file on a case-insensitive volume, even in a
 directory not created yet. A `deny` or `ask` also matches the supplied path

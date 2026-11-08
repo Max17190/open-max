@@ -602,9 +602,9 @@ Grammar: `[[rules]]` tables only; unknown keys anywhere are rejected.
 What the regex matches:
 - `bash` → the command string.
 - `read_file`, `write_file`, `edit_file`, `list_dir` → the path the tool will
-  touch, resolved and root-relative however the call spells it (a directory
-  ends in `/`); a `deny` also matches the resolved absolute path and ignores
-  case on resolved paths. A `deny` or `ask` also matches the supplied spelling.
+  touch, resolved and root-relative however the call spells it. Directories
+  also match with a trailing `/`. A `deny` checks the absolute path too and
+  ignores case on resolved paths. A `deny` or `ask` also matches the supplied spelling.
 - `glob` and `grep` → the pattern; `deny` and `ask` for `grep` also match its
   search root using the same path rules.
 - any other tool → the full serialized JSON arguments.
