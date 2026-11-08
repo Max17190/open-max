@@ -60,7 +60,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
-use crate::prompt::NOTE_SEPARATOR;
 use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
 
 /// OpenAI-compatible `/chat/completions` request body. Built once per
@@ -104,18 +103,7 @@ struct StreamOptions {
 /// reasoning, `reasoning_details`, and each tool call's `extra_content` go
 /// only to the endpoint that produced them (`origin` matches the message's
 /// `reasoning_origin`), and the stamp itself never goes. What does go is
-/// the stored bytes, unchanged, except where `note` rides.
-///
-/// `note` is the trailing note, never stored. It goes after the whole
-/// history, so a prefix cache keeps every stored byte before it, and it adds
-/// no message: it ends the content of the last message, the user's prompt or
-/// a tool result, after `NOTE_SEPARATOR`. A separate message there would
-/// change the role order the endpoint sees: some hosted validators refuse a
-/// system or a user message after a tool message, and a template that
-/// enforces user/assistant alternation refuses a user message after the
-/// prompt. Only when the history ends with neither (an assistant reply, or
-/// the system prompt alone) does the note go as a user message of its own,
-/// which every one of them takes there.
+/// the stored bytes, unchanged.
 ///
 /// `marks` is for a route that caches a prompt only up to a `cache_control`
 /// marker (`ChatClient::cache_marks`): the system prompt and the newest
@@ -123,12 +111,9 @@ struct StreamOptions {
 /// and system prompt every session shares and what the request before it
 /// wrote. A system or user message carries it on its text as one text part,
 /// a tool result or an assistant reply beside its role, where OpenRouter's
-/// own SDK puts them. The note always goes as a user message of its own
-/// there, after the marked one: inside it, the note would void the entry the
-/// next request, which drops the note, reads back.
+/// own SDK puts them.
 struct WireMessages<'a> {
     messages: &'a [ChatMessage],
-    note: Option<&'a str>,
     origin: &'a str,
     marks: bool,
 }
@@ -136,20 +121,13 @@ struct WireMessages<'a> {
 impl Serialize for WireMessages<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let last = self.messages.len().saturating_sub(1);
-        let ends = !self.marks && self.messages.last().is_some_and(|m| m.role == "user" || m.role == "tool");
-        let (folded, alone) = match self.note {
-            Some(note) if ends => (Some(note), None),
-            Some(note) => (None, Some(ChatMessage::user(note))),
-            None => (None, None),
-        };
-        serializer.collect_seq(self.messages.iter().chain(alone.as_ref()).enumerate().map(|(at, m)| {
+        serializer.collect_seq(self.messages.iter().enumerate().map(|(at, m)| {
             let replay = m.reasoning_origin.as_deref() == Some(self.origin);
-            let note = folded.filter(|_| at == last);
-            let mark = self.marks && at < self.messages.len() && (at == last || m.role == "system");
+            let mark = self.marks && (at == last || m.role == "system");
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             WireMessage {
                 role: &m.role,
-                content: m.content.as_deref().or(note.map(|_| "")).map(|text| WireContent { text, note, mark: text_mark }),
+                content: m.content.as_deref().map(|text| WireContent { text, mark: text_mark }),
                 tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| replay),
@@ -183,24 +161,20 @@ struct WireMessage<'a> {
     cache_control: Option<Value>,
 }
 
-/// A message's content on the wire: its stored text, then, on the message
-/// the trailing note ends, `NOTE_SEPARATOR` and the note, escaped straight
-/// into the body with no copy of either. A `mark`ed one goes as one text
-/// part carrying the cache marker, unless it is empty, which a marker
-/// cannot end.
+/// A message's content on the wire: its stored text, or, when `mark`ed,
+/// one text part carrying the cache marker, unless it is empty, which a
+/// marker cannot end.
 struct WireContent<'a> {
     text: &'a str,
-    note: Option<&'a str>,
     mark: bool,
 }
 
 impl Serialize for WireContent<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.note {
-            _ if self.mark && !self.text.is_empty() => serializer
-                .collect_seq([serde_json::json!({"type": "text", "text": self.text, "cache_control": {"type": "ephemeral"}})]),
-            None => serializer.serialize_str(self.text),
-            Some(note) => serializer.collect_str(&format_args!("{}{NOTE_SEPARATOR}{note}", self.text)),
+        if self.mark && !self.text.is_empty() {
+            serializer.collect_seq([serde_json::json!({"type": "text", "text": self.text, "cache_control": {"type": "ephemeral"}})])
+        } else {
+            serializer.serialize_str(self.text)
         }
     }
 }
@@ -244,7 +218,7 @@ struct WireToolCall<'a> {
 /// the server's KV cache without re-walking a `Value` tree. The client's
 /// `origin` decides whose reasoning goes out, and its `cache_marks` whether
 /// the messages carry cache markers.
-fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], note: Option<&str>, tools_wire: &str) -> Result<Vec<u8>, String> {
+fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], tools_wire: &str) -> Result<Vec<u8>, String> {
     let include_tools = !tools_wire.is_empty() && tools_wire != "[]";
     // Borrow the frozen wire as RawValue: validation only, no Value rebuild.
     // Serialize writes these exact bytes into the body.
@@ -253,7 +227,7 @@ fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], no
     let (origin, completion) = (client.origin(), client.use_max_completion_tokens);
     let req = ChatCompletionRequest {
         model: &client.model,
-        messages: WireMessages { messages, note, origin: &origin, marks: client.cache_marks() },
+        messages: WireMessages { messages, origin: &origin, marks: client.cache_marks() },
         temperature: client.temperature,
         reasoning_effort: client.reasoning_effort,
         max_tokens: (!completion).then_some(client.max_tokens),
@@ -610,20 +584,6 @@ impl ChatClient {
         messages: &[ChatMessage],
         tools_wire: &str,
         cancelled: Arc<crate::state::CancelToken>,
-        on_delta: impl FnMut(StreamDelta),
-    ) -> Result<CompletionResult, String> {
-        self.stream_chat_with_note(messages, None, tools_wire, cancelled, on_delta).await
-    }
-
-    /// `stream_chat` with `note` sent after `messages`: the trailing note,
-    /// which belongs to this request only and is never part of the history
-    /// (see `WireMessages` for where it rides).
-    pub async fn stream_chat_with_note(
-        &self,
-        messages: &[ChatMessage],
-        note: Option<&str>,
-        tools_wire: &str,
-        cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
         crate::providers::validate_reasoning_effort(&self.base_url, self.wire_api, self.reasoning_effort)?;
@@ -647,10 +607,10 @@ impl ChatClient {
         // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
         let body = if self.wire_api == crate::providers::WireApi::Anthropic {
-            anthropic::serialize(self, messages, note, tools_wire)?
+            anthropic::serialize(self, messages, tools_wire)?
         } else if self.wire_api == crate::providers::WireApi::Responses {
-            responses::serialize(self, messages, note, tools_wire)?
-        } else { serialize_chat_request_body(self, messages, note, tools_wire)? };
+            responses::serialize(self, messages, tools_wire)?
+        } else { serialize_chat_request_body(self, messages, tools_wire)? };
 
         let mut attempt = 0u32;
         // Attempts in a row that never reached the endpoint; any other
@@ -3749,7 +3709,7 @@ mod tests {
         }])
         .to_string();
         // Default compat: max_tokens + stream_options (local OpenAI-compatible).
-        let bytes = serialize_chat_request_body(&chat_client("test-model", Some(0.2), 1024, false, true), &messages, None, &tools_wire).unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("test-model", Some(0.2), 1024, false, true), &messages, &tools_wire).unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(v["model"], "test-model");
@@ -3797,7 +3757,7 @@ mod tests {
         );
         assert_eq!(wire(&messages, "o"), old_shape);
         assert_eq!(serde_json::to_string(&messages).unwrap(), old_shape);
-        let bytes = serialize_chat_request_body(&chat_client("m", None, 64, false, false), &messages, None, "").unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("m", None, 64, false, false), &messages, "").unwrap();
         let body = String::from_utf8(bytes).unwrap();
         assert!(body.contains(&format!(r#""messages":{old_shape}"#)), "{body}");
 
@@ -3813,53 +3773,6 @@ mod tests {
         assert!(old.reasoning_details.is_none());
         let old: ToolCall = serde_json::from_str(r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}"#).unwrap();
         assert!(old.extra_content.is_none());
-    }
-
-    /// The trailing note adds no message: it ends the content of the last
-    /// one, a tool result or the user's prompt, so the endpoint sees the
-    /// stored role order, which some hosted validators and templates that
-    /// enforce alternation check, and every stored byte before it is the
-    /// history a prefix cache keeps. A history that ends with an assistant
-    /// reply or the system prompt alone takes it as a user message of its
-    /// own. Escaping covers the note like the text it follows, and the
-    /// stored messages never change.
-    #[test]
-    fn the_trailing_note_ends_the_last_message_and_adds_none() {
-        let note = "[index]\n- wordfreq: \"top\" words";
-        let tail = r#"\n\n[index]\n- wordfreq: \"top\" words"#;
-        let sent = |messages: &[ChatMessage]| {
-            let with = serde_json::to_string(&WireMessages { messages, note: Some(note), origin: "o", marks: false }).unwrap();
-            (with, wire(messages, "o"))
-        };
-        let tool_round = vec![
-            ChatMessage::system("p"),
-            ChatMessage::user("hi"),
-            ChatMessage::assistant(Some("calling".into()), Some(vec![bash_call()])),
-            ChatMessage::tool("c1", "out"),
-        ];
-        let (with, stored) = sent(&tool_round);
-        let stem = &stored[..stored.len() - r#"","tool_call_id":"c1"}]"#.len()];
-        assert_eq!(with, format!(r#"{stem}{tail}","tool_call_id":"c1"}}]"#), "the note ends the tool result");
-        let parsed: Vec<ChatMessage> = serde_json::from_str(&with).unwrap();
-        assert_eq!(parsed.len(), tool_round.len(), "and adds no message");
-        assert_eq!(parsed[3].content.as_deref(), Some(format!("out{NOTE_SEPARATOR}{note}").as_str()));
-        assert_eq!(tool_round[3].content.as_deref(), Some("out"), "the stored result is unchanged");
-
-        let prompt = &tool_round[..2];
-        let (with, stored) = sent(prompt);
-        assert_eq!(with, format!(r#"{}{tail}"}}]"#, &stored[..stored.len() - 3]), "the note ends the user's prompt");
-
-        let replied = [ChatMessage::user("hi"), ChatMessage::assistant(Some("done".into()), None)];
-        for history in [&replied[..], &tool_round[..1]] {
-            let (with, stored) = sent(history);
-            let own = serde_json::to_string(&ChatMessage::user(note)).unwrap();
-            assert_eq!(with, format!("{},{own}]", &stored[..stored.len() - 1]), "a message of its own after {history:?}");
-        }
-
-        let mut empty = tool_round.clone();
-        empty[3].content = None;
-        let parsed: Vec<ChatMessage> = serde_json::from_str(&sent(&empty).0).unwrap();
-        assert_eq!(parsed[3].content.as_deref(), Some(format!("{NOTE_SEPARATOR}{note}").as_str()), "a result with no text still carries it");
     }
 
     /// Gemini streams each call whole, without an `index`, and puts its
@@ -4111,12 +4024,12 @@ mod tests {
 
     /// The messages array exactly as `origin` would receive it.
     fn wire(messages: &[ChatMessage], origin: &str) -> String {
-        serde_json::to_string(&WireMessages { messages, note: None, origin, marks: false }).unwrap()
+        serde_json::to_string(&WireMessages { messages, origin, marks: false }).unwrap()
     }
 
     /// The whole request body `client` would send for `messages`.
     fn request_body(client: &ChatClient, messages: &[ChatMessage]) -> String {
-        let bytes = serialize_chat_request_body(client, messages, None, "").unwrap();
+        let bytes = serialize_chat_request_body(client, messages, "").unwrap();
         String::from_utf8(bytes).unwrap()
     }
 
@@ -4134,10 +4047,8 @@ mod tests {
     /// messages, the system prompt (with the tools ahead of it, what every
     /// session shares) and the newest stored one (what the next request
     /// reads back): a system or user message on its text as one text part,
-    /// a tool result or an assistant reply beside its role. Nothing else
-    /// changes. The note goes after the marked message as a user message of
-    /// its own, since inside it the note would void the entry. Empty text
-    /// takes no marker. Another model there, an Anthropic model elsewhere, or
+    /// a tool result or an assistant reply beside its role, a note stored on
+    /// it included. Nothing else changes. Empty text takes no marker. Another model there, an Anthropic model elsewhere, or
     /// another wire, marks nothing.
     #[test]
     fn an_anthropic_model_through_openrouter_marks_its_cache_entries() {
@@ -4162,9 +4073,7 @@ mod tests {
         assert!(!responses.cache_marks(), "only Chat Completions");
 
         let marked = |text: &str| json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
-        let sent = |messages: &[ChatMessage], note: Option<&str>| {
-            serde_json::to_value(WireMessages { messages, note, origin: "o", marks: true }).unwrap()
-        };
+        let sent = |messages: &[ChatMessage]| serde_json::to_value(WireMessages { messages, origin: "o", marks: true }).unwrap();
         let round = vec![
             ChatMessage::system("p"),
             ChatMessage::user("hi"),
@@ -4175,28 +4084,25 @@ mod tests {
         let mut expected = plain.clone();
         expected[0]["content"] = marked("p");
         expected[3]["cache_control"] = json!({ "type": "ephemeral" });
-        assert_eq!(sent(&round, None), expected);
-        expected.as_array_mut().unwrap().push(json!({ "role": "user", "content": "[index] a note" }));
-        assert_eq!(sent(&round, Some("[index] a note")), expected, "the note follows the marked result");
-        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "anthropic/claude-sonnet-5.5"), &round, None, "").unwrap();
+        assert_eq!(sent(&round), expected);
+        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "anthropic/claude-sonnet-5.5"), &round, "").unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["messages"], sent(&round, None), "the route's requests carry them");
+        assert_eq!(body["messages"], sent(&round), "the route's requests carry them");
         assert_eq!(body.to_string().matches("cache_control").count(), 2, "{body}");
-        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "openai/gpt-5.6"), &round, None, "").unwrap();
+        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "openai/gpt-5.6"), &round, "").unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["messages"], plain, "another model's do not");
 
         let mut expected = serde_json::to_value(&round[..2]).unwrap();
         expected[0]["content"] = marked("p");
         expected[1]["content"] = marked("hi");
-        assert_eq!(sent(&round[..2], None), expected, "the prompt is the newest stored message");
+        assert_eq!(sent(&round[..2]), expected, "the prompt is the newest stored message");
         let answered = vec![ChatMessage::system("p"), ChatMessage::user("hi"), ChatMessage::assistant(Some("done".into()), None)];
         let mut expected = serde_json::to_value(&answered).unwrap();
         expected[0]["content"] = marked("p");
         expected[2]["cache_control"] = json!({ "type": "ephemeral" });
-        assert_eq!(sent(&answered, None), expected, "so is an assistant reply");
+        assert_eq!(sent(&answered), expected, "so is an assistant reply");
         let silent = vec![ChatMessage::system("p"), ChatMessage::user("")];
-        assert_eq!(sent(&silent, None)[1], json!({ "role": "user", "content": "" }), "empty text takes no marker");
-        assert_eq!(sent(&[], Some("n")), json!([{ "role": "user", "content": "n" }]), "nor does the note, even alone");
+        assert_eq!(sent(&silent)[1], json!({ "role": "user", "content": "" }), "empty text takes no marker");
     }
 
     #[test]
@@ -4204,7 +4110,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         for tools_wire in ["", "[]"] {
             let bytes =
-                serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, None, tools_wire)
+                serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, tools_wire)
                     .unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(
@@ -4229,9 +4135,9 @@ mod tests {
             "function": { "name": "bash", "parameters": { "type": "object" } }
         }])
         .to_string();
-        let a = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, None, &tools_wire)
+        let a = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, &tools_wire)
             .unwrap();
-        let b = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, None, &tools_wire)
+        let b = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, &tools_wire)
             .unwrap();
         assert_eq!(a, b);
     }
@@ -4241,10 +4147,10 @@ mod tests {
     #[test]
     fn serialize_omits_temperature_unless_configured() {
         let messages = vec![ChatMessage::user("hi")];
-        let unset = serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, None, "").unwrap();
+        let unset = serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, "").unwrap();
         let v: Value = serde_json::from_slice(&unset).unwrap();
         assert!(v.get("temperature").is_none(), "{v}");
-        let set = serialize_chat_request_body(&chat_client("m", Some(0.7), 64, false, true), &messages, None, "").unwrap();
+        let set = serialize_chat_request_body(&chat_client("m", Some(0.7), 64, false, true), &messages, "").unwrap();
         let v: Value = serde_json::from_slice(&set).unwrap();
         assert!((v["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-5, "{v}");
     }
@@ -4253,7 +4159,7 @@ mod tests {
     fn serialize_respects_max_completion_tokens_and_omits_stream_options() {
         let messages = vec![ChatMessage::user("compat")];
         // max_completion_tokens, no stream_options, no tools.
-        let bytes = serialize_chat_request_body(&chat_client("gpt-style", Some(0.1), 512, true, false), &messages, None, "").unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("gpt-style", Some(0.1), 512, true, false), &messages, "").unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["max_completion_tokens"], 512);
         assert!(v.get("max_tokens").is_none());
@@ -4272,7 +4178,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         let wire = registry.tool_schemas_wire();
         let bytes =
-            serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, None, wire).unwrap();
+            serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, wire).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(
             body.contains(wire),

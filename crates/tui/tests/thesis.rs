@@ -698,9 +698,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // The terminal app folds its repeated key handling, search overlays, state resets and listing rows into
-    // one helper each: 445 lines fewer, no crate but the terminal app touched.
-    const BASELINE: usize = 44_010;
+    // The note is stored once in the history where it changes, so no wire carries a note of its own: 31 lines
+    // fewer, the trust dispatcher and the frozen prompt unchanged.
+    const BASELINE: usize = 43_979;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -4074,7 +4074,7 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
 /// `.openmax/tools/line_count.toml`, an awk tool that counts the lines of
 /// notes.txt and prints the attestation variable as its environment holds it.
 /// The second must carry, on that write's result, the refreeze receipt naming
-/// `line_count` callable from the next step and the trailing note's line
+/// `line_count` callable from the next step and the stored note's line
 /// giving its description and parameters, and gets a call of `line_count` by
 /// name. The third must carry that call's output, and gets the answer. The
 /// run must exit 0 with the answer on stdout, having made exactly those
@@ -4172,7 +4172,7 @@ mutating = false
     assert!(stdout.contains("notes.txt has 3 lines"), "no answer on stdout: {printed}");
     assert_eq!(served.len(), 3, "the run made {} requests, not three: {served:?}", served.len());
     assert_eq!(std::fs::read_to_string(project.join(tool)).unwrap(), manifest, "the tool file is not what was written");
-    // The write's result carries the receipt, then the trailing note's line
+    // The write's result carries the receipt, then the stored note's line
     // for the tool: the tools array stays as the session froze it, so that
     // line is where the model reads the new tool's description and
     // parameters.
