@@ -1163,7 +1163,7 @@ async fn only_a_scrollback_focus_highlights_the_selected_block() {
         let mut terminal = Terminal::new(TestBackend::new(30, 14)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer();
-        (0..14).any(|y| (0..30).any(|x| buffer[(x, y)].bg == crate::theme::BORDER()))
+        (0..14).any(|y| (0..30).any(|x| buffer[(x, y)].bg == crate::theme::BORDER))
     };
     assert!(!highlighted(&mut app), "the composer has focus");
     app.focus = Focus::Scrollback;
@@ -1348,7 +1348,7 @@ async fn a_transcript_selection_paints_on_the_row_it_selected() {
         let buffer = terminal.backend().buffer();
         (0..14u16)
             .flat_map(|y| (0..30u16).map(move |x| (x, y)))
-            .filter(|&(x, y)| buffer[(x, y)].bg == crate::theme::SELECT())
+            .filter(|&(x, y)| buffer[(x, y)].bg == crate::theme::SELECT)
             .collect::<Vec<_>>()
     };
     // A double click takes the word under it, a third click its line.
