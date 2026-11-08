@@ -188,6 +188,19 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("trailing note (changes")), "no note, no note heading: {lines:#?}");
     }
 
+    /// The cache and budget rows give their percentages of the numbers
+    /// beside them.
+    #[test]
+    fn the_cache_and_budget_rows_give_their_percentages() {
+        let bd = PromptBreakdown::default();
+        let lines: Vec<String> =
+            context_block(&bd, Provenance::Frozen, Some((500, 2000)), Some(40), Some((30, 120))).iter().map(plain).collect();
+        let row = |label: &str| lines.iter().find(|l| l.trim_start().starts_with(label)).unwrap_or_else(|| panic!("no {label} row: {lines:#?}")).clone();
+        assert!(row("cache hit (last turn)").ends_with("    40 %"), "{lines:#?}");
+        assert!(row("cache hit (session)").contains("    25 %   30 of 120 prompt tok"), "{lines:#?}");
+        assert!(row("context used").ends_with("~  500 tok   of 2000 (25%)"), "{lines:#?}");
+    }
+
     /// Three provenances, three true sentences. A resumed session's next
     /// message continues THAT session, so its header may not promise a
     /// preview of "the next new session", and it must say the numbers are

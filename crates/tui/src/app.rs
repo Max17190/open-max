@@ -6220,6 +6220,56 @@ mod tests {
         assert!(text.contains("… 4 more (keep typing)"), "{text}");
     }
 
+    /// Both search overlays show the query (or what to type) and a window of
+    /// six rows that follows the selection, marked; with nothing to list they
+    /// say so, and a list that fits names nothing hidden.
+    #[test]
+    fn search_overlays_window_six_rows_around_the_selection() {
+        let text = |lines: &[Line<'_>]| lines.iter().map(line_text).collect::<Vec<_>>();
+        let items: Vec<String> = (0..10).map(|i| format!("prompt {i}")).collect();
+        let shown = text(&super::history_search_lines("", 8, &items, 40));
+        assert_eq!(shown[0], "⌕ history…");
+        assert_eq!(&shown[1..7], ["  prompt 3", "  prompt 4", "  prompt 5", "  prompt 6", "  prompt 7", "▸ prompt 8"]);
+        assert_eq!(shown[7], "  … 4 more (keep typing)");
+        // A selection past the list still shows its last six.
+        let shown = text(&super::history_search_lines("p", 20, &items, 40));
+        assert_eq!(shown[1], "  prompt 4");
+        assert_eq!(shown[6], "  prompt 9");
+        let shown = text(&super::history_search_lines("p", 0, &items[..6], 40));
+        assert_eq!(shown.len(), 7, "{shown:?}");
+        assert_eq!(shown[1], "▸ prompt 0");
+        assert_eq!(text(&super::history_search_lines("zz", 0, &[], 40)), ["⌕ zz", "  no matches"]);
+
+        let mut transcript = Transcript::new();
+        transcript.set_width(40);
+        for block in ["needle one", "hay", "needle two"] {
+            transcript.push_user(vec![Line::from(block)]);
+        }
+        let mut previews = std::collections::HashMap::new();
+        let shown = text(&super::scroll_search_lines("needle", 1, &[0, 2], &transcript, &mut previews, 40));
+        assert_eq!(shown.len(), 3, "{shown:?}");
+        assert_eq!(shown[0], "⌕ needle  2/2");
+        assert!(shown[1].starts_with("  ") && shown[1].contains("needle one"), "{shown:?}");
+        assert!(shown[2].starts_with("▸ ") && shown[2].contains("needle two"), "{shown:?}");
+        let shown = text(&super::scroll_search_lines("", 0, &[], &transcript, &mut previews, 40));
+        assert_eq!(shown, ["⌕ find in conversation…  0/0", "  no matches"]);
+    }
+
+    /// The live rate counts four characters a token, and only once half a
+    /// second of streaming makes it a rate.
+    #[test]
+    fn throughput_counts_four_chars_a_token_after_half_a_second() {
+        let (mut app, dir) = app_fixture();
+        assert_eq!(app.tok_per_sec(), 0.0);
+        app.stream_chars = 400;
+        app.first_token = Some(std::time::Instant::now());
+        assert_eq!(app.tok_per_sec(), 0.0, "under half a second there is no rate yet");
+        app.first_token = Some(std::time::Instant::now() - Duration::from_secs(2));
+        let rate = app.tok_per_sec();
+        assert!((49.0..=50.0).contains(&rate), "{rate}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A fully typed `@` file mention is mid-prompt, not a finished command:
     /// Enter must accept it and keep composing (the separator closes the
     /// popup), never submit the draft out from under the user.
@@ -6432,6 +6482,7 @@ mod tests {
         assert_eq!(home_shortened("/srv/data", home), "/srv/data");
         assert_eq!(home_shortened("/srv/data", None), "/srv/data");
         assert_eq!(home_shortened("/srv/data", Some("/")), "/srv/data");
+        assert_eq!(home_shortened("/srv/data", Some("")), "/srv/data");
     }
 
     /// The reasoning tail shown during a turn belongs to one attempt. A
@@ -8402,4 +8453,307 @@ mod tests {
         assert_eq!(plural(8, "tool"), "8 tools");
     }
 
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    async fn type_keys(app: &mut App, keys: &[KeyEvent]) {
+        for key in keys {
+            app.on_key(*key).await.unwrap();
+        }
+    }
+
+    /// Every scrollback binding moves the block selection the way the help
+    /// screen says: turn jumps with `[`/`]` and Shift+arrows, a block at a
+    /// time with arrows and j/k, g and G to the ends, Enter/l and o to fold,
+    /// n/N through the last find query, and Esc or Space back to the prompt.
+    #[tokio::test]
+    async fn scrollback_keys_move_the_block_selection_the_help_screen_names() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(40);
+        app.transcript.push_user(vec![Line::from("first question")]);
+        app.transcript.push_assistant(vec![Line::from("an answer")]);
+        app.transcript.push_user(vec![Line::from("second question")]);
+        app.transcript.push_tool(vec![Line::from("ran a tool")], "tool output line".into(), true);
+        app.transcript.push_user(vec![Line::from("third question")]);
+        app.focus = Focus::Scrollback;
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        for (key, selected) in [
+            (press(KeyCode::Char('[')), Some(4)),
+            (press(KeyCode::Char('[')), Some(2)),
+            (press(KeyCode::Char(']')), Some(4)),
+            (shift(KeyCode::Up), Some(2)),
+            (shift(KeyCode::Up), Some(0)),
+            (shift(KeyCode::Down), Some(2)),
+            (press(KeyCode::Up), Some(1)),
+            (press(KeyCode::Down), Some(2)),
+            (press(KeyCode::Char('k')), Some(1)),
+            (press(KeyCode::Char('j')), Some(2)),
+            (press(KeyCode::Char('g')), Some(0)),
+            (shift(KeyCode::Char('G')), None),
+        ] {
+            app.on_key(key).await.unwrap();
+            assert_eq!(app.transcript.selected(), selected, "after {key:?}");
+            assert!(app.focus == Focus::Scrollback, "after {key:?}");
+        }
+
+        // The tool block folds and unfolds under Enter, Right and l, and o
+        // opens the last tool block from anywhere.
+        let shows_output = |app: &mut App| buffer_text(&render_app(app, 60, 20)).contains("tool output line");
+        assert!(!shows_output(&mut app));
+        type_keys(&mut app, &[press(KeyCode::Char('o'))]).await;
+        assert_eq!(app.transcript.selected(), Some(3));
+        assert!(shows_output(&mut app));
+        for key in [press(KeyCode::Enter), press(KeyCode::Right), press(KeyCode::Char('l'))] {
+            let before = shows_output(&mut app);
+            app.on_key(key).await.unwrap();
+            assert_ne!(shows_output(&mut app), before, "{key:?} did not toggle the fold");
+        }
+
+        // n and N step the last find query's matches, both ways around.
+        app.scroll_search_last = Some("question".into());
+        for (key, selected) in [
+            (press(KeyCode::Char('n')), Some(4)),
+            (press(KeyCode::Char('n')), Some(0)),
+            (shift(KeyCode::Char('N')), Some(4)),
+            (shift(KeyCode::Char('N')), Some(2)),
+        ] {
+            app.on_key(key).await.unwrap();
+            assert_eq!(app.transcript.selected(), selected, "after {key:?}");
+        }
+
+        for key in [press(KeyCode::Esc), press(KeyCode::Char(' '))] {
+            app.focus = Focus::Scrollback;
+            app.on_key(key).await.unwrap();
+            assert!(app.focus == Focus::Composer, "{key:?} did not return to the prompt");
+            assert_eq!(app.transcript.selected(), None);
+            assert!(app.composer.is_empty(), "{key:?} reached the composer");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// PageUp and PageDown scroll the conversation by a page from the prompt.
+    #[tokio::test]
+    async fn page_keys_scroll_the_conversation_by_a_page() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..40 {
+            app.transcript.push(vec![Line::from(format!("history line {index}"))]);
+        }
+        render_app(&mut app, 40, 12);
+        let page = app.page_h as usize;
+        app.on_key(press(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(app.transcript.offset(), page);
+        app.on_key(press(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(app.transcript.offset(), 2 * page);
+        app.on_key(press(KeyCode::PageDown)).await.unwrap();
+        assert_eq!(app.transcript.offset(), page);
+        assert!(app.composer.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The model picker owns the keys while it is open: arrows and Tab move
+    /// the selection, typing filters, a control chord types nothing, and
+    /// Enter saves the pick and returns to the chat.
+    #[tokio::test]
+    async fn the_model_picker_moves_filters_and_picks_from_the_keyboard() {
+        let (mut app, dir) = app_fixture();
+        fs::write(
+            dir.join("providers.json"),
+            r#"{"providers":{"alpha":{"base_url":"http://127.0.0.1:9/v1",
+               "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+        )
+        .unwrap();
+        app.handle_submit("/provider alpha".into()).await.unwrap();
+        app.handle_submit("/model".into()).await.unwrap();
+        assert!(app.mode == Mode::ModelPicker);
+        let selected = |app: &App| app.model_picker.as_ref().unwrap().selected;
+        let start = selected(&app);
+        let listed = app.model_picker.as_ref().unwrap().filtered.len();
+        assert!(listed > 2, "need a list to step through");
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        assert_eq!(selected(&app), (start + 1) % listed);
+        app.on_key(press(KeyCode::Tab)).await.unwrap();
+        assert_eq!(selected(&app), (start + 2) % listed);
+        app.on_key(press(KeyCode::Up)).await.unwrap();
+        assert_eq!(selected(&app), (start + 1) % listed);
+
+        type_keys(&mut app, &[press(KeyCode::Char('t')), press(KeyCode::Char('h')), press(KeyCode::Char('x'))]).await;
+        assert_eq!(app.model_picker.as_ref().unwrap().query, "thx");
+        app.on_key(press(KeyCode::Backspace)).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)).await.unwrap();
+        assert_eq!(app.model_picker.as_ref().unwrap().query, "th");
+        let choice = app.model_picker.as_ref().unwrap().selected_choice().unwrap().id.clone();
+        assert_eq!(choice, "three");
+
+        app.on_key(press(KeyCode::Enter)).await.unwrap();
+        assert!(app.mode == Mode::Chat);
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.core.settings.lock().unwrap().model, "three");
+        assert!(app.composer.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ctrl+R searches this project's prompt history: it opens on the newest
+    /// entry, arrows stop at either end, typing narrows the list, Enter loads
+    /// the pick into the composer, and Esc closes it leaving the draft alone.
+    #[tokio::test]
+    async fn history_search_steps_narrows_and_loads_from_the_keyboard() {
+        let (mut app, dir) = app_fixture();
+        for prompt in ["alpha one", "beta two", "alpha three"] {
+            app.composer.load(prompt);
+            app.composer.take();
+        }
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_r).await.unwrap();
+        let selected = |app: &App| app.history_search.as_ref().unwrap().1;
+        assert_eq!(selected(&app), 2, "opens on the newest entry");
+        for (key, expected) in [
+            (KeyCode::Up, 1),
+            (KeyCode::Up, 0),
+            (KeyCode::Up, 0),
+            (KeyCode::Down, 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Down, 2),
+        ] {
+            app.on_key(press(key)).await.unwrap();
+            assert_eq!(selected(&app), expected, "after {key:?}");
+        }
+
+        // A selection past the narrowed list clamps to its end.
+        let typed: Vec<KeyEvent> = "alph".chars().map(|c| press(KeyCode::Char(c))).collect();
+        type_keys(&mut app, &typed).await;
+        assert_eq!(selected(&app), 1);
+        app.on_key(press(KeyCode::Char('x'))).await.unwrap();
+        app.on_key(press(KeyCode::Backspace)).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)).await.unwrap();
+        let (query, selected, matches) = app.history_search.clone().unwrap();
+        assert_eq!(query, "alph");
+        assert_eq!(matches, ["alpha one", "alpha three"]);
+        assert_eq!(selected, 0, "no match left nothing to keep selected");
+        assert!(app.composer.is_empty(), "the query took the keys");
+
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        app.on_key(press(KeyCode::Enter)).await.unwrap();
+        assert!(app.history_search.is_none());
+        assert!(app.focus == Focus::Composer);
+        assert_eq!(app.composer.text(), "alpha three");
+
+        app.on_key(ctrl_r).await.unwrap();
+        app.on_key(press(KeyCode::Up)).await.unwrap();
+        app.on_key(press(KeyCode::Esc)).await.unwrap();
+        assert!(app.history_search.is_none());
+        assert_eq!(app.composer.text(), "alpha three");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ctrl+F's arrows step its matches and wrap, and Esc keeps the query
+    /// for n/N.
+    #[tokio::test]
+    async fn the_find_bar_steps_its_matches_and_keeps_its_query() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(40);
+        for text in ["needle one", "hay", "needle two", "needle three"] {
+            app.transcript.push_user(vec![Line::from(text)]);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)).await.unwrap();
+        // It opens on every block, the latest selected.
+        assert_eq!(app.scroll_search.as_ref().unwrap().1, 3);
+        assert_eq!(app.transcript.selected(), Some(3));
+        let typed: Vec<KeyEvent> = "needle".chars().map(|c| press(KeyCode::Char(c))).collect();
+        type_keys(&mut app, &typed).await;
+        assert_eq!(app.scroll_search.as_ref().unwrap().2, [0, 2, 3]);
+        for (key, block) in [(KeyCode::Up, 2), (KeyCode::Up, 0), (KeyCode::Up, 3), (KeyCode::Down, 0)] {
+            app.on_key(press(key)).await.unwrap();
+            assert_eq!(app.transcript.selected(), Some(block), "after {key:?}");
+        }
+        // A block that arrives under the open bar joins its matches, and the
+        // block being looked at stays selected.
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        app.on_agent_event(AgentEvent::MessageDone { text: "needle four".into() });
+        assert_eq!(app.scroll_search.as_ref().unwrap().2, [0, 2, 3, 4]);
+        assert_eq!(app.transcript.selected(), Some(2));
+        app.on_key(press(KeyCode::Esc)).await.unwrap();
+        assert!(app.scroll_search.is_none());
+        assert_eq!(app.scroll_search_last.as_deref(), Some("needle"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// /tools and /skills list what the next new session would load when no
+    /// session has frozen its own, and /context counts the same tools.
+    #[tokio::test]
+    async fn tools_skills_and_context_preview_the_next_session() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/tools".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("tools (preview of the next new session)"), "{shown}");
+        assert!(shown.contains("read_file") && shown.contains("built-in"), "{shown}");
+        app.handle_submit("/skills".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("skills (preview of the next new session)"), "{shown}");
+        assert!(shown.contains("(none loaded)") && shown.contains("0 skills"), "{shown}");
+        app.handle_submit("/context".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("context (preview of the next new session)"), "{shown}");
+        assert!(!shown.contains("tools (0 built-in)"), "{shown}");
+        assert!(!shown.contains("unknown command"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An open command menu takes the arrows: Down and Up step through it.
+    #[tokio::test]
+    async fn the_command_menu_takes_the_arrow_keys() {
+        let (mut app, dir) = app_fixture();
+        app.on_key(press(KeyCode::Char('/'))).await.unwrap();
+        let selected = |app: &App| app.completion.as_ref().unwrap().selected;
+        assert_eq!(selected(&app), 0);
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        assert_eq!(selected(&app), 1);
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        app.on_key(press(KeyCode::Up)).await.unwrap();
+        assert_eq!(selected(&app), 1);
+        assert_eq!(app.composer.text(), "/");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The mouse in the conversation: a paste lands in the prompt, a drag
+    /// selects as it moves, a release extends to its own cell, double and
+    /// triple clicks take the word and the line, and nothing reaches the
+    /// chat while a picker is open.
+    #[tokio::test]
+    async fn the_mouse_selects_conversation_text_and_pastes_into_the_prompt() {
+        let (mut app, dir) = app_fixture();
+        app.on_term_event(TermEvent::Paste("pasted words".into())).await.unwrap();
+        assert_eq!(app.composer.text(), "pasted words");
+        app.composer.clear();
+        app.transcript.push_user(vec![Line::from("alpha beta gamma")]);
+        let painted = rows(&render_app(&mut app, 40, 12));
+        let row = painted.iter().position(|text| text.contains("alpha beta")).unwrap() as u16;
+        let shown = &painted[row as usize];
+        let from = shown[..shown.find("alpha").unwrap()].chars().count() as u16;
+        let event = |kind, column| mouse(kind, column, row);
+
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), from)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::Drag(MouseButton::Left), from + 4)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("alpha"), "a drag selects as it moves");
+        app.on_term_event(event(MouseEventKind::Up(MouseButton::Left), from + 9)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("alpha beta"), "a release reaches its cell");
+
+        // A second and third press on one cell, quickly: the word, then the line.
+        let word = from + 7;
+        app.last_click = None;
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), word)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), word)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("beta"));
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), word)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("alpha beta gamma"));
+
+        app.transcript.clear_text_selection();
+        app.mode = Mode::ModelPicker;
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), from)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::Up(MouseButton::Left), from + 4)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::ScrollUp, from)).await.unwrap();
+        assert_eq!(app.transcript.selected_text(), None, "a picker's mouse reached the chat");
+        assert_eq!(app.transcript.offset(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

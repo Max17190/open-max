@@ -227,6 +227,8 @@ mod tests {
             .join("");
         assert!(text.contains("built-in") || text.contains("read_file") || text.contains("bash"));
         assert!(text.contains("preview") || text.contains("tools"));
+        // Only external tools count as external.
+        assert!(text.contains(&format!("{} tools · 0 external", reg.tools.len())), "{text}");
     }
 
     #[test]
