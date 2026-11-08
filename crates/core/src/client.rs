@@ -1759,7 +1759,7 @@ async fn resend_after(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -1884,7 +1884,7 @@ mod tests {
 
     /// [`spawn_response_once`] that also hands back the request head it read
     /// (request line and headers), to show what the client sent.
-    fn spawn_recording_once(response: String) -> (String, std::sync::mpsc::Receiver<String>) {
+    pub(crate) fn spawn_recording_once(response: String) -> (String, std::sync::mpsc::Receiver<String>) {
         let (head, heads) = std::sync::mpsc::channel();
         (serve_once(response, None, Some(head)), heads)
     }
