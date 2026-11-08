@@ -24,16 +24,6 @@ pub struct CompatFlags {
     pub omit_temperature: bool,
 }
 
-impl CompatFlags {
-    fn defaults_for_missing() -> Self {
-        Self {
-            use_max_completion_tokens: false,
-            send_stream_options: true,
-            omit_temperature: false,
-        }
-    }
-}
-
 // serde default for send_stream_options is false via Default; we want true when
 // the field is omitted from JSON. Custom deserialize via Option merge on load.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -752,7 +742,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         max_tokens,
         temperature: settings.temperature,
         reasoning_effort: settings.reasoning_effort,
-        compat: CompatFlags::defaults_for_missing(),
+        compat: CompatFlagsFile::default().into(),
         idle_timeout_secs: None,
         key_hint: None,
     })
@@ -762,6 +752,11 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
 /// conversation's requests to one server by a header: host, model id prefix
 /// (which names the provider behind a proxy or gateway too), header.
 pub const CACHE_ROUTES: &[(&str, &str, &str)] = &[("api.x.ai", "grok-", "x-grok-conv-id")];
+
+/// Chat Completions routes that cache a model's prompt only up to a
+/// `cache_control` marker, and so read nothing back from a request without
+/// one: host, model id prefix. OpenRouter serving an Anthropic model is one.
+pub const CACHE_MARKS: &[(&str, &str)] = &[("openrouter.ai", "anthropic/")];
 
 /// Known compatibility routes can accept the field while ignoring its value.
 pub fn validate_reasoning_effort(base: &str, wire: WireApi, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
