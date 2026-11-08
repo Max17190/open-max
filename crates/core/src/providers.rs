@@ -24,7 +24,7 @@ pub struct CompatFlags {
     pub send_stream_options: bool,
     /// When true, omit temperature for servers that choose it themselves.
     pub omit_temperature: bool,
-    /// Replay structured reasoning on compatible Chat Completions routes.
+    /// Omit duplicate plaintext reasoning on compatible Chat Completions routes.
     pub prefer_reasoning_details: bool,
 }
 

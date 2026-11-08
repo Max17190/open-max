@@ -3047,13 +3047,14 @@ mod tests {
 
     /// A provider that answers its first request with `first` and every later
     /// one with `STOP_SSE`, keeping each request body it was sent.
-    async fn capturing_endpoint(first: &'static str) -> (String, Arc<StdMutex<Vec<String>>>) {
+    async fn capturing_endpoint(first: &str) -> (String, Arc<StdMutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
         let seen = bodies.clone();
+        let first = first.to_owned();
         tokio::spawn(async move {
             let mut n = 0usize;
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -3080,7 +3081,7 @@ mod tests {
                 }
                 seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
                 n += 1;
-                let sse = if n == 1 { first } else { STOP_SSE };
+                let sse = if n == 1 { first.as_str() } else { STOP_SSE };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
                 );
@@ -3413,14 +3414,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_loop_replays_only_details_on_a_compatible_route() {
+    async fn a_tool_loop_deduplicates_only_matching_reasoning() {
+        let details = serde_json::json!([
+            {"type":"reasoning.text","text":"read a.txt first","signature":"EqQBsig==","id":"rs-1","format":"unknown","index":0},
+            {"type":"reasoning.encrypted","data":"opaque==","id":"enc-1","format":"unknown","index":1},
+        ]);
+        check_preferred_reasoning(DETAILED_TOOL_SSE, None, &details).await;
+        let unmatched = DETAILED_TOOL_SSE.replace(r#""reasoning":"first""#, r#""reasoning":"with full context""#);
+        check_preferred_reasoning(&unmatched, Some("read a.txt with full context"), &details).await;
+    }
+
+    async fn check_preferred_reasoning(first: &str, expected_plaintext: Option<&str>, details: &Value) {
         let dir = std::env::temp_dir().join(format!("openmax-details-route-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.join("data")).unwrap();
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
-        let (url, bodies) = capturing_endpoint(DETAILED_TOOL_SSE).await;
+        let (url, bodies) = capturing_endpoint(first).await;
         std::fs::write(
             crate::providers::providers_path(&core.data_dir),
             serde_json::json!({"providers":{"fixture":{
@@ -3442,12 +3453,9 @@ mod tests {
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2);
         let reply = &sent_replies(&bodies[1])[0];
-        assert!(reply.get("reasoning").is_none(), "the details are the wire representation");
+        assert_eq!(reply["reasoning"].as_str(), expected_plaintext);
         assert!(reply.get("reasoning_content").is_none());
-        assert_eq!(reply["reasoning_details"], serde_json::json!([
-            {"type":"reasoning.text","text":"read a.txt first","signature":"EqQBsig==","id":"rs-1","format":"unknown","index":0},
-            {"type":"reasoning.encrypted","data":"opaque==","id":"enc-1","format":"unknown","index":1},
-        ]));
+        assert_eq!(&reply["reasoning_details"], details);
         let second: Value = serde_json::from_str(&bodies[1]).unwrap();
         assert_eq!(second["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], reply["tool_calls"][0]["id"]);
         let messages: Vec<ChatMessage> = serde_json::from_value(second["messages"].clone()).unwrap();

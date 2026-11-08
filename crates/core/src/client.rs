@@ -104,7 +104,7 @@ struct StreamOptions {
 /// reasoning, `reasoning_details`, and each tool call's `extra_content` go
 /// only to the endpoint that produced them (`origin` matches the message's
 /// `reasoning_origin`), and the stamp itself never goes. Compatible routes
-/// receive unchanged structured blocks in place of the plaintext field.
+/// receive unchanged structured blocks without a duplicate plaintext field.
 ///
 /// `marks` is for a route that caches a prompt only up to a `cache_control`
 /// marker (`ChatClient::cache_marks`): the system prompt and the newest
@@ -120,16 +120,37 @@ struct WireMessages<'a> {
     prefer_reasoning_details: bool,
 }
 
-fn has_reasoning_blocks(raw: &RawValue) -> bool {
-    // Normal replies store a nonempty array of blocks. Retain plaintext for
-    // older transcripts carrying an empty array or another shape.
-    raw.get().trim_start().strip_prefix('[')
-        .is_some_and(|body| body.trim_start().starts_with('{'))
+#[derive(Deserialize)]
+struct ReasoningTextBlock<'a> {
+    #[serde(default, borrow, rename = "type")]
+    kind: std::borrow::Cow<'a, str>,
+    #[serde(default, borrow)]
+    text: std::borrow::Cow<'a, str>,
+}
+
+fn details_repeat_plaintext(message: &ChatMessage) -> bool {
+    let mut plaintext = [message.reasoning_content.as_deref(), message.reasoning.as_deref()]
+        .into_iter().flatten();
+    let Some(text) = plaintext.next().filter(|text| !text.is_empty()) else { return false };
+    let Some(details) = message.reasoning_details.as_deref() else { return false };
+    let raw = details.get();
+    if plaintext.any(|other| other != text) || raw.len() > MAX_RESPONSE_BYTES {
+        return false;
+    }
+    // Borrow unescaped text and skip opaque fields. Compare blocks in order
+    // without assembling another copy of the reasoning or rewriting the JSON.
+    let Ok(blocks) = serde_json::from_str::<Vec<ReasoningTextBlock<'_>>>(raw) else { return false };
+    let mut remaining = text;
+    for block in blocks.iter().filter(|block| block.kind == "reasoning.text") {
+        let Some(tail) = remaining.strip_prefix(block.text.as_ref()) else { return false };
+        remaining = tail;
+    }
+    remaining.is_empty()
 }
 
 fn chat_replay(message: &ChatMessage, origin: &str, prefer_details: bool) -> (bool, bool) {
     let replay = message.reasoning_origin.as_deref() == Some(origin);
-    let plain = replay && !(prefer_details && message.reasoning_details.as_deref().is_some_and(has_reasoning_blocks));
+    let plain = replay && !(prefer_details && details_repeat_plaintext(message));
     (replay, plain)
 }
 
@@ -4133,18 +4154,38 @@ pub(crate) mod tests {
             let mut reply = ChatMessage::assistant(Some("done".into()), None);
             reply.reasoning_origin = Some(client.origin());
             reply.reasoning_content = Some("reasoning text".into());
-            for (raw, has_blocks) in [
+            for (raw, duplicates_plaintext) in [
                 (r#"[ {"type":"reasoning.text","text":"reasoning text","signature":"sig"} ]"#, true),
+                (r#"[{"type":"reasoning.text","text":"reasoning "},{"type":"reasoning.text","text":"text"}]"#, true),
+                (r#"[{"type":"reasoning.text","text":"reasoning \u0074ext"}]"#, true),
                 ("[ ]", false),
+                ("[{}]", false),
+                (r#"[{"type":"reasoning.text","text":""}]"#, false),
+                (r#"[{"type":"reasoning.text","text":"different"}]"#, false),
+                (r#"[{"type":"reasoning.summary","summary":"reasoning text"}]"#, false),
+                (r#"[{"type":"reasoning.encrypted","data":"opaque=="}]"#, false),
+                (r#"[{"type":"custom","text":"reasoning text"}]"#, false),
                 ("null", false),
             ] {
                 reply.reasoning_details = Some(RawValue::from_string(raw.into()).unwrap());
                 let body = request_body(&client, &[reply.clone()]);
                 assert!(body.contains(&format!(r#""reasoning_details":{raw}"#)));
-                assert_eq!(body.contains(r#""reasoning_content":"reasoning text""#), !(prefers_details && has_blocks));
+                assert_eq!(body.contains(r#""reasoning_content":"reasoning text""#), !(prefers_details && duplicates_plaintext));
             }
+            reply.reasoning_content = Some("line one\n\"quoted\"".into());
+            let raw = r#"[{"type":"reasoning.text","text":"line one\n"},{"type":"reasoning.text","text":"\"quoted\""}]"#;
+            reply.reasoning_details = Some(RawValue::from_string(raw.into()).unwrap());
+            let body = request_body(&client, &[reply.clone()]);
+            assert!(body.contains(&format!(r#""reasoning_details":{raw}"#)));
+            assert_eq!(body.contains(r#""reasoning_content":"line one\n\"quoted\"""#), !prefers_details);
+
+            reply.reasoning = Some("another plaintext alias".into());
+            let body = request_body(&client, &[reply.clone()]);
+            assert!(body.contains(r#""reasoning_content":"line one\n\"quoted\"""#));
+            assert!(body.contains(r#""reasoning":"another plaintext alias""#));
+
             reply.reasoning_details = None;
-            assert!(request_body(&client, &[reply]).contains(r#""reasoning_content":"reasoning text""#));
+            assert!(request_body(&client, &[reply]).contains(r#""reasoning_content":"line one\n\"quoted\"""#));
         }
     }
 
