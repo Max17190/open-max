@@ -156,7 +156,7 @@ fn custom_runner<'a>(target: &str, entry: &'a toml::Value) -> &'a str {
 /// them takes longer than the whole pull-request gate. The Release workflow
 /// itself runs only on a release tag, as dist's `pr-run-mode = "skip"`
 /// generates it, so none of its jobs runs on a pull request, where CI's own
-/// Release plan job runs dist's plan instead. README.md states where the
+/// Release plan job runs dist's plan instead. docs/development.md states where the
 /// builds run.
 #[test]
 fn ci_builds_and_size_gates_every_release_target() {
@@ -184,15 +184,15 @@ fn ci_builds_and_size_gates_every_release_target() {
         Some("skip"),
         "dist would generate a Release workflow that runs on pull requests"
     );
-    let readme = read("README.md");
+    let stated = read("docs/development.md");
     let claim = "The Release build workflow builds and size-gates every release target on every push to main, every night and every merge group, and on no pull request";
-    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
-    // So main's run is the only size check a release has, as README.md says.
+    assert!(stated.contains(claim), "docs/development.md does not say \"{claim}\", which this test holds");
+    // So main's run is the only size check a release has, as docs/development.md says.
     let claim = "A release tag publishes nothing unless dist builds every target, but it reads no size budget";
-    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(claim), "docs/development.md does not say \"{claim}\", which this test holds");
     assert!(
         !read(".github/workflows/release.yml").contains("check-binary-size"),
-        "the Release workflow gates binary sizes, so README.md's \"{claim}\" no longer holds"
+        "the Release workflow gates binary sizes, so docs/development.md's \"{claim}\" no longer holds"
     );
 
     let matrix = ci_release_matrix();
@@ -286,7 +286,7 @@ fn dist_installs(lines: &[String]) -> (Vec<String>, Vec<String>) {
 /// installer at the version Cargo.toml names, checked against the same
 /// sha256 before it runs, so a bump that re-pins one and not the other fails
 /// here. Nothing skips the job or lets it fail, and its token only reads.
-/// README.md states this.
+/// docs/development.md states this.
 #[test]
 fn ci_plans_the_release_with_the_dist_a_tag_installs() {
     let version = manifest_table("workspace.metadata.dist")
@@ -343,9 +343,9 @@ fn ci_plans_the_release_with_the_dist_a_tag_installs() {
         .collect();
     assert_eq!(granted, ["contents: read"], "the Release plan job's token can do more than read the repository");
 
-    let readme = read("README.md");
+    let stated = read("docs/development.md");
     let claim = "CI's Release plan job runs `dist plan`, the plan a release tag starts with, on every pull request";
-    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(claim), "docs/development.md does not say \"{claim}\", which this test holds");
 }
 
 /// The gate passes a binary exactly at its target's budget and fails one a

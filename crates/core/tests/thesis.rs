@@ -464,7 +464,7 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// the request before it sent, and every request after the first but the
 /// summary shares its whole frozen prefix with an earlier one. The share holds the 75% target and a ratchet, the
 /// share measured when the ratchet was set less half a point, rounded down to
-/// a tenth; README.md states the ratchet and the session's length, held here.
+/// a tenth; docs/development.md states the ratchet and the session's length, held here.
 /// Measured on this tree, when the ratchets were set: 85.51% (167,050 of
 /// 195,365 prompt tokens) on Chat Completions, 85.51% (168,222 of 196,730) on
 /// Responses and 84.34% (70,531 of 83,630) on native Messages. A byte count,
@@ -483,7 +483,7 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// share: every request but the two the compaction makes reads back the
 /// entry the request before it wrote, when that one was long enough to write
 /// one, and the share holds the 75% target and its ratchet, set as above;
-/// README.md states it. With the note at the end of the last message, the
+/// docs/development.md states it. With the note at the end of the last message, the
 /// Responses share was 0.00%; measured when its ratchet was set, 84.74%
 /// (166,870 of 196,910 prompt tokens). With no block marked, the native
 /// Messages share was 0.00%; measured when its ratchet was set, 82.81%
@@ -958,7 +958,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     );
     assert!(share >= ratchet, "the cacheable share {share:.2}% fell under its {ratchet:.1}% ratchet:\n{}", per_request());
     assert!(share >= TARGET_PERCENT, "the cacheable share {share:.2}% is under the {TARGET_PERCENT}% target");
-    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/development.md")).unwrap();
     let mut claims = vec![format!("{ratchet:.1}% ({name})"), format!("drives one {}-request session", prompts.len())];
     // A modeled rule's share reports until a ratchet holds it.
     let billed_share = 100.0 * tokens(&billed) as f64 / sent as f64;
@@ -991,7 +991,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         claims.push(format!("{billed_ratchet:.1}% billed ({name})"));
     }
     for claim in claims {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1009,7 +1009,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
 /// earlier request's bytes could serve, where a provider's rule is modeled
 /// the share it bills as cached (as `a_session_prompt_is_75_percent_cacheable`
 /// models it), and on native Messages the thinking blocks replayed of those
-/// a request could replay; README.md states the design, held here. Sent
+/// a request could replay; docs/design.md states the design, held here. Sent
 /// after the history of each request and dropped by the next, the note left
 /// every request after the second short of repeating the one before it,
 /// native Messages replaying 8 of 36 thinking blocks, and 74.62%
@@ -1122,7 +1122,7 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
         .collect();
     let dropped: Vec<usize> =
         (0..prompts.len()).filter(|&i| wire == WireApi::Anthropic && replayed[i] < i).map(|i| i + 1).collect();
-    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/design.md")).unwrap();
     let claim = "rides a note stored once, where it changes";
     close(&core, &id).await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -1131,7 +1131,7 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
         (!unread.is_empty()).then(|| format!("requests {unread:?} read back no entry the request before them wrote")),
         (copies != 2).then(|| format!("the last request carries {copies} notes, not each of the two once")),
         (!dropped.is_empty()).then(|| format!("requests {dropped:?} replay the thinking of fewer replies than came before them")),
-        (!readme.contains(claim)).then(|| format!("README.md does not say \"{claim}\", which this test holds")),
+        (!stated.contains(claim)).then(|| format!("docs/design.md does not say \"{claim}\", which this test holds")),
     ]
     .into_iter()
     .flatten()
@@ -1431,7 +1431,7 @@ fn reference_machine() -> bool {
 /// ratchet on it 10% over 2.88, its highest with no other work on the same
 /// cores, rounded up to a tenth; elsewhere, CI's runners included, it prints
 /// the ratio. A debug build asserts a 20x sanity bound on the median.
-/// The test holds the README's statements of the target and the ratchet.
+/// The test holds the statements in docs/development.md of the target and the ratchet.
 #[test]
 fn a_hundred_extensions_load_in_under_10_ms() {
     use open_max_core::config::ApprovalMode;
@@ -1617,7 +1617,7 @@ fn a_hundred_extensions_load_in_under_10_ms() {
             "a load of 100 extensions took {ratio:.2} times the time to read their files ({total:?} over {read:?}), over its ratchet of {ratchet:.1}"
         );
     }
-    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/development.md")).unwrap();
     for claim in [
         format!("Parsing and registering 100 extensions takes under {} ms", TARGET.as_millis()),
         format!(
@@ -1626,7 +1626,7 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         ),
         "Elsewhere, CI's runners included, a release build prints the ratio, whose scale is the machine's own.".to_string(),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

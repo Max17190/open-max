@@ -329,9 +329,9 @@ fn transcript_frame_p99_at_1m_lines() {
         app.transcript.len(),
         mb(peak)
     );
-    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/development.md")).unwrap();
     let claim = format!("a release build holds it to a ratchet of {LINUX_RATCHET_MS} ms until it meets its target");
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     assert_eq!(chat_allocations, 0, "an idle frame of the conversation allocated");
     assert!(per_row <= 600.0, "the transcript holds {per_row:.0} bytes a row");
     assert!(read - held <= 5_000_000, "reading every row once grew the heap by {:.1} MB", mb(read - held));
