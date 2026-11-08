@@ -3538,6 +3538,45 @@ mod tests {
         assert!(!t.has_text_selection());
     }
 
+    /// A press that has not moved yet selects nothing: no cell is
+    /// highlighted and a copy carries nothing, while the anchor waits for a
+    /// drag to extend it.
+    #[test]
+    fn a_plain_press_highlights_and_copies_nothing() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push_assistant(vec![Line::from("alpha beta")]);
+        assert!(t.begin_text_selection_at(0, 3));
+        assert_eq!(t.selection_columns(0), None);
+        assert_eq!(t.selected_text(), None);
+        // Inclusive of the cell the pointer is on.
+        assert!(t.update_text_selection_at(0, 6));
+        assert_eq!(t.selected_text().as_deref(), Some("ha b"));
+    }
+
+    /// A removal above a word gesture moves the range the gesture picked
+    /// with its text, so a drag after it still extends from that word.
+    #[test]
+    fn a_removal_above_a_word_gesture_moves_the_range_it_extends_from() {
+        let mut t = Transcript::new();
+        t.set_width(40);
+        t.push_user(vec![Line::from("alpha")]);
+        t.push_assistant(vec![Line::from("beta")]);
+        t.push_user(vec![Line::from("gamma")]);
+        t.push_assistant(vec![Line::from("delta epsilon")]);
+        let row_of = |t: &mut Transcript, block: usize| {
+            (0..t.len()).find(|&row| t.row(row).is_some_and(|(at, _)| at == block)).unwrap()
+        };
+        let delta = row_of(&mut t, 3);
+        assert!(t.select_word_at(delta, 2));
+        assert!(t.pop_last_user());
+        let delta = row_of(&mut t, 2);
+        // A drag that stays inside the word keeps exactly the word.
+        assert!(t.update_text_selection_at(delta, 4));
+        t.finish_text_selection();
+        assert_eq!(t.selected_text().as_deref(), Some("delta"));
+    }
+
     #[test]
     fn folding_a_selected_tool_clears_text_selection() {
         let mut t = Transcript::new();

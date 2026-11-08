@@ -1091,6 +1091,16 @@ mod tests {
         assert!(long.chars().count() <= TRANSCRIPT_MSG_CHARS + 1);
         assert_eq!(t["truncated"], true);
         assert_eq!(validate_line(&line).unwrap(), "transcript");
+        // Each message is an object with both strings: a bare value has
+        // neither, and one string alone is half a message.
+        for messages in [r#"[1]"#, r#"["hello"]"#, r#"[{"role":"user"}]"#] {
+            let line = format!(r#"{{"type":"transcript","session_id":"s1","messages":{messages}}}"#);
+            assert_eq!(
+                validate_line(&line).unwrap_err(),
+                "transcript message missing string 'role'/'content'",
+                "{messages}"
+            );
+        }
         // `type` first, then the fields and each message's keys in the order
         // docs/stdio-protocol.md shows.
         assert_eq!(
