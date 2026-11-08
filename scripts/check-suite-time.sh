@@ -97,7 +97,15 @@ perl -MJSON::PP -MTime::HiRes -e 1 2> /dev/null || {
 threads=32
 
 cd "$(dirname "$0")/.."
-now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+# The clock in milliseconds: bash 5's own, read with no process started,
+# else perl's (macOS ships bash 3.2). It is read twice for each binary, as
+# the binaries start and end, so a perl start for each reading was the
+# check's own work on the clock, beside the binaries it times.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+  now_ms() { local us=${EPOCHREALTIME//[!0-9]/}; echo $((us / 1000)); }
+else
+  now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+fi
 secs() { printf '%d.%02ds' "$(($1 / 1000))" "$(($1 % 1000 / 10))"; }
 
 # One line per executable: whether it is a test binary, its package

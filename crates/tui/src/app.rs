@@ -7580,50 +7580,58 @@ mod tests {
         }
     }
 
-    /// Paint `steps` into an app that wraps lazily and one that wraps every
-    /// block up front, both starting from `history` blocks, and require the
-    /// same frame after every step. Only the scrollbar marker, a proportion
-    /// of the estimated total, may differ.
-    fn assert_lazy_paints_like_eager(history: usize, steps: &[ViewStep]) {
-        assert_lazy_holding_wraps_paints_like_eager(history, steps, None);
-    }
-
-    /// The same, with the lazy side keeping at most `wrap_budget` rows of
-    /// wraps beyond the view when one is given.
-    fn assert_lazy_holding_wraps_paints_like_eager(history: usize, steps: &[ViewStep], wrap_budget: Option<usize>) {
-        let (mut lazy, lazy_dir) = app_fixture();
+    /// Paint `steps` into an app that wraps every block up front and, for
+    /// each of `wrap_budgets`, an app that wraps lazily, keeping at most that
+    /// many rows of wraps beyond the view (`None`: every wrap it made), all
+    /// starting from `history` blocks, and require each lazy app to paint
+    /// the eager app's frame after every step. Only the scrollbar marker, a
+    /// proportion of the estimated total, may differ. A lazy app with a
+    /// budget must have dropped a wrap by the end. The lazy apps share one
+    /// eager walk, the costlier side, which wraps every block again at each
+    /// resize.
+    fn assert_lazy_paints_like_eager(history: usize, steps: &[ViewStep], wrap_budgets: &[Option<usize>]) {
         let (mut eager, eager_dir) = app_fixture();
-        lazy.transcript.wrap_budget = wrap_budget;
         eager.transcript.eager = true;
-        for app in [&mut lazy, &mut eager] {
-            push_long_history(app, history);
-        }
+        push_long_history(&mut eager, history);
+        let mut lazies: Vec<_> = wrap_budgets
+            .iter()
+            .map(|&budget| {
+                let (mut lazy, dir) = app_fixture();
+                lazy.transcript.wrap_budget = budget;
+                push_long_history(&mut lazy, history);
+                (lazy, dir, budget)
+            })
+            .collect();
+        // The header row names each fixture's own directory.
+        let painted = |app: &mut App, width: u16, height: u16| -> Vec<String> {
+            rows(&render_app(app, width, height))
+                .into_iter()
+                .skip(1)
+                .map(|row| row.replace('▐', " "))
+                .collect()
+        };
         let (mut width, mut height) = (100, 30);
         for (index, &step) in steps.iter().enumerate() {
             if let ViewStep::Size(w, h) = step {
                 (width, height) = (w, h);
             }
-            for app in [&mut lazy, &mut eager] {
-                apply_view_step(app, step, index);
+            apply_view_step(&mut eager, step, index);
+            let expected = painted(&mut eager, width, height);
+            for (lazy, _, budget) in &mut lazies {
+                apply_view_step(lazy, step, index);
+                assert_eq!(
+                    painted(lazy, width, height),
+                    expected,
+                    "{history} blocks, step {index} ({step:?}) painted differently at {width}x{height}, wrap budget {budget:?}"
+                );
             }
-            // The header row names each fixture's own directory.
-            let painted = |app: &mut App| -> Vec<String> {
-                rows(&render_app(app, width, height))
-                    .into_iter()
-                    .skip(1)
-                    .map(|row| row.replace('▐', " "))
-                    .collect()
-            };
-            assert_eq!(
-                painted(&mut lazy),
-                painted(&mut eager),
-                "{history} blocks, step {index} ({step:?}) painted differently at {width}x{height}"
-            );
         }
-        if wrap_budget.is_some() {
-            assert!(lazy.transcript.dropped_wraps > 0, "the walk never dropped a wrap");
+        for (lazy, dir, budget) in lazies {
+            if budget.is_some() {
+                assert!(lazy.transcript.dropped_wraps > 0, "the walk never dropped a wrap");
+            }
+            fs::remove_dir_all(dir).unwrap();
         }
-        fs::remove_dir_all(lazy_dir).unwrap();
         fs::remove_dir_all(eager_dir).unwrap();
     }
 
@@ -7677,44 +7685,34 @@ mod tests {
             Size(90, 20), Up(100), Size(33, 20), Down(25), Follow, Stream, Stream,
             Focus, Find(37), Prev, Prev, Fold, Size(45, 16), Find(150), Done, Follow,
         ];
-        assert_lazy_paints_like_eager(400, &scripted);
+        assert_lazy_paints_like_eager(400, &scripted, &[None]);
     }
 
     #[test]
     fn lazy_wrapping_paints_what_eager_wrapping_paints_on_a_short_walk() {
-        assert_lazy_paints_like_eager(6, &random_view_steps(1, 300, 6));
+        assert_lazy_paints_like_eager(6, &random_view_steps(1, 300, 6), &[None]);
     }
 
     #[test]
     fn lazy_wrapping_paints_what_eager_wrapping_paints_on_another_short_walk() {
-        assert_lazy_paints_like_eager(6, &random_view_steps(2, 300, 6));
+        assert_lazy_paints_like_eager(6, &random_view_steps(2, 300, 6), &[None]);
     }
 
     /// A seeded walk over a long history, which repaints four hundred
-    /// blocks twice a step: one test per seed, so the walks run at once.
+    /// blocks a step, with two lazy apps beside the eager one: one keeps
+    /// every wrap it made, and one holds about two screens of wraps, so
+    /// blocks drop their wraps as the walk leaves them and wrap again as it
+    /// comes back, across resizes, folds, arrivals and a removed prompt.
+    /// Every frame of each paints what wrapping every block up front
+    /// paints. One test per seed, so the walks run at once.
     #[test]
     fn lazy_wrapping_paints_what_eager_wrapping_paints_on_a_long_walk() {
-        assert_lazy_paints_like_eager(400, &random_view_steps(1, 300, 400));
+        assert_lazy_paints_like_eager(400, &random_view_steps(1, 300, 400), &[None, Some(60)]);
     }
 
     #[test]
     fn lazy_wrapping_paints_what_eager_wrapping_paints_on_another_long_walk() {
-        assert_lazy_paints_like_eager(400, &random_view_steps(2, 300, 400));
-    }
-
-    /// The long walks again with the lazy side holding about two screens of
-    /// wraps, so blocks drop their wraps as the walk leaves them and wrap
-    /// again as it comes back, across resizes, folds, arrivals and a
-    /// removed prompt: every frame still paints what wrapping every block
-    /// up front paints.
-    #[test]
-    fn lazy_wrapping_paints_what_eager_wrapping_paints_while_dropping_wraps() {
-        assert_lazy_holding_wraps_paints_like_eager(400, &random_view_steps(1, 300, 400), Some(60));
-    }
-
-    #[test]
-    fn lazy_wrapping_paints_what_eager_wrapping_paints_while_dropping_wraps_on_another_walk() {
-        assert_lazy_holding_wraps_paints_like_eager(400, &random_view_steps(2, 300, 400), Some(60));
+        assert_lazy_paints_like_eager(400, &random_view_steps(2, 300, 400), &[None, Some(60)]);
     }
 
     /// Heap allocations of one frame that repaints the conversation, after
