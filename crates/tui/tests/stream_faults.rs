@@ -1327,6 +1327,50 @@ fn an_error_chunk_after_reply_text_fails_the_turn_and_keeps_no_partial_text() {
     env.resume(&run, &run.after);
 }
 
+/// An output limit can cut a call after its name and before any arguments.
+#[test]
+fn a_capped_call_without_arguments_does_not_run() {
+    for (tag, reason, completion, stream, allowed) in [
+        ("length", "length", 5, true, false),
+        ("reported-cap", "tool_calls", 32, false, false),
+        ("normal", "tool_calls", 5, true, true),
+    ] {
+        let calls = json!([
+            {"index":0,"id":"first","type":"function","function":{"name":"bash","arguments":bash_args("first")}},
+            {"index":1,"id":"last","type":"function","function":{"name":"write_marker"}},
+        ]);
+        let usage = json!({"prompt_tokens":20,"completion_tokens":completion});
+        let reply = if stream {
+            Step::Finished(format!("{}{}{}{DONE}", data(&chunk(json!({"tool_calls":calls}), Value::Null)),
+                finish(reason), data(&json!({"choices":[],"usage":usage}))))
+        } else {
+            Step::Status { status: "200 OK", headers: JSON_TYPE,
+                body: json!({"choices":[{"message":{"tool_calls":calls},"finish_reason":reason}],"usage":usage}).to_string() }
+        };
+        let env = Env::with_settings(tag, tag, vec![reply, Step::Finished(sse_text("done"))], r#","max_tokens":32"#);
+        let tools = env.project.join(".openmax/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("marker.toml"), r#"name = "write_marker"
+description = "Write a marker"
+command = "/bin/sh"
+args = ["-c", "echo last >> ran.log"]
+mutating = true
+"#).unwrap();
+        let run = env.first("run the tools");
+        let log = run.log();
+        assert_eq!(env.ran_log(), if allowed { "first\nlast\n" } else { "first\n" }, "{log}");
+        assert_eq!(run.stop_reason(), "stop", "{log}");
+        let wire: Value = serde_json::from_str(&run.requests[1]).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["tool_call_id"], "last", "{log}");
+        assert_eq!(messages[messages.len() - 3]["tool_calls"][1]["function"]["arguments"], "{}", "{log}");
+        if !allowed {
+            assert!(last["content"].as_str().unwrap().starts_with("Error: Not run: your reply reached the output limit"), "{log}");
+        }
+    }
+}
+
 /// A 500 before any body, and a 503 the provider reports in its stream
 /// before any reply text, are each resent once after the backoff with the
 /// same bytes, and the turn ends with the one reply that followed.
