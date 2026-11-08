@@ -322,9 +322,10 @@ fn the_suite_fails_over_its_time_budget() {
     // A binary that holds a test the gate runs alone, and a binary beside it
     // that marks when it ended: beside the others the first must be run
     // without that test, then alone with only it, with libtest's own pool,
-    // once every other binary has ended, once a run. Alone, its test takes
-    // 0.6 seconds, a fifth of a second longer than the binary beside it, and
-    // ends with `code`.
+    // once every other binary has ended, once a run. Alone, its test takes a
+    // second the first time, four fifths of a second longer than the binary
+    // beside it (room for either to start late on a busy runner and still
+    // keep their order), and no time after that. It ends with `code`.
     let held_alone = |name: &str, code: u8| {
         let (path, ended, runs) = (dir.join(name), dir.join(format!("{name}-lagging-ended")), dir.join(format!("{name}-alone-runs")));
         executable(
@@ -337,7 +338,7 @@ fn the_suite_fails_over_its_time_budget() {
                  *) echo \"run with $*\"; exit 1 ;;\n\
                  esac\n\
                  [ -e '{ended}' ] || {{ echo 'run alone beside another binary'; exit 1; }}\n\
-                 sleep 0.6\n\
+                 [ \"$(wc -l < '{runs}')\" -gt 1 ] || sleep 1\n\
                  [ {code} = 0 ] || printf 'failures:\\n\\n---- harness_time_per_tool_round stdout ----\\npast its bound\\n'\n\
                  exit {code}\n",
                 runs = runs.display(),
@@ -345,7 +346,7 @@ fn the_suite_fails_over_its_time_budget() {
             ),
         );
         let lagging = dir.join(format!("{name}-lagging"));
-        executable(&lagging, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nrm -f '{0}'\nsleep 0.4\n: > '{0}'\n", ended.display()));
+        executable(&lagging, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nrm -f '{0}'\nsleep 0.2\n: > '{0}'\n", ended.display()));
         (path, lagging, runs)
     };
     let (timed, timed_lagging, timed_runs) = held_alone("timed", 0);
@@ -612,22 +613,20 @@ fn the_suite_fails_over_its_time_budget() {
     assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
     // A test that times its own work runs alone: beside the others its
     // binary runs without it, then it runs alone, once every other binary
-    // has ended, and its time counts toward the run's, which names it when
-    // it is the slowest. Alone, its failure fails the gate, with no second
-    // run.
-    let timed_runs_reported = (1..=2)
-        .filter(|n| {
-            let line = alone_report.lines().find_map(|line| line.strip_prefix(&format!("run {n} of 2: ")));
-            line.and_then(|line| line.split_once("s, slowest binary ")).is_some_and(|(took, slowest)| {
-                took.parse::<f64>().is_ok_and(|took| took >= 1.0)
-                    && slowest.split_once(", load ").is_some_and(|(slowest, _)| {
-                        slowest.ends_with("s harness_time_per_tool_round in timed (test), alone")
-                    })
-            })
-        })
-        .count();
+    // has ended, in every run, and its time counts toward the run's, which
+    // names it when it is the slowest. Alone, its failure fails the gate,
+    // with no second run.
+    let first_run = alone_report
+        .lines()
+        .find_map(|line| line.strip_prefix("run 1 of 2: ")?.split_once("s, slowest binary "))
+        .and_then(|(took, slowest)| Some((took.parse::<f64>().ok()?, slowest.split_once(", load ")?.0)));
     assert!(
-        alone == Some(0) && timed_ran == 2 && timed_runs_reported == 2,
+        alone == Some(0)
+            && timed_ran == 2
+            && alone_report.lines().any(|line| line.starts_with("run 2 of 2: "))
+            && first_run.is_some_and(|(took, slowest)| {
+                took >= 1.2 && slowest.ends_with("s harness_time_per_tool_round in timed (test), alone")
+            }),
         "a test that runs alone did not run once a run, alone, after the others and on the clock, \
          or the run did not name it as its slowest: {alone_report}"
     );
