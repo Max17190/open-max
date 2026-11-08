@@ -1313,15 +1313,25 @@ async fn a_transcript_selection_paints_on_the_row_it_selected() {
     }
     let (rows, _) = frame(&mut app, 30, 14);
     let row = rows.iter().position(|row| row.contains("line 3")).unwrap();
-    for _ in 0..3 {
-        click(&mut app, 4, row as u16).await;
-    }
-    let mut terminal = Terminal::new(TestBackend::new(30, 14)).unwrap();
-    terminal.draw(|frame| app.draw(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let selected: Vec<u16> =
-        (0..14).filter(|&y| (0..30).any(|x| buffer[(x, y)].bg == crate::theme::SELECT())).collect();
-    assert_eq!(selected, [row as u16]);
+    // The cells each frame paints as selected, as (column, row).
+    let painted = |app: &mut App| {
+        let mut terminal = Terminal::new(TestBackend::new(30, 14)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..14u16)
+            .flat_map(|y| (0..30u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].bg == crate::theme::SELECT())
+            .collect::<Vec<_>>()
+    };
+    // A double click takes the word under it, a third click its line.
+    let start = rows[row][..rows[row].find("line 3").unwrap()].chars().count() as u16;
+    click(&mut app, start + 1, row as u16).await;
+    click(&mut app, start + 1, row as u16).await;
+    let word = painted(&mut app);
+    assert_eq!(word, (start..start + 4).map(|x| (x, row as u16)).collect::<Vec<_>>(), "{:?}", rows[row]);
+    click(&mut app, start + 1, row as u16).await;
+    let line = painted(&mut app);
+    assert!(line.len() > word.len() && line.iter().all(|&(_, y)| y == row as u16), "{line:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
