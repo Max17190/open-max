@@ -1494,6 +1494,13 @@ mod first_frame {
         assert!(shown.contains("requested: low"), "{shown}");
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(s.dir.join("home/.openmax/settings.json")).unwrap()).unwrap();
         assert_eq!(saved["reasoning_effort"], "low", "same-value selection becomes persistent");
+        // xAI's grok-4.x refuses max, so Shift+Tab wraps from xhigh to default.
+        s.write(b"/model grok-4.7\r/effort xhigh\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: xhigh"));
+        assert!(shown.contains("requested: xhigh"), "{shown}");
+        s.write(b"\x1b[Z");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default"));
+        assert!(shown.contains("requested: default") && !shown.contains("requested: max"), "{shown}");
         s.write(CTRL_C_TWICE);
         assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
 

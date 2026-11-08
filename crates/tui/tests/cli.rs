@@ -1783,6 +1783,45 @@ fn effort_flags_reach_requests_and_keep_existing_settings_during_overrides() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// xAI takes reasoning effort low to xhigh for grok-4.7 and refuses none and
+/// max with a 400 once the request is spent. On each wire, behind a proxy
+/// where the model id names the route, a level it does not take is refused
+/// at launch, or before the request when settings.json holds it, naming the
+/// levels it takes; a level it takes reaches the request.
+#[test]
+fn an_effort_the_route_does_not_take_is_refused_before_any_request() {
+    let (project, home) = fresh_dirs("route-effort");
+    let (base_url, requests, _server) = spawn_scripted_server(vec![(sse_text("done"), true)]);
+    let data = home.join(".openmax");
+    std::fs::create_dir_all(&data).unwrap();
+    let write = |wire: &str, effort: &str| {
+        std::fs::write(data.join("providers.json"),
+            format!(r#"{{"providers":{{"xai":{{"base_url":"{base_url}","wire_api":"{wire}"}}}}}}"#)).unwrap();
+        std::fs::write(data.join("settings.json"),
+            format!(r#"{{"provider":"xai","model":"grok-4.7","context_tokens":16384{effort}}}"#)).unwrap();
+    };
+    let run = |effort: Option<&str>| {
+        let mut command = cmd(&project, &home);
+        command.args(["--trust-project", "-p", "hello"]).args(effort.map(|level| ["--effort", level]).into_iter().flatten());
+        finish_with_deadline(command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap())
+    };
+    for wire in ["chat_completions", "responses", "anthropic"] {
+        for (level, saved) in [("none", false), ("minimal", false), ("max", false), ("max", true)] {
+            write(wire, &if saved { format!(r#","reasoning_effort":"{level}""#) } else { String::new() });
+            let output = run((!saved).then_some(level));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success() && stderr.contains("choose default, low, medium, high or xhigh"), "{wire} {level}: {stderr}");
+        }
+    }
+    assert!(requests.lock().unwrap().is_empty(), "a level the route refuses spent a request");
+    write("chat_completions", "");
+    let output = run(Some("xhigh"));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let body: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
+    assert_eq!(body["reasoning_effort"], "xhigh");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 #[test]
 fn a_print_turn_against_a_stub_server_reaches_stdout() {
     let (project, home) = fresh_dirs("turn");
