@@ -497,7 +497,7 @@ mod tests {
         let body = |url: &str, model: &str, tools: &str| -> Value {
             let client = ChatClient::new(url.into(), None, model.into(), None, 64);
             let messages = [ChatMessage::system("rules"), ChatMessage::user("task")];
-            serde_json::from_slice(&serialize(&client, &messages, None, tools).unwrap()).unwrap()
+            serde_json::from_slice(&serialize(&client, &messages, tools).unwrap()).unwrap()
         };
         let openai = body("https://api.openai.com/v1", "gpt-5.6", &fixture);
         assert_eq!(openai["input"][1]["type"], "additional_tools");
