@@ -103,6 +103,46 @@ async fn native_effort_auth_and_default_omission_preserve_request_content() {
     }
 }
 
+/// A Claude model that takes an effort change inside the conversation
+/// (`providers::EFFORT_UPDATES`) keeps the effort the conversation opened
+/// with in `output_config` and sends each later choice as an effort-only
+/// system message just ahead of the prompt it was made for, under the beta
+/// that defines it. A request with no change sends no beta, and a model that
+/// takes none names the current effort at the top, as before; so does one
+/// whose conversation opened on another route, at an effort it may refuse.
+/// A Responses request sends its change as an input item, with no beta.
+#[tokio::test]
+async fn native_effort_change_rides_the_history_under_its_beta() {
+    let scratch=Scratch::new();
+    let completed=json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"verified"}]}],"usage":{"input_tokens":10,"output_tokens":7}}});
+    let (base,server)=serve([vec![(200,text_response());4],vec![(200,event(completed))]].concat()).await;
+    let mut opus=client(&scratch,&base,Some(ReasoningEffort::High)); opus.model="claude-opus-5-5".into();
+    let prompt=|text: &str, effort: &str, route: &ChatClient| ChatMessage { effort:Some(format!("{effort} {}",route.origin())), ..ChatMessage::user(text) };
+    let changed=[ChatMessage::system("instructions"),prompt("task","default",&opus),ChatMessage::assistant(Some("done".into()),None),prompt("again","high",&opus)];
+    run(&opus,&changed).await.unwrap();
+    run(&opus,&[ChatMessage::system("instructions"),ChatMessage::user("task")]).await.unwrap();
+    let other=client(&scratch,&base,None);
+    run(&opus,&[ChatMessage::system("instructions"),prompt("task","minimal",&other),ChatMessage::assistant(Some("done".into()),None),prompt("again","high",&opus)]).await.unwrap();
+    run(&client(&scratch,&base,Some(ReasoningEffort::High)),&changed).await.unwrap();
+    std::fs::write(scratch.0.join("providers.json"),json!({"providers":{"native":{"base_url":base,"api_key":"fixture-native-key","wire_api":"responses"}}}).to_string()).unwrap();
+    let settings=Settings { provider:Some("native".into()),model:"gpt-6.1-sol".into(),context_tokens:Some(8192),max_tokens:128,reasoning_effort:Some(ReasoningEffort::High),..Settings::default() };
+    let sol=ChatClient::from_endpoint(&providers::resolve(&settings,&scratch.0).unwrap());
+    run(&sol,&[ChatMessage::system("instructions"),prompt("task","default",&sol),ChatMessage::assistant(Some("done".into()),None),prompt("again","high",&sol)]).await.unwrap();
+    let requests=server.await.unwrap();
+    let beta=|request: &Request| request.head.to_ascii_lowercase().contains(&format!("\r\nanthropic-beta: {}", providers::EFFORT_BETA));
+    let bodies: Vec<Value>=requests.iter().map(|request| serde_json::from_slice(&request.body).unwrap()).collect();
+    assert!(beta(&requests[0]) && bodies[0].get("output_config").is_none(), "the top keeps the default the conversation opened with: {}", bodies[0]);
+    assert_eq!(bodies[0]["messages"][2],json!({"role":"system","content":[],"output_config":{"effort":"high"}}));
+    assert_eq!((&bodies[0]["messages"][1]["role"],&bodies[0]["messages"][3]["role"]),(&json!("assistant"),&json!("user")),"the change goes just ahead of its prompt");
+    for (request,body) in requests.iter().zip(&bodies).take(4).skip(1) {
+        assert!(!beta(request),"{}",request.head);
+        assert_eq!(body["output_config"],json!({"effort":"high"}));
+        assert!(body["messages"].as_array().unwrap().iter().all(|message| message["role"]!="system"),"{body}");
+    }
+    assert!(!beta(&requests[4]) && bodies[4].get("reasoning").is_none(),"{}",requests[4].head);
+    assert_eq!(bodies[4]["input"][4],json!({"type":"configuration_update","reasoning":{"effort":"high"}}));
+}
+
 #[tokio::test]
 async fn native_tool_round_trip_preserves_signed_blocks_only_for_the_same_origin() {
     let scratch=Scratch::new();let(base,server)=serve(vec![(200,tool_response()),(200,text_response()),(200,text_response())]).await;
