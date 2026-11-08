@@ -378,27 +378,20 @@ impl Session {
     /// The server closed its output or its input: name how it ended, when
     /// it has.
     fn closed(&mut self, method: &str) -> String {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let status = loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-                _ => break None,
-            }
-        };
-        match status {
+        match self.exit_within(Duration::from_millis(500)) {
             Some(status) => format!("the MCP server exited ({status}) before answering {method}"),
             None => format!("the MCP server closed its stdio before answering {method}"),
         }
     }
 
-    fn exited_within(&mut self, grace: Duration) -> bool {
+    /// The server's exit status once it has exited, waiting up to `grace`.
+    fn exit_within(&mut self, grace: Duration) -> Option<std::process::ExitStatus> {
         let deadline = Instant::now() + grace;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return true,
+                Ok(Some(status)) => return Some(status),
                 Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-                _ => return false,
+                _ => return None,
             }
         }
     }
@@ -411,7 +404,7 @@ impl Drop for Session {
     /// stuck on a server that stopped reading is freed when the server dies.
     fn drop(&mut self) {
         drop(self.writes.take());
-        if self.exited_within(STOP_GRACE) {
+        if self.exit_within(STOP_GRACE).is_some() {
             return;
         }
         #[cfg(unix)]
@@ -420,7 +413,7 @@ impl Drop for Session {
                 // SAFETY: the pid is this process's own unreaped child, so it
                 // cannot have been reused by another process.
                 unsafe { libc::kill(pid, libc::SIGTERM) };
-                if self.exited_within(STOP_GRACE) {
+                if self.exit_within(STOP_GRACE).is_some() {
                     return;
                 }
             }

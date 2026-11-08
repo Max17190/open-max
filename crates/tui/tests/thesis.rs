@@ -698,10 +698,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // A reasoning effort the route refuses fails before any request, from one table of the levels
-    // each vendor documents, and providers.json's reader parses with fewer steps: 1 line fewer, the
-    // frozen prompt unchanged.
-    const BASELINE: usize = 43_974;
+    // The terminal frontends share one selection type, one session opener, constant theme styles and
+    // one stdio field check: 315 lines fewer, the core and the frozen prompt unchanged.
+    const BASELINE: usize = 43_659;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
