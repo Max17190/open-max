@@ -803,13 +803,15 @@ fn check_requests(run: &Run, log: &str) {
 }
 
 /// The wire never carries `reasoning_origin`, the stamp the transcript keeps
-/// on a message with reasoning.
+/// on a message with reasoning, nor `effort`, the last field of a prompt's
+/// record, which says the effort its turn ran at.
 fn without_origin(line: &str) -> String {
     const KEY: &str = ",\"reasoning_origin\":\"";
-    match line.find(KEY) {
+    let line = match line.find(KEY) {
         Some(at) => format!("{}{}", &line[..at], &line[at + KEY.len() + 17..]),
         None => line.to_string(),
-    }
+    };
+    line.find(",\"effort\":\"").map_or(line.clone(), |at| format!("{}}}", &line[..at]))
 }
 
 fn user_line(prompt: &str) -> String {
@@ -829,7 +831,8 @@ fn check_resume(first: &Run, resumed: &Run) {
     assert_eq!(body["messages"].get(), expected, "the resume sends the transcript as stored: {log}");
     assert_eq!(body["tools"].get(), fields(&first.requests[0])["tools"].get(), "the resume sends the same tools: {log}");
     let grown = String::from_utf8_lossy(&resumed.after[kept.len()..]).to_string();
-    assert_eq!(grown, format!("{}\n{}\n", user_line(&resumed.prompt), r#"{"role":"assistant","content":"resumed"}"#), "{log}");
+    let prompt = format!("{},\"effort\":\"default\"}}", user_line(&resumed.prompt).trim_end_matches('}'));
+    assert_eq!(grown, format!("{prompt}\n{}\n", r#"{"role":"assistant","content":"resumed"}"#), "{log}");
 }
 
 /// xorshift64*, seeded per case, so a failure replays from its seed alone.
