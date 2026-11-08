@@ -133,10 +133,18 @@ jobs:
               if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"] and m["target"]["name"] == "cli": print(m["executable"])')
           echo "lib $lib"; echo "cli $cli"
           mkdir -p "$RUNNER_TEMP/out"
-          for i in 1 2 3; do
-            (cd crates/core && strace -f -e trace=setsockopt,bind,listen,connect,getsockname "$lib" --exact client::tests::an_address_that_never_answers_gives_up_before_the_budget 2>&1 | grep -E '127\.0\.0\.1|SO_REUSE|listen\(|test result|panicked|left|right' | grep -v 'ENOENT' | head -n 30) || true
-            echo ---
+          for test in client::tests::an_address_that_never_answers_gives_up_before_the_budget client::tests::unreached_retry_line_counts_unreached_attempts; do
+            failed=0
+            for i in $(seq 30); do
+              (cd crates/core && strace -f -o /dev/null "$lib" --exact "$test" > "$RUNNER_TEMP/traced.log" 2>&1) || { failed=$((failed + 1)); grep -m 1 -A 2 'left:' "$RUNNER_TEMP/traced.log" | cut -c 1-260 || true; }
+            done
+            echo "TRACED ${{ matrix.tree }} $test: $failed of 30 failed"
           done
+          failed=0
+          for i in $(seq 10); do
+            (cd crates/tui && strace -f -o /dev/null "$cli" --exact refused_connection_names_the_host_and_the_cause > "$RUNNER_TEMP/traced.log" 2>&1) || { failed=$((failed + 1)); grep -m 1 'panicked' -A 3 "$RUNNER_TEMP/traced.log" | cut -c 1-260 || true; }
+          done
+          echo "TRACED ${{ matrix.tree }} refused_connection_names_the_host_and_the_cause: $failed of 10 failed"
           for test in client::tests::unreached_retry_line_counts_unreached_attempts client::tests::an_address_that_never_answers_gives_up_before_the_budget; do
             failed=0
             for i in $(seq 300); do
