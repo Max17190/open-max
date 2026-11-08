@@ -564,6 +564,7 @@ mod tests {
         let current = (Some(High), vec![]);
         assert_eq!(client.effort_plan(&history(&["high", "medium"])), current, "the history does not end on the current effort");
         assert_eq!(client.effort_plan(&messages[..1]), current, "no prompt says the effort");
+        assert_eq!(client.effort_plan(&history(&["default", "high", "default", "high"])), current, "a return to the default stays unnamed");
         client.reasoning_effort = None;
         assert_eq!(client.effort_plan(&history(&["high", "default"])), (None, vec![]), "no item names the default");
         client.reasoning_effort = Some(High);
