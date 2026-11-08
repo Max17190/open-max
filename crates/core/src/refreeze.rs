@@ -1525,7 +1525,7 @@ mod tests {
             reasoning_content: None,
             reasoning: None,
             reasoning_details: None,
-            reasoning_origin: None,
+            reasoning_origin: None, effort: None,
         });
 
         // Missing required field `command`: parses as TOML, fails the spec.

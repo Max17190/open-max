@@ -80,7 +80,7 @@ fn assigned(script: &str, name: &str) -> String {
         .to_string()
 }
 
-/// `n` with a comma between each group of three digits, as the README writes
+/// `n` with a comma between each group of three digits, as the docs write
 /// a count.
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
@@ -680,7 +680,7 @@ fn repo_lines() -> Result<&'static str, String> {
 /// lines it saves stay saved. A BASELINE past CEILING does not compile, and
 /// no change grows the core past CEILING, lines the agent loop moves into
 /// other files (agent_loop_stays_under_its_line_ratchet) included.
-/// README.md states the ratchet and CEILING, held here. A count, so every
+/// docs/development.md states the ratchet and CEILING, held here. A count, so every
 /// build asserts it.
 ///
 /// First the script is held to a fixture checkout
@@ -838,7 +838,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
          {core} in this change",
         BASELINE - core
     );
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!(
             "The ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
@@ -849,7 +849,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
         ),
         format!("The core's ratchet is never raised above {}", thousands(CEILING as u64)),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     Ok(())
 }
@@ -866,7 +866,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 /// more raises BASELINE to its new count in its own diff and says why; one
 /// that cuts the loop must lower BASELINE to its new count, so the lines it
 /// cuts stay cut. Lines the loop hands to another file of the core stay
-/// under the core's ratchet. README.md states this ratchet, held here.
+/// under the core's ratchet. docs/development.md states this ratchet, held here.
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     const TARGET: usize = 2_000;
@@ -902,7 +902,7 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
          BASELINE to {lines} in this change",
         BASELINE - lines
     );
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let claim = format!(
         "The agent loop's ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
         thousands(RATCHET as u64),
@@ -910,7 +910,7 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
         thousands(BASELINE as u64),
         thousands(TARGET as u64)
     );
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     Ok(())
 }
 
@@ -935,7 +935,7 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
 /// reported test printed none, so it never runs on a pull request, whose
 /// gate holds only steps that can fail it. A runner reports only
 /// the tests whose targets it does not meet with room, listed in its matrix
-/// entry, held here and named in README.md, so moving a test between the
+/// entry, held here and named in docs/development.md, so moving a test between the
 /// two is a change to this test too: the harness time per tool round on
 /// both runners, and the transcript frame's p99 on macOS. libtest selects
 /// and skips tests by substring, so no other name in a thesis source may
@@ -1065,12 +1065,12 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
         })
         .collect();
     assert_eq!(listed, frames, "a runner's `frames` is not whether it gates a test of the binary's thesis_frames module");
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     assert!(
-        readme.contains(
+        stated.contains(
             "`harness_time_per_tool_round` (target 250 us) on both runners and `transcript_frame_p99_at_100k_lines` (target 0.5 ms) and `transcript_frame_p99_at_1m_lines` (target 0.25 ms) on macOS"
         ),
-        "README.md does not name the thesis tests each runner reports instead of gating"
+        "docs/development.md does not name the thesis tests each runner reports instead of gating"
     );
     // A renamed test would no longer be skipped by the gate step, nor run by
     // the reports step. libtest selects and skips by substring, so a test or
@@ -1688,8 +1688,8 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
 /// and every runner of the job has one. It fails under that floor, offers to
 /// raise that floor when the count is over it, reports the distance to the
 /// 2,000-test target until that is met, and on a platform with no floor
-/// reports the count and passes; the README states both floors and the
-/// target. This test holds the wiring, holds the README to the script, and
+/// reports the count and passes; docs/development.md states both floors and the
+/// target. This test holds the wiring, holds that page to the script, and
 /// holds the script to its method by driving it with a stand-in `uname` and a
 /// stand-in `cargo` whose test binaries list their tests as libtest does: it
 /// counts the lines that end in ": test" (not a benchmark, not the summary),
@@ -1704,12 +1704,12 @@ fn the_test_count_fails_under_its_platform_floor() {
     let (linux, macos) = (floor_of("linux_floor"), floor_of("macos_floor"));
     let target: u64 = assigned(&gate, "target").parse().expect("the target is a count");
     assert_eq!(target, 2000, "the target is 2,000 tests");
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!("fails when there are fewer than {} on Linux, or {} on macOS", thousands(linux), thousands(macos)),
         format!("The target is {} tests", thousands(target)),
     ] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which scripts/check-test-count.sh gates");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which scripts/check-test-count.sh gates");
     }
 
     let job = ci_job("test");
@@ -1823,9 +1823,9 @@ fn the_test_count_fails_under_its_platform_floor() {
 /// script writes as an artifact and builds no Rust, and nothing skips the job
 /// or a step of it, or lets them fail. The share is reported, not gated,
 /// until it meets the target: the script exits 0 whatever the share, so the
-/// job fails only when the script cannot measure. The README states the
+/// job fails only when the script cannot measure. docs/development.md states the
 /// method, the window, the artifact, the target and the gate. This test holds
-/// the wiring and the README to the script, and the script to its method on a
+/// the wiring and that page to the script, and the script to its method on a
 /// history it builds: one row for each first-parent commit, newest first, so
 /// a merge is one commit, its diff against its first parent, and the commits
 /// it brought in are no rows, as for the test merge CI checks out for a pull
@@ -1850,9 +1850,9 @@ fn core_share_reports_the_share_of_commits_that_change_the_core() {
     let count_of = |name: &str| -> u64 { assigned(&method, name).parse().unwrap_or_else(|_| panic!("{name} is not a count")) };
     let (window, target, core) = (count_of("window"), count_of("target"), assigned(&method, "core"));
     assert_eq!((window, target), (50, 20), "the target is at most 20% of the latest 50 commits");
-    // The name CI keeps the CSV under, which the README gives.
+    // The name CI keeps the CSV under, which docs/development.md gives.
     let artifact = "core-share";
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!("of the latest {window} first-parent commits of main whose diff against their first parent changes a file under `{core}`"),
         format!("the share over it and the {} commits before it", window - 1),
@@ -1860,7 +1860,7 @@ fn core_share_reports_the_share_of_commits_that_change_the_core() {
         format!("The target is at most {target}%"),
         "the job reports the share and fails only when the script cannot measure it".to_string(),
     ] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which the script and CI's core-share job hold");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which the script and CI's core-share job hold");
     }
 
     let events = triggers("ci.yml");
@@ -2311,7 +2311,7 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
 /// binary keeps nothing apart across the processes nextest starts, so the
 /// harness-time tests, which thesis_rounds holds apart with a lock for their
 /// CPU-bound timing, reserve every test thread instead. The doc tests, which
-/// nextest does not run, run in a step of their own. README.md states this.
+/// nextest does not run, run in a step of their own. docs/development.md states this.
 #[test]
 fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
     let job = ci_job("test");
@@ -2403,9 +2403,9 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
         rounds.contains("static SERIAL: tokio::sync::Mutex<()>"),
         "thesis_rounds no longer holds its tests apart, the reason they reserve every thread under nextest"
     );
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let claim = "CI's test job runs every test under cargo-nextest, each in a process of its own and none retried (`.config/nextest.toml`)";
-    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(claim), "docs/development.md does not say \"{claim}\", which this test holds");
 }
 
 /// The pull-request gate turns green in under 90 seconds at the median and
@@ -2431,13 +2431,13 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
 /// repository by --repo, else GITHUB_REPOSITORY. It exits 0 whatever it
 /// measures, 1 when it cannot measure (gh fails or prints what the script
 /// does not read, or no run passed), and 2 on a malformed argument or a perl
-/// without its modules. README.md states the method and the target. This
+/// without its modules. docs/development.md states the method and the target. This
 /// test drives the script with a stand-in `gh` serving runs it makes up.
 #[test]
 fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     let gate_script = std::fs::read_to_string(repo().join("scripts/gate-time.sh")).unwrap();
     let default_runs: u64 = assigned(&gate_script, "runs").parse().expect("the default sample is a count");
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         "`scripts/gate-time.sh` (bash, gh and perl) measures the pull-request gate".to_string(),
         format!("the latest {default_runs} pull-request runs of the CI workflow that passed at their first attempt"),
@@ -2446,7 +2446,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
         "The Gate time workflow runs it on every push to main and every night".to_string(),
         "the job reports the times and fails only when the script cannot measure them".to_string(),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which scripts/gate-time.sh and its workflow hold");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which scripts/gate-time.sh and its workflow hold");
     }
     let events = triggers("gate-time.yml");
     let names: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
@@ -2792,7 +2792,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
 /// workspace, with one pinned compiler and at most four concurrent shards.
 /// Runs queue per branch. Each shard first tests the unmutated workspace in
 /// a memory-capped cgroup and preserves outcomes for the final score judge.
-/// The score floor, baseline and margin remain documented in the README;
+/// The score floor, baseline and margin remain documented in docs/development.md;
 /// docs/testing.md also explains targeted local checks with the script's
 /// optional --diff mode. Pull requests and pushes do not trigger full sweeps.
 /// This test holds the wiring and the documents to the files, and holds the
@@ -2831,10 +2831,10 @@ fn a_full_mutation_run_fails_under_its_floor() {
     };
     let percent = |bp: u64| format!("{}.{:02}%", bp / 100, bp % 100);
     let (floor_bp, margin_bp) = (hundredths(&floor), hundredths(&margin));
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let measured = format!("{}, less a margin of {margin} points", percent(floor_bp + margin_bp));
     for claim in [format!("is under {floor}%"), measured, format!("The target is {target}%, and {file_target}% in each file")] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which scripts/check-mutants.sh gates");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which scripts/check-mutants.sh gates");
     }
     let config: toml::Table = std::fs::read_to_string(repo().join(".cargo/mutants.toml")).unwrap().parse().unwrap();
     let (multiplier, minimum) = (config["timeout_multiplier"].as_float().unwrap(), config["minimum_test_timeout"].as_integer().unwrap());
@@ -2847,7 +2847,7 @@ fn a_full_mutation_run_fails_under_its_floor() {
     // over its scored is its score; less the catches that cannot be told from
     // chance, which the floor's basis leaves out, it is the basis, which less
     // the margin is the floor, while the score less the margin is what the
-    // run's report offered; the README gives its count, its score and its
+    // run's report offered; docs/development.md gives its count, its score and its
     // basis; and the documents say how many of the basis's catches a run of
     // unchanged code can lose before it fails.
     let (tested, caught_then, scored_then, score_then) = testing
@@ -2880,7 +2880,7 @@ fn a_full_mutation_run_fails_under_its_floor() {
     }
     let without = format!("That run scored {score_then}%, or {basis}% without the {} catches", thousands(left_out));
     for claim in [format!("{} in the run that set the floor", thousands(tested)), without] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", as docs/testing.md records");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", as docs/testing.md records");
     }
     let header: Vec<&str> = gate.lines().take_while(|line| line.starts_with('#')).map(|line| line.trim_start_matches('#').trim()).collect();
     let lost = kept + 1 - (floor_bp * kept_of).div_ceil(10_000);
@@ -2909,7 +2909,7 @@ fn a_full_mutation_run_fails_under_its_floor() {
     assert!(workflow.contains(concurrency), "full mutation sweeps do not queue per branch: {concurrency}");
     // A listing that fails reads as no mutants unless the pipe fails too.
     assert!(workflow.contains("defaults:\n  run:\n    shell: bash\n"), "the workflow's steps do not run under bash -eo pipefail");
-    // Linux runners, as the README says: the code a run leaves out as not
+    // Linux runners, as docs/development.md says: the code a run leaves out as not
     // built is the code Linux does not compile.
     let runners: Vec<&str> = workflow.lines().filter_map(|line| line.trim().strip_prefix("runs-on: ")).collect();
     assert!(
@@ -3426,7 +3426,7 @@ fn first_frame_holds_its_ratio_to_a_baseline_binary() {
     // holds still under a ratchet with less room (above).
     const LAUNCHES: usize = 21;
     const ASSERTED_LAUNCHES: usize = 61;
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!("under a ratchet of {MACOS_RATCHET:.1} on macOS and {LINUX_RATCHET:.1} on Linux"),
         format!("it times {ASSERTED_LAUNCHES} launches instead of {LAUNCHES}"),
@@ -3437,7 +3437,7 @@ fn first_frame_holds_its_ratio_to_a_baseline_binary() {
         format!("up to {WORK_MEASUREMENTS} measurements in all"),
         format!("The work's target of {} us is not met", WORK_TARGET.as_micros()),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     let Some(baseline) = first_frame::baseline_binary() else { return };
     if !first_frame::alone("first_frame_holds_its_ratio_to_a_baseline_binary") {
@@ -3574,9 +3574,9 @@ fn the_binary_names_only_libsystem_caps_its_imports_and_chains_its_fixups() {
     const DYLD_CHAINED_PTR_64: u16 = 2;
     // The imports a release build binds on Apple silicon (above).
     const IMPORTS: u32 = 183;
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let claim = format!("binds at most {IMPORTS} libSystem imports in a release build on Apple silicon");
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     let path = env!("CARGO_BIN_EXE_openmax");
     let mut file = std::fs::File::open(path).unwrap();
     let mut header = [0u8; 32];
@@ -4253,7 +4253,7 @@ mutating = false
 /// 10, 30, 90, 300 and 600 s, have their p50 at rank 3 and their p90 at rank
 /// 6 (the nearest rank, ceil(q n)): 30 and 600 s, where interpolating would
 /// give 60 and 450 s. It exits 1 for a directory without a usage file and 2
-/// without one directory argument. README.md states the method, held here.
+/// without one directory argument. docs/development.md states the method, held here.
 #[test]
 fn cache_report_measures_recorded_sessions() {
     let fixture = repo().join("crates/tui/tests/fixtures/sessions");
@@ -4286,13 +4286,13 @@ gaps: p50 30 s, p90 600 s over 6 gaps of at most 600 s between consecutive reque
         assert_eq!(code, Some(2), "{args:?}: {printed}");
         assert!(printed.starts_with("usage: "), "{args:?}: {printed}");
     }
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         "the share of prompt tokens served from cache over the sessions with more than 100,000 prompt tokens (target 75%)",
         "the share of sessions that cached no prompt token (target 5%)",
         "a gap over 600 s left out as idle (target p90 90 s)",
     ] {
-        assert!(readme.contains(claim), "README.md does not say \"{claim}\", which scripts/cache-report.sh reports");
+        assert!(stated.contains(claim), "docs/development.md does not say \"{claim}\", which scripts/cache-report.sh reports");
     }
     let _ = std::fs::remove_dir_all(empty);
 }
@@ -5168,19 +5168,19 @@ struct Kill9 {
 /// job, and the watcher, which leads a session of its own, is out of its
 /// reach. The method is `assert_no_orphans_after_kill_9`'s, on a run whose
 /// HOME holds its data directory; this run's listing is the one CI keeps.
-/// README.md states the grace and the bound, held here.
+/// docs/execution.md states the grace and the bound, held here.
 #[cfg(unix)]
 #[test]
 fn zero_orphans_after_kill_9() {
     let kill = Kill9 { home: true, group: true, removed: false };
     assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", kill, Some(ORPHANS_LISTING));
     let (grace, bound) = (open_max_core::execution::LEFT_BEHIND_GRACE.as_millis(), ORPHANS_GONE_WITHIN.as_millis());
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/execution.md")).unwrap();
     for claim in [
         format!("SIGKILL if it is still there {grace} ms later"),
         format!("within {bound} ms of the signal, and none of the three before the {grace} ms grace"),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/execution.md does not say \"{claim}\", which this test holds");
     }
 }
 
@@ -5366,7 +5366,7 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
 /// stop's grace nor its wait for an owner still exiting, which is longer
 /// and, measured from the run's collection, could still read just under its
 /// own length. A debug build asserts 20 times the bound, as the whole suite
-/// runs beside it; each prints the time. README.md states the bound, held
+/// runs beside it; each prints the time. docs/execution.md states the bound, held
 /// here.
 #[cfg(unix)]
 #[test]
@@ -5425,8 +5425,8 @@ fn a_runs_watcher_ends_with_the_run() {
     assert!(named.as_ref().is_some_and(|named| named.starts_with(&line)), "the watcher's command line is {named:?}, not {line}<start>");
     assert!(gone.iter().all(|time| time.is_some_and(|time| time < bound)), "the watcher outlived its run, which exited 0, by {} or more: {gone:?}", ms(bound));
     let claim = format!("which it outlives by less than {} ms in a release build", LEFT_BEHIND_GRACE.as_millis());
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    let stated = std::fs::read_to_string(repo().join("docs/execution.md")).unwrap();
+    assert!(stated.contains(&claim), "docs/execution.md does not say \"{claim}\", which this test holds");
 }
 
 /// One command from a fresh install answers a local endpoint in under a

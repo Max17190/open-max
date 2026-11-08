@@ -441,8 +441,10 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// project and answers. Turn two reads fourteen small files and one of 300
 /// lines, which takes the transcript past the window's budget, so the harness
 /// compacts, with its summary request, and the turn answers. Turn three runs
-/// in a new `Core`, as a resume in a new process does: four reads and an
-/// answer. Every reply carries reasoning, as a reasoning model's does. A
+/// in a new `Core`, as a resume in a new process does, at a reasoning effort
+/// the user chose since: four reads and an answer. The Responses and native
+/// Messages sessions run a model that takes an effort change inside the
+/// conversation. Every reply carries reasoning, as a reasoning model's does. A
 /// request's prompt is the raw wire bytes of what a prompt cache keys on, in
 /// the order the provider renders them: the tools and the system prompt (on
 /// Responses the instructions first, as its `input` sends them, and on the
@@ -462,15 +464,21 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// whose history the prune rewrote, so that it repeats only the frozen prefix
 /// and the opening the prune keeps. Every other request repeats every byte
 /// the request before it sent, and every request after the first but the
-/// summary shares its whole frozen prefix with an earlier one. The share holds the 75% target and a ratchet, the
+/// summary shares its whole frozen prefix with an earlier one; on native
+/// Messages each request from the rewritten one on replays the thinking of
+/// every reply since. The share holds the 75% target and a ratchet, the
 /// share measured when the ratchet was set less half a point, rounded down to
-/// a tenth; README.md states the ratchet and the session's length, held here.
+/// a tenth; docs/development.md states the ratchet and the session's length, held here.
 /// Measured on this tree, when the ratchets were set: 85.51% (167,050 of
 /// 195,365 prompt tokens) on Chat Completions, 85.51% (168,222 of 196,730) on
 /// Responses and 84.34% (70,531 of 83,630) on native Messages. A byte count,
 /// so it holds in debug and release alike. Once the note was stored where it
 /// changes rather than sent after the history, they were 86.66%, 86.69% and
-/// 87.15%.
+/// 87.15%. With the effort change sent at the top of each request, which
+/// both providers render ahead of the history, request 22 repeated none of
+/// request 21 on Responses and only its tools and system prompt on native
+/// Messages: 81.57% and 84.33%; sent with the prompt it was chosen for,
+/// 86.69% and 87.15%.
 ///
 /// Where a provider's cache ends its entries at message or block boundaries
 /// rather than at any byte, the Responses and native Messages twins also
@@ -483,12 +491,13 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// share: every request but the two the compaction makes reads back the
 /// entry the request before it wrote, when that one was long enough to write
 /// one, and the share holds the 75% target and its ratchet, set as above;
-/// README.md states it. With the note at the end of the last message, the
+/// docs/development.md states it. With the note at the end of the last message, the
 /// Responses share was 0.00%; measured when its ratchet was set, 84.74%
 /// (166,870 of 196,910 prompt tokens). With no block marked, the native
 /// Messages share was 0.00%; measured when its ratchet was set, 82.81%
 /// (69,363 of 83,762). Once the note was stored where it changes, the two
-/// read back 85.91% and 86.26%.
+/// read back 85.91% and 86.26%; across the effort change sent at the top of
+/// each request, 80.79% and 83.05%, and sent as history, 85.91% and 86.26%.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_prompt_is_75_percent_cacheable() {
     cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0, None).await;
@@ -603,14 +612,17 @@ fn implicit_breakpoints(input: &str) -> (Vec<usize>, Vec<usize>) {
 /// Anthropic's prompt caching on native Messages: a request writes an entry
 /// through each block it marks, and each mark looks for one at the ends of
 /// the 20 blocks that end at it. Its tools, system blocks and content blocks
-/// are blocks; offsets are into the prompt without its marks. `body` is the
-/// request as sent.
+/// are blocks, its `output_config` none, rendered between the system blocks
+/// and the messages; offsets are into the prompt without its marks. `body`
+/// is the request as sent.
 fn marked_breakpoints(body: &str) -> (Vec<usize>, Vec<usize>) {
     let fields = serde_json::from_str::<BTreeMap<String, &RawValue>>(body).unwrap();
     let (mut blocks, mut base) = (Vec::new(), 0);
-    for key in ["tools", "system", "messages"] {
+    for key in ["tools", "system", "output_config", "messages"] {
         let Some(part) = fields.get(key).map(|part| part.get()) else { continue };
-        let units: Vec<(usize, &str)> = if key == "messages" {
+        let units: Vec<(usize, &str)> = if key == "output_config" {
+            Vec::new()
+        } else if key == "messages" {
             element_ends(part, part)
                 .into_iter()
                 .flat_map(|(_, message)| {
@@ -639,9 +651,13 @@ impl Prompt {
     /// `body`'s prompt on `wire`. Chat Completions renders `tools` ahead of
     /// the messages (OpenAI's prompt caching guide: tools, then the developer
     /// message, then the history); a Responses `input` holds all three, its
-    /// opening run of developer items being the instructions and the tools;
+    /// opening run of developer items being the instructions and the tools,
+    /// after the request's `reasoning`, which can rewrite the hidden
+    /// instructions OpenAI renders ahead of all of it (the same guide);
     /// native Messages caches `tools`, then `system`, then `messages`
-    /// (Anthropic's), and its breakpoint marks are left out.
+    /// (Anthropic's), with `output_config` ahead of the messages, since an
+    /// effort change invalidates their cache (its invalidation hierarchy),
+    /// and its breakpoint marks are left out.
     fn of(wire: WireApi, marked: &str) -> Self {
         let body = MARKS.iter().fold(marked.to_string(), |body, mark| body.replace(mark, ""));
         let fields = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(&body).unwrap();
@@ -654,23 +670,28 @@ impl Prompt {
                 (vec![tools, messages], frozen)
             }
             WireApi::Responses => {
-                let input = raw("input");
-                let frozen = items(&input)
-                    .iter()
-                    .take_while(|item| serde_json::from_str::<serde_json::Value>(item.get()).unwrap()["role"] == "developer")
-                    .map(|item| item.get().len() + 1)
-                    .sum();
-                (vec![input], frozen)
+                let (reasoning, input) = (raw("reasoning"), raw("input"));
+                let frozen = reasoning.len()
+                    + items(&input)
+                        .iter()
+                        .take_while(|item| serde_json::from_str::<serde_json::Value>(item.get()).unwrap()["role"] == "developer")
+                        .map(|item| item.get().len() + 1)
+                        .sum::<usize>();
+                (vec![reasoning, input], frozen)
             }
             WireApi::Anthropic => {
                 let (tools, system, messages) = (raw("tools"), raw("system"), raw("messages"));
                 let frozen = tools.len() + system.len();
-                (vec![tools, system, messages], frozen)
+                (vec![tools, system, raw("output_config"), messages], frozen)
             }
         };
         let (writes, lookups) = match wire {
             WireApi::ChatCompletions => (Vec::new(), Vec::new()),
-            WireApi::Responses => implicit_breakpoints(&parts[0]),
+            WireApi::Responses => {
+                let shift = |ends: Vec<usize>| ends.into_iter().map(|end| parts[0].len() + end).collect();
+                let (writes, lookups) = implicit_breakpoints(&parts[1]);
+                (shift(writes), shift(lookups))
+            }
             WireApi::Anthropic => marked_breakpoints(marked),
         };
         let text = parts.concat();
@@ -833,12 +854,21 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         _ => recording_endpoint(script).await,
     };
     std::fs::create_dir_all(&data).unwrap();
-    std::fs::write(
-        data.join("settings.json"),
-        json!({ "provider": "fixture", "model": "scripted", "approval_mode": "ask", "context_tokens": 16384, "max_tokens": 1024 })
-            .to_string(),
-    )
-    .unwrap();
+    // A model of each wire's that takes an effort change inside the
+    // conversation (`providers::EFFORT_UPDATES`); Chat Completions has none.
+    let model = match wire {
+        WireApi::ChatCompletions => "scripted",
+        WireApi::Responses => "gpt-6.1-sol",
+        WireApi::Anthropic => "claude-opus-5-5",
+    };
+    let settings = |effort: Option<&str>| {
+        let mut settings = json!({ "provider": "fixture", "model": model, "approval_mode": "ask", "context_tokens": 16384, "max_tokens": 1024 });
+        if let Some(effort) = effort {
+            settings["reasoning_effort"] = json!(effort);
+        }
+        std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
+    };
+    settings(None);
     std::fs::write(
         data.join("providers.json"),
         json!({ "providers": { "fixture": { "base_url": base_url, "wire_api": wire } } }).to_string(),
@@ -861,7 +891,9 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         close(&core, &id).await;
         id
     };
-    // A new process resumes the session from its files.
+    // A new process resumes the session from its files, at an effort the
+    // user chose since.
+    settings(Some("high"));
     let (core, mut rx) = Core::new(data).unwrap();
     events.extend(drive_turn(&core, &mut rx, &id, &project, "read four of them again").await);
     let ends: Vec<bool> = events
@@ -942,6 +974,13 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         rewritten + 1,
         per_request()
     );
+    // On native Messages each request from the one the prune rewrote on
+    // replays the thinking of every reply since, across the effort change:
+    // a block goes back only while the history its reply answered holds.
+    if wire == WireApi::Anthropic {
+        let replayed: Vec<usize> = bodies[rewritten..].iter().map(|body| body.matches(r#""type":"thinking""#).count()).collect();
+        assert_eq!(replayed, (0..replayed.len()).collect::<Vec<_>>(), "thinking replayed from request {}", rewritten + 1);
+    }
     let cold: Vec<usize> = (1..prompts.len()).filter(|&i| cacheable[i] < prompts[i].frozen).map(|i| i + 1).collect();
     assert_eq!(cold, [SUMMARY + 1], "only the compaction's summary starts cold after the first request:\n{}", per_request());
 
@@ -958,7 +997,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     );
     assert!(share >= ratchet, "the cacheable share {share:.2}% fell under its {ratchet:.1}% ratchet:\n{}", per_request());
     assert!(share >= TARGET_PERCENT, "the cacheable share {share:.2}% is under the {TARGET_PERCENT}% target");
-    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/development.md")).unwrap();
     let mut claims = vec![format!("{ratchet:.1}% ({name})"), format!("drives one {}-request session", prompts.len())];
     // A modeled rule's share reports until a ratchet holds it.
     let billed_share = 100.0 * tokens(&billed) as f64 / sent as f64;
@@ -991,7 +1030,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         claims.push(format!("{billed_ratchet:.1}% billed ({name})"));
     }
     for claim in claims {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1009,7 +1048,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
 /// earlier request's bytes could serve, where a provider's rule is modeled
 /// the share it bills as cached (as `a_session_prompt_is_75_percent_cacheable`
 /// models it), and on native Messages the thinking blocks replayed of those
-/// a request could replay; README.md states the design, held here. Sent
+/// a request could replay; docs/design.md states the design, held here. Sent
 /// after the history of each request and dropped by the next, the note left
 /// every request after the second short of repeating the one before it,
 /// native Messages replaying 8 of 36 thinking blocks, and 74.62%
@@ -1122,7 +1161,7 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
         .collect();
     let dropped: Vec<usize> =
         (0..prompts.len()).filter(|&i| wire == WireApi::Anthropic && replayed[i] < i).map(|i| i + 1).collect();
-    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/design.md")).unwrap();
     let claim = "rides a note stored once, where it changes";
     close(&core, &id).await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -1131,7 +1170,7 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
         (!unread.is_empty()).then(|| format!("requests {unread:?} read back no entry the request before them wrote")),
         (copies != 2).then(|| format!("the last request carries {copies} notes, not each of the two once")),
         (!dropped.is_empty()).then(|| format!("requests {dropped:?} replay the thinking of fewer replies than came before them")),
-        (!readme.contains(claim)).then(|| format!("README.md does not say \"{claim}\", which this test holds")),
+        (!stated.contains(claim)).then(|| format!("docs/design.md does not say \"{claim}\", which this test holds")),
     ]
     .into_iter()
     .flatten()
@@ -1431,7 +1470,7 @@ fn reference_machine() -> bool {
 /// ratchet on it 10% over 2.88, its highest with no other work on the same
 /// cores, rounded up to a tenth; elsewhere, CI's runners included, it prints
 /// the ratio. A debug build asserts a 20x sanity bound on the median.
-/// The test holds the README's statements of the target and the ratchet.
+/// The test holds the statements in docs/development.md of the target and the ratchet.
 #[test]
 fn a_hundred_extensions_load_in_under_10_ms() {
     use open_max_core::config::ApprovalMode;
@@ -1617,7 +1656,7 @@ fn a_hundred_extensions_load_in_under_10_ms() {
             "a load of 100 extensions took {ratio:.2} times the time to read their files ({total:?} over {read:?}), over its ratchet of {ratchet:.1}"
         );
     }
-    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/development.md")).unwrap();
     for claim in [
         format!("Parsing and registering 100 extensions takes under {} ms", TARGET.as_millis()),
         format!(
@@ -1626,7 +1665,7 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         ),
         "Elsewhere, CI's runners included, a release build prints the ratio, whose scale is the machine's own.".to_string(),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

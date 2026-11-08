@@ -85,6 +85,10 @@ pub struct ChatMessage {
     /// made. Without a stamp they go back nowhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_origin: Option<String>,
+    /// On a turn's prompt only, the effort (`default` or a level) and route
+    /// (`ChatClient::origin`) it ran at, for `ChatClient::effort_plan`. Never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl ChatMessage {
@@ -104,7 +108,7 @@ impl ChatMessage {
     /// Every constructor starts without reasoning: only the agent loop
     /// attaches it, from a reply, together with its origin.
     fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
-        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None }
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None }
     }
 
     /// Rough size estimate used for context budgeting, plus a small constant

@@ -8,15 +8,12 @@ pub(super) fn serialize(
     messages: &[ChatMessage],
     tools: &str,
 ) -> Result<Vec<u8>, String> {
-    let origin = client.origin();
+    let (origin, (effort, changes)) = (client.origin(), client.effort_plan(messages));
     let schemas: Vec<Value> = serde_json::from_str(tools).map_err(|_| "invalid frozen tools")?;
     let mut functions = Vec::new();
     for schema in schemas {
         let function = &schema["function"];
-        let name = function["name"]
-            .as_str()
-            .filter(|name| valid_name(name))
-            .ok_or("invalid Messages tool name")?;
+        let name = function["name"].as_str().filter(|name| valid_name(name)).ok_or("invalid Messages tool name")?;
         if !function["parameters"].is_object() {
             return Err("invalid Messages tool schema".into());
         }
@@ -31,14 +28,14 @@ pub(super) fn serialize(
         .map(|text| json!({"type":"text","text":text})).collect();
     let mut prefix = prefix_seed(&json!(system), &json!(functions));
     let mut input: Vec<Value> = Vec::new();
-    for message in messages {
+    for (i, message) in messages.iter().enumerate() {
         let text = message.content.clone().unwrap_or_default();
         if message.role == "system" { continue; }
-        let role = if message.role == "tool" {
-            "user"
-        } else {
-            &message.role
-        };
+        if let Some((_, level)) = changes.iter().find(|(at, _)| *at == i) {
+            if let Some(last) = input.last() { hash_message(&mut prefix, last); }
+            input.push(json!({"role":"system","content":[],"output_config":{"effort":level}}));
+        }
+        let role = if message.role == "tool" { "user" } else { &message.role };
         if !matches!(role, "user" | "assistant") {
             return Err("unsupported Messages role".into());
         }
@@ -60,11 +57,7 @@ pub(super) fn serialize(
         }
         if blocks.is_empty() {
             if message.role == "tool" {
-                let id = message
-                    .tool_call_id
-                    .as_deref()
-                    .filter(|id| !id.is_empty())
-                    .ok_or("Messages tool result lacks call ID")?;
+                let id = message.tool_call_id.as_deref().filter(|id| !id.is_empty()).ok_or("Messages tool result lacks call ID")?;
                 blocks.push(json!({"type":"tool_result","tool_use_id":id,"content":text}));
             } else {
                 if !text.is_empty() {
@@ -84,10 +77,7 @@ pub(super) fn serialize(
         }
         if !blocks.is_empty() {
             if role == "user" && input.last().is_some_and(|m| m["role"] == role) {
-                input.last_mut().unwrap()["content"]
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(blocks);
+                input.last_mut().unwrap()["content"].as_array_mut().unwrap().extend(blocks);
             } else {
                 if let Some(last) = input.last() { hash_message(&mut prefix, last); }
                 input.push(json!({"role":role,"content":blocks}));
@@ -115,7 +105,7 @@ pub(super) fn serialize(
     if let Some(temperature) = client.temperature {
         body["temperature"] = json!(temperature);
     }
-    if let Some(effort) = client.reasoning_effort {
+    if let Some(effort) = effort {
         body["output_config"] = json!({"effort":effort});
     }
     serde_json::to_vec(&body).map_err(|_| "cannot serialize Messages request".into())
@@ -168,11 +158,7 @@ fn visible_matches(blocks: &[Value], message: &ChatMessage) -> bool {
 }
 
 fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    !name.is_empty() && name.len() <= 128 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn validate_blocks(blocks: &[Value]) -> Result<(), String> {
@@ -186,9 +172,7 @@ fn validate_blocks(blocks: &[Value]) -> Result<(), String> {
             }
             Some("redacted_thinking") => block["data"].as_str().is_some_and(|s| !s.is_empty()),
             Some("tool_use") => {
-                block["id"]
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty() && ids.insert(id))
+                block["id"].as_str().is_some_and(|id| !id.is_empty() && ids.insert(id))
                     && block["name"].as_str().is_some_and(valid_name)
                     && block["input"].is_object()
             }
@@ -235,13 +219,8 @@ fn complete(blocks: Vec<Value>, reason: &str, usage: Value) -> Result<Completion
     if reason != "tool_use" && !reply.tool_calls.is_empty() {
         return Err("Messages returned tool calls without a tool-use stop".into());
     }
-    if blocks
-        .iter()
-        .any(|b| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")))
-    {
-        reply.reasoning_details = Some(
-            serde_json::value::to_raw_value(&blocks).map_err(|_| "invalid Messages reasoning")?,
-        );
+    if blocks.iter().any(|b| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking"))) {
+        reply.reasoning_details = Some(serde_json::value::to_raw_value(&blocks).map_err(|_| "invalid Messages reasoning")?);
     }
     reply.usage = parse_usage(&usage);
     Ok(reply)
@@ -261,34 +240,18 @@ pub(super) async fn read(
 ) -> (CompletionResult, Option<Unfinished>) {
     let mut reply = cancelled_response();
     reply.finish_reason = TRUNCATED.into();
-    let request_id = resp
-        .headers()
-        .get("request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let failed = |message: String| {
-        Some(Unfinished::Failed(ServerFailure {
-            message,
-            retryable: false,
-        }))
-    };
+    let request_id = resp.headers().get("request-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let failed = |message: String| Some(Unfinished::Failed(ServerFailure { message, retryable: false }));
     let failure = |error: &Value| {
         let api_error = error["type"] == "api_error";
         let mut error = server_failure(error, &error.to_string());
         error.retryable |= api_error;
         if let Some(id) = &request_id {
-            error
-                .message
-                .push_str(&format!(" (request ID: {})", truncate(id, 120)));
+            error.message.push_str(&format!(" (request ID: {})", truncate(id, 120)));
         }
         Some(Unfinished::Failed(error))
     };
-    if resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("application/json"))
-    {
+    if resp.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("application/json")) {
         return match read_body(resp, cancelled, idle).await {
             Ok(None) => (cancelled_response(), None),
             Err(error) => (reply, failed(error)),
@@ -303,16 +266,8 @@ pub(super) async fn read(
                 if value["type"] != "message" || value["role"] != "assistant" {
                     return (reply, failed("invalid Messages response envelope".into()));
                 }
-                let result = value["content"]
-                    .as_array()
-                    .ok_or_else(|| "Messages response lacks content".into())
-                    .and_then(|blocks| {
-                        complete(
-                            blocks.clone(),
-                            value["stop_reason"].as_str().unwrap_or(""),
-                            value["usage"].clone(),
-                        )
-                    });
+                let result = value["content"].as_array().ok_or_else(|| "Messages response lacks content".into())
+                    .and_then(|blocks| complete(blocks.clone(), value["stop_reason"].as_str().unwrap_or(""), value["usage"].clone()));
                 match result {
                     Ok(done) => {
                         if !done.content.is_empty() {
@@ -426,14 +381,8 @@ pub(super) async fn read(
                         });
                     }
                     Some("content_block_delta" | "content_block_stop") => {
-                        let index = event["index"]
-                            .as_u64()
-                            .and_then(|n| usize::try_from(n).ok())
-                            .ok_or("invalid Messages block index")?;
-                        let block = blocks
-                            .get_mut(index)
-                            .filter(|b| !b.closed)
-                            .ok_or("Messages delta for absent or closed block")?;
+                        let index = event["index"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or("invalid Messages block index")?;
+                        let block = blocks.get_mut(index).filter(|b| !b.closed).ok_or("Messages delta for absent or closed block")?;
                         if event["type"] == "content_block_stop" {
                             if block.value["type"] == "tool_use" && !block.arguments.is_empty() {
                                 block.value["input"] = serde_json::from_str(&block.arguments)

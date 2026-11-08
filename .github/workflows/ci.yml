@@ -186,7 +186,7 @@ jobs:
         # The thesis tests a runner does not gate, as it does not meet their
         # targets with room: the gate step skips them, and the Reports
         # workflow, whose matrix lists the same tests, measures them every
-        # night instead. README.md names them too.
+        # night instead. docs/development.md names them too.
         # `frames` is whether the runner gates a test of the binary's
         # thesis_frames module. Those tests live in the binary's own
         # unit-test harness, which the release profile links as one more
