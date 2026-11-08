@@ -891,19 +891,22 @@ fn on_the_shell<E>(
 }
 
 /// Run setup with the shell's screen, then resume the same application on every
-/// nonfatal outcome. The caller stops terminal input before handing it over.
+/// nonfatal outcome. Setup reads its keys from `keys`, the session's reader.
 async fn setup_on_shell(
     terminal: &mut ui::transcript::Term,
     dir: &std::path::Path,
     action: setup::Action,
     target: Option<&str>,
+    keys: &mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
 ) -> std::io::Result<Result<(), String>> {
     restore_terminal();
-    let result = setup::run(dir, action, target).await;
+    let keys = futures_util::stream::poll_fn(|cx| keys.poll_recv(cx).map(|key| key.map(Ok)));
+    let result = setup::run(dir, action, target, Some(Box::new(keys))).await;
     enter_terminal()?;
     *terminal = frame_terminal()?;
     start_input();
     signal_keys(false);
+    enable_keyboard_enhancement();
     Ok(result)
 }
 
@@ -919,7 +922,7 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         let quit = watch_quit_signals(false);
         let dir = default_data_dir();
         let result = tokio::select! {
-            result = Box::pin(setup::run(&dir, action, target)) => Some(result),
+            result = Box::pin(setup::run(&dir, action, target, None)) => Some(result),
             _ = quit.notified() => None,
         };
         open_max_core::chatgpt::finish_refreshes().await;
@@ -1623,9 +1626,11 @@ fn enable_mode(mode: u8, command: impl crossterm::Command) {
 /// on the terminal's answer: a network round trip over ssh, and crossterm's
 /// full 2 s timeout on a terminal that never answers. So the event loop runs
 /// this on the blocking pool once its first frame is out, and before it
-/// starts reading input, which would otherwise take the answer itself.
+/// starts reading input, which would otherwise take the answer itself. Asked
+/// once a run: setup hands the same terminal back to a reader still reading.
 fn enable_keyboard_enhancement() {
-    if !crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+    static SPEAKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*SPEAKS.get_or_init(|| crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)) {
         return;
     }
     // Under the stdout lock, which `restore_terminal` holds while it claims
