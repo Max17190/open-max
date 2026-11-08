@@ -72,6 +72,14 @@ fn lines_text(lines: &[Line<'_>]) -> Vec<String> {
     lines.iter().map(line_text).collect()
 }
 
+/// The tokens a second `text` reports before " tok/s". The rate is measured
+/// against the clock, so a test holds it to a range, not a figure: a pause
+/// of the test thread lowers it.
+fn rate(text: &str) -> f64 {
+    let head = &text[..text.find(" tok/s").expect("a rate")];
+    head[head.rfind(' ').unwrap() + 1..].parse().unwrap()
+}
+
 /// Five blocks, prompts at 0, 2 and 4.
 fn conversation(app: &mut App) {
     for turn in 1..=3 {
@@ -617,6 +625,9 @@ fn the_running_line_reports_rate_and_thinking_only_when_there_is_some() {
     let (mut app, dir) = app_fixture();
     app.running = true;
     app.turn_started = Some(Instant::now());
+    // A first token still ahead of now has no time behind it, so no rate,
+    // however long the test thread pauses.
+    app.first_token = Some(Instant::now() + Duration::from_secs(3_600));
     let running_row = |app: &mut App| {
         let (rows, _) = frame(app, 100, 20);
         rows.into_iter().find(|row| row.contains("esc to cancel")).unwrap()
@@ -633,7 +644,7 @@ fn the_running_line_reports_rate_and_thinking_only_when_there_is_some() {
     app.on_agent_event(AgentEvent::Token { text: "x".repeat(797) });
     app.dirty = Dirty::all();
     let row = running_row(&mut app);
-    assert!(row.contains("· 100 tok/s"), "{row}");
+    assert!((50.0..=100.0).contains(&rate(&row)), "{row}");
     assert!(!row.contains("thinking"), "the answer streaming replaces the thinking label: {row}");
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -749,9 +760,15 @@ fn a_finished_turn_records_its_time_and_rate_only_when_long_enough() {
         let _ = std::fs::remove_dir_all(dir);
         text
     };
-    assert!(!stats(4, 0, None).contains('◦'), "a short turn leaves no record");
-    assert!(stats(5, 0, None).trim_end().ends_with("> ◦ 5s"));
-    assert!(stats(6, 800, Some(2)).trim_end().ends_with("> ◦ 6s · 100 tok/s"));
+    // The record reads the clock too: a pause of the test thread can only
+    // lengthen the turn and lower its rate.
+    assert!(!stats(0, 0, None).contains('◦'), "a short turn leaves no record");
+    let five = stats(5, 0, None);
+    let record = five.trim_end().rsplit("> ◦ ").next().unwrap();
+    assert!(record.ends_with('s') && record[..record.len() - 1].parse::<u64>().unwrap() >= 5, "{five}");
+    let six = stats(6, 800, Some(2));
+    let record = six.trim_end().rsplit("> ◦ ").next().unwrap();
+    assert!(record.contains("s · ") && (50.0..=100.0).contains(&rate(record)), "{six}");
 }
 
 #[tokio::test]
@@ -1022,9 +1039,14 @@ async fn a_streamed_tail_paints_what_one_fresh_frame_paints() {
         Step::ToggleThinking,
         token(" after a tool."),
     ];
+    // Both apps show no elapsed time and no rate: those read the clock, and
+    // the live app's first token is older than each fresh app's. A first
+    // token still ahead of now reads as no time elapsed at all.
+    let ahead = Instant::now() + Duration::from_secs(3_600);
     let start = |app: &mut App| {
         app.running = true;
         app.turn_started = None;
+        app.first_token = Some(ahead);
     };
     let (mut live, dir) = app_fixture();
     start(&mut live);
