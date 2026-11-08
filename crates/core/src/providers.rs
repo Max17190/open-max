@@ -867,21 +867,11 @@ pub(crate) fn expand_secret(raw: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// The headers to send: each named one whose value expands (`expand_secret`
+/// never yields an empty one), so a header whose secret env is unset is
+/// skipped rather than sent empty.
 pub fn expand_headers(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
-    map.iter()
-        .filter_map(|(k, v)| {
-            let key = k.trim();
-            if key.is_empty() {
-                return None;
-            }
-            // Skip headers whose secret env is unset rather than sending empty values.
-            let val = expand_secret(v)?;
-            if val.is_empty() {
-                return None;
-            }
-            Some((key.to_string(), val))
-        })
-        .collect()
+    map.iter().filter(|(k, _)| !k.trim().is_empty()).filter_map(|(k, v)| Some((k.trim().to_string(), expand_secret(v)?))).collect()
 }
 
 #[cfg(test)]
