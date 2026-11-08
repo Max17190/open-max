@@ -1,0 +1,58 @@
+name: Suite time A/B
+
+# Temporary: compares the suite time check before and after this branch on
+# one runner, interleaved. Removed before review.
+on:
+  push:
+    branches: [test/suite-time-runs-timing-tests-alone]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      - name: Build the tests
+        run: cargo test --workspace --locked --no-run
+
+      - name: Before and after, interleaved
+        timeout-minutes: 30
+        run: |
+          git fetch --depth=1 origin main
+          mkdir -p "$GITHUB_WORKSPACE/ab-before"
+          git show FETCH_HEAD:scripts/check-suite-time.sh > "$GITHUB_WORKSPACE/ab-before/check-suite-time.sh"
+          chmod +x "$GITHUB_WORKSPACE/ab-before/check-suite-time.sh"
+          mkdir -p "$RUNNER_TEMP/ab"
+          for i in $(seq 12); do
+            for v in before after; do
+              script=scripts/check-suite-time.sh
+              [ "$v" = after ] || script=ab-before/check-suite-time.sh
+              load=$(cut -d ' ' -f 1 /proc/loadavg)
+              code=0
+              env -u GITHUB_ACTIONS "$script" 3 > "$RUNNER_TEMP/ab/$v-$i.log" 2>&1 || code=$?
+              took=$(grep -oE 'the test suite took [0-9.]+s' "$RUNNER_TEMP/ab/$v-$i.log" | grep -oE '[0-9.]+s' || echo none)
+              alone=$(grep -c 'failed beside the other binaries and passed alone' "$RUNNER_TEMP/ab/$v-$i.log" || true)
+              names=$(grep -oE "^thread '[^']+'" "$RUNNER_TEMP/ab/$v-$i.log" | sort -u | tr '\n' ' ' || true)
+              echo "AB $v $i exit=$code took=$took retried=$alone load=$load $names"
+            done
+          done
+          for f in "$RUNNER_TEMP"/ab/after-1.log "$RUNNER_TEMP"/ab/before-1.log; do echo "== $f"; cat "$f"; done
