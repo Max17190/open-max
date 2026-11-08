@@ -562,11 +562,10 @@ impl Run {
 
 /// The exit code the documented table gives for these events: 4 when the
 /// turn stopped short, which wins over an earlier error line; else 1 for a
-/// failed turn or any error line; else 0, a finish_reason the harness does
-/// not name (such as `length`) included.
+/// failed turn or any error line; else 0.
 fn code_from_events(events: &[Value]) -> i32 {
     let stop = events.iter().rev().find(|e| e["type"] == "done").and_then(|e| e["stop_reason"].as_str()).unwrap_or("");
-    if matches!(stop, "max_iterations" | "budget_exhausted" | "unverified") {
+    if matches!(stop, "length" | "max_iterations" | "budget_exhausted" | "unverified") {
         4
     } else if stop == "error" || events.iter().any(|e| e["type"] == "error") {
         1
@@ -1572,7 +1571,7 @@ fn a_finish_reason_without_done_and_done_without_a_finish_reason_both_finish_the
                 let env = Env::new(tag, tag, script);
                 let run = env.first("go");
                 let log = run.log();
-                assert_eq!(run.code, Some(0), "{log}");
+                assert_eq!(run.code, Some(if stop == "length" { 4 } else { 0 }), "{log}");
                 assert_eq!(run.stop_reason(), stop, "{log}");
                 assert_eq!(run.count("retry"), 0, "{log}");
                 assert_eq!(env.ran_log(), ran, "{log}");
@@ -2146,6 +2145,33 @@ fn a_truncated_first_prompt_skips_the_prompts_after_it() {
     assert_eq!(run.stop_reason(), "truncated", "{log}");
     assert_eq!(run.requests.len(), 1, "{log}");
     assert!(!run.messages().iter().any(|m| m.content.as_deref() == Some("second")), "{log}");
+}
+
+#[test]
+fn a_reply_cut_by_the_provider_exits_four_and_skips_later_prompts() {
+    let usage = data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":32}}));
+    for (reason, code, turns) in [("length", 4, 1), ("stop", 0, 2)] {
+        let reply = format!("{}{}{usage}{DONE}", content("first answer"), finish(reason));
+        let env = Env::with_settings(
+            reason,
+            reason,
+            vec![Step::Finished(reply), Step::Finished(sse_text("second answer"))],
+            r#","max_tokens":32"#,
+        );
+        let run = env.run(&["--trust-project"], &["first", "second"], &[], &env.ctx);
+        let log = run.log();
+        assert_eq!(run.code, Some(code), "{log}");
+        assert_eq!(run.requests.len(), turns, "{log}");
+        assert_eq!(serde_json::from_str::<Value>(&run.requests[0]).unwrap()["max_tokens"], 32, "{log}");
+        assert_eq!(run.of("usage").next().unwrap()["completion_tokens"], 32, "{log}");
+        assert_eq!(run.count("done"), turns, "{log}");
+        assert_eq!(run.of("done").next().unwrap()["stop_reason"], reason, "{log}");
+        assert_eq!(
+            run.messages().iter().any(|m| m.role == "user" && m.content.as_deref() == Some("second")),
+            turns == 2,
+            "{log}",
+        );
+    }
 }
 
 /// The iteration cap stops a turn with every call it ran answered, and exits
