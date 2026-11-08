@@ -417,6 +417,8 @@ async fn run_compact(
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    let origin = client.origin();
+    let (ratio_origin, estimate) = client.message_estimator(&origin);
     let (messages, registry, take_seq, prompt_ratio) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
@@ -428,7 +430,7 @@ async fn run_compact(
             return Err("a turn is in flight; run /compact after it finishes".into());
         }
         let registry = data.registry.clone();
-        let prompt_ratio = route_ratio(data.prompt_ratio.as_ref(), &client.origin());
+        let prompt_ratio = route_ratio(data.prompt_ratio.as_ref(), &ratio_origin);
         let (messages, seq) = take_messages(data);
         (messages, registry, seq, prompt_ratio)
     };
@@ -446,7 +448,7 @@ async fn run_compact(
     let trigger = requested_trigger(endpoint.compaction_tokens, prompt_ratio, budget);
     let trigger = if schemas_exceed_budget(trigger, schema_tokens) { budget } else { trigger };
     let tokens_before =
-        schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>();
     if schemas_exceed_budget(trigger, schema_tokens) {
         guard.commit().await;
         return Err(
@@ -468,7 +470,7 @@ async fn run_compact(
         });
     }
     let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-    let ctx = CompactionCtx { core, session_id, project_root, client: &client, hooks: &hooks, cancelled };
+    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
     let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, schema_tokens, true, &mut spend).await {
         Ok(count) => count,
@@ -478,7 +480,7 @@ async fn run_compact(
         }
     };
     let tokens_after =
-        schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+        schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>();
     sessions::touch(core, session_id);
     guard.commit().await;
     Ok(CompactReceipt {
@@ -743,9 +745,10 @@ async fn run_loop(
     // with what the earlier requests on this route taught, a request the
     // provider refused for length included (see `refusal_ratio`).
     let origin = client.origin();
+    let (ratio_origin, estimate) = client.message_estimator(&origin);
     let mut prompt_ratio = route_ratio(
         core.sessions.lock().await.get(session_id).and_then(|d| d.prompt_ratio.as_ref()),
-        &origin,
+        &ratio_origin,
     );
     let max_iterations = settings.max_agent_iterations.max(1);
     let mut repeats = RepeatTracker::default();
@@ -777,10 +780,10 @@ async fn run_loop(
                 .await;
         }
         let trigger = compaction_trigger(
-            budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(),
+            budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(), &estimate,
         );
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, hooks: &hooks, cancelled: &cancelled,
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled,
         };
         if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, schema_tokens, false, &mut spend).await {
             core.send_agent(session_id, AgentEvent::Error { message });
@@ -788,7 +791,7 @@ async fn run_loop(
             break 'turns;
         }
         let used = schema_tokens
-            + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
+            + guard.messages().iter().map(&estimate).sum::<usize>();
         let used_real = to_real(used, factor);
         // The ceiling refuses the request it cannot afford, not just the one
         // after it: what the turn has spent plus the request-side size of the
@@ -825,7 +828,7 @@ async fn run_loop(
                     .or(prompt_ratio.filter(|&ratio| ratio >= 1.0));
                 if next_ratio != prompt_ratio {
                     if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                        data.prompt_ratio = next_ratio.map(|ratio| (origin.clone(), ratio));
+                        data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
                     }
                 }
                 // A knowingly oversized request that then fails owes the user
@@ -849,7 +852,7 @@ async fn run_loop(
         if next_ratio != prompt_ratio {
             prompt_ratio = next_ratio;
             if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                data.prompt_ratio = next_ratio.map(|ratio| (origin.clone(), ratio));
+                data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
             }
         }
 
@@ -3044,13 +3047,14 @@ mod tests {
 
     /// A provider that answers its first request with `first` and every later
     /// one with `STOP_SSE`, keeping each request body it was sent.
-    async fn capturing_endpoint(first: &'static str) -> (String, Arc<StdMutex<Vec<String>>>) {
+    async fn capturing_endpoint(first: &str) -> (String, Arc<StdMutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
         let seen = bodies.clone();
+        let first = first.to_owned();
         tokio::spawn(async move {
             let mut n = 0usize;
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -3077,7 +3081,7 @@ mod tests {
                 }
                 seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
                 n += 1;
-                let sse = if n == 1 { first } else { STOP_SSE };
+                let sse = if n == 1 { first.as_str() } else { STOP_SSE };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
                 );
@@ -3407,6 +3411,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_tool_loop_deduplicates_only_matching_reasoning() {
+        let details = serde_json::json!([
+            {"type":"reasoning.text","text":"read a.txt first","signature":"EqQBsig==","id":"rs-1","format":"unknown","index":0},
+            {"type":"reasoning.encrypted","data":"opaque==","id":"enc-1","format":"unknown","index":1},
+        ]);
+        check_preferred_reasoning(DETAILED_TOOL_SSE, None, &details).await;
+        let unmatched = DETAILED_TOOL_SSE.replace(r#""reasoning":"first""#, r#""reasoning":"with full context""#);
+        check_preferred_reasoning(&unmatched, Some("read a.txt with full context"), &details).await;
+    }
+
+    async fn check_preferred_reasoning(first: &str, expected_plaintext: Option<&str>, details: &Value) {
+        let dir = std::env::temp_dir().join(format!("openmax-details-route-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (url, bodies) = capturing_endpoint(first).await;
+        std::fs::write(
+            crate::providers::providers_path(&core.data_dir),
+            serde_json::json!({"providers":{"fixture":{
+                "base_url":url, "compat":{"prefer_reasoning_details":true},
+                "models":[{"id":"stub","context_tokens":16384}]
+            }}}).to_string(),
+        ).unwrap();
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.provider = Some("fixture".into());
+            settings.model = "stub".into();
+            settings.approval_mode = ApprovalMode::Auto;
+        }
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id, project, "Read a.txt".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        let reply = &sent_replies(&bodies[1])[0];
+        assert_eq!(reply["reasoning"].as_str(), expected_plaintext);
+        assert!(reply.get("reasoning_content").is_none());
+        assert_eq!(&reply["reasoning_details"], details);
+        let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(second["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], reply["tool_calls"][0]["id"]);
+        let messages: Vec<ChatMessage> = serde_json::from_value(second["messages"].clone()).unwrap();
+        let sent_estimate = request_overhead(&second["tools"].to_string())
+            + messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+        assert_eq!(budgets[1], sent_estimate, "budget must price the reasoning representation sent");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// One read as OpenRouter streams it for a model that does not reason:
@@ -7514,7 +7570,7 @@ mod tests {
             let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
-                compaction_trigger(budget, schema_tokens, 20_000, None, &data.messages),
+                compaction_trigger(budget, schema_tokens, 20_000, None, &data.messages, &ChatMessage::estimated_tokens),
                 budget,
                 "fixture must sit in the fallback band"
             );
