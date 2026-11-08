@@ -511,7 +511,7 @@ impl ChatClient {
     /// requests carry it as `prompt_cache_key`: that translation targets
     /// OpenAI's Responses API, which defines the key. Chat Completions servers
     /// vary and some refuse a field they do not know, so there it goes only to
-    /// a host that routes by it, in its header (see `cache_route`); native
+    /// a provider that routes by it, in its header (see `cache_route`); native
     /// Messages does not define it. docs/configuration.md covers its effect on
     /// routing and its costs.
     pub fn for_conversation(mut self, root: &str) -> Self {
@@ -521,14 +521,16 @@ impl ChatClient {
         self
     }
 
-    /// The header a Chat Completions host routes a conversation by to the
-    /// server that holds its prompt cache (`providers::CACHE_ROUTES`), with
-    /// this conversation's key: a request served elsewhere prefills the whole
-    /// history again, at the uncached price. None where the provider's own
-    /// headers set it.
+    /// The header a Chat Completions provider, known by its host or by its
+    /// model id after any `vendor/` prefix (so behind a proxy or gateway too),
+    /// routes a conversation by to the server that holds its prompt cache
+    /// (`providers::CACHE_ROUTES`), with this conversation's key: a request
+    /// served elsewhere prefills the whole history again, at the uncached
+    /// price. None where the provider's own headers set it.
     fn cache_route(&self) -> Option<(&'static str, &str)> {
-        let url = reqwest::Url::parse(self.base_url.trim()).ok()?;
-        let (_, name) = crate::providers::CACHE_ROUTES.iter().find(|(host, _)| url.host_str() == Some(*host))?;
+        let url = reqwest::Url::parse(self.base_url.trim()).ok();
+        let (host, model) = (url.as_ref().and_then(reqwest::Url::host_str), self.model.rsplit('/').next()?.to_ascii_lowercase());
+        let (.., name) = crate::providers::CACHE_ROUTES.iter().find(|(h, prefix, _)| host == Some(*h) || model.starts_with(prefix))?;
         let own = self.headers.iter().any(|(header, _)| header.eq_ignore_ascii_case(name));
         (self.wire_api == crate::providers::WireApi::ChatCompletions && !own).then_some((*name, self.cache_key.as_deref()?))
     }
@@ -665,10 +667,9 @@ impl ChatClient {
             if self.wire_api == crate::providers::WireApi::Anthropic && !self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("anthropic-version")) {
                 req = req.header("anthropic-version", "2023-06-01");
             }
-            for (name, value) in &self.headers {
-                req = req.header(name.as_str(), value.as_str());
+            for (name, value) in self.headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).chain(self.cache_route()) {
+                req = req.header(name, value);
             }
-            if let Some((name, key)) = self.cache_route() { req = req.header(name, key); }
             // An endpoint can spend a long time in prompt processing before the
             // first byte arrives, and a large prompt makes that worse wherever
             // it runs; keep cancellation responsive throughout. Only silence
@@ -4261,13 +4262,16 @@ mod tests {
         }
     }
 
-    /// The vendor table is pinned: a host joins it only with its header. A
-    /// conversation's requests to a host there carry its key in that header,
-    /// one key per conversation, and nothing goes anywhere else, to another
-    /// wire, or over a value the provider's own headers set.
+    /// The vendor table is pinned: a provider joins it only with its host,
+    /// its model prefix and its header. A conversation's requests to that
+    /// host, or for one of its models at any host (a proxy or gateway in
+    /// front of it), carry its key in that header, one key per conversation,
+    /// and nothing goes anywhere else, to another wire, or over a value the
+    /// provider's own headers set.
     #[test]
     fn a_host_that_routes_by_conversation_gets_the_key_in_its_header() {
-        assert_eq!(crate::providers::CACHE_ROUTES, [("api.x.ai", "x-grok-conv-id")]);
+        assert_eq!(crate::providers::CACHE_ROUTES, [("api.x.ai", "grok-", "x-grok-conv-id")]);
+        let serving = |url: &str, model: &str| ChatClient::new(url.into(), None, model.into(), None, 64).for_conversation("root");
         let routed = |url: &str, root: &str| ChatClient::new(url.into(), None, "m".into(), None, 64).for_conversation(root);
         let xai = routed("https://api.x.ai/v1", "root");
         let key = xai.cache_key.clone().unwrap();
@@ -4277,6 +4281,12 @@ mod tests {
         assert_eq!(ChatClient::new("https://api.x.ai/v1".into(), None, "m".into(), None, 64).cache_route(), None);
         for elsewhere in ["http://127.0.0.1:8080/v1", "https://openrouter.ai/api/v1", "https://api.x.ai.example/v1", "not a url"] {
             assert_eq!(routed(elsewhere, "root").cache_route(), None, "{elsewhere}");
+            for model in ["grok-4.7", "x-ai/Grok-4.7"] {
+                assert_eq!(serving(elsewhere, model).cache_route(), Some(("x-grok-conv-id", key.as_str())), "{model} at {elsewhere}");
+            }
+            for model in ["x-grok-4.7", "grok", "grok/m"] {
+                assert_eq!(serving(elsewhere, model).cache_route(), None, "{model} at {elsewhere}");
+            }
         }
         let mut responses = routed("https://api.x.ai/v1", "root");
         responses.wire_api = crate::providers::WireApi::Responses;
@@ -4284,5 +4294,25 @@ mod tests {
         let mut own = routed("https://api.x.ai/v1", "root");
         own.headers = vec![("X-Grok-Conv-Id".into(), "configured".into())];
         assert_eq!(own.cache_route(), None);
+    }
+
+    /// The bug this guards: behind a proxy (a usage logger, a gateway, a
+    /// local relay) the host was the proxy's, so a grok conversation's
+    /// requests went out without the header, met whichever server the
+    /// provider picked, and prefilled the history again wherever that server
+    /// had not seen it. A request for a grok model to a local endpoint now
+    /// carries the conversation's key; one for another model carries none.
+    #[tokio::test]
+    async fn a_grok_conversation_behind_a_proxy_carries_its_route() {
+        for (model, routed) in [("grok-4.7", true), ("m", false)] {
+            let (url, requests) = spawn_recording_once(finished_response());
+            let client = ChatClient::new(url, None, model.into(), None, 64).for_conversation("root");
+            let reply = client.stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
+            assert_eq!(reply.unwrap().content, "all of it");
+            let request = requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
+            let header = format!("x-grok-conv-id: {}", client.cache_key.as_deref().unwrap());
+            assert_eq!(head.contains(&header), routed, "{model}: {head}");
+        }
     }
 }
