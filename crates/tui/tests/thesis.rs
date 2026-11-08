@@ -605,10 +605,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // The client asks each provider's prompt cache for the conversation it serves, reads every wire's usage
-    // with one parser, and builds itself without its eight-argument constructor: 8 lines fewer, the trust
-    // dispatcher and the frozen prompt unchanged.
-    const BASELINE: usize = 44_448;
+    // Usage counts the output a provider bills, reasoning included, and the chat request body builds its
+    // optional fields in one line each: 10 lines fewer, the trust dispatcher and the frozen prompt unchanged.
+    const BASELINE: usize = 44_438;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

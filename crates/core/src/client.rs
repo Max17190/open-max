@@ -239,37 +239,19 @@ fn serialize_chat_request_body(
     let include_tools = !tools_wire.is_empty() && tools_wire != "[]";
     // Borrow the frozen wire as RawValue: validation only, no Value rebuild.
     // Serialize writes these exact bytes into the body.
-    let tools_raw: Option<&RawValue> = if include_tools {
-        Some(
-            serde_json::from_str(tools_wire)
-                .map_err(|e| format!("invalid tools wire JSON: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let tools: Option<&RawValue> =
+        include_tools.then(|| serde_json::from_str(tools_wire)).transpose().map_err(|e| format!("invalid tools wire JSON: {e}"))?;
     let req = ChatCompletionRequest {
         model,
         messages: WireMessages { messages, note, origin },
         temperature,
         reasoning_effort,
-        max_tokens: if use_max_completion_tokens {
-            None
-        } else {
-            Some(max_tokens)
-        },
-        max_completion_tokens: if use_max_completion_tokens {
-            Some(max_tokens)
-        } else {
-            None
-        },
+        max_tokens: (!use_max_completion_tokens).then_some(max_tokens),
+        max_completion_tokens: use_max_completion_tokens.then_some(max_tokens),
         stream: true,
-        stream_options: if send_stream_options {
-            Some(StreamOptions { include_usage: true })
-        } else {
-            None
-        },
-        tools: tools_raw,
-        tool_choice: if include_tools { Some("auto") } else { None },
+        stream_options: send_stream_options.then_some(StreamOptions { include_usage: true }),
+        tools,
+        tool_choice: include_tools.then_some("auto"),
     };
     serde_json::to_vec(&req).map_err(|e| format!("failed to serialize chat request: {e}"))
 }
@@ -333,11 +315,13 @@ pub struct CompletionResult {
 /// prompt tokens served from the prompt cache (servers report it under
 /// `prompt_tokens_details` or as `prompt_cache_hit_tokens`): if it stays
 /// near zero across turns, the harness broke prefix stability and every
-/// step is paying a full re-prefill.
+/// step is paying a full re-prefill. `completion_tokens` is the reply as the
+/// server counts it against the output cap, `output_tokens` as it is billed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub output_tokens: u64,
     pub cached_tokens: Option<u64>,
 }
 
@@ -403,16 +387,22 @@ struct StreamChunk {
 /// read on its own, so a value of a shape this client does not expect under
 /// one key costs nothing under the others: a count that is not a whole
 /// number (a string, a fraction, a negative) reads as not reported, and a
-/// whole number typed as a float is the count.
+/// whole number typed as a float is the count. Reasoning is billed output:
+/// xAI's Chat Completions counts it beside `completion_tokens`, in
+/// `total_tokens` alone, so it is added where the total shows it there.
 fn parse_usage(usage: &Value) -> Option<Usage> {
     if !usage.is_object() {
         return None;
     }
     let count = |key: &str| usage.pointer(key).and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64)));
     let input = ["/input_tokens", "/cache_creation_input_tokens", "/cache_read_input_tokens"];
+    let prompt_tokens = count("/prompt_tokens").unwrap_or_else(|| input.iter().filter_map(|k| count(k)).fold(0, u64::saturating_add));
+    let completion_tokens = count("/completion_tokens").or_else(|| count("/output_tokens")).unwrap_or(0);
+    let beside = count("/completion_tokens_details/reasoning_tokens").filter(|r| count("/total_tokens") == Some(prompt_tokens.saturating_add(completion_tokens).saturating_add(*r)));
     Some(Usage {
-        prompt_tokens: count("/prompt_tokens").unwrap_or_else(|| input.iter().filter_map(|k| count(k)).fold(0, u64::saturating_add)),
-        completion_tokens: count("/completion_tokens").or_else(|| count("/output_tokens")).unwrap_or(0),
+        prompt_tokens,
+        completion_tokens,
+        output_tokens: completion_tokens.saturating_add(beside.unwrap_or(0)),
         cached_tokens: ["/prompt_tokens_details/cached_tokens", "/prompt_cache_hit_tokens", "/input_tokens_details/cached_tokens", input[2]]
             .iter().find_map(|k| count(k)),
     })
@@ -4243,8 +4233,32 @@ mod tests {
         ] {
             let u = parse_usage(&usage).expect("a usage object is usage");
             assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), counts, "{usage}");
+            assert_eq!(u.output_tokens, u.completion_tokens, "{usage}");
         }
         assert!(parse_usage(&Value::Null).is_none());
+    }
+
+    /// Reasoning is output the provider bills. xAI's Chat Completions counts
+    /// it beside `completion_tokens` and in `total_tokens` (the first row is
+    /// one real reply's counts), where OpenAI counts it inside both, and a
+    /// Responses reply inside `output_tokens`: the total says which, and a
+    /// total that says neither adds nothing. `completion_tokens` stays the
+    /// server's own count, the one its output cap applies to.
+    #[test]
+    fn reasoning_billed_beside_the_completion_is_output() {
+        let chat = |completion: u64, total: Value| json!({"prompt_tokens":2243,"completion_tokens":completion,"total_tokens":total,"completion_tokens_details":{"reasoning_tokens":35}});
+        for (usage, counts) in [
+            (chat(55, json!(2333)), (55, 90)),
+            (chat(55, json!(2333.0)), (55, 90)),
+            (chat(90, json!(2333)), (90, 90)),
+            (chat(55, json!(2334)), (55, 55)),
+            (chat(55, Value::Null), (55, 55)),
+            (json!({"input_tokens":2538,"output_tokens":90,"total_tokens":2628,"output_tokens_details":{"reasoning_tokens":35}}), (90, 90)),
+            (json!({"prompt_tokens":u64::MAX,"completion_tokens":1,"total_tokens":u64::MAX,"completion_tokens_details":{"reasoning_tokens":2}}), (1, 3)),
+        ] {
+            let u = parse_usage(&usage).expect("a usage object is usage");
+            assert_eq!((u.completion_tokens, u.output_tokens), counts, "{usage}");
+        }
     }
 
     /// The vendor table is pinned: a host joins it only with its header. A
