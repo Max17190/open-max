@@ -1258,8 +1258,11 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("X-A".into(), "$NO_SUCH_OPENMAX_ENV_VAR_ZZZ".into());
         map.insert("X-B".into(), "ok".into());
+        map.insert(" X-C ".into(), " padded ".into());
+        map.insert("  ".into(), "nameless".into());
+        map.insert("X-D".into(), "  ".into());
         let headers = expand_headers(&map);
-        assert_eq!(headers, vec![("X-B".into(), "ok".into())]);
+        assert_eq!(headers, vec![("X-C".into(), "padded".into()), ("X-B".into(), "ok".into())]);
     }
 
     #[test]

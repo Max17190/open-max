@@ -4196,6 +4196,7 @@ mod tests {
         assert_eq!(sent(&answered, None), expected, "so is an assistant reply");
         let silent = vec![ChatMessage::system("p"), ChatMessage::user("")];
         assert_eq!(sent(&silent, None)[1], json!({ "role": "user", "content": "" }), "empty text takes no marker");
+        assert_eq!(sent(&[], Some("n")), json!([{ "role": "user", "content": "n" }]), "nor does the note, even alone");
     }
 
     #[test]
