@@ -103,16 +103,18 @@ while [ $# -gt 0 ]; do
 done
 [ $# -ge 1 ] || usage
 # JSON::PP is one of perl's core modules, but a minimal Linux image can have a
-# perl without it: the perl-base package of Debian and Ubuntu.
-perl -MJSON::PP -e 1 2> /dev/null || {
-  echo "error: $0 needs perl with its core module JSON::PP" >&2
-  exit 2
-}
-
-DIFF=$diff EXPECTED=$expected MISSED=$missed FLOOR=$floor MARGIN=$margin TARGET=$target FILE_TARGET=$file_target exec perl -e '
+# perl without it: the perl-base package of Debian and Ubuntu. The perl below
+# loads it before anything else and exits 2, naming it, when it cannot: one
+# perl start, where a check of its own would start a second one.
+SCRIPT=$0 DIFF=$diff EXPECTED=$expected MISSED=$missed FLOOR=$floor MARGIN=$margin TARGET=$target FILE_TARGET=$file_target exec perl -e '
 use strict;
 use warnings;
-use JSON::PP;
+BEGIN {
+    eval { require JSON::PP; JSON::PP->import; 1 } or do {
+        print STDERR "error: $ENV{SCRIPT} needs perl with its core module JSON::PP\n";
+        exit 2;
+    };
+}
 
 my ($diff, $expected, $missed_out, $floor, $margin, $target, $file_target) =
     @ENV{qw(DIFF EXPECTED MISSED FLOOR MARGIN TARGET FILE_TARGET)};
