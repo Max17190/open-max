@@ -505,16 +505,20 @@ impl ChatClient {
         self
     }
 
-    /// The header a Chat Completions provider, known by its host or by its
-    /// model id after any `vendor/` prefix (so behind a proxy or gateway too),
-    /// routes a conversation by to the server that holds its prompt cache
+    /// Whether this client serves the provider known by `host`, or by a model
+    /// id `prefix` after any `vendor/` prefix (so behind a proxy or gateway too).
+    fn serves(&self, host: &str, prefix: &str) -> bool {
+        reqwest::Url::parse(self.base_url.trim()).is_ok_and(|url| url.host_str() == Some(host))
+            || self.model.rsplit('/').next().is_some_and(|model| model.to_ascii_lowercase().starts_with(prefix))
+    }
+
+    /// The header a Chat Completions provider this client `serves` routes a
+    /// conversation by to the server that holds its prompt cache
     /// (`providers::CACHE_ROUTES`), with this conversation's key: a request
     /// served elsewhere prefills the whole history again, at the uncached
     /// price. None where the provider's own headers set it.
     fn cache_route(&self) -> Option<(&'static str, &str)> {
-        let url = reqwest::Url::parse(self.base_url.trim()).ok();
-        let (host, model) = (url.as_ref().and_then(reqwest::Url::host_str), self.model.rsplit('/').next()?.to_ascii_lowercase());
-        let (.., name) = crate::providers::CACHE_ROUTES.iter().find(|(h, prefix, _)| host == Some(*h) || model.starts_with(prefix))?;
+        let (.., name) = crate::providers::CACHE_ROUTES.iter().find(|(host, prefix, _)| self.serves(host, prefix))?;
         let own = self.headers.iter().any(|(header, _)| header.eq_ignore_ascii_case(name));
         (self.wire_api == crate::providers::WireApi::ChatCompletions && !own).then_some((*name, self.cache_key.as_deref()?))
     }

@@ -58,12 +58,17 @@ pub(super) fn serialize(
     }
     // This supported input item avoids an extra namespace and leaves tool names
     // unchanged. It joins the frozen prefix immediately after the instructions.
-    if !functions.is_empty() {
+    // A server whose input defines no such item refuses the whole request
+    // over it (`providers::TOOLS_FIELD`): there the tools go in `tools`.
+    if !functions.is_empty() && !crate::providers::TOOLS_FIELD.iter().any(|(host, prefix)| client.serves(host, prefix)) {
         let at = usize::from(input.first().is_some_and(|item| item["role"] == "developer"));
-        input.insert(at, json!({"type":"additional_tools","role":"developer","tools":functions}));
+        input.insert(at, json!({"type":"additional_tools","role":"developer","tools":std::mem::take(&mut functions)}));
     }
     let mut body = json!({"model":client.model,"input":input,"store":false,"stream":true,
         "include":["reasoning.encrypted_content"]});
+    if !functions.is_empty() {
+        body["tools"] = json!(functions);
+    }
     if let Some(effort) = client.reasoning_effort {
         body["reasoning"] = json!({"effort": effort});
     }
@@ -141,14 +146,8 @@ fn complete(value: &Value) -> Result<CompletionResult, String> {
         match item["type"].as_str() {
             Some("message") => {
                 for part in item["content"].as_array().ok_or("invalid Responses message")? {
-                    let text = match part["type"].as_str() {
-                        Some("output_text") => part["text"].as_str(),
-                        Some("refusal") => part["refusal"].as_str(),
-                        _ => None,
-                    };
-                    if let Some(text) = text {
-                        result.content.push_str(text);
-                    }
+                    let key = match part["type"].as_str() { Some("output_text") => "text", Some("refusal") => "refusal", _ => continue };
+                    result.content.push_str(part[key].as_str().unwrap_or_default());
                 }
             }
             Some("reasoning") => reasoning.push(item.clone()),
@@ -174,12 +173,8 @@ fn complete(value: &Value) -> Result<CompletionResult, String> {
     if !result.tool_calls.is_empty() {
         result.finish_reason = "tool_calls".into();
     }
-    if !reasoning.is_empty() {
-        result.reasoning_details = Some(
-            RawValue::from_string(serde_json::to_string(&reasoning).map_err(|_| "invalid reasoning")?)
-                .map_err(|_| "invalid reasoning")?,
-        );
-    }
+    result.reasoning_details =
+        (!reasoning.is_empty()).then(|| serde_json::value::to_raw_value(&reasoning)).transpose().map_err(|_| "invalid reasoning")?;
     result.usage = parse_usage(&value["usage"]);
     Ok(result)
 }
@@ -211,14 +206,8 @@ pub(super) async fn read(
             chunk = tokio::time::timeout(idle, stream.next()) => chunk,
             _ = cancelled.cancelled() => { result.finish_reason = "cancelled".into(); return (result, None); }
         };
-        let chunk = match next {
-            Ok(Some(Ok(chunk))) => chunk,
-            _ => {
-                return (
-                    result,
-                    Some(Unfinished::Interrupted("Responses stream ended before response.completed".into())),
-                )
-            }
+        let Ok(Some(Ok(chunk))) = next else {
+            return (result, Some(Unfinished::Interrupted("Responses stream ended before response.completed".into())));
         };
         if chunk.len() > MAX_RESPONSE_BYTES - received {
             return (result, None);
@@ -242,9 +231,8 @@ pub(super) async fn read(
             if data.is_empty() {
                 continue;
             }
-            let mut event: Value = match serde_json::from_slice(&data) {
-                Ok(v) => v,
-                Err(_) => return (result, Some(Unfinished::Interrupted("invalid Responses event".into()))),
+            let Ok(mut event) = serde_json::from_slice::<Value>(&data) else {
+                return (result, Some(Unfinished::Interrupted("invalid Responses event".into())));
             };
             data.clear();
             match event["type"].as_str() {
@@ -494,6 +482,39 @@ mod tests {
             message.reasoning_origin = Some(if same_origin { client.origin() } else { "different-origin".into() });
             let body = serialize(&client, &[message], "[]").unwrap();
             assert_eq!(String::from_utf8(body).unwrap().contains("opaque"), same_origin);
+        }
+    }
+
+    /// The table is pinned: a server joins it only with its host and model
+    /// prefix. A request to that host, or for one of its models at any host
+    /// (a proxy or gateway in front of it), carries the tools in `tools` and
+    /// no `additional_tools` item; any other carries the item and no `tools`.
+    /// Either way the same functions go, and none when there are no tools.
+    #[test]
+    fn a_server_without_the_tools_item_gets_the_tools_field() {
+        assert_eq!(crate::providers::TOOLS_FIELD, [("api.x.ai", "grok-")]);
+        let fixture = json!([{"type":"function","function":{"name":"fixture","parameters":{"type":"object"}}}]).to_string();
+        let body = |url: &str, model: &str, tools: &str| -> Value {
+            let client = ChatClient::new(url.into(), None, model.into(), None, 64);
+            let messages = [ChatMessage::system("rules"), ChatMessage::user("task")];
+            serde_json::from_slice(&serialize(&client, &messages, tools).unwrap()).unwrap()
+        };
+        let openai = body("https://api.openai.com/v1", "gpt-5.6", &fixture);
+        assert_eq!(openai["input"][1]["type"], "additional_tools");
+        let functions = &openai["input"][1]["tools"];
+        assert_eq!(functions.as_array().unwrap().len(), 1);
+        let messages = json!([{"role":"developer","content":"rules"},{"role":"user","content":"task"}]);
+        for (url, model) in [("https://api.x.ai/v1", "m"), (" https://API.x.ai/v1/ ", "m"), ("http://127.0.0.1:8080/v1", "grok-4.7"),
+            ("https://openrouter.ai/api/v1", "x-ai/Grok-4.7")] {
+            let field = body(url, model, &fixture);
+            assert_eq!((&field["tools"], &field["input"]), (functions, &messages), "{model} at {url}");
+            assert_eq!(body(url, model, "[]").get("tools"), None, "{model} at {url}");
+        }
+        for (url, model) in [("http://127.0.0.1:8080/v1", "m"), ("https://api.x.ai.example/v1", "x-grok-4.7"), ("not a url", "grok"),
+            ("https://openrouter.ai/api/v1", "grok/m")] {
+            let item = body(url, model, &fixture);
+            assert_eq!((&item["input"][1]["tools"], item.get("tools")), (functions, None), "{model} at {url}");
+            assert_eq!(body(url, model, "[]")["input"], messages, "{model} at {url}");
         }
     }
 

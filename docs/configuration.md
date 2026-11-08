@@ -324,7 +324,12 @@ entries apart. The key is request metadata the model never sees.
 
 The Responses translation targets OpenAI's Responses API, which defines the
 key, and already uses other constructs that API defines, such as the
-`additional_tools` input item that carries the tools. Chat Completions
+`additional_tools` input item that carries the tools. A Responses server
+whose input has no such item refuses every request that carries one, so
+there the tools go in the request's `tools` field, which every Responses
+server takes. One such server is known, by its host or by its model id
+(after any `vendor/` prefix, so behind a proxy or gateway too): `api.x.ai`,
+whose models are `grok-*`. Chat Completions
 requests do not carry the key as a field: the servers that implement that
 protocol vary, and some refuse a field they do not know. A provider that keeps
 its prompt cache per server and routes a conversation to one server by a

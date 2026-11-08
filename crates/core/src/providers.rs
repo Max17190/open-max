@@ -758,6 +758,10 @@ pub const CACHE_ROUTES: &[(&str, &str, &str)] = &[("api.x.ai", "grok-", "x-grok-
 /// one: host, model id prefix. OpenRouter serving an Anthropic model is one.
 pub const CACHE_MARKS: &[(&str, &str)] = &[("openrouter.ai", "anthropic/")];
 
+/// Responses servers whose input has no `additional_tools` item and refuses
+/// the request that carries one: host, model id prefix, as in `CACHE_ROUTES`.
+pub const TOOLS_FIELD: &[(&str, &str)] = &[("api.x.ai", "grok-")];
+
 /// Known compatibility routes can accept the field while ignoring its value.
 pub fn validate_reasoning_effort(base: &str, wire: WireApi, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
     if wire == WireApi::Anthropic {
