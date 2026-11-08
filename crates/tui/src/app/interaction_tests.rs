@@ -1399,3 +1399,23 @@ fn an_empty_chat_says_ready_where_the_word_fits() {
     assert!(ready(5));
     assert!(!ready(4));
 }
+
+#[tokio::test]
+async fn choosing_a_chatgpt_plan_model_names_the_plan_on_the_status_row() {
+    let (mut app, dir) = app_fixture();
+    std::fs::write(
+        dir.join("providers.json"),
+        r#"{"providers":{"plan":{"base_url":"https://api.openai.com/v1","wire_api":"responses",
+           "chatgpt_account":"me@example.com","models":[{"id":"plan-model"}]}}}"#,
+    )
+    .unwrap();
+    app.handle_submit("/model".into()).await.unwrap();
+    assert!(app.mode == Mode::ModelPicker);
+    press(&mut app, key(KeyCode::Enter)).await;
+    assert!(app.mode == Mode::Chat);
+    assert_eq!(app.core.settings.lock().unwrap().model, "plan-model");
+    let (rows, _) = frame(&mut app, 120, 12);
+    let border = rows.iter().position(|row| row.starts_with('╭')).unwrap();
+    assert!(rows[border - 1].contains("Using ChatGPT plan (me@example.com) · plan-model"), "{:?}", rows[border - 1]);
+    let _ = std::fs::remove_dir_all(dir);
+}
