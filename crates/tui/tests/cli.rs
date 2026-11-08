@@ -2173,8 +2173,8 @@ fn a_json_print_turn_emits_valid_envelopes_ending_in_done() {
 
 /// Reasoning is output a provider bills, and xAI's Chat Completions counts it
 /// beside `completion_tokens`, in `total_tokens` alone: a run that copied
-/// `completion_tokens` recorded about a quarter of the output it paid for,
-/// and its `max_agent_tokens` budget let the turn spend the rest unseen. The
+/// `completion_tokens` recorded only the visible part of the output it paid
+/// for, and its `max_agent_tokens` budget let the turn spend the rest. The
 /// `usage` line, the session's usage record and the budget take the billed
 /// count, so here the second reply's reasoning exhausts the budget and the
 /// third request is refused at admission. The output cap still reads the
