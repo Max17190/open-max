@@ -26,13 +26,15 @@ pub const SURFACES: [&str; 13] = [
     "usage",
 ];
 
-/// The authoring contract for one surface, or None for an unknown name.
+/// One surface's authoring contract (or the `.approval` part it names), or None.
 pub fn render(surface: &str) -> Option<&'static str> {
     match surface {
         "tools" => Some(TOOLS),
+        "tools.approval" => Some(TOOLS_APPROVAL),
         "skills" => Some(SKILLS),
         "prompts" => Some(PROMPTS),
         "hooks" => Some(HOOKS),
+        "hooks.approval" => Some(HOOKS_APPROVAL),
         "permissions" => Some(PERMISSIONS),
         "providers" => Some(PROVIDERS),
         "settings" => Some(SETTINGS),
@@ -125,7 +127,7 @@ Fields:
 - `mutating` (optional, default false): routes calls through the ordinary
   approval_mode gate (snapshots, read-only sessions, prompts). Trusted
   metadata for scheduling and UX, not a sandbox: it never widens or narrows
-  the human content approval below.
+  the human content approval required outside auto.
 - `env` (optional, default none): the environment variable NAMES this tool
   receives from the harness's environment, e.g. `env = ["GITHUB_TOKEN"]`
   (at most 16). Everything not listed is scrubbed: the tool always gets a
@@ -160,34 +162,8 @@ content approval, even under a permission allow rule. Later calls of the same
 bytes need no content approval, but the mutating/permission gate still applies.
 Readonly refuses mutating calls and calls requiring confirmation.
 
-Select /permissions auto|ask|readonly in a
-human-controlled frontend.
-The choice persists for this exact trusted project across launches, including
-headless/stdio. A subdirectory, including a worktree placed under the project,
-without its own choice follows the nearest enclosing project's. A worktree
-outside the root (git worktree add ../x) needs its own trust and choice. Other
-projects retain their own choice or settings default.
-Running in auto does not grant hashes: switching back to ask restores content
-requirements. Approve specific bytes with openmax --approve <manifest> or the
-content card in ask. Approving a file write approves only that write.
-
-The following content binding applies when content approval is required.
-What "the exact bytes" covers is the whole definition: the `.toml` *and* the
-project-local file its `command` (or a path in `args`) names, because that file
-is the code that actually runs and the agent can rewrite it after the fact.
-Editing the manifest or that script makes the next call ask again. A `command`
-outside the project root (an absolute path, a name on PATH) is covered by the
-manifest approval alone - that path is what the human read - while a command
-resolving to no file at all is covered by nothing, so the tool asks until it
-exists. `openmax --approve <tool.toml>` approves the pair up front and prints
-every path and hash it blessed.
-
-Binding reaches the files a manifest *names*. A command handed a program on
-its own command line (`python3 -c "..."`, `sh -c "..."`) has that program text
-bound - it is part of the manifest - but anything the program opens while it
-runs is chosen at runtime and is not. Put the program in a project file and
-name it in `args`, and its bytes are covered too; `openmax --check` warns when
-inline text reads a project file.
+Outside auto (ask, readonly), how a human keeps a mode, what a content approval
+binds, and how an example runs: `openmax --spec tools.approval`.
 
 Example (`.openmax/tools/todo_scan.toml`):
 
@@ -249,6 +225,37 @@ Plain `--check` runs no command.
 In auto, examples run the real host command without content approval, behind
 hook gates and permission denies. Permission ask rules do not prompt or block
 in auto. Validation, output limits, and execution reports still apply.
+"#;
+
+const TOOLS_APPROVAL: &str = r#"# External tools: content approval outside auto (ask, readonly)
+
+Select /permissions auto|ask|readonly in a human-controlled frontend.
+The choice persists for this exact trusted project across launches, including
+headless/stdio. A subdirectory, including a worktree placed under the project,
+without its own choice follows the nearest enclosing project's. A worktree
+outside the root (git worktree add ../x) needs its own trust and choice. Other
+projects retain their own choice or settings default.
+Running in auto does not grant hashes: switching back to ask restores content
+requirements. Approve specific bytes with openmax --approve <manifest> or the
+content card in ask. Approving a file write approves only that write.
+
+The following content binding applies when content approval is required.
+What "the exact bytes" covers is the whole definition: the `.toml` *and* the
+project-local file its `command` (or a path in `args`) names, because that file
+is the code that actually runs and the agent can rewrite it after the fact.
+Editing the manifest or that script makes the next call ask again. A `command`
+outside the project root (an absolute path, a name on PATH) is covered by the
+manifest approval alone - that path is what the human read - while a command
+resolving to no file at all is covered by nothing, so the tool asks until it
+exists. `openmax --approve <tool.toml>` approves the pair up front and prints
+every path and hash it blessed.
+
+Binding reaches the files a manifest *names*. A command handed a program on
+its own command line (`python3 -c "..."`, `sh -c "..."`) has that program text
+bound - it is part of the manifest - but anything the program opens while it
+runs is chosen at runtime and is not. Put the program in a project file and
+name it in `args`, and its bytes are covered too; `openmax --check` warns when
+inline text reads a project file.
 
 Outside auto, an example's execution depends on whether a human has approved
 the tool's exact bytes (manifest plus the project-local code it names):
@@ -488,10 +495,32 @@ path is missing or has no executable bit, whose command is not on PATH, or
 whose interpreter's script does not exist; while a blocking `turn_end` gate
 is in that state, the model is also told at turn start, once per session for
 each distinct failure.
-Manifest edits apply from the next turn; a script runs from disk, so an edit
-to it applies at the hook's next run. Explicit mode changes refresh policy
+Manifest edits apply from the next turn, with no reload: in print mode
+(`openmax -p`) the run's next `-p` prompt, and any run started later, including
+one started now from bash (`openmax -p ...`). A script runs from disk, so an
+edit to it applies at the hook's next run. Explicit mode changes refresh policy
 before subsequent calls. Execution failures are reported and no hashes are
 automatically granted. Removing a hook in auto removes that policy.
+
+In ask/readonly, a hook is inert until a human approves its exact content, and
+deleting, breaking or (for a gate) editing an approved hook blocks every tool:
+read `openmax --spec hooks.approval` before changing a hook outside auto.
+
+Example (`.openmax/hooks/deny-rm.toml`):
+
+```toml
+event = "pre_tool_use"
+command = "sh"
+args = ["./scripts/deny-rm.sh"]
+tool = "bash"
+timeout_secs = 5
+```
+
+Verify with `openmax --check`. Test the script directly:
+`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | sh ./scripts/deny-rm.sh`.
+"#;
+
+const HOOKS_APPROVAL: &str = r#"# Hooks: content approval outside auto (ask, readonly)
 
 In ask/readonly, a hook is inert until a human approves its exact content - the
 `.toml` *and* the project-local file its `command` (or a path in `args`) names,
@@ -553,21 +582,7 @@ reported by `openmax --check`:
 
 A hook whose content was never approved is inert rather than blocking: it never
 ran, so it removes no policy. It is not silent - each turn reports it, and
-`openmax --check` names it. Hooks are re-discovered every turn; no reload is
-needed.
-
-Example (`.openmax/hooks/deny-rm.toml`):
-
-```toml
-event = "pre_tool_use"
-command = "sh"
-args = ["./scripts/deny-rm.sh"]
-tool = "bash"
-timeout_secs = 5
-```
-
-Verify with `openmax --check`. Test the script directly:
-`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | sh ./scripts/deny-rm.sh`.
+`openmax --check` names it.
 "#;
 
 const PERMISSIONS: &str = r#"# Permission rules
@@ -1346,6 +1361,50 @@ mod tests {
         }
     }
 
+    /// Every `openmax --spec <name>` a contract sends its reader to prints,
+    /// and fits one bash result whole like the contract that named it: a
+    /// pointer to a part that does not render is a dead end mid-task.
+    #[test]
+    fn every_spec_a_contract_names_renders() {
+        let cap = crate::tools::OutputCaps::default().command_bytes;
+        let mut named = Vec::new();
+        for surface in SURFACES {
+            let Some(text) = render(surface) else { continue };
+            for (_, rest) in text.match_indices("openmax --spec ").map(|(at, m)| text.split_at(at + m.len())) {
+                let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.')).unwrap_or(rest.len());
+                let name = rest[..end].trim_end_matches('.');
+                if !name.is_empty() && name != "usage" {
+                    named.push(name.to_string());
+                }
+            }
+        }
+        assert!(named.iter().any(|n| n == "tools.approval") && named.iter().any(|n| n == "hooks.approval"));
+        for name in named {
+            let text = render(&name).unwrap_or_else(|| panic!("a contract names `openmax --spec {name}`, which renders nothing"));
+            assert!(text.len() < cap, "--spec {name} is {} bytes, over the {cap}-byte bash cap", text.len());
+        }
+    }
+
+    /// Content approval detail that applies only outside auto is one command
+    /// away instead of in the contract every authoring session re-sends on
+    /// each later request: in auto none of it applies. The contract still
+    /// states each mode's rule and names the command, and nothing is lost:
+    /// the part prints the moved text.
+    #[test]
+    fn outside_auto_approval_detail_is_one_command_away() {
+        for (surface, part, detail) in [
+            ("tools", "tools.approval", "The following content binding applies"),
+            ("tools", "tools.approval", "SANDBOXED PROBE"),
+            ("hooks", "hooks.approval", "Editing a live gate cannot turn it off"),
+            ("hooks", "hooks.approval", "openmax --forget <path>"),
+        ] {
+            let contract = render(surface).unwrap();
+            assert!(contract.contains(&format!("`openmax --spec {part}`")), "--spec {surface} names {part}");
+            assert!(!contract.contains(detail), "--spec {surface} leaves {detail:?} to {part}");
+            assert!(render(part).is_some_and(|t| t.contains(detail)), "--spec {part} prints {detail:?}");
+        }
+    }
+
     /// No authoring surface claims the refreeze needs a SUCCESSFUL call:
     /// #242 activates on any executed mutating call (a failed writer
     /// included), and the permissions/settings/memory surfaces already said
@@ -1444,6 +1503,16 @@ mod tests {
             HOOKS.contains(&format!("At most {} hooks", crate::hooks::MAX_HOOKS_PER_EVENT)),
             "--spec hooks names the least visible cap: hooks have no prompt trailer"
         );
+    }
+
+    /// Hooks are discovered at turn start and print mode runs only the turns
+    /// its command line names, so a hook written in a one-prompt run has no
+    /// next turn there: the contract names the runs that apply it.
+    #[test]
+    fn spec_hooks_names_the_runs_that_apply_a_new_hook() {
+        for run in ["(`openmax -p`) the run's next `-p` prompt", "one started now from bash (`openmax -p ...`)"] {
+            assert!(HOOKS.contains(run), "--spec hooks must name {run}");
+        }
     }
 
     #[test]
@@ -1670,7 +1739,8 @@ mod tests {
     /// The execution policy note names a mode and its limits and leaves
     /// content approval detail to the contracts, and docs/configuration.md
     /// says that detail is in `openmax --spec tools`, `hooks`, and
-    /// `permissions`. Each of those contracts must keep stating its own
+    /// `permissions` (and the `.approval` parts the first two name outside
+    /// auto). Each of those contracts must keep stating its own
     /// content approval rule, or that sentence sends the reader to a contract
     /// that no longer says it. Line wrapping is collapsed so the check does
     /// not depend on where a phrase breaks across lines.

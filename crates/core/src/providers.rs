@@ -758,6 +758,11 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     })
 }
 
+/// Chat Completions providers that keep a prompt cache per server and send a
+/// conversation's requests to one server by a header: host, model id prefix
+/// (which names the provider behind a proxy or gateway too), header.
+pub const CACHE_ROUTES: &[(&str, &str, &str)] = &[("api.x.ai", "grok-", "x-grok-conv-id")];
+
 /// Known compatibility routes can accept the field while ignoring its value.
 pub fn validate_reasoning_effort(base: &str, wire: WireApi, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
     if wire == WireApi::Anthropic {

@@ -245,7 +245,10 @@ The model reads the mode in a one-line `[execution policy: <mode>; ...]` note
 placed ahead of a session's first prompt, and written again only when the mode
 changes or a resumed session's history no longer holds it. The history resends
 it on every later request, so it states only the mode's limits; content
-approval detail is in `openmax --spec tools`, `hooks`, and `permissions`.
+approval detail is in `openmax --spec tools`, `hooks`, and `permissions`. The
+tools and hooks contracts state each mode's rule and leave what applies only
+outside auto to `openmax --spec tools.approval` and `hooks.approval`, which
+they name, so a session in auto never re-sends it.
 
 Only a human can select a saved mode: at the trust grant, or with the
 selectors above in a human-controlled frontend. Agent-spawned processes can
@@ -323,8 +326,16 @@ entries apart. The key is request metadata the model never sees.
 The Responses translation targets OpenAI's Responses API, which defines the
 key, and already uses other constructs that API defines, such as the
 `additional_tools` input item that carries the tools. Chat Completions
-requests do not carry the key: the servers that implement that protocol vary,
-and some refuse a field they do not know. Native Messages does not define it.
+requests do not carry the key as a field: the servers that implement that
+protocol vary, and some refuse a field they do not know. A provider that keeps
+its prompt cache per server and routes a conversation to one server by a
+header gets the key in that header instead, known by its host or by its model
+id (after any `vendor/` prefix), so a request through a proxy or gateway in
+front of it carries the header too. One such provider is known: `api.x.ai`,
+whose models are `grok-*`, by `x-grok-conv-id`. Without it, a request can meet
+a server that never saw the conversation and prefill the whole history again
+at the uncached price. A provider whose own `headers` set that header keeps
+its value. Native Messages does not define the key.
 
 An explicit `anthropic` selects the native Messages protocol. Set `base_url`
 to `https://api.anthropic.com/v1`; requests use `/v1/messages`, `x-api-key`
@@ -349,8 +360,13 @@ single custom `x-api-key` header, without combining key sources. For example:
 Populate `models` with the IDs and context windows available to the account,
 or use login to discover them. Native Messages translates the system prompt,
 text, tools, and tool results while retaining the existing agent loop and trust
-checks. Signed thinking blocks return only to their producing endpoint, model,
-and credentials, with unchanged prior system, tools, and messages, and matching
+checks. Messages caches a prompt only up to a `cache_control` marker, so every
+request carries two: one on the system prompt, which caches the tools and the
+system prompt every session shares, and one on the newest stored block, which
+the next request reads back at the cache price. The trailing note follows that
+block as a text block of its own, so the entry holds without it. Signed
+thinking blocks return only to their producing endpoint, model, and
+credentials, with unchanged prior system, tools, and messages, and matching
 assistant text and tool calls. Compaction, reloads, transient notes, or edits
 that change this context discard stale thinking while retaining the current
 text and tool calls. An interrupted,
@@ -370,8 +386,10 @@ changed, or removed after its prompt and tools array were built) opens with a
 header that names the harness as its source, and it is never stored. On Chat
 Completions and native Messages it is appended to the content of the
 request's last message, the user's prompt or the newest tool result, after a
-blank line. On Responses it is a developer message after the history, which
-the Responses API takes anywhere in its `input`: OpenAI's prompt cache on
+blank line (on native Messages, as a text block of its own in that message,
+after the cache marker). On Responses it is a developer message after the
+history, which the Responses API takes anywhere in its `input`: OpenAI's
+prompt cache on
 GPT-5.6 and later ends each entry at a request's newest user message or tool
 output, so an entry then holds no note byte, and the next request, which
 drops the note, reads back the whole history. Every Chat Completions and

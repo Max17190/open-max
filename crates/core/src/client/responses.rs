@@ -187,13 +187,7 @@ fn complete(value: &Value) -> Result<CompletionResult, String> {
                 .map_err(|_| "invalid reasoning")?,
         );
     }
-    if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
-        result.usage = Some(Usage {
-            prompt_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-            cached_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64(),
-        });
-    }
+    result.usage = parse_usage(&value["usage"]);
     Ok(result)
 }
 

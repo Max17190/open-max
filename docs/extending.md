@@ -240,8 +240,10 @@ for a bare script name on PATH). In `auto`:
   blocking `turn_end` gate is in that state the model is also told at turn
   start, once per session for each distinct failure.
 
-Manifest changes activate at the next turn; a script runs from disk, so an
-edit to it applies at the hook's next run.
+Manifest changes activate at the next turn, with no reload: in print mode
+(`openmax -p`) the run's next `-p` prompt, and any run started later, including
+one the agent starts now from `bash` with `openmax -p`. A script runs from
+disk, so an edit to it applies at the hook's next run.
 
 In `ask` and `readonly`, unknown keys in a hook file are rejected, and a hook file that a human approved
 and that no longer parses blocks every tool call until it is fixed or removed
@@ -569,7 +571,11 @@ surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`,
 and defaults, hook stdin payload shapes, and activation timing. The frozen
 prompt carries only a one-line pointer to it, so the full contract costs zero
 tokens until the agent reads it, and the printed examples are parsed by the
-same validation code in tests so the text cannot drift from the binary.
+same validation code in tests so the text cannot drift from the binary. The
+tools and hooks contracts state each mode's content approval rule and name
+`openmax --spec tools.approval` and `hooks.approval` for the detail that
+applies only outside auto, so a session in auto never re-sends it with every
+request after the read.
 
 ## Freezing and re-freezing
 

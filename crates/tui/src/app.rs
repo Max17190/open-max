@@ -481,7 +481,9 @@ pub async fn run(
     (result, warnings)
 }
 
-/// The event reader relinquishes stdin completely while setup owns the shell.
+/// The session's one terminal reader, which setup reads its keys from too:
+/// crossterm stops a reader with a wake any other read of the terminal can
+/// take first, which leaves that reader holding the terminal.
 struct TerminalInput {
     task: tokio::task::JoinHandle<()>,
     ready: tokio::sync::oneshot::Receiver<()>,
@@ -620,9 +622,8 @@ async fn event_loop(
             if let Err(error) = crate::require_human("changing provider authentication", &format!("openmax {flag}")) {
                 app.error(&error);
             } else {
-                input.stop().await;
                 let result = tokio::select! {
-                    result = Box::pin(crate::setup_on_shell(terminal, &app.core.data_dir, action, target.as_deref())) => Some(result?),
+                    result = Box::pin(crate::setup_on_shell(terminal, &app.core.data_dir, action, target.as_deref(), &mut input.events)) => Some(result?),
                     _ = &mut quit => None,
                 };
                 let Some(result) = result else { break; };
@@ -641,8 +642,6 @@ async fn event_loop(
                 resize_hold = None;
                 input_unpainted = false;
                 last_drew_input = false;
-                input = TerminalInput::start();
-                probing = true;
             }
         }
         // Animation cadence follows state; the interval is recreated only on

@@ -2171,6 +2171,52 @@ fn a_json_print_turn_emits_valid_envelopes_ending_in_done() {
     );
 }
 
+/// Reasoning is output a provider bills, and xAI's Chat Completions counts it
+/// beside `completion_tokens`, in `total_tokens` alone: a run that copied
+/// `completion_tokens` recorded only the visible part of the output it paid
+/// for, and its `max_agent_tokens` budget let the turn spend the rest. The
+/// `usage` line, the session's usage record and the budget take the billed
+/// count, so here the second reply's reasoning exhausts the budget and the
+/// third request is refused at admission. The output cap still reads the
+/// server's own `completion_tokens`, all that xAI's cap limits: the first
+/// reply's reasoning brings it to exactly `max_tokens` (4096), yet the cap
+/// did not cut it, so its unparsable call is the model's slip, answered with
+/// the parse error rather than the output-limit advice.
+#[test]
+fn a_run_records_and_charges_the_reasoning_its_provider_bills_as_output() {
+    let (project, home) = fresh_dirs("billed-output");
+    let call = |id: &str, args: &str, completion: u64, reasoning: u64| sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": id, "type": "function",
+            "function": {"name": "read_file", "arguments": args}}]}, "finish_reason": "tool_calls"}]}),
+        serde_json::json!({"choices": [], "usage": {"prompt_tokens": 2243, "completion_tokens": completion,
+            "total_tokens": 2243 + completion + reasoning, "prompt_tokens_details": {"cached_tokens": 1152},
+            "completion_tokens_details": {"reasoning_tokens": reasoning}}}),
+    ]);
+    let (base_url, requests, _server) =
+        spawn_scripted_server(vec![(call("c1", r#"{"path":"a.t"#, 4000, 96), true), (call("c2", r#"{"path":"a.txt"}"#, 55, 60_000), true), (sse_text("read it"), true)]);
+    std::fs::create_dir_all(home.join(".openmax")).unwrap();
+    let settings = format!(r#"{{"base_url":"{base_url}","model":"stub-model","context_tokens":16384,"max_agent_tokens":50000}}"#);
+    std::fs::write(home.join(".openmax/settings.json"), settings).unwrap();
+
+    let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "read a.txt"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).expect("every stdout line is JSON")).collect();
+    let billed = |l: &serde_json::Value| (l["completion_tokens"].as_u64(), l["cached_tokens"].as_u64());
+    let emitted: Vec<_> = lines.iter().filter(|l| l["type"] == "usage").map(billed).collect();
+    assert_eq!(emitted, [(Some(4096), Some(1152)), (Some(60_055), Some(1152))], "{stdout}");
+    let id = lines[0]["session_id"].as_str().unwrap();
+    let record = std::fs::read_to_string(home.join(".openmax/sessions").join(format!("{id}.usage.jsonl"))).unwrap();
+    let recorded: Vec<_> = record.lines().map(|l| billed(&serde_json::from_str(l).unwrap())).collect();
+    assert_eq!(recorded, emitted, "{record}");
+    assert_eq!((out.status.code(), lines.last().unwrap()["stop_reason"].as_str()), (Some(4), Some("budget_exhausted")), "{stdout}");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "{stdout}");
+    let second: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+    let result = second["messages"].as_array().unwrap().iter().find(|m| m["tool_call_id"] == "c1").expect("the call's result");
+    assert!(result["content"].as_str().unwrap().starts_with("Error: invalid JSON in tool arguments"), "{result}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// A harness note is addressed to the model, which reads it in its own
 /// transcript, so print mode keeps it off stderr. A parent agent that runs
 /// `openmax -p` reads the child's stderr in its bash result, and the child's
@@ -2225,6 +2271,58 @@ fn the_model_flag_names_the_model_a_run_asks_for() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let sent: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
     assert_eq!(sent["model"], "flag-model", "settings.json names stub-model: {sent}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Hooks are discovered at turn start, so one written mid-turn applies from
+/// the next turn, and print mode runs only the turns its command line names.
+/// The receipt on the write that made the hook names the two runs that apply
+/// it before this one ends: the run's next `-p` prompt, and a run the agent
+/// starts from bash. Both run it, and it does not run on a write later in the
+/// turn that made it.
+#[test]
+fn a_print_runs_hook_receipt_names_the_runs_that_apply_the_hook() {
+    let (project, home) = fresh_dirs("hook-next-turn");
+    let hook = "event = \"post_tool_use\"\ntool = \"write_file\"\ncommand = \"sh\"\nargs = [\"-c\", \"cat >> seen.jsonl\"]\n";
+    let write = |path: &str| sse_tool_call("write_file", serde_json::json!({ "path": path, "content": "x\n" }));
+    let (base_url, requests, _server) = spawn_scripted_server(vec![
+        // The first prompt's turn writes the hook, then a file.
+        (sse_tool_call("write_file", serde_json::json!({ "path": ".openmax/hooks/seen.toml", "content": hook })), true),
+        (write("same-turn.txt"), true),
+        (sse_text("hook written"), true),
+        // The second prompt's turn writes a file, then starts a run from
+        // bash, whose two requests come next.
+        (write("next-prompt.txt"), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": "openmax -p 'write later-run.txt'" })), true),
+        (write("later-run.txt"), true),
+        (sse_text("written"), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings(&home, &base_url);
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+
+    let out = cmd(&project, &home).args(["-p", "add the hook", "-p", "use it"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 8, "both runs made every scripted request: {requests:#?}");
+    let sent: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+    let receipt = sent["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        receipt.ends_with(
+            "\n[hook files changed. Valid hooks apply from the next turn (in print mode, the run's next -p prompt) \
+             under auto without content approval; a run started now from bash (openmax -p ...) runs them too.]"
+        ),
+        "the hook's write names the runs that apply it: {receipt}"
+    );
+    let seen: Vec<String> = std::fs::read_to_string(project.join("seen.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["args"]["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(seen, ["next-prompt.txt", "later-run.txt"], "the hook ran on exactly these writes");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
@@ -3406,6 +3504,20 @@ fn spec_usage_names_memory_cost_and_never_claims_zero() {
         text.contains("staging-port") && text.contains("memory"),
         "the installed memory note is named with its cost:\n{text}"
     );
+}
+
+/// The tools and hooks contracts name `openmax --spec <surface>.approval`
+/// for their content approval detail outside auto, and an agent runs that in
+/// bash: the binary must print the part, or the pointer is a dead end.
+#[test]
+fn spec_prints_the_approval_part_a_contract_names() {
+    let (project, home) = fresh_dirs("spec-approval-part");
+    for part in ["tools.approval", "hooks.approval"] {
+        let out = cmd(&project, &home).args(["--spec", part]).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "--spec {part} exits 0: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("content approval outside auto (ask, readonly)"), "--spec {part} prints its part:\n{text}");
+    }
 }
 
 #[test]
