@@ -5806,6 +5806,104 @@ fn settings_flags_beside_a_selected_provider_say_what_the_run_uses() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+#[test]
+fn compaction_uses_the_selected_ceiling_within_the_model_window() {
+    use serde_json::{Value, json};
+
+    // Cases with a model select it from the named catalog via --model.
+    // The others use a flat endpoint.
+    for (window, reserve, model, global, trigger) in [
+        (500_000, 4_096, None, None, 150_000),
+        (1_000_000, 4_096, Some("stub-model"), None, 150_000),
+        (128_000, 65_536, None, None, 61_440),
+        (500_000, 4_096, Some("short-history"), None, 100_000),
+        (500_000, 4_096, Some("long-history"), None, 200_000),
+        (500_000, 4_096, Some("short-history"), Some(180_000), 180_000),
+        (500_000, 4_096, Some("long-history"), Some(125_000), 125_000),
+    ] {
+        let case = format!("window {window}, model {model:?}, global {global:?}");
+        let (project, home) = fresh_dirs("compaction-ceiling");
+        let (base_url, requests, server) = spawn_scripted_server(vec![(sse_text("stub reply"), true); 7]);
+        let data = home.join(".openmax");
+        std::fs::create_dir_all(&data).unwrap();
+        let settings_path = data.join("settings.json");
+        let mut settings = json!({"base_url": base_url, "model": "stub-model", "max_tokens": reserve});
+        if let Some(global) = global {
+            settings["compaction_tokens"] = json!(global);
+        } else if window == 1_000_000 {
+            // Older settings saves wrote null for an unset ceiling.
+            settings["compaction_tokens"] = Value::Null;
+        }
+        if model.is_some() {
+            settings["provider"] = json!("stub");
+            let catalog = json!({"providers": {"stub": {"base_url": base_url, "models": [
+                {"id": "stub-model"},
+                {"id": "short-history", "compaction_tokens": 100_000},
+                {"id": "long-history", "compaction_tokens": 200_000}
+            ]}}});
+            std::fs::write(data.join("providers.json"), catalog.to_string()).unwrap();
+        }
+        std::fs::write(&settings_path, settings.to_string()).unwrap();
+
+        let run = |args: &[&str]| -> Vec<Value> {
+            let output = finish_with_deadline(cmd(&project, &home)
+                .args(["--trust-project", "--json"]).args(args)
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+            assert!(output.status.success(), "{case}: {}", String::from_utf8_lossy(&output.stderr));
+            let events: Vec<Value> = String::from_utf8(output.stdout).unwrap().lines()
+                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{case}: {events:?}");
+            events
+        };
+        let probe = |padding: usize, pruned: bool| -> usize {
+            // Each probe starts from a fresh session. The first seed also
+            // exercises a settings save, because the window was unset.
+            let seed = run(&["--context-tokens", &window.to_string(), "-p", "begin"]);
+            let id = seed[0]["session_id"].as_str().unwrap();
+            let mut messages = transcript_on_disk(&home, id);
+            let old = messages.iter_mut().find(|m| m["role"] == "assistant").unwrap();
+            old["content"] = json!(format!("stub reply{}", "x".repeat(4 * padding)));
+            // Put a couple of exchanges after the padded reply so it can be
+            // pruned while the opening prompt and recent messages survive.
+            for i in 0..2 {
+                messages.push(json!({"role": "user", "content": format!("follow-up {i}")}));
+                messages.push(json!({"role": "assistant", "content": "short reply"}));
+            }
+            let mut transcript = std::fs::File::create(data.join("sessions").join(format!("{id}.messages.json"))).unwrap();
+            for message in messages {
+                writeln!(transcript, "{message}").unwrap();
+            }
+
+            let model = model.unwrap_or("stub-model");
+            let before = requests.lock().unwrap().len();
+            let events = run(&["--continue", "--model", model, "-p", "continue"]);
+            let archive = data.join("sessions").join(format!("{id}.archive.jsonl"));
+            assert_eq!(archive.exists(), pruned, "{case}, padding {padding}");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len() - before, 1 + usize::from(pruned), "{case}, padding {padding}");
+            let sent: Value = serde_json::from_str(requests.last().unwrap()).unwrap();
+            assert_eq!(sent["model"], model, "{case}");
+            assert_eq!(sent["max_tokens"], reserve, "{case}");
+            let budget = events.iter().find(|e| e["type"] == "budget").unwrap();
+            assert_eq!(budget["context_tokens"], window, "{case}");
+            budget["used_tokens"].as_u64().unwrap() as usize
+        };
+
+        // Measure the unpadded input through the CLI so the assertions stay
+        // exact even as the system prompt or the frozen schemas change.
+        let baseline = probe(0, false);
+        assert_eq!(probe(trigger - baseline, false), trigger, "{case}");
+        assert!(probe(trigger + 1 - baseline, true) < trigger, "{case}");
+        let saved: Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(saved["context_tokens"], window, "{case}");
+        assert_eq!(saved.get("compaction_tokens"), global.map(|value| json!(value)).as_ref(), "{case}");
+        assert_eq!(saved["model"], "stub-model", "{case}");
+        assert_eq!(requests.lock().unwrap().len(), 7, "{case}");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
 /// Each request a window server read: its token count, and whether it was
 /// refused.
 type WindowLog = Arc<Mutex<Vec<(usize, bool)>>>;
