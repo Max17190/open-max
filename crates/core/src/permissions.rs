@@ -311,12 +311,13 @@ impl Permissions {
                 }),
             };
         }
-        let haystacks = arg_haystacks(&self.project_root, tool, args);
+        let mut haystacks = None;
         for rule in &self.rules {
             if rule.tool != tool {
                 continue;
             }
             if let Some(re) = &rule.arg_regex {
+                let haystacks = haystacks.get_or_insert_with(|| arg_haystacks(&self.project_root, tool, args));
                 if !haystacks.iter().any(|(haystack, deny_only)| (!deny_only || rule.effect == Effect::Deny) && re.is_match(haystack)) {
                     continue;
                 }
@@ -531,9 +532,11 @@ fn load_file(path: &Path) -> FileLoad {
         };
         let arg_regex = match raw.arg_regex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => None,
-            // A deny ignores case: a path's case variant is the same file on a
-            // case-insensitive volume, even in a directory not created yet.
-            Some(pat) => match regex::RegexBuilder::new(pat).case_insensitive(effect == Effect::Deny).build() {
+            // A case variant can name the same target on a case-insensitive volume.
+            Some(pat) => match regex::RegexBuilder::new(pat)
+                .case_insensitive(effect == Effect::Deny && matches!(tool.as_str(), "read_file" | "write_file" | "edit_file" | "list_dir" | "grep"))
+                .build()
+            {
                 Ok(re) => Some(re),
                 // The regex engine's own caret block pinpoints the character;
                 // this only has to say which rule it is under.
@@ -650,6 +653,7 @@ mod tests {
             ("deny", "read_file", "^secrets/".into()),
             ("deny", "read_file", format!("^{}/notes/", regex::escape(&abs))),
             ("deny", "grep", "^secrets/".into()),
+            ("deny", "bash", "^example$".into()),
             ("allow", "write_file", "^src/".into()),
             ("allow", "write_file", "docs/".into()),
         ];
@@ -689,6 +693,8 @@ mod tests {
             assert!(denied("grep", json!({"pattern": ".", "path": path})), "grep over {path} is not denied");
         }
         assert_eq!(decide("grep", json!({"pattern": ".", "path": "src"})), PermissionDecision::Default);
+        assert!(denied("bash", json!({"command": "example"})));
+        assert_eq!(decide("bash", json!({"command": "EXAMPLE"})), PermissionDecision::Default);
         for path in ["src/main.rs", "./src/main.rs", "src/new/mod.rs"] {
             assert_eq!(decide("write_file", json!({"path": path, "content": "x"})), PermissionDecision::Allow, "{path}");
         }

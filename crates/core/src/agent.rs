@@ -1,7 +1,7 @@
 //! The turn loop: everything that happens between a user message and the
 //! model falling silent.
 //!
-//! Two entry points, `start_turn` and `reload_session`, in front of ~2.5k
+//! Two entry points, `start_turn` and `reload_session`, in front of ~1.7k
 //! lines. That ratio is deliberate: a turn has a fixed order that callers must
 //! not be able to reach into and reorder.
 //!
@@ -30,50 +30,45 @@
 //!    that ran out or a human who stopped the turn, and neither is a hook's to
 //!    overrule.
 //!
-//! Read-only calls batch and run concurrently; anything mutating serializes.
+//! Read-only calls batch and run concurrently (`batch.rs`); anything mutating
+//! serializes.
 //! Refreezing mid-turn is allowed between iterations but never inside one, so
 //! the schemas a model was shown are the schemas its reply is checked against.
 
-use std::collections::{BTreeSet, HashSet};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::client::{ChatClient, CompletionResult, StreamDelta, TRUNCATED};
+use crate::batch::{batchable_call, execute_readonly_batch, parallel_tool_limit, partition_concurrent_runs, ReadonlyBatchCtx};
+use crate::client::{ChatClient, CompletionResult, TRUNCATED};
 use crate::compaction::{
     achievable_target, compact_messages, compaction_trigger, observed_prompt_ratio, over_budget_error_context, refusal_ratio,
     request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
     to_estimate, to_real, token_factor, CompactionCtx, RequestSpend,
 };
-use crate::config::{ApprovalMode, Settings};
+use crate::config::{ApprovalMode, ReasoningEffort, Settings};
 use crate::hooks::{Hooks, PreToolResult};
+use crate::notes::{
+    append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
+    narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
+    settings_drift_note, store_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
+};
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
-use crate::prompt::{session_context, trailing_note, PromptBreakdown};
 pub use crate::refreeze::reload_session;
 use crate::refreeze::{refreeze_between_iterations, refreeze_if_extensions_changed, refresh_note_after_memory_write};
 use crate::registry::Registry;
 use crate::sessions;
-use crate::state::{CancelToken, Core, SessionData};
+use crate::state::{CancelToken, Core};
+use crate::stream::{spawn_stale_flusher, TokenBatcher};
 use crate::tools;
+use crate::transcript::{complete_pending_tool_replies, ensure_session_hydrated, save_messages, take_messages, MessageGuard};
 use crate::types::{AgentEvent, ChatMessage, ToolCall};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
-const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
-/// A batched call that auto admitted without asking about its content, still
-/// waiting for a slot when the mode left auto. Not declined: requested
-/// again, it takes the serial path, which raises the card.
-const MODE_LEFT_AUTO_BEFORE_START: &str = "Execution mode changed before this call started; this call was not executed. Request it again under the current mode.";
-/// Hold a streamed delta at most this long before it goes to the UI: under
-/// one frame of a 240 Hz display, so streamed text keeps up with the screen,
-/// while a fast provider's deltas still coalesce into a few hundred events a
-/// second rather than one per delta. A longer window caps text below display
-/// rate whatever the UI's own pacing allows: 25 ms means 40 updates a second.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(4);
+pub(crate) const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
 /// Outcome of a mutating-tool approval prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApprovalOutcome {
@@ -82,84 +77,6 @@ enum ApprovalOutcome {
     Cancelled,
     TimedOut,
 }
-
-/// One consecutive run of tool calls: `[start, end)`; `concurrent` when length >= 2
-/// and every call in the run is batchable.
-struct ToolCallSegment {
-    start: usize,
-    end: usize,
-    concurrent: bool,
-}
-
-/// Split tool calls into maximal consecutive runs that are eligible for concurrent
-/// read-only execution. Single-call runs and non-batchable calls use the serial path.
-fn partition_concurrent_runs<F>(tool_calls: &[ToolCall], is_batchable: F) -> Vec<ToolCallSegment>
-where
-    F: Fn(&ToolCall) -> bool,
-{
-    let mut segments = Vec::new();
-    let mut i = 0;
-    while i < tool_calls.len() {
-        if !is_batchable(&tool_calls[i]) {
-            segments.push(ToolCallSegment { start: i, end: i + 1, concurrent: false });
-            i += 1;
-            continue;
-        }
-        let start = i;
-        i += 1;
-        while i < tool_calls.len() && is_batchable(&tool_calls[i]) {
-            i += 1;
-        }
-        let end = i;
-        segments.push(ToolCallSegment {
-            start,
-            end,
-            concurrent: end - start >= 2,
-        });
-    }
-    segments
-}
-
-fn batchable_call(
-    call: &ToolCall,
-    registry: &Registry,
-    permissions: &TurnPermissions,
-    mode: ApprovalMode,
-    data_dir: &Path,
-    project_root: &Path,
-) -> bool {
-    let name = call.function.name.as_str();
-    if name.is_empty() {
-        return false;
-    }
-    let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments) else {
-        return false;
-    };
-    if registry.get(name).is_none() || registry.is_mutating(name) {
-        return false;
-    }
-    // Ask needs the serial path so the approval UI runs; Deny stays serial for
-    // a single clear error path (batch still handles Deny if it ever arrives).
-    match permissions.evaluate(name, &args) {
-        PermissionDecision::Ask | PermissionDecision::Deny { .. } => return false,
-        PermissionDecision::Allow | PermissionDecision::Default => {}
-    }
-    // Same principle as Ask: outside auto, a tool whose content no human has
-    // approved needs the serial path, which is where the prompt and its
-    // actionable event live. This check is load-bearing rather than
-    // defensive - batching selects for external non-mutating tools, which is
-    // exactly the population the content gate exists to catch, so an
-    // unapproved tool called twice in one message would otherwise run
-    // unattended. Auto runs it unattended anyway, so there the question is
-    // never asked and the ledger never read. Kept last because it is the only
-    // check that touches disk, and built-ins return before the ledger is read.
-    mode == ApprovalMode::Auto || unapproved_capability(registry, data_dir, project_root, name).is_none()
-}
-
-/// The reply for a tool call whose result was never recorded: the process
-/// died, or the turn unwound, after the call was persisted and before its
-/// result was. Nothing that runs later knows whether the call ran.
-const INTERRUPTED_TOOL_CALL: &str = "This call was interrupted before its result was recorded, so whether it ran and what it changed are unknown. Check before repeating it.";
 
 /// Whether the provider stopped this reply at the output cap. Most servers say
 /// so with finish_reason `length`. Some report every reply that carries calls
@@ -188,493 +105,6 @@ fn cut_off_call_error(max_tokens: usize) -> String {
     )
 }
 
-/// Answer every tool call in the transcript that has no reply with a tool
-/// message carrying `note`. Returns the index of each reply inserted, in
-/// ascending order, for a caller that has to move replay boundaries with it.
-///
-/// A provider accepts an assistant message with `tool_calls` only when a reply
-/// for each id follows it before any other message, and refuses every later
-/// request that carries one unanswered id. The call is persisted before its
-/// tool runs and the result only at iteration end, so a cancel, a truncated
-/// reply whose calls were refused, a panic, or a killed process can each
-/// leave one. A reply counts only inside the run of tool messages directly
-/// after its call, and a missing one goes at the end of that run rather than
-/// the end of the transcript: a history that kept growing past the gap is
-/// answered where the gap is.
-fn complete_pending_tool_replies(messages: &mut Vec<ChatMessage>, note: &str) -> Vec<usize> {
-    let mut inserted = Vec::new();
-    let mut i = 0;
-    while i < messages.len() {
-        let ids: Vec<String> = match &messages[i] {
-            m if m.role == "assistant" => {
-                m.tool_calls.iter().flatten().map(|c| c.id.clone()).collect()
-            }
-            _ => Vec::new(),
-        };
-        i += 1;
-        if ids.is_empty() {
-            continue;
-        }
-        let mut end = i;
-        while messages.get(end).is_some_and(|m| m.role == "tool") {
-            end += 1;
-        }
-        let missing: Vec<String> = {
-            let answered: BTreeSet<&str> =
-                messages[i..end].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
-            ids.into_iter().filter(|id| !answered.contains(id.as_str())).collect()
-        };
-        for id in missing {
-            messages.insert(end, ChatMessage::tool(id, note));
-            inserted.push(end);
-            end += 1;
-        }
-        i = end;
-    }
-    inserted
-}
-
-/// Remove every tool message that is not inside the run of tool messages
-/// directly after a call it answers. Returns the index of each removal in
-/// the order made, each counted after the removals before it.
-///
-/// Earlier builds answered only the last call's missing ids, at the end of
-/// the transcript, so a cancelled or cut-short turn could save that reply
-/// after prompts that followed an unanswered call. A provider refuses a tool
-/// message no call precedes as surely as a call with no reply. Real results
-/// always land in their call's run and a prune drops a call together with
-/// its run, so what this removes is such a misplaced harness reply, once its
-/// call has been answered where it stands. Hydration only: it rewrites the
-/// file, while a turn's own saves append.
-fn drop_stray_tool_replies(messages: &mut Vec<ChatMessage>) -> Vec<usize> {
-    let mut removed = Vec::new();
-    let mut ids: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < messages.len() {
-        let m = &messages[i];
-        if m.role != "tool" {
-            ids = match m.role.as_str() {
-                "assistant" => m.tool_calls.iter().flatten().map(|c| c.id.clone()).collect(),
-                _ => Vec::new(),
-            };
-            i += 1;
-        } else if m.tool_call_id.as_ref().is_some_and(|id| ids.contains(id)) {
-            i += 1;
-        } else {
-            messages.remove(i);
-            removed.push(i);
-        }
-    }
-    removed
-}
-
-/// Forward observe-only hook failures to the frontend. The turn proceeds
-/// (observe hooks are fail-open) but a broken observer is never silent.
-pub(crate) fn report_hook_failures(
-    core: &Arc<Core>,
-    session_id: &str,
-    failures: Vec<crate::hooks::HookFailure>,
-) {
-    for f in failures {
-        core.send_agent(session_id, AgentEvent::HookFailed {
-            hook: f.hook,
-            event: f.event.to_string(),
-            detail: f.detail,
-        });
-    }
-}
-
-/// Insert a turn-start harness note just before the pending user prompt AND
-/// emit it on the wire as a `HarnessNote`. The transcript half is what the
-/// MODEL reads; the wire half is what a custom or interactive frontend reads,
-/// so a protocol-v5 client can display the state change that affects the next
-/// turn instead of it being model-only. The empty `call_id` marks
-/// a note owned by no tool call, exactly as the policy-notice path does.
-fn insert_startup_note(
-    core: &Arc<Core>,
-    session_id: &str,
-    msgs: &mut Vec<ChatMessage>,
-    text: String,
-) {
-    let at = msgs.len().saturating_sub(1);
-    insert_note(core, session_id, msgs, at, text);
-}
-
-/// Insert a harness note as a user message at `at` and emit it on the wire,
-/// as `insert_startup_note` does ahead of the pending prompt.
-fn insert_note(
-    core: &Arc<Core>,
-    session_id: &str,
-    msgs: &mut Vec<ChatMessage>,
-    at: usize,
-    text: String,
-) {
-    // The door, not each note. Every turn-start note is one bracketed clause
-    // by construction and several are built from author-controlled bytes (an
-    // approval record's capability path, a provider name read out of
-    // providers.json, a hook stem and its parse reason). Flattening the
-    // parameter here neutralizes all of them at once, and a note added later
-    // inherits the rule instead of reintroducing the class.
-    let text = crate::text::one_line(&text);
-    msgs.insert(at, ChatMessage::user(text.clone()));
-    core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
-}
-
-/// A settings.json drift note, when the file moved outside this process's
-/// own writes. Settings are launch-frozen by design (base_url/api_key are
-/// credential routing, approval_mode hot-adoption would be self-approval),
-/// so an agent edit is inert for this process - and, unstated, that silence
-/// cost real detours. Valid new bytes: state the launch-read rule and what
-/// this session still runs. Invalid bytes: the brick warning (next launch
-/// exits 2), delivered while the author can still repair the file.
-fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
-    let changed = core.settings_disk_changed()?;
-    Some(match changed {
-        Ok(()) => {
-            let (model, endpoint) = {
-                let s = core.settings.lock().unwrap_or_else(|e| e.into_inner());
-                let endpoint = s
-                    .provider
-                    .clone()
-                    .filter(|p| !p.trim().is_empty())
-                    .unwrap_or_else(|| s.base_url.clone());
-                (s.model.clone(), endpoint)
-            };
-            format!(
-                "[settings.json changed on disk. Settings are read at launch: this session \
-                 still runs {model} via {endpoint}, and the new values apply from the next \
-                 openmax launch. Switching this session's model is /model, which the user \
-                 runs; the TUI rewrites settings.json on /model and settings changes, \
-                 overwriting manual edits.]"
-            )
-        }
-        Err(e) => format!(
-            "[settings.json is now INVALID: {e}. The next launch of openmax will refuse to \
-             start (exit 2) until the file parses; fix it now.]"
-        ),
-    })
-}
-
-/// The one canonical form of a policy notice. A notice is reported once per
-/// session, and that "already said it" set does not persist on its own: on
-/// resume it is rebuilt by parsing the notices back out of the transcript.
-/// Identity therefore has to be taken on exactly the text that gets persisted,
-/// and the text that gets persisted has to survive the round trip, which means
-/// a notice may not spell either of the two things the transcript uses to
-/// delimit it:
-///
-/// - a line break, which would forge a second clause in a user-role message
-///   the model reads as the human's own words; and
-/// - `NOTICE_JOINER`, which separates the notices inside one note. Rehydration
-///   splits on that literal, so a notice containing it was restored as
-///   fragments whose hashes matched nothing, and the session said it again
-///   after every resume. Collapsing it needs no escape/unescape
-///   machinery on this path: the delimiter simply cannot occur in a value.
-///
-/// Identity, persistence and display are all this one text, which is what
-/// makes the once-per-session promise hold across a resume.
-fn canonical_notice(notice: &str) -> String {
-    crate::text::one_line(notice).replace(NOTICE_JOINER, " / ")
-}
-
-fn policy_notice_hash(notice: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    notice.hash(&mut h);
-    h.finish()
-}
-
-const POLICY_NOTE_PREFIX: &str = "[policy notice: ";
-const PERMISSION_NOTE_PREFIX: &str = "\n[permission notice: ";
-const PERMISSION_NOTE_PREFIX_CLEAN: &str = "[permission notice: ";
-const NOTICE_JOINER: &str = " | ";
-
-/// Rebuild the reported-notice set from a persisted transcript, so a resumed
-/// session (new process, hydrated messages) does not re-narrate every
-/// still-applicable static notice: the transcript already carries them, and
-/// once per SESSION means once across the session's whole life, not once
-/// per process. Notes are split on the joiner they were assembled with, so
-/// the hashes match what novel_policy_notices would compute.
-fn rehydrate_policy_notices(messages: &[ChatMessage]) -> HashSet<u64> {
-    let mut seen = HashSet::new();
-    for message in messages {
-        let Some(content) = message.content.as_deref() else { continue };
-        let bodies: Vec<&str> = match message.role.as_str() {
-            "user" => content
-                .strip_prefix(POLICY_NOTE_PREFIX)
-                .and_then(|s| s.strip_suffix(']'))
-                .into_iter()
-                .collect(),
-            "tool" => content
-                .split(PERMISSION_NOTE_PREFIX)
-                .skip(1)
-                .filter_map(|tail| tail.split(']').next())
-                .collect(),
-            _ => Vec::new(),
-        };
-        for body in bodies {
-            for notice in body.split(NOTICE_JOINER) {
-                seen.insert(policy_notice_hash(notice));
-            }
-        }
-    }
-    seen
-}
-
-/// Filter to policy notices this session has not yet narrated to the model,
-/// and mark them reported. Identity is the full notice text - it embeds the
-/// file path, which is the identity that matters - so a static problem notes
-/// once per session while a new or reworded one gets through. The UI channel
-/// (HookFailed events, per turn) is unchanged; this dedupe is only for the
-/// transcript, where repetition is token spend.
-async fn novel_policy_notices(
-    core: &Arc<Core>,
-    session_id: &str,
-    notices: Vec<String>,
-) -> Vec<String> {
-    if notices.is_empty() {
-        return Vec::new();
-    }
-    let mut map = core.sessions.lock().await;
-    let Some(data) = map.get_mut(session_id) else {
-        return Vec::new();
-    };
-    notices
-        .into_iter()
-        // Canonicalize BEFORE taking identity: see `canonical_notice`.
-        .map(|n| canonical_notice(&n))
-        .filter(|n| data.reported_policy_notices.insert(policy_notice_hash(n)))
-        .collect()
-}
-
-/// The turn-start narration for approval activity this session did not
-/// perform. It must not presume a benign third party: the actor may have
-/// been a human at another terminal OR an agent process stepping around the
-/// session marker from its own shell (the acknowledged ADR-0006 friction
-/// ceiling), and the model reading this note is the only witness that knows
-/// which one it saw. Name both and ask for the confirmation; the old
-/// "outside this session" wording let a self-approval read as a human act.
-fn outside_approval_note(fresh: &[String]) -> String {
-    format!(
-        "[approval activity this session did not perform: {}. Either a human acted at \
-         another terminal, or an agent process stepped around the session marker; surface \
-         this to the user and confirm it was theirs before relying on it. A capability \
-         whose exact bytes were approved now runs without a card; a retired one asks \
-         again. Verify what is live with bash: openmax --check.]",
-        fresh.join("; ")
-    )
-}
-
-/// Tell the frontend, once per session, that the installed tool schemas and
-/// any trailing note cost more than the window can spend. It holds on every
-/// turn once it holds at all, so repeating it per turn would be noise; the
-/// turn still runs, because this is the user's configuration to fix, not a
-/// failure of this turn.
-async fn report_schemas_over_budget(
-    core: &Arc<Core>,
-    session_id: &str,
-    msgs: &mut Vec<ChatMessage>,
-    schema_tokens: usize,
-    budget_tokens: usize,
-) {
-    let first = {
-        let mut map = core.sessions.lock().await;
-        match map.get_mut(session_id) {
-            Some(data) => !std::mem::replace(&mut data.schemas_over_budget_reported, true),
-            // No live session state to dedupe against: say it rather than
-            // swallow it.
-            None => true,
-        }
-    };
-    if first {
-        core.send_agent(session_id, AgentEvent::SchemasOverBudget {
-            schema_tokens,
-            budget_tokens,
-        });
-        // The frontend is not the party that can act on this. The AGENT
-        // installed these tools, `--spec usage` prices them one by one, and
-        // retiring one is a file it can delete - but until now the advisory
-        // existed only as a wire event, so the human saw it and the agent
-        // never did. It goes in the transcript for the same reason every
-        // other receipt does: the reader who can fix a thing has to be told.
-        //
-        // Written straight into the transcript rather than through
-        // `insert_startup_note`, which would also emit a HarnessNote: the wire
-        // already carries this as the structured SchemasOverBudget event, and
-        // a note beside it renders the same advisory twice (the same reason
-        // the post-approval receipt rides `outcome.output`).
-        let note = crate::text::one_line(&format!(
-            "[tool schemas and any trailing note cost ~{schema_tokens} tokens of the \
-             ~{budget_tokens} this context window can spend on a request. They are resent \
-             whole every request, so history compacts early and a long turn may not fit at \
-             all. Price each tool with bash: openmax --spec usage, retire one you are not \
-             using (delete its .toml; the tools array drops it at /reload or in a new \
-             session), or raise context_tokens for this model.]"
-        ));
-        // APPENDED, never inserted before the tail. `insert_startup_note`
-        // inserts at len-1 because at turn start the tail is the user's own
-        // message; here the tail is `assistant(tool_calls)` followed by its
-        // `tool` replies, and putting a user message between a tool call and
-        // its reply is a transcript the provider rejects outright. This runs
-        // at the top of an iteration, where the previous iteration's replies
-        // are all appended, so the sequence is complete and the note lands
-        // after it.
-        msgs.push(ChatMessage::user(note));
-    }
-}
-
-/// The approval events a new session counts as already seen: every one on
-/// record, so its first turn narrates only what happens after it starts.
-/// Auto never asks the chain anything, so a session built there is seeded
-/// by its first turn in another mode instead (`narrate_outside_approvals`).
-fn seen_approval_events(core: &Core, project_root: &Path) -> Option<HashSet<u64>> {
-    if core.approval_mode(project_root) == ApprovalMode::Auto {
-        return None;
-    }
-    Some(
-        crate::ledger::approval_events(&core.data_dir, project_root)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| e.id)
-            .collect(),
-    )
-}
-
-pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> Result<SessionData, String> {
-    sessions::ensure_owned(core, session_id)?;
-    Ok(if let Some(mut messages) = sessions::load_messages(core, session_id)? {
-        let count = messages.len();
-        // The prompt lives at index 0. A transcript without it there is from
-        // a build that predates the rule (none was ever released): give the
-        // model its prompt, and the file is rewritten into that shape below.
-        let needs_system = messages.first().map(|m| m.role.as_str()) != Some("system");
-        // Resume: the generation the session last froze, its tools array,
-        // and the record of what its persisted prompt indexes, from a
-        // manifest whose record describes that prompt. Without one, nothing
-        // says what the prompt indexes: the session is from an older shape,
-        // its manifest write failed, or a transcript write failed after the
-        // manifest's landed. The prompt and the registry are then rebuilt
-        // from disk once, as at creation, and saved with the manifest, so
-        // every later sitting sends the persisted bytes as they are.
-        let persisted = messages.first().filter(|m| m.role == "system").and_then(|m| m.content.as_deref());
-        let manifest = sessions::load_manifest(core, session_id)
-            .filter(|m| persisted.is_some_and(|prompt| m.prompt_index.describes(prompt)));
-        let rebuild_prompt = manifest.is_none();
-        let (registry, note, breakdown) = match manifest {
-            Some(manifest) => {
-                let mut registry = Registry::from_manifest(manifest);
-                registry.scan_memory(project_root);
-                let (note, rows) = trailing_note(project_root, &registry);
-                let prompt = persisted.unwrap_or_default();
-                let breakdown = PromptBreakdown::from_persisted(prompt, &registry, project_root).with_note(rows);
-                (registry, note, breakdown)
-            }
-            None => {
-                let mut registry = Registry::build(&core.data_dir, project_root);
-                let (prompt, note, breakdown) = session_context(project_root, &mut registry);
-                if needs_system {
-                    messages.insert(0, ChatMessage::system(prompt));
-                } else {
-                    messages[0] = ChatMessage::system(prompt);
-                }
-                sessions::save_manifest(core, session_id, &registry.to_manifest());
-                (registry, note, breakdown)
-            }
-        };
-        let registry = Arc::new(registry);
-        let prompt_breakdown = Arc::new(breakdown);
-        // A process that died mid-tool left a call on record with no reply,
-        // and a provider refuses every request that carries one. Answer it
-        // where it stands, including in a transcript that went on growing
-        // past it, then drop the reply an earlier build may have saved for
-        // it after those later prompts.
-        let stubs = complete_pending_tool_replies(&mut messages, INTERRUPTED_TOOL_CALL);
-        let strays = drop_stray_tool_replies(&mut messages);
-        // Any edit rewrites the file into the current shape at once, so
-        // every later save is a plain append. Then every replay boundary
-        // follows the message it marked, edit by edit in the order they were
-        // made; edits the file or the index cannot take yet wait on the
-        // session for a later save. A crash between the rewrite and the
-        // shifts leaves a divider a message off, which changes where a
-        // replay draws it and nothing the model is sent.
-        let edits: Vec<sessions::ResumeEdit> = needs_system
-            .then_some(0)
-            .into_iter()
-            .chain(stubs)
-            .map(|at| sessions::ResumeEdit::Insert(at as u64))
-            .chain(strays.into_iter().map(|at| sessions::ResumeEdit::Remove(at as u64)))
-            .collect();
-        let (persisted_count, saved) = if edits.is_empty() && !rebuild_prompt {
-            (count, true)
-        } else {
-            let mut persisted = 0usize;
-            if sessions::save_messages(core, session_id, &messages, &mut persisted, true) {
-                (persisted, true)
-            } else {
-                // The file still holds the transcript as it was. A count of
-                // zero would make every later save refuse to append to it,
-                // so no turn of this sitting would reach disk; a stale count
-                // makes the next save rewrite the file whole, which lands the
-                // repair too, and the boundaries move with it then.
-                (sessions::PERSISTED_STALE, false)
-            }
-        };
-        let reported_policy_notices = rehydrate_policy_notices(&messages);
-        let reported_approval_mode = rehydrate_approval_mode(&messages);
-        // Once per session means once per session's record: the note rides a
-        // tool result, so a resumed session finds it in the transcript, or in
-        // the compaction archive if a prune has since dropped that exchange,
-        // and does not repeat it.
-        let mut data = SessionData {
-            messages,
-            registry,
-            trailing_note: note.map(Arc::from),
-            prompt_breakdown,
-            persisted_count,
-            deferred_resume_edits: edits,
-            take_seq: 0,
-            schemas_over_budget_reported: false,
-            reported_policy_notices,
-            reported_approval_mode,
-            seen_ledger_events: seen_approval_events(core, project_root),
-            prompt_ratio: None,
-        };
-        land_deferred_resume_edits(core, session_id, &mut data, saved);
-        data
-    } else {
-        // No transcript on disk: start fresh, honoring a manifest saved
-        // before the session wrote its first message.
-        let mut registry = match sessions::load_manifest(core, session_id) {
-            Some(manifest) => {
-                let mut registry = Registry::from_manifest(manifest);
-                registry.scan_memory(project_root);
-                registry
-            }
-            None => Registry::build(&core.data_dir, project_root),
-        };
-        let (prompt, note, breakdown) = session_context(project_root, &mut registry);
-        // Always persisted (even builtin-only) so the extension fingerprint
-        // and the record of what the prompt indexes travel with the session;
-        // without them every resume would look like a self-modification and
-        // re-freeze for nothing, and rebuild the prompt.
-        sessions::save_manifest(core, session_id, &registry.to_manifest());
-        SessionData {
-            messages: vec![ChatMessage::system(prompt)],
-            registry: Arc::new(registry),
-            trailing_note: note.map(Arc::from),
-            prompt_breakdown: Arc::new(breakdown),
-            persisted_count: 0,
-            deferred_resume_edits: Vec::new(),
-            take_seq: 0,
-            schemas_over_budget_reported: false,
-            reported_policy_notices: Default::default(),
-            reported_approval_mode: None,
-            seen_ledger_events: seen_approval_events(core, project_root),
-            prompt_ratio: None,
-        }
-    })
-}
-
 /// The one failure persisted without the `Error: ` prefix: the model must
 /// read the timeout as an instruction to stop, not as tool noise. Everything
 /// that classifies persisted results (tool_message_content here, the TUI's
@@ -687,8 +117,8 @@ pub const APPROVAL_TIMEOUT_MESSAGE: &str =
     "Approval request timed out with no response. Stop and summarize what you were about to do.";
 
 fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
-    // The trailing note can end this very message, so what a file or a
-    // command printed never carries the note's header.
+    // The note can be stored at the end of this very message, so what a
+    // file or a command printed never carries the note's header.
     let output = crate::prompt::defuse_note_header(&outcome.output);
     if outcome.ok || outcome.output == APPROVAL_TIMEOUT_MESSAGE {
         output.into_owned()
@@ -697,27 +127,32 @@ fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
     }
 }
 
-struct ReadonlyBatchCtx<'a> {
-    core: &'a Arc<Core>,
-    session_id: &'a str,
-    registry: &'a Arc<Registry>,
-    project_root: &'a Path,
-    /// `project_root` as the turn resolved it once, so a mode read walks no path.
-    canonical_root: &'a Path,
-    caps: tools::OutputCaps,
-    cancelled: Arc<CancelToken>,
-    hooks: &'a mut Hooks,
-    permissions: &'a mut TurnPermissions,
-    policy_mode: &'a mut ApprovalMode,
-    parallelism: usize,
-    /// Turn-local usage accumulator, flushed once at turn end.
-    usage: &'a std::sync::Mutex<TurnUsage>,
+/// End a call: its diff and `ToolEnd` on the wire, then its reply in the
+/// transcript. Approval timeouts are not model errors, so that reply carries
+/// no "Error:" prefix, which would push small models into pointless retries.
+pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &tools::ToolOutcome, messages: &mut Vec<ChatMessage>) {
+    if let Some(d) = &outcome.diff {
+        let (path, diff, added, removed) = (d.path.clone(), d.diff.clone(), d.added, d.removed);
+        core.send_agent(session_id, AgentEvent::Diff { call_id: call_id.into(), path, diff, added, removed });
+    }
+    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: outcome.ok, output: outcome.output.clone() });
+    messages.push(ChatMessage::tool(call_id, tool_message_content(outcome)));
+}
+
+/// What a call the user cancelled answers, on the wire and to the model.
+const USER_CANCELLED: &str = "The user cancelled this turn.";
+
+/// End a started call the user cancelled. Its reply carries no "Error:"
+/// prefix: nothing failed, and the turn stops here.
+fn end_cancelled(core: &Core, session_id: &str, call_id: &str, messages: &mut Vec<ChatMessage>) {
+    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: false, output: USER_CANCELLED.into() });
+    messages.push(ChatMessage::tool(call_id, USER_CANCELLED));
 }
 
 /// Turn-local accumulators the dispatcher fills and turn end flushes: ledger
 /// usage feeds `--spec usage`, memory accesses feed the activation log.
 #[derive(Default)]
-struct TurnUsage {
+pub(crate) struct TurnUsage {
     ledger: crate::ledger::UsageDelta,
     memory: Vec<(String, String)>,
 }
@@ -725,7 +160,7 @@ struct TurnUsage {
 /// Count what only the dispatcher sees: external tool calls (by outcome),
 /// skill-body reads (a read_file whose path is a frozen skill's SKILL.md),
 /// and memory accesses (file tools on `.openmax/memory/*.md`).
-fn count_usage(
+pub(crate) fn count_usage(
     usage: &std::sync::Mutex<TurnUsage>,
     registry: &Registry,
     project_root: &Path,
@@ -760,211 +195,29 @@ fn count_usage(
     }
 }
 
-fn parallel_tool_limit(configured: usize) -> usize {
-    configured.clamp(1, 32)
-}
-
-async fn collect_bounded<F>(futures: Vec<F>, parallelism: usize) -> Vec<F::Output>
-where
-    F: Future,
-{
-    let mut completed: Vec<_> = futures_util::stream::iter(
-        futures
-            .into_iter()
-            .enumerate()
-            .map(|(index, future)| async move { (index, future.await) }),
-    )
-    .buffer_unordered(parallel_tool_limit(parallelism))
-    .collect()
-    .await;
-    completed.sort_unstable_by_key(|(index, _)| *index);
-    completed.into_iter().map(|(_, output)| output).collect()
-}
-
-/// Returns true when the user cancelled mid-gate so the turn should stop
-/// before more tools run (matches the serial tool path).
-async fn execute_readonly_batch(
-    ctx: &mut ReadonlyBatchCtx<'_>,
-    calls: &[ToolCall],
-    messages: &mut Vec<ChatMessage>,
-) -> bool {
-    let mut parsed: Vec<Value> = Vec::with_capacity(calls.len());
-    let mut blocked: Vec<Option<tools::ToolOutcome>> = Vec::with_capacity(calls.len());
-    // Per call: admitted by auto without the content question being asked.
-    let mut unasked: Vec<bool> = Vec::with_capacity(calls.len());
-    for call in calls {
-        let name = call.function.name.as_str();
-        // batchable_call already validated the JSON; Null (impossible) would
-        // just surface as a missing-argument tool error.
-        let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-        parsed.push(args.clone());
-        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
-            call_id: call.id.clone(),
-            name: name.into(),
-            args: args.clone(),
-        });
-        // hooks pre → permissions → content gate. approval_mode is skipped
-        // because batchable_call excludes mutating tools.
-        let mode = *ctx.policy_mode;
-        let pre = ctx.hooks.pre_tool_use(ctx.session_id, name, &args, ctx.project_root, &ctx.cancelled).await;
-        refresh_approval_policy_canonical(ctx.core, ctx.session_id, ctx.project_root, ctx.canonical_root, ctx.policy_mode, ctx.hooks, ctx.permissions, messages).await;
-        if mode != *ctx.policy_mode && !matches!(pre, PreToolResult::Cancelled) {
-            // Nothing has executed. Refuse the batch without replaying hooks,
-            // which may have side effects even for a non-mutating tool.
-            for (index, pending) in calls.iter().enumerate() {
-                if index >= parsed.len() {
-                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolStart {
-                        call_id: pending.id.clone(),
-                        name: pending.function.name.clone(),
-                        args: serde_json::from_str(&pending.function.arguments).unwrap_or(Value::Null),
-                    });
-                }
-                ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                    call_id: pending.id.clone(), ok: false, output: POLICY_CHANGED_DURING_HOOK.into(),
-                });
-                messages.push(ChatMessage::tool(pending.id.clone(), format!("Error: {POLICY_CHANGED_DURING_HOOK}")));
-            }
-            return false;
-        }
-        let block = match pre {
-            PreToolResult::Block { reason } => Some(tools::ToolOutcome {
-                ok: false,
-                output: reason,
-                diff: None, ..Default::default()
-            }),
-            PreToolResult::Cancelled => {
-                // Close every ToolStart already emitted in this batch so the
-                // transcript stays well-formed, then stop the turn.
-                for prior in calls.iter().take(parsed.len()) {
-                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                        call_id: prior.id.clone(),
-                        ok: false,
-                        output: "cancelled".to_string(),
-                    });
-                    messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
-                }
-                return true;
-            }
-            PreToolResult::Allow => match ctx.permissions.evaluate(name, &args) {
-                PermissionDecision::Deny { reason } => Some(tools::ToolOutcome {
-                    ok: false,
-                    output: reason,
-                    diff: None, ..Default::default()
-                }),
-                // Ask is excluded from batching (see batchable_call); if it
-                // still lands here outside auto, refuse the batch call.
-                PermissionDecision::Ask if ctx.core.approval_mode_canonical(ctx.canonical_root) != ApprovalMode::Auto => Some(tools::ToolOutcome {
-                    ok: false,
-                    output: "permission rule requires approval; re-run outside a concurrent batch"
-                        .into(),
-                    diff: None, ..Default::default()
-                }),
-                // Allow/Default: readonly batch tools are non-mutating.
-                PermissionDecision::Allow | PermissionDecision::Default | PermissionDecision::Ask => None,
-            },
-        };
-        // Unapproved content is excluded from batching (see batchable_call) so
-        // the serial path can prompt; if one still lands here, block rather
-        // than run unapproved host code outside auto. The sites share one
-        // predicate, so the batch path cannot drift away from the gate again.
-        let auto = ctx.core.approval_mode_canonical(ctx.canonical_root) == ApprovalMode::Auto;
-        let block = block.or_else(|| {
-            if auto { return None; }
-            unapproved_capability(ctx.registry, &ctx.core.data_dir, ctx.project_root, name).map(
-                |source| tools::ToolOutcome {
-                    ok: false,
-                    output: declined_message(Some(&source)),
-                    diff: None,
-                    ..Default::default()
-                },
-            )
-        });
-        unasked.push(auto && block.is_none());
-        blocked.push(block);
+/// Claim `session_id` in a trusted project for a turn or a compaction, and
+/// return the claim's cancel token. `running` is the outer lock for every
+/// piece of turn state: claiming the session and publishing its token (and,
+/// for a turn, opening its steer queue) under one hold is what makes "a
+/// running session always has a live token" true, so work is always
+/// cancellable and nothing can start into a half-claimed session. `before`
+/// names the work in the refusal an untrusted project gets.
+fn claim_session(core: &Arc<Core>, session_id: &str, project_root: &Path, before: &str, steers: bool) -> Result<Arc<CancelToken>, String> {
+    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
+        return Err(format!("project {} is not trusted; establish trust before {before}", project_root.display()));
     }
-
-    let core = ctx.core;
-    let data_dir = &ctx.core.data_dir;
-    let canonical_root = ctx.canonical_root;
-    let futures: Vec<_> = calls
-        .iter()
-        .zip(parsed.iter())
-        .zip(blocked.iter())
-        .zip(unasked.iter().copied())
-        .map(|(((call, args), block), unasked)| {
-            let name = call.function.name.clone();
-            let args = args.clone();
-            let root = ctx.project_root.to_path_buf();
-            let cancel = ctx.cancelled.clone();
-            let registry = ctx.registry.clone();
-            let caps = ctx.caps;
-            let blocked_outcome = block.clone();
-            async move {
-                if let Some(outcome) = blocked_outcome {
-                    return (outcome, false);
-                }
-                // Calls past the parallelism cap start only as earlier ones
-                // end, long after admission. Auto admitted this one without
-                // asking about its content; if the mode has left auto since,
-                // here or in another frontend that saved it, unapproved
-                // content must not start on that admission, or it runs under
-                // ask with no card. Read the store back, then the live mode,
-                // as the serial path does right before each call.
-                if unasked {
-                    core.refresh_saved_approval_modes();
-                    if core.approval_mode_canonical(canonical_root) != ApprovalMode::Auto
-                        && unapproved_capability(&registry, data_dir, &root, &name).is_some()
-                    {
-                        let refused = tools::ToolOutcome {
-                            ok: false,
-                            output: MODE_LEFT_AUTO_BEFORE_START.into(),
-                            ..Default::default()
-                        };
-                        return (refused, false);
-                    }
-                }
-                (registry.execute(&name, &args, data_dir, &root, caps, cancel).await, true)
-            }
-        })
-        .collect();
-    let outcomes = collect_bounded(futures, ctx.parallelism).await;
-
-    for (i, call) in calls.iter().enumerate() {
-        let (outcome, ran) = &outcomes[i];
-        let name = call.function.name.as_str();
-        let args = &parsed[i];
-        if *ran {
-            count_usage(ctx.usage, ctx.registry, ctx.project_root, name, args, outcome.ok);
-            let failures = ctx
-                .hooks
-                .post_tool_use(
-                    ctx.session_id,
-                    name,
-                    args,
-                    ctx.project_root,
-                    outcome,
-                    &ctx.cancelled,
-                )
-                .await;
-            report_hook_failures(ctx.core, ctx.session_id, failures);
-        }
-        if let Some(diff) = &outcome.diff {
-            ctx.core.send_agent(ctx.session_id, AgentEvent::Diff {
-                call_id: call.id.clone(),
-                path: diff.path.clone(),
-                diff: diff.diff.clone(),
-                added: diff.added,
-                removed: diff.removed,
-            });
-        }
-        ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-            call_id: call.id.clone(),
-            ok: outcome.ok,
-            output: outcome.output.clone(),
-        });
-        messages.push(ChatMessage::tool(call.id.clone(), tool_message_content(outcome)));
+    let cancelled = Arc::new(CancelToken::default());
+    let mut running = core.running.lock().unwrap();
+    if running.contains(session_id) {
+        return Err("the agent is already working in this session".into());
     }
-    false
+    sessions::attach(core, session_id)?;
+    core.cancel_flags.lock().unwrap().insert(session_id.to_string(), cancelled.clone());
+    if steers {
+        core.steers.lock().unwrap().insert(session_id.to_string(), Vec::new());
+    }
+    running.insert(session_id.to_string());
+    Ok(cancelled)
 }
 
 /// Kick off one agent turn in a session. Errors if that session is already running.
@@ -974,31 +227,7 @@ pub fn start_turn(
     project_root: PathBuf,
     user_text: String,
 ) -> Result<(), String> {
-    if !crate::trust::is_trusted(&core.data_dir, &project_root)? {
-        return Err(format!(
-            "project {} is not trusted; establish trust before starting a turn",
-            project_root.display()
-        ));
-    }
-    let cancelled = Arc::new(CancelToken::default());
-    {
-        // `running` is the outer lock for both pieces of turn state. Claiming
-        // the session and publishing its cancel token under one hold is what
-        // makes "a running session always has a live token" true, so a turn
-        // can never be started into a state where cancel does nothing.
-        let mut running = core.running.lock().unwrap();
-        if running.contains(&session_id) {
-            return Err("the agent is already working in this session".into());
-        }
-        sessions::attach(&core, &session_id)?;
-        core.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), cancelled.clone());
-        core.steers.lock().unwrap().insert(session_id.clone(), Vec::new());
-        running.insert(session_id.clone());
-    }
-
+    let cancelled = claim_session(&core, &session_id, &project_root, "starting a turn", true)?;
     let settings = core.settings.lock().unwrap().clone();
     // Title is set after user_prompt_submit accepts the text (see run_loop).
     // Titling here would fail-open secret/PII gates into the session index.
@@ -1030,9 +259,7 @@ where
         let stop_reason = match tokio::spawn(turn).await {
             Ok(reason) => reason,
             Err(join) => {
-                let detail = if join.is_cancelled() {
-                    "the turn task was dropped".to_string()
-                } else { panic_detail(join.into_panic()) };
+                let detail = join_failure(join, "turn");
                 core.send_agent(&session_id, AgentEvent::Error {
                     message: format!("the turn ended unexpectedly: {detail}"),
                 });
@@ -1110,8 +337,13 @@ async fn accept_steers(
     true
 }
 
-/// Recover the message a panic carried, for the error event that replaces it.
-fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
+/// Why a guarded `what` task ended without its result, for the error event
+/// that replaces it: the message its panic carried, or that it was dropped.
+fn join_failure(join: tokio::task::JoinError, what: &str) -> String {
+    if join.is_cancelled() {
+        return format!("the {what} task was dropped");
+    }
+    let payload = join.into_panic();
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return (*s).to_string();
     }
@@ -1144,28 +376,7 @@ pub fn compact_session(
     session_id: &str,
     project_root: &Path,
 ) -> Result<(), String> {
-    if !crate::trust::is_trusted(&core.data_dir, project_root)? {
-        return Err(format!(
-            "project {} is not trusted; establish trust before compacting",
-            project_root.display()
-        ));
-    }
-    let cancelled = Arc::new(CancelToken::default());
-    {
-        // Same claim discipline as start_turn: session and cancel token under
-        // one hold, so a running compaction is always cancellable and a turn
-        // can never start into a half-claimed session.
-        let mut running = core.running.lock().unwrap();
-        if running.contains(session_id) {
-            return Err("the agent is already working in this session".into());
-        }
-        sessions::attach(core, session_id)?;
-        core.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), cancelled.clone());
-        running.insert(session_id.to_string());
-    }
+    let cancelled = claim_session(core, session_id, project_root, "compacting", false)?;
     let core = core.clone();
     let session_id = session_id.to_string();
     let project_root = project_root.to_path_buf();
@@ -1184,11 +395,7 @@ pub fn compact_session(
         let outcome = match work.await {
             Ok(outcome) => outcome,
             Err(join) => {
-                let detail = if join.is_cancelled() {
-                    "the compaction task was dropped".to_string()
-                } else {
-                    panic_detail(join.into_panic())
-                };
+                let detail = join_failure(join, "compaction");
                 Err(format!("compaction ended unexpectedly: {detail}"))
             }
         };
@@ -1220,7 +427,7 @@ async fn run_compact(
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
-    let (messages, registry, note, take_seq, factor) = {
+    let (messages, registry, take_seq, factor) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
             .get_mut(session_id)
@@ -1231,15 +438,13 @@ async fn run_compact(
             return Err("a turn is in flight; run /compact after it finishes".into());
         }
         let registry = data.registry.clone();
-        let note = data.trailing_note.clone();
         let factor = token_factor(route_ratio(data.prompt_ratio.as_ref(), &client.origin()));
         let (messages, seq) = take_messages(data);
-        (messages, registry, note, seq, factor)
+        (messages, registry, seq, factor)
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
-    // The same overhead the turn loop budgets with: the tool schemas and the
-    // trailing note the next request sends after the history.
-    let schema_tokens = request_overhead(&registry.schemas_wire_arc(), note.as_deref());
+    // The same overhead the turn loop budgets with: the tool schemas.
+    let schema_tokens = request_overhead(&registry.schemas_wire_arc());
     // In estimator units, like the turn loop's; the receipt converts back.
     let budget = to_estimate(
         endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024),
@@ -1262,7 +467,7 @@ async fn run_compact(
     if schemas_exceed_budget(trigger, schema_tokens) {
         guard.commit().await;
         return Err(
-            "the frozen tool schemas and any trailing note alone fill the window, so pruning \
+            "the frozen tool schemas alone fill the window, so pruning \
              cannot help; uninstall tools (`openmax --spec usage` ranks what each costs) and \
              /reload, or raise context_tokens"
                 .into(),
@@ -1299,307 +504,6 @@ async fn run_compact(
         compacted_messages,
         context_tokens: endpoint.context_tokens,
     })
-}
-
-/// Load a session into the in-memory map if this process has not seen it yet.
-/// Resuming with `-c` or `/resume` starts with an empty map, and the freeze
-/// check only inspects sessions it can find there.
-pub(crate) async fn ensure_session_hydrated(core: &Arc<Core>, session_id: &str, project_root: &Path) -> Result<(), String> {
-    if core.sessions.lock().await.contains_key(session_id) {
-        return Ok(());
-    }
-    let core_clone = core.clone();
-    let session_id_owned = session_id.to_string();
-    let project_root_owned = project_root.to_path_buf();
-    let built = tokio::task::spawn_blocking(move || {
-        build_session_data(&core_clone, &session_id_owned, &project_root_owned)
-    }).await.map_err(|e| format!("session hydration failed: {e}"))??;
-    core.sessions.lock().await.entry(session_id.to_string()).or_insert(built);
-    Ok(())
-}
-
-/// Consecutive iterations whose tool calls AND results are byte-identical.
-///
-/// Identical arguments alone say nothing (#225: a `wait`, a `git status`, a
-/// log tail repeat verbatim while their output moves), so nothing here vetoes
-/// a call; every call executes. What this tracks is the pair: the model asked
-/// the same thing and the world answered the same way. That pair is how a
-/// model that has finished fails to stop: its reasoning says the task is
-/// complete, its reply is the same verification call again, with the same
-/// output, until the iteration cap ends the turn. The shape is common enough
-/// to end turns at the cap. From the third identical pair on, the tool
-/// message carries [`repeated_result_note`]: advisory, counted, and it names
-/// the two ways out.
-#[derive(Default)]
-struct RepeatTracker {
-    last: Option<u64>,
-    streak: usize,
-}
-
-/// The identical-pair count at which the note first appears.
-const REPEAT_NOTE_AT: usize = 3;
-
-/// The note's opening, so tests and readers can find it in a tool message.
-const REPEAT_NOTE_MARK: &str = "[harness: identical call, identical output";
-
-impl RepeatTracker {
-    /// Record one finished iteration: its calls and the tool replies they
-    /// drew (the trailing run of tool messages, one per call). Returns the
-    /// length of the current run of identical iterations, this one included:
-    /// 1 when it differs from the previous one.
-    fn observe(&mut self, calls: &[ToolCall], messages: &[ChatMessage]) -> usize {
-        use std::hash::{Hash as _, Hasher as _};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for call in calls {
-            call.function.name.hash(&mut h);
-            call.function.arguments.hash(&mut h);
-        }
-        let replies = messages.iter().rev().take(calls.len()).take_while(|m| m.role == "tool");
-        for reply in replies {
-            reply.content.hash(&mut h);
-        }
-        let key = h.finish();
-        self.streak = if self.last == Some(key) { self.streak + 1 } else { 1 };
-        self.last = Some(key);
-        self.streak
-    }
-}
-
-/// The advisory for the n-th identical call-and-result pair in a row. It
-/// never claims the result cannot change (a poll can legitimately sit still
-/// for longer than one call may run), so it offers the polling exit and the
-/// finished exit and lets the model pick.
-fn repeated_result_note(n: usize) -> String {
-    format!(
-        "{REPEAT_NOTE_MARK}, {n} times in a row. If you are waiting on something, \
-         keep waiting. If the task is complete, stop calling tools and reply with \
-         a short plain-text summary now.]"
-    )
-}
-
-/// Append a harness note to the last tool message (where the MODEL reads it)
-/// and emit it on the wire as a HarnessNote (where a custom FRONTEND reads
-/// it): the receipts the model sees were invisible to any non-TUI client,
-/// which saw only the bare tool output.
-/// The `\n` prefix keeps the transcript readable; the wire note is clean.
-pub(crate) fn append_and_emit_note(
-    core: &Arc<Core>,
-    session_id: &str,
-    messages: &mut [ChatMessage],
-    note: &str,
-) {
-    // The same door for every mid-turn note. The `\n` below is the harness's
-    // own separator between the tool result and its note, so it is the note
-    // that flattens, never the assembled content.
-    let note = &crate::prompt::defuse_note_header(&crate::text::one_line(note)).into_owned();
-    let call_id = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "tool")
-        .and_then(|m| m.tool_call_id.clone())
-        .unwrap_or_default();
-    if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "tool") {
-        let piece = format!("\n{note}");
-        match &mut last.content {
-            Some(content) => content.push_str(&piece),
-            None => last.content = Some(note.to_string()),
-        }
-    }
-    core.send_agent(session_id, AgentEvent::HarnessNote { call_id, text: note.to_string() });
-}
-
-/// Buffers streamed deltas and flushes them as batched events. Flushes on
-/// push once the batch window has elapsed, and via [`spawn_stale_flusher`]
-/// when the stream goes quiet with a batch still buffered.
-struct TokenBatcher {
-    core: Arc<Core>,
-    session_id: String,
-    content: String,
-    thinking: String,
-    /// On the runtime clock, which the stale flusher's deadline sleeps on.
-    last_flush: tokio::time::Instant,
-    /// Wakes the stale flusher when a batch starts buffering.
-    buffering: Option<tokio::sync::mpsc::Sender<()>>,
-}
-
-impl TokenBatcher {
-    fn new(core: Arc<Core>, session_id: String) -> Self {
-        Self {
-            core,
-            session_id,
-            content: String::new(),
-            thinking: String::new(),
-            last_flush: tokio::time::Instant::now(),
-            buffering: None,
-        }
-    }
-
-    fn push(&mut self, delta: StreamDelta) {
-        let was_empty = self.content.is_empty() && self.thinking.is_empty();
-        match delta {
-            StreamDelta::Content(t) => self.content.push_str(&t),
-            StreamDelta::Reasoning(t) => self.thinking.push_str(&t),
-            // Flush first so the wire keeps the order the client saw: the
-            // reasoning already streamed, then the notice that it is void.
-            StreamDelta::Retry { attempt, max_attempts, reason } => {
-                self.flush();
-                self.core.send_agent(&self.session_id, AgentEvent::Retry { attempt, max_attempts, reason });
-                return;
-            }
-        }
-        if self.last_flush.elapsed() >= FLUSH_INTERVAL {
-            self.flush();
-        } else if was_empty {
-            if let Some(wake) = &self.buffering {
-                // Full means a wake is already pending; the flusher reads
-                // the window when it takes that wake, so it covers this one.
-                let _ = wake.try_send(());
-            }
-        }
-    }
-
-    /// Flush a batch the stream went quiet on. Pushes only flush when the
-    /// next delta arrives, so without this a tail buffered just before the
-    /// deltas stop - the model switching to tool-call arguments (which emit
-    /// no deltas), or a stalled endpoint - stays invisible until the whole
-    /// response ends: for a large write_file call, many seconds after the
-    /// text was received.
-    fn flush_if_stale(&mut self) {
-        if (!self.content.is_empty() || !self.thinking.is_empty())
-            && self.last_flush.elapsed() >= FLUSH_INTERVAL
-        {
-            self.flush();
-        }
-    }
-
-    fn flush(&mut self) {
-        if !self.content.is_empty() {
-            self.core.send_agent(&self.session_id, AgentEvent::Token { text: std::mem::take(&mut self.content) });
-        }
-        if !self.thinking.is_empty() {
-            self.core.send_agent(&self.session_id, AgentEvent::Thinking { text: std::mem::take(&mut self.thinking) });
-        }
-        self.last_flush = tokio::time::Instant::now();
-    }
-}
-
-/// Flush each buffered batch when its window ends, for the lifetime of one
-/// streaming request; the caller aborts the task as soon as the stream
-/// returns. Abort can only land at an await point, so it never interrupts a
-/// flush half way, and a wake racing the caller's final flush finds the
-/// buffers already drained and does nothing.
-///
-/// The task sleeps toward a deadline only while a batch is buffered. Most of
-/// a request has nothing to show (the model thinking before its first token,
-/// or streaming tool-call arguments), and a fixed tick at the batch window
-/// would wake the process 250 times a second through all of it.
-///
-/// The task holds the batcher weakly: a panicking turn unwinds past the
-/// caller's abort, and dropping a JoinHandle detaches rather than aborts, so
-/// a strong reference would leave a task parked (and pinning `Core`) for the
-/// process lifetime. When the turn's own references drop, the batcher's
-/// sender drops with them and the task exits.
-fn spawn_stale_flusher(batcher: &Arc<StdMutex<TokenBatcher>>) -> tokio::task::JoinHandle<()> {
-    let (wake, mut buffering) = tokio::sync::mpsc::channel(1);
-    batcher.lock().unwrap().buffering = Some(wake);
-    let batcher = Arc::downgrade(batcher);
-    tokio::spawn(async move {
-        while buffering.recv().await.is_some() {
-            let Some(strong) = batcher.upgrade() else { return };
-            let due = strong.lock().unwrap().last_flush + FLUSH_INTERVAL;
-            drop(strong);
-            tokio::time::sleep_until(due).await;
-            let Some(strong) = batcher.upgrade() else { return };
-            strong.lock().unwrap().flush_if_stale();
-        }
-    })
-}
-
-/// The mode as the model reads it. It goes out ahead of a session's first
-/// prompt, and again only when the mode changes or a resumed session's
-/// history no longer holds it, but the history resends it on every request
-/// after, so every request pays for it like the system prompt: it names the
-/// mode and its limits, and leaves content approval detail to the contracts
-/// `openmax --spec` prints.
-pub(crate) fn execution_policy_note(mode: ApprovalMode) -> String {
-    let detail = match mode {
-        ApprovalMode::Auto => "do authorized work without asking, extensions included; deny rules and validation still apply",
-        ApprovalMode::Ask => "mutating calls need approval unless a permission allows them; unapproved tool content always does",
-        ApprovalMode::Readonly => "mutating calls and calls needing approval are disabled",
-    };
-    format!("[execution policy: {}; {detail}.]", mode.as_str())
-}
-
-fn rehydrate_approval_mode(messages: &[ChatMessage]) -> Option<ApprovalMode> {
-    let notes = [ApprovalMode::Auto, ApprovalMode::Ask, ApprovalMode::Readonly]
-        .map(|mode| (mode, execution_policy_note(mode)));
-    // Recover only the last visible notice. If wording changes or compaction
-    // removed it, emit the current policy again. This never grants authority.
-    messages.iter().rev()
-        .filter(|m| m.role == "user" || m.role == "tool")
-        .filter_map(|m| m.content.as_deref())
-        .flat_map(|content| content.lines().rev())
-        .find_map(|line| notes.iter().find(|(_, text)| line == text).map(|(mode, _)| *mode))
-}
-
-/// Approvals recorded outside this running session (#199): a human at
-/// another terminal ran `openmax --approve`, and that reaches the session
-/// through no other channel - the refreeze receipt names FILE changes, not
-/// approvals, so a tool that asked yesterday just silently stops asking.
-/// Name any approval/retire event this session has not yet seen, skipping
-/// ones it recorded itself (the model watched those on the card).
-///
-/// Auto never asks: its calls run without content approval, so a grant
-/// changes nothing it does, and reading the chain every turn was pure cost
-/// on the common path. A session that first reads the chain here (one built
-/// in auto) takes what is on record as seen and narrates nothing: those
-/// grants predate anything this turn could have been told.
-///
-/// An unverifiable ledger never reaches this point in a turn: the hook
-/// layer fails closed on the same state first and blocks the input entirely
-/// ("input blocked: the capability ledger cannot be read...", naming
-/// --ledger-repair), and the approvals cache that gate reads is keyed on the
-/// log's content hash, so a rewrite cannot serve it a stale pass. The Result
-/// keeps the API honest for callers that must not mistake "unreadable" for
-/// "no activity".
-async fn narrate_outside_approvals(
-    core: &Arc<Core>,
-    session_id: &str,
-    project_root: &Path,
-    messages: &mut Vec<ChatMessage>,
-) {
-    if core.approval_mode(project_root) == ApprovalMode::Auto {
-        return;
-    }
-    let Ok(events) = crate::ledger::approval_events(&core.data_dir, project_root) else {
-        return;
-    };
-    let mut fresh: Vec<String> = Vec::new();
-    {
-        let mut map = core.sessions.lock().await;
-        let Some(data) = map.get_mut(session_id) else { return };
-        let Some(seen) = data.seen_ledger_events.as_mut() else {
-            data.seen_ledger_events = Some(events.iter().map(|e| e.id).collect());
-            return;
-        };
-        for e in &events {
-            if !seen.insert(e.id) {
-                continue;
-            }
-            if e.session_id.as_deref() == Some(session_id) {
-                continue; // this session's own in-session grant
-            }
-            let path = e.path.strip_prefix(project_root).unwrap_or(&e.path);
-            fresh.push(format!(
-                "{} {}",
-                if e.granted { "approved" } else { "approval retired for" },
-                path.display()
-            ));
-        }
-    }
-    if !fresh.is_empty() {
-        insert_startup_note(core, session_id, messages, outside_approval_note(&fresh));
-    }
 }
 
 /// `refresh_approval_policy_canonical` for a root that has not been resolved
@@ -1648,7 +552,7 @@ fn reload_approval_policy(
 /// another process saved since applies from here, like a selection made in
 /// this one.
 #[allow(clippy::too_many_arguments)]
-async fn refresh_approval_policy_canonical(
+pub(crate) async fn refresh_approval_policy_canonical(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
@@ -1660,46 +564,6 @@ async fn refresh_approval_policy_canonical(
 ) {
     reload_approval_policy(core, session_id, project_root, canonical_root, mode, hooks, permissions);
     narrate_approval_policy(core, session_id, *mode, messages).await;
-}
-
-/// The second half of a refresh: tell the model about `current`, the mode
-/// the first half read, once per change the session has not been told of.
-async fn narrate_approval_policy(
-    core: &Arc<Core>,
-    session_id: &str,
-    current: ApprovalMode,
-    messages: &mut Vec<ChatMessage>,
-) {
-    // Keep provider tool-call/reply adjacency intact. A mode selected before
-    // a batch has any reply is narrated at the next completed reply instead.
-    let Some(last_role) = messages.last().map(|m| m.role.as_str()) else { return };
-    let on_tool = last_role == "tool";
-    if !on_tool && last_role != "user" { return; }
-    let len = messages.len();
-    let mut tail_saved = false;
-    let changed = {
-        let mut sessions = core.sessions.lock().await;
-        sessions.get_mut(session_id).is_some_and(|session| {
-            if session.reported_approval_mode == Some(current) { return false; }
-            session.reported_approval_mode = Some(current);
-            tail_saved = session.persisted_count == len;
-            true
-        })
-    };
-    if changed {
-        let text = execution_policy_note(current);
-        if on_tool {
-            append_and_emit_note(core, session_id, messages, &text);
-        } else {
-            // Ahead of a pending prompt, which reaches disk with the reply. A
-            // user message already saved (a steer, a turn_end refusal: each is
-            // on disk before the request that carries it) is not moved: a save
-            // appends from the persisted length, so a note put ahead of it
-            // would write it to disk twice.
-            let at = if tail_saved { len } else { len - 1 };
-            insert_note(core, session_id, messages, at, text);
-        }
-    }
 }
 
 async fn run_loop(
@@ -1772,6 +636,7 @@ async fn run_loop(
         let data = sessions_map.get_mut(session_id).expect("session was hydrated");
         let first_turn = data.messages.len() <= 1;
         data.messages.push(ChatMessage::user(user_text));
+        store_note(&mut data.messages, data.trailing_note.as_deref());
         let (messages, seq) = take_messages(data);
         (messages, data.registry.clone(), data.trailing_note.clone(), seq, first_turn)
     };
@@ -1805,48 +670,21 @@ async fn run_loop(
     // until a human approves them: both were UI-only, so an agent that wrote
     // itself an allow rule kept being prompted with no stated cause. One
     // harness note per distinct notice per session, ahead of the prompt.
-    startup_notices.extend(hooks.notices().into_iter().map(|f| {
-        // The hook stem and the parse reason are author-controlled and this
-        // text is one clause of a bracketed, `|`-joined policy note (a
-        // user-role message); a newline in either would forge a clause or
-        // close the note, so both are flattened to one line.
-        format!(
-            "hook '{}' on {} did not load: {}",
-            crate::text::one_line(&f.hook),
-            f.event,
-            crate::text::one_line(&f.detail)
-        )
-    }));
-    startup_notices.extend(unchecked.iter().map(|f| {
-        format!(
-            "hook '{}' on {}: {}",
-            crate::text::one_line(&f.hook),
-            f.event,
-            crate::text::one_line(&f.detail)
-        )
-    }));
+    startup_notices.extend(hooks.notices().iter().map(|f| format!("hook {}", hook_clause(f, " did not load"))));
+    startup_notices.extend(unchecked.iter().map(|f| format!("hook {}", hook_clause(f, ""))));
     // A completion gate that cannot start ends each turn `unverified` after
     // the model's last word, so this is the first point it can be told.
-    startup_notices.extend(hooks.completion_gates_that_cannot_start(project_root).into_iter().map(|f| {
-        format!(
-            "hook '{}' on turn_end cannot start, so no turn's end is verified until it is repaired: {}",
-            crate::text::one_line(&f.hook),
-            crate::text::one_line(&f.detail)
-        )
-    }));
+    let gates = hooks.completion_gates_that_cannot_start(project_root);
+    let unverified = " cannot start, so no turn's end is verified until it is repaired";
+    startup_notices.extend(gates.iter().map(|f| format!("hook {}", hook_clause(f, unverified))));
     let novel = novel_policy_notices(core, session_id, startup_notices).await;
     if !novel.is_empty() {
         let text = format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER));
         insert_startup_note(core, session_id, guard.messages(), text);
     }
 
-    // The provider catalog's content identity at turn start: an agent bash
-    // edit to ~/.openmax/providers.json is otherwise silent (the file is
-    // outside the project root, so no refreeze covers it), and a malformed
-    // edit would surface turns later as an unrelated-looking resolve error.
-    let mut providers_seen = crate::providers::providers_status(&core.data_dir).content_hash;
-    let mut hooks_seen = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
-    let mut approval_seen = approval_state(core, &registry, project_root, &canonical_root);
+    // What a mutating call can change that no refreeze covers, as the turn starts.
+    let mut changes = ChangeWatch::new(core, &registry, project_root, &canonical_root);
 
     if let Some(note) = settings_drift_note(core) {
         // Same channel as the refreeze receipt: before the prompt, once per
@@ -1885,6 +723,8 @@ async fn run_loop(
         }
     };
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
+    if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(format!("{} {}", client.reasoning_effort.map_or("default", ReasoningEffort::as_str), client.origin())); }
     // Frozen wire form: every request of the session injects the same tool
     // schema bytes without re-serializing the Value array. A refreeze swaps
     // the registry and keeps these (a tool file written since rides the
@@ -1938,12 +778,10 @@ async fn run_loop(
         reload_approval_policy(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions);
         accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await;
         narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
-        // The tool schemas and the note are re-sent whole on every request,
-        // so they are as real as the transcript: the overhead every request
-        // carries besides the history. Read per iteration: a mid-turn
-        // refreeze swaps the note, and the overhead must follow the current
-        // generation, not the one this turn started with.
-        let schema_tokens = request_overhead(&schemas_wire, note.as_deref());
+        // The tool schemas are re-sent whole on every request, so they are
+        // as real as the transcript: the overhead every request carries
+        // besides the history, the note stored in it included.
+        let schema_tokens = request_overhead(&schemas_wire);
         // The window is counted in the server's tokens and everything
         // compaction compares is an estimate, so the window side converts
         // here, once. `compaction_tokens` converts with it (inside the
@@ -1989,7 +827,7 @@ async fn run_loop(
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
         let result = client
-            .stream_chat_with_note(guard.messages(), note.as_deref(), &schemas_wire, cancelled.clone(), move |delta| {
+            .stream_chat(guard.messages(), &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -2316,8 +1154,7 @@ async fn run_loop(
                 if name.is_empty() {
                     let msg = "tool call has an empty function name; use a known tool name from the schema";
                     core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: String::new(), args: Value::Null });
-                    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.into() });
-                    guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                    end_call(core, session_id, &call.id, &tools::ToolOutcome::err(msg), guard.messages());
                     continue;
                 }
                 let args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -2342,8 +1179,7 @@ async fn run_loop(
                         };
                         let msg = format!("{cause} Arguments sent: {sent}");
                         core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
-                        core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call.id.clone(), ok: false, output: msg.clone() });
-                        guard.messages().push(ChatMessage::tool(call.id.clone(), format!("Error: {msg}")));
+                        end_call(core, session_id, &call.id, &tools::ToolOutcome::err(msg), guard.messages());
                         continue;
                     }
                 };
@@ -2366,19 +1202,7 @@ async fn run_loop(
                 }
                 match pre {
                     PreToolResult::Block { reason } => {
-                        core.send_agent(session_id, AgentEvent::ToolEnd {
-                            call_id: call.id.clone(),
-                            ok: false,
-                            output: reason.clone(),
-                        });
-                        guard.messages().push(ChatMessage::tool(
-                            call.id.clone(),
-                            tool_message_content(&tools::ToolOutcome {
-                                ok: false,
-                                output: reason,
-                                diff: None, ..Default::default()
-                            }),
-                        ));
+                        end_call(core, session_id, &call.id, &tools::ToolOutcome::err(reason), guard.messages());
                         continue;
                     }
                     PreToolResult::Cancelled => {
@@ -2390,15 +1214,7 @@ async fn run_loop(
                         // pushed here keeps the transcript pairing visible in
                         // the same place instead of leaning on the post-loop
                         // orphan stubs.
-                        core.send_agent(session_id, AgentEvent::ToolEnd {
-                            call_id: call.id.clone(),
-                            ok: false,
-                            output: "The user cancelled this turn.".into(),
-                        });
-                        guard.messages().push(ChatMessage::tool(
-                            call.id.clone(),
-                            "The user cancelled this turn.",
-                        ));
+                        end_cancelled(core, session_id, &call.id, guard.messages());
                         stop_reason = "cancelled".into();
                         break 'turns;
                     }
@@ -2407,19 +1223,7 @@ async fn run_loop(
 
                 let perm = permissions.evaluate(name, &args);
                 if let PermissionDecision::Deny { reason } = &perm {
-                    core.send_agent(session_id, AgentEvent::ToolEnd {
-                        call_id: call.id.clone(),
-                        ok: false,
-                        output: reason.clone(),
-                    });
-                    guard.messages().push(ChatMessage::tool(
-                        call.id.clone(),
-                        tool_message_content(&tools::ToolOutcome {
-                            ok: false,
-                            output: reason.clone(),
-                            diff: None, ..Default::default()
-                        }),
-                    ));
+                    end_call(core, session_id, &call.id, &tools::ToolOutcome::err(reason.clone()), guard.messages());
                     continue;
                 }
 
@@ -2433,19 +1237,11 @@ async fn run_loop(
                     .flatten();
                 let mut executed = false;
                 let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
-                    (tools::ToolOutcome {
-                        ok: false,
-                        output: "This session is read-only; mutating tools are disabled. Explain what you would do instead.".into(),
-                        diff: None, ..Default::default()
-                    }, false)
+                    (tools::ToolOutcome::err("This session is read-only; mutating tools are disabled. Explain what you would do instead."), false)
                 } else if approval_mode == ApprovalMode::Readonly
                     && (unapproved_source.is_some() || force_ask)
                 {
-                    (tools::ToolOutcome {
-                        ok: false,
-                        output: "This session is read-only; calls requiring approval are disabled.".into(),
-                        ..Default::default()
-                    }, false)
+                    (tools::ToolOutcome::err("This session is read-only; calls requiring approval are disabled."), false)
                 } else if approval_mode == ApprovalMode::Ask
                     && (unapproved_source.is_some() || (!force_allow && (force_ask || registry.is_mutating(name))))
                 {
@@ -2459,11 +1255,7 @@ async fn run_loop(
                     core.refresh_saved_approval_modes();
                     match answer {
                         ApprovalOutcome::Approved if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Readonly => {
-                            (tools::ToolOutcome {
-                                ok: false,
-                                output: "This session is now read-only; the pending action was not executed.".into(),
-                                ..Default::default()
-                            }, false)
+                            (tools::ToolOutcome::err("This session is now read-only; the pending action was not executed."), false)
                         }
                         ApprovalOutcome::Approved => {
                             let source = source.filter(|_| core.approval_mode_canonical(&canonical_root) != ApprovalMode::Auto);
@@ -2559,26 +1351,12 @@ async fn run_loop(
                             }
                             (outcome, false)
                         }
-                        ApprovalOutcome::Declined => (tools::ToolOutcome {
-                            ok: false,
-                            output: match source {
-                                Some(source) if agent_spawned() => {
-                                    nested_session_declined_message(source)
-                                }
-                                _ => declined_message(source),
-                            },
-                            diff: None, ..Default::default()
-                        }, false),
-                        ApprovalOutcome::TimedOut => (tools::ToolOutcome {
-                            ok: false,
-                            output: APPROVAL_TIMEOUT_MESSAGE.into(),
-                            diff: None, ..Default::default()
-                        }, false),
-                        ApprovalOutcome::Cancelled => (tools::ToolOutcome {
-                            ok: false,
-                            output: "The user cancelled this turn.".into(),
-                            diff: None, ..Default::default()
-                        }, true),
+                        ApprovalOutcome::Declined => (tools::ToolOutcome::err(match source {
+                            Some(source) if agent_spawned() => nested_session_declined_message(source),
+                            _ => declined_message(source),
+                        }), false),
+                        ApprovalOutcome::TimedOut => (tools::ToolOutcome::err(APPROVAL_TIMEOUT_MESSAGE), false),
+                        ApprovalOutcome::Cancelled => (tools::ToolOutcome::err(USER_CANCELLED), true),
                     }
                 } else {
                     executed = true;
@@ -2591,12 +1369,7 @@ async fn run_loop(
                 };
 
                 if turn_cancelled {
-                    core.send_agent(session_id, AgentEvent::ToolEnd {
-                        call_id: call.id.clone(),
-                        ok: false,
-                        output: "The user cancelled this turn.".into(),
-                    });
-                    guard.messages().push(ChatMessage::tool(call.id.clone(), "The user cancelled this turn."));
+                    end_cancelled(core, session_id, &call.id, guard.messages());
                     stop_reason = "cancelled".into();
                     break 'turns;
                 }
@@ -2615,27 +1388,10 @@ async fn run_loop(
                     report_hook_failures(core, session_id, failures);
                 }
 
-                if let Some(diff) = &outcome.diff {
-                    core.send_agent(session_id, AgentEvent::Diff {
-                        call_id: call.id.clone(),
-                        path: diff.path.clone(),
-                        diff: diff.diff.clone(),
-                        added: diff.added,
-                        removed: diff.removed,
-                    });
-                }
-                core.send_agent(session_id, AgentEvent::ToolEnd {
-                    call_id: call.id.clone(),
-                    ok: outcome.ok,
-                    output: outcome.output.clone(),
-                });
+                end_call(core, session_id, &call.id, &outcome, guard.messages());
                 if executed {
                     count_usage(&turn_usage, &registry, project_root, name, &args, outcome.ok);
                 }
-
-                // Approval timeouts are not model errors; the "Error:" prefix
-                // would push small models into pointless retry loops.
-                guard.messages().push(ChatMessage::tool(call.id.clone(), tool_message_content(&outcome)));
                 if executed && registry.is_mutating(name) {
                     // Any executed mutating call may have changed extension
                     // bytes, a FAILED one included: a bash command can persist
@@ -2669,182 +1425,8 @@ async fn run_loop(
                     // the parse reason and the turn-scoped rule.
                     let fail_closed_now = current.fail_closed_reason().map(str::to_string);
                     permissions.reload(current);
-                    if let Some(reason) = fail_closed_now {
-                        let novel = novel_policy_notices(
-                            core,
-                            session_id,
-                            vec![format!("permissions fail-closed: {reason}")],
-                        )
-                        .await;
-                        if !novel.is_empty() {
-                            // The repair carve-out returns Default for
-                            // write/edit on this file, but an earlier
-                            // snapshot this turn may have explicitly DENIED
-                            // one of them, and the most restrictive answer
-                            // wins - so the receipt must not promise a
-                            // repair tool a rule already blocks.
-                            // A rule reads the path a call touches, however
-                            // it is spelled, so one probe answers for all.
-                            let repair_denied = |tool: &str| {
-                                let probe = serde_json::json!({ "path": ".openmax/permissions.toml" });
-                                matches!(permissions.evaluate(tool, &probe), crate::permissions::PermissionDecision::Deny { .. })
-                            };
-                            let allowed: Vec<&str> = ["write_file", "edit_file"]
-                                .into_iter()
-                                .filter(|t| !repair_denied(t))
-                                .collect();
-                            let repair_clause = if allowed.is_empty() {
-                                "a rule earlier this turn denies write_file and edit_file on \
-                                 this file too, so even the repair waits for the START OF THE \
-                                 NEXT TURN; read_file is not allowed"
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "{} on exactly this file is still allowed and takes effect \
-                                     at the START OF THE NEXT TURN, not this one; read_file is \
-                                     NOT, so rewrite it from what you intended",
-                                    allowed.join("/")
-                                )
-                            };
-                            let note = format!(
-                                "[permissions.toml is now malformed ({reason}). Every tool \
-                                 call is DENIED for the rest of THIS turn - policy snapshots \
-                                 only narrow within a turn, never widen - and your repair \
-                                 ({repair_clause}). \
-                                 openmax --check cannot run until then (bash is denied too).]"
-                            );
-                            append_and_emit_note(core, session_id, guard.messages(), &note);
-                        }
-                    }
-                    // The agent may have just written itself an allow
-                    // rule that can never fire (#180). Say so NOW, on
-                    // this call's result, with the command that lifts
-                    // it - not silently at the next surprise prompt.
-                    let novel = novel_policy_notices(core, session_id, inert).await;
-                    if !novel.is_empty() {
-                        let note =
-                            format!("{PERMISSION_NOTE_PREFIX_CLEAN}{}]", novel.join(NOTICE_JOINER));
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A providers.json edit (bash: the file is outside
-                    // the project root) gets a receipt too: what loaded,
-                    // when it applies - or that the catalog is EMPTY,
-                    // while the author can still fix it.
-                    let status = crate::providers::providers_status(&core.data_dir);
-                    if status.content_hash != providers_seen {
-                        providers_seen = status.content_hash;
-                        let note = match &status.parse_error {
-                            Some(err) => format!(
-                                "[providers.json changed but is invalid JSON: {err}. The \
-                                 provider catalog is EMPTY until this parses; any turn using \
-                                 settings.provider will fail at its start.]"
-                            ),
-                            None => format!(
-                                "[providers.json changed: {} provider(s) ({}). Endpoint \
-                                 resolution happens at turn start, so a provider or model \
-                                 switch applies from the next turn; switching this session's \
-                                 model is /model, which the user runs.]",
-                                status.count,
-                                status.names.join(", ")
-                            ),
-                        };
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A script edit revokes the approval of the tool that
-                    // runs it, but moves no fingerprint: no refreeze, no
-                    // receipt - and the model learned only when the next
-                    // call raised a card. Diff approval state per call.
-                    let approval_now = approval_state(core, &registry, project_root, &canonical_root);
-                    let mut revoked: Vec<String> = Vec::new();
-                    for (name, state) in &approval_now {
-                        if let (Some(path), Some(None)) = (state, approval_seen.get(name)) {
-                            revoked.push(format!(
-                                "{name} (openmax --approve {})",
-                                crate::doctor::shell_quote(std::path::Path::new(path))
-                            ));
-                        }
-                    }
-                    approval_seen = approval_now;
-                    if !revoked.is_empty() {
-                        revoked.sort();
-                        let note = format!(
-                            "[approval revoked: the code these tools run changed since a human \
-                             approved it, so the next call of each stops for a card: {}. Re-approve \
-                             the exact bytes, or prove them first with openmax --check --run-examples.]",
-                            revoked.join(", ")
-                        );
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A hook file written this call: hooks are outside
-                    // the extension fingerprint, so this write got no
-                    // refreeze receipt and the inertness notice would
-                    // otherwise land a whole turn later, leaving the
-                    // agent believing its gate was live for a whole turn.
-                    let hooks_now = crate::hooks::hooks_fingerprint(&core.data_dir, project_root);
-                    if hooks_now != hooks_seen {
-                        hooks_seen = hooks_now;
-                        let discovered = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(&canonical_root));
-                        let inert: Vec<String> = discovered
-                            .notices()
-                            .into_iter()
-                            .map(|f| {
-                                format!(
-                                    "'{}' on {}: {}",
-                                    crate::text::one_line(&f.hook),
-                                    f.event,
-                                    crate::text::one_line(&f.detail)
-                                )
-                            })
-                            .collect();
-                        // An APPROVED gate whose bytes just changed is not
-                        // inert - it fails closed and blocks every tool
-                        // call from the next turn until restored or
-                        // re-approved. Say that, not "applies next turn".
-                        let note = if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Auto {
-                            let mut note = match discovered.fail_closed_reason() {
-                                Some(reason) => format!("[hook files changed. Invalid or unavailable hooks block tools from the next turn until repaired: {reason}"),
-                                None => "[hook files changed. Valid hooks apply from the next turn under auto without content approval.".into(),
-                            };
-                            // Named on this write, while this turn can fix
-                            // it, not at the hook's first run next turn.
-                            let unstartable = discovered.cannot_start(project_root);
-                            if !unstartable.is_empty() {
-                                if !note.ends_with('.') {
-                                    note.push('.');
-                                }
-                                note.push_str(&format!(" These cannot start as written: {}", unstartable.join(" | ")));
-                            }
-                            note + "]"
-                        } else if let Some(blocked) = discovered.fail_closed_reason() {
-                            format!(
-                                "[hook files changed. A live gate is now failing closed: \
-                                 {blocked}. From the next turn every tool call is BLOCKED \
-                                 until the file is restored to its approved bytes or a human \
-                                 re-approves it (openmax --approve <path>, at a terminal \
-                                 outside any session).]"
-                            )
-                        } else if inert.is_empty() {
-                            "[hook files changed. Hooks are discovered at turn start; \
-                             approved hooks apply from the next turn.]"
-                                .to_string()
-                        } else {
-                            format!(
-                                "[hook files changed. Not running: {}. Hooks activate only \
-                                 after a human runs openmax --approve <path> at a terminal \
-                                 outside any session; until then the guarantee is NOT in \
-                                 force - say so if asked, do not claim it.]",
-                                inert.join(" | ")
-                            )
-                        };
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
-                    // A settings.json edit (bash: outside the project
-                    // root) is inert for this session and bricks the
-                    // next launch when malformed - answered on the
-                    // writing call, while it is still repairable.
-                    if let Some(note) = settings_drift_note(core) {
-                        append_and_emit_note(core, session_id, guard.messages(), &note);
-                    }
+                    narrate_permissions_reload(core, session_id, &permissions, fail_closed_now, inert, guard.messages()).await;
+                    changes.after_mutation(core, session_id, project_root, &canonical_root, &registry, guard.messages());
                 }
             }
         }
@@ -2872,13 +1454,16 @@ async fn run_loop(
         if refrozen {
             // The refreeze receipt already narrated manifest-level approval
             // changes; resync so the per-call diff does not repeat them.
-            approval_seen = approval_state(core, &registry, project_root, &canonical_root);
+            changes.resync_approvals(core, &registry, project_root, &canonical_root);
         } else if memory_written {
             // A memory write changes no extension byte, so no refreeze ran,
-            // and the note, sent after the history as the harness's account
-            // of what changed, must not go on presenting the line it replaced.
+            // and the note, the harness's account of what changed, must not
+            // go on presenting the line it replaced.
             refresh_note_after_memory_write(core, session_id, project_root, &registry, &mut note).await;
         }
+        // A note this iteration changed goes on its last tool result, the
+        // receipt's, before the save that writes that result.
+        store_note(guard.messages(), note.as_deref());
         save_messages(core, session_id, guard.messages(), false).await;
     }
 
@@ -2887,7 +1472,7 @@ async fn run_loop(
     // before tools ran), or a truncated response whose calls were refused.
     // Stub the orphans so resume templates stay well-formed.
     let unanswered_note = if stop_reason == "cancelled" || cancelled.is_cancelled() {
-        Some("The user cancelled this turn.")
+        Some(USER_CANCELLED)
     } else if stop_reason == TRUNCATED {
         Some("The provider stream ended before this call could run; it was not executed.")
     } else {
@@ -2939,143 +1524,6 @@ async fn run_loop(
         );
     }
     stop_reason
-}
-
-/// Persist transcript to disk without cloning it back into SessionData.
-/// The turn owns `messages` until `MessageGuard` commits on drop/finish.
-/// True when the transcript is durable on disk after this call (see
-/// `sessions::save_messages`).
-pub(crate) async fn save_messages(core: &Arc<Core>, session_id: &str, messages: &[ChatMessage], rewrite: bool) -> bool {
-    let mut sessions_map = core.sessions.lock().await;
-    if let Some(data) = sessions_map.get_mut(session_id) {
-        let saved = sessions::save_messages(core, session_id, messages, &mut data.persisted_count, rewrite);
-        land_deferred_resume_edits(core, session_id, data, saved);
-        saved
-    } else {
-        false
-    }
-}
-
-/// Move the replay boundaries of a hydration repair once `saved` says the
-/// file holds it: the first save after a failed hydration rewrite rewrites
-/// the file whole (`sessions::PERSISTED_STALE`), and every save after that
-/// keeps it. The edits stay pending until the index write that applies them
-/// lands, so an index that refuses the write leaves them for the next save
-/// to retry, instead of leaving each later divider a message early for good.
-pub(crate) fn land_deferred_resume_edits(core: &Core, session_id: &str, data: &mut SessionData, saved: bool) {
-    if saved
-        && !data.deferred_resume_edits.is_empty()
-        && sessions::apply_resume_edits(core, session_id, &data.deferred_resume_edits).is_ok()
-    {
-        data.deferred_resume_edits.clear();
-    }
-}
-
-/// Process-unique ids for transcript takes. Starts at 1 so a freshly built
-/// `SessionData` (`take_seq: 0`) can never match a live guard.
-static TAKE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Take the transcript for a turn and stamp the session with a fresh take id.
-/// The paired [`MessageGuard`] may only write back while the stamp matches.
-pub(crate) fn take_messages(data: &mut SessionData) -> (Vec<ChatMessage>, u64) {
-    let seq = TAKE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    data.take_seq = seq;
-    (std::mem::take(&mut data.messages), seq)
-}
-
-/// Holds the turn-local transcript and restores it to SessionData on drop so a
-/// panic or early exit cannot leave the session empty after `mem::take`.
-///
-/// Normal exits call [`MessageGuard::commit`] (async lock). `Drop` first
-/// `try_lock`s (`blocking_lock` panics inside a Tokio async context); if the
-/// lock is contended the restore is handed to a spawned task. Every write-back
-/// requires the session's `take_seq` to still equal this guard's — a newer
-/// turn or a recreated session re-stamps it, which turns a late restore into
-/// a no-op instead of installing stale context.
-struct MessageGuard {
-    core: Arc<Core>,
-    session_id: String,
-    messages: Option<Vec<ChatMessage>>,
-    take_seq: u64,
-}
-
-fn restore_if_current(
-    map: &mut std::collections::HashMap<String, SessionData>,
-    session_id: &str,
-    take_seq: u64,
-    messages: Vec<ChatMessage>,
-) {
-    if let Some(data) = map.get_mut(session_id) {
-        if data.take_seq == take_seq && data.messages.is_empty() {
-            data.messages = messages;
-        }
-    }
-}
-
-impl MessageGuard {
-    fn new(core: Arc<Core>, session_id: &str, messages: Vec<ChatMessage>, take_seq: u64) -> Self {
-        Self {
-            core,
-            session_id: session_id.to_string(),
-            messages: Some(messages),
-            take_seq,
-        }
-    }
-
-    fn messages(&mut self) -> &mut Vec<ChatMessage> {
-        self.messages.as_mut().expect("messages already committed")
-    }
-
-    /// Move the working transcript back into SessionData. Consumes the guard
-    /// so `Drop` becomes a no-op.
-    async fn commit(mut self) {
-        if let Some(messages) = self.messages.take() {
-            let mut map = self.core.sessions.lock().await;
-            restore_if_current(&mut map, &self.session_id, self.take_seq, messages);
-        }
-    }
-}
-
-impl Drop for MessageGuard {
-    fn drop(&mut self) {
-        let Some(mut messages) = self.messages.take() else {
-            return;
-        };
-        // No commit means an unwind (a panic, or the turn's task dropped),
-        // possibly mid-tool: the call is on record and its reply is not. The
-        // session stays live in this process, so hydration never sees this
-        // transcript again; what goes back here is what the next request
-        // sends, and an unanswered call would make the provider refuse it.
-        // The only call left unanswered is the one this turn was running, so
-        // the replies land at the tail, past everything on disk, and the
-        // next turn's save appends them in order. Drop cannot rewrite the
-        // file, so a reply placed any earlier would leave disk and memory
-        // apart.
-        complete_pending_tool_replies(&mut messages, INTERRUPTED_TOOL_CALL);
-        match self.core.sessions.try_lock() {
-            Ok(mut map) => {
-                restore_if_current(&mut map, &self.session_id, self.take_seq, messages);
-            }
-            Err(_) => {
-                // Lock contended mid-unwind. Discarding here would leave the
-                // session entry present-but-empty for the process lifetime
-                // (it never rehydrates from disk once the entry exists), so
-                // hand the restore to the runtime instead.
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let core = self.core.clone();
-                    let session_id = self.session_id.clone();
-                    let take_seq = self.take_seq;
-                    let restoration = handle.spawn(async move {
-                        let mut map = core.sessions.lock().await;
-                        restore_if_current(&mut map, &session_id, take_seq, messages);
-                    });
-                    self.core.message_restorations.lock().unwrap()
-                        .insert(self.session_id.clone(), restoration);
-                }
-                // No runtime means process teardown; disk saves bound the loss.
-            }
-        }
-    }
 }
 
 /// The capability file behind a tool whose exact content no human has
@@ -3151,7 +1599,7 @@ pub(crate) fn unapproved_capability(
 /// gate is not a user decision, so saying "the user declined" would be false
 /// and would leave the agent with nothing to relay: name the boundary and the
 /// exact command that lifts it.
-fn declined_message(source: Option<&UnapprovedCapability>) -> String {
+pub(crate) fn declined_message(source: Option<&UnapprovedCapability>) -> String {
     match source {
         Some(source) => format!(
             "This tool's content has not been approved by a human, so the harness declined the call. \
@@ -3176,43 +1624,6 @@ fn nested_session_declined_message(source: &UnapprovedCapability) -> String {
          terminal, or make the tool's first call from a session a human is watching.",
         source.path
     )
-}
-
-/// Which external tools currently lack an approval covering their exact
-/// bytes (manifest + bound code). Diffed after every mutating call so a
-/// script edit - which moves no extension fingerprint and so earns no
-/// refreeze receipt - is still announced the moment it revokes an approval.
-fn unapproved_tool_map(
-    registry: &Registry,
-    data_dir: &Path,
-    project_root: &Path,
-) -> std::collections::HashMap<String, Option<String>> {
-    registry
-        .tools
-        .iter()
-        .filter(|s| matches!(s.kind, crate::registry::ToolKind::External(_)))
-        .map(|s| {
-            let state = unapproved_capability(registry, data_dir, project_root, &s.name).map(|u| u.path);
-            (s.name.clone(), state)
-        })
-        .collect()
-}
-
-/// `unapproved_tool_map` outside auto, and empty under it: auto runs every
-/// external tool without content approval, so there is no revocation to
-/// announce, and the map costs a read of the chain per external tool on
-/// every mutating call. A diff across a mode switch starts from empty and
-/// so announces nothing; the next call's card (or its absence) is accurate.
-fn approval_state(
-    core: &Core,
-    registry: &Registry,
-    project_root: &Path,
-    canonical_root: &Path,
-) -> std::collections::HashMap<String, Option<String>> {
-    if core.approval_mode_canonical(canonical_root) == ApprovalMode::Auto {
-        return std::collections::HashMap::new();
-    }
-    unapproved_tool_map(registry, &core.data_dir, project_root)
 }
 
 /// True when the harness itself spawned this process: every child it starts
@@ -3355,10 +1766,19 @@ fn approval_detail(args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch::{collect_bounded, MODE_LEFT_AUTO_BEFORE_START};
+    use crate::client::StreamDelta;
     use crate::compaction::tests::msg;
     use crate::compaction::{
-        enforce_budget, is_digest_message, CompactionDigest, DIGEST_PREFIX, DROPPED_TEXT_CAP_FLOOR, MAX_DIGEST_SNIPPET_BYTES,
+        is_digest_message, CompactionDigest, DIGEST_PREFIX, DROPPED_TEXT_CAP_FLOOR, MAX_DIGEST_SNIPPET_BYTES,
     };
+    use crate::notes::{
+        canonical_notice, execution_policy_note, outside_approval_note, policy_notice_hash, rehydrate_policy_notices,
+        REPEAT_NOTE_MARK,
+    };
+    use crate::state::SessionData;
+    use crate::stream::FLUSH_INTERVAL;
+    use crate::transcript::{build_session_data, land_deferred_resume_edits, INTERRUPTED_TOOL_CALL};
     use crate::types::estimate_tokens;
 
     #[tokio::test]
@@ -6934,7 +5354,7 @@ mod tests {
         let map = core.sessions.lock().await;
         let data = &map[id];
         let sent = &data.messages[..data.messages.len() - 1];
-        request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
+        request_overhead(&data.registry.schemas_wire_arc())
             + sent.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
     }
 
@@ -7175,7 +5595,7 @@ mod tests {
         let (pruned, raised) = {
             let map = core.sessions.lock().await;
             let data = &map[&id];
-            let sent = request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
+            let sent = request_overhead(&data.registry.schemas_wire_arc())
                 + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
             (sent, data.prompt_ratio.as_ref().unwrap().1)
         };
@@ -7960,7 +6380,7 @@ mod tests {
         let message = error.expect("the failed turn must surface an error");
         assert!(message.contains("maximum context length exceeded"), "{message}");
         assert!(message.contains("over budget before it was sent"), "{message}");
-        assert!(message.contains("frozen tool schemas and any trailing note, re-sent every request"), "{message}");
+        assert!(message.contains("frozen tool schemas, re-sent every request"), "{message}");
         assert!(message.contains("and /reload"), "a frozen schema leaves the request only at /reload: {message}");
         assert!(message.contains("context_tokens 1200"), "{message}");
         assert_eq!(stop.as_deref(), Some("error"));
@@ -8963,7 +7383,7 @@ mod tests {
             }
             // The fat tail puts the automatic path in its fallback band:
             // enforce_budget must hold still on this exact transcript.
-            let schema_tokens = request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref());
+            let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
                 compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &data.messages),
@@ -9105,7 +7525,7 @@ mod tests {
         let used = {
             let map = core.sessions.lock().await;
             let data = &map[id];
-            request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
+            request_overhead(&data.registry.schemas_wire_arc())
                 + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
         };
         let mut s = core.settings.lock().unwrap();
@@ -9312,7 +7732,7 @@ mod tests {
         let notes: Vec<&str> = msgs
             .iter()
             .filter_map(|m| m.content.as_deref())
-            .filter(|c| c.contains("tool schemas and any trailing note cost"))
+            .filter(|c| c.contains("tool schemas cost"))
             .collect();
         assert_eq!(notes.len(), 1, "{msgs:?}");
 
@@ -9350,10 +7770,11 @@ mod tests {
     }
 
     /// A mid-turn refreeze leaves the wire schemas alone and grows the note,
-    /// so the overhead the budget carries must follow the current
-    /// generation's note, not the one the session started with.
+    /// which is stored on the iteration's last tool result: the budget counts
+    /// it with the history it is stored in, and the overhead every request
+    /// carries besides the history stays the schemas.
     #[tokio::test]
-    async fn budget_overhead_tracks_the_refrozen_note() {
+    async fn the_budget_counts_a_refrozen_note_with_the_history() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -9371,16 +7792,17 @@ mod tests {
             let (messages, _seq) = take_messages(data);
             (messages, data.registry.clone(), data.trailing_note.clone())
         };
+        messages.push(ChatMessage::assistant(None, Some(vec![ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "write_file".into(), arguments: "{}".into() },
+            extra_content: None,
+        }])));
+        messages.push(ChatMessage::tool("c1", "wrote it"));
         let wire = registry.schemas_wire_arc();
-        let carried = |note: &Option<Arc<str>>| {
-            note.as_deref().map_or(0, |n| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + n.len()))
-        };
-        let before = request_overhead(&wire, note.as_deref());
-        assert_eq!(
-            before,
-            estimate_tokens(wire.len()) + carried(&note),
-            "overhead must be the bytes the request actually carries: the schemas, and the note with its separator"
-        );
+        let history = |messages: &[ChatMessage]| messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+        let before = history(&messages);
+        assert_eq!(note, None, "a session that changed nothing has no note");
 
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
@@ -9390,36 +7812,19 @@ mod tests {
         .unwrap();
         assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
         assert_eq!(registry.tool_schemas_wire(), &*wire, "the schemas never move");
-        let after = request_overhead(&wire, note.as_deref());
-        assert_eq!(after, estimate_tokens(wire.len()) + carried(&note), "the refrozen note, priced the same way");
-        assert!(after > before, "a new tool must grow the overhead: {before} -> {after}");
-
-        // And enforcement follows: a window that fit the old generation with
-        // this transcript no longer fits the new one.
-        let mut transcript = vec![msg("system", 200), msg("user", 200)];
-        for _ in 0..4 {
-            transcript.push(msg("assistant", 200));
-            transcript.push(msg("tool", 4000));
-        }
-        let budget: usize =
-            before + transcript.iter().map(|m| m.estimated_tokens()).sum::<usize>();
-        let mut old_generation = transcript.clone();
-        assert!(!enforce_budget(&mut old_generation, budget, before).0);
-        assert!(
-            enforce_budget(&mut transcript, budget, after).0,
-            "the refrozen note must be what pushes the turn over"
-        );
+        store_note(&mut messages, note.as_deref());
+        let stored = note.as_deref().expect("a new tool is a change");
+        assert!(messages.last().unwrap().content.as_deref().unwrap().ends_with(stored), "the note ends the tool result");
+        assert!(history(&messages) >= before + estimate_tokens(stored.len()), "the history carries the note");
+        assert_eq!(request_overhead(&wire), estimate_tokens(wire.len()), "and the overhead is the schemas alone");
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `/compact` prices a request the way the turn loop does: the tool
-    /// schemas plus the trailing note the next request sends after the
-    /// history. Pricing the schemas alone under-reported its receipt by the
-    /// note and aimed the prune at a target the next request overshoots by
-    /// the same amount, so the next turn's own budget pass pruned again.
+    /// schemas plus the history, the note stored in it included.
     #[tokio::test]
-    async fn compact_prices_the_trailing_note_like_the_turn_loop() {
+    async fn compact_prices_the_stored_note_like_the_turn_loop() {
         use crate::state::{CancelToken, Core};
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -9436,25 +7841,24 @@ mod tests {
             s.max_tokens = 1_024;
         }
         let mut data = build_session_data(&core, &id, &project).unwrap();
+        // The note a tool written after the prompt leaves, stored on it.
+        data.trailing_note = Some(Arc::from(format!("{}\n\n- wordfreq: top-n words {{}}\n", crate::prompt::NOTE_HEADER)));
         data.messages.push(ChatMessage::user("ship it".to_string()));
+        store_note(&mut data.messages, data.trailing_note.as_deref());
         data.messages.push(ChatMessage::assistant(Some("shipped".into()), None));
         assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
-        // The note a tool written after the prompt leaves.
-        data.trailing_note = Some(Arc::from(format!("{}\n\n- wordfreq: top-n words {{}}\n", crate::prompt::NOTE_HEADER)));
         let transcript: usize = data.messages.iter().map(ChatMessage::estimated_tokens).sum();
         let wire = data.registry.schemas_wire_arc();
-        let note = data.trailing_note.clone();
         core.sessions.lock().await.insert(id.clone(), data);
 
-        let turn_loop = request_overhead(&wire, note.as_deref());
-        assert!(turn_loop > estimate_tokens(wire.len()), "the note must cost something here");
+        let turn_loop = request_overhead(&wire);
 
         let receipt = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(receipt.compacted_messages, 0, "the transcript is already under the target");
         assert_eq!(
             receipt.tokens_before,
             turn_loop + transcript,
-            "/compact must count what the turn loop counts: the schemas, the note, and the transcript"
+            "/compact must count what the turn loop counts: the schemas and the transcript, the note in it"
         );
 
         let _ = std::fs::remove_dir_all(dir);

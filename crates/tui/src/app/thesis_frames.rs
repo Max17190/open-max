@@ -72,6 +72,9 @@ fn transcript_frame_p99_at_100k_lines() {
         if app.transcript.len() >= LINES {
             break;
         }
+        // A frame that left the transcript without a width would leave it
+        // counting no rows, and the fill would run to the bound below.
+        assert!(blocks == 0 || app.transcript.len() > 0, "a frame drew {blocks} blocks and the transcript counts no rows");
         // Every block is at least a row, so no fill needs more blocks.
         assert!(blocks < LINES, "{blocks} blocks pushed, and the transcript counts {} rows", app.transcript.len());
         push_long_history(&mut app, FILL_STEP);
@@ -245,6 +248,7 @@ fn transcript_frame_p99_at_1m_lines() {
         if app.transcript.len() >= FILL_TO {
             break;
         }
+        assert!(blocks == 0 || app.transcript.len() > 0, "a frame drew {blocks} blocks and the transcript counts no rows");
         assert!(blocks < FILL_TO, "{blocks} blocks pushed, and the transcript counts {} rows", app.transcript.len());
         push_marathon(&mut app, blocks, STEP);
         blocks += STEP;
@@ -329,9 +333,9 @@ fn transcript_frame_p99_at_1m_lines() {
         app.transcript.len(),
         mb(peak)
     );
-    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap();
+    let stated = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/development.md")).unwrap();
     let claim = format!("a release build holds it to a ratchet of {LINUX_RATCHET_MS} ms until it meets its target");
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     assert_eq!(chat_allocations, 0, "an idle frame of the conversation allocated");
     assert!(per_row <= 600.0, "the transcript holds {per_row:.0} bytes a row");
     assert!(read - held <= 5_000_000, "reading every row once grew the heap by {:.1} MB", mb(read - held));

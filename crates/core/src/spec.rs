@@ -26,13 +26,15 @@ pub const SURFACES: [&str; 13] = [
     "usage",
 ];
 
-/// The authoring contract for one surface, or None for an unknown name.
+/// One surface's authoring contract (or the `.approval` part it names), or None.
 pub fn render(surface: &str) -> Option<&'static str> {
     match surface {
         "tools" => Some(TOOLS),
+        "tools.approval" => Some(TOOLS_APPROVAL),
         "skills" => Some(SKILLS),
         "prompts" => Some(PROMPTS),
         "hooks" => Some(HOOKS),
+        "hooks.approval" => Some(HOOKS_APPROVAL),
         "permissions" => Some(PERMISSIONS),
         "providers" => Some(PROVIDERS),
         "settings" => Some(SETTINGS),
@@ -125,7 +127,7 @@ Fields:
 - `mutating` (optional, default false): routes calls through the ordinary
   approval_mode gate (snapshots, read-only sessions, prompts). Trusted
   metadata for scheduling and UX, not a sandbox: it never widens or narrows
-  the human content approval below.
+  the human content approval required outside auto.
 - `env` (optional, default none): the environment variable NAMES this tool
   receives from the harness's environment, e.g. `env = ["GITHUB_TOKEN"]`
   (at most 16). Everything not listed is scrubbed: the tool always gets a
@@ -148,11 +150,10 @@ password, an ssh host key) fails at once. When the tool exits, any
 process still in that group is terminated (`&`, `nohup` and `disown` leave a
 process there), and the result carries a note saying so. Cleanup reaches only
 that group: a process that moved itself to a new session or group is neither
-stopped nor reported. A
-helper that must outlive the call, such as a long-lived server, belongs in a
-named tmux session. The process is a
-native host process with the network and filesystem authority of Open Max;
-its environment is the scrubbed baseline plus the manifest's `env` list.
+stopped nor reported. A helper that must outlive the call, such as a
+long-lived server, belongs in a named tmux session. The process is a native
+host process with the network and filesystem authority of Open Max; its
+environment is the scrubbed baseline plus the manifest's `env` list.
 
 Execution policy: in auto, valid tools run without confirmation or content
 grants, including after edits. Deny rules and hook gates still apply. In ask,
@@ -161,34 +162,8 @@ content approval, even under a permission allow rule. Later calls of the same
 bytes need no content approval, but the mutating/permission gate still applies.
 Readonly refuses mutating calls and calls requiring confirmation.
 
-Select /permissions auto|ask|readonly in a
-human-controlled frontend.
-The choice persists for this exact trusted project across launches, including
-headless/stdio. A subdirectory, including a worktree placed under the project,
-without its own choice follows the nearest enclosing project's. A worktree
-outside the root (git worktree add ../x) needs its own trust and choice. Other
-projects retain their own choice or settings default.
-Running in auto does not grant hashes: switching back to ask restores content
-requirements. Approve specific bytes with openmax --approve <manifest> or the
-content card in ask. Approving a file write approves only that write.
-
-The following content binding applies when content approval is required.
-What "the exact bytes" covers is the whole definition: the `.toml` *and* the
-project-local file its `command` (or a path in `args`) names, because that file
-is the code that actually runs and the agent can rewrite it after the fact.
-Editing the manifest or that script makes the next call ask again. A `command`
-outside the project root (an absolute path, a name on PATH) is covered by the
-manifest approval alone - that path is what the human read - while a command
-resolving to no file at all is covered by nothing, so the tool asks until it
-exists. `openmax --approve <tool.toml>` approves the pair up front and prints
-every path and hash it blessed.
-
-Binding reaches the files a manifest *names*. A command handed a program on
-its own command line (`python3 -c "..."`, `sh -c "..."`) has that program text
-bound - it is part of the manifest - but anything the program opens while it
-runs is chosen at runtime and is not. Put the program in a project file and
-name it in `args`, and its bytes are covered too; `openmax --check` warns when
-inline text reads a project file.
+Outside auto (ask, readonly), how a human keeps a mode, what a content approval
+binds, and how an example runs: `openmax --spec tools.approval`.
 
 Example (`.openmax/tools/todo_scan.toml`):
 
@@ -217,7 +192,7 @@ script itself before first use:
 
 The tools array is the one the session began with, so a write never moves
 the cached prompt prefix. A tool file written or changed after that is a
-line of the trailing note at the end of each request, `- name: description
+line of the note stored in your history when it changes, `- name: description
 <params as JSON>; bash: printf '%s\n' '<JSON arguments>' | command args`
 (command and args shell-quoted): run it with that bash command, the JSON
 arguments filled in (a `'` in them written `'\''`), from your next step on.
@@ -250,6 +225,37 @@ Plain `--check` runs no command.
 In auto, examples run the real host command without content approval, behind
 hook gates and permission denies. Permission ask rules do not prompt or block
 in auto. Validation, output limits, and execution reports still apply.
+"#;
+
+const TOOLS_APPROVAL: &str = r#"# External tools: content approval outside auto (ask, readonly)
+
+Select /permissions auto|ask|readonly in a human-controlled frontend.
+The choice persists for this exact trusted project across launches, including
+headless/stdio. A subdirectory, including a worktree placed under the project,
+without its own choice follows the nearest enclosing project's. A worktree
+outside the root (git worktree add ../x) needs its own trust and choice. Other
+projects retain their own choice or settings default.
+Running in auto does not grant hashes: switching back to ask restores content
+requirements. Approve specific bytes with openmax --approve <manifest> or the
+content card in ask. Approving a file write approves only that write.
+
+The following content binding applies when content approval is required.
+What "the exact bytes" covers is the whole definition: the `.toml` *and* the
+project-local file its `command` (or a path in `args`) names, because that file
+is the code that actually runs and the agent can rewrite it after the fact.
+Editing the manifest or that script makes the next call ask again. A `command`
+outside the project root (an absolute path, a name on PATH) is covered by the
+manifest approval alone - that path is what the human read - while a command
+resolving to no file at all is covered by nothing, so the tool asks until it
+exists. `openmax --approve <tool.toml>` approves the pair up front and prints
+every path and hash it blessed.
+
+Binding reaches the files a manifest *names*. A command handed a program on
+its own command line (`python3 -c "..."`, `sh -c "..."`) has that program text
+bound - it is part of the manifest - but anything the program opens while it
+runs is chosen at runtime and is not. Put the program in a project file and
+name it in `args`, and its bytes are covered too; `openmax --check` warns when
+inline text reads a project file.
 
 Outside auto, an example's execution depends on whether a human has approved
 the tool's exact bytes (manifest plus the project-local code it names):
@@ -318,8 +324,8 @@ budget first. More skills or longer descriptions can push a skill out of the
 prompt entirely (`openmax --check` names each one it drops). The prompt
 shows each indexed skill as `- name: description — path/to/SKILL.md`.
 A skill written or changed after the prompt was built shows the same line
-in the trailing note at the end of each request until `/reload` or a new
-session puts it in the prompt.
+in the note stored in your history when it changes, until `/reload` or a
+new session puts it in the prompt.
 
 Example (`.agents/skills/release/SKILL.md`):
 
@@ -489,10 +495,32 @@ path is missing or has no executable bit, whose command is not on PATH, or
 whose interpreter's script does not exist; while a blocking `turn_end` gate
 is in that state, the model is also told at turn start, once per session for
 each distinct failure.
-Manifest edits apply from the next turn; a script runs from disk, so an edit
-to it applies at the hook's next run. Explicit mode changes refresh policy
+Manifest edits apply from the next turn, with no reload: in print mode
+(`openmax -p`) the run's next `-p` prompt, and any run started later, including
+one started now from bash (`openmax -p ...`). A script runs from disk, so an
+edit to it applies at the hook's next run. Explicit mode changes refresh policy
 before subsequent calls. Execution failures are reported and no hashes are
 automatically granted. Removing a hook in auto removes that policy.
+
+In ask/readonly, a hook is inert until a human approves its exact content, and
+deleting, breaking or (for a gate) editing an approved hook blocks every tool:
+read `openmax --spec hooks.approval` before changing a hook outside auto.
+
+Example (`.openmax/hooks/deny-rm.toml`):
+
+```toml
+event = "pre_tool_use"
+command = "sh"
+args = ["./scripts/deny-rm.sh"]
+tool = "bash"
+timeout_secs = 5
+```
+
+Verify with `openmax --check`. Test the script directly:
+`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | sh ./scripts/deny-rm.sh`.
+"#;
+
+const HOOKS_APPROVAL: &str = r#"# Hooks: content approval outside auto (ask, readonly)
 
 In ask/readonly, a hook is inert until a human approves its exact content - the
 `.toml` *and* the project-local file its `command` (or a path in `args`) names,
@@ -554,21 +582,7 @@ reported by `openmax --check`:
 
 A hook whose content was never approved is inert rather than blocking: it never
 ran, so it removes no policy. It is not silent - each turn reports it, and
-`openmax --check` names it. Hooks are re-discovered every turn; no reload is
-needed.
-
-Example (`.openmax/hooks/deny-rm.toml`):
-
-```toml
-event = "pre_tool_use"
-command = "sh"
-args = ["./scripts/deny-rm.sh"]
-tool = "bash"
-timeout_secs = 5
-```
-
-Verify with `openmax --check`. Test the script directly:
-`echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | sh ./scripts/deny-rm.sh`.
+`openmax --check` names it.
 "#;
 
 const PERMISSIONS: &str = r#"# Permission rules
@@ -590,7 +604,8 @@ What the regex matches:
 - `read_file`, `write_file`, `edit_file`, `list_dir` → the path the tool will
   touch, resolved and root-relative however the call spells it (a directory
   ends in `/`); a `deny` also reads it absolute, and ignores case.
-- `glob` → the pattern; `grep` → the pattern, and the path it searches.
+- `glob` → the pattern; `grep` → the pattern or the resolved search root.
+  A `deny` on `grep` ignores case.
 - any other tool → the full serialized JSON arguments.
 
 A rule (and a `pre_tool_use` hook) sees TEXT, not effects. A `deny` on
@@ -838,11 +853,11 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
 - `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,
-  `xhigh`, or `max`. Unset leaves the provider default. Native Anthropic
-  accepts low through max; model support varies. Its compatibility route
-  ignores effort and is refused when set. Humans use /effort or Shift+Tab
-  for live changes; these never change permissions. Explicit in-session
-  selections persist unless the endpoint is a temporary launch override.
+  `xhigh`, or `max`. Unset leaves the provider default. A level the route
+  refuses fails before any request: native Anthropic takes low to max, xAI's
+  grok-4.x low to xhigh, Anthropic's compatibility route none. Humans use
+  /effort or Shift+Tab for live changes; these never change permissions.
+  Explicit selections persist unless the endpoint is a launch override.
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
 - `compaction_tokens`: optional early-compaction trigger; only ever earlier.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
@@ -928,7 +943,7 @@ history that keeps a fact alive.
 Activation: a memory write does not re-freeze. The index is frozen with the
 prompt for the whole session, so the provider's prompt cache survives every
 write. A memory added, edited, or deleted after the prompt was built is a
-line of the trailing note at the end of each request: from your next step
+line of the note stored in your history when it changes: from your next step
 when you write it with write_file or edit_file, and otherwise (bash, another
 process) from the next re-freeze a tool or skill change causes (that receipt
 then says "Memory index rebuilt with this refreeze (indexed: <name>)") or the
@@ -1064,7 +1079,7 @@ fields. Parse by field name, never by key order. Only two lines carry no
 `session_id`: `protocol_error` and the `approval_mode` acknowledgement
 (`hello`, `transcript`, and `forked` are not events either, but carry one). Types: `token` (text), `thinking`
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
-the tool schemas and any trailing note sent on every request, context_tokens),
+the tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
 (call_id, name, args), `tool_end` (call_id, ok, output), `harness_note`
 (call_id, text: a note the harness wrote into the MODEL's transcript - a
@@ -1080,7 +1095,7 @@ path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt, one line
 per tool or skill file added, modified, or removed), `schemas_over_budget`
-(schema_tokens, budget_tokens: the tool schemas and any trailing note take
+(schema_tokens, budget_tokens: the tool schemas take
 most of what the window can spend, so compaction runs early and stops
 entirely once they reach it; advisory, at most once per session), `compacted` (tokens_before,
 tokens_after, compacted_messages: the receipt of a forced compaction;
@@ -1335,6 +1350,64 @@ git log --stat -1 subagent/make-the-flaky-retry-test-1a2b3c4d
 mod tests {
     use super::*;
 
+    /// The frozen prompt sends an agent to `openmax --spec <surface>` in
+    /// bash before it writes a capability, so a contract the bash cap cut
+    /// would lose its middle on exactly the read that needs all of it. The
+    /// cap bounds what one result adds to every later request, and every
+    /// contract must still fit under it whole.
+    #[test]
+    fn every_contract_fits_one_bash_result_whole() {
+        let cap = crate::tools::OutputCaps::default().command_bytes;
+        for surface in SURFACES {
+            let Some(text) = render(surface) else { continue };
+            assert!(text.len() < cap, "--spec {surface} is {} bytes, over the {cap}-byte bash cap", text.len());
+        }
+    }
+
+    /// Every `openmax --spec <name>` a contract sends its reader to prints,
+    /// and fits one bash result whole like the contract that named it: a
+    /// pointer to a part that does not render is a dead end mid-task.
+    #[test]
+    fn every_spec_a_contract_names_renders() {
+        let cap = crate::tools::OutputCaps::default().command_bytes;
+        let mut named = Vec::new();
+        for surface in SURFACES {
+            let Some(text) = render(surface) else { continue };
+            for (_, rest) in text.match_indices("openmax --spec ").map(|(at, m)| text.split_at(at + m.len())) {
+                let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.')).unwrap_or(rest.len());
+                let name = rest[..end].trim_end_matches('.');
+                if !name.is_empty() && name != "usage" {
+                    named.push(name.to_string());
+                }
+            }
+        }
+        assert!(named.iter().any(|n| n == "tools.approval") && named.iter().any(|n| n == "hooks.approval"));
+        for name in named {
+            let text = render(&name).unwrap_or_else(|| panic!("a contract names `openmax --spec {name}`, which renders nothing"));
+            assert!(text.len() < cap, "--spec {name} is {} bytes, over the {cap}-byte bash cap", text.len());
+        }
+    }
+
+    /// Content approval detail that applies only outside auto is one command
+    /// away instead of in the contract every authoring session re-sends on
+    /// each later request: in auto none of it applies. The contract still
+    /// states each mode's rule and names the command, and nothing is lost:
+    /// the part prints the moved text.
+    #[test]
+    fn outside_auto_approval_detail_is_one_command_away() {
+        for (surface, part, detail) in [
+            ("tools", "tools.approval", "The following content binding applies"),
+            ("tools", "tools.approval", "SANDBOXED PROBE"),
+            ("hooks", "hooks.approval", "Editing a live gate cannot turn it off"),
+            ("hooks", "hooks.approval", "openmax --forget <path>"),
+        ] {
+            let contract = render(surface).unwrap();
+            assert!(contract.contains(&format!("`openmax --spec {part}`")), "--spec {surface} names {part}");
+            assert!(!contract.contains(detail), "--spec {surface} leaves {detail:?} to {part}");
+            assert!(render(part).is_some_and(|t| t.contains(detail)), "--spec {part} prints {detail:?}");
+        }
+    }
+
     /// No authoring surface claims the refreeze needs a SUCCESSFUL call:
     /// #242 activates on any executed mutating call (a failed writer
     /// included), and the permissions/settings/memory surfaces already said
@@ -1433,6 +1506,16 @@ mod tests {
             HOOKS.contains(&format!("At most {} hooks", crate::hooks::MAX_HOOKS_PER_EVENT)),
             "--spec hooks names the least visible cap: hooks have no prompt trailer"
         );
+    }
+
+    /// Hooks are discovered at turn start and print mode runs only the turns
+    /// its command line names, so a hook written in a one-prompt run has no
+    /// next turn there: the contract names the runs that apply it.
+    #[test]
+    fn spec_hooks_names_the_runs_that_apply_a_new_hook() {
+        for run in ["(`openmax -p`) the run's next `-p` prompt", "one started now from bash (`openmax -p ...`)"] {
+            assert!(HOOKS.contains(run), "--spec hooks must name {run}");
+        }
     }
 
     #[test]
@@ -1659,7 +1742,8 @@ mod tests {
     /// The execution policy note names a mode and its limits and leaves
     /// content approval detail to the contracts, and docs/configuration.md
     /// says that detail is in `openmax --spec tools`, `hooks`, and
-    /// `permissions`. Each of those contracts must keep stating its own
+    /// `permissions` (and the `.approval` parts the first two name outside
+    /// auto). Each of those contracts must keep stating its own
     /// content approval rule, or that sentence sends the reader to a contract
     /// that no longer says it. Line wrapping is collapsed so the check does
     /// not depend on where a phrase breaks across lines.

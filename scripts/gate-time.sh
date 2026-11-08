@@ -66,16 +66,20 @@ esac
   echo "error: name the repository as OWNER/NAME with --repo (or GITHUB_REPOSITORY), not '$repo'" >&2
   exit 2
 }
-perl -MJSON::PP -MTime::Local -e 1 2> /dev/null || {
-  echo "error: $0 needs perl with its core modules JSON::PP and Time::Local" >&2
-  exit 2
-}
-
-report=$(perl -MJSON::PP -MTime::Local=timegm -e '
+# The perl below loads its two modules before anything else and exits 2,
+# naming them, when it cannot: one perl start, where a check of its own
+# would start a second one with the same modules.
+report=$(perl -e '
 use strict;
 use warnings;
+BEGIN {
+  eval { require JSON::PP; require Time::Local; Time::Local->import("timegm"); 1 } or do {
+    print STDERR "error: $ARGV[0] needs perl with its core modules JSON::PP and Time::Local\n";
+    exit 2;
+  };
+}
 
-my ($repo, $want) = @ARGV;
+my (undef, $repo, $want) = @ARGV;
 my $workflow = "ci.yml";
 my $json = JSON::PP->new->utf8;
 sub fail {
@@ -170,7 +174,7 @@ printf "since the oldest of them, %d %s at the first attempt (%d of them passed 
 # verdict, so it breaks no run of them.
 printf "target p50 under 90 s and p99 under 120 s over %d consecutive %s that passed at the first attempt: %s\n",
   $want, $want == 1 ? "run" : "runs", $n == $want && $red == 0 && $p50 < 90 && $p99 < 120 ? "met" : "not met";
-' "$repo" "$runs") || exit $?
+' "$0" "$repo" "$runs") || exit $?
 
 echo "$report"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

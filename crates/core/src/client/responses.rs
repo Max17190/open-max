@@ -6,20 +6,14 @@ use serde_json::json;
 pub(super) fn serialize(
     client: &ChatClient,
     messages: &[ChatMessage],
-    note: Option<&str>,
     tools: &str,
 ) -> Result<Vec<u8>, String> {
-    let origin = client.origin();
+    let (origin, (effort, changes)) = (client.origin(), client.effort_plan(messages));
     let mut input = Vec::new();
-    let last = messages.len().saturating_sub(1);
-    let fold_note = messages.last().is_some_and(|m| m.role == "user" || m.role == "tool");
-    for (index, m) in messages.iter().enumerate() {
-        let mut content = m.content.clone().unwrap_or_default();
-        if index == last && fold_note {
-            if let Some(note) = note {
-                content.push_str(NOTE_SEPARATOR);
-                content.push_str(note);
-            }
+    for (i, m) in messages.iter().enumerate() {
+        let content = m.content.as_deref().unwrap_or_default();
+        if let Some((_, level)) = changes.iter().find(|(at, _)| *at == i) {
+            input.push(json!({"type":"configuration_update","reasoning":{"effort":level}}));
         }
         if m.role == "assistant" && m.reasoning_origin.as_deref() == Some(&origin) {
             if let Some(raw) = &m.reasoning_details {
@@ -45,11 +39,6 @@ pub(super) fn serialize(
             }
         }
     }
-    if !fold_note {
-        if let Some(note) = note {
-            input.push(json!({"role":"user","content":note}));
-        }
-    }
     let schemas: Vec<Value> = serde_json::from_str(tools).map_err(|_| "invalid frozen tools")?;
     let mut functions = Vec::new();
     for schema in schemas {
@@ -72,13 +61,18 @@ pub(super) fn serialize(
     }
     // This supported input item avoids an extra namespace and leaves tool names
     // unchanged. It joins the frozen prefix immediately after the instructions.
-    if !functions.is_empty() {
+    // A server whose input defines no such item refuses the whole request
+    // over it (`providers::TOOLS_FIELD`): there the tools go in `tools`.
+    if !functions.is_empty() && !crate::providers::TOOLS_FIELD.iter().any(|(host, prefix)| crate::providers::serves(&client.base_url, &client.model, host, prefix)) {
         let at = usize::from(input.first().is_some_and(|item| item["role"] == "developer"));
-        input.insert(at, json!({"type":"additional_tools","role":"developer","tools":functions}));
+        input.insert(at, json!({"type":"additional_tools","role":"developer","tools":std::mem::take(&mut functions)}));
     }
     let mut body = json!({"model":client.model,"input":input,"store":false,"stream":true,
         "include":["reasoning.encrypted_content"]});
-    if let Some(effort) = client.reasoning_effort {
+    if !functions.is_empty() {
+        body["tools"] = json!(functions);
+    }
+    if let Some(effort) = effort {
         body["reasoning"] = json!({"effort": effort});
     }
     // Both OpenAI routes take it: the subscription one refuses
@@ -155,14 +149,8 @@ fn complete(value: &Value) -> Result<CompletionResult, String> {
         match item["type"].as_str() {
             Some("message") => {
                 for part in item["content"].as_array().ok_or("invalid Responses message")? {
-                    let text = match part["type"].as_str() {
-                        Some("output_text") => part["text"].as_str(),
-                        Some("refusal") => part["refusal"].as_str(),
-                        _ => None,
-                    };
-                    if let Some(text) = text {
-                        result.content.push_str(text);
-                    }
+                    let key = match part["type"].as_str() { Some("output_text") => "text", Some("refusal") => "refusal", _ => continue };
+                    result.content.push_str(part[key].as_str().unwrap_or_default());
                 }
             }
             Some("reasoning") => reasoning.push(item.clone()),
@@ -188,19 +176,9 @@ fn complete(value: &Value) -> Result<CompletionResult, String> {
     if !result.tool_calls.is_empty() {
         result.finish_reason = "tool_calls".into();
     }
-    if !reasoning.is_empty() {
-        result.reasoning_details = Some(
-            RawValue::from_string(serde_json::to_string(&reasoning).map_err(|_| "invalid reasoning")?)
-                .map_err(|_| "invalid reasoning")?,
-        );
-    }
-    if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
-        result.usage = Some(Usage {
-            prompt_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-            cached_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64(),
-        });
-    }
+    result.reasoning_details =
+        (!reasoning.is_empty()).then(|| serde_json::value::to_raw_value(&reasoning)).transpose().map_err(|_| "invalid reasoning")?;
+    result.usage = parse_usage(&value["usage"]);
     Ok(result)
 }
 
@@ -231,14 +209,8 @@ pub(super) async fn read(
             chunk = tokio::time::timeout(idle, stream.next()) => chunk,
             _ = cancelled.cancelled() => { result.finish_reason = "cancelled".into(); return (result, None); }
         };
-        let chunk = match next {
-            Ok(Some(Ok(chunk))) => chunk,
-            _ => {
-                return (
-                    result,
-                    Some(Unfinished::Interrupted("Responses stream ended before response.completed".into())),
-                )
-            }
+        let Ok(Some(Ok(chunk))) = next else {
+            return (result, Some(Unfinished::Interrupted("Responses stream ended before response.completed".into())));
         };
         if chunk.len() > MAX_RESPONSE_BYTES - received {
             return (result, None);
@@ -262,9 +234,8 @@ pub(super) async fn read(
             if data.is_empty() {
                 continue;
             }
-            let mut event: Value = match serde_json::from_slice(&data) {
-                Ok(v) => v,
-                Err(_) => return (result, Some(Unfinished::Interrupted("invalid Responses event".into()))),
+            let Ok(mut event) = serde_json::from_slice::<Value>(&data) else {
+                return (result, Some(Unfinished::Interrupted("invalid Responses event".into())));
             };
             data.clear();
             match event["type"].as_str() {
@@ -482,25 +453,21 @@ mod tests {
     }
 
     #[test]
-    fn notes_stay_at_the_transcript_tail_and_complex_tool_schemas_keep_their_shape() {
+    fn each_message_goes_as_its_stored_text_and_complex_tool_schemas_keep_their_shape() {
         let client = ChatClient::new("http://127.0.0.1".into(), None, "fixture".into(), None, 64);
-        for (last, key, folded) in [
-            (ChatMessage::user("task"), "content", true),
-            (ChatMessage::tool("call-1", "result"), "output", true),
-            (ChatMessage::assistant(Some("answer".into()), None), "content", false),
+        // A prompt cache that ends its entry at the newest user message or
+        // tool output holds the stored text, as the next request sends it.
+        for (last, key) in [
+            (ChatMessage::user("task"), "content"),
+            (ChatMessage::tool("call-1", "result"), "output"),
+            (ChatMessage::assistant(Some("answer".into()), None), "content"),
         ] {
             let messages = [ChatMessage::system("rules"), last.clone()];
-            let body: Value = serde_json::from_slice(&serialize(&client, &messages, Some("live note"), "[]").unwrap()).unwrap();
+            let body: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
             assert_eq!(body["input"][0]["content"], "rules");
             let input = body["input"].as_array().unwrap();
-            if folded {
-                assert_eq!(input.len(), 2);
-                assert_eq!(input[1][key], format!("{}{NOTE_SEPARATOR}live note", last.content.unwrap()));
-            } else {
-                assert_eq!(input.len(), 3);
-                assert_eq!(input[1]["content"], "answer");
-                assert_eq!(input[2], json!({"role":"user","content":"live note"}));
-            }
+            assert_eq!(input.len(), 2);
+            assert_eq!(input[1][key], last.content.unwrap());
         }
         for parameters in [
             json!({"type":"object","properties":{"value":{"type":"string"}},"required":[],"additionalProperties":false}),
@@ -508,7 +475,7 @@ mod tests {
             json!({"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":true}),
         ] {
             let tools = json!([{"type":"function","function":{"name":"fixture","parameters":parameters}}]);
-            let body: Value = serde_json::from_slice(&serialize(&client, &[], None, &tools.to_string()).unwrap()).unwrap();
+            let body: Value = serde_json::from_slice(&serialize(&client, &[], &tools.to_string()).unwrap()).unwrap();
             assert_eq!(body["input"][0]["tools"][0]["strict"], false);
             assert_eq!(body["input"][0]["tools"][0]["parameters"], parameters);
         }
@@ -516,9 +483,112 @@ mod tests {
             let mut message = ChatMessage::assistant(Some("answer".into()), None);
             message.reasoning_details = Some(RawValue::from_string(json!([{"type":"reasoning","encrypted_content":"opaque"}]).to_string()).unwrap());
             message.reasoning_origin = Some(if same_origin { client.origin() } else { "different-origin".into() });
-            let body = serialize(&client, &[message], None, "[]").unwrap();
+            let body = serialize(&client, &[message], "[]").unwrap();
             assert_eq!(String::from_utf8(body).unwrap().contains("opaque"), same_origin);
         }
+    }
+
+    /// The table is pinned: a server joins it only with its host and model
+    /// prefix. A request to that host, or for one of its models at any host
+    /// (a proxy or gateway in front of it), carries the tools in `tools` and
+    /// no `additional_tools` item; any other carries the item and no `tools`.
+    /// Either way the same functions go, and none when there are no tools.
+    #[test]
+    fn a_server_without_the_tools_item_gets_the_tools_field() {
+        assert_eq!(crate::providers::TOOLS_FIELD, [("api.x.ai", "grok-")]);
+        let fixture = json!([{"type":"function","function":{"name":"fixture","parameters":{"type":"object"}}}]).to_string();
+        let body = |url: &str, model: &str, tools: &str| -> Value {
+            let client = ChatClient::new(url.into(), None, model.into(), None, 64);
+            let messages = [ChatMessage::system("rules"), ChatMessage::user("task")];
+            serde_json::from_slice(&serialize(&client, &messages, tools).unwrap()).unwrap()
+        };
+        let openai = body("https://api.openai.com/v1", "gpt-5.6", &fixture);
+        assert_eq!(openai["input"][1]["type"], "additional_tools");
+        let functions = &openai["input"][1]["tools"];
+        assert_eq!(functions.as_array().unwrap().len(), 1);
+        let messages = json!([{"role":"developer","content":"rules"},{"role":"user","content":"task"}]);
+        for (url, model) in [("https://api.x.ai/v1", "m"), (" https://API.x.ai/v1/ ", "m"), ("http://127.0.0.1:8080/v1", "grok-4.7"),
+            ("https://openrouter.ai/api/v1", "x-ai/Grok-4.7")] {
+            let field = body(url, model, &fixture);
+            assert_eq!((&field["tools"], &field["input"]), (functions, &messages), "{model} at {url}");
+            assert_eq!(body(url, model, "[]").get("tools"), None, "{model} at {url}");
+        }
+        for (url, model) in [("http://127.0.0.1:8080/v1", "m"), ("https://api.x.ai.example/v1", "x-grok-4.7"), ("not a url", "grok"),
+            ("https://openrouter.ai/api/v1", "grok/m")] {
+            let item = body(url, model, &fixture);
+            assert_eq!((&item["input"][1]["tools"], item.get("tools")), (functions, None), "{model} at {url}");
+            assert_eq!(body(url, model, "[]")["input"], messages, "{model} at {url}");
+        }
+    }
+
+    /// A GPT-6 conversation keeps the effort it opened with at the top of
+    /// every request and sends each later choice as a `configuration_update`
+    /// just ahead of the prompt it was made for, so a change appends to what
+    /// the requests before it sent. Only the prompts this route ran and a
+    /// reply answered count, and the newest. Where the model, the wire or the
+    /// route documents no such item, or the prompts in the history do not end
+    /// on the current effort or return to the default, the top names the
+    /// current effort and no item goes, as before.
+    #[test]
+    fn an_effort_change_rides_the_history_where_the_model_takes_it() {
+        use crate::config::ReasoningEffort::{High, Medium};
+        let history = |client: &ChatClient, efforts: &[&str]| {
+            let mut messages = vec![ChatMessage::system("rules")];
+            for (turn, effort) in efforts.iter().enumerate() {
+                messages.push(ChatMessage::user("note"));
+                messages.push(ChatMessage { effort: Some(format!("{effort} {}", client.origin())), ..ChatMessage::user(format!("task {turn}")) });
+                messages.push(ChatMessage::assistant(Some(format!("done {turn}")), None));
+            }
+            messages
+        };
+        let body = |client: &ChatClient, messages: &[ChatMessage]| -> Value {
+            serde_json::from_slice(&serialize(client, messages, "[]").unwrap()).unwrap()
+        };
+        let update = |effort: &str| json!({"type":"configuration_update","reasoning":{"effort":effort}});
+        let mut client = ChatClient::new("https://api.openai.com/v1".into(), None, "gpt-6.1-sol".into(), None, 64);
+        client.wire_api = crate::providers::WireApi::Responses;
+        client.reasoning_effort = Some(High);
+        let sent = body(&client, &history(&client, &["default", "high"]));
+        assert!(sent.get("reasoning").is_none(), "the top keeps the default the conversation opened with: {sent}");
+        assert_eq!(sent["input"][5], update("high"));
+        assert_eq!(sent["input"][6], json!({"role":"user","content":"task 1"}), "the change goes just ahead of its prompt");
+        let messages = history(&client, &["high", "medium", "high"]);
+        let sent = body(&client, &messages);
+        assert_eq!(sent["reasoning"], json!({"effort":"high"}));
+        let updates: Vec<&Value> = sent["input"].as_array().unwrap().iter().filter(|item| item["type"] == "configuration_update").collect();
+        assert_eq!(updates, [&update("medium"), &update("high")]);
+        assert_eq!(client.effort_plan(&messages), (Some(High), vec![(5, Medium), (8, High)]));
+        assert_eq!(client.effort_plan(&messages[..9]), (Some(High), vec![(5, Medium), (8, High)]), "the newest prompt counts before its reply");
+        assert_eq!(client.effort_plan(&history(&client, &["high", "high"])), (Some(High), vec![]), "an unchanged effort sends no item");
+        let mut refused = history(&client, &["none", "medium", "high"]);
+        refused.remove(3);
+        assert_eq!(client.effort_plan(&refused), (Some(Medium), vec![(7, High)]), "an effort no reply answered never goes again");
+        let mut terra = ChatClient::new("https://api.openai.com/v1".into(), None, "gpt-6.1-terra".into(), None, 64);
+        terra.wire_api = crate::providers::WireApi::Responses;
+        let mut switched = history(&terra, &["none"]);
+        switched.extend(history(&client, &["medium", "high"]).into_iter().skip(1));
+        assert_eq!(client.effort_plan(&switched), (Some(Medium), vec![(8, High)]), "an effort another model took never goes again");
+        client.model = "openai/GPT-6.1-sol".into();
+        assert_eq!(client.effort_plan(&history(&client, &["high", "medium", "high"])).1.len(), 2, "a gateway's vendor prefix names the same model");
+        let current = (Some(High), vec![]);
+        assert_eq!(client.effort_plan(&history(&client, &["high", "medium"])), current, "the history does not end on the current effort");
+        assert_eq!(client.effort_plan(&messages[..1]), current, "no prompt says the effort");
+        assert_eq!(client.effort_plan(&history(&client, &["default", "high", "default", "high"])), current, "a return to the default stays unnamed");
+        client.reasoning_effort = None;
+        assert_eq!(client.effort_plan(&history(&client, &["high", "default"])), (None, vec![]), "no item names the default");
+        client.reasoning_effort = Some(High);
+        for (model, wire) in [("gpt-5.6", crate::providers::WireApi::Responses), ("gpt-6.1-sol", crate::providers::WireApi::ChatCompletions)] {
+            (client.model, client.wire_api) = (model.into(), wire);
+            assert_eq!(client.effort_plan(&history(&client, &["high", "medium", "high"])), current, "{model} over {wire:?}");
+        }
+        client.wire_api = crate::providers::WireApi::Responses;
+        let dir = std::env::temp_dir().join(format!("openmax-effort-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        client.chatgpt = Some(crate::chatgpt::tests::seeded(&dir));
+        let sent = body(&client, &history(&client, &["high", "medium", "high"]));
+        assert_eq!(sent["reasoning"], json!({"effort":"high"}));
+        assert!(!sent.to_string().contains("configuration_update"), "a ChatGPT plan's route documents no such item: {sent}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -530,7 +600,7 @@ mod tests {
         client.chatgpt = Some(crate::chatgpt::tests::seeded(&dir));
         assert!(client.sends_credential());
         let messages = [ChatMessage::system("rules"), ChatMessage::user("task")];
-        let body: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
+        let body: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
         for key in ["max_output_tokens", "temperature", "previous_response_id", "conversation", "background", "tools",
             "prompt_cache_retention", "user"] {
             assert!(body.get(key).is_none(), "{key}");
@@ -543,14 +613,14 @@ mod tests {
         let origin = client.origin();
         assert!(body.get("reasoning").is_none());
         client.reasoning_effort = Some(crate::config::ReasoningEffort::High);
-        let explicit: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
+        let explicit: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
         assert_eq!(explicit["reasoning"], json!({"effort":"high"}));
         assert!(explicit.get("temperature").is_none());
         assert!(explicit.get("max_output_tokens").is_none());
         assert_eq!(client.origin(), origin, "effort does not change opaque-reasoning ownership");
         client.chatgpt = None;
         assert_ne!(client.origin(), origin);
-        let body: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
+        let body: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
         assert_eq!(body["max_output_tokens"], 4096);
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["prompt_cache_key"], cache_key.as_str());

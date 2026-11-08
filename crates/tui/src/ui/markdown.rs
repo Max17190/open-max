@@ -37,29 +37,26 @@ pub fn render_line(raw: &str, st: &mut LineState) -> Option<Line<'static>> {
 
     if st.in_fence {
         return Some(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(theme::DIM())),
-            Span::styled(raw.to_string(), Style::default().fg(theme::CODE())),
+            Span::styled("│ ", Style::default().fg(theme::DIM)),
+            Span::styled(raw.to_string(), Style::default().fg(theme::CODE)),
         ]));
     }
 
     // Headings.
     if let Some(rest) = strip_heading(trimmed) {
-        return Some(Line::from(Span::styled(
-            rest.to_string(),
-            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
-        )));
+        return Some(Line::from(Span::styled(rest.to_string(), theme::ACCENT_BOLD)));
     }
     // Horizontal rule.
     if trimmed == "---" || trimmed == "***" {
         return Some(Line::from(Span::styled(
             "─".repeat(24),
-            Style::default().fg(theme::DIM()),
+            Style::default().fg(theme::DIM),
         )));
     }
     // Blockquote.
     if let Some(rest) = trimmed.strip_prefix("> ") {
-        let mut spans = vec![Span::styled("▎", Style::default().fg(theme::DIM()))];
-        spans.extend(inline(rest, Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)));
+        let mut spans = vec![Span::styled("▎", Style::default().fg(theme::DIM))];
+        spans.extend(inline(rest, theme::DIM_ITALIC));
         return Some(Line::from(spans));
     }
     // Bullets keep their indent.
@@ -67,7 +64,7 @@ pub fn render_line(raw: &str, st: &mut LineState) -> Option<Line<'static>> {
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
         let mut spans = vec![
             Span::raw(" ".repeat(indent_len)),
-            Span::styled("• ", Style::default().fg(theme::ACCENT())),
+            Span::styled("• ", Style::default().fg(theme::ACCENT)),
         ];
         spans.extend(inline(&trimmed[2..], Style::default()));
         return Some(Line::from(spans));
@@ -284,7 +281,7 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 // reads as a heavier emphasis than the prose it is quoted
                 // inside and breaks up a paragraph you are trying to read
                 // straight through.
-                spans.push(Span::styled(code, base.fg(theme::CODE())));
+                spans.push(Span::styled(code, base.fg(theme::CODE)));
                 i = close + 1;
                 continue;
             }
@@ -375,7 +372,7 @@ mod tests {
             .iter()
             .find(|span| span.content == "PLAN.md")
             .unwrap();
-        assert_ne!(code.style.fg, Some(theme::DIM()));
+        assert_ne!(code.style.fg, Some(theme::DIM));
     }
 
     /// Inline code is quoted inside prose, so it must never carry a heavier
@@ -404,6 +401,49 @@ mod tests {
     fn unclosed_markers_stay_literal() {
         let lines = render("a * lone star and `tick");
         assert_eq!(plain(&lines)[0], "a * lone star and `tick");
+    }
+
+    /// Two stars with nothing between them are text, not an empty italic,
+    /// and bold at the very start of a line drops its markers.
+    #[test]
+    fn a_bare_double_star_is_text_and_leading_bold_drops_its_markers() {
+        let spans = inline("**bold** then 2 ** 3", Style::default());
+        let texts: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(texts, ["bold", " then 2 ** 3"]);
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// A lone star opens italic even when a double star comes later on the
+    /// line: bold needs two stars where it starts.
+    #[test]
+    fn italic_before_bold_keeps_both() {
+        let spans = inline("*a* and **b**", Style::default());
+        let texts: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(texts, ["a", " and ", "b"]);
+        assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// Either spelling of a rule draws one, and a paragraph keeps the indent
+    /// it was written with and gains none it was not.
+    #[test]
+    fn rules_draw_and_paragraphs_keep_exactly_their_indent() {
+        for rule in ["---", "***"] {
+            assert_eq!(plain(&render(rule)), ["─".repeat(24)]);
+        }
+        let lines = render("  indented\nflush");
+        let spans: Vec<Vec<&str>> =
+            lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect()).collect();
+        assert_eq!(spans, [vec!["  ", "indented"], vec!["flush"]]);
+    }
+
+    /// A finish on a shorter text than the stream had seen (a new turn
+    /// replaced it) renders the new text from scratch.
+    #[test]
+    fn finishing_on_a_shorter_text_renders_it_from_scratch() {
+        let mut sm = StreamingMarkdown::default();
+        sm.update("an earlier, longer reply\nwith two lines\n", 40);
+        assert_eq!(plain(&sm.finish("new")), ["new"]);
     }
 
     // ---- StreamingMarkdown: incremental output must match batch render ----

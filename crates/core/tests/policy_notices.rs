@@ -478,6 +478,47 @@ async fn a_hook_written_mid_turn_is_named_inert_on_the_writing_call() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// In auto a valid hook the agent writes applies from the next turn. Print
+/// mode runs only the turns its command line names, so a one-prompt run has
+/// none: the receipt on the write names the run's next `-p` prompt and a run
+/// started now from bash, the two ways the hook runs before the run ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_valid_hook_written_in_auto_names_the_runs_that_apply_it() {
+    let dir = std::env::temp_dir().join(format!("omx-notice-{}", uuid::Uuid::new_v4()));
+    let data = dir.join("data");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let hook = "event = \"post_tool_use\"\ncommand = \"sh\"\nargs = [\"-c\", \"exit 0\"]\n";
+    let (base_url, bodies) = recording_endpoint(vec![
+        completion_with_tool_call(
+            "write_file",
+            serde_json::json!({ "path": ".openmax/hooks/format.toml", "content": hook }),
+        ),
+        completion_with_text("done"),
+    ])
+    .await;
+    write_config(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    core.set_project_approval_mode(&project, open_max_core::config::ApprovalMode::Auto).unwrap();
+    drive_turn(&core, &mut rx, "hook-write-auto", &project, "add a formatter hook").await;
+
+    let bodies = bodies.lock().unwrap();
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let content = second["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content.ends_with(
+            "\n[hook files changed. Valid hooks apply from the next turn (in print mode, the run's next -p prompt) \
+             under auto without content approval; a run started now from bash (openmax -p ...) runs them too.]"
+        ),
+        "the receipt names the runs that apply the hook: {content}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The mid-turn twin of the policy-note guard: a broken hook WRITTEN mid-turn
 /// lands its multi-line parse error in the `[hook files changed. Not running:
 /// ...]` receipt (a user-role message), and that clause must stay one line.

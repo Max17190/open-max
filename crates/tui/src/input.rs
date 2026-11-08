@@ -8,12 +8,12 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme;
-use crate::ui::text;
+use crate::ui::text::{self, Selection};
 
 const MAX_HISTORY: usize = 200;
 
@@ -51,28 +51,6 @@ pub enum ComposerAction {
     Submit(String),
 }
 
-/// A mouse selection over the draft, endpoints inclusive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Selection {
-    anchor: Point,
-    head: Point,
-    /// Set by a word or line gesture, which picks a real range even when it is
-    /// one character wide. With inclusive endpoints a drag that has not moved
-    /// looks identical to a one-character selection; this tells them apart and
-    /// keeps a plain click from selecting.
-    explicit: bool,
-    /// The inclusive range the press picked: the word or line under a
-    /// gesture, the character under a plain press. A drag extends from it
-    /// but never shrinks the selection below it, matching the transcript.
-    origin: (Point, Point),
-}
-
-impl Selection {
-    fn is_empty(&self) -> bool {
-        !self.explicit && self.anchor == self.head
-    }
-}
-
 /// One display row: a soft-wrapped slice `start..end` (char columns) of
 /// logical line `line`. `last` marks the row that ends the logical line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,10 +71,8 @@ pub struct Composer {
     /// Whether the viewport tracks the cursor. The wheel detaches it; the
     /// next edit or cursor move re-attaches, so typing is never lost offscreen.
     follow: bool,
-    /// Mouse selection in logical coordinates. Both endpoints are inclusive,
-    /// matching the transcript: what is highlighted is exactly what a copy
-    /// carries, down to the character under the release cell.
-    selection: Option<Selection>,
+    /// Mouse selection in logical coordinates.
+    selection: Option<Selection<Point>>,
     /// Whether the mouse button is still down on that selection.
     dragging: bool,
     /// Ticks on every entry point that can change the text, via `touch`, so a
@@ -317,9 +293,6 @@ impl Composer {
         out
     }
 
-    /// Splice the collapsed paste whose marker sits under the cursor back
-    /// into the draft, for editing it in place. Returns false when the
-    /// cursor's row holds no intact marker under the cursor.
     /// Append `text` at the very end of the draft on its own line, leaving
     /// the cursor after it. Whole-block arrivals (a p-quote from the
     /// transcript) land here: splicing at the cursor would merge them into
@@ -334,6 +307,9 @@ impl Composer {
         self.insert_str(text);
     }
 
+    /// Splice the collapsed paste whose marker sits under the cursor back
+    /// into the draft, for editing it in place. Returns false when the
+    /// cursor's row holds no intact marker under the cursor.
     pub fn expand_paste_at_cursor(&mut self) -> bool {
         let row_text = self.lines[self.row].clone();
         for i in 0..self.pastes.len() {
@@ -750,26 +726,16 @@ impl Composer {
             // the draft, where `…` is the only signal that the view is
             // scrolled and there is more text above.
             let prefix = if row.line == 0 && row.start == 0 {
-                Span::styled(
-                    "❯ ",
-                    Style::default()
-                        .fg(theme::ACCENT())
-                        .add_modifier(Modifier::BOLD),
-                )
+                Span::styled("❯ ", theme::ACCENT_BOLD)
             } else if seen == 0 {
-                Span::styled("… ", Style::default().fg(theme::DIM()))
+                Span::styled("… ", Style::default().fg(theme::DIM))
             } else {
                 Span::raw("  ")
             };
             if self.is_empty() {
                 out.push(Line::from(vec![
                     prefix,
-                    Span::styled(
-                        "Describe a task",
-                        Style::default()
-                            .fg(theme::DIM())
-                            .add_modifier(Modifier::ITALIC),
-                    ),
+                    Span::styled("Describe a task", theme::DIM_ITALIC),
                 ]));
                 continue;
             }
@@ -779,7 +745,7 @@ impl Composer {
             let (sel_start, sel_end) = selected.unwrap_or((row.start, row.start));
             for (from, to, style) in [
                 (row.start, sel_start, Style::default()),
-                (sel_start, sel_end, Style::default().bg(theme::SELECT())),
+                (sel_start, sel_end, Style::default().bg(theme::SELECT)),
                 (sel_end, row.end, Style::default()),
             ] {
                 if from >= to {
@@ -809,39 +775,22 @@ impl Composer {
     /// area, and start a selection there.
     pub fn click_at(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
         let point = self.point_at(width, max_h, cell, row);
-        self.row = point.0;
-        self.col = point.1;
+        (self.row, self.col) = point;
         self.follow = true;
         self.hist_idx = None;
-        self.selection = Some(Selection {
-            anchor: point,
-            head: point,
-            explicit: false,
-            origin: (point, point),
-        });
+        self.selection = Some(Selection::press(point));
         self.dragging = true;
     }
 
     /// Extend an in-progress click selection to `(cell, row)`.
     pub fn drag_to(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
-        let Some(current) = self.selection.filter(|_| self.dragging) else {
+        if self.selection.is_none() || !self.dragging {
             return;
-        };
+        }
         let point = self.point_at(width, max_h, cell, row);
-        // The selection grows from the origin range and never shrinks below
-        // it: past either edge the far edge anchors and the pointer leads;
-        // inside it the selection is exactly the range the press picked.
-        let (lo, hi) = current.origin;
-        let (anchor, head) = if point > hi {
-            (lo, point)
-        } else if point < lo {
-            (hi, point)
-        } else {
-            (lo, hi)
-        };
-        self.selection = Some(Selection { anchor, head, ..current });
-        self.row = head.0;
-        self.col = head.1;
+        let Some(selection) = &mut self.selection else { return };
+        selection.drag_to(point);
+        (self.row, self.col) = selection.head;
         self.follow = true;
     }
 
@@ -863,35 +812,18 @@ impl Composer {
         row: u16,
         bounds: fn(&str, usize) -> (usize, usize),
     ) -> bool {
-        let point = self.point_at(width, max_h, cell, row);
         // A press replaces whatever was selected, including with nothing. An
         // empty line has no word and no line to take, and leaving the old
         // highlight standing would make it lie about what a copy carries, so
         // this falls back to exactly what a plain press does.
-        self.row = point.0;
-        self.col = point.1;
-        self.follow = true;
-        self.hist_idx = None;
-        self.selection = Some(Selection {
-            anchor: point,
-            head: point,
-            explicit: false,
-            origin: (point, point),
-        });
-        self.dragging = true;
-
-        let (start, end) = bounds(&self.lines[point.0], point.1);
+        self.click_at(width, max_h, cell, row);
+        let (line, col) = (self.row, self.col);
+        let (start, end) = bounds(&self.lines[line], col);
         if start >= end {
             return false;
         }
         self.col = end;
-        let (lo, hi) = ((point.0, start), (point.0, end - 1));
-        self.selection = Some(Selection {
-            anchor: lo,
-            head: hi,
-            explicit: true,
-            origin: (lo, hi),
-        });
+        self.selection = Some(Selection::range((line, start), (line, end - 1)));
         true
     }
 
@@ -899,9 +831,7 @@ impl Composer {
     /// only a cursor, so the next drag in the transcript is not swallowed.
     pub fn finish_selection(&mut self) {
         self.dragging = false;
-        if self.selection_bounds().is_none() {
-            self.selection = None;
-        }
+        self.selection = self.selection.filter(|selection| !selection.is_empty());
     }
 
     /// Whether a click started in the prompt and the button is still down.
@@ -965,15 +895,7 @@ impl Composer {
 
     /// Selection as (low, high) logical points, or `None` when it is empty.
     fn selection_bounds(&self) -> Option<(Point, Point)> {
-        let selection = self.selection?;
-        if selection.is_empty() {
-            return None;
-        }
-        Some(if selection.anchor <= selection.head {
-            (selection.anchor, selection.head)
-        } else {
-            (selection.head, selection.anchor)
-        })
+        self.selection?.bounds()
     }
 
     /// The highlighted text, newline-joined across logical lines.
@@ -1101,38 +1023,19 @@ fn boundary_iter(s: &str) -> impl Iterator<Item = usize> + '_ {
     }))
 }
 
+/// The last boundary before `col`, or 0 at the start of `s`.
 fn previous_grapheme_boundary(s: &str, col: usize) -> usize {
-    let mut prev = 0;
-    for boundary in boundary_iter(s) {
-        if boundary >= col {
-            break;
-        }
-        prev = boundary;
-    }
-    prev
+    boundary_iter(s).take_while(|&boundary| boundary < col).last().unwrap_or(0)
 }
 
+/// The first boundary after `col`, or the final one, the char count of `s`.
 fn next_grapheme_boundary(s: &str, col: usize) -> usize {
-    // Falls through to the final boundary, which is the char count of `s`.
-    let mut last = 0;
-    for boundary in boundary_iter(s) {
-        if boundary > col {
-            return boundary;
-        }
-        last = boundary;
-    }
-    last
+    boundary_iter(s).find(|&boundary| boundary > col).unwrap_or_else(|| s.chars().count())
 }
 
+/// The last boundary at or before `col`.
 fn floor_grapheme_boundary(s: &str, col: usize) -> usize {
-    let mut prev = 0;
-    for boundary in boundary_iter(s) {
-        if boundary > col {
-            break;
-        }
-        prev = boundary;
-    }
-    prev
+    boundary_iter(s).take_while(|&boundary| boundary <= col).last().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1763,7 +1666,7 @@ mod tests {
         let highlighted = |line: &Line<'static>| -> String {
             line.spans
                 .iter()
-                .filter(|span| span.style.bg == Some(theme::SELECT()))
+                .filter(|span| span.style.bg == Some(theme::SELECT))
                 .map(|span| span.content.as_ref())
                 .collect()
         };
@@ -1812,6 +1715,252 @@ mod tests {
         assert_eq!(composer.text(), "third");
         composer.handle_key(ctrl_u);
         assert_eq!(composer.text(), "");
+    }
+
+    fn press(composer: &mut Composer, code: KeyCode) -> ComposerAction {
+        composer.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ctrl(composer: &mut Composer, c: char) {
+        composer.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    /// Backspace at the start of a line joins it onto the line above, and
+    /// Delete at the end of a line pulls up the line below; at the very start
+    /// and end of the draft there is nothing to join and both do nothing.
+    #[test]
+    fn backspace_and_delete_join_lines_only_at_their_edges() {
+        let mut composer = Composer::blank();
+        composer.insert_str("ab\ncd\nef");
+        press(&mut composer, KeyCode::Home);
+        assert_eq!((composer.row, composer.col), (2, 0));
+        press(&mut composer, KeyCode::Backspace);
+        assert_eq!(composer.text(), "ab\ncdef");
+        assert_eq!((composer.row, composer.col), (1, 2));
+        press(&mut composer, KeyCode::End);
+        assert_eq!(composer.col, 4);
+        press(&mut composer, KeyCode::Delete);
+        assert_eq!(composer.text(), "ab\ncdef", "the end of the draft has nothing after it");
+        press(&mut composer, KeyCode::Up);
+        assert_eq!((composer.row, composer.col), (0, 2));
+        press(&mut composer, KeyCode::Delete);
+        assert_eq!(composer.text(), "abcdef");
+        assert_eq!((composer.row, composer.col), (0, 2));
+        press(&mut composer, KeyCode::Delete);
+        assert_eq!(composer.text(), "abdef", "mid-line, Delete takes the character after the cursor");
+        press(&mut composer, KeyCode::Home);
+        press(&mut composer, KeyCode::Backspace);
+        assert_eq!(composer.text(), "abdef", "the start of the draft has nothing before it");
+        assert_eq!((composer.row, composer.col), (0, 0));
+    }
+
+    /// Left and Right step over the break between two lines, Up and Down
+    /// move between them, and neither end of the draft lets the cursor off.
+    #[test]
+    fn arrow_keys_cross_line_breaks_and_stop_at_the_ends() {
+        let mut composer = Composer::blank();
+        composer.insert_str("ab\ncd");
+        let at = |composer: &Composer| (composer.row, composer.col);
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(at(&composer), (1, 2), "Right at the end of the draft stays");
+        press(&mut composer, KeyCode::Home);
+        press(&mut composer, KeyCode::Left);
+        assert_eq!(at(&composer), (0, 2));
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(at(&composer), (1, 0));
+        press(&mut composer, KeyCode::Up);
+        assert_eq!(at(&composer), (0, 0));
+        press(&mut composer, KeyCode::Left);
+        assert_eq!(at(&composer), (0, 0), "Left at the start of the draft stays");
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(at(&composer), (0, 1));
+        press(&mut composer, KeyCode::Down);
+        assert_eq!(at(&composer), (1, 1));
+        assert_eq!(composer.text(), "ab\ncd");
+    }
+
+    /// Ctrl+A and Ctrl+E jump to the ends of the line and Ctrl+K cuts to its
+    /// end, while a control chord with no binding types nothing.
+    #[test]
+    fn control_chords_move_and_cut_and_an_unbound_one_types_nothing() {
+        let mut composer = Composer::blank();
+        composer.insert_str("hello world");
+        ctrl(&mut composer, 'a');
+        assert_eq!(composer.col, 0);
+        ctrl(&mut composer, 'b');
+        assert_eq!(composer.text(), "hello world");
+        ctrl(&mut composer, 'e');
+        assert_eq!(composer.col, 11);
+        press(&mut composer, KeyCode::Home);
+        for _ in 0..5 {
+            press(&mut composer, KeyCode::Right);
+        }
+        ctrl(&mut composer, 'k');
+        assert_eq!(composer.text(), "hello");
+    }
+
+    /// Ctrl+W deletes back over the spaces before the cursor, then the word
+    /// before them, wherever the cursor is in the line.
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor() {
+        let mut composer = Composer::blank();
+        composer.insert_str("one two  ");
+        ctrl(&mut composer, 'w');
+        assert_eq!((composer.text().as_str(), composer.col), ("one ", 4));
+        ctrl(&mut composer, 'w');
+        assert_eq!(composer.text(), "");
+        ctrl(&mut composer, 'w');
+        assert_eq!(composer.text(), "");
+
+        composer.insert_str("alpha beta gamma");
+        press(&mut composer, KeyCode::Home);
+        for _ in 0.."alpha beta".len() {
+            press(&mut composer, KeyCode::Right);
+        }
+        ctrl(&mut composer, 'w');
+        assert_eq!((composer.text().as_str(), composer.col), ("alpha  gamma", 6));
+    }
+
+    /// Up walks back through the submitted prompts from the newest, Down
+    /// walks forward again and, past the newest, restores the unsent draft.
+    /// A prompt sent twice in a row is kept once, and the history outlives
+    /// the composer that kept it.
+    #[test]
+    fn history_walks_both_ways_and_gives_back_the_draft() {
+        let dir = crate::test_temp_dir("openmax-composer-history");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut composer = Composer::new(&dir, &dir);
+        for prompt in ["one", "two", "three", "three"] {
+            composer.insert_str(prompt);
+            let sent = press(&mut composer, KeyCode::Enter);
+            assert!(matches!(sent, ComposerAction::Submit(text) if text == prompt));
+        }
+        assert_eq!(composer.history_entries(), ["one", "two", "three"]);
+
+        composer.insert_str("draft");
+        let mut walk = |code| {
+            press(&mut composer, code);
+            composer.text()
+        };
+        let walked: Vec<String> = [
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Down,
+        ]
+        .into_iter()
+        .map(&mut walk)
+        .collect();
+        assert_eq!(walked, ["three", "two", "one", "one", "two", "three", "draft", "draft"]);
+        assert_eq!(Composer::new(&dir, &dir).history_entries(), ["one", "two", "three"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// History keeps the newest 200 prompts: a longer file trims to them on
+    /// the next prompt kept, which `take` keeps as Enter does.
+    #[test]
+    fn history_keeps_the_newest_two_hundred_prompts() {
+        let dir = crate::test_temp_dir("openmax-composer-history-cap");
+        std::fs::create_dir_all(dir.join("history")).unwrap();
+        let file = dir
+            .join("history")
+            .join(format!("{}.json", open_max_core::ledger::project_key(&dir)));
+        let older: Vec<String> = (0..300).map(|i| format!("old {i}")).collect();
+        std::fs::write(&file, serde_json::to_string(&older).unwrap()).unwrap();
+        let mut composer = Composer::new(&dir, &dir);
+        assert_eq!(composer.history_entries().len(), 300);
+
+        composer.insert_str("  newest  ");
+        assert_eq!(composer.take(), "newest");
+        assert!(composer.is_empty());
+        let kept = composer.history_entries();
+        assert_eq!(kept.len(), MAX_HISTORY);
+        assert_eq!((kept[0].as_str(), kept[MAX_HISTORY - 1].as_str()), ("old 101", "newest"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Accepting a completion leaves the cursor right after what it put in.
+    #[test]
+    fn a_replaced_token_leaves_the_cursor_after_the_replacement() {
+        let mut composer = Composer::blank();
+        composer.insert_str("see @src/ma");
+        composer.replace_token(4, 7, "@src/main.rs ");
+        assert_eq!(composer.text(), "see @src/main.rs ");
+        assert_eq!(composer.cursor_context().1, "see @src/main.rs ".len());
+    }
+
+    /// A plain `a` or `e` is text, not the Ctrl+A or Ctrl+E cursor move, so
+    /// typing it re-wraps the draft.
+    #[test]
+    fn typing_the_letter_of_a_cursor_chord_rewraps_the_draft() {
+        let mut composer = Composer::blank();
+        assert_eq!(composer.height(10), 1);
+        for _ in 0..12 {
+            press(&mut composer, KeyCode::Char('a'));
+        }
+        assert_eq!(composer.height(10), 2, "twelve cells of text wrap at eight");
+    }
+
+    /// A wrap point belongs to the row that starts there: the cursor on it is
+    /// drawn at the start of the lower row, not past the end of the upper.
+    #[test]
+    fn a_cursor_on_a_wrap_point_starts_the_next_row() {
+        let mut composer = Composer::blank();
+        composer.insert_str("abcde fgh");
+        // Five cells of text: the rows are "abcde" and " fgh".
+        let cursor = |composer: &mut Composer| {
+            let (_, x, y) = composer.render(7, 6);
+            (x, y)
+        };
+        assert_eq!(cursor(&mut composer), (6, 1));
+        press(&mut composer, KeyCode::Home);
+        assert_eq!(cursor(&mut composer), (2, 0));
+        press(&mut composer, KeyCode::Right);
+        press(&mut composer, KeyCode::Right);
+        assert_eq!(cursor(&mut composer), (4, 0));
+        for _ in 0..3 {
+            press(&mut composer, KeyCode::Right);
+        }
+        assert_eq!(cursor(&mut composer), (2, 1));
+    }
+
+    /// In a draft taller than the box the view follows the cursor, keeping it
+    /// on the top row going up and on the bottom row going down, also when
+    /// the cursor stops short of the last row; a cursor the wheel left out of
+    /// view is drawn on the box's bottom edge.
+    #[test]
+    fn the_view_follows_the_cursor_through_a_tall_draft() {
+        let mut composer = Composer::blank();
+        let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        composer.insert_str(&lines.join("\n"));
+        let (width, height) = (20, 6);
+        let view = |composer: &mut Composer| {
+            let (lines, _, y) = composer.render(width, height);
+            (plain(&lines[0]), y)
+        };
+        assert_eq!(view(&mut composer), ("… line 4".to_string(), 5));
+        for _ in 0..6 {
+            press(&mut composer, KeyCode::Up);
+        }
+        assert_eq!(view(&mut composer), ("… line 3".to_string(), 0));
+        for _ in 0..3 {
+            press(&mut composer, KeyCode::Up);
+        }
+        assert_eq!(view(&mut composer), ("❯ line 0".to_string(), 0));
+        for _ in 0..7 {
+            press(&mut composer, KeyCode::Down);
+        }
+        assert_eq!(view(&mut composer), ("… line 2".to_string(), 5));
+        for _ in 0..2 {
+            press(&mut composer, KeyCode::Down);
+        }
+        assert_eq!(view(&mut composer), ("… line 4".to_string(), 5));
+        composer.scroll_by(width, height, -10);
+        assert_eq!(view(&mut composer), ("❯ line 0".to_string(), 5));
     }
 
     /// Insertion cost of a paste, the case the segment splice in

@@ -257,6 +257,74 @@ pub fn line_bounds(text: &str, offset: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// A mouse selection with inclusive endpoints, so what is highlighted is
+/// exactly what a copy carries, down to the character under the release
+/// cell. The composer's points are (logical line, char column), the
+/// transcript's a block and an offset into its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection<P> {
+    pub anchor: P,
+    pub head: P,
+    /// Set by a word or line gesture, which picks a real range even when it is
+    /// one character wide. With inclusive endpoints a drag that has not moved
+    /// looks identical to a one-character selection; this tells them apart and
+    /// keeps a plain click from selecting.
+    pub explicit: bool,
+    /// The inclusive range the press picked: the word or line under a
+    /// gesture, the character under a plain press. A drag extends from it but
+    /// never shrinks the selection below it, so a gesture's own release (and a
+    /// drag that wanders back inside the range) keeps the word or line the
+    /// user was shown.
+    pub origin: (P, P),
+}
+
+impl<P: Copy + Ord> Selection<P> {
+    /// A plain press: an anchor a drag extends from, covering nothing yet.
+    pub fn press(point: P) -> Self {
+        Self { anchor: point, head: point, explicit: false, origin: (point, point) }
+    }
+
+    /// The word or line `lo..=hi` a gesture picked.
+    pub fn range(lo: P, hi: P) -> Self {
+        Self { anchor: lo, head: hi, explicit: true, origin: (lo, hi) }
+    }
+
+    /// Whether this covers any text at all.
+    pub fn is_empty(&self) -> bool {
+        !self.explicit && self.anchor == self.head
+    }
+
+    /// Extend to the pointer at `point`: past either edge of the origin range
+    /// the far edge anchors and the pointer leads; inside it the selection is
+    /// exactly the range the press picked.
+    pub fn drag_to(&mut self, point: P) {
+        let (lo, hi) = self.origin;
+        (self.anchor, self.head) = if point > hi {
+            (lo, point)
+        } else if point < lo {
+            (hi, point)
+        } else {
+            (lo, hi)
+        };
+    }
+
+    /// The endpoints as (low, high).
+    pub fn ordered(&self) -> (P, P) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+
+    /// The endpoints as (low, high), or None when this covers no text.
+    pub fn bounds(&self) -> Option<(P, P)> {
+        (!self.is_empty()).then(|| self.ordered())
+    }
+
+    /// The same selection with every point moved by `f`.
+    pub fn map(self, f: impl Fn(P) -> P) -> Self {
+        let (lo, hi) = self.origin;
+        Self { anchor: f(self.anchor), head: f(self.head), explicit: self.explicit, origin: (f(lo), f(hi)) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +434,8 @@ mod tests {
         let (s, e) = line_bounds("a\n\nb", 2);
         assert_eq!(s, e);
         assert_eq!(line_bounds("", 0), (0, 0));
+        // An offset past the end takes the last line.
+        assert_eq!(line_bounds("ab", 99), (0, 2));
     }
 
     #[test]

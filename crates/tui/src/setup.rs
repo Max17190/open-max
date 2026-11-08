@@ -21,14 +21,15 @@ const OPENAI: &str = "https://api.openai.com/v1";
 const ANTHROPIC: &str = "https://api.anthropic.com/v1";
 const LIMIT: usize = 1024 * 1024;
 
-pub async fn run(dir: &Path, action: Action, target: Option<&str>) -> Result<(), String> {
+/// Setup's keys: a session's reader (`app::TerminalInput`), else its own stream.
+pub(crate) type Keys<'a> = Box<dyn futures_util::Stream<Item = std::io::Result<Event>> + Unpin + 'a>;
+
+pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<Keys<'_>>) -> Result<(), String> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Err("provider setup needs an interactive terminal".into());
     }
     let snapshot = providers::read_catalog(dir)?;
-    let mut prompts = Prompts {
-        events: EventStream::new(),
-    };
+    let mut prompts = Prompts { events: keys.unwrap_or_else(|| Box::new(EventStream::new())) };
     let name = match target.filter(|s| !s.is_empty()) {
         Some(name) => name.to_owned(),
         None => {
@@ -511,10 +512,10 @@ impl Drop for InputMode {
     }
 }
 
-struct Prompts {
-    events: EventStream,
+struct Prompts<'a> {
+    events: Keys<'a>,
 }
-impl Prompts {
+impl Prompts<'_> {
     async fn ask(&mut self, title: &str, secret: bool) -> Result<String, String> {
         self.input(title, secret, None).await
     }

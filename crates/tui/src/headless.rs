@@ -67,7 +67,7 @@ pub async fn run(
 
 /// The latest session here, or a new one: Ok(its id), or Err(the exit
 /// status) once the reason is on stderr.
-fn open_session(core: &Core, project_key: String, continue_session: bool) -> Result<String, i32> {
+pub(crate) fn open_session(core: &Core, project_key: String, continue_session: bool) -> Result<String, i32> {
     if continue_session {
         match sessions::latest(core, &project_key) {
             Ok(Some(meta)) => Ok(meta.id),
@@ -225,41 +225,6 @@ async fn run_turn_events(
         }
 
         match &env.event {
-            AgentEvent::Token { text } => {
-                if !json {
-                    *saw_tokens = true;
-                    let _ = write!(stdout, "{text}");
-                    let _ = stdout.flush();
-                }
-            }
-            AgentEvent::MessageDone { text } => {
-                if !json && !text.is_empty() {
-                    // Some backends only deliver the final message (no stream).
-                    if !*saw_tokens {
-                        let _ = write!(stdout, "{text}");
-                    }
-                    if !text.ends_with('\n') {
-                        let _ = writeln!(stdout);
-                    }
-                    let _ = stdout.flush();
-                    *saw_tokens = false;
-                }
-            }
-            AgentEvent::ToolStart { name, args: tool_args, .. } => {
-                if !json {
-                    let summary = open_max_core::registry::summarize_call(name, tool_args);
-                    let _ = writeln!(stderr, "→ {}", call_line(name, &summary));
-                    let _ = stderr.flush();
-                }
-            }
-            AgentEvent::ToolEnd { ok, output, .. } => {
-                if !json {
-                    let status = if *ok { "ok" } else { "err" };
-                    let preview = truncate_line(output, 120);
-                    let _ = writeln!(stderr, "← {status}: {preview}");
-                    let _ = stderr.flush();
-                }
-            }
             AgentEvent::ApprovalRequest {
                 approval_id,
                 name,
@@ -318,69 +283,82 @@ async fn run_turn_events(
                 }
                 return stopping.unwrap_or(exit_code);
             }
-            AgentEvent::Refrozen { tools, skills, changes, .. } => {
-                if !json {
-                    // `changes` names the capability files that changed; a
-                    // refreeze can name none (a manifest that turned
-                    // unreadable), and the line must not end in a colon with
-                    // nothing after it.
-                    let what = match changes.is_empty() {
-                        true => String::new(),
-                        false => format!(": {}", changes.join(", ")),
-                    };
-                    let _ = writeln!(stderr, "openmax: re-frozen ({tools} tools, {skills} skills){what}");
+            // Every other event is only printed, and `--json` printed it above.
+            _ if json => {}
+            AgentEvent::Token { text } => {
+                *saw_tokens = true;
+                let _ = write!(stdout, "{text}");
+                let _ = stdout.flush();
+            }
+            AgentEvent::MessageDone { text } => {
+                if !text.is_empty() {
+                    // Some backends only deliver the final message (no stream).
+                    if !*saw_tokens {
+                        let _ = write!(stdout, "{text}");
+                    }
+                    if !text.ends_with('\n') {
+                        let _ = writeln!(stdout);
+                    }
+                    let _ = stdout.flush();
+                    *saw_tokens = false;
                 }
             }
-            AgentEvent::HarnessNote { .. } => {
-                // Addressed to the model, which reads it in its transcript;
-                // `--json` carries it as a `harness_note` line. Not stderr:
-                // a parent agent running `openmax -p` reads this run's stderr
-                // in its tool result, so every note meant for this run's
-                // model would also cost the parent's.
+            AgentEvent::ToolStart { name, args: tool_args, .. } => {
+                let summary = open_max_core::registry::summarize_call(name, tool_args);
+                let _ = writeln!(stderr, "→ {}", call_line(name, &summary));
+                let _ = stderr.flush();
+            }
+            AgentEvent::ToolEnd { ok, output, .. } => {
+                let status = if *ok { "ok" } else { "err" };
+                let _ = writeln!(stderr, "← {status}: {}", truncate_line(output, 120));
+                let _ = stderr.flush();
+            }
+            AgentEvent::Refrozen { tools, skills, changes, .. } => {
+                // `changes` names the capability files that changed; a
+                // refreeze can name none (a manifest that turned
+                // unreadable), and the line must not end in a colon with
+                // nothing after it.
+                let what = match changes.is_empty() {
+                    true => String::new(),
+                    false => format!(": {}", changes.join(", ")),
+                };
+                let _ = writeln!(stderr, "openmax: re-frozen ({tools} tools, {skills} skills){what}");
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
-                if !json {
-                    let _ = writeln!(
-                        stderr,
-                        "openmax: compacted ~{tokens_before} to ~{tokens_after} tokens ({compacted_messages} messages archived)"
-                    );
-                }
+                let _ = writeln!(
+                    stderr,
+                    "openmax: compacted ~{tokens_before} to ~{tokens_after} tokens ({compacted_messages} messages archived)"
+                );
             }
             AgentEvent::Retry { attempt, max_attempts, reason } => {
-                if !json {
-                    let _ = writeln!(stderr, "openmax: {}; retrying ({attempt} of {max_attempts})", one_line(reason));
-                }
+                let _ = writeln!(stderr, "openmax: {}; retrying ({attempt} of {max_attempts})", one_line(reason));
             }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Advisory: the turn still runs, so the exit code is untouched.
-                if !json {
-                    let _ = writeln!(
-                        stderr,
-                        "openmax: tool schemas and any trailing note cost ~{schema_tokens} tokens of the ~{budget_tokens} this context window can spend; history is compacted early and turns may not fit at all. Remove tools (openmax --spec usage) for the next session, or raise context_tokens"
-                    );
-                }
+                let _ = writeln!(
+                    stderr,
+                    "openmax: tool schemas cost ~{schema_tokens} tokens of the ~{budget_tokens} this context window can spend; history is compacted early and turns may not fit at all. Remove tools (openmax --spec usage) for the next session, or raise context_tokens"
+                );
             }
             AgentEvent::HookFailed { hook, event, detail } => {
-                if !json {
-                    let _ = writeln!(
-                        stderr,
-                        "openmax: hook '{hook}' failed on {event}: {}",
-                        one_line(detail)
-                    );
-                }
+                let _ = writeln!(stderr, "openmax: hook '{hook}' failed on {event}: {}", one_line(detail));
             }
             AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
-                if !json {
-                    let _ = writeln!(
-                        stderr,
-                        "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {}",
-                        continuation + 1,
-                        continuation + continuations_left,
-                        one_line(reason),
-                    );
-                }
+                let _ = writeln!(
+                    stderr,
+                    "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {}",
+                    continuation + 1,
+                    continuation + continuations_left,
+                    one_line(reason),
+                );
             }
-            AgentEvent::Thinking { .. }
+            // Addressed to the model, which reads it in its transcript;
+            // `--json` carries it as a `harness_note` line. Not stderr: a
+            // parent agent running `openmax -p` reads this run's stderr in its
+            // tool result, so every note meant for this run's model would also
+            // cost the parent's.
+            AgentEvent::HarnessNote { .. }
+            | AgentEvent::Thinking { .. }
             | AgentEvent::Budget { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Diff { .. }

@@ -24,16 +24,6 @@ pub struct CompatFlags {
     pub omit_temperature: bool,
 }
 
-impl CompatFlags {
-    fn defaults_for_missing() -> Self {
-        Self {
-            use_max_completion_tokens: false,
-            send_stream_options: true,
-            omit_temperature: false,
-        }
-    }
-}
-
 // serde default for send_stream_options is false via Default; we want true when
 // the field is omitted from JSON. Custom deserialize via Option merge on load.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -62,15 +52,6 @@ pub enum WireApi {
     ChatCompletions,
     Responses,
     Anthropic,
-}
-
-impl WireApi {
-    pub fn effort_levels(self) -> &'static [&'static str] {
-        match self {
-            Self::Anthropic => &["default", "low", "medium", "high", "xhigh", "max"],
-            _ => &crate::config::ReasoningEffort::LEVELS,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,14 +188,11 @@ fn content_hash(text: &str) -> u64 {
 }
 
 fn parse_providers_file(text: &str) -> Result<BTreeMap<String, ProviderConfig>, String> {
-    let file = match serde_json::from_str::<ProvidersFile>(text) {
-        Ok(file) => file,
-        // The runtime stays lax about unknown keys (--check names those),
-        // but a file that is not JSON at all must keep its reason: an empty
-        // map here surfaces later as "unknown provider", which sends the
-        // repair in the wrong direction.
-        Err(e) => return Err(e.to_string()),
-    };
+    // The runtime stays lax about unknown keys (--check names those), but a
+    // file that is not JSON at all must keep its reason: an empty map here
+    // surfaces later as "unknown provider", which sends the repair in the
+    // wrong direction.
+    let file = serde_json::from_str::<ProvidersFile>(text).map_err(|e| e.to_string())?;
     // A provider with an empty base_url is kept, not dropped: it still shows
     // up in listings and fails loudly at resolve time (MissingEndpoint)
     // instead of silently vanishing from the picker.
@@ -224,17 +202,11 @@ fn parse_providers_file(text: &str) -> Result<BTreeMap<String, ProviderConfig>, 
         .map(|(name, raw)| {
             let base_url = raw.base_url.trim().to_string();
             let api_key_env = match raw.api_key_env {
-                Some(ApiKeyEnv::One(s)) => {
-                    let s = s.trim().to_string();
-                    if s.is_empty() { Vec::new() } else { vec![s] }
-                }
-                Some(ApiKeyEnv::Many(v)) => v
-                    .into_iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
+                Some(ApiKeyEnv::One(s)) => vec![s],
+                Some(ApiKeyEnv::Many(v)) => v,
                 None => Vec::new(),
             };
+            let api_key_env = api_key_env.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             (
                 name,
                 ProviderConfig {
@@ -660,7 +632,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         if base_url.is_empty() {
             return Err(ResolveError::MissingEndpoint);
         }
-        validate_reasoning_effort(base_url, p.wire_api, settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
+        validate_reasoning_effort(base_url, p.wire_api, settings.model.trim(), settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
         let model = settings.model.trim();
         if model.is_empty() {
             // A catalog that sizes its models only lacks the choice; when
@@ -722,7 +694,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     // Flat settings path when no provider is selected. No endpoint or model
     // means no request: there is no default server to guess at.
     let base_url = settings.base_url.trim();
-    validate_reasoning_effort(base_url, WireApi::ChatCompletions, settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
+    validate_reasoning_effort(base_url, WireApi::ChatCompletions, settings.model.trim(), settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
     let model = settings.model.trim();
     let missing = [base_url.is_empty(), model.is_empty(), settings.context_tokens.is_none()];
     if missing.iter().filter(|m| **m).count() > 1 {
@@ -752,25 +724,71 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         max_tokens,
         temperature: settings.temperature,
         reasoning_effort: settings.reasoning_effort,
-        compat: CompatFlags::defaults_for_missing(),
+        compat: CompatFlagsFile::default().into(),
         idle_timeout_secs: None,
         key_hint: None,
     })
 }
 
-/// Known compatibility routes can accept the field while ignoring its value.
-pub fn validate_reasoning_effort(base: &str, wire: WireApi, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
-    if wire == WireApi::Anthropic {
-        if matches!(effort, Some(crate::config::ReasoningEffort::None | crate::config::ReasoningEffort::Minimal)) {
-            return Err("native Messages effort must be low, medium, high, xhigh, max or default".into());
-        }
-        return Ok(());
+/// Chat Completions providers that keep a prompt cache per server and send a
+/// conversation's requests to one server by a header: host, model id prefix
+/// (which names the provider behind a proxy or gateway too), header.
+pub const CACHE_ROUTES: &[(&str, &str, &str)] = &[("api.x.ai", "grok-", "x-grok-conv-id")];
+
+/// Chat Completions routes that cache a model's prompt only up to a
+/// `cache_control` marker, and so read nothing back from a request without
+/// one: host, model id prefix. OpenRouter serving an Anthropic model is one.
+pub const CACHE_MARKS: &[(&str, &str)] = &[("openrouter.ai", "anthropic/")];
+
+/// Responses servers whose input has no `additional_tools` item and refuses
+/// the request that carries one: host, model id prefix, as in `CACHE_ROUTES`.
+pub const TOOLS_FIELD: &[(&str, &str)] = &[("api.x.ai", "grok-")];
+
+/// Models that take a reasoning effort change inside the conversation, so
+/// the effort at a request's top, rendered ahead of the history, need never
+/// change: wire, model id prefix after any `vendor/`. GPT-6 and later take a
+/// `configuration_update` input item, these Claude models an effort-only
+/// system message under the `EFFORT_BETA` header.
+pub const EFFORT_UPDATES: &[(WireApi, &str)] = &[(WireApi::Responses, "gpt-6"), (WireApi::Anthropic, "claude-opus-5"),
+    (WireApi::Anthropic, "claude-sonnet-5-5"), (WireApi::Anthropic, "claude-haiku-5-5"), (WireApi::Anthropic, "claude-fable-5-1"),
+    (WireApi::Anthropic, "claude-mythos-5-1")];
+pub const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
+
+/// Reasoning effort levels a route takes where its server refuses the others
+/// with a 400 once the request is spent: host, model id prefix, as in
+/// `CACHE_ROUTES`, then the levels. xAI documents low to xhigh for grok-4.5
+/// and later, whose reasoning cannot be disabled.
+pub const EFFORT_LEVELS: &[(&str, &str, &[&str])] = &[("api.x.ai", "grok-4.", &["default", "low", "medium", "high", "xhigh"])];
+
+/// The reasoning effort levels a route takes, "default" (no field) first: its
+/// `EFFORT_LEVELS` row, else native Messages' five, else none at all on
+/// api.anthropic.com's compatibility route, which accepts the field and
+/// ignores it, else every level, for the server to validate.
+pub fn effort_levels(base: &str, wire: WireApi, model: &str) -> &'static [&'static str] {
+    match EFFORT_LEVELS.iter().find(|(host, prefix, _)| serves(base, model, host, prefix)) {
+        Some((.., levels)) => levels,
+        None if wire == WireApi::Anthropic => &["default", "low", "medium", "high", "xhigh", "max"],
+        None if reqwest::Url::parse(base.trim()).is_ok_and(|url| url.host_str() == Some("api.anthropic.com")) => &["default"],
+        None => &crate::config::ReasoningEffort::LEVELS,
     }
-    if effort.is_some()
-        && reqwest::Url::parse(base).is_ok_and(|url| url.host_str() == Some("api.anthropic.com")) {
-        return Err("this endpoint ignores reasoning effort; choose /effort default or --effort default".into());
+}
+
+/// Refuse a level the route does not take before a request is spent on it.
+pub fn validate_reasoning_effort(base: &str, wire: WireApi, model: &str, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
+    let levels = effort_levels(base, wire, model);
+    match effort.map(crate::config::ReasoningEffort::as_str) {
+        Some(_) if levels == ["default"] => Err("this endpoint ignores reasoning effort; choose /effort default or --effort default".into()),
+        Some(level) if !levels.contains(&level) => Err(format!("this endpoint does not take reasoning effort {level}; choose {}", join_list(levels, "or"))),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// Whether a request to `base` for `model` reaches the provider known by
+/// `host`, or by a model id `prefix` after any `vendor/` prefix (so behind a
+/// proxy or gateway too).
+pub(crate) fn serves(base: &str, model: &str, host: &str, prefix: &str) -> bool {
+    reqwest::Url::parse(base.trim()).is_ok_and(|url| url.host_str() == Some(host))
+        || model.rsplit('/').next().is_some_and(|model| model.to_ascii_lowercase().starts_with(prefix))
 }
 
 fn validate_chatgpt(base: &str, wire: WireApi, extra_credentials: bool) -> Result<(), String> {
@@ -867,21 +885,11 @@ pub(crate) fn expand_secret(raw: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// The headers to send: each named one whose value expands (`expand_secret`
+/// never yields an empty one), so a header whose secret env is unset is
+/// skipped rather than sent empty.
 pub fn expand_headers(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
-    map.iter()
-        .filter_map(|(k, v)| {
-            let key = k.trim();
-            if key.is_empty() {
-                return None;
-            }
-            // Skip headers whose secret env is unset rather than sending empty values.
-            let val = expand_secret(v)?;
-            if val.is_empty() {
-                return None;
-            }
-            Some((key.to_string(), val))
-        })
-        .collect()
+    map.iter().filter(|(k, _)| !k.trim().is_empty()).filter_map(|(k, v)| Some((k.trim().to_string(), expand_secret(v)?))).collect()
 }
 
 #[cfg(test)]
@@ -1268,8 +1276,11 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("X-A".into(), "$NO_SUCH_OPENMAX_ENV_VAR_ZZZ".into());
         map.insert("X-B".into(), "ok".into());
+        map.insert(" X-C ".into(), " padded ".into());
+        map.insert("  ".into(), "nameless".into());
+        map.insert("X-D".into(), "  ".into());
         let headers = expand_headers(&map);
-        assert_eq!(headers, vec![("X-B".into(), "ok".into())]);
+        assert_eq!(headers, vec![("X-C".into(), "padded".into()), ("X-B".into(), "ok".into())]);
     }
 
     #[test]
@@ -1500,5 +1511,38 @@ mod tests {
         assert_eq!(resolve(&named, &dir).unwrap().context_tokens, 32_768);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// xAI documents reasoning effort low to xhigh for grok-4.5 and later
+    /// (docs.x.ai, model capabilities, reasoning) and refuses none and max
+    /// with a 400 once the request is spent. Every wire to that route, known
+    /// by its host or by the model id behind a proxy or gateway, takes those
+    /// levels and refuses the others before a request; other routes keep theirs.
+    #[test]
+    fn each_route_takes_the_reasoning_effort_levels_its_vendor_documents() {
+        use crate::config::ReasoningEffort as E;
+        let xai = ["default", "low", "medium", "high", "xhigh"];
+        assert_eq!(EFFORT_LEVELS, [("api.x.ai", "grok-4.", &xai[..])]);
+        for wire in [WireApi::ChatCompletions, WireApi::Responses, WireApi::Anthropic] {
+            for (base, model) in [("https://api.x.ai/v1", "grok-4.7"), (" https://api.x.ai/v1", "other"), ("http://127.0.0.1:8080/v1", "x-ai/Grok-4.20-multi-agent")] {
+                assert_eq!(effort_levels(base, wire, model), xai, "{wire:?} {base} {model}");
+                for level in [E::None, E::Minimal, E::Max] {
+                    let refused = validate_reasoning_effort(base, wire, model, Some(level)).unwrap_err();
+                    assert_eq!(refused, format!("this endpoint does not take reasoning effort {}; choose default, low, medium, high or xhigh", level.as_str()));
+                }
+                for level in [None, Some(E::Low), Some(E::Medium), Some(E::High), Some(E::XHigh)] {
+                    assert!(validate_reasoning_effort(base, wire, model, level).is_ok(), "{level:?}");
+                }
+            }
+        }
+        let local = "http://127.0.0.1:8080/v1";
+        assert_eq!(effort_levels(local, WireApi::Anthropic, "model"), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert!(validate_reasoning_effort(local, WireApi::Anthropic, "model", Some(E::Minimal)).unwrap_err().ends_with("xhigh or max"));
+        assert!(validate_reasoning_effort(local, WireApi::Anthropic, "model", Some(E::Max)).is_ok());
+        let compat = "https://api.anthropic.com/v1";
+        assert_eq!(effort_levels(compat, WireApi::ChatCompletions, "model"), ["default"]);
+        assert!(validate_reasoning_effort(compat, WireApi::ChatCompletions, "model", Some(E::Low)).unwrap_err().contains("ignores reasoning effort"));
+        assert_eq!(effort_levels(local, WireApi::Responses, "grok-3-mini"), crate::config::ReasoningEffort::LEVELS);
+        assert!(validate_reasoning_effort(local, WireApi::ChatCompletions, "grok-3-mini", Some(E::None)).is_ok());
     }
 }

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use open_max_core::providers;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
@@ -135,17 +135,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::BORDER()))
-        .title(Span::styled(
-            " Model ",
-            Style::default()
-                .fg(theme::ACCENT())
-                .add_modifier(Modifier::BOLD),
-        ));
+        .border_style(Style::default().fg(theme::BORDER))
+        .title(Span::styled(" Model ", theme::ACCENT_BOLD));
     let inner = block.inner(area);
     block.render(area, frame.buffer_mut());
     let mut lines = vec![Line::from(vec![
-        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
+        Span::styled("⌕ ", Style::default().fg(theme::ACCENT)),
         Span::styled(
             if state.query.is_empty() {
                 "type to filter".to_string()
@@ -153,9 +148,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
                 state.query.clone()
             },
             if state.query.is_empty() {
-                Style::default()
-                    .fg(theme::DIM())
-                    .add_modifier(Modifier::ITALIC)
+                theme::DIM_ITALIC
             } else {
                 Style::default()
             },
@@ -175,9 +168,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
         let marker = if selected { "▸" } else { " " };
         let active = if item.active { "●" } else { " " };
         let base = if selected {
-            Style::default()
-                .fg(theme::ACCENT())
-                .add_modifier(Modifier::BOLD)
+            theme::ACCENT_BOLD
         } else {
             Style::default()
         };
@@ -208,22 +199,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
                     &clip(provider, provider_width.saturating_sub(1)),
                     provider_width,
                 ),
-                base.fg(theme::DIM()),
+                base.fg(theme::DIM),
             ),
-            Span::styled(clip(&item.id, id_width), base.fg(theme::DIM())),
+            Span::styled(clip(&item.id, id_width), base.fg(theme::DIM)),
         ]));
     }
     if state.filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no matching configured models",
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
-        )));
+        lines.push(Line::from(Span::styled("  no matching configured models", theme::DIM_ITALIC)));
     }
     lines.push(Line::from(Span::styled(
         "↑/↓ navigate · enter select · type to filter · esc close",
-        Style::default().fg(theme::DIM()),
+        Style::default().fg(theme::DIM),
     )));
     Paragraph::new(lines).render(inner, frame.buffer_mut());
     if inner.width > 2 && inner.height > 0 {
@@ -243,6 +229,7 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
     use std::fs;
 
     fn fixture() -> std::path::PathBuf {
@@ -348,6 +335,59 @@ mod tests {
         assert!(text.contains("Model One"));
         assert_eq!(buffer[(1, 2)].symbol(), "▸");
         assert!(buffer[(1, 2)].modifier.contains(Modifier::BOLD));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An active model a catalog lists is not added a second time, and
+    /// stepping through the list wraps around at both ends.
+    #[test]
+    fn a_listed_active_model_appears_once_and_the_selection_wraps() {
+        let dir = fixture();
+        let mut state = ModelPickerState::load(&dir, Some("alpha"), "one");
+        assert_eq!(state.items.len(), 4);
+        let mut stepped = Vec::new();
+        for _ in 0..4 {
+            state.next();
+            stepped.push(state.selected);
+        }
+        assert_eq!(stepped, [1, 2, 3, 0]);
+        state.prev();
+        assert_eq!(state.selected, 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Each row lays out marker, name, provider and id in columns whose
+    /// widths follow the picker's width, and the cursor sits in the query
+    /// line only while the picker has room for it.
+    #[test]
+    fn rows_lay_out_columns_by_width_and_the_cursor_needs_room() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = fixture();
+        let state = ModelPickerState::load(&dir, Some("alpha"), "one");
+        let draw = |width: u16, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, frame.area(), &state)).unwrap();
+            let backend = terminal.backend();
+            let row: String = if height > 2 {
+                (0..width).map(|x| backend.buffer()[(x, 2)].symbol().to_string()).collect()
+            } else {
+                String::new()
+            };
+            let cursor = backend.cursor_visible().then(|| backend.cursor_position());
+            (row, cursor)
+        };
+        // Inside the borders: 78 cells give the name 24 and the provider 14,
+        // and 60 give them 18 and 10; the id takes what is left.
+        let (wide, cursor) = draw(80, 10);
+        assert_eq!(wide, format!("│▸ ● {:<24}{:<14}{:<36}│", "Model One", "alpha", "one"));
+        assert_eq!(cursor, Some(Position::new(3, 1)));
+        let (medium, _) = draw(62, 10);
+        assert_eq!(medium, format!("│▸ ● {:<18}{:<10}{:<28}│", "Model One", "alpha", "one"));
+        // Two cells wide or no rows high, there is nowhere to put it.
+        assert_eq!(draw(4, 10).1, None);
+        assert_eq!(draw(20, 2).1, None);
         let _ = fs::remove_dir_all(dir);
     }
 }

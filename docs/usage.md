@@ -61,9 +61,10 @@ session or trust flags. `--account` defaults to `main`. See
 context-window configuration, and billing behavior.
 
 `--effort high` requests a reasoning effort level at launch. **Shift+Tab**
-cycles the active provider's effort levels. Choose `default`,
+cycles the levels the active endpoint and model take. Choose `default`,
 `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Levels depend on
-model support; provider errors are preserved. The setting follows the same
+model support; a level the route is known to refuse (for example `max` on
+xAI's grok-4.x) is refused before any request, and provider errors are preserved. The setting follows the same
 initial-configuration and run-only override rules as the endpoint flags below.
 
 `--base-url`, `--model`, `--api-key` (a literal or `'$ENV_VAR'`) and
@@ -432,7 +433,7 @@ watcher nor a later launch stops them.
 | `/approvals auto\|ask\|readonly` | Alias for `/permissions` |
 | `/new` · `/resume` | Fresh session · pick an earlier one |
 | `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
-| `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the trailing note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
+| `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |

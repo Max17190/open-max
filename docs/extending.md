@@ -48,7 +48,7 @@ the files. Hooks are capped at 32 per event the same way.
 
 A session's `tools` array is the one it began with, so writing a tool file
 mid-session moves no byte of the cached prompt prefix. From the agent's next
-step the new tool is a line of the trailing note (see
+step the new tool is a line of the note (see
 [Freezing and re-freezing](#freezing-and-re-freezing)): its name, description,
 and `params` schema, then the bash command that runs it the way the harness
 does, `printf '%s\n' '<JSON arguments>' | 'command' 'arg'...` in the project
@@ -117,7 +117,7 @@ base-level activation (each past access at age `t` hours contributes
 memory) and injected as one index line each under a 1500-byte budget. The
 index is frozen with the prompt: writing a memory mid-session does not
 re-freeze, so the prompt cache survives the write. The new line rides the
-trailing note from the agent's next step when it writes the memory with
+note from the agent's next step when it writes the memory with
 `write_file` or `edit_file`, and otherwise from the next re-freeze a tool or
 skill change causes or the next resume; it reaches the prompt at the next
 session or `/reload`. The
@@ -240,8 +240,10 @@ for a bare script name on PATH). In `auto`:
   blocking `turn_end` gate is in that state the model is also told at turn
   start, once per session for each distinct failure.
 
-Manifest changes activate at the next turn; a script runs from disk, so an
-edit to it applies at the hook's next run.
+Manifest changes activate at the next turn, with no reload: in print mode
+(`openmax -p`) the run's next `-p` prompt, and any run started later, including
+one the agent starts now from `bash` with `openmax -p`. A script runs from
+disk, so an edit to it applies at the hook's next run.
 
 In `ask` and `readonly`, unknown keys in a hook file are rejected, and a hook file that a human approved
 and that no longer parses blocks every tool call until it is fixed or removed
@@ -304,11 +306,11 @@ directory not created yet. `allow` and `ask` read only the relative path,
 case and all. A path the tool refuses (one that leaves the project) is
 matched as written, and the tool refuses it anyway.
 
-A rule names one tool, so a `deny read_file` on `secrets/` keeps `read_file`
-out of it and nothing else. `grep` with no path searches the whole project,
-`secrets/` included, and `bash` reads anything. To keep a path's contents
-from the agent, deny `grep` too (or `grep` over it, by path, if every search
-names one) and `bash`, or move the files out of the project.
+A rule names one tool. A `deny read_file` on `secrets/` gates reads through
+`read_file`. A `grep` path rule matches the search root, so a search rooted
+above `secrets/` can still reach it. A deny regex for `grep` also matches
+its pattern case-insensitively. For broader protection, deny `grep` and
+`bash` calls or move the files out of the project.
 
 `tool` is matched by exact name, so a rule naming a tool that does not exist
 never fires: a misspelled `deny` reads exactly like a `deny` that never had to
@@ -586,7 +588,11 @@ surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`,
 and defaults, hook stdin payload shapes, and activation timing. The frozen
 prompt carries only a one-line pointer to it, so the full contract costs zero
 tokens until the agent reads it, and the printed examples are parsed by the
-same validation code in tests so the text cannot drift from the binary.
+same validation code in tests so the text cannot drift from the binary. The
+tools and hooks contracts state each mode's content approval rule and name
+`openmax --spec tools.approval` and `hooks.approval` for the detail that
+applies only outside auto, so a session in auto never re-sends it with every
+request after the read.
 
 ## Freezing and re-freezing
 
@@ -599,7 +605,7 @@ from the built-ins and the tool files that load then. The prompt is persisted
 with the session, and its manifest records the array's tool files and what the
 prompt's index shows.
 
-What the session changes after that rides the trailing note: each tool file
+What the session changes after that rides the note: each tool file
 the array lacks or carries with another description or schema, by its line
 (schema and bash command included, see [Tools](#tools)); each skill and memory
 added or changed, by its new index line; each tool file, skill, and memory the
@@ -608,14 +614,20 @@ compared whole though the prompt carries it capped. An entry that only moved
 in or out of the index (a memory that faded, a skill the byte cap now leaves
 out) is not a change, and the layout map stays the prompt's. The note is built
 when a generation activates, at a resume, and after the agent writes a memory
-with `write_file` or `edit_file`, never persisted, and sent after
-the whole history of each request: it ends the content of the last message
-(the user's prompt or the newest tool result) after a blank line and a header
-that names the harness as its source, or, after an assistant reply, goes as a
-user message of its own, so the endpoint sees the stored role order (see
-[configuration](configuration.md#multiple-providers)) and a provider's prompt
-cache covers the prompt and the whole conversation. A session that changes
-nothing sends no note. The note holds at most 6000 bytes, with the skills and
+with `write_file` or `edit_file`, and stored in the transcript each time it
+changes, never moved or rewritten: it ends the content of the newest tool
+result (after the receipt of the write that changed it) or, at the start of a
+turn, of the user's prompt, after a blank line and a header that names the
+harness as its source and says the latest note replaces any earlier one, or,
+after an assistant reply, goes as a user message of its own, so the endpoint
+sees the stored role order (see
+[configuration](configuration.md#multiple-providers)). Every later request
+repeats it as history, so a provider's prompt cache covers the prompt and the
+whole conversation, notes included. A prune that drops or shortens the stored
+note stores it again, a resumed session stores one only when what it builds
+differs from the last one stored, and when nothing differs from the prompt any
+more, the header alone is stored. A session that changes nothing stores no
+note. The note holds at most 6000 bytes, with the skills and
 memory sections under their prompt sections' caps (3000 and 1500), and counts
 what it leaves out. A copy of the note's header in tool output has its
 brackets turned to parentheses where the output is captured, so a file the

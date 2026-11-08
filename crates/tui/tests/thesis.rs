@@ -1,4 +1,6 @@
-//! The thesis targets, one test each, named after the target it holds.
+//! The thesis gates, each named for what it asserts: one whose name states a
+//! bound prints a `MEASURE` line keyed by its name that gives that bound
+//! (every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -78,7 +80,7 @@ fn assigned(script: &str, name: &str) -> String {
         .to_string()
 }
 
-/// `n` with a comma between each group of three digits, as the README writes
+/// `n` with a comma between each group of three digits, as the docs write
 /// a count.
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
@@ -121,13 +123,18 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
     (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
-/// The whole suite runs in 5 seconds after compilation. No test inside the
-/// suite can time the suite, so CI does: its test job runs
-/// scripts/check-suite-time.sh on the suite it just built, on every runner of
-/// its matrix, with that runner's multiplier, which the script explains, in a
-/// step with a timeout. Linux gates the result; macOS reports failures as an
-/// advisory warning and summary. Functional tests remain enforced on both.
-/// This test holds that wiring, and holds the gate to
+/// The suite fails over its time budget: 5 seconds after compilation, the
+/// target, times the multiplier of the machine it runs on. No test inside
+/// the suite can time the suite, so CI does: its Suite time job builds the
+/// suite and runs scripts/check-suite-time.sh on it with ubuntu-latest's
+/// multiplier, which the script explains, in a step with a timeout, and
+/// fails the pull request over that budget. It is a job of its own, so no
+/// step of the test job runs on one of its runners only, and it restores the
+/// test job's cache, saving none. macos-latest does not meet its budget, so
+/// the Reports workflow runs the script there every night instead, five
+/// times after one build with that runner's multiplier, and reports what it
+/// prints, failing only when the five runs did not finish. This test holds
+/// that wiring, and holds the gate to
 /// its job by driving it with a stand-in `cargo` that lists stand-in test
 /// binaries: it runs them at once (four of them each wait for the other
 /// three to start), each the way `cargo test` would (from its package
@@ -135,7 +142,12 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// times the multiplier, and fails one over it or with a binary that fails
 /// again when run alone (or that a signal ends, SIGALRM included), naming
 /// the binary and showing its failures, and passes one whose binary failed
-/// only beside the others. A binary still running at three times the budget
+/// only beside the others. A test the script runs alone, as it times its
+/// own work, is left out of its binary's run beside the others and then runs
+/// alone once they have ended, on the clock (a run names it when it is
+/// the slowest), and fails the gate when it fails there, with no second
+/// run; each such test is one the suite holds.
+/// A binary still running at three times the budget
 /// is stopped, with every process still under it (a grandchild and one in a
 /// session of its own among them; on Linux, with no `ps` on the PATH), and
 /// fails the gate, which names the test it had not finished. Run several
@@ -146,66 +158,80 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// never reported. It refuses arguments it does not take. Under a perl
 /// without a module it needs, it stops before cargo and names the module.
 #[test]
-fn whole_suite_runs_in_five_seconds() {
-    let job = ci_job("test");
-    let step = |run: &str| {
-        job.iter()
-            .position(|line| line.trim() == format!("run: {run}"))
-            .unwrap_or_else(|| panic!("the test job does not run `{run}`"))
+fn the_suite_fails_over_its_time_budget() {
+    // The gate: a job of its own on one runner, which builds the suite and
+    // then times it under a timeout, and restores the test job's cache.
+    let job = ci_job("suite-time");
+    let at = |job: &[String], line: &str| job.iter().position(|l| l.trim() == line);
+    assert!(at(&job, "runs-on: ubuntu-latest").is_some(), "the suite time gate does not run on ubuntu-latest");
+    let (built, gate) =
+        (at(&job, "run: cargo test --workspace --locked --no-run"), at(&job, "run: scripts/check-suite-time.sh 3"));
+    let (Some(built), Some(gate)) = (built, gate) else {
+        panic!("the suite time job does not build the suite and then check it with a multiplier of 3: {job:?}")
     };
-    let gate_run = "scripts/check-suite-time.sh ${{ matrix.suite_time_multiplier }}";
-    let (tests, docs, gate) = (step(NEXTEST_RUN), step(DOC_TESTS), step(gate_run));
-    assert!(tests < gate, "the suite time gate runs before the suite is built");
-    for functional in [tests, docs] {
-        let keys = step_keys(&job, functional);
-        assert!(!keys.iter().any(|key| key.starts_with("if:") || key.starts_with("continue-on-error:")),
-            "normal functional tests must stay enforced on every runner: {keys:?}");
-    }
-    let keys = step_keys(&job, gate);
-    assert!(!keys.iter().any(|key| key.starts_with("if:")), "a runner skips its suite timing measurement");
-    let soft: Vec<_> = keys.iter().filter(|key| key.starts_with("continue-on-error:")).copied().collect();
-    assert_eq!(soft, ["continue-on-error: ${{ matrix.os == 'macos-latest' }}"],
-        "only the macOS concurrent suite measurement is advisory");
-    assert!(keys.contains(&"id: suite_time"), "the advisory reporter cannot inspect the measurement outcome");
-    let report = job.iter().position(|line| line.trim() == "- name: Report macOS suite timing failure")
-        .expect("macOS measurement failures have no visible report");
-    let report = step_keys(&job, report);
-    assert!(report.contains(&"if: ${{ !cancelled() && matrix.os == 'macos-latest' && steps.suite_time.outcome == 'failure' }}"),
-        "the advisory report must inspect the failed step outcome, including an allowed failure");
-    assert!(report.iter().any(|line| line.contains("::warning::")) && report.iter().any(|line| line.contains("$GITHUB_STEP_SUMMARY")),
-        "macOS measurement failures must remain visible as a warning and summary");
+    assert!(built < gate, "the suite time gate builds under its own timeout");
     assert!(
-        keys.iter().any(|key| key.starts_with("timeout-minutes:")),
+        step_keys(&job, gate).iter().any(|key| key.starts_with("timeout-minutes:")),
         "a test that hangs beside the others holds the suite time gate until the job's own limit"
     );
-    // Each runner of the matrix has its own multiplier, and the script gives
-    // the reason for each one: a multiplier raised without one passes a pull
-    // request that slowed the suite on that runner.
-    let script = std::fs::read_to_string(repo().join("scripts/check-suite-time.sh")).unwrap();
-    let runners: Vec<&str> = job
-        .iter()
-        .find_map(|line| line.trim().strip_prefix("os: [")?.strip_suffix(']'))
-        .expect("the test job names no runners")
-        .split(", ")
-        .collect();
-    let mut multipliers = Vec::new();
-    let mut entry = None;
-    for line in job.iter().map(|line| line.trim()) {
-        if let Some(os) = line.strip_prefix("- os: ") {
-            entry = Some(os);
-        } else if let Some(multiplier) = line.strip_prefix("suite_time_multiplier: ") {
-            multipliers.push((entry.take().expect("a multiplier outside a runner's entry"), multiplier));
-        }
+    for line in ["shared-key: test", "save-if: false"] {
+        assert!(at(&job, line).is_some(), "the suite time job does not restore the test job's cache without saving one: {line}");
     }
-    for runner in runners {
-        let (_, multiplier) = multipliers
-            .iter()
-            .find(|(os, _)| *os == runner)
-            .unwrap_or_else(|| panic!("the suite time gate has no multiplier on {runner}"));
+    let test_job = ci_job("test");
+    assert!(
+        !test_job.iter().any(|line| line.contains("check-suite-time")),
+        "the test job times the suite on every runner of its matrix, or on one of them only"
+    );
+    // The report: macos-latest, five runs, its own multiplier, run as outside
+    // GitHub Actions so a run over budget is a line and not an error, and a
+    // failure only when the five runs did not finish.
+    let report = workflow_job("reports.yml", "suite-time");
+    assert!(at(&report, "runs-on: macos-latest").is_some(), "the suite time report does not run on macos-latest");
+    assert!(at(&report, "run: cargo test --workspace --locked --no-run").is_some(), "the report builds under its timeout");
+    for line in ["shared-key: test", "save-if: false"] {
+        assert!(at(&report, line).is_some(), "the suite time report does not restore the test job's cache without saving one: {line}");
+    }
+    let run = at(&report, "- name: Report the suite time").expect("the Reports workflow has no suite time report");
+    assert!(
+        step_keys(&report, run).iter().any(|key| key.starts_with("timeout-minutes:")),
+        "a test that hangs holds the suite time report until the job's own limit"
+    );
+    let commands: Vec<&str> =
+        report[run..].iter().map(|line| line.trim()).skip_while(|line| *line != "run: |").skip(1).take_while(|line| !line.is_empty()).collect();
+    assert_eq!(
+        commands,
+        [
+            "env -u GITHUB_ACTIONS scripts/check-suite-time.sh --runs 5 4 2>&1 | tee \"$RUNNER_TEMP/suite-time.log\"",
+            "status=${PIPESTATUS[0]}",
+            "{ echo \"Reported, not gated, on macos-latest; the check exited $status:\"; echo '```'; sed -n -E '/^(run [0-9]+ of 5: |median )/p' \"$RUNNER_TEMP/suite-time.log\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
+            "grep -q '^median .* over 5 runs,' \"$RUNNER_TEMP/suite-time.log\" || { echo \"::error::the suite did not run 5 times, so it measured nothing\"; exit 1; }",
+            "if grep -E 'FAILED \\(stopped at |test binaries did not report' \"$RUNNER_TEMP/suite-time.log\"; then echo \"::error::a run did not finish, so its time is not the suite's\"; exit 1; fi",
+        ],
+        "the suite time report does not run the suite five times on macos-latest, report each run and the median, \
+         and fail only when the runs did not finish"
+    );
+    // Each runner's multiplier, the gate's and the report's, has its reason
+    // in the script: a multiplier raised without one passes a pull request
+    // that slowed the suite on that runner.
+    let script = std::fs::read_to_string(repo().join("scripts/check-suite-time.sh")).unwrap();
+    for (multiplier, runner) in [("3", "ubuntu-latest"), ("4", "macos-latest")] {
         assert!(
             script.contains(&format!("a multiplier of {multiplier} on {runner}")),
             "the script does not give the reason for the multiplier of {multiplier} on {runner}"
         );
+    }
+    // The tests the script runs alone are tests of the suite under those
+    // names: one renamed would run beside the others again and time the
+    // runner.
+    let named = script.lines().find_map(|line| line.strip_prefix("alone_tests=\"")?.strip_suffix('"')).unwrap_or("");
+    assert!(!named.is_empty(), "the script names no test that runs alone");
+    let sources: String = ["crates/core/tests", "crates/tui/tests"]
+        .iter()
+        .flat_map(|tests| std::fs::read_dir(repo().join(tests)).unwrap())
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default())
+        .collect();
+    for test in named.split(' ') {
+        assert!(sources.contains(&format!("fn {test}()")), "the script runs {test} alone, which no test is named");
     }
 
     let nonce = std::time::SystemTime::now()
@@ -293,6 +319,38 @@ fn whole_suite_runs_in_five_seconds() {
         path
     };
     let (contended, flaky) = (fails_once("contended"), fails_once("flaky"));
+    // A binary that holds a test the gate runs alone, and a binary beside it
+    // that marks when it ended: beside the others the first must be run
+    // without that test, then alone with only it, with libtest's own pool,
+    // once every other binary has ended, once a run. Alone, its test takes a
+    // second the first time, four fifths of a second longer than the binary
+    // beside it (room for either to start late on a busy runner and still
+    // keep their order), and no time after that. It ends with `code`.
+    let held_alone = |name: &str, code: u8| {
+        let (path, ended, runs) = (dir.join(name), dir.join(format!("{name}-lagging-ended")), dir.join(format!("{name}-alone-runs")));
+        executable(
+            &path,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --list ] && {{ printf 'beside: test\\nharness_time_per_tool_round: test\\n'; exit 0; }}\n\
+                 case \"$*\" in\n\
+                 \"--test-threads \"*\" --exact --skip harness_time_per_tool_round\") exit 0 ;;\n\
+                 \"--exact harness_time_per_tool_round\") echo run >> '{runs}' ;;\n\
+                 *) echo \"run with $*\"; exit 1 ;;\n\
+                 esac\n\
+                 [ -e '{ended}' ] || {{ echo 'run alone beside another binary'; exit 1; }}\n\
+                 [ \"$(wc -l < '{runs}')\" -gt 1 ] || sleep 1\n\
+                 [ {code} = 0 ] || printf 'failures:\\n\\n---- harness_time_per_tool_round stdout ----\\npast its bound\\n'\n\
+                 exit {code}\n",
+                runs = runs.display(),
+                ended = ended.display(),
+            ),
+        );
+        let lagging = dir.join(format!("{name}-lagging"));
+        executable(&lagging, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nrm -f '{0}'\nsleep 0.2\n: > '{0}'\n", ended.display()));
+        (path, lagging, runs)
+    };
+    let (timed, timed_lagging, timed_runs) = held_alone("timed", 0);
+    let (slow_alone, slow_lagging, slow_runs) = held_alone("slow-alone", 101);
     // A binary whose n-th run sleeps the n-th of `sleeps` seconds, for the
     // gate run several times over. In each series below the median is a
     // tenth of a second or more from the mean, the last run and the middle
@@ -369,6 +427,8 @@ fn whole_suite_runs_in_five_seconds() {
         (repeated_failed, repeated_failed_report),
         (unreported, unreported_report),
         (no_runs, _),
+        (alone, alone_report),
+        (alone_failed, alone_failed_report),
     ) = std::thread::scope(|scope| {
         let passed = scope.spawn(|| {
             let mut binaries: Vec<(&str, Option<&Path>)> =
@@ -382,9 +442,11 @@ fn whole_suite_runs_in_five_seconds() {
         let failed = scope.spawn(|| {
             run_gate("failed", &["1"], &[("broken", Some(failing.as_path())), ("crashing", Some(crashing.as_path()))], None)
         });
-        // A twenty-fifth of the target is a fifth of a second, so the bound
-        // is three fifths.
-        let stopped = scope.spawn(|| run_gate("stopped", &["0.04"], &[("hanging", Some(hanging.as_path()))], None));
+        // A tenth of the target is half a second, so the bound is a second
+        // and a half: room for the hanging binary to start what it leaves
+        // running on a busy runner, beside a dozen other gates, before the
+        // bound stops it, while its `sleep 5` still outlasts the bound.
+        let stopped = scope.spawn(|| run_gate("stopped", &["0.1"], &[("hanging", Some(hanging.as_path()))], None));
         let usage = scope.spawn(|| run_gate("usage", &["twice"], &[], None));
         let leftover = scope.spawn(|| run_gate("leftover", &["1", "--runs", "2"], &[], None));
         let retried = scope.spawn(|| run_gate("retried", &["1"], &[("contended", Some(contended.as_path()))], None));
@@ -399,6 +461,14 @@ fn whole_suite_runs_in_five_seconds() {
         let unreported =
             scope.spawn(|| run_gate("unreported", &["--runs", "2", "1"], &[("vanishing", Some(vanishing.as_path()))], None));
         let no_runs = scope.spawn(|| run_gate("no-runs", &["--runs", "0", "1"], &[], None));
+        let alone = scope.spawn(|| {
+            let binaries = [("timed", Some(timed.as_path())), ("lagging", Some(timed_lagging.as_path()))];
+            run_gate("alone", &["--runs", "2", "1"], &binaries, None)
+        });
+        let alone_failed = scope.spawn(|| {
+            let binaries = [("slow-alone", Some(slow_alone.as_path())), ("lagging", Some(slow_lagging.as_path()))];
+            run_gate("alone-failed", &["1"], &binaries, None)
+        });
         (
             passed.join().unwrap(),
             over.join().unwrap(),
@@ -413,8 +483,12 @@ fn whole_suite_runs_in_five_seconds() {
             repeated_failed.join().unwrap(),
             unreported.join().unwrap(),
             no_runs.join().unwrap(),
+            alone.join().unwrap(),
+            alone_failed.join().unwrap(),
         )
     });
+    let ran_alone = |runs: &Path| std::fs::read_to_string(runs).map_or(0, |text| text.lines().count());
+    let (timed_ran, slow_ran) = (ran_alone(&timed_runs), ran_alone(&slow_runs));
     // What the processes the hanging binary left running wrote, and whether
     // one of them still holds the lifeline two seconds on.
     let (mut said, mut chunk) = (Vec::new(), [0_u8; 64]);
@@ -462,12 +536,12 @@ fn whole_suite_runs_in_five_seconds() {
     );
     assert!(!outlived, "the processes the stopped binary left running outlived it: {stopped_report}");
     let unfinished: Vec<&str> = stopped_report
-        .split_once("hanging (test) failed beside the other binaries and passed alone:\nstill running at 0.60s, when it was stopped:\n")
+        .split_once("hanging (test) failed beside the other binaries and passed alone:\nstill running at 1.50s, when it was stopped:\n")
         .map_or(Vec::new(), |(_, rest)| rest.lines().take_while(|line| !line.is_empty() && !line.contains(' ')).collect());
     assert!(
-        stopped_report.contains("hanging (test) FAILED (stopped at 0.60s)")
+        stopped_report.contains("hanging (test) FAILED (stopped at 1.50s)")
             && unfinished == ["hangs"]
-            && stopped_report.contains("over its 0.20s budget"),
+            && stopped_report.contains("over its 0.50s budget"),
         "the binary stopped at its bound, or the test it had not finished, is not named: {stopped_report}"
     );
     assert_eq!(usage, Some(2), "a multiplier that is not a number is not refused");
@@ -537,6 +611,35 @@ fn whole_suite_runs_in_five_seconds() {
         "the run whose binary never reported does not say why: {unreported_report}"
     );
     assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
+    // A test that times its own work runs alone: beside the others its
+    // binary runs without it, then it runs alone, once every other binary
+    // has ended, in every run, and its time counts toward the run's, which
+    // names it when it is the slowest. Alone, its failure fails the gate,
+    // with no second run.
+    let first_run = alone_report
+        .lines()
+        .find_map(|line| line.strip_prefix("run 1 of 2: ")?.split_once("s, slowest binary "))
+        .and_then(|(took, slowest)| Some((took.parse::<f64>().ok()?, slowest.split_once(", load ")?.0)));
+    assert!(
+        alone == Some(0)
+            && timed_ran == 2
+            && alone_report.lines().any(|line| line.starts_with("run 2 of 2: "))
+            && first_run.is_some_and(|(took, slowest)| {
+                took >= 1.2 && slowest.ends_with("s harness_time_per_tool_round in timed (test), alone")
+            }),
+        "a test that runs alone did not run once a run, alone, after the others and on the clock, \
+         or the run did not name it as its slowest: {alone_report}"
+    );
+    assert!(
+        alone_failed == Some(1)
+            && alone_failed_report.contains("harness_time_per_tool_round in slow-alone (test), alone FAILED (exit 101)")
+            && alone_failed_report.contains(
+                "harness_time_per_tool_round in slow-alone (test), alone failed:\nfailures:\n\n---- harness_time_per_tool_round stdout ----\npast its bound"
+            )
+            && !alone_failed_report.contains("passed alone")
+            && slow_ran == 1,
+        "a test that fails alone passes the gate, or runs a second time: {alone_failed_report}"
+    );
 }
 
 /// What scripts/count-core-lines.sh prints for `checkout` with `flags`, or,
@@ -562,7 +665,8 @@ fn repo_lines() -> Result<&'static str, String> {
     REPORT.get_or_init(|| gauge(&repo(), &["--files"])).as_deref().map_err(String::clone)
 }
 
-/// The core, production Rust without its tests, is about 37,000 lines.
+/// The core, production Rust without its tests, stays under its line
+/// ratchet, against a target of about 37,000 lines.
 /// scripts/count-core-lines.sh measures it as core-excluding-tests (the
 /// lines of crates/*/src less test-only items, by the method its header
 /// states) beside total-including-tests (every line of Rust under crates/),
@@ -575,8 +679,9 @@ fn repo_lines() -> Result<&'static str, String> {
 /// removes production lines must lower BASELINE to its new count, so the
 /// lines it saves stay saved. A BASELINE past CEILING does not compile, and
 /// no change grows the core past CEILING, lines the agent loop moves into
-/// other files (agent_loop_is_under_2500_lines) included. README.md states
-/// the ratchet and CEILING, held here. A count, so every build asserts it.
+/// other files (agent_loop_stays_under_its_line_ratchet) included.
+/// docs/development.md states the ratchet and CEILING, held here. A count, so every
+/// build asserts it.
 ///
 /// First the script is held to a fixture checkout
 /// (crates/tui/tests/fixtures/count-core-lines.txt) whose every source line
@@ -593,10 +698,8 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // Permission rules that read the path a file tool touches, not its spelling, add 16 lines to
-    // permissions.rs and 2 to the spec, and the agent loop's repair probe, which reads one spelling now
-    // instead of three, gives back 17.
-    const BASELINE: usize = 44_508;
+    // Resolving file paths for permission rules adds 17 lines after simplifying the repair probe.
+    const BASELINE: usize = 43_676;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -734,7 +837,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
          {core} in this change",
         BASELINE - core
     );
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!(
             "The ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
@@ -745,27 +848,28 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
         ),
         format!("The core's ratchet is never raised above {}", thousands(CEILING as u64)),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     Ok(())
 }
 
-/// The agent loop, crates/core/src/agent.rs without its tests, is at most
-/// 2,500 lines. scripts/count-core-lines.sh --files gives each file's
+/// The agent loop, crates/core/src/agent.rs without its tests, stays under
+/// its line ratchet, against a target of 2,000 lines.
+/// scripts/count-core-lines.sh --files gives each file's
 /// core-excluding-tests by the method core_source_stays_under_its_line_budget
 /// holds to its fixture, so the loop is measured as the core is, not by a
-/// second counter. The target is not met yet, so this prints it beside the
-/// loop's two counts and holds a ratchet by the same rule: the loop's
+/// second counter. This prints the target beside the loop's two counts and
+/// holds a ratchet by the same rule: the loop's
 /// core-excluding-tests at least BASELINE, the count this test last
 /// measured, and at most RATCHET, BASELINE plus MARGIN. A change that needs
 /// more raises BASELINE to its new count in its own diff and says why; one
 /// that cuts the loop must lower BASELINE to its new count, so the lines it
 /// cuts stay cut. Lines the loop hands to another file of the core stay
-/// under the core's ratchet. README.md states this ratchet, held here.
+/// under the core's ratchet. docs/development.md states this ratchet, held here.
 #[test]
-fn agent_loop_is_under_2500_lines() -> Result<(), String> {
-    const TARGET: usize = 2_500;
-    const BASELINE: usize = 3_337;
+fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
+    const TARGET: usize = 2_000;
+    const BASELINE: usize = 1_746;
     // About 1% of the loop: room for a small fix, not for a feature.
     const MARGIN: usize = 50;
     const RATCHET: usize = BASELINE + MARGIN;
@@ -781,7 +885,10 @@ fn agent_loop_is_under_2500_lines() -> Result<(), String> {
             .unwrap_or_else(|| panic!("no {name} in the gauge's row for {LOOP}: {row}"))
     };
     let (lines, total) = (count("core-excluding-tests="), count("total-including-tests="));
-    println!("agent loop: {lines} lines excluding tests (ratchet {RATCHET}, target {TARGET}), {total} including tests");
+    println!(
+        "MEASURE agent_loop_stays_under_its_line_ratchet {lines} lines excluding tests (ratchet {RATCHET}, target {TARGET}), \
+         {total} including tests"
+    );
     assert!(
         lines <= RATCHET,
         "{LOOP} has {lines} lines excluding tests, {} over its ratchet of {RATCHET}: trim it, or set BASELINE to \
@@ -794,7 +901,7 @@ fn agent_loop_is_under_2500_lines() -> Result<(), String> {
          BASELINE to {lines} in this change",
         BASELINE - lines
     );
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let claim = format!(
         "The agent loop's ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
         thousands(RATCHET as u64),
@@ -802,27 +909,32 @@ fn agent_loop_is_under_2500_lines() -> Result<(), String> {
         thousands(BASELINE as u64),
         thousands(TARGET as u64)
     );
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     Ok(())
 }
 
-/// Cold start to the first painted frame under one millisecond.
-/// The thesis claims are gated in CI: every thesis test runs there in
-/// release and fails the pull request, but for the ones a runner reports. A
+/// The thesis gates run in release on both runners: every thesis test runs
+/// in CI's thesis job in release and fails the pull request, but for the
+/// ones a runner reports instead. A
 /// test that times the harness asserts its bound only in a release build,
 /// and the test job builds in debug, so ci.yml's `thesis` job builds in
 /// release, on each of the test job's runners, every test target named
 /// thesis* in the workspace (cargo matches the glob against target names,
 /// and a file under a crate's tests/ is a target named after its stem), the
-/// binary's `thesis_frames` module and the first-frame test's baseline
-/// binary, an example that `cargo test` leaves unbuilt once a target is
-/// selected. Its reports step, the only step in this job allowed to fail, runs
-/// the tests its runner reports to print their numbers and copies each
-/// `MEASURE` line to the job's summary; its gate step, after that so a
-/// failing gate cannot skip the reports, runs exactly every other thesis
-/// test and fails the pull request when one fails. A runner reports only
+/// binary's `thesis_frames` module where the runner gates one of its tests,
+/// and the first-frame test's baseline binary, an example that `cargo test`
+/// leaves unbuilt once a target is selected. The module's tests run from
+/// the binary's own unit-test harness, one more whole-program LTO unit, so
+/// a runner whose matrix entry reports them all (`frames: false`) neither
+/// builds nor runs it. Its gate step runs exactly every thesis test but the
+/// ones its runner reports, and fails the pull request when one fails. The Reports
+/// workflow runs the reported tests instead, every night, in release and one
+/// at a time on the same runners, from a matrix that lists the same tests;
+/// it copies each `MEASURE` line to its job's summary and fails only when a
+/// reported test printed none, so it never runs on a pull request, whose
+/// gate holds only steps that can fail it. A runner reports only
 /// the tests whose targets it does not meet with room, listed in its matrix
-/// entry, held here and named in README.md, so moving a test between the
+/// entry, held here and named in docs/development.md, so moving a test between the
 /// two is a change to this test too: the harness time per tool round on
 /// both runners, and the transcript frame's p99 on macOS. libtest selects
 /// and skips tests by substring, so no other name in a thesis source may
@@ -835,7 +947,7 @@ fn agent_loop_is_under_2500_lines() -> Result<(), String> {
 /// debug bound: not the release profile in Cargo.toml, nor the workflow's
 /// or the job's environment.
 #[test]
-fn thesis_claims_are_gated_in_ci() {
+fn the_thesis_gates_run_in_release_on_both_runners() {
     let job = ci_job("thesis");
     let runners =
         |job: &[String]| job.iter().find_map(|line| Some(line.trim().strip_prefix("os: [")?.strip_suffix(']')?.to_string()));
@@ -852,21 +964,9 @@ fn thesis_claims_are_gated_in_ci() {
     let skipped: Vec<&&str> =
         steps.iter().flatten().filter(|line| line.starts_with("if:") && **line != "if: ${{ !cancelled() }}").collect();
     assert!(skipped.is_empty(), "the thesis job, or a step of it, can be skipped: {skipped:?}");
-    // Only the thesis reports and the test job's macOS concurrent timing
-    // measurement may fail without failing their job. Keep both exceptions
-    // attached to their exact steps rather than allowing either on any gate.
+    // No step of ci.yml may fail without failing the gate:
+    // pull_request_workflows_skip_no_step_and_let_none_fail holds that.
     let ci = std::fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
-    let soft: Vec<&str> =
-        ci.lines().map(str::trim).filter(|line| !line.starts_with('#') && line.contains("continue-on-error")).collect();
-    let macos_advisory = "continue-on-error: ${{ matrix.os == 'macos-latest' }}";
-    assert_eq!(soft, [macos_advisory, "continue-on-error: true"],
-        "ci.yml allows a job or step to fail beyond the two documented measurements");
-    let test_job = ci_job("test");
-    let timing = test_job.iter().position(|line| line.trim() == "run: scripts/check-suite-time.sh ${{ matrix.suite_time_multiplier }}")
-        .expect("the test job has no concurrent suite timing step");
-    let timing = step_keys(&test_job, timing);
-    assert!(timing.contains(&"id: suite_time") && timing.contains(&macos_advisory),
-        "the conditional exception must belong only to the test job's concurrent suite timing step");
     // Debug assertions in these builds would hold each timing test to its
     // debug bound while every other check here passes. They can come from
     // the release profile, or from the environment: the workflow's, the
@@ -898,28 +998,39 @@ fn thesis_claims_are_gated_in_ci() {
             .position(|step| step.contains(&format!("name: {name}").as_str()))
             .unwrap_or_else(|| panic!("the thesis job has no `{name}` step"))
     };
-    let (build, reports, gates) = (step("Build release tests"), step("Thesis reports"), step("Thesis gates"));
-    // A step after a failed one is skipped, and no step here has an `if:`,
-    // so the reports run ahead of the gates, which can fail.
-    assert!(build < reports && reports < gates, "the thesis job does not build, then report, then gate");
-    assert!(steps[reports].contains(&"continue-on-error: true"), "the thesis reports step is not the one allowed to fail");
-    for n in [gates, reports] {
-        assert!(
-            steps[n].iter().any(|line| line.starts_with("timeout-minutes:")),
-            "a thesis test that hangs holds its step until the job's own limit: {:?}",
-            steps[n]
-        );
-    }
-    // What each runner reports, from its matrix entry.
-    let mut reported = Vec::new();
-    let mut entry = None;
-    for line in job.iter().map(|line| line.trim()) {
-        if let Some(runner) = line.strip_prefix("- os: ") {
-            entry = Some(runner);
-        } else if let Some(tests) = line.strip_prefix("reported: ") {
-            reported.push((entry.take().expect("a reported list outside a runner's entry"), tests));
+    let (build, gates) = (step("Build release tests"), step("Thesis gates"));
+    assert!(build < gates, "the thesis job does not build before it gates");
+    assert!(
+        steps[gates].iter().any(|line| line.starts_with("timeout-minutes:")),
+        "a thesis test that hangs holds the gate step until the job's own limit: {:?}",
+        steps[gates]
+    );
+    // A key of each runner's matrix entry, one value each: `reported`, what
+    // the runner reports, in the thesis job, whose gate step skips them, and
+    // in the Reports workflow, which runs them; and the thesis job's
+    // `frames`.
+    let by_runner = |job: &[String], key: &str| {
+        let mut values = Vec::new();
+        let mut entry = None;
+        for line in job.iter().map(|line| line.trim().to_string()) {
+            if let Some(runner) = line.strip_prefix("- os: ") {
+                entry = Some(runner.to_string());
+            } else if let Some(value) = line.strip_prefix(&format!("{key}: ")) {
+                values.push((entry.take().unwrap_or_else(|| panic!("a `{key}` outside a runner's entry")), value.to_string()));
+            }
         }
-    }
+        values
+    };
+    let reported_by = |job: &[String]| by_runner(job, "reported");
+    let reports_job = workflow_job("reports.yml", "thesis-reports");
+    assert_eq!(runners(&reports_job), runners(&job), "the thesis reports do not run on the thesis job's runners");
+    assert_eq!(
+        reported_by(&reports_job),
+        reported_by(&job),
+        "the Reports workflow does not run exactly the thesis tests each runner's gate step skips"
+    );
+    let reported = reported_by(&job);
+    let reported: Vec<(&str, &str)> = reported.iter().map(|(os, tests)| (os.as_str(), tests.as_str())).collect();
     assert_eq!(
         reported,
         [
@@ -928,24 +1039,42 @@ fn thesis_claims_are_gated_in_ci() {
         ],
         "the thesis tests a runner reports instead of gating changed"
     );
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    // The binary's thesis_frames tests run from its own unit-test harness,
+    // one more whole-program LTO unit of the release build: a runner builds
+    // and runs it exactly when it gates one of them, a test built there, not
+    // ignored and not reported. So no runner skips one it gates, nor builds
+    // a harness its gate step would run no test from.
+    let frames_tests = tests_in(&std::fs::read_to_string(repo().join("crates/tui/src/app/thesis_frames.rs")).unwrap());
+    assert!(!frames_tests.is_empty(), "the binary's thesis_frames module holds no test");
+    let gates_frames = |os: &str, reported: &str| {
+        let platform = if os.starts_with("macos") { "macos" } else { "linux" };
+        frames_tests.iter().any(|(name, attributes)| {
+            let cfgs = attributes.iter().filter_map(|line| line.strip_prefix("#[cfg(")?.strip_suffix(")]"));
+            !reported.split(' ').any(|test| test == name.as_str())
+                && !attributes.iter().any(|line| line.starts_with("#[ignore"))
+                && cfgs.into_iter().all(|cfg| cfg_holds(cfg, platform))
+        })
+    };
+    let frames: Vec<(&str, bool)> = reported.iter().map(|(os, tests)| (*os, gates_frames(os, tests))).collect();
+    let listed = by_runner(&job, "frames");
+    let listed: Vec<(&str, bool)> = listed
+        .iter()
+        .map(|(os, value)| {
+            (os.as_str(), value.parse::<bool>().unwrap_or_else(|_| panic!("{os}'s `frames` is not true or false: {value}")))
+        })
+        .collect();
+    assert_eq!(listed, frames, "a runner's `frames` is not whether it gates a test of the binary's thesis_frames module");
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     assert!(
-        readme.contains(
+        stated.contains(
             "`harness_time_per_tool_round` (target 250 us) on both runners and `transcript_frame_p99_at_100k_lines` (target 0.5 ms) and `transcript_frame_p99_at_1m_lines` (target 0.25 ms) on macOS"
         ),
-        "README.md does not name the thesis tests each runner reports instead of gating"
+        "docs/development.md does not name the thesis tests each runner reports instead of gating"
     );
     // A renamed test would no longer be skipped by the gate step, nor run by
     // the reports step. libtest selects and skips by substring, so a test or
     // module whose name holds a reported one would leave the gate step too.
-    let mut sources = std::fs::read_to_string(repo().join("crates/tui/src/app/thesis_frames.rs")).unwrap();
-    for tests in ["crates/core/tests", "crates/tui/tests"] {
-        for file in std::fs::read_dir(repo().join(tests)).unwrap().map(|file| file.unwrap().path()) {
-            if file.file_name().is_some_and(|name| name.to_string_lossy().starts_with("thesis")) {
-                sources.push_str(&std::fs::read_to_string(file).unwrap());
-            }
-        }
-    }
+    let sources: String = thesis_sources().into_iter().map(|(_, text)| text).collect();
     let names: Vec<&str> = ["fn ", "mod "]
         .into_iter()
         .flat_map(|item| sources.split(item).skip(1))
@@ -963,28 +1092,53 @@ fn thesis_claims_are_gated_in_ci() {
         [
             "skip=; for test in ${{ matrix.reported }}; do skip=\"$skip --skip $test\"; done",
             "cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1",
+            "if ${{ matrix.frames }}; then",
             "cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1",
+            "fi",
             "exit ${failed:-0}",
         ],
         "the gate step does not run, in release, one at a time and printing what it measured, every thesis test but the \
          ones its runner reports, each command even after one failed, and fail when one did"
     );
-    assert_eq!(
-        commands(reports),
-        [
-            "[ -n \"${{ matrix.reported }}\" ] || exit 0",
-            "cargo test --release --workspace --locked --test 'thesis*' --bin openmax --no-fail-fast -- --test-threads=1 --nocapture ${{ matrix.reported }} 2>&1 | tee \"$RUNNER_TEMP/thesis-reports.log\"",
-            "status=${PIPESTATUS[0]}",
-            "{ echo \"Reported, not gated, on ${{ matrix.os }}; cargo test exited $status:\"; echo '```'; sed -n 's/.*MEASURE /MEASURE /p' \"$RUNNER_TEMP/thesis-reports.log\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
-            "exit \"$status\"",
-        ],
-        "the reports step does not run, in release and one at a time, exactly the tests its runner reports, \
-         copy their measurements to the job's summary and end as they did"
+    // The Reports workflow's report: in release and one at a time, exactly
+    // the tests its runner reports, every MEASURE line to the job's summary,
+    // and a failure only for a reported test that printed none.
+    let report = reports_job
+        .iter()
+        .position(|line| line.trim() == "- name: Report the thesis tests this runner does not gate")
+        .expect("the thesis reports job has no report step");
+    assert!(
+        step_keys(&reports_job, report).iter().any(|key| key.starts_with("timeout-minutes:")),
+        "a reported test that hangs holds its report until the job's own limit"
     );
+    let report: Vec<&str> = reports_job[report..]
+        .iter()
+        .map(|line| line.trim())
+        .skip_while(|line| *line != "run: |")
+        .skip(1)
+        .take_while(|line| !line.is_empty() && !line.starts_with("- "))
+        .collect();
+    assert_eq!(
+        report,
+        [
+            "cargo test --release --workspace --locked --test 'thesis*' --bin openmax --no-fail-fast -- --test-threads=1 --nocapture ${{ matrix.reported }} 2>&1 | tee \"$RUNNER_TEMP/reports.log\"",
+            "status=${PIPESTATUS[0]}",
+            "sed -n 's/.*MEASURE /MEASURE /p' \"$RUNNER_TEMP/reports.log\" > \"$RUNNER_TEMP/measured.txt\"",
+            "{ echo \"Reported, not gated, on ${{ matrix.os }}; cargo test exited $status:\"; echo '```'; cat \"$RUNNER_TEMP/measured.txt\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
+            "for test in ${{ matrix.reported }}; do",
+            "grep -q \"^MEASURE $test \" \"$RUNNER_TEMP/measured.txt\" || { echo \"::error::$test printed no MEASURE line, so it measured nothing\"; missing=1; }",
+            "done",
+            "exit ${missing:-0}",
+        ],
+        "the Reports workflow does not run, in release and one at a time, exactly the tests its runner reports, \
+         copy their measurements to the job's summary, and fail only when one measured nothing"
+    );
+    let built = "run: cargo test --release --workspace --locked --no-run --test 'thesis*' --bin openmax";
+    assert!(reports_job.iter().any(|line| line.trim() == built), "the thesis reports build what they run under its timeout");
     assert_eq!(
         commands(build),
         [
-            "cargo test --release --workspace --locked --no-run --test 'thesis*' --bin openmax",
+            "cargo test --release --workspace --locked --no-run --test 'thesis*' ${{ matrix.frames && '--bin openmax' || '' }}",
             "cargo build --release --workspace --locked --example startup_baseline",
         ],
         "the thesis job does not build in release what its steps run and the baseline binary"
@@ -997,7 +1151,534 @@ fn thesis_claims_are_gated_in_ci() {
     );
 }
 
-/// The workspace has 2,000 tests. No test can count the suite it runs in, so
+/// Whether `script`, a step's `run`, swallows a failure: a `||` followed by
+/// `true`, `:` or `exit 0`, read as shell words, so no whitespace between
+/// them, a line break included, no braces or parentheses around the rest,
+/// and no `;` after them hides one; or a `set` command whose flags turn
+/// `errexit` or `pipefail` off (`set +e`, `set +euo pipefail`,
+/// `set +o errexit`), shell keywords and command prefixes before it
+/// (`then set +e`, `builtin set +e`) skipped. A `+` word of another command
+/// (`cargo +stable test`) is no such flag.
+fn swallows_a_failure(script: &str) -> bool {
+    let spaced = script.replace("||", " || ");
+    let words: Vec<&str> = spaced
+        .split_whitespace()
+        .map(|word| word.trim_matches(['(', ')', '{', '}', ';']))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let turns_off = |command: &str| {
+        let words: Vec<&str> = command
+            .split_whitespace()
+            .map(|word| word.trim_matches(['(', ')', '{', '}']))
+            .filter(|word| !word.is_empty())
+            .skip_while(|word| matches!(*word, "!" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "time" | "builtin" | "command"))
+            .collect();
+        words.first() == Some(&"set")
+            && words.iter().enumerate().any(|(at, word)| {
+                let flags = word.strip_prefix('+').filter(|flags| !flags.is_empty() && flags.chars().all(|c| c.is_ascii_alphabetic()));
+                flags.is_some_and(|flags| flags.contains('e') || (flags.ends_with('o') && matches!(words.get(at + 1), Some(&("pipefail" | "errexit")))))
+            })
+    };
+    words.windows(2).any(|pair| pair[0] == "||" && matches!(pair[1], "true" | ":"))
+        || words.windows(3).any(|three| three == ["||", "exit", "0"])
+        || script.split(['\n', ';', '&', '|']).any(turns_off)
+}
+
+/// No step of a workflow that runs on pull requests can be skipped in a run
+/// that decides the gate, or fail without failing it, by the means this
+/// reads, each key read as YAML reads it, quoted or with space before its
+/// colon: no `continue-on-error` anywhere; no `if:` but
+/// `if: ${{ !cancelled() }}`, which runs a step after a failed one too and
+/// skips it only in a run that was cancelled; no script that swallows a
+/// failure (swallows_a_failure); and every script runs under bash with
+/// `pipefail`, the shell the workflow's `defaults` names and no job or step
+/// replaces, so no pipe loses the failure of a command in it, wherever the
+/// command stands. A measurement no runner meets with room leaves the pull
+/// request's gate for the Reports workflow, which runs every night and by
+/// hand, on no pull request and no push, and fails only when it cannot
+/// measure. Of the workflows GitHub runs, `.yml` and `.yaml` files, ci.yml is
+/// the one that runs on pull requests.
+#[test]
+fn pull_request_workflows_skip_no_step_and_let_none_fail() {
+    for (script, swallows) in [
+        ("cargo test || true", true),
+        ("cargo test ||true", true),
+        ("cargo test ||  true", true),
+        ("cargo test ||\n  true", true),
+        ("cargo test || :", true),
+        ("cargo test || exit 0; echo done", true),
+        ("cargo test || { true; }", true),
+        ("cargo test || failed=1", false),
+        ("cargo test || exit 1", false),
+        ("x=\"${a:-b}\" || exit", false),
+        ("set +o pipefail\ncargo test | tee log", true),
+        ("set +e; cargo test", true),
+        ("set +euo pipefail", true),
+        ("set +o errexit", true),
+        ("set -euo pipefail\nchmod +x scripts/a.sh", false),
+        ("cargo +stable test", false),
+        ("cargo +nightly test || exit 1", false),
+        ("cargo build && set +e", true),
+        ("{ set +o pipefail; }", true),
+        ("if true; then set +e; fi", true),
+        ("while read -r line; do builtin set +o pipefail; done", true),
+        ("if cargo test; then echo set +e; fi", false),
+    ] {
+        assert_eq!(swallows_a_failure(script), swallows, "whether {script:?} swallows a failure");
+    }
+    let mut workflows: Vec<String> = std::fs::read_dir(repo().join(".github/workflows"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
+        .collect();
+    workflows.sort();
+    let gating: Vec<&String> =
+        workflows.iter().filter(|workflow| triggers(workflow).iter().any(|(event, _)| event.starts_with("pull_request"))).collect();
+    assert_eq!(gating, ["ci.yml"], "the workflows that run on pull requests changed");
+    let mut soft = Vec::new();
+    for workflow in gating {
+        let text = std::fs::read_to_string(repo().join(".github/workflows").join(workflow)).unwrap();
+        if !text.contains("\ndefaults:\n  run:\n    shell: bash\n") {
+            soft.push(format!("{workflow} names no `defaults: run: shell: bash`, so its pipes run without pipefail"));
+        }
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let unquoted = |text: &str| text.trim().trim_matches(['"', '\'']).to_string();
+        for (at, line) in lines.iter().enumerate() {
+            let body = line.trim().trim_start_matches("- ");
+            if body.starts_with('#') {
+                continue;
+            }
+            let (key, value) = body.split_once(':').map_or((String::new(), String::new()), |(key, value)| (unquoted(key), unquoted(value)));
+            if key == "continue-on-error" || (key == "if" && value != "${{ !cancelled() }}") || (key == "shell" && value != "bash") {
+                soft.push(format!("{workflow} line {}: {body}", at + 1));
+            }
+            if key != "run" {
+                continue;
+            }
+            // The script: the value with every line under it indented past
+            // the key, which continue a plain value as they make a `|` or
+            // `>` value's block.
+            let indent = line.len() - line.trim_start().len() + if line.trim_start().starts_with("- ") { 2 } else { 0 };
+            let block = lines[at + 1..].iter().take_while(|next| next.trim().is_empty() || next.len() - next.trim_start().len() > indent);
+            let script = std::iter::once(value.as_str()).chain(block.map(String::as_str)).collect::<Vec<_>>().join("\n");
+            if swallows_a_failure(&script) {
+                soft.push(format!("{workflow} line {}: the step's script swallows a failure", at + 1));
+            }
+        }
+    }
+    assert!(
+        soft.is_empty(),
+        "a step or job of the pull request's gate can be skipped, or fail without failing it:\n{}",
+        soft.join("\n")
+    );
+    let reports: Vec<String> = triggers("reports.yml").into_iter().map(|(event, _)| event).collect();
+    assert_eq!(reports, ["schedule", "workflow_dispatch"], "the Reports workflow runs on other events than these");
+}
+
+/// The thesis sources, each with its path: every test target named thesis*
+/// under a crate's tests/, and the binary's `thesis_frames` module.
+fn thesis_sources() -> Vec<(String, String)> {
+    let mut paths = vec!["crates/tui/src/app/thesis_frames.rs".to_string()];
+    for tests in ["crates/core/tests", "crates/tui/tests"] {
+        let mut found: Vec<String> = std::fs::read_dir(repo().join(tests))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("thesis") && name.ends_with(".rs"))
+            .map(|name| format!("{tests}/{name}"))
+            .collect();
+        found.sort();
+        paths.extend(found);
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(repo().join(&path)).unwrap();
+            (path, text)
+        })
+        .collect()
+}
+
+/// Each test in `source`: its name, and its attribute lines, from the first
+/// one above its `#[test]` or `#[tokio::test]` to its `fn` line.
+fn tests_in(source: &str) -> Vec<(String, Vec<String>)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let attribute = |line: &&str| line.trim_start().starts_with("#[");
+    let mut tests = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let line = line.trim_start();
+        if line != "#[test]" && !line.starts_with("#[tokio::test") {
+            continue;
+        }
+        let first = lines[..at].iter().rposition(|line| !attribute(line)).map_or(0, |above| above + 1);
+        let item = at + lines[at..].iter().position(|line| !attribute(line)).expect("a test attribute on no item");
+        let name = lines[item]
+            .trim_start()
+            .trim_start_matches("async ")
+            .strip_prefix("fn ")
+            .and_then(|rest| rest.split('(').next())
+            .unwrap_or_else(|| panic!("a test that is not a function: {}", lines[item]));
+        tests.push((name.to_string(), lines[first..item].iter().map(|line| line.trim().to_string()).collect()));
+    }
+    tests
+}
+
+/// The function `name` in `source`, from its `fn` line to the line that
+/// closes it at that line's indentation.
+fn function_in(source: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines.iter().position(|line| {
+        let item = line.trim_start().trim_start_matches("pub ").trim_start_matches("async ");
+        item.strip_prefix("fn ").and_then(|rest| rest.strip_prefix(name)).is_some_and(|rest| rest.starts_with(['(', '<']))
+    })?;
+    let close = format!("{}}}", &lines[at][..lines[at].len() - lines[at].trim_start().len()]);
+    let end = lines[at..].iter().position(|line| *line == close)?;
+    Some(lines[at..=at + end].join("\n"))
+}
+
+/// Where `needle` first stands in `code` as code: a `//` before it on its
+/// own line comments it out, so a print commented out prints nothing. A
+/// block comment is not read.
+fn code_find(code: &str, needle: &str) -> Option<usize> {
+    let commented = |at: usize| code[code[..at].rfind('\n').map_or(0, |n| n + 1)..at].contains("//");
+    code.match_indices(needle).map(|(at, _)| at).find(|&at| !commented(at))
+}
+
+/// The string literal whose opening quote is at byte `open` of `code`, as
+/// rustc reads it: a `\` that ends a line is taken out with the whitespace
+/// that starts the next, and every other escape is kept as written.
+fn literal_at(code: &str, open: usize) -> String {
+    let mut text = String::new();
+    let mut chars = code[open + 1..].chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' if chars.peek() == Some(&'\n') => {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+            }
+            '\\' => {
+                text.push(c);
+                text.extend(chars.next());
+            }
+            c => text.push(c),
+        }
+    }
+    text
+}
+
+/// The number that starts at `words[at]` of a test's name, as the count of
+/// words it takes and its value: in digits, in words (`two_thousand`,
+/// `ninety_five`), or `a` before a unit (`a_second`, 1) or a fraction
+/// (`a_fifth`, the 20 percent it is).
+fn number_at(words: &[&str], at: usize) -> Option<(usize, u64)> {
+    const ONES: [&str; 20] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+        "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+    ];
+    const TENS: [&str; 8] = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+    const UNITS: [&str; 14] = [
+        "second", "minute", "hour", "millisecond", "microsecond", "byte", "kilobyte", "megabyte", "gigabyte", "line",
+        "token", "test", "commit", "request",
+    ];
+    const FRACTIONS: [(&str, u64); 5] = [("half", 50), ("third", 33), ("quarter", 25), ("fifth", 20), ("tenth", 10)];
+    let first = *words.get(at)?;
+    if let Ok(value) = first.parse::<u64>() {
+        return Some((1, value));
+    }
+    if first == "a" {
+        let next = *words.get(at + 1)?;
+        let fraction = FRACTIONS.iter().find(|(word, _)| *word == next).map(|(_, percent)| (2, *percent));
+        return fraction.or(UNITS.contains(&next).then_some((2, 1)));
+    }
+    let (mut taken, mut total, mut group) = (0, 0, 0);
+    while let Some(word) = words.get(at + taken) {
+        if let Some(n) = ONES.iter().position(|one| one == word) {
+            group += n as u64;
+        } else if let Some(n) = TENS.iter().position(|ten| ten == word) {
+            group += 20 + 10 * n as u64;
+        } else if *word == "hundred" && taken > 0 {
+            group *= 100;
+        } else if (*word == "thousand" || *word == "million") && taken > 0 {
+            total += group * if *word == "thousand" { 1_000 } else { 1_000_000 };
+            group = 0;
+        } else {
+            break;
+        }
+        taken += 1;
+    }
+    (taken > 0).then_some((taken, total + group))
+}
+
+/// The bound a test's name states, as the number its MEASURE line must
+/// give: a number (number_at) after a comparator (`under`, `over`, `below`,
+/// `above`, `within`, `at_least`, `at_most`, `fewer_than`, `less_than`,
+/// `more_than`, `has`, `in`), a number before `percent`, or 0 for `zero`.
+fn stated_bound(name: &str) -> Option<u64> {
+    let words: Vec<&str> = name.split('_').collect();
+    for at in 0..words.len() {
+        if words[at] == "zero" {
+            return Some(0);
+        }
+        let pair = words.get(at + 1).map(|next| format!("{}_{next}", words[at]));
+        let comparator = if ["under", "over", "below", "above", "within", "has", "in"].contains(&words[at]) {
+            Some(1)
+        } else if pair.is_some_and(|pair| ["at_least", "at_most", "fewer_than", "less_than", "more_than"].contains(&pair.as_str())) {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some((_, bound)) = comparator.and_then(|words_taken| number_at(&words, at + words_taken)) {
+            return Some(bound);
+        }
+        if words[at] == "percent" {
+            let before = (0..at).find_map(|from| number_at(&words, from).filter(|(taken, _)| from + taken == at));
+            if let Some((_, bound)) = before {
+                return Some(bound);
+            }
+        }
+    }
+    None
+}
+
+/// Whether the predicate of a `#[cfg(...)]`, `cfg`, holds in the build CI's
+/// thesis job makes on `os`, `linux` or `macos`: `unix` and `test` hold,
+/// `target_os = "..."` holds for its own os, `debug_assertions` does not
+/// hold in a release build, and `not`, `all` and `any` combine as rustc's
+/// do. Any other predicate (a feature, an architecture) is taken not to
+/// hold, so a cfg this cannot read counts as keeping a test off.
+fn cfg_holds(cfg: &str, os: &str) -> bool {
+    let cfg = cfg.trim();
+    let Some((combinator, inner)) = cfg.strip_suffix(')').and_then(|cfg| cfg.split_once('(')) else {
+        let (key, value) = cfg.split_once('=').map_or((cfg, ""), |(key, value)| (key.trim(), value.trim().trim_matches('"')));
+        return matches!(key, "unix" | "test") || (key == "target_os" && value == os);
+    };
+    let (mut parts, mut depth, mut from) = (Vec::new(), 0, 0);
+    for (at, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&inner[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[from..]);
+    let mut parts = parts.into_iter().filter(|part| !part.trim().is_empty()).map(|part| cfg_holds(part, os));
+    match combinator.trim() {
+        "not" => !parts.next().unwrap_or(false),
+        "all" => parts.all(|holds| holds),
+        "any" => parts.any(|holds| holds),
+        _ => false,
+    }
+}
+
+/// Whether a test with these attribute lines is built on one of CI's
+/// runners at least, in a release build: rustc builds an item only where
+/// every `#[cfg(...)]` on it holds, so all of them must hold on the same
+/// runner (cfg_holds), and two that each hold on another keep it off both.
+fn built_on_a_runner(attributes: &[impl AsRef<str>]) -> bool {
+    let cfgs: Vec<&str> =
+        attributes.iter().filter_map(|attribute| attribute.as_ref().strip_prefix("#[cfg(")?.strip_suffix(")]")).collect();
+    ["linux", "macos"].iter().any(|os| cfgs.iter().all(|cfg| cfg_holds(cfg, os)))
+}
+
+/// Every thesis test whose name states a bound prints what it measured
+/// beside that bound, and CI gates it. A name states a bound with a number
+/// after a comparator (`_under_700_`, `_at_least_ninety_five_`,
+/// `_in_five_seconds`, `_has_two_thousand_`), a number before `_percent`, or
+/// `zero_`, in digits or in words (stated_bound gives the grammar). Each
+/// such test prints, with `println!` or `eprintln!`, which CI's thesis job
+/// shows, a `MEASURE` line keyed by its own name, from its body or from the
+/// function it passes its name to first, which keys the line by that
+/// parameter; a line or call that a `//` comments out does not count
+/// (code_find). The line's first number is formatted from a local of the
+/// test's own, named inline (`{orphans}`, not `{}` or `{0}`), neither
+/// written in the literal nor a constant of its code or its file, and the
+/// line gives the bound the name states as a number of
+/// its own (not the 10 of `p10`), in its literal or through a constant it
+/// formats, read from the function that prints the line, then the test,
+/// then the file, so another test's constant of the same name does not
+/// answer for it. And CI's thesis job gates the test: no runner reports it
+/// instead, it is not ignored, and its cfg attributes all hold on one of
+/// CI's runners in a release build (built_on_a_runner). What the test
+/// asserts against the bound is its own, and so is whether the value it
+/// prints is a measurement of what its name states rather than a value
+/// read from elsewhere: no reading of its source settles that, and its red
+/// record shows it failing past the bound. This holds what a test's name,
+/// its line and CI say to each other, so a test named for a bound that prints
+/// nothing keyed by its name, as `mutation_score_is_at_least_ninety_five_percent`
+/// did, or one that prints the bound where a measurement belongs, fails
+/// here, and so does a test that takes back one of the seven names retired
+/// for claiming a bound their tests never asserted, whatever its line says.
+#[test]
+fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
+    for (cfg, linux, macos) in [
+        ("unix", true, true),
+        ("not(unix)", false, false),
+        ("windows", false, false),
+        ("target_os = \"linux\"", true, false),
+        ("not(target_os = \"macos\")", true, false),
+        ("any(target_os = \"linux\", target_os = \"macos\")", true, true),
+        ("all(unix, not(debug_assertions))", true, true),
+        ("all(unix, feature = \"slow\")", false, false),
+    ] {
+        assert_eq!((cfg_holds(cfg, "linux"), cfg_holds(cfg, "macos")), (linux, macos), "where #[cfg({cfg})] holds");
+    }
+    for (attributes, built) in [
+        (&["#[test]"][..], true),
+        (&["#[cfg(unix)]", "#[cfg(target_os = \"linux\")]", "#[test]"][..], true),
+        (&["#[cfg(target_os = \"linux\")]", "#[cfg(target_os = \"macos\")]", "#[test]"][..], false),
+    ] {
+        assert_eq!(built_on_a_runner(attributes), built, "whether a test under {attributes:?} is built on one of CI's runners");
+    }
+    for (code, at) in [("// println!(\"M\");\n    println!(\"M\");", Some(31)), ("let a = 1; // println!(\"M\");", None)] {
+        assert_eq!(code_find(code, "\"M\""), at, "where {code:?} prints \"M\" as code");
+    }
+    // The names seven gates had while they claimed a bound they never
+    // asserted, each with that bound. A gate that took one back would claim
+    // it again whatever its line said, so none may.
+    let retired = [
+        ("mutation_score_is_at_least_ninety_five_percent", 95),
+        ("the_workspace_has_two_thousand_tests", 2_000),
+        ("whole_suite_runs_in_five_seconds", 5),
+        ("at_most_a_fifth_of_commits_touch_the_core", 20),
+        ("agent_loop_is_under_2500_lines", 2_500),
+        ("headless_turn_peak_rss_is_under_four_megabytes", 4),
+        ("one_command_from_a_fresh_install_answers_in_under_thirty_seconds", 30),
+    ];
+    // The grammar, on those names and names the thesis sources have.
+    for (name, bound) in retired.iter().map(|&(name, bound)| (name, Some(bound))).chain([
+        ("one_command_from_a_fresh_install_answers_locally_in_under_a_second", Some(1)),
+        ("frozen_prefix_is_under_700_tokens", Some(700)),
+        ("a_session_prompt_is_75_percent_cacheable", Some(75)),
+        ("zero_orphans_after_kill_9", Some(0)),
+        ("every_test_runs_under_a_checksummed_nextest_that_retries_none", None),
+        ("every_request_in_a_session_carries_the_same_prefix_bytes", None),
+        ("transcript_frame_p99_at_100k_lines", None),
+        ("core_source_stays_under_its_line_budget", None),
+        ("the_thesis_gates_run_in_release_on_both_runners", None),
+    ]) {
+        assert_eq!(stated_bound(name), bound, "the bound `{name}` states");
+    }
+    let reported: Vec<String> = ci_job("thesis")
+        .iter()
+        .filter_map(|line| line.trim().strip_prefix("reported: ").map(str::to_string))
+        .flat_map(|tests| tests.split(' ').map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    assert!(!reported.is_empty(), "no runner reports a thesis test, so this holds nothing about the reported ones");
+    let (mut bounded, mut problems) = (Vec::new(), Vec::new());
+    for (path, source) in thesis_sources() {
+        for (name, attributes) in tests_in(&source) {
+            let Some(bound) = stated_bound(&name) else { continue };
+            bounded.push(format!("{name} ({bound})"));
+            let mut problem = |what: String| problems.push(format!("{path}: {name}: {what}"));
+            if retired.iter().any(|&(old, _)| old == name) {
+                problem("it takes back a name retired for claiming a bound its test never asserted".to_string());
+            }
+            if reported.contains(&name) {
+                problem("a runner reports it, so no pull request gates the bound its name states".to_string());
+            }
+            if attributes.iter().any(|attribute| attribute.contains("ignore")) {
+                problem("it is ignored, so no CI job runs it".to_string());
+            }
+            if !built_on_a_runner(&attributes[..]) {
+                let cfgs: Vec<&str> = attributes.iter().map(String::as_str).filter(|attribute| attribute.starts_with("#[cfg(")).collect();
+                problem(format!("{} keeps it off both of CI's runners", cfgs.join(" with ")));
+            }
+            let body = function_in(&source, &name).unwrap_or_else(|| panic!("{path}: {name} has no end"));
+            let keyed = code_find(&body, &format!("\"MEASURE {name} ")).map(|at| (body.clone(), at)).or_else(|| {
+                // The function the test passes its name to first.
+                let call = code_find(&body, &format!("(\"{name}\""))?;
+                let callee = &body[..call];
+                let callee = &callee[callee.rfind(|c: char| !c.is_alphanumeric() && c != '_').map_or(0, |n| n + 1)..];
+                let helper = function_in(&source, callee)?;
+                let parameter = helper.split_once('(')?.1.split(':').next()?.trim().to_string();
+                let at = code_find(&helper, &format!("\"MEASURE {{{parameter}}} "))?;
+                Some((helper, at))
+            });
+            let Some((code, at)) = keyed else {
+                problem("prints no MEASURE line keyed by its name".to_string());
+                continue;
+            };
+            if !["println!(", "eprintln!("].iter().any(|print| code[..at].trim_end().ends_with(print)) {
+                problem("its MEASURE line is not printed with println! or eprintln!".to_string());
+            }
+            // A constant the line formats, as its value: a number, or the
+            // count a Duration's constructor takes. It is read from the
+            // function that prints the line, then the test, then the file.
+            let constant = |name: &str| {
+                let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                [code.as_str(), body.as_str(), source.as_str()].into_iter().filter(|_| named).find_map(|scope| {
+                    scope.lines().find_map(|line| {
+                        let typed = line.trim_start().strip_prefix("const ")?.strip_prefix(name)?.strip_prefix(':')?;
+                        let value = typed.split_once('=')?.1.trim().strip_suffix(';')?;
+                        let value = value.strip_prefix("Duration::from_").and_then(|call| call.split_once('(')?.1.strip_suffix(')')).unwrap_or(value);
+                        let value = value.replace('_', "");
+                        value.parse::<f64>().is_ok().then_some(value)
+                    })
+                })
+            };
+            let literal = literal_at(&code, at);
+            let line = literal.splitn(3, ' ').nth(2).unwrap_or_default();
+            let first = line.find('{').filter(|value| line.find(|c: char| c.is_ascii_digit()).is_none_or(|digit| *value < digit));
+            let first = first.map(|open| line[open + 1..].split(['}', ':']).next().unwrap_or_default());
+            // A local, named inline as a format string names one: a
+            // positional `{}`, `{0}` or `{:?}` leaves the value to the call's
+            // arguments, which this does not read, and an upper-case name is
+            // a constant's or a static's.
+            let local = |value: &str| {
+                value.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                    && value.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            };
+            match first {
+                None => problem(format!("its MEASURE line writes its first number instead of formatting a value: {literal}")),
+                Some(value) if constant(value).is_some() => {
+                    problem(format!("its MEASURE line's first number is the constant {value}, not a value it measured: {literal}"))
+                }
+                Some(value) if !local(value) => problem(format!(
+                    "its MEASURE line's first value, {{{value}}}, is not a local named inline, so the line cannot show it is measured: {literal}"
+                )),
+                Some(_) => {}
+            }
+            // The line with each constant it formats written out, and every
+            // other value left out.
+            let mut said = String::new();
+            let mut rest = line;
+            while let Some(open) = rest.find('{') {
+                said.push_str(&rest[..open]);
+                let close = rest[open..].find('}').map_or(rest.len(), |n| open + n);
+                let value = rest[open + 1..close].split(':').next().unwrap_or_default();
+                said.push_str(&constant(value).unwrap_or_else(|| " ".to_string()));
+                rest = &rest[(close + 1).min(rest.len())..];
+            }
+            said.push_str(rest);
+            // Each number the line says, but the digits that go on a word or
+            // a number (`p10`, `x86_64`, the 0 of `85.0`).
+            let numbers = said.char_indices().filter(|(at, c)| {
+                c.is_ascii_digit() && said[..*at].chars().next_back().is_none_or(|before| !before.is_alphanumeric() && !"_.".contains(before))
+            });
+            let mut numbers = numbers.map(|(at, _)| {
+                let digits = said[at..].find(|c: char| !c.is_ascii_digit() && c != '.').map_or(&said[at..], |end| &said[at..at + end]);
+                digits.trim_end_matches('.').parse::<f64>().unwrap_or(f64::NAN)
+            });
+            if !numbers.any(|number| number == bound as f64) {
+                problem(format!("its MEASURE line does not give the bound its name states, {bound}: {literal}"));
+            }
+        }
+    }
+    println!("thesis gates whose names state a bound: {}", bounded.join(", "));
+    assert!(
+        bounded.iter().any(|gate| gate == "frozen_prefix_is_under_700_tokens (700)"),
+        "the frozen prompt's gate is not among the gates found to state a bound, so the parser finds less than it should: {bounded:?}"
+    );
+    assert!(problems.is_empty(), "a thesis gate's name states what it does not measure:\n{}", problems.join("\n"));
+}
+
+/// The test count fails under its platform floor, and reports how far it is
+/// from the 2,000-test target. No test can count the suite it runs in, so
 /// CI does: its test job runs scripts/check-test-count.sh on each of its
 /// runners once the suite has built and passed, in a step that nothing there
 /// skips or lets fail. Linux and macOS each compile a few tests the other does
@@ -1006,8 +1687,8 @@ fn thesis_claims_are_gated_in_ci() {
 /// and every runner of the job has one. It fails under that floor, offers to
 /// raise that floor when the count is over it, reports the distance to the
 /// 2,000-test target until that is met, and on a platform with no floor
-/// reports the count and passes; the README states both floors and the
-/// target. This test holds the wiring, holds the README to the script, and
+/// reports the count and passes; docs/development.md states both floors and the
+/// target. This test holds the wiring, holds that page to the script, and
 /// holds the script to its method by driving it with a stand-in `uname` and a
 /// stand-in `cargo` whose test binaries list their tests as libtest does: it
 /// counts the lines that end in ": test" (not a benchmark, not the summary),
@@ -1016,18 +1697,18 @@ fn thesis_claims_are_gated_in_ci() {
 /// floor for a count over it; it passes any count on another platform, and
 /// fails when cargo fails rather than counting nothing.
 #[test]
-fn the_workspace_has_two_thousand_tests() {
+fn the_test_count_fails_under_its_platform_floor() {
     let gate = std::fs::read_to_string(repo().join("scripts/check-test-count.sh")).unwrap();
     let floor_of = |name: &str| -> u64 { assigned(&gate, name).parse().unwrap_or_else(|_| panic!("{name} is not a count")) };
     let (linux, macos) = (floor_of("linux_floor"), floor_of("macos_floor"));
     let target: u64 = assigned(&gate, "target").parse().expect("the target is a count");
     assert_eq!(target, 2000, "the target is 2,000 tests");
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!("fails when there are fewer than {} on Linux, or {} on macOS", thousands(linux), thousands(macos)),
         format!("The target is {} tests", thousands(target)),
     ] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which scripts/check-test-count.sh gates");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which scripts/check-test-count.sh gates");
     }
 
     let job = ci_job("test");
@@ -1130,19 +1811,20 @@ fn the_workspace_has_two_thousand_tests() {
     );
 }
 
-/// At most a fifth of the latest 50 commits of main change the core: the
-/// capability the agent needs lands in files (tools, skills, templates,
-/// hooks) instead of the core growing. No test can read the history it was
-/// built from, as CI's test job checks out one commit, so CI measures it: its
+/// The core share reports how many of the latest 50 commits of main change
+/// the core, against a target of at most a fifth: the capability the agent
+/// needs lands in files (tools, skills, templates, hooks) instead of the
+/// core growing. No test can read the history it was built from, as CI's
+/// test job checks out one commit, so CI measures it: its
 /// core-share job runs scripts/core-share.sh on every push to main and every
 /// pull request, on the event's own commit with the whole history (for a
 /// pull request, GitHub's test merge of it into its base), keeps the CSV the
 /// script writes as an artifact and builds no Rust, and nothing skips the job
 /// or a step of it, or lets them fail. The share is reported, not gated,
 /// until it meets the target: the script exits 0 whatever the share, so the
-/// job fails only when the script cannot measure. The README states the
+/// job fails only when the script cannot measure. docs/development.md states the
 /// method, the window, the artifact, the target and the gate. This test holds
-/// the wiring and the README to the script, and the script to its method on a
+/// the wiring and that page to the script, and the script to its method on a
 /// history it builds: one row for each first-parent commit, newest first, so
 /// a merge is one commit, its diff against its first parent, and the commits
 /// it brought in are no rows, as for the test merge CI checks out for a pull
@@ -1162,14 +1844,14 @@ fn the_workspace_has_two_thousand_tests() {
 /// of git's it does not read or a git command that fails, and each malformed
 /// argument refused; with no run leaving a temporary file behind.
 #[test]
-fn at_most_a_fifth_of_commits_touch_the_core() {
+fn core_share_reports_the_share_of_commits_that_change_the_core() {
     let method = std::fs::read_to_string(repo().join("scripts/core-share.sh")).unwrap();
     let count_of = |name: &str| -> u64 { assigned(&method, name).parse().unwrap_or_else(|_| panic!("{name} is not a count")) };
     let (window, target, core) = (count_of("window"), count_of("target"), assigned(&method, "core"));
     assert_eq!((window, target), (50, 20), "the target is at most 20% of the latest 50 commits");
-    // The name CI keeps the CSV under, which the README gives.
+    // The name CI keeps the CSV under, which docs/development.md gives.
     let artifact = "core-share";
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!("of the latest {window} first-parent commits of main whose diff against their first parent changes a file under `{core}`"),
         format!("the share over it and the {} commits before it", window - 1),
@@ -1177,7 +1859,7 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
         format!("The target is at most {target}%"),
         "the job reports the share and fails only when the script cannot measure it".to_string(),
     ] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which the script and CI's core-share job hold");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which the script and CI's core-share job hold");
     }
 
     let events = triggers("ci.yml");
@@ -1520,7 +2202,8 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
 /// none needs another, so the gate takes as long as its slowest job, and
 /// Clippy, which builds with a compiler of its own, pinned to a release, is a
 /// job of its own instead of steps after the tests. The jobs are the tests,
-/// Clippy, the thesis gates, the core share and dist's plan of the release;
+/// the suite time, Clippy, the thesis gates, the core share and dist's plan
+/// of the release;
 /// the six release builds are not among them (crates/tui/tests/release.rs
 /// holds their workflow and the plan). CI runs on every push to main, every
 /// pull request, every merge group of a merge queue and every night. A push
@@ -1530,7 +2213,9 @@ fn at_most_a_fifth_of_commits_touch_the_core() {
 /// step of a workflow that builds saves only on main: a pull request's copy
 /// would serve only that pull request's later runs, which main's copy serves
 /// as well unless the pull request changes Cargo.lock, since rust-cache keeps
-/// no workspace crate, and it would take the repository's cache space.
+/// no workspace crate, and it would take the repository's cache space. A job
+/// that repeats the build of a ci.yml job saves none, and restores that
+/// job's cache by naming it as its shared key.
 #[test]
 fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
     let events = triggers("ci.yml");
@@ -1557,7 +2242,7 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
         .skip(1)
         .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':').filter(|key| !key.starts_with([' ', '#'])))
         .collect();
-    assert_eq!(jobs, ["test", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
+    assert_eq!(jobs, ["test", "suite-time", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
     for job in &jobs {
         let waits: Vec<String> = ci_job(job).into_iter().filter(|line| line.trim().starts_with("needs:")).collect();
         assert!(waits.is_empty(), "the {job} job waits for another, so the gate takes the two one after the other: {waits:?}");
@@ -1585,7 +2270,11 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
         .collect();
     assert!(soft.is_empty(), "Clippy can be skipped or fail while the gate passes: {soft:?}");
 
-    for workflow in ["ci.yml", "release-build.yml", "mutants.yml"] {
+    // ci.yml's jobs whose cache steps save on main, by job: the keys another
+    // job's cache step may restore.
+    let saved: Vec<&str> =
+        jobs.iter().copied().filter(|job| ci_job(job).iter().any(|line| line.trim() == "save-if: ${{ github.ref == 'refs/heads/main' }}")).collect();
+    for workflow in ["ci.yml", "release-build.yml", "mutants.yml", "reports.yml"] {
         let lines: Vec<String> = std::fs::read_to_string(repo().join(".github/workflows").join(workflow))
             .unwrap()
             .lines()
@@ -1596,9 +2285,12 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
         assert!(!caches.is_empty(), "{workflow} caches nothing, so this test holds nothing there");
         for at in caches {
             let keys = step_keys(&lines, at);
+            let shared = keys.iter().find_map(|key| key.strip_prefix("shared-key: "));
+            let saves_on_main = keys.contains(&"save-if: ${{ github.ref == 'refs/heads/main' }}");
+            let restores = keys.contains(&"save-if: false") && shared.is_some_and(|job| saved.contains(&job));
             assert!(
-                keys.contains(&"save-if: ${{ github.ref == 'refs/heads/main' }}"),
-                "a cache step of {workflow} saves on other branches too: {keys:?}"
+                (saves_on_main && shared.is_none()) || restores,
+                "a cache step of {workflow} saves on other branches too, or saves a second copy of a ci.yml job's: {keys:?}"
             );
         }
     }
@@ -1618,7 +2310,7 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
 /// binary keeps nothing apart across the processes nextest starts, so the
 /// harness-time tests, which thesis_rounds holds apart with a lock for their
 /// CPU-bound timing, reserve every test thread instead. The doc tests, which
-/// nextest does not run, run in a step of their own. README.md states this.
+/// nextest does not run, run in a step of their own. docs/development.md states this.
 #[test]
 fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
     let job = ci_job("test");
@@ -1710,9 +2402,9 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
         rounds.contains("static SERIAL: tokio::sync::Mutex<()>"),
         "thesis_rounds no longer holds its tests apart, the reason they reserve every thread under nextest"
     );
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let claim = "CI's test job runs every test under cargo-nextest, each in a process of its own and none retried (`.config/nextest.toml`)";
-    assert!(readme.contains(claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(claim), "docs/development.md does not say \"{claim}\", which this test holds");
 }
 
 /// The pull-request gate turns green in under 90 seconds at the median and
@@ -1738,13 +2430,13 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
 /// repository by --repo, else GITHUB_REPOSITORY. It exits 0 whatever it
 /// measures, 1 when it cannot measure (gh fails or prints what the script
 /// does not read, or no run passed), and 2 on a malformed argument or a perl
-/// without its modules. README.md states the method and the target. This
+/// without its modules. docs/development.md states the method and the target. This
 /// test drives the script with a stand-in `gh` serving runs it makes up.
 #[test]
 fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     let gate_script = std::fs::read_to_string(repo().join("scripts/gate-time.sh")).unwrap();
     let default_runs: u64 = assigned(&gate_script, "runs").parse().expect("the default sample is a count");
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         "`scripts/gate-time.sh` (bash, gh and perl) measures the pull-request gate".to_string(),
         format!("the latest {default_runs} pull-request runs of the CI workflow that passed at their first attempt"),
@@ -1753,7 +2445,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
         "The Gate time workflow runs it on every push to main and every night".to_string(),
         "the job reports the times and fails only when the script cannot measure them".to_string(),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which scripts/gate-time.sh and its workflow hold");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which scripts/gate-time.sh and its workflow hold");
     }
     let events = triggers("gate-time.yml");
     let names: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
@@ -2090,14 +2782,16 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
     }
 }
 
-/// The mutation score, caught / (caught + missed) over every mutant of the
-/// workspace, reaches 95%, and 90% over the mutants of each file, whose score
-/// the run's report lists. No test can mutate the code it runs in, so CI does:
+/// A full mutation run fails when the mutation score, caught / (caught +
+/// missed) over every mutant of the workspace, is under the floor
+/// scripts/check-mutants.sh keeps, a ratchet toward the 95% target; the
+/// run's report also gives each file's score against a target of 90%.
+/// No test sees a score: none can mutate the code it runs in, so CI does:
 /// the Mutants workflow runs cargo-mutants weekly and by hand over the whole
 /// workspace, with one pinned compiler and at most four concurrent shards.
 /// Runs queue per branch. Each shard first tests the unmutated workspace in
 /// a memory-capped cgroup and preserves outcomes for the final score judge.
-/// The score floor, baseline and margin remain documented in the README;
+/// The score floor, baseline and margin remain documented in docs/development.md;
 /// docs/testing.md also explains targeted local checks with the script's
 /// optional --diff mode. Pull requests and pushes do not trigger full sweeps.
 /// This test holds the wiring and the documents to the files, and holds the
@@ -2122,7 +2816,7 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
 /// a Failure no signal ended, an outcome cargo-mutants does not write even in
 /// code the run did not build, and an allowlist entry with no reason.
 #[test]
-fn mutation_score_is_at_least_ninety_five_percent() {
+fn a_full_mutation_run_fails_under_its_floor() {
     let gate = std::fs::read_to_string(repo().join("scripts/check-mutants.sh")).unwrap();
     let (floor, margin, target) = (assigned(&gate, "floor"), assigned(&gate, "margin"), assigned(&gate, "target"));
     let file_target = assigned(&gate, "file_target");
@@ -2136,10 +2830,10 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     };
     let percent = |bp: u64| format!("{}.{:02}%", bp / 100, bp % 100);
     let (floor_bp, margin_bp) = (hundredths(&floor), hundredths(&margin));
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let measured = format!("{}, less a margin of {margin} points", percent(floor_bp + margin_bp));
     for claim in [format!("is under {floor}%"), measured, format!("The target is {target}%, and {file_target}% in each file")] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", which scripts/check-mutants.sh gates");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which scripts/check-mutants.sh gates");
     }
     let config: toml::Table = std::fs::read_to_string(repo().join(".cargo/mutants.toml")).unwrap().parse().unwrap();
     let (multiplier, minimum) = (config["timeout_multiplier"].as_float().unwrap(), config["minimum_test_timeout"].as_integer().unwrap());
@@ -2152,7 +2846,7 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     // over its scored is its score; less the catches that cannot be told from
     // chance, which the floor's basis leaves out, it is the basis, which less
     // the margin is the floor, while the score less the margin is what the
-    // run's report offered; the README gives its count, its score and its
+    // run's report offered; docs/development.md gives its count, its score and its
     // basis; and the documents say how many of the basis's catches a run of
     // unchanged code can lose before it fails.
     let (tested, caught_then, scored_then, score_then) = testing
@@ -2185,7 +2879,7 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     }
     let without = format!("That run scored {score_then}%, or {basis}% without the {} catches", thousands(left_out));
     for claim in [format!("{} in the run that set the floor", thousands(tested)), without] {
-        assert!(readme.contains(&claim), "the README does not say \"{claim}\", as docs/testing.md records");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", as docs/testing.md records");
     }
     let header: Vec<&str> = gate.lines().take_while(|line| line.starts_with('#')).map(|line| line.trim_start_matches('#').trim()).collect();
     let lost = kept + 1 - (floor_bp * kept_of).div_ceil(10_000);
@@ -2214,7 +2908,7 @@ fn mutation_score_is_at_least_ninety_five_percent() {
     assert!(workflow.contains(concurrency), "full mutation sweeps do not queue per branch: {concurrency}");
     // A listing that fails reads as no mutants unless the pipe fails too.
     assert!(workflow.contains("defaults:\n  run:\n    shell: bash\n"), "the workflow's steps do not run under bash -eo pipefail");
-    // Linux runners, as the README says: the code a run leaves out as not
+    // Linux runners, as docs/development.md says: the code a run leaves out as not
     // built is the code Linux does not compile.
     let runners: Vec<&str> = workflow.lines().filter_map(|line| line.trim().strip_prefix("runs-on: ")).collect();
     assert!(
@@ -2731,7 +3425,7 @@ fn first_frame_holds_its_ratio_to_a_baseline_binary() {
     // holds still under a ratchet with less room (above).
     const LAUNCHES: usize = 21;
     const ASSERTED_LAUNCHES: usize = 61;
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!("under a ratchet of {MACOS_RATCHET:.1} on macOS and {LINUX_RATCHET:.1} on Linux"),
         format!("it times {ASSERTED_LAUNCHES} launches instead of {LAUNCHES}"),
@@ -2742,7 +3436,7 @@ fn first_frame_holds_its_ratio_to_a_baseline_binary() {
         format!("up to {WORK_MEASUREMENTS} measurements in all"),
         format!("The work's target of {} us is not met", WORK_TARGET.as_micros()),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
     let Some(baseline) = first_frame::baseline_binary() else { return };
     if !first_frame::alone("first_frame_holds_its_ratio_to_a_baseline_binary") {
@@ -2879,9 +3573,9 @@ fn the_binary_names_only_libsystem_caps_its_imports_and_chains_its_fixups() {
     const DYLD_CHAINED_PTR_64: u16 = 2;
     // The imports a release build binds on Apple silicon (above).
     const IMPORTS: u32 = 183;
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let claim = format!("binds at most {IMPORTS} libSystem imports in a release build on Apple silicon");
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     let path = env!("CARGO_BIN_EXE_openmax");
     let mut file = std::fs::File::open(path).unwrap();
     let mut header = [0u8; 32];
@@ -3379,7 +4073,7 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
 /// `.openmax/tools/line_count.toml`, an awk tool that counts the lines of
 /// notes.txt and prints the attestation variable as its environment holds it.
 /// The second must carry, on that write's result, the refreeze receipt naming
-/// `line_count` callable from the next step and the trailing note's line
+/// `line_count` callable from the next step and the stored note's line
 /// giving its description and parameters, and gets a call of `line_count` by
 /// name. The third must carry that call's output, and gets the answer. The
 /// run must exit 0 with the answer on stdout, having made exactly those
@@ -3477,7 +4171,7 @@ mutating = false
     assert!(stdout.contains("notes.txt has 3 lines"), "no answer on stdout: {printed}");
     assert_eq!(served.len(), 3, "the run made {} requests, not three: {served:?}", served.len());
     assert_eq!(std::fs::read_to_string(project.join(tool)).unwrap(), manifest, "the tool file is not what was written");
-    // The write's result carries the receipt, then the trailing note's line
+    // The write's result carries the receipt, then the stored note's line
     // for the tool: the tools array stays as the session froze it, so that
     // line is where the model reads the new tool's description and
     // parameters.
@@ -3558,7 +4252,7 @@ mutating = false
 /// 10, 30, 90, 300 and 600 s, have their p50 at rank 3 and their p90 at rank
 /// 6 (the nearest rank, ceil(q n)): 30 and 600 s, where interpolating would
 /// give 60 and 450 s. It exits 1 for a directory without a usage file and 2
-/// without one directory argument. README.md states the method, held here.
+/// without one directory argument. docs/development.md states the method, held here.
 #[test]
 fn cache_report_measures_recorded_sessions() {
     let fixture = repo().join("crates/tui/tests/fixtures/sessions");
@@ -3591,13 +4285,13 @@ gaps: p50 30 s, p90 600 s over 6 gaps of at most 600 s between consecutive reque
         assert_eq!(code, Some(2), "{args:?}: {printed}");
         assert!(printed.starts_with("usage: "), "{args:?}: {printed}");
     }
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         "the share of prompt tokens served from cache over the sessions with more than 100,000 prompt tokens (target 75%)",
         "the share of sessions that cached no prompt token (target 5%)",
         "a gap over 600 s left out as idle (target p90 90 s)",
     ] {
-        assert!(readme.contains(claim), "README.md does not say \"{claim}\", which scripts/cache-report.sh reports");
+        assert!(stated.contains(claim), "docs/development.md does not say \"{claim}\", which scripts/cache-report.sh reports");
     }
     let _ = std::fs::remove_dir_all(empty);
 }
@@ -3751,7 +4445,20 @@ fn a_sub_agent_is_one_flag_and_zero_prompt_tokens() {
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let bodies = bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 3, "two child requests, then the -p request");
-    assert_eq!(bodies[0].replace(worktree, &root.display().to_string()), bodies[2], "the child's request differs from -p's");
+    let child = bodies[0].replace(worktree, &root.display().to_string());
+    // The bytes between the two requests' longest common prefix and suffix,
+    // so one byte inserted counts as one, not as every byte after it.
+    let (theirs, own) = (child.as_bytes(), bodies[2].as_bytes());
+    let same = theirs.iter().zip(own).take_while(|(theirs, own)| theirs == own).count();
+    let tail = theirs[same..].iter().rev().zip(own[same..].iter().rev()).take_while(|(theirs, own)| theirs == own).count();
+    let differ = theirs.len().max(own.len()) - same - tail;
+    println!(
+        "MEASURE a_sub_agent_is_one_flag_and_zero_prompt_tokens {differ} bytes differ between the child's first request, its \
+         worktree read as the project, and the first request -p sends ({} and {} bytes, the first {same} the same); target 0",
+        theirs.len(),
+        own.len()
+    );
+    assert_eq!(child, bodies[2], "the child's request differs from -p's");
     for body in &bodies {
         assert!(!body.contains("--subagent") && !body.contains("--worktree"), "a request names the flag: {body}");
     }
@@ -3956,9 +4663,10 @@ fn fresh_install(tag: &str, run: usize) -> (PathBuf, PathBuf) {
     (project, home)
 }
 
-/// Peak RSS of a two-round headless turn at most 4 MB, read as 4,000,000
-/// bytes, the stricter of its two readings (4 MiB is 4,194,304 bytes), so
-/// the target is never reported met under the looser one.
+/// Peak RSS of a two-round headless turn stays under its ratchet, and is
+/// reported against a target of 4 MB, read as 4,000,000 bytes, the stricter
+/// of its two readings (4 MiB is 4,194,304 bytes), so the target is never
+/// reported met under the looser one.
 ///
 /// Method: `openmax --trust-project -p TASK` on a fresh HOME and project,
 /// against a loopback endpoint (`scripted_endpoint`) that answers the run's
@@ -4033,7 +4741,7 @@ fn fresh_install(tag: &str, run: usize) -> (PathBuf, PathBuf) {
 /// KiB of it live at the peak, about 650 KiB the loader's own code, 288 KiB
 /// constant data it rebases at launch, and 224 KiB thread stacks.
 #[test]
-fn headless_turn_peak_rss_is_under_four_megabytes() {
+fn headless_turn_peak_rss_stays_under_its_ratchet() {
     const KIB: u64 = 1024;
     // 4 MB, in bytes (above).
     const TARGET: u64 = 4_000_000;
@@ -4146,14 +4854,14 @@ fn headless_turn_peak_rss_is_under_four_megabytes() {
     };
     let report =
         format!("two-round headless turn peak RSS: {text}; target {TARGET} bytes {met} ({build} build){inherited}");
-    println!("{report}");
+    println!("MEASURE headless_turn_peak_rss_stays_under_its_ratchet {report}");
     if !gated {
         assert!(turn < TARGET * 20, "{report}: {published:?}");
         return;
     }
     let (_, beyond, text) = summary(&pinned);
     let ratchet = format!("with MallocMaxMagazines=1: {text}; ratchet {} KiB beyond the floor", RATCHET / KIB);
-    println!("{ratchet}");
+    println!("MEASURE headless_turn_peak_rss_stays_under_its_ratchet {ratchet}");
     assert!(beyond <= RATCHET, "over the ratchet: {ratchet}; {report}");
 }
 
@@ -4459,19 +5167,19 @@ struct Kill9 {
 /// job, and the watcher, which leads a session of its own, is out of its
 /// reach. The method is `assert_no_orphans_after_kill_9`'s, on a run whose
 /// HOME holds its data directory; this run's listing is the one CI keeps.
-/// README.md states the grace and the bound, held here.
+/// docs/execution.md states the grace and the bound, held here.
 #[cfg(unix)]
 #[test]
 fn zero_orphans_after_kill_9() {
     let kill = Kill9 { home: true, group: true, removed: false };
     assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", kill, Some(ORPHANS_LISTING));
     let (grace, bound) = (open_max_core::execution::LEFT_BEHIND_GRACE.as_millis(), ORPHANS_GONE_WITHIN.as_millis());
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let stated = std::fs::read_to_string(repo().join("docs/execution.md")).unwrap();
     for claim in [
         format!("SIGKILL if it is still there {grace} ms later"),
         format!("within {bound} ms of the signal, and none of the three before the {grace} ms grace"),
     ] {
-        assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+        assert!(stated.contains(&claim), "docs/execution.md does not say \"{claim}\", which this test holds");
     }
 }
 
@@ -4548,7 +5256,9 @@ fn gone_after(pids: &[i32], file: Option<&Path>, since: Instant, wait: Duration)
 /// watcher's stop, or the end of the tree its SIGKILL began. A release
 /// build, as CI's thesis job runs it, asserts the bound; a debug build
 /// asserts 20 times it, as the whole suite runs beside it, and prints the
-/// times. The clock is read before the signal, not once the call returns:
+/// times. Its `MEASURE` line, keyed by `name`, gives the count it asserts is
+/// zero: the processes still found at the bound. The clock is read before
+/// the signal, not once the call returns:
 /// the watcher's SIGTERM follows the run's death, which follows the call's
 /// start, and its SIGKILL comes no sooner than the grace after its SIGTERM,
 /// so no process of the tree can read as gone within the grace of that
@@ -4623,9 +5333,19 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
         std::fs::write(Path::new(env!("CARGO_TARGET_TMPDIR")).join(file), &listing).unwrap();
     }
     print!("{listing}");
+    // The orphans: each process of the tree, and the watcher, still found
+    // at the bound. The gate's name states their count, zero, and that
+    // count is what it prints and asserts.
+    let orphans = gone.iter().filter(|time| time.is_none_or(|time| time >= bound)).count();
+    println!(
+        "MEASURE {name} {orphans} of {} processes, the tool tree's and its watcher, outlived the killed run by {} \
+         (target 0, {build} build)",
+        watched.len(),
+        ms(bound)
+    );
     assert!(watcher.is_some(), "the run's first tool started no watcher\n{listing}");
     assert_eq!(session, watcher, "the watcher does not lead a session of its own\n{listing}");
-    assert!(gone.iter().all(|time| time.is_some_and(|time| time < bound)), "a process outlived its killed run by {}\n{listing}", ms(bound));
+    assert_eq!(orphans, 0, "a process outlived its killed run by {}\n{listing}", ms(bound));
     assert!(
         gone[..tree.len()].iter().flatten().all(|&time| time >= LEFT_BEHIND_GRACE),
         "a process of the tree, which ignores SIGTERM, was gone before the {} grace had passed\n{listing}",
@@ -4645,7 +5365,7 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
 /// stop's grace nor its wait for an owner still exiting, which is longer
 /// and, measured from the run's collection, could still read just under its
 /// own length. A debug build asserts 20 times the bound, as the whole suite
-/// runs beside it; each prints the time. README.md states the bound, held
+/// runs beside it; each prints the time. docs/execution.md states the bound, held
 /// here.
 #[cfg(unix)]
 #[test]
@@ -4704,14 +5424,15 @@ fn a_runs_watcher_ends_with_the_run() {
     assert!(named.as_ref().is_some_and(|named| named.starts_with(&line)), "the watcher's command line is {named:?}, not {line}<start>");
     assert!(gone.iter().all(|time| time.is_some_and(|time| time < bound)), "the watcher outlived its run, which exited 0, by {} or more: {gone:?}", ms(bound));
     let claim = format!("which it outlives by less than {} ms in a release build", LEFT_BEHIND_GRACE.as_millis());
-    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
-    assert!(readme.contains(&claim), "README.md does not say \"{claim}\", which this test holds");
+    let stated = std::fs::read_to_string(repo().join("docs/execution.md")).unwrap();
+    assert!(stated.contains(&claim), "docs/execution.md does not say \"{claim}\", which this test holds");
 }
 
-/// One command from a fresh install to a first real answer in under 30
-/// seconds, carrying the trust grant, the endpoint and the first turn. Nearly
-/// all of those 30 seconds are the download and the model's own latency, so
-/// what this gates is the harness's share: the wall time of
+/// One command from a fresh install answers a local endpoint in under a
+/// second, carrying the trust grant, the endpoint and the first turn: the
+/// harness's share of the 30 seconds a first real answer is meant to take,
+/// nearly all of which are the download and the model's own latency, which
+/// no test here measures. The share is the wall time of
 /// `openmax --trust-project --base-url URL --model ID --api-key '$NAME'
 /// --context-tokens N -p TASK` on an empty HOME against a local endpoint that
 /// answers at once, from spawn to exit. Method: one warmup run, then the
@@ -4720,7 +5441,7 @@ fn a_runs_watcher_ends_with_the_run() {
 /// settings.json. Release builds assert the median is under 1 second; debug
 /// builds print it and assert under 20 seconds.
 #[test]
-fn one_command_from_a_fresh_install_answers_in_under_thirty_seconds() {
+fn one_command_from_a_fresh_install_answers_locally_in_under_a_second() {
     let base_url = spawn_answering_server();
     let mut runs = Vec::new();
     for run in 0..12 {
@@ -4752,12 +5473,12 @@ fn one_command_from_a_fresh_install_answers_in_under_thirty_seconds() {
     }
     runs.sort();
     let median = runs[runs.len() / 2];
-    let target = Duration::from_secs(1);
-    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
-    eprintln!("first answer from a fresh install: median {median:?} over {} runs ({build} build)", runs.len());
-    if cfg!(debug_assertions) {
-        assert!(median < target * 20, "median {median:?}, runs {runs:?}");
-    } else {
-        assert!(median < target, "median {median:?}, runs {runs:?}");
-    }
+    const TARGET: Duration = Duration::from_secs(1);
+    let (bound, build) = if cfg!(debug_assertions) { (TARGET * 20, "debug") } else { (TARGET, "release") };
+    println!(
+        "MEASURE one_command_from_a_fresh_install_answers_locally_in_under_a_second {median:?} median over {} runs \
+         ({build} build); bound {bound:?}, the target {TARGET:?} in release",
+        runs.len()
+    );
+    assert!(median < bound, "median {median:?}, runs {runs:?}");
 }
