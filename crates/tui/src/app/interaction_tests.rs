@@ -1304,3 +1304,64 @@ async fn a_transcript_selection_paints_on_the_row_it_selected() {
     assert_eq!(selected, [row as u16]);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_resize_while_following_a_live_tail_keeps_following() {
+    let (mut app, dir) = app_fixture();
+    app.running = true;
+    app.on_agent_event(AgentEvent::Token { text: "a streamed reply that wraps at a narrower width".into() });
+    frame(&mut app, 40, 12);
+    assert_eq!(app.transcript.offset(), 0);
+    frame(&mut app, 24, 12);
+    assert_eq!(app.transcript.offset(), 0, "the view follows the live output");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn full_width_history_that_exactly_fits_keeps_every_column() {
+    let (mut app, dir) = app_fixture();
+    let visible = chat_rows(&mut app).len();
+    let full: Vec<String> = (1..visible).map(|i| format!("{i:<29}x")).collect();
+    app.transcript.push_assistant(full.iter().map(|line| Line::from(line.clone())).collect());
+    let rows = chat_rows(&mut app);
+    assert_eq!(rows[..visible - 1], full[..], "{rows:#?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn the_status_hint_names_the_keys_that_act_on_the_selection() {
+    let (mut app, dir) = app_fixture();
+    for i in 0..4 {
+        app.note(&format!("line {i}"));
+    }
+    let hint = |app: &mut App| {
+        app.dirty = Dirty::all();
+        let (rows, _) = frame(app, 60, 12);
+        let border = rows.iter().position(|row| row.starts_with('╭')).unwrap();
+        rows[border - 1].trim().to_string()
+    };
+    app.focus = Focus::Scrollback;
+    assert!(hint(&mut app).starts_with("j/k block · enter fold"), "{}", hint(&mut app));
+    let (rows, _) = frame(&mut app, 60, 12);
+    let row = rows.iter().position(|row| row.contains("line 2")).unwrap() as u16;
+    for _ in 0..3 {
+        click(&mut app, 4, row).await;
+    }
+    assert!(app.focus == Focus::Scrollback);
+    assert!(hint(&mut app).starts_with("y copy selection · esc clear"), "{}", hint(&mut app));
+    app.focus = Focus::Composer;
+    assert!(hint(&mut app).starts_with("ctrl+c copy selection · esc clear"), "{}", hint(&mut app));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_empty_chat_says_ready_where_the_word_fits() {
+    let ready = |width| {
+        let (mut app, dir) = app_fixture();
+        let (rows, _) = frame(&mut app, width, 8);
+        let _ = std::fs::remove_dir_all(dir);
+        rows.iter().any(|row| row.contains("READY"))
+    };
+    assert!(ready(5));
+    assert!(!ready(4));
+}
