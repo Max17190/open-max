@@ -3506,6 +3506,20 @@ fn spec_usage_names_memory_cost_and_never_claims_zero() {
     );
 }
 
+/// The tools and hooks contracts name `openmax --spec <surface>.approval`
+/// for their content approval detail outside auto, and an agent runs that in
+/// bash: the binary must print the part, or the pointer is a dead end.
+#[test]
+fn spec_prints_the_approval_part_a_contract_names() {
+    let (project, home) = fresh_dirs("spec-approval-part");
+    for part in ["tools.approval", "hooks.approval"] {
+        let out = cmd(&project, &home).args(["--spec", part]).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "--spec {part} exits 0: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("content approval outside auto (ask, readonly)"), "--spec {part} prints its part:\n{text}");
+    }
+}
+
 #[test]
 fn saved_project_auto_applies_to_headless_and_cannot_be_changed_by_a_child() {
     let (project, home) = fresh_dirs("saved-auto");
