@@ -406,6 +406,49 @@ mod tests {
         assert_eq!(plain(&lines)[0], "a * lone star and `tick");
     }
 
+    /// Two stars with nothing between them are text, not an empty italic,
+    /// and bold at the very start of a line drops its markers.
+    #[test]
+    fn a_bare_double_star_is_text_and_leading_bold_drops_its_markers() {
+        let spans = inline("**bold** then 2 ** 3", Style::default());
+        let texts: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(texts, ["bold", " then 2 ** 3"]);
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// A lone star opens italic even when a double star comes later on the
+    /// line: bold needs two stars where it starts.
+    #[test]
+    fn italic_before_bold_keeps_both() {
+        let spans = inline("*a* and **b**", Style::default());
+        let texts: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(texts, ["a", " and ", "b"]);
+        assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// Either spelling of a rule draws one, and a paragraph keeps the indent
+    /// it was written with and gains none it was not.
+    #[test]
+    fn rules_draw_and_paragraphs_keep_exactly_their_indent() {
+        for rule in ["---", "***"] {
+            assert_eq!(plain(&render(rule)), ["─".repeat(24)]);
+        }
+        let lines = render("  indented\nflush");
+        let spans: Vec<Vec<&str>> =
+            lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect()).collect();
+        assert_eq!(spans, [vec!["  ", "indented"], vec!["flush"]]);
+    }
+
+    /// A finish on a shorter text than the stream had seen (a new turn
+    /// replaced it) renders the new text from scratch.
+    #[test]
+    fn finishing_on_a_shorter_text_renders_it_from_scratch() {
+        let mut sm = StreamingMarkdown::default();
+        sm.update("an earlier, longer reply\nwith two lines\n", 40);
+        assert_eq!(plain(&sm.finish("new")), ["new"]);
+    }
+
     // ---- StreamingMarkdown: incremental output must match batch render ----
 
     /// Text + full style per span, per line: a strong equality projection that
