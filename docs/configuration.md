@@ -163,12 +163,15 @@ override the first two.
   Where the model takes an effort change inside the conversation (GPT-6 and
   later over Responses, not on a ChatGPT plan; Claude Opus 5 and 5.5, Sonnet
   5.5, Haiku 5.5, Fable 5.1 and Mythos 5.1 over native Messages), the field
-  keeps the effort the session opened with and each later choice goes just
-  ahead of the prompt of the turn it was made for: a `configuration_update`
-  input item, or an effort-only system message under the
-  `mid-conversation-output-config-2026-07-01` beta header. Each prompt records
-  its turn's effort in the session file. A return to Default, which no such
-  change can name, sends the field as before. Supported levels still depend on the model and endpoint;
+  keeps the first effort the session ran at on that route and each later
+  choice goes just ahead of the prompt of the turn it was made for: a
+  `configuration_update` input item, or an effort-only system message under
+  the `mid-conversation-output-config-2026-07-01` beta header. Each prompt
+  records its turn's effort and route (endpoint, model and credentials,
+  hashed) in the session file, and only prompts the current route ran and
+  answered count, so an effort another model took or the server refused is
+  never sent again. A return to Default, which no such change can name, sends
+  the field as before. Supported levels still depend on the model and endpoint;
   the server validates explicit selections. A rejection is reported without
   retrying at another level. Sampling and protocol settings are unchanged.
   The Anthropic compatibility endpoint ignores effort, so explicit selections

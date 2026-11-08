@@ -635,7 +635,7 @@ async fn run_loop(
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map.get_mut(session_id).expect("session was hydrated");
         let first_turn = data.messages.len() <= 1;
-        data.messages.push(ChatMessage { effort: Some(settings.reasoning_effort.map_or("default", ReasoningEffort::as_str).into()), ..ChatMessage::user(user_text) });
+        data.messages.push(ChatMessage::user(user_text));
         store_note(&mut data.messages, data.trailing_note.as_deref());
         let (messages, seq) = take_messages(data);
         (messages, data.registry.clone(), data.trailing_note.clone(), seq, first_turn)
@@ -723,6 +723,8 @@ async fn run_loop(
         }
     };
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
+    if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(format!("{} {}", client.reasoning_effort.map_or("default", ReasoningEffort::as_str), client.origin())); }
     // Frozen wire form: every request of the session injects the same tool
     // schema bytes without re-serializing the Value array. A refreeze swaps
     // the registry and keeps these (a tool file written since rides the

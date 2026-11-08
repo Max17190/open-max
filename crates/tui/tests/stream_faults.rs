@@ -804,7 +804,7 @@ fn check_requests(run: &Run, log: &str) {
 
 /// The wire never carries `reasoning_origin`, the stamp the transcript keeps
 /// on a message with reasoning, nor `effort`, the last field of a prompt's
-/// record, which says the effort its turn ran at.
+/// record, which says the effort and route its turn ran at.
 fn without_origin(line: &str) -> String {
     const KEY: &str = ",\"reasoning_origin\":\"";
     let line = match line.find(KEY) {
@@ -812,6 +812,15 @@ fn without_origin(line: &str) -> String {
         None => line.to_string(),
     };
     line.find(",\"effort\":\"").map_or(line.clone(), |at| format!("{}}}", &line[..at]))
+}
+
+/// A line with its prompt record's route (the space and 16 hex digits after
+/// the effort) left out: two runs at different endpoints differ only there.
+fn without_route(line: &str) -> String {
+    match line.find(",\"effort\":\"").and_then(|at| line[at..].find(' ').map(|space| at + space)) {
+        Some(at) => format!("{}{}", &line[..at], &line[at + 17..]),
+        None => line.to_string(),
+    }
 }
 
 fn user_line(prompt: &str) -> String {
@@ -831,8 +840,10 @@ fn check_resume(first: &Run, resumed: &Run) {
     assert_eq!(body["messages"].get(), expected, "the resume sends the transcript as stored: {log}");
     assert_eq!(body["tools"].get(), fields(&first.requests[0])["tools"].get(), "the resume sends the same tools: {log}");
     let grown = String::from_utf8_lossy(&resumed.after[kept.len()..]).to_string();
-    let prompt = format!("{},\"effort\":\"default\"}}", user_line(&resumed.prompt).trim_end_matches('}'));
-    assert_eq!(grown, format!("{prompt}\n{}\n", r#"{"role":"assistant","content":"resumed"}"#), "{log}");
+    let (prompt, reply) = grown.split_once('\n').unwrap_or_default();
+    let record = format!("{},\"effort\":\"default ", user_line(&resumed.prompt).trim_end_matches('}'));
+    assert!(prompt.starts_with(&record) && prompt.len() == record.len() + 18, "the prompt records its effort and route: {log}");
+    assert_eq!(reply, format!("{}\n", r#"{"role":"assistant","content":"resumed"}"#), "{log}");
 }
 
 /// xorshift64*, seeded per case, so a failure replays from its seed alone.
@@ -1263,8 +1274,9 @@ fn the_way_a_reply_is_split_across_reads_changes_nothing() {
         assert_eq!(split.ran_log(), format!("{}\n", template.marker), "{}", cut.log());
         assert_eq!(split.ran_log(), reference.ran_log(), "{ctx}");
         assert_eq!(shape(&cut.events), shape(&whole.events), "{ctx}");
-        // Line 0 is the system prompt, which names the project path.
-        let tail = |run: &Run| String::from_utf8(run.after.clone()).unwrap().lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+        // Line 0 is the system prompt, which names the project path, and a
+        // prompt's record names the endpoint the run used.
+        let tail = |run: &Run| String::from_utf8(run.after.clone()).unwrap().lines().skip(1).map(without_route).collect::<Vec<_>>();
         assert_eq!(tail(&cut), tail(&whole), "{ctx}");
     });
 }

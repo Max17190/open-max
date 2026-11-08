@@ -85,8 +85,8 @@ pub struct ChatMessage {
     /// made. Without a stamp they go back nowhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_origin: Option<String>,
-    /// The effort a turn's prompt ran at (`default` or a level), absent on
-    /// any other message. Never sent; see `ChatClient::effort_plan`.
+    /// On a turn's prompt only, the effort (`default` or a level) and route
+    /// (`ChatClient::origin`) it ran at, for `ChatClient::effort_plan`. Never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 }

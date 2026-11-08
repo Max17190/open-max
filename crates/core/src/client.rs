@@ -535,20 +535,24 @@ impl ChatClient {
             && crate::providers::CACHE_MARKS.iter().any(|(h, prefix)| host.as_deref() == Some(*h) && model.starts_with(prefix))
     }
 
-    /// The effort a request names at its top, and each later choice it sends
-    /// as history, `(i, level)` just ahead of message `i`, its turn's prompt.
-    /// Both providers render the top one ahead of the history, so changing it
-    /// misses the cache for all of it. A model that takes a change inside the
-    /// conversation (`providers::EFFORT_UPDATES`; not on a ChatGPT plan, whose
-    /// route documents none) keeps the opening effort there, unless the prompts
-    /// do not end on the current effort (a prune dropped its prompt) or return
-    /// to the default, which no change names: then the current effort goes.
+    /// The effort a request names at its top, which both providers render
+    /// ahead of the history, and each later choice it sends as history,
+    /// `(i, level)` just ahead of message `i`, its turn's prompt. A model that
+    /// takes one (`providers::EFFORT_UPDATES`; never on a ChatGPT plan) keeps
+    /// its opening effort at the top. Only prompts this route ran (`origin`)
+    /// and a reply answered count, and the newest; if they do not end on the
+    /// current effort (a prune dropped its prompt) or return to the default,
+    /// which no change names, the current effort goes.
     pub(crate) fn effort_plan(&self, messages: &[ChatMessage]) -> (Option<ReasoningEffort>, Vec<(usize, ReasoningEffort)>) {
-        let (current, model) = ((self.reasoning_effort, Vec::new()), self.model.rsplit('/').next().unwrap_or_default().to_ascii_lowercase());
+        let (current, model, origin) = ((self.reasoning_effort, Vec::new()), self.model.rsplit('/').next().unwrap_or_default().to_ascii_lowercase(), self.origin());
         if self.chatgpt.is_some() || !crate::providers::EFFORT_UPDATES.iter().any(|(wire, prefix)| *wire == self.wire_api && model.starts_with(prefix)) {
             return current;
         }
-        let mut chosen = messages.iter().enumerate().filter_map(|(i, m)| Some((i, ReasoningEffort::parse(m.effort.as_deref()?).ok()?)));
+        let mut chosen = messages.iter().enumerate().filter_map(|(i, m)| {
+            let (level, route) = m.effort.as_deref()?.split_once(' ')?;
+            let answered = messages[i + 1..].iter().find(|m| m.effort.is_some() || m.role == "assistant").is_none_or(|m| m.role == "assistant");
+            Some((i, ReasoningEffort::parse(level).ok().filter(|_| route == origin && answered)?))
+        });
         let Some((_, opening)) = chosen.next() else { return current };
         let (mut running, mut changes) = (opening, Vec::new());
         for (i, effort) in chosen {
