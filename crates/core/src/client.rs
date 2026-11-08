@@ -139,9 +139,15 @@ fn details_repeat_plaintext(message: &ChatMessage) -> bool {
     }
     // Borrow unescaped text and skip opaque fields. Compare blocks in order
     // without assembling another copy of the reasoning or rewriting the JSON.
-    let Ok(blocks) = serde_json::from_str::<Vec<ReasoningTextBlock<'_>>>(raw) else { return false };
+    let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(raw) else { return false };
     let mut remaining = text;
-    for block in blocks.iter().filter(|block| block.kind == "reasoning.text") {
+    for block in blocks {
+        // A named Rust struct can deserialize from a JSON array, but a
+        // reasoning block has to be an object on this wire.
+        let raw = block.get().trim_start();
+        if !raw.starts_with('{') { return false; }
+        let Ok(block) = serde_json::from_str::<ReasoningTextBlock<'_>>(raw) else { return false };
+        if block.kind != "reasoning.text" { continue; }
         let Some(tail) = remaining.strip_prefix(block.text.as_ref()) else { return false };
         remaining = tail;
     }
@@ -4165,6 +4171,7 @@ pub(crate) mod tests {
                 (r#"[{"type":"reasoning.summary","summary":"reasoning text"}]"#, false),
                 (r#"[{"type":"reasoning.encrypted","data":"opaque=="}]"#, false),
                 (r#"[{"type":"custom","text":"reasoning text"}]"#, false),
+                (r#"[["reasoning.text","reasoning text"]]"#, false),
                 ("null", false),
             ] {
                 reply.reasoning_details = Some(RawValue::from_string(raw.into()).unwrap());
