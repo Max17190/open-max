@@ -142,7 +142,12 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// times the multiplier, and fails one over it or with a binary that fails
 /// again when run alone (or that a signal ends, SIGALRM included), naming
 /// the binary and showing its failures, and passes one whose binary failed
-/// only beside the others. A binary still running at three times the budget
+/// only beside the others. A test the script runs alone, as it times its
+/// own work, is left out of its binary's run beside the others and then runs
+/// alone once they have ended, on the clock (a run names it when it is
+/// the slowest), and fails the gate when it fails there, with no second
+/// run; each such test is one the suite holds.
+/// A binary still running at three times the budget
 /// is stopped, with every process still under it (a grandchild and one in a
 /// session of its own among them; on Linux, with no `ps` on the PATH), and
 /// fails the gate, which names the test it had not finished. Run several
@@ -214,6 +219,19 @@ fn the_suite_fails_over_its_time_budget() {
             script.contains(&format!("a multiplier of {multiplier} on {runner}")),
             "the script does not give the reason for the multiplier of {multiplier} on {runner}"
         );
+    }
+    // The tests the script runs alone are tests of the suite under those
+    // names: one renamed would run beside the others again and time the
+    // runner.
+    let named = script.lines().find_map(|line| line.strip_prefix("alone_tests=\"")?.strip_suffix('"')).unwrap_or("");
+    assert!(!named.is_empty(), "the script names no test that runs alone");
+    let sources: String = ["crates/core/tests", "crates/tui/tests"]
+        .iter()
+        .flat_map(|tests| std::fs::read_dir(repo().join(tests)).unwrap())
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default())
+        .collect();
+    for test in named.split(' ') {
+        assert!(sources.contains(&format!("fn {test}()")), "the script runs {test} alone, which no test is named");
     }
 
     let nonce = std::time::SystemTime::now()
@@ -301,6 +319,38 @@ fn the_suite_fails_over_its_time_budget() {
         path
     };
     let (contended, flaky) = (fails_once("contended"), fails_once("flaky"));
+    // A binary that holds a test the gate runs alone, and a binary beside it
+    // that marks when it ended: beside the others the first must be run
+    // without that test, then alone with only it, with libtest's own pool,
+    // once every other binary has ended, once a run. Alone, its test takes a
+    // second the first time, four fifths of a second longer than the binary
+    // beside it (room for either to start late on a busy runner and still
+    // keep their order), and no time after that. It ends with `code`.
+    let held_alone = |name: &str, code: u8| {
+        let (path, ended, runs) = (dir.join(name), dir.join(format!("{name}-lagging-ended")), dir.join(format!("{name}-alone-runs")));
+        executable(
+            &path,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --list ] && {{ printf 'beside: test\\nharness_time_per_tool_round: test\\n'; exit 0; }}\n\
+                 case \"$*\" in\n\
+                 \"--test-threads \"*\" --exact --skip harness_time_per_tool_round\") exit 0 ;;\n\
+                 \"--exact harness_time_per_tool_round\") echo run >> '{runs}' ;;\n\
+                 *) echo \"run with $*\"; exit 1 ;;\n\
+                 esac\n\
+                 [ -e '{ended}' ] || {{ echo 'run alone beside another binary'; exit 1; }}\n\
+                 [ \"$(wc -l < '{runs}')\" -gt 1 ] || sleep 1\n\
+                 [ {code} = 0 ] || printf 'failures:\\n\\n---- harness_time_per_tool_round stdout ----\\npast its bound\\n'\n\
+                 exit {code}\n",
+                runs = runs.display(),
+                ended = ended.display(),
+            ),
+        );
+        let lagging = dir.join(format!("{name}-lagging"));
+        executable(&lagging, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nrm -f '{0}'\nsleep 0.2\n: > '{0}'\n", ended.display()));
+        (path, lagging, runs)
+    };
+    let (timed, timed_lagging, timed_runs) = held_alone("timed", 0);
+    let (slow_alone, slow_lagging, slow_runs) = held_alone("slow-alone", 101);
     // A binary whose n-th run sleeps the n-th of `sleeps` seconds, for the
     // gate run several times over. In each series below the median is a
     // tenth of a second or more from the mean, the last run and the middle
@@ -377,6 +427,8 @@ fn the_suite_fails_over_its_time_budget() {
         (repeated_failed, repeated_failed_report),
         (unreported, unreported_report),
         (no_runs, _),
+        (alone, alone_report),
+        (alone_failed, alone_failed_report),
     ) = std::thread::scope(|scope| {
         let passed = scope.spawn(|| {
             let mut binaries: Vec<(&str, Option<&Path>)> =
@@ -409,6 +461,14 @@ fn the_suite_fails_over_its_time_budget() {
         let unreported =
             scope.spawn(|| run_gate("unreported", &["--runs", "2", "1"], &[("vanishing", Some(vanishing.as_path()))], None));
         let no_runs = scope.spawn(|| run_gate("no-runs", &["--runs", "0", "1"], &[], None));
+        let alone = scope.spawn(|| {
+            let binaries = [("timed", Some(timed.as_path())), ("lagging", Some(timed_lagging.as_path()))];
+            run_gate("alone", &["--runs", "2", "1"], &binaries, None)
+        });
+        let alone_failed = scope.spawn(|| {
+            let binaries = [("slow-alone", Some(slow_alone.as_path())), ("lagging", Some(slow_lagging.as_path()))];
+            run_gate("alone-failed", &["1"], &binaries, None)
+        });
         (
             passed.join().unwrap(),
             over.join().unwrap(),
@@ -423,8 +483,12 @@ fn the_suite_fails_over_its_time_budget() {
             repeated_failed.join().unwrap(),
             unreported.join().unwrap(),
             no_runs.join().unwrap(),
+            alone.join().unwrap(),
+            alone_failed.join().unwrap(),
         )
     });
+    let ran_alone = |runs: &Path| std::fs::read_to_string(runs).map_or(0, |text| text.lines().count());
+    let (timed_ran, slow_ran) = (ran_alone(&timed_runs), ran_alone(&slow_runs));
     // What the processes the hanging binary left running wrote, and whether
     // one of them still holds the lifeline two seconds on.
     let (mut said, mut chunk) = (Vec::new(), [0_u8; 64]);
@@ -547,6 +611,35 @@ fn the_suite_fails_over_its_time_budget() {
         "the run whose binary never reported does not say why: {unreported_report}"
     );
     assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
+    // A test that times its own work runs alone: beside the others its
+    // binary runs without it, then it runs alone, once every other binary
+    // has ended, in every run, and its time counts toward the run's, which
+    // names it when it is the slowest. Alone, its failure fails the gate,
+    // with no second run.
+    let first_run = alone_report
+        .lines()
+        .find_map(|line| line.strip_prefix("run 1 of 2: ")?.split_once("s, slowest binary "))
+        .and_then(|(took, slowest)| Some((took.parse::<f64>().ok()?, slowest.split_once(", load ")?.0)));
+    assert!(
+        alone == Some(0)
+            && timed_ran == 2
+            && alone_report.lines().any(|line| line.starts_with("run 2 of 2: "))
+            && first_run.is_some_and(|(took, slowest)| {
+                took >= 1.2 && slowest.ends_with("s harness_time_per_tool_round in timed (test), alone")
+            }),
+        "a test that runs alone did not run once a run, alone, after the others and on the clock, \
+         or the run did not name it as its slowest: {alone_report}"
+    );
+    assert!(
+        alone_failed == Some(1)
+            && alone_failed_report.contains("harness_time_per_tool_round in slow-alone (test), alone FAILED (exit 101)")
+            && alone_failed_report.contains(
+                "harness_time_per_tool_round in slow-alone (test), alone failed:\nfailures:\n\n---- harness_time_per_tool_round stdout ----\npast its bound"
+            )
+            && !alone_failed_report.contains("passed alone")
+            && slow_ran == 1,
+        "a test that fails alone passes the gate, or runs a second time: {alone_failed_report}"
+    );
 }
 
 /// What scripts/count-core-lines.sh prints for `checkout` with `flags`, or,
@@ -605,10 +698,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // The client asks each provider's prompt cache for the conversation it serves, reads every wire's usage
-    // with one parser, and builds itself without its eight-argument constructor: 8 lines fewer, the trust
-    // dispatcher and the frozen prompt unchanged.
-    const BASELINE: usize = 44_448;
+    // A Responses server with no tools item gets the tools field, and the Responses reader states four
+    // of its steps more simply: 4 lines fewer, the frozen prompt unchanged.
+    const BASELINE: usize = 43_975;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -3982,7 +4074,7 @@ fn spawn_scripted_server(script: Vec<String>) -> (String, std::sync::Arc<std::sy
 /// `.openmax/tools/line_count.toml`, an awk tool that counts the lines of
 /// notes.txt and prints the attestation variable as its environment holds it.
 /// The second must carry, on that write's result, the refreeze receipt naming
-/// `line_count` callable from the next step and the trailing note's line
+/// `line_count` callable from the next step and the stored note's line
 /// giving its description and parameters, and gets a call of `line_count` by
 /// name. The third must carry that call's output, and gets the answer. The
 /// run must exit 0 with the answer on stdout, having made exactly those
@@ -4080,7 +4172,7 @@ mutating = false
     assert!(stdout.contains("notes.txt has 3 lines"), "no answer on stdout: {printed}");
     assert_eq!(served.len(), 3, "the run made {} requests, not three: {served:?}", served.len());
     assert_eq!(std::fs::read_to_string(project.join(tool)).unwrap(), manifest, "the tool file is not what was written");
-    // The write's result carries the receipt, then the trailing note's line
+    // The write's result carries the receipt, then the stored note's line
     // for the tool: the tools array stays as the session froze it, so that
     // line is where the model reads the new tool's description and
     // parameters.

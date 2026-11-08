@@ -24,16 +24,6 @@ pub struct CompatFlags {
     pub omit_temperature: bool,
 }
 
-impl CompatFlags {
-    fn defaults_for_missing() -> Self {
-        Self {
-            use_max_completion_tokens: false,
-            send_stream_options: true,
-            omit_temperature: false,
-        }
-    }
-}
-
 // serde default for send_stream_options is false via Default; we want true when
 // the field is omitted from JSON. Custom deserialize via Option merge on load.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -752,15 +742,25 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         max_tokens,
         temperature: settings.temperature,
         reasoning_effort: settings.reasoning_effort,
-        compat: CompatFlags::defaults_for_missing(),
+        compat: CompatFlagsFile::default().into(),
         idle_timeout_secs: None,
         key_hint: None,
     })
 }
 
-/// Chat Completions hosts that keep a prompt cache per server and send a
-/// conversation's requests to one server by a header, with that header.
-pub const CACHE_ROUTES: &[(&str, &str)] = &[("api.x.ai", "x-grok-conv-id")];
+/// Chat Completions providers that keep a prompt cache per server and send a
+/// conversation's requests to one server by a header: host, model id prefix
+/// (which names the provider behind a proxy or gateway too), header.
+pub const CACHE_ROUTES: &[(&str, &str, &str)] = &[("api.x.ai", "grok-", "x-grok-conv-id")];
+
+/// Chat Completions routes that cache a model's prompt only up to a
+/// `cache_control` marker, and so read nothing back from a request without
+/// one: host, model id prefix. OpenRouter serving an Anthropic model is one.
+pub const CACHE_MARKS: &[(&str, &str)] = &[("openrouter.ai", "anthropic/")];
+
+/// Responses servers whose input has no `additional_tools` item and refuses
+/// the request that carries one: host, model id prefix, as in `CACHE_ROUTES`.
+pub const TOOLS_FIELD: &[(&str, &str)] = &[("api.x.ai", "grok-")];
 
 /// Known compatibility routes can accept the field while ignoring its value.
 pub fn validate_reasoning_effort(base: &str, wire: WireApi, effort: Option<crate::config::ReasoningEffort>) -> Result<(), String> {
@@ -871,21 +871,11 @@ pub(crate) fn expand_secret(raw: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// The headers to send: each named one whose value expands (`expand_secret`
+/// never yields an empty one), so a header whose secret env is unset is
+/// skipped rather than sent empty.
 pub fn expand_headers(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
-    map.iter()
-        .filter_map(|(k, v)| {
-            let key = k.trim();
-            if key.is_empty() {
-                return None;
-            }
-            // Skip headers whose secret env is unset rather than sending empty values.
-            let val = expand_secret(v)?;
-            if val.is_empty() {
-                return None;
-            }
-            Some((key.to_string(), val))
-        })
-        .collect()
+    map.iter().filter(|(k, _)| !k.trim().is_empty()).filter_map(|(k, v)| Some((k.trim().to_string(), expand_secret(v)?))).collect()
 }
 
 #[cfg(test)]
@@ -1272,8 +1262,11 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("X-A".into(), "$NO_SUCH_OPENMAX_ENV_VAR_ZZZ".into());
         map.insert("X-B".into(), "ok".into());
+        map.insert(" X-C ".into(), " padded ".into());
+        map.insert("  ".into(), "nameless".into());
+        map.insert("X-D".into(), "  ".into());
         let headers = expand_headers(&map);
-        assert_eq!(headers, vec![("X-B".into(), "ok".into())]);
+        assert_eq!(headers, vec![("X-C".into(), "padded".into()), ("X-B".into(), "ok".into())]);
     }
 
     #[test]

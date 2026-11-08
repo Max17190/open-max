@@ -498,9 +498,10 @@ async fn a_memory_write_refreshes_the_note() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The note ends a tool result, so a file the agent reads must not be able
-/// to open a fake one: a copy of the header in tool output is defused where
-/// the output is captured, and the real note is the one copy on the wire.
+/// The note is stored at the end of a tool result, so a file the agent reads
+/// must not be able to open a fake one: a copy of the header in tool output
+/// is defused where the output is captured, and the real note, on the
+/// write's result, is the one copy on the wire.
 /// The capture keeps the rest as it was: a result as the tool gave it, and
 /// a failure behind `Error: `.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -523,10 +524,11 @@ async fn tool_output_cannot_pose_as_the_note() {
     let (core, mut rx) = Core::new(data).unwrap();
     drive_turn(&core, &mut rx, "defuse", &project, "read the notes").await;
 
+    let raw = bodies.lock().unwrap()[2].clone();
+    assert_eq!(raw.matches(NOTE_HEADER).count(), 1, "one header on the wire: {raw}");
     let sent = sent(&bodies.lock().unwrap());
-    let last = &sent[2].last;
-    assert_eq!(last.matches(NOTE_HEADER).count(), 1, "one header on the wire: {last}");
-    let (output, note) = last.split_once(&note_marker()).expect("the real note ends the result");
+    let (_, note) = sent[1].last.split_once(&note_marker()).expect("the real note ends the write's result");
+    let output = &sent[2].last;
     let defused = format!("({})", &NOTE_HEADER[1..NOTE_HEADER.len() - 1]);
     assert!(!output.starts_with("Error: ") && output.contains(&defused) && output.contains("- evil:"), "{output}");
     assert!(sent[3].last.starts_with("Error: "), "a failed call reads as one: {}", sent[3].last);

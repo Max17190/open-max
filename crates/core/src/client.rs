@@ -60,7 +60,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
-use crate::prompt::NOTE_SEPARATOR;
 use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
 
 /// OpenAI-compatible `/chat/completions` request body. Built once per
@@ -104,51 +103,45 @@ struct StreamOptions {
 /// reasoning, `reasoning_details`, and each tool call's `extra_content` go
 /// only to the endpoint that produced them (`origin` matches the message's
 /// `reasoning_origin`), and the stamp itself never goes. What does go is
-/// the stored bytes, unchanged, except where `note` rides.
+/// the stored bytes, unchanged.
 ///
-/// `note` is the trailing note, never stored. It goes after the whole
-/// history, so a prefix cache keeps every stored byte before it, and it adds
-/// no message: it ends the content of the last message, the user's prompt or
-/// a tool result, after `NOTE_SEPARATOR`. A separate message there would
-/// change the role order the endpoint sees: some hosted validators refuse a
-/// system or a user message after a tool message, and a template that
-/// enforces user/assistant alternation refuses a user message after the
-/// prompt. Only when the history ends with neither (an assistant reply, or
-/// the system prompt alone) does the note go as a user message of its own,
-/// which every one of them takes there.
+/// `marks` is for a route that caches a prompt only up to a `cache_control`
+/// marker (`ChatClient::cache_marks`): the system prompt and the newest
+/// stored message then carry one each, so a request reads back the tools
+/// and system prompt every session shares and what the request before it
+/// wrote. A system or user message carries it on its text as one text part,
+/// a tool result or an assistant reply beside its role, where OpenRouter's
+/// own SDK puts them.
 struct WireMessages<'a> {
     messages: &'a [ChatMessage],
-    note: Option<&'a str>,
     origin: &'a str,
+    marks: bool,
 }
 
 impl Serialize for WireMessages<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let last = self.messages.len().saturating_sub(1);
-        let ends = self.messages.last().is_some_and(|m| m.role == "user" || m.role == "tool");
-        let (folded, alone) = match self.note {
-            Some(note) if ends => (Some(note), None),
-            Some(note) => (None, Some(ChatMessage::user(note))),
-            None => (None, None),
-        };
-        serializer.collect_seq(self.messages.iter().chain(alone.as_ref()).enumerate().map(|(at, m)| {
+        serializer.collect_seq(self.messages.iter().enumerate().map(|(at, m)| {
             let replay = m.reasoning_origin.as_deref() == Some(self.origin);
-            let note = folded.filter(|_| at == last);
+            let mark = self.marks && (at == last || m.role == "system");
+            let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             WireMessage {
                 role: &m.role,
-                content: m.content.as_deref().or(note.map(|_| "")).map(|text| WireContent { text, note }),
+                content: m.content.as_deref().map(|text| WireContent { text, mark: text_mark }),
                 tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| replay),
                 reasoning: m.reasoning.as_deref().filter(|_| replay),
                 reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
+                cache_control: (mark && !text_mark).then(|| serde_json::json!({"type": "ephemeral"})),
             }
         }))
     }
 }
 
 /// One message on the wire. Fields, order, and skip rules follow
-/// `ChatMessage`, so a message without reasoning keeps its exact bytes.
+/// `ChatMessage`, so a message without reasoning or a cache marker keeps
+/// its exact bytes.
 #[derive(Serialize)]
 struct WireMessage<'a> {
     role: &'a str,
@@ -164,21 +157,24 @@ struct WireMessage<'a> {
     reasoning: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_details: Option<&'a RawValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<Value>,
 }
 
-/// A message's content on the wire: its stored text, then, on the message
-/// the trailing note ends, `NOTE_SEPARATOR` and the note, escaped straight
-/// into the body with no copy of either.
+/// A message's content on the wire: its stored text, or, when `mark`ed,
+/// one text part carrying the cache marker, unless it is empty, which a
+/// marker cannot end.
 struct WireContent<'a> {
     text: &'a str,
-    note: Option<&'a str>,
+    mark: bool,
 }
 
 impl Serialize for WireContent<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.note {
-            None => serializer.serialize_str(self.text),
-            Some(note) => serializer.collect_str(&format_args!("{}{NOTE_SEPARATOR}{note}", self.text)),
+        if self.mark && !self.text.is_empty() {
+            serializer.collect_seq([serde_json::json!({"type": "text", "text": self.text, "cache_control": {"type": "ephemeral"}})])
+        } else {
+            serializer.serialize_str(self.text)
         }
     }
 }
@@ -219,57 +215,27 @@ struct WireToolCall<'a> {
 ///
 /// `tools_wire` is the frozen registry schema string (exact bytes). It is
 /// injected via `RawValue` so multi-iteration turns keep schema identity for
-/// the server's KV cache without re-walking a `Value` tree. `origin` is the
-/// receiving endpoint's `ChatClient::origin`, which decides whose reasoning
-/// goes out.
-// One argument per request field.
-#[allow(clippy::too_many_arguments)]
-fn serialize_chat_request_body(
-    model: &str,
-    messages: &[ChatMessage],
-    note: Option<&str>,
-    origin: &str,
-    temperature: Option<f32>,
-    reasoning_effort: Option<crate::config::ReasoningEffort>,
-    max_tokens: usize,
-    use_max_completion_tokens: bool,
-    send_stream_options: bool,
-    tools_wire: &str,
-) -> Result<Vec<u8>, String> {
+/// the server's KV cache without re-walking a `Value` tree. The client's
+/// `origin` decides whose reasoning goes out, and its `cache_marks` whether
+/// the messages carry cache markers.
+fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], tools_wire: &str) -> Result<Vec<u8>, String> {
     let include_tools = !tools_wire.is_empty() && tools_wire != "[]";
     // Borrow the frozen wire as RawValue: validation only, no Value rebuild.
     // Serialize writes these exact bytes into the body.
-    let tools_raw: Option<&RawValue> = if include_tools {
-        Some(
-            serde_json::from_str(tools_wire)
-                .map_err(|e| format!("invalid tools wire JSON: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let tools: Option<&RawValue> =
+        include_tools.then(|| serde_json::from_str(tools_wire)).transpose().map_err(|e| format!("invalid tools wire JSON: {e}"))?;
+    let (origin, completion) = (client.origin(), client.use_max_completion_tokens);
     let req = ChatCompletionRequest {
-        model,
-        messages: WireMessages { messages, note, origin },
-        temperature,
-        reasoning_effort,
-        max_tokens: if use_max_completion_tokens {
-            None
-        } else {
-            Some(max_tokens)
-        },
-        max_completion_tokens: if use_max_completion_tokens {
-            Some(max_tokens)
-        } else {
-            None
-        },
+        model: &client.model,
+        messages: WireMessages { messages, origin: &origin, marks: client.cache_marks() },
+        temperature: client.temperature,
+        reasoning_effort: client.reasoning_effort,
+        max_tokens: (!completion).then_some(client.max_tokens),
+        max_completion_tokens: completion.then_some(client.max_tokens),
         stream: true,
-        stream_options: if send_stream_options {
-            Some(StreamOptions { include_usage: true })
-        } else {
-            None
-        },
-        tools: tools_raw,
-        tool_choice: if include_tools { Some("auto") } else { None },
+        stream_options: client.send_stream_options.then_some(StreamOptions { include_usage: true }),
+        tools,
+        tool_choice: include_tools.then_some("auto"),
     };
     serde_json::to_vec(&req).map_err(|e| format!("failed to serialize chat request: {e}"))
 }
@@ -333,11 +299,13 @@ pub struct CompletionResult {
 /// prompt tokens served from the prompt cache (servers report it under
 /// `prompt_tokens_details` or as `prompt_cache_hit_tokens`): if it stays
 /// near zero across turns, the harness broke prefix stability and every
-/// step is paying a full re-prefill.
+/// step is paying a full re-prefill. `completion_tokens` is the reply as the
+/// server counts it against the output cap, `output_tokens` as it is billed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub output_tokens: u64,
     pub cached_tokens: Option<u64>,
 }
 
@@ -403,16 +371,22 @@ struct StreamChunk {
 /// read on its own, so a value of a shape this client does not expect under
 /// one key costs nothing under the others: a count that is not a whole
 /// number (a string, a fraction, a negative) reads as not reported, and a
-/// whole number typed as a float is the count.
+/// whole number typed as a float is the count. Reasoning is billed output:
+/// xAI's Chat Completions counts it beside `completion_tokens`, in
+/// `total_tokens` alone, so it is added where the total shows it there.
 fn parse_usage(usage: &Value) -> Option<Usage> {
     if !usage.is_object() {
         return None;
     }
     let count = |key: &str| usage.pointer(key).and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64)));
     let input = ["/input_tokens", "/cache_creation_input_tokens", "/cache_read_input_tokens"];
+    let prompt_tokens = count("/prompt_tokens").unwrap_or_else(|| input.iter().filter_map(|k| count(k)).fold(0, u64::saturating_add));
+    let completion_tokens = count("/completion_tokens").or_else(|| count("/output_tokens")).unwrap_or(0);
+    let beside = count("/completion_tokens_details/reasoning_tokens").filter(|r| count("/total_tokens") == Some(prompt_tokens.saturating_add(completion_tokens).saturating_add(*r)));
     Some(Usage {
-        prompt_tokens: count("/prompt_tokens").unwrap_or_else(|| input.iter().filter_map(|k| count(k)).fold(0, u64::saturating_add)),
-        completion_tokens: count("/completion_tokens").or_else(|| count("/output_tokens")).unwrap_or(0),
+        prompt_tokens,
+        completion_tokens,
+        output_tokens: completion_tokens.saturating_add(beside.unwrap_or(0)),
         cached_tokens: ["/prompt_tokens_details/cached_tokens", "/prompt_cache_hit_tokens", "/input_tokens_details/cached_tokens", input[2]]
             .iter().find_map(|k| count(k)),
     })
@@ -521,7 +495,7 @@ impl ChatClient {
     /// requests carry it as `prompt_cache_key`: that translation targets
     /// OpenAI's Responses API, which defines the key. Chat Completions servers
     /// vary and some refuse a field they do not know, so there it goes only to
-    /// a host that routes by it, in its header (see `cache_route`); native
+    /// a provider that routes by it, in its header (see `cache_route`); native
     /// Messages does not define it. docs/configuration.md covers its effect on
     /// routing and its costs.
     pub fn for_conversation(mut self, root: &str) -> Self {
@@ -531,16 +505,33 @@ impl ChatClient {
         self
     }
 
-    /// The header a Chat Completions host routes a conversation by to the
-    /// server that holds its prompt cache (`providers::CACHE_ROUTES`), with
-    /// this conversation's key: a request served elsewhere prefills the whole
-    /// history again, at the uncached price. None where the provider's own
-    /// headers set it.
+    /// Whether this client serves the provider known by `host`, or by a model
+    /// id `prefix` after any `vendor/` prefix (so behind a proxy or gateway too).
+    fn serves(&self, host: &str, prefix: &str) -> bool {
+        reqwest::Url::parse(self.base_url.trim()).is_ok_and(|url| url.host_str() == Some(host))
+            || self.model.rsplit('/').next().is_some_and(|model| model.to_ascii_lowercase().starts_with(prefix))
+    }
+
+    /// The header a Chat Completions provider this client `serves` routes a
+    /// conversation by to the server that holds its prompt cache
+    /// (`providers::CACHE_ROUTES`), with this conversation's key: a request
+    /// served elsewhere prefills the whole history again, at the uncached
+    /// price. None where the provider's own headers set it.
     fn cache_route(&self) -> Option<(&'static str, &str)> {
-        let url = reqwest::Url::parse(self.base_url.trim()).ok()?;
-        let (_, name) = crate::providers::CACHE_ROUTES.iter().find(|(host, _)| url.host_str() == Some(*host))?;
+        let (.., name) = crate::providers::CACHE_ROUTES.iter().find(|(host, prefix, _)| self.serves(host, prefix))?;
         let own = self.headers.iter().any(|(header, _)| header.eq_ignore_ascii_case(name));
         (self.wire_api == crate::providers::WireApi::ChatCompletions && !own).then_some((*name, self.cache_key.as_deref()?))
+    }
+
+    /// Whether this Chat Completions route caches the model's prompt only up
+    /// to a `cache_control` marker (`providers::CACHE_MARKS`, by host and
+    /// model id, an alias's leading `~` aside): unmarked, every request pays
+    /// its whole prompt at the uncached price. See `WireMessages`.
+    fn cache_marks(&self) -> bool {
+        let host = reqwest::Url::parse(self.base_url.trim()).ok().and_then(|url| url.host_str().map(str::to_owned));
+        let model = self.model.trim_start_matches('~').to_ascii_lowercase();
+        self.wire_api == crate::providers::WireApi::ChatCompletions
+            && crate::providers::CACHE_MARKS.iter().any(|(h, prefix)| host.as_deref() == Some(*h) && model.starts_with(prefix))
     }
 
     fn endpoint(&self) -> String {
@@ -597,20 +588,6 @@ impl ChatClient {
         messages: &[ChatMessage],
         tools_wire: &str,
         cancelled: Arc<crate::state::CancelToken>,
-        on_delta: impl FnMut(StreamDelta),
-    ) -> Result<CompletionResult, String> {
-        self.stream_chat_with_note(messages, None, tools_wire, cancelled, on_delta).await
-    }
-
-    /// `stream_chat` with `note` sent after `messages`: the trailing note,
-    /// which belongs to this request only and is never part of the history
-    /// (see `WireMessages` for where it rides).
-    pub async fn stream_chat_with_note(
-        &self,
-        messages: &[ChatMessage],
-        note: Option<&str>,
-        tools_wire: &str,
-        cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<CompletionResult, String> {
         crate::providers::validate_reasoning_effort(&self.base_url, self.wire_api, self.reasoning_effort)?;
@@ -634,21 +611,10 @@ impl ChatClient {
         // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
         let body = if self.wire_api == crate::providers::WireApi::Anthropic {
-            anthropic::serialize(self, messages, note, tools_wire)?
+            anthropic::serialize(self, messages, tools_wire)?
         } else if self.wire_api == crate::providers::WireApi::Responses {
-            responses::serialize(self, messages, note, tools_wire)?
-        } else { serialize_chat_request_body(
-            &self.model,
-            messages,
-            note,
-            &self.origin(),
-            self.temperature,
-            self.reasoning_effort,
-            self.max_tokens,
-            self.use_max_completion_tokens,
-            self.send_stream_options,
-            tools_wire,
-        )? };
+            responses::serialize(self, messages, tools_wire)?
+        } else { serialize_chat_request_body(self, messages, tools_wire)? };
 
         let mut attempt = 0u32;
         // Attempts in a row that never reached the endpoint; any other
@@ -675,10 +641,9 @@ impl ChatClient {
             if self.wire_api == crate::providers::WireApi::Anthropic && !self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("anthropic-version")) {
                 req = req.header("anthropic-version", "2023-06-01");
             }
-            for (name, value) in &self.headers {
-                req = req.header(name.as_str(), value.as_str());
+            for (name, value) in self.headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).chain(self.cache_route()) {
+                req = req.header(name, value);
             }
-            if let Some((name, key)) = self.cache_route() { req = req.header(name, key); }
             // An endpoint can spend a long time in prompt processing before the
             // first byte arrives, and a large prompt makes that worse wherever
             // it runs; keep cancellation responsive throughout. Only silence
@@ -3748,18 +3713,7 @@ mod tests {
         }])
         .to_string();
         // Default compat: max_tokens + stream_options (local OpenAI-compatible).
-        let bytes = serialize_chat_request_body(
-            "test-model",
-            &messages,
-            None,
-            "o",
-            Some(0.2), None,
-            1024,
-            false,
-            true,
-            &tools_wire,
-        )
-        .unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("test-model", Some(0.2), 1024, false, true), &messages, &tools_wire).unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(v["model"], "test-model");
@@ -3807,7 +3761,7 @@ mod tests {
         );
         assert_eq!(wire(&messages, "o"), old_shape);
         assert_eq!(serde_json::to_string(&messages).unwrap(), old_shape);
-        let bytes = serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, false, "").unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("m", None, 64, false, false), &messages, "").unwrap();
         let body = String::from_utf8(bytes).unwrap();
         assert!(body.contains(&format!(r#""messages":{old_shape}"#)), "{body}");
 
@@ -3823,53 +3777,6 @@ mod tests {
         assert!(old.reasoning_details.is_none());
         let old: ToolCall = serde_json::from_str(r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}"#).unwrap();
         assert!(old.extra_content.is_none());
-    }
-
-    /// The trailing note adds no message: it ends the content of the last
-    /// one, a tool result or the user's prompt, so the endpoint sees the
-    /// stored role order, which some hosted validators and templates that
-    /// enforce alternation check, and every stored byte before it is the
-    /// history a prefix cache keeps. A history that ends with an assistant
-    /// reply or the system prompt alone takes it as a user message of its
-    /// own. Escaping covers the note like the text it follows, and the
-    /// stored messages never change.
-    #[test]
-    fn the_trailing_note_ends_the_last_message_and_adds_none() {
-        let note = "[index]\n- wordfreq: \"top\" words";
-        let tail = r#"\n\n[index]\n- wordfreq: \"top\" words"#;
-        let sent = |messages: &[ChatMessage]| {
-            let with = serde_json::to_string(&WireMessages { messages, note: Some(note), origin: "o" }).unwrap();
-            (with, wire(messages, "o"))
-        };
-        let tool_round = vec![
-            ChatMessage::system("p"),
-            ChatMessage::user("hi"),
-            ChatMessage::assistant(Some("calling".into()), Some(vec![bash_call()])),
-            ChatMessage::tool("c1", "out"),
-        ];
-        let (with, stored) = sent(&tool_round);
-        let stem = &stored[..stored.len() - r#"","tool_call_id":"c1"}]"#.len()];
-        assert_eq!(with, format!(r#"{stem}{tail}","tool_call_id":"c1"}}]"#), "the note ends the tool result");
-        let parsed: Vec<ChatMessage> = serde_json::from_str(&with).unwrap();
-        assert_eq!(parsed.len(), tool_round.len(), "and adds no message");
-        assert_eq!(parsed[3].content.as_deref(), Some(format!("out{NOTE_SEPARATOR}{note}").as_str()));
-        assert_eq!(tool_round[3].content.as_deref(), Some("out"), "the stored result is unchanged");
-
-        let prompt = &tool_round[..2];
-        let (with, stored) = sent(prompt);
-        assert_eq!(with, format!(r#"{}{tail}"}}]"#, &stored[..stored.len() - 3]), "the note ends the user's prompt");
-
-        let replied = [ChatMessage::user("hi"), ChatMessage::assistant(Some("done".into()), None)];
-        for history in [&replied[..], &tool_round[..1]] {
-            let (with, stored) = sent(history);
-            let own = serde_json::to_string(&ChatMessage::user(note)).unwrap();
-            assert_eq!(with, format!("{},{own}]", &stored[..stored.len() - 1]), "a message of its own after {history:?}");
-        }
-
-        let mut empty = tool_round.clone();
-        empty[3].content = None;
-        let parsed: Vec<ChatMessage> = serde_json::from_str(&sent(&empty).0).unwrap();
-        assert_eq!(parsed[3].content.as_deref(), Some(format!("{NOTE_SEPARATOR}{note}").as_str()), "a result with no text still carries it");
     }
 
     /// Gemini streams each call whole, without an `index`, and puts its
@@ -4121,13 +4028,85 @@ mod tests {
 
     /// The messages array exactly as `origin` would receive it.
     fn wire(messages: &[ChatMessage], origin: &str) -> String {
-        serde_json::to_string(&WireMessages { messages, note: None, origin }).unwrap()
+        serde_json::to_string(&WireMessages { messages, origin, marks: false }).unwrap()
     }
 
     /// The whole request body `client` would send for `messages`.
     fn request_body(client: &ChatClient, messages: &[ChatMessage]) -> String {
-        let bytes = serialize_chat_request_body(&client.model, messages, None, &client.origin(), None, None, 64, false, false, "").unwrap();
+        let bytes = serialize_chat_request_body(client, messages, "").unwrap();
         String::from_utf8(bytes).unwrap()
+    }
+
+    /// A local Chat Completions client for `model` with these request
+    /// settings: temperature, output cap, `max_completion_tokens` in place of
+    /// `max_tokens`, and `stream_options`.
+    fn chat_client(model: &str, temperature: Option<f32>, max_tokens: usize, completion: bool, stream_options: bool) -> ChatClient {
+        let client = ChatClient::new("http://127.0.0.1:8080/v1".into(), None, model.into(), temperature, max_tokens);
+        ChatClient { use_max_completion_tokens: completion, send_stream_options: stream_options, ..client }
+    }
+
+    /// The vendor table is pinned: a route joins it only with its host and
+    /// its model id prefix. OpenRouter caches an Anthropic model's prompt
+    /// only up to a `cache_control` marker, so a request there marks two
+    /// messages, the system prompt (with the tools ahead of it, what every
+    /// session shares) and the newest stored one (what the next request
+    /// reads back): a system or user message on its text as one text part,
+    /// a tool result or an assistant reply beside its role, a note stored on
+    /// it included. Nothing else changes. Empty text takes no marker. Another model there, an Anthropic model elsewhere, or
+    /// another wire, marks nothing.
+    #[test]
+    fn an_anthropic_model_through_openrouter_marks_its_cache_entries() {
+        assert_eq!(crate::providers::CACHE_MARKS, [("openrouter.ai", "anthropic/")]);
+        let serving = |url: &str, model: &str| ChatClient::new(url.into(), None, model.into(), None, 64);
+        for model in ["anthropic/claude-sonnet-5.5", "Anthropic/Claude-Opus-5.5", "~anthropic/claude-sonnet-latest"] {
+            assert!(serving(" https://OpenRouter.ai/api/v1/ ", model).cache_marks(), "{model}");
+        }
+        for (url, model) in [
+            ("https://openrouter.ai/api/v1", "openai/gpt-5.6"),
+            ("https://openrouter.ai/api/v1", "claude-sonnet-5.5"),
+            ("https://openrouter.ai/api/v1", "vendor/anthropic/claude"),
+            ("https://api.anthropic.com/v1", "anthropic/claude-sonnet-5.5"),
+            ("http://127.0.0.1:8080/v1", "anthropic/claude-sonnet-5.5"),
+            ("https://openrouter.ai.example/api/v1", "anthropic/claude-sonnet-5.5"),
+            ("not a url", "anthropic/claude-sonnet-5.5"),
+        ] {
+            assert!(!serving(url, model).cache_marks(), "{model} at {url}");
+        }
+        let mut responses = serving("https://openrouter.ai/api/v1", "anthropic/claude-sonnet-5.5");
+        responses.wire_api = crate::providers::WireApi::Responses;
+        assert!(!responses.cache_marks(), "only Chat Completions");
+
+        let marked = |text: &str| json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+        let sent = |messages: &[ChatMessage]| serde_json::to_value(WireMessages { messages, origin: "o", marks: true }).unwrap();
+        let round = vec![
+            ChatMessage::system("p"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant(Some("calling".into()), Some(vec![bash_call()])),
+            ChatMessage::tool("c1", "out"),
+        ];
+        let plain = serde_json::to_value(&round).unwrap();
+        let mut expected = plain.clone();
+        expected[0]["content"] = marked("p");
+        expected[3]["cache_control"] = json!({ "type": "ephemeral" });
+        assert_eq!(sent(&round), expected);
+        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "anthropic/claude-sonnet-5.5"), &round, "").unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["messages"], sent(&round), "the route's requests carry them");
+        assert_eq!(body.to_string().matches("cache_control").count(), 2, "{body}");
+        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "openai/gpt-5.6"), &round, "").unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["messages"], plain, "another model's do not");
+
+        let mut expected = serde_json::to_value(&round[..2]).unwrap();
+        expected[0]["content"] = marked("p");
+        expected[1]["content"] = marked("hi");
+        assert_eq!(sent(&round[..2]), expected, "the prompt is the newest stored message");
+        let answered = vec![ChatMessage::system("p"), ChatMessage::user("hi"), ChatMessage::assistant(Some("done".into()), None)];
+        let mut expected = serde_json::to_value(&answered).unwrap();
+        expected[0]["content"] = marked("p");
+        expected[2]["cache_control"] = json!({ "type": "ephemeral" });
+        assert_eq!(sent(&answered), expected, "so is an assistant reply");
+        let silent = vec![ChatMessage::system("p"), ChatMessage::user("")];
+        assert_eq!(sent(&silent)[1], json!({ "role": "user", "content": "" }), "empty text takes no marker");
     }
 
     #[test]
@@ -4135,7 +4114,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         for tools_wire in ["", "[]"] {
             let bytes =
-                serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, true, tools_wire)
+                serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, tools_wire)
                     .unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(
@@ -4160,9 +4139,9 @@ mod tests {
             "function": { "name": "bash", "parameters": { "type": "object" } }
         }])
         .to_string();
-        let a = serialize_chat_request_body("m", &messages, None, "o", Some(0.5), None, 256, false, true, &tools_wire)
+        let a = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, &tools_wire)
             .unwrap();
-        let b = serialize_chat_request_body("m", &messages, None, "o", Some(0.5), None, 256, false, true, &tools_wire)
+        let b = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, &tools_wire)
             .unwrap();
         assert_eq!(a, b);
     }
@@ -4172,10 +4151,10 @@ mod tests {
     #[test]
     fn serialize_omits_temperature_unless_configured() {
         let messages = vec![ChatMessage::user("hi")];
-        let unset = serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, true, "").unwrap();
+        let unset = serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, "").unwrap();
         let v: Value = serde_json::from_slice(&unset).unwrap();
         assert!(v.get("temperature").is_none(), "{v}");
-        let set = serialize_chat_request_body("m", &messages, None, "o", Some(0.7), None, 64, false, true, "").unwrap();
+        let set = serialize_chat_request_body(&chat_client("m", Some(0.7), 64, false, true), &messages, "").unwrap();
         let v: Value = serde_json::from_slice(&set).unwrap();
         assert!((v["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-5, "{v}");
     }
@@ -4183,18 +4162,8 @@ mod tests {
     #[test]
     fn serialize_respects_max_completion_tokens_and_omits_stream_options() {
         let messages = vec![ChatMessage::user("compat")];
-        let bytes = serialize_chat_request_body(
-            "gpt-style",
-            &messages,
-            None,
-            "o",
-            Some(0.1), None,
-            512,
-            true,  // use_max_completion_tokens
-            false, // send_stream_options
-            "",    // no tools
-        )
-        .unwrap();
+        // max_completion_tokens, no stream_options, no tools.
+        let bytes = serialize_chat_request_body(&chat_client("gpt-style", Some(0.1), 512, true, false), &messages, "").unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["max_completion_tokens"], 512);
         assert!(v.get("max_tokens").is_none());
@@ -4213,7 +4182,7 @@ mod tests {
         let messages = vec![ChatMessage::user("hi")];
         let wire = registry.tool_schemas_wire();
         let bytes =
-            serialize_chat_request_body("m", &messages, None, "o", None, None, 64, false, true, wire).unwrap();
+            serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, wire).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(
             body.contains(wire),
@@ -4243,17 +4212,44 @@ mod tests {
         ] {
             let u = parse_usage(&usage).expect("a usage object is usage");
             assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), counts, "{usage}");
+            assert_eq!(u.output_tokens, u.completion_tokens, "{usage}");
         }
         assert!(parse_usage(&Value::Null).is_none());
     }
 
-    /// The vendor table is pinned: a host joins it only with its header. A
-    /// conversation's requests to a host there carry its key in that header,
-    /// one key per conversation, and nothing goes anywhere else, to another
-    /// wire, or over a value the provider's own headers set.
+    /// Reasoning is output the provider bills. xAI's Chat Completions counts
+    /// it beside `completion_tokens` and in `total_tokens` (the first row is
+    /// one real reply's counts), where OpenAI counts it inside both, and a
+    /// Responses reply inside `output_tokens`: the total says which, and a
+    /// total that says neither adds nothing. `completion_tokens` stays the
+    /// server's own count, the one its output cap applies to.
+    #[test]
+    fn reasoning_billed_beside_the_completion_is_output() {
+        let chat = |completion: u64, total: Value| json!({"prompt_tokens":2243,"completion_tokens":completion,"total_tokens":total,"completion_tokens_details":{"reasoning_tokens":35}});
+        for (usage, counts) in [
+            (chat(55, json!(2333)), (55, 90)),
+            (chat(55, json!(2333.0)), (55, 90)),
+            (chat(90, json!(2333)), (90, 90)),
+            (chat(55, json!(2334)), (55, 55)),
+            (chat(55, Value::Null), (55, 55)),
+            (json!({"input_tokens":2538,"output_tokens":90,"total_tokens":2628,"output_tokens_details":{"reasoning_tokens":35}}), (90, 90)),
+            (json!({"prompt_tokens":u64::MAX,"completion_tokens":1,"total_tokens":u64::MAX,"completion_tokens_details":{"reasoning_tokens":2}}), (1, 3)),
+        ] {
+            let u = parse_usage(&usage).expect("a usage object is usage");
+            assert_eq!((u.completion_tokens, u.output_tokens), counts, "{usage}");
+        }
+    }
+
+    /// The vendor table is pinned: a provider joins it only with its host,
+    /// its model prefix and its header. A conversation's requests to that
+    /// host, or for one of its models at any host (a proxy or gateway in
+    /// front of it), carry its key in that header, one key per conversation,
+    /// and nothing goes anywhere else, to another wire, or over a value the
+    /// provider's own headers set.
     #[test]
     fn a_host_that_routes_by_conversation_gets_the_key_in_its_header() {
-        assert_eq!(crate::providers::CACHE_ROUTES, [("api.x.ai", "x-grok-conv-id")]);
+        assert_eq!(crate::providers::CACHE_ROUTES, [("api.x.ai", "grok-", "x-grok-conv-id")]);
+        let serving = |url: &str, model: &str| ChatClient::new(url.into(), None, model.into(), None, 64).for_conversation("root");
         let routed = |url: &str, root: &str| ChatClient::new(url.into(), None, "m".into(), None, 64).for_conversation(root);
         let xai = routed("https://api.x.ai/v1", "root");
         let key = xai.cache_key.clone().unwrap();
@@ -4263,6 +4259,12 @@ mod tests {
         assert_eq!(ChatClient::new("https://api.x.ai/v1".into(), None, "m".into(), None, 64).cache_route(), None);
         for elsewhere in ["http://127.0.0.1:8080/v1", "https://openrouter.ai/api/v1", "https://api.x.ai.example/v1", "not a url"] {
             assert_eq!(routed(elsewhere, "root").cache_route(), None, "{elsewhere}");
+            for model in ["grok-4.7", "x-ai/Grok-4.7"] {
+                assert_eq!(serving(elsewhere, model).cache_route(), Some(("x-grok-conv-id", key.as_str())), "{model} at {elsewhere}");
+            }
+            for model in ["x-grok-4.7", "grok", "grok/m"] {
+                assert_eq!(serving(elsewhere, model).cache_route(), None, "{model} at {elsewhere}");
+            }
         }
         let mut responses = routed("https://api.x.ai/v1", "root");
         responses.wire_api = crate::providers::WireApi::Responses;
@@ -4270,5 +4272,25 @@ mod tests {
         let mut own = routed("https://api.x.ai/v1", "root");
         own.headers = vec![("X-Grok-Conv-Id".into(), "configured".into())];
         assert_eq!(own.cache_route(), None);
+    }
+
+    /// The bug this guards: behind a proxy (a usage logger, a gateway, a
+    /// local relay) the host was the proxy's, so a grok conversation's
+    /// requests went out without the header, met whichever server the
+    /// provider picked, and prefilled the history again wherever that server
+    /// had not seen it. A request for a grok model to a local endpoint now
+    /// carries the conversation's key; one for another model carries none.
+    #[tokio::test]
+    async fn a_grok_conversation_behind_a_proxy_carries_its_route() {
+        for (model, routed) in [("grok-4.7", true), ("m", false)] {
+            let (url, requests) = spawn_recording_once(finished_response());
+            let client = ChatClient::new(url, None, model.into(), None, 64).for_conversation("root");
+            let reply = client.stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
+            assert_eq!(reply.unwrap().content, "all of it");
+            let request = requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
+            let header = format!("x-grok-conv-id: {}", client.cache_key.as_deref().unwrap());
+            assert_eq!(head.contains(&header), routed, "{model}: {head}");
+        }
     }
 }

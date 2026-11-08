@@ -83,7 +83,7 @@ async fn native_effort_auth_and_default_omission_preserve_request_content() {
     let (base,server)=serve(levels.iter().map(|_|(200,text_response())).collect()).await;
     for effort in levels {
         let client=client(&scratch,&base,effort).for_conversation("native-session"); let mut shown=String::new();
-        let result=client.stream_chat_with_note(&[ChatMessage::system("instructions"),ChatMessage::user("task")],Some("turn note"),&tools(),Arc::new(CancelToken::default()),|delta| if let StreamDelta::Content(text)=delta {shown.push_str(&text)}).await.unwrap();
+        let result=client.stream_chat(&[ChatMessage::system("instructions"),ChatMessage::user("task")],&tools(),Arc::new(CancelToken::default()),|delta| if let StreamDelta::Content(text)=delta {shown.push_str(&text)}).await.unwrap();
         assert_eq!(result.content,"verified"); assert_eq!(shown,"verified"); assert_eq!(result.finish_reason,"stop"); assert!(result.tool_calls.is_empty());
         let usage=result.usage.unwrap();assert_eq!((usage.prompt_tokens,usage.completion_tokens,usage.cached_tokens),(17,7,Some(4)));
     }
@@ -96,7 +96,7 @@ async fn native_effort_auth_and_default_omission_preserve_request_content() {
         assert!(body.get("reasoning_effort").is_none());assert!(body.get("thinking").is_none());assert!(body.get("prompt_cache_key").is_none());
         if let Some(effort)=effort {assert_eq!(body["output_config"]["effort"],effort.as_str());} else {assert!(body.get("output_config").is_none());}
         assert!(body["system"].to_string().contains("instructions"));
-        assert_eq!(body["messages"][0]["role"],"user");assert!(body["messages"][0]["content"].to_string().contains("turn note"));
+        assert_eq!(body["messages"][0]["role"],"user");assert!(body["messages"][0]["content"].to_string().contains("task"));
         assert_eq!(body["tools"][0]["name"],"inspect");assert_eq!(body["tools"][0]["input_schema"],serde_json::from_str::<Value>(&tools()).unwrap()[0]["function"]["parameters"]);
         body.as_object_mut().unwrap().remove("output_config");
         if let Some(default)=&default {assert_eq!(&body,default);} else {default=Some(body);}
@@ -227,15 +227,15 @@ async fn native_custom_headers_and_legacy_credentials_keep_their_protocol() {
 }
 
 #[tokio::test]
-async fn native_history_groups_tool_results_and_places_notes_at_the_tail() {
+async fn native_history_groups_tool_results_and_marks_the_newest_block() {
     use open_max_core::types::{ToolCall,ToolCallFunction};
     let scratch=Scratch::new();let(base,server)=serve(vec![(200,text_response());3]).await;
     let native=client(&scratch,&base,None);
     let call=|id:&str| ToolCall {id:id.into(),kind:"function".into(),function:ToolCallFunction{name:"inspect".into(),arguments:"{}".into()},extra_content:None};
     let history=[ChatMessage::system(""),ChatMessage::system("instructions"),ChatMessage::user("first"),ChatMessage::user("second"),
         ChatMessage::assistant(Some("checking".into()),Some(vec![call("one"),call("two")])),ChatMessage::tool("one","result one"),ChatMessage::tool("two","result two")];
-    native.stream_chat_with_note(&history,Some("fresh note"),"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
-    native.stream_chat_with_note(&history[..5],Some("after assistant"),"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
+    native.stream_chat(&history,"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
+    native.stream_chat(&history[..5],"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
     native.stream_chat(&history[..2],"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
     let records=server.await.unwrap();let body:Value=serde_json::from_slice(&records[0].body).unwrap();
     assert!(body.get("tools").is_none());assert!(body.get("tool_choice").is_none());
@@ -244,27 +244,26 @@ async fn native_history_groups_tool_results_and_places_notes_at_the_tail() {
     assert_eq!(body["messages"][1]["content"][1]["input"],json!({}));
     assert_eq!(body["messages"][2]["content"][0]["content"],"result one");
     assert_eq!(body["messages"][2]["content"][1],json!({"type":"tool_result","tool_use_id":"two","content":"result two","cache_control":{"type":"ephemeral"}}));
-    assert_eq!(body["messages"][2]["content"][2],json!({"type":"text","text":"fresh note"}));
+    assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(),2);
     let body:Value=serde_json::from_slice(&records[1].body).unwrap();
     assert_eq!(body["messages"][1]["content"][2]["cache_control"],json!({"type":"ephemeral"}));
-    assert_eq!(body["messages"].as_array().unwrap().last().unwrap(),&json!({"role":"user","content":[{"type":"text","text":"after assistant"}]}));
+    assert_eq!(body["messages"].as_array().unwrap().len(),2);
     let body:Value=serde_json::from_slice(&records[2].body).unwrap();assert_eq!(body["messages"],json!([]));
 }
 
 /// Messages caches a prompt only up to a `cache_control` marker, and a
 /// request reads only what an earlier one wrote at its markers. So each
-/// request marks the end of the system prompt and its newest stored block,
-/// and sends the trailing note after that block: what one request marked is
-/// then, markers and note aside, the head of the next, so the next reads it
-/// at the cache price. Before, no request carried a marker and nothing was
-/// ever read from the cache.
+/// request marks the end of the system prompt and its newest block: what one
+/// request marked is then, markers aside, the head of the next, so the next
+/// reads it at the cache price. Before, no request carried a marker and
+/// nothing was ever read from the cache.
 #[tokio::test]
 async fn native_requests_mark_the_shared_prefix_and_the_tail_the_next_request_reads() {
     let scratch=Scratch::new();let(base,server)=serve(vec![(200,tool_response()),(200,tool_response()),(200,text_response())]).await;
     let native=client(&scratch,&base,None);
     let mut history=vec![ChatMessage::system("instructions"),ChatMessage::user("inspect")];
     for step in 0..3 {
-        let reply=native.stream_chat_with_note(&history,Some("live note"),&tools(),Arc::new(CancelToken::default()),|_|{}).await.unwrap();
+        let reply=native.stream_chat(&history,&tools(),Arc::new(CancelToken::default()),|_|{}).await.unwrap();
         let mut assistant=ChatMessage::assistant(Some(reply.content),Some(reply.tool_calls));
         assistant.reasoning_details=reply.reasoning_details;assistant.reasoning_origin=Some(native.origin());
         history.push(assistant);history.push(ChatMessage::tool("call-fixture",format!("result {step}")));
@@ -278,11 +277,9 @@ async fn native_requests_mark_the_shared_prefix_and_the_tail_the_next_request_re
         assert_eq!(body.to_string().matches("cache_control").count(),2,"request {step}: {body}");
         assert_eq!(body["system"],json!([{"type":"text","text":"instructions","cache_control":{"type":"ephemeral"}}]));
         let tail=body["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap();
-        assert_eq!(tail[tail.len()-1],json!({"type":"text","text":"live note"}),"request {step}");
-        assert_eq!(tail[tail.len()-2]["cache_control"],json!({"type":"ephemeral"}),"request {step}");
+        assert_eq!(tail[tail.len()-1]["cache_control"],json!({"type":"ephemeral"}),"request {step}");
         if step>0 {
-            let mut previous=unmarked(bodies[step-1]["messages"].clone());
-            previous.as_array_mut().unwrap().last_mut().unwrap()["content"].as_array_mut().unwrap().pop();
+            let previous=unmarked(bodies[step-1]["messages"].clone());
             let previous=previous.as_array().unwrap();
             assert_eq!(&unmarked(body["messages"].clone()).as_array().unwrap()[..previous.len()],previous.as_slice(),"request {step}");
         }
@@ -390,7 +387,8 @@ async fn native_signed_thinking_requires_unchanged_prefix_and_assistant_payload(
     let mut changed=history.clone();changed[4].content=Some("edited assistant text".into());run(&native,&changed).await.unwrap();
     let mut changed=history.clone();changed[4].tool_calls.as_mut().unwrap()[0].function.arguments="{\"path\":\"edited.txt\"}".into();run(&native,&changed).await.unwrap();
     let mut changed=history.clone();changed[4].tool_calls.as_mut().unwrap()[0].id="edited-call".into();changed[5].tool_call_id=Some("edited-call".into());run(&native,&changed).await.unwrap();
-    let noted=native.stream_chat_with_note(&opening,Some("transient capability note"),&tools(),Arc::new(CancelToken::default()), |_|{}).await.unwrap();
+    let mut noted_opening=opening.clone();noted_opening[3].content=Some("inspect\n\nsince removed".into());
+    let noted=run(&native,&noted_opening).await.unwrap();
     assistant.reasoning_details=noted.reasoning_details;
     let mut noted_history=opening;noted_history.push(assistant);noted_history.push(ChatMessage::tool("call-fixture","result"));
     run(&native,&noted_history).await.unwrap();

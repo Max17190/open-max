@@ -183,8 +183,7 @@ override the first two.
 - `max_agent_iterations` (default 50): tool-call rounds one turn may take.
 
 Each turn budgets `context_tokens - (max_tokens + 1024)` for the transcript
-plus the frozen tool schemas and the trailing note every request re-sends
-beside it (estimated at ~4 bytes per token, scaled up when
+plus the frozen tool schemas every request re-sends beside it (estimated at ~4 bytes per token, scaled up when
 the server reported more `prompt_tokens` than estimated for the session's last
 request, as BPE tokenizers do on code, or refused a request for length
 (recognized by the error's wording) that the estimate said fit). Both are kept
@@ -245,7 +244,10 @@ The model reads the mode in a one-line `[execution policy: <mode>; ...]` note
 placed ahead of a session's first prompt, and written again only when the mode
 changes or a resumed session's history no longer holds it. The history resends
 it on every later request, so it states only the mode's limits; content
-approval detail is in `openmax --spec tools`, `hooks`, and `permissions`.
+approval detail is in `openmax --spec tools`, `hooks`, and `permissions`. The
+tools and hooks contracts state each mode's rule and leave what applies only
+outside auto to `openmax --spec tools.approval` and `hooks.approval`, which
+they name, so a session in auto never re-sends it.
 
 Only a human can select a saved mode: at the trust grant, or with the
 selectors above in a human-controlled frontend. Agent-spawned processes can
@@ -322,15 +324,34 @@ entries apart. The key is request metadata the model never sees.
 
 The Responses translation targets OpenAI's Responses API, which defines the
 key, and already uses other constructs that API defines, such as the
-`additional_tools` input item that carries the tools. Chat Completions
+`additional_tools` input item that carries the tools. A Responses server
+whose input has no such item refuses every request that carries one, so
+there the tools go in the request's `tools` field, which every Responses
+server takes. One such server is known, by its host or by its model id
+(after any `vendor/` prefix, so behind a proxy or gateway too): `api.x.ai`,
+whose models are `grok-*`. Chat Completions
 requests do not carry the key as a field: the servers that implement that
-protocol vary, and some refuse a field they do not know. A host that keeps its
-prompt cache per server and routes a conversation to one server by a header
-gets the key in that header instead. One such host is known: `api.x.ai`, by
-`x-grok-conv-id`. Without it, a request can meet a server that never saw the
-conversation and prefill the whole history again at the uncached price. A
-provider whose own `headers` set that header keeps its value. Native Messages
-does not define the key.
+protocol vary, and some refuse a field they do not know. A provider that keeps
+its prompt cache per server and routes a conversation to one server by a
+header gets the key in that header instead, known by its host or by its model
+id (after any `vendor/` prefix), so a request through a proxy or gateway in
+front of it carries the header too. One such provider is known: `api.x.ai`,
+whose models are `grok-*`, by `x-grok-conv-id`. Without it, a request can meet
+a server that never saw the conversation and prefill the whole history again
+at the uncached price. A provider whose own `headers` set that header keeps
+its value. Native Messages does not define the key.
+
+A Chat Completions route that caches a model's prompt only up to a
+`cache_control` marker reads nothing back from a request without one, so
+every request would pay its whole prompt at the uncached price. One such route
+is known, by its host and the model id: `openrouter.ai` serving an Anthropic
+model (`anthropic/...`). Each request there carries two markers, as on native
+Messages: one on the system prompt, which caches the tools and the system
+prompt every session shares, and one on the newest stored message, which the
+next request reads back at the cache price. The system prompt and a user
+message carry theirs on their text, sent as one text part; a tool result or
+an assistant reply carries its own beside its role, a note stored on it
+included.
 
 An explicit `anthropic` selects the native Messages protocol. Set `base_url`
 to `https://api.anthropic.com/v1`; requests use `/v1/messages`, `x-api-key`
@@ -357,13 +378,12 @@ or use login to discover them. Native Messages translates the system prompt,
 text, tools, and tool results while retaining the existing agent loop and trust
 checks. Messages caches a prompt only up to a `cache_control` marker, so every
 request carries two: one on the system prompt, which caches the tools and the
-system prompt every session shares, and one on the newest stored block, which
-the next request reads back at the cache price. The trailing note follows that
-block as a text block of its own, so the entry holds without it. Signed
+system prompt every session shares, and one on the newest block, which the
+next request reads back at the cache price. Signed
 thinking blocks return only to their producing endpoint, model, and
 credentials, with unchanged prior system, tools, and messages, and matching
-assistant text and tool calls. Compaction, reloads, transient notes, or edits
-that change this context discard stale thinking while retaining the current
+assistant text and tool calls. Compaction, reloads, or edits that change this
+context discard stale thinking while retaining the current
 text and tool calls. An interrupted,
 malformed, or failed stream cannot dispatch
 partial tool calls. Effort is sent as `output_config.effort`; default omits it.
@@ -376,29 +396,26 @@ models that reject it. See the official [Messages API](https://platform.claude.c
 [thinking](https://platform.claude.com/docs/en/build-with-claude/thinking), and
 [preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking) contracts.
 
-The trailing note (the tool files, skills, and memories a session added,
-changed, or removed after its prompt and tools array were built) opens with a
-header that names the harness as its source, and it is never stored. On Chat
-Completions and native Messages it is appended to the content of the
-request's last message, the user's prompt or the newest tool result, after a
-blank line (on native Messages, as a text block of its own in that message,
-after the cache marker). On Responses it is a developer message after the
-history, which the Responses API takes anywhere in its `input`: OpenAI's
-prompt cache on
-GPT-5.6 and later ends each entry at a request's newest user message or tool
-output, so an entry then holds no note byte, and the next request, which
-drops the note, reads back the whole history. Every Chat Completions and
-native Messages endpoint, a flat `base_url` or a named provider, therefore
-sees the stored transcript's role order, the same as with no note, and the
-system prompt stays the only system message. A note of its own after the
-history is what picky Chat Completions servers refuse: some hosted validators
+The note (the tool files, skills, and memories a session added, changed, or
+removed after its prompt and tools array were built) opens with a header that
+names the harness as its source and says the latest note replaces any earlier
+one. It is stored in the transcript when it changes, never moved or rewritten:
+appended to the content of the newest tool result, after the receipt of the
+write that changed it, or of the user's prompt at the start of a turn, after a
+blank line, and only after an assistant reply as a user message of its own.
+Every later request repeats it as history, so every protocol's prompt cache
+reads it back like any other stored byte, and native Messages keeps replaying
+the thinking a reply made after it. Every endpoint, a flat `base_url` or a
+named provider, therefore sees the stored transcript's role order and the
+system prompt as the only system message. A message of its own after a tool
+result is what picky Chat Completions servers refuse: some hosted validators
 reject a system or a user message after a tool message, a chat template that
 enforces user/assistant alternation rejects a user message after the prompt,
 and some gateways hoist every system message into the system prompt, which
-would move the cached prefix on every capability write. On those two
-protocols, only a history that ends with an assistant reply gets the note as
-a user message of its own, which those servers take there. A prefix cache
-keeps every stored byte before the note.
+would move the cached prefix on every capability write. A prune that drops or
+shortens the stored note stores it again, and a session that changes nothing
+stores none. When nothing differs from the prompt any more, the header alone
+is stored.
 
 A provider takes its key from its own `api_key` or `api_key_env`. Without one,
 it uses the settings `api_key` (or `OPENMAX_API_KEY`) only when its `base_url`
