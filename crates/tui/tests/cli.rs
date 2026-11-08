@@ -2258,6 +2258,55 @@ fn a_print_run_keeps_harness_notes_off_stderr() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// OpenRouter caches an Anthropic model's prompt only up to a
+/// `cache_control` marker, and requests carried none, so every one paid its
+/// whole prompt at the uncached price. A run against it (the scripted
+/// endpoint here, reached as `openrouter.ai` through an HTTP proxy) marks
+/// the system prompt and the newest stored message of every request, the
+/// prompt and then the tool result, as OpenRouter's own SDK marks them; a
+/// run for another model there marks nothing.
+#[test]
+fn an_anthropic_model_through_openrouter_asks_for_its_prompt_cache() {
+    let (project, home) = fresh_dirs("openrouter-marks");
+    std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+    std::fs::create_dir_all(home.join(".openmax")).unwrap();
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    let marked = |text: &serde_json::Value| serde_json::json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]);
+    for (model, marks) in [("anthropic/claude-sonnet-5.5", true), ("openai/gpt-5.6", false)] {
+        let (stub, requests, _server) = spawn_scripted_server(vec![
+            (sse_tool_call("read_file", serde_json::json!({"path": "a.txt"})), true),
+            (sse_text("read it"), true),
+        ]);
+        let settings = format!(r#"{{"base_url":"http://openrouter.ai/api/v1","model":"{model}","context_tokens":16384}}"#);
+        std::fs::write(home.join(".openmax/settings.json"), settings).unwrap();
+        let mut command = cmd(&project, &home);
+        for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
+            command.env_remove(var);
+        }
+        let out = command.env("HTTP_PROXY", stub.trim_end_matches("/v1")).args(["-p", "read a.txt"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (n, request) in requests.iter().enumerate() {
+            assert_eq!(request.matches("cache_control").count(), if marks { 2 } else { 0 }, "{model}, request {n}: {request}");
+            let messages = serde_json::from_str::<serde_json::Value>(request).unwrap()["messages"].as_array().unwrap().clone();
+            let (system, newest) = (&messages[0], messages.last().unwrap());
+            assert_eq!((system["role"].as_str(), newest["role"].as_str()), (Some("system"), Some(["user", "tool"][n])), "{request}");
+            // The system prompt and the prompt on their text, the tool
+            // result beside its role.
+            for (message, on_text) in [(system, true), (newest, n == 0)] {
+                let content = &message["content"];
+                assert_eq!(content.is_array(), marks && on_text, "{model}, request {n}: {message}");
+                assert_eq!(message.get("cache_control").is_some(), marks && !on_text, "{model}, request {n}: {message}");
+                if marks && on_text {
+                    assert_eq!(content, &marked(&content[0]["text"]), "{message}");
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// `--model` names the model a run asks for, over the one settings.json
 /// names: the request a print run sends carries the flag's.
 #[test]

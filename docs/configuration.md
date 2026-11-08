@@ -337,6 +337,18 @@ a server that never saw the conversation and prefill the whole history again
 at the uncached price. A provider whose own `headers` set that header keeps
 its value. Native Messages does not define the key.
 
+A Chat Completions route that caches a model's prompt only up to a
+`cache_control` marker reads nothing back from a request without one, so
+every request would pay its whole prompt at the uncached price. One such route
+is known, by its host and the model id: `openrouter.ai` serving an Anthropic
+model (`anthropic/...`). Each request there carries two markers, as on native
+Messages: one on the system prompt, which caches the tools and the system
+prompt every session shares, and one on the newest stored message, which the
+next request reads back at the cache price. The system prompt and a user
+message carry theirs on their text, sent as one text part; a tool result or
+an assistant reply carries its own beside its role. The trailing note follows
+the marked message as a user message of its own.
+
 An explicit `anthropic` selects the native Messages protocol. Set `base_url`
 to `https://api.anthropic.com/v1`; requests use `/v1/messages`, `x-api-key`
 authentication, and `anthropic-version: 2023-06-01` unless a custom version
@@ -387,15 +399,19 @@ header that names the harness as its source, and it is never stored. On Chat
 Completions and native Messages it is appended to the content of the
 request's last message, the user's prompt or the newest tool result, after a
 blank line (on native Messages, as a text block of its own in that message,
-after the cache marker). On Responses it is a developer message after the
-history, which the Responses API takes anywhere in its `input`: OpenAI's
+after the cache marker; on a Chat Completions route that caches only up to a
+marker, as a user message of its own after the marked message). On Responses
+it is a developer message after the history, which the Responses API takes
+anywhere in its `input`: OpenAI's
 prompt cache on
 GPT-5.6 and later ends each entry at a request's newest user message or tool
 output, so an entry then holds no note byte, and the next request, which
-drops the note, reads back the whole history. Every Chat Completions and
-native Messages endpoint, a flat `base_url` or a named provider, therefore
-sees the stored transcript's role order, the same as with no note, and the
-system prompt stays the only system message. A note of its own after the
+drops the note, reads back the whole history. Every native Messages endpoint
+and every other Chat Completions endpoint, a flat `base_url` or a named
+provider, therefore sees the stored transcript's role order, the same as with
+no note, and the system prompt stays the only system message. OpenRouter
+takes the marked route's user message after a tool result, and Anthropic's
+API joins it to the turn that holds the results. A note of its own after the
 history is what picky Chat Completions servers refuse: some hosted validators
 reject a system or a user message after a tool message, a chat template that
 enforces user/assistant alternation rejects a user message after the prompt,
