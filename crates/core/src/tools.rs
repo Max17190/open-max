@@ -4114,7 +4114,7 @@ mod tests {
         let out = read_file(&root, &json!({"path": "long.txt"}));
         assert!(out.ok, "{}", out.output);
         let first = out.output.lines().next().unwrap();
-        assert!(first.contains("[line clipped;"), "{first}");
+        assert!(first.starts_with("1 prefix x") && first.contains("[line clipped;"), "{first}");
         assert!(first.contains("more bytes]"), "{first}");
         assert!(!first.contains("suffix-END"), "the tail is dropped, not hidden: {first}");
         assert!(out.output.contains("\n2 short\n"), "ordinary lines stay unmarked: {}", out.output);
