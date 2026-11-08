@@ -6,7 +6,6 @@ use serde_json::json;
 pub(super) fn serialize(
     client: &ChatClient,
     messages: &[ChatMessage],
-    note: Option<&str>,
     tools: &str,
 ) -> Result<Vec<u8>, String> {
     let origin = client.origin();
@@ -36,12 +35,6 @@ pub(super) fn serialize(
                     "arguments":call.function.arguments}));
             }
         }
-    }
-    // The note is a developer message after the history: a prompt cache that
-    // ends its entry at the newest user message or tool output then holds no
-    // note byte, so the next request, which drops the note, reads it back.
-    if let Some(note) = note {
-        input.push(json!({"role":"developer","content":note}));
     }
     let schemas: Vec<Value> = serde_json::from_str(tools).map_err(|_| "invalid frozen tools")?;
     let mut functions = Vec::new();
@@ -457,22 +450,21 @@ mod tests {
     }
 
     #[test]
-    fn notes_follow_the_transcript_as_a_developer_message_and_complex_tool_schemas_keep_their_shape() {
+    fn each_message_goes_as_its_stored_text_and_complex_tool_schemas_keep_their_shape() {
         let client = ChatClient::new("http://127.0.0.1".into(), None, "fixture".into(), None, 64);
         // A prompt cache that ends its entry at the newest user message or
-        // tool output holds the stored text alone, as the next request sends it.
+        // tool output holds the stored text, as the next request sends it.
         for (last, key) in [
             (ChatMessage::user("task"), "content"),
             (ChatMessage::tool("call-1", "result"), "output"),
             (ChatMessage::assistant(Some("answer".into()), None), "content"),
         ] {
             let messages = [ChatMessage::system("rules"), last.clone()];
-            let body: Value = serde_json::from_slice(&serialize(&client, &messages, Some("live note"), "[]").unwrap()).unwrap();
+            let body: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
             assert_eq!(body["input"][0]["content"], "rules");
             let input = body["input"].as_array().unwrap();
-            assert_eq!(input.len(), 3);
+            assert_eq!(input.len(), 2);
             assert_eq!(input[1][key], last.content.unwrap());
-            assert_eq!(input[2], json!({"role":"developer","content":"live note"}));
         }
         for parameters in [
             json!({"type":"object","properties":{"value":{"type":"string"}},"required":[],"additionalProperties":false}),
@@ -480,7 +472,7 @@ mod tests {
             json!({"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":true}),
         ] {
             let tools = json!([{"type":"function","function":{"name":"fixture","parameters":parameters}}]);
-            let body: Value = serde_json::from_slice(&serialize(&client, &[], None, &tools.to_string()).unwrap()).unwrap();
+            let body: Value = serde_json::from_slice(&serialize(&client, &[], &tools.to_string()).unwrap()).unwrap();
             assert_eq!(body["input"][0]["tools"][0]["strict"], false);
             assert_eq!(body["input"][0]["tools"][0]["parameters"], parameters);
         }
@@ -488,7 +480,7 @@ mod tests {
             let mut message = ChatMessage::assistant(Some("answer".into()), None);
             message.reasoning_details = Some(RawValue::from_string(json!([{"type":"reasoning","encrypted_content":"opaque"}]).to_string()).unwrap());
             message.reasoning_origin = Some(if same_origin { client.origin() } else { "different-origin".into() });
-            let body = serialize(&client, &[message], None, "[]").unwrap();
+            let body = serialize(&client, &[message], "[]").unwrap();
             assert_eq!(String::from_utf8(body).unwrap().contains("opaque"), same_origin);
         }
     }
@@ -535,7 +527,7 @@ mod tests {
         client.chatgpt = Some(crate::chatgpt::tests::seeded(&dir));
         assert!(client.sends_credential());
         let messages = [ChatMessage::system("rules"), ChatMessage::user("task")];
-        let body: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
+        let body: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
         for key in ["max_output_tokens", "temperature", "previous_response_id", "conversation", "background", "tools",
             "prompt_cache_retention", "user"] {
             assert!(body.get(key).is_none(), "{key}");
@@ -548,14 +540,14 @@ mod tests {
         let origin = client.origin();
         assert!(body.get("reasoning").is_none());
         client.reasoning_effort = Some(crate::config::ReasoningEffort::High);
-        let explicit: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
+        let explicit: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
         assert_eq!(explicit["reasoning"], json!({"effort":"high"}));
         assert!(explicit.get("temperature").is_none());
         assert!(explicit.get("max_output_tokens").is_none());
         assert_eq!(client.origin(), origin, "effort does not change opaque-reasoning ownership");
         client.chatgpt = None;
         assert_ne!(client.origin(), origin);
-        let body: Value = serde_json::from_slice(&serialize(&client, &messages, None, "[]").unwrap()).unwrap();
+        let body: Value = serde_json::from_slice(&serialize(&client, &messages, "[]").unwrap()).unwrap();
         assert_eq!(body["max_output_tokens"], 4096);
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["prompt_cache_key"], cache_key.as_str());

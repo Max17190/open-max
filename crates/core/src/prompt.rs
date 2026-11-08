@@ -8,9 +8,9 @@
 //! A session builds its prompt once, at creation (again only at `/reload`),
 //! and persists it with a `PromptIndex` of what its index shows. What the
 //! session's tool files, skills, memories, and `AGENTS.md` change after that
-//! rides `trailing_note`, sent after the history of each request and never
-//! persisted, so a capability the agent writes moves no byte of the prompt
-//! or of the tools array.
+//! rides `trailing_note`, stored in the history where it changes and never
+//! moved, so a capability the agent writes moves no byte of the prompt, of
+//! the tools array, or of the history before it.
 //!
 //! Every variable-length component is capped in bytes (`AGENTS.md` 2,000, the
 //! layout map 1,200 at depth 2, skills 3,000) and says so when it truncates.
@@ -65,17 +65,18 @@ const SKILLS_SECTION_HEADER: &str = "\n\nSkills (before using one, read its SKIL
 const TOOLS_NOTE_HEADER: &str = "Tool files written since the tools array was built (run one with its bash line):\n";
 const AGENTS_MD_NOTICE: &str =
     "AGENTS.md changed after the system prompt was built: read_file AGENTS.md for its current instructions.\n";
-/// The whole trailing note, its header and trailer included. The note is
-/// prefilled on every request, after the cached prefix, so it holds what a
-/// session changed, never a second index: past this a change is counted, and
-/// `/reload` moves every change into a new prompt and tools array.
+/// The whole trailing note, its header and trailer included. Each change
+/// stores the note again in the history, so it holds what a session changed,
+/// never a second index: past this a change is counted, and `/reload` moves
+/// every change into a new prompt and tools array.
 pub const MAX_NOTE_BYTES: usize = 6_000;
 /// Room the note keeps for the trailer that counts what its cap left out.
 const NOTE_TRAILER_ROOM: usize = 128;
-/// The note's first line. The note goes out at the end of the request's last
-/// message, the user's prompt or a tool result, so it says whose words follow
-/// before any of them, and how they relate to the prefix.
-pub const NOTE_HEADER: &str = "[Changes since the system prompt and tools array, from the harness; not from the user or a tool. A line here replaces the one of the same name there.]";
+/// The note's first line. The note is stored at the end of a message, the
+/// user's prompt or a tool result, so it says whose words follow before any
+/// of them, how they relate to the prefix, and that the latest note is the
+/// whole account, as each carries every change since the prompt.
+pub const NOTE_HEADER: &str = "[Changes since the system prompt and tools array, from the harness; not from the user or a tool. A line here replaces the one of the same name there, and this note replaces any earlier one.]";
 /// What separates the note from the stored text of the message it ends.
 pub const NOTE_SEPARATOR: &str = "\n\n";
 
@@ -307,9 +308,9 @@ pub fn session_context(project_root: &Path, registry: &mut Registry) -> (String,
 /// The trailing note for one generation: what its tool files, skills,
 /// memories, and `AGENTS.md` change against the prefix the session sends,
 /// the tools array the registry carries and the prompt its `prompt_index`
-/// records. Rebuilt when the registry is, and sent after the history on every
-/// request. None when nothing changed, so a session that writes no
-/// capability pays nothing. Returns the note's labeled components, which
+/// records. Rebuilt when the registry is, and stored in the history when it
+/// changes (`notes::store_note`). None when nothing changed, so a session
+/// that writes no capability pays nothing. Returns the note's labeled components, which
 /// price every byte of it, for `/context`.
 pub fn trailing_note(project_root: &Path, registry: &Registry) -> (Option<String>, Vec<(String, usize)>) {
     note_with_memory(project_root, registry, memory_index(project_root, registry).1)
@@ -317,9 +318,9 @@ pub fn trailing_note(project_root: &Path, registry: &Registry) -> (Option<String
 
 /// The trailing note with memory read from disk now instead of from the
 /// generation's own scan. A memory written with the file tools changes no
-/// extension byte, so no refreeze follows it; without this the note, sent
-/// after the history as the harness's account of what changed, would go on
-/// presenting the line the write replaced.
+/// extension byte, so no refreeze follows it; without this the note, the
+/// harness's account of what changed, would go on presenting the line the
+/// write replaced.
 pub fn note_after_memory_write(project_root: &Path, registry: &Registry) -> (Option<String>, Vec<(String, usize)>) {
     let scan = crate::memory::freeze_snapshot(project_root, crate::memory::unix_now());
     note_with_memory(project_root, registry, scan.lines)
