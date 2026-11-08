@@ -138,7 +138,7 @@ and the run that writes a key already uses it.
   length limit. When the server reports the cut (finish_reason `length`, or
   a usage count at the limit), a tool call cut off at that limit does not
   run; the model is told why and to send large content in parts.
-- `compaction_tokens` caps the input size before automatic compaction. Open
+- `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
   model's value in `providers.json`, then the shared default of 150,000
   tokens. To keep more history on a large-window model, raise the cap in
@@ -219,15 +219,21 @@ than estimated or refuses a request for length that the estimate said fit.
 Calibration stays in memory, so a resumed session starts on the plain
 estimate.
 
-The automatic compaction trigger is the lower of the input budget and the
-selected `compaction_tokens` value, with a 20,000-token floor on the selected
-value before the input budget is applied. With the defaults, a 128,000-token
-window triggers at 122,880 tokens and a 500,000-token window triggers at
-150,000 tokens. Compaction aims for 70% of the trigger. If the frozen schemas
-or the messages a prune must keep make that target unreachable, automatic
-compaction falls back to the input budget. The `/compact` command immediately
-aims for 70% of the selected trigger and uses the input budget if the frozen
-schemas alone fill that trigger.
+Open Max estimates the current input against the selected `compaction_tokens`
+value, with a 20,000-token floor on that value. It calibrates this soft trigger
+and its 70% prune target with the prompt count from the same route. A lower
+reported count can allow more history within the conservative input budget.
+This is a best-effort estimate because providers may count prompt tokens
+differently. A normal turn request that fails or returns no usable prompt
+count discards a lower calibration.
+
+The input budget always bounds the trigger. With the defaults before
+calibration, a 128,000-token window triggers at 122,880 tokens and a
+500,000-token window triggers at 150,000 tokens. If the frozen schemas or the
+messages a prune must keep make the target unreachable, automatic compaction
+falls back to the input budget. The `/compact` command aims for 70% of the
+calibrated trigger and uses the input budget if the frozen schemas alone
+fill the trigger.
 
 Between prunes the history stays byte-stable so the server can reuse its
 prompt cache. A prune truncates old tool outputs first, then drops the oldest
