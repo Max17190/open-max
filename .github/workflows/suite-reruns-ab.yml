@@ -39,7 +39,7 @@ jobs:
       - name: Tree
         run: |
           if [ "${{ matrix.tree }}" = before ]; then
-            git fetch --depth=1 origin 74266c11099589a1ad37ee88501f92693aa3b867
+            git fetch --depth=1 origin 2f9b6df0f27ca28af258a4ac8f5954853ea8087e
             git checkout FETCH_HEAD -- crates/core/src/client.rs crates/tui/tests/cli.rs crates/tui/src/app/thesis_frames.rs
           fi
           git status --short
