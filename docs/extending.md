@@ -571,7 +571,11 @@ surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`,
 and defaults, hook stdin payload shapes, and activation timing. The frozen
 prompt carries only a one-line pointer to it, so the full contract costs zero
 tokens until the agent reads it, and the printed examples are parsed by the
-same validation code in tests so the text cannot drift from the binary.
+same validation code in tests so the text cannot drift from the binary. The
+tools and hooks contracts state each mode's content approval rule and name
+`openmax --spec tools.approval` and `hooks.approval` for the detail that
+applies only outside auto, so a session in auto never re-sends it with every
+request after the read.
 
 ## Freezing and re-freezing
 
