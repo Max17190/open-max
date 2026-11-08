@@ -1096,8 +1096,8 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
     let header = serde_json::to_string(NOTE_HEADER).unwrap();
     let copies = bodies.last().unwrap().matches(&header[1..header.len() - 1]).count();
     println!(
-        "MEASURE a_note_is_stored_once_where_it_changes ({}) {:.2}% cacheable, {} = {} of {} prompt tokens; thinking \
-         replayed {} of {}; the last request carries {copies} notes",
+        "MEASURE a_note_is_stored_once_where_it_changes ({}) {:.2}% cacheable, {} = {} of {} prompt tokens;{} the last \
+         request carries {copies} notes",
         match wire {
             WireApi::ChatCompletions => "Chat Completions",
             WireApi::Responses => "Responses",
@@ -1107,8 +1107,11 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
         if wire == WireApi::ChatCompletions { "billed by the byte".to_string() } else { format!("{:.2}% billed", percent(&billed)) },
         tokens(if wire == WireApi::ChatCompletions { &cacheable } else { &billed }),
         tokens(&sizes),
-        replayed.iter().sum::<usize>(),
-        if wire == WireApi::Anthropic { (0..prompts.len()).sum::<usize>() } else { 0 },
+        if wire == WireApi::Anthropic {
+            format!(" thinking replayed {} of {};", replayed.iter().sum::<usize>(), (0..prompts.len()).sum::<usize>())
+        } else {
+            String::new()
+        },
     );
     let ahead = |prompt: &Prompt| prompt.text.trim_end_matches([']', '}']).len();
     let rewrote: Vec<usize> =
