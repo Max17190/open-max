@@ -90,6 +90,39 @@ jobs:
           churner=$!
           sleep 3
           head -n 1 "$RUNNER_TEMP/churn.log"
+          cat > "$RUNNER_TEMP/probe.py" <<'EOF'
+          import collections, socket, sys, time
+          free = set(map(int, sys.argv[1].split(",")))
+          hold = sys.argv[2] == "hold"
+          res = collections.Counter()
+          for i in range(2000):
+              s = socket.socket()
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("127.0.0.1", 0)); s.listen(128)
+              p = s.getsockname()[1]
+              kept = []
+              if hold:
+                  c = socket.create_connection(("127.0.0.1", p)); a, _ = s.accept(); kept = [c, a]
+              s.close()
+              outcome = ""
+              for delay in (0.001, 0.002, 0.004, 0.008):
+                  time.sleep(delay)
+                  c = socket.socket(); c.settimeout(1)
+                  try:
+                      c.connect(("127.0.0.1", p)); outcome += "C"
+                  except ConnectionRefusedError:
+                      outcome += "R"
+                  except OSError as e:
+                      outcome += "E"
+                  c.close()
+              for k in kept: k.close()
+              res[outcome] += 1
+              res["port among the free" if p in free else "port elsewhere"] += 1
+          print("PROBE", sys.argv[2], dict(res), flush=True)
+          EOF
+          free=$(head -n 1 "$RUNNER_TEMP/churn.log" | sed -E 's/.*free \[(.*)\]/\1/; s/ //g')
+          python3 -I "$RUNNER_TEMP/probe.py" "$free" release
+          python3 -I "$RUNNER_TEMP/probe.py" "$free" hold
           lib=$(cargo test -p open-max-core --lib --locked --no-run --message-format=json 2>/dev/null | python3 -I -c 'import json,sys
           for l in sys.stdin:
               m = json.loads(l)
@@ -115,102 +148,3 @@ jobs:
           kill "$churner"
           tail -n 3 "$RUNNER_TEMP/churn.log"
 
-  load:
-    name: Frames under load (${{ matrix.tree }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        tree: [before, after]
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
-        with:
-          toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: test
-          save-if: false
-
-      - name: Tree
-        run: |
-          if [ "${{ matrix.tree }}" = before ]; then
-            git fetch --depth=1 origin 74266c11099589a1ad37ee88501f92693aa3b867
-            git checkout FETCH_HEAD -- crates/core/src/client.rs crates/tui/tests/cli.rs crates/tui/src/app/thesis_frames.rs
-          fi
-          git status --short
-
-      - name: Build the tests
-        run: cargo test -p openmax --bin openmax --locked --no-run
-
-      - name: Load
-        timeout-minutes: 25
-        run: |
-          bin=$(cargo test -p openmax --bin openmax --locked --no-run --message-format=json 2>/dev/null | python3 -I -c 'import json,sys
-          for l in sys.stdin:
-              m = json.loads(l)
-              if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"] and m["target"]["kind"] == ["bin"]: print(m["executable"])')
-          echo "bin $bin"
-          nproc
-          cd crates/tui
-          for load in 0 12; do
-            pids=
-            for _ in $(seq "$load"); do (while :; do :; done) & pids="$pids $!"; done
-            failed=0
-            for i in $(seq 10); do
-              "$bin" --exact app::thesis_frames::transcript_frame_p99_at_1m_lines app::thesis_frames::transcript_frame_p99_at_100k_lines --nocapture > "$RUNNER_TEMP/frames-$load-$i.log" 2>&1 || failed=$((failed + 1))
-              grep -E '^MEASURE .*(idle|scrolling)' "$RUNNER_TEMP/frames-$load-$i.log" | sed "s/^/load=$load run=$i /" || true
-              grep -E 'panicked|sanity bound' "$RUNNER_TEMP/frames-$load-$i.log" | sed "s/^/load=$load run=$i /" || true
-            done
-            [ -z "$pids" ] || kill $pids
-            echo "RESULT ${{ matrix.tree }} frames with $load busy loops: $failed of 10 failed"
-          done
-
-  suite:
-    name: Suite time, interleaved
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
-        with:
-          toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: test
-          save-if: false
-
-      - name: Build both trees
-        run: |
-          git fetch --depth=1 origin 74266c11099589a1ad37ee88501f92693aa3b867
-          git worktree add "$RUNNER_TEMP/before" FETCH_HEAD
-          cargo test --workspace --locked --no-run
-          (cd "$RUNNER_TEMP/before" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo test --workspace --locked --no-run)
-
-      - name: Before and after, interleaved
-        timeout-minutes: 40
-        run: |
-          mkdir -p "$RUNNER_TEMP/ab"
-          for i in $(seq 12); do
-            for v in before after; do
-              dir=$GITHUB_WORKSPACE
-              [ "$v" = after ] || dir=$RUNNER_TEMP/before
-              load=$(cut -d ' ' -f 1 /proc/loadavg)
-              code=0
-              (cd "$dir" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" env -u GITHUB_ACTIONS scripts/check-suite-time.sh 3) > "$RUNNER_TEMP/ab/$v-$i.log" 2>&1 || code=$?
-              took=$(grep -oE 'the test suite took [0-9.]+s' "$RUNNER_TEMP/ab/$v-$i.log" | grep -oE '[0-9.]+s' || echo none)
-              alone=$(grep -c 'failed beside the other binaries and passed alone' "$RUNNER_TEMP/ab/$v-$i.log" || true)
-              names=$(grep -oE "^thread '[^']+'" "$RUNNER_TEMP/ab/$v-$i.log" | sort -u | tr '\n' ' ' || true)
-              echo "AB $v $i exit=$code took=$took retried=$alone load=$load $names"
-            done
-          done
-          for f in "$RUNNER_TEMP"/ab/after-1.log "$RUNNER_TEMP"/ab/before-1.log; do echo "== $f"; cat "$f"; done
