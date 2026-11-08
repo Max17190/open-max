@@ -537,10 +537,8 @@ pub(crate) async fn narrate_permissions_reload(
             // file, but an earlier snapshot this turn may have explicitly
             // DENIED one of them, and the most restrictive answer wins - so
             // the receipt must not promise a repair tool a rule already
-            // blocks. Probe every path spelling a repair call could use (an
-            // `arg_regex` matches the raw path argument): absolute,
-            // relative, and ./relative. A tool is allowed only if NONE is
-            // denied.
+            // blocks. Restrictions also match the original argument, so
+            // check the conventional spellings of the repair path.
             let abs = project_root.join(".openmax/permissions.toml").to_string_lossy().into_owned();
             let repair_denied = |tool: &str| {
                 [abs.as_str(), ".openmax/permissions.toml", "./.openmax/permissions.toml"].iter().any(|p| {

@@ -831,11 +831,11 @@ async fn a_denied_repair_tool_is_not_offered_by_the_malformed_receipt() {
     let project = dir.join("project");
     std::fs::create_dir_all(project.join(".openmax")).unwrap();
     let project = project.canonicalize().unwrap();
-    // Turn-start policy: deny both repair tools on anything matching
-    // "permissions" (valid TOML, applies at turn start).
+    // Turn-start policy: deny write by its resolved target and edit by a
+    // specific spelling. The receipt must account for both rules.
     std::fs::write(
         project.join(".openmax/permissions.toml"),
-        "[[rules]]\neffect = \"deny\"\ntool = \"write_file\"\narg_regex = \"^[.]/[.]openmax\"\n\
+        "[[rules]]\neffect = \"deny\"\ntool = \"write_file\"\narg_regex = \"^[.]openmax/\"\n\
          [[rules]]\neffect = \"deny\"\ntool = \"edit_file\"\narg_regex = \"^[.]/[.]openmax\"\n",
     )
     .unwrap();
