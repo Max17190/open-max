@@ -243,50 +243,21 @@ fn conversation_layout(
     let queue_h = desired_queue_h.min(remaining);
     let chat_h = remaining.saturating_sub(queue_h);
 
-    let header = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: header_h,
+    // The bands stack top to bottom, each starting where the one above ends;
+    // a struct expression evaluates its fields in the order written.
+    let mut y = area.y;
+    let mut band = |height| {
+        let rect = Rect { y, height, ..area };
+        y = rect.bottom();
+        rect
     };
-    let chat = Rect {
-        x: area.x,
-        y: header.bottom(),
-        width: area.width,
-        height: chat_h,
-    };
-    let queue = Rect {
-        x: area.x,
-        y: chat.bottom(),
-        width: area.width,
-        height: queue_h,
-    };
-    let popup = Rect {
-        x: area.x,
-        y: queue.bottom(),
-        width: area.width,
-        height: popup_h,
-    };
-    let status = Rect {
-        x: area.x,
-        y: popup.bottom(),
-        width: area.width,
-        height: status_h,
-    };
-    let input = Rect {
-        x: area.x,
-        y: status.bottom(),
-        width: area.width,
-        height: input_h,
-    };
-
     ConversationLayout {
-        header,
-        chat,
-        queue,
-        popup,
-        status,
-        input,
+        header: band(header_h),
+        chat: band(chat_h),
+        queue: band(queue_h),
+        popup: band(popup_h),
+        status: band(status_h),
+        input: band(input_h),
     }
 }
 
@@ -1000,9 +971,7 @@ impl App {
         // filtered out once the id changes, so a flag left armed here would
         // misroute the next session's first Error into the compaction branch.
         self.compacting = false;
-        self.stream_text.clear();
-        self.thinking_chars = 0;
-        self.thinking_tail.clear();
+        self.clear_live_tail();
         self.turn_started = None;
         self.first_token = None;
         self.stream_chars = 0;
@@ -1026,15 +995,7 @@ impl App {
         // path that destroyed it.
         self.return_queue_to_composer();
         self.flush_queue = false;
-        self.stream_wrapped.clear();
-        self.stream_stable_len = 0;
-        self.stream_md.clear();
-        self.thinking_wrapped.clear();
-        self.thinking_source.clear();
         self.tail_width = 0;
-        self.tail_content_len = 0;
-        self.tail_stable_len = 0;
-        self.tail_buf.clear();
         self.chat_line_map.clear();
         self.chat_draw_area = Rect::default();
         self.composer_draw_area = Rect::default();
@@ -1115,113 +1076,85 @@ impl App {
                     self.dirty.mark_chrome();
                 }
             }
-            TermEvent::Mouse(m) => {
-                if self.mode == Mode::Chat {
-                    match m.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let clicks = self.count_click(m.column, m.row);
-                            if let Some(choice) = self
-                                .approval_hits
-                                .iter()
-                                .position(|hit| hit.is_some_and(|rect| rect_contains(rect, m.column, m.row)))
-                            {
-                                self.respond_approval_choice(choice);
-                            } else if let Some((cell, row)) =
-                                self.composer_position(m.column, m.row)
-                            {
-                                let area = self.composer_draw_area;
-                                self.focus = Focus::Composer;
-                                self.transcript.clear_text_selection();
-                                self.transcript.clear_selection();
-                                let (w, h) = (area.width, area.height);
-                                match clicks {
-                                    2 => {
-                                        self.composer.select_word_at(w, h, cell, row);
-                                    }
-                                    3 => {
-                                        self.composer.select_line_at(w, h, cell, row);
-                                    }
-                                    _ => self.composer.click_at(w, h, cell, row),
-                                }
-                                self.dirty.mark_chrome();
-                                self.dirty.mark_selection();
-                            } else if let Some((line, x)) =
-                                self.transcript_position(m.column, m.row)
-                            {
-                                self.focus = Focus::Scrollback;
-                                self.composer.clear_selection();
-                                match clicks {
-                                    2 => {
-                                        self.transcript.select_word_at(line, x);
-                                    }
-                                    3 => {
-                                        self.transcript.select_line_at(line, x);
-                                    }
-                                    _ => {
-                                        self.transcript.begin_text_selection_at(line, x);
-                                    }
-                                }
-                                self.dirty.mark_selection();
-                            } else {
-                                self.transcript.clear_text_selection();
-                                self.dirty.mark_selection();
-                            }
+            TermEvent::Mouse(m) if self.mode == Mode::Chat => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let clicks = self.count_click(m.column, m.row);
+                    if let Some(choice) = self
+                        .approval_hits
+                        .iter()
+                        .position(|hit| hit.is_some_and(|rect| rect_contains(rect, m.column, m.row)))
+                    {
+                        self.respond_approval_choice(choice);
+                    } else if let Some((cell, row)) = self.composer_position(m.column, m.row) {
+                        let area = self.composer_draw_area;
+                        self.focus = Focus::Composer;
+                        self.transcript.clear_text_selection();
+                        self.transcript.clear_selection();
+                        let (w, h) = (area.width, area.height);
+                        match clicks {
+                            2 => { self.composer.select_word_at(w, h, cell, row); }
+                            3 => { self.composer.select_line_at(w, h, cell, row); }
+                            _ => self.composer.click_at(w, h, cell, row),
                         }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            if self.composer.is_dragging() {
-                                let area = self.composer_draw_area;
-                                let (cell, row) = self.composer_drag_target(m.column, m.row);
-                                self.composer.drag_to(area.width, area.height, cell, row);
-                                self.dirty.mark_chrome();
-                            } else if let Some((line, x)) =
-                                self.transcript_position(m.column, m.row)
-                            {
-                                self.transcript.update_text_selection_at(line, x);
-                                self.dirty.mark_selection();
-                            }
+                        self.dirty.mark_chrome();
+                        self.dirty.mark_selection();
+                    } else if let Some((line, x)) = self.transcript_position(m.column, m.row) {
+                        self.focus = Focus::Scrollback;
+                        self.composer.clear_selection();
+                        match clicks {
+                            2 => { self.transcript.select_word_at(line, x); }
+                            3 => { self.transcript.select_line_at(line, x); }
+                            _ => { self.transcript.begin_text_selection_at(line, x); }
                         }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            if self.composer.is_dragging() {
-                                self.composer.finish_selection();
-                                self.dirty.mark_chrome();
-                            } else {
-                                if let Some((line, x)) =
-                                    self.transcript_position(m.column, m.row)
-                                {
-                                    // The release of a gesture's own click
-                                    // must not shrink the word or line it
-                                    // picked; end_text_selection_at knows.
-                                    self.transcript.end_text_selection_at(line, x);
-                                } else {
-                                    self.transcript.finish_text_selection();
-                                }
-                                self.dirty.mark_selection();
-                            }
-                        }
-                        MouseEventKind::ScrollUp => {
-                            if self.composer_position(m.column, m.row).is_some() {
-                                let area = self.composer_draw_area;
-                                self.composer.scroll_by(area.width, area.height, -1);
-                                self.dirty.mark_chrome();
-                            } else {
-                                self.transcript.scroll_up(WHEEL_LINES);
-                                self.dirty.mark_chat();
-                            }
-                        }
-                        MouseEventKind::ScrollDown => {
-                            if self.composer_position(m.column, m.row).is_some() {
-                                let area = self.composer_draw_area;
-                                self.composer.scroll_by(area.width, area.height, 1);
-                                self.dirty.mark_chrome();
-                            } else {
-                                self.transcript.scroll_down(WHEEL_LINES);
-                                self.dirty.mark_chat();
-                            }
-                        }
-                        _ => {}
+                        self.dirty.mark_selection();
+                    } else {
+                        self.transcript.clear_text_selection();
+                        self.dirty.mark_selection();
                     }
                 }
-            }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if self.composer.is_dragging() {
+                        let area = self.composer_draw_area;
+                        let (cell, row) = self.composer_drag_target(m.column, m.row);
+                        self.composer.drag_to(area.width, area.height, cell, row);
+                        self.dirty.mark_chrome();
+                    } else if let Some((line, x)) = self.transcript_position(m.column, m.row) {
+                        self.transcript.update_text_selection_at(line, x);
+                        self.dirty.mark_selection();
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if self.composer.is_dragging() {
+                        self.composer.finish_selection();
+                        self.dirty.mark_chrome();
+                    } else {
+                        match self.transcript_position(m.column, m.row) {
+                            // The release of a gesture's own click must not
+                            // shrink the word or line it picked;
+                            // end_text_selection_at knows.
+                            Some((line, x)) => self.transcript.end_text_selection_at(line, x),
+                            None => self.transcript.finish_text_selection(),
+                        }
+                        self.dirty.mark_selection();
+                    }
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let up = m.kind == MouseEventKind::ScrollUp;
+                    if self.composer_position(m.column, m.row).is_some() {
+                        let area = self.composer_draw_area;
+                        self.composer.scroll_by(area.width, area.height, if up { -1 } else { 1 });
+                        self.dirty.mark_chrome();
+                    } else {
+                        if up {
+                            self.transcript.scroll_up(WHEEL_LINES);
+                        } else {
+                            self.transcript.scroll_down(WHEEL_LINES);
+                        }
+                        self.dirty.mark_chat();
+                    }
+                }
+                _ => {}
+            },
             TermEvent::Resize(_, _) => self.dirty = Dirty::all(),
             TermEvent::FocusGained => self.on_focus_change(true),
             TermEvent::FocusLost => self.on_focus_change(false),
@@ -1343,40 +1276,22 @@ impl App {
             return Ok(());
         }
 
-        if self.mode == Mode::ModelPicker {
-            self.on_model_picker_key(key);
-            return Ok(());
-        }
-        if self.mode == Mode::Sessions {
-            self.on_sessions_key(key);
-            return Ok(());
-        }
-
-        // History search overlay owns keys until Esc/Enter.
-        if self.history_search.is_some() {
-            self.on_history_search_key(key);
-            return Ok(());
-        }
-
-        // Scrollback find overlay owns keys until Esc/Enter.
-        if self.scroll_search.is_some() {
-            self.on_scroll_search_key(key);
-            return Ok(());
-        }
-
-        // Transcript scrolling always available in chat.
+        // The pickers and the search overlays own every key until they close;
+        // under anything else, PageUp and PageDown scroll the transcript.
         match key.code {
-            KeyCode::PageUp => {
-                self.transcript.scroll_up(self.page_h.max(1) as usize);
-                return Ok(());
-            }
-            KeyCode::PageDown => {
-                self.transcript.scroll_down(self.page_h.max(1) as usize);
-                return Ok(());
-            }
-            _ => {}
+            _ if self.mode == Mode::ModelPicker => self.on_model_picker_key(key),
+            _ if self.mode == Mode::Sessions => self.on_sessions_key(key),
+            _ if self.history_search.is_some() => self.on_history_search_key(key),
+            _ if self.scroll_search.is_some() => self.on_scroll_search_key(key),
+            KeyCode::PageUp => self.transcript.scroll_up(self.page_h.max(1) as usize),
+            KeyCode::PageDown => self.transcript.scroll_down(self.page_h.max(1) as usize),
+            _ => return self.on_chat_key(key).await,
         }
+        Ok(())
+    }
 
+    /// A key in chat with no picker or search overlay open.
+    async fn on_chat_key(&mut self, key: KeyEvent) -> std::io::Result<()> {
         // Approval prompt swallows keys until answered.
         if let Some((id, name, _, _, _)) = self.pending_approval.clone() {
             // Affirmative approval (y / a) is refused while the card could not
@@ -1419,27 +1334,17 @@ impl App {
 
         // Completion popup: navigation and acceptance take priority over the
         // composer; anything else falls through and refilters afterwards.
-        if self.completion.is_some() {
+        if let Some(popup) = &mut self.completion {
             // Shift+Tab steps back through the list here: an open popup
             // owns the keyboard, and the reverse
             // of "Tab picks the next item" is the only reading of it on screen.
-            if is_shift_tab(&key) {
-                if let Some(popup) = &mut self.completion {
-                    popup.prev();
-                }
+            if is_shift_tab(&key) || key.code == KeyCode::Up {
+                popup.prev();
                 return Ok(());
             }
             match key.code {
-                KeyCode::Up => {
-                    if let Some(popup) = &mut self.completion {
-                        popup.prev();
-                    }
-                    return Ok(());
-                }
                 KeyCode::Down => {
-                    if let Some(popup) = &mut self.completion {
-                        popup.next();
-                    }
+                    popup.next();
                     return Ok(());
                 }
                 KeyCode::Tab | KeyCode::Enter
@@ -1448,10 +1353,7 @@ impl App {
                             .modifiers
                             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
-                    let has_item = self
-                        .completion
-                        .as_ref()
-                        .is_some_and(|p| p.selected_item().is_some());
+                    let has_item = popup.selected_item().is_some();
                     // A command typed out in full is finished, not half-typed:
                     // accepting it would replace the token with itself and
                     // reopen the popup, so Enter looped as a no-op and the
@@ -1501,102 +1403,8 @@ impl App {
             return Ok(());
         }
 
-        // Scrollback-focused navigation.
-        if self.focus == Focus::Scrollback {
-            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            match key.code {
-                // Turn jumps: `[`/`]` work on every terminal; Shift+arrows when
-                // the terminal reports modifiers (many do not).
-                KeyCode::Char('[') => {
-                    self.transcript.select_prev_user();
-                    return Ok(());
-                }
-                KeyCode::Char(']') => {
-                    self.transcript.select_next_user();
-                    return Ok(());
-                }
-                KeyCode::Up if shift => {
-                    self.transcript.select_prev_user();
-                    return Ok(());
-                }
-                KeyCode::Down if shift => {
-                    self.transcript.select_next_user();
-                    return Ok(());
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.transcript.select_prev();
-                    return Ok(());
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.transcript.select_next();
-                    return Ok(());
-                }
-                KeyCode::Char('g') => {
-                    self.transcript.select_first();
-                    return Ok(());
-                }
-                KeyCode::Char('G') => {
-                    self.transcript.select_last_follow();
-                    return Ok(());
-                }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    let _ = self.transcript.toggle_fold_selected();
-                    return Ok(());
-                }
-                KeyCode::Char('o') => {
-                    let _ = self.transcript.expand_last_tool();
-                    return Ok(());
-                }
-                KeyCode::Char('p') => {
-                    // Copy-to-prompt: the block's source lands in the draft,
-                    // for quoting output back at the model without a
-                    // clipboard round-trip.
-                    if self.transcript.selected().is_none() {
-                        self.transcript.select_prev();
-                    }
-                    if let Some(text) = self.transcript.selected_copy_text() {
-                        // At the end of the draft, never at the cursor: a
-                        // mid-line cursor would splice the draft's suffix
-                        // onto the quoted block.
-                        self.composer.append_block(&text);
-                        self.focus = Focus::Composer;
-                        self.transcript.select_last_follow();
-                        self.dirty.mark_chat();
-                        self.dirty.mark_chrome();
-                    }
-                    return Ok(());
-                }
-                KeyCode::Char('y') => {
-                    // G follows the bottom without selecting a block; y must
-                    // still mean "copy the block I am looking at".
-                    if self.transcript.selected().is_none() {
-                        self.transcript.select_prev();
-                    }
-                    if let Some(text) = self.transcript.selected_copy_text() {
-                        if clipboard::copy_text(&mut self.term_out, &text) {
-                            self.note("copied block");
-                        } else {
-                            self.note("copy failed (terminal may block OSC 52)");
-                        }
-                    }
-                    return Ok(());
-                }
-                // Continue last Ctrl+F query without reopening the find bar.
-                KeyCode::Char('n') => {
-                    self.step_last_scroll_search(1);
-                    return Ok(());
-                }
-                KeyCode::Char('N') => {
-                    self.step_last_scroll_search(-1);
-                    return Ok(());
-                }
-                KeyCode::Esc | KeyCode::Char(' ') => {
-                    self.focus = Focus::Composer;
-                    self.transcript.clear_selection();
-                    return Ok(());
-                }
-                _ => {}
-            }
+        if self.focus == Focus::Scrollback && self.on_scrollback_key(key) {
+            return Ok(());
         }
 
         if key.code == KeyCode::Esc {
@@ -1648,6 +1456,69 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Navigation while the conversation has focus. Returns false for a key
+    /// it leaves to the composer.
+    fn on_scrollback_key(&mut self, key: KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            // Turn jumps: `[`/`]` work on every terminal; Shift+arrows when
+            // the terminal reports modifiers (many do not).
+            KeyCode::Char('[') => self.transcript.select_prev_user(),
+            KeyCode::Char(']') => self.transcript.select_next_user(),
+            KeyCode::Up if shift => self.transcript.select_prev_user(),
+            KeyCode::Down if shift => self.transcript.select_next_user(),
+            KeyCode::Up | KeyCode::Char('k') => self.transcript.select_prev(),
+            KeyCode::Down | KeyCode::Char('j') => self.transcript.select_next(),
+            KeyCode::Char('g') => self.transcript.select_first(),
+            KeyCode::Char('G') => self.transcript.select_last_follow(),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                self.transcript.toggle_fold_selected();
+            }
+            KeyCode::Char('o') => {
+                self.transcript.expand_last_tool();
+            }
+            KeyCode::Char('p') => {
+                // Copy-to-prompt: the block's source lands in the draft,
+                // for quoting output back at the model without a
+                // clipboard round-trip.
+                if let Some(text) = self.block_in_view_text() {
+                    // At the end of the draft, never at the cursor: a
+                    // mid-line cursor would splice the draft's suffix
+                    // onto the quoted block.
+                    self.composer.append_block(&text);
+                    self.focus = Focus::Composer;
+                    self.transcript.select_last_follow();
+                    self.dirty.mark_chat();
+                    self.dirty.mark_chrome();
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(text) = self.block_in_view_text() {
+                    self.note_copy(&text, "block");
+                }
+            }
+            // Continue last Ctrl+F query without reopening the find bar.
+            KeyCode::Char('n') => self.step_last_scroll_search(1),
+            KeyCode::Char('N') => self.step_last_scroll_search(-1),
+            KeyCode::Esc | KeyCode::Char(' ') => {
+                self.focus = Focus::Composer;
+                self.transcript.clear_selection();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The selected block's copy text, selecting the latest block first when
+    /// none is: G follows the bottom without selecting one, and p and y must
+    /// still mean "the block I am looking at".
+    fn block_in_view_text(&mut self) -> Option<String> {
+        if self.transcript.selected().is_none() {
+            self.transcript.select_prev();
+        }
+        self.transcript.selected_copy_text()
     }
 
     /// How many times this cell has been clicked in quick succession: 1, 2, or
@@ -1715,7 +1586,7 @@ impl App {
         if let Some(text) = self.composer.selected_text() {
             self.composer.clear_selection();
             self.dirty.mark_chrome();
-            self.note_copied(&text);
+            self.note_copy(&text, "selection");
             return true;
         }
         self.copy_text_selection()
@@ -1729,13 +1600,14 @@ impl App {
         // the next Ctrl+C: press once to copy, again to cancel or quit.
         self.transcript.clear_text_selection();
         self.dirty.mark_selection();
-        self.note_copied(&text);
+        self.note_copy(&text, "selection");
         true
     }
 
-    fn note_copied(&mut self, text: &str) {
+    /// Copy `text` to the clipboard and say so, naming `what` was copied.
+    fn note_copy(&mut self, text: &str, what: &str) {
         if clipboard::copy_text(&mut self.term_out, text) {
-            self.note("copied selection");
+            self.note(&format!("copied {what}"));
         } else {
             self.note("copy failed (terminal may block OSC 52)");
         }
@@ -1807,54 +1679,30 @@ impl App {
     }
 
     fn on_model_picker_key(&mut self, key: KeyEvent) {
-        // Before the Tab arm below: where the terminal reports Shift+Tab as a
-        // shifted Tab, matching on the code alone would step forward.
-        if is_shift_tab(&key) {
-            if let Some(picker) = &mut self.model_picker {
-                picker.prev();
-            }
+        self.dirty.mark_chrome();
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Chat;
+            self.model_picker = None;
             return;
         }
+        let Some(picker) = &mut self.model_picker else { return };
         match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Chat;
-                self.model_picker = None;
-            }
-            KeyCode::Up => {
-                if let Some(picker) = &mut self.model_picker {
-                    picker.prev();
-                }
-            }
-            KeyCode::Down | KeyCode::Tab => {
-                if let Some(picker) = &mut self.model_picker {
-                    picker.next();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(picker) = &mut self.model_picker {
-                    picker.backspace();
-                }
-            }
+            // Before the Tab arm below: where the terminal reports Shift+Tab
+            // as a shifted Tab, matching on the code alone would step forward.
+            _ if is_shift_tab(&key) => picker.prev(),
+            KeyCode::Up => picker.prev(),
+            KeyCode::Down | KeyCode::Tab => picker.next(),
+            KeyCode::Backspace => picker.backspace(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => picker.push(c),
             KeyCode::Enter => {
-                let choice = self
-                    .model_picker
-                    .as_ref()
-                    .and_then(model_picker::ModelPickerState::selected_choice)
-                    .cloned();
-                if let Some(choice) = choice {
+                if let Some(choice) = picker.selected_choice().cloned() {
                     self.mode = Mode::Chat;
                     self.model_picker = None;
                     self.persist_model_selection(choice.provider, choice.id);
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(picker) = &mut self.model_picker {
-                    picker.push(c);
-                }
-            }
             _ => {}
         }
-        self.dirty.mark_chrome();
     }
 
     fn open_model_picker(&mut self) {
@@ -1911,58 +1759,28 @@ impl App {
             self.note("no prompt history yet");
             return;
         }
-        let matches = entries;
-        let selected = matches.len().saturating_sub(1);
-        self.history_search = Some((String::new(), selected, matches));
+        self.history_search = Some((String::new(), entries.len() - 1, entries));
         self.completion = None;
     }
 
     fn on_history_search_key(&mut self, key: KeyEvent) {
+        let Some((query, selected, matches)) = &mut self.history_search else { return };
         match key.code {
-            KeyCode::Esc => {
-                self.history_search = None;
-            }
+            KeyCode::Esc => self.history_search = None,
             KeyCode::Enter => {
-                let pick = self
-                    .history_search
-                    .as_ref()
-                    .and_then(|(q, sel, all)| {
-                        let _ = q;
-                        all.get(*sel).cloned()
-                    });
-                if let Some(text) = pick {
+                if let Some(text) = matches.get(*selected).cloned() {
                     self.composer.load(&text);
                 }
                 self.history_search = None;
                 self.focus = Focus::Composer;
             }
-            KeyCode::Up => {
-                if let Some((_, sel, _)) = &mut self.history_search {
-                    if *sel > 0 {
-                        *sel -= 1;
-                    }
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down if *selected + 1 < matches.len() => *selected += 1,
+            _ => {
+                if edit_query(query, &key) {
+                    self.refilter_history_search();
                 }
             }
-            KeyCode::Down => {
-                if let Some((_, sel, all)) = &mut self.history_search {
-                    if *sel + 1 < all.len() {
-                        *sel += 1;
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some((query, _, _)) = &mut self.history_search {
-                    query.pop();
-                }
-                self.refilter_history_search();
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some((query, _, _)) = &mut self.history_search {
-                    query.push(c);
-                }
-                self.refilter_history_search();
-            }
-            _ => {}
         }
     }
 
@@ -1976,130 +1794,83 @@ impl App {
             .into_iter()
             .filter(|e| q.is_empty() || e.to_ascii_lowercase().contains(&q))
             .collect();
-        if matches.is_empty() {
-            *selected = 0;
-        } else {
-            *selected = (*selected).min(matches.len() - 1);
-        }
+        *selected = (*selected).min(matches.len().saturating_sub(1));
     }
 
     fn open_scroll_search(&mut self) {
-        if self.transcript.block_count() == 0 {
+        let n = self.transcript.block_count();
+        if n == 0 {
             self.note("no conversation yet");
             return;
         }
-        let n = self.transcript.block_count();
-        let matches: Vec<usize> = (0..n).collect();
-        let selected = matches.len().saturating_sub(1);
         self.find_previews.clear();
-        self.scroll_search = Some((String::new(), selected, matches));
+        self.scroll_search = Some((String::new(), n - 1, (0..n).collect()));
         self.completion = None;
         self.focus_scroll_match();
     }
 
     fn on_scroll_search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => {
-                if let Some((q, _, _)) = &self.scroll_search {
-                    if !q.is_empty() {
-                        self.scroll_search_last = Some(q.clone());
-                    }
-                }
-                self.scroll_search = None;
-            }
+            KeyCode::Esc => self.close_scroll_search(),
             KeyCode::Enter => {
                 let has_match = self
                     .scroll_search
                     .as_ref()
                     .is_some_and(|(_, _, matches)| !matches.is_empty());
-                if let Some((q, _, _)) = &self.scroll_search {
-                    if !q.is_empty() {
-                        self.scroll_search_last = Some(q.clone());
-                    }
-                }
                 if has_match {
                     self.focus_scroll_match();
-                    self.scroll_search = None;
-                    self.focus = Focus::Scrollback;
-                } else {
-                    // Nothing to jump to: land back at the prompt. Dropping
-                    // into scrollback focus after a failed search left the
-                    // next typed prompt feeding silent nav bindings.
-                    self.scroll_search = None;
-                    self.focus = Focus::Composer;
                 }
+                self.close_scroll_search();
+                // Nothing to jump to: land back at the prompt. Dropping
+                // into scrollback focus after a failed search left the
+                // next typed prompt feeding silent nav bindings.
+                self.focus = if has_match { Focus::Scrollback } else { Focus::Composer };
             }
             KeyCode::Tab => {
                 // The explicit way OUT of the find bar and into typing:
                 // every other printable key feeds the query, so a prompt
                 // typed here would vanish into it.
-                if let Some((q, _, _)) = &self.scroll_search {
-                    if !q.is_empty() {
-                        self.scroll_search_last = Some(q.clone());
-                    }
-                }
-                self.scroll_search = None;
+                self.close_scroll_search();
                 self.focus = Focus::Composer;
             }
             // Next / previous match while the find bar is open.
             // (n/N step the last query after Enter, from scrollback focus, so
             // the letter n stays typeable in the query.)
-            KeyCode::Up => {
-                self.step_scroll_match(-1);
-            }
-            KeyCode::Down => {
-                self.step_scroll_match(1);
-            }
-            KeyCode::Backspace => {
-                if let Some((query, _, _)) = &mut self.scroll_search {
-                    query.pop();
+            KeyCode::Up => self.step_scroll_match(-1),
+            KeyCode::Down => self.step_scroll_match(1),
+            _ => {
+                if self.scroll_search.as_mut().is_some_and(|(query, _, _)| edit_query(query, &key)) {
+                    self.refilter_scroll_search(false);
                 }
-                self.refilter_scroll_search();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some((query, _, _)) = &mut self.scroll_search {
-                    query.push(c);
-                }
-                self.refilter_scroll_search();
-            }
-            _ => {}
         }
     }
 
-    fn refilter_scroll_search(&mut self) {
-        self.refilter_scroll_search_inner(true);
+    /// Close the find bar, keeping a non-empty query for n/N.
+    fn close_scroll_search(&mut self) {
+        if let Some((query, _, _)) = self.scroll_search.take().filter(|(query, _, _)| !query.is_empty()) {
+            self.scroll_search_last = Some(query);
+        }
     }
 
     /// Refresh matches when the transcript grows under an open find bar.
     /// Keeps the current block selected if it still matches.
     fn refilter_scroll_search_live(&mut self) {
-        if self.scroll_search.is_none() {
-            return;
-        }
-        self.refilter_scroll_search_inner(false);
+        self.refilter_scroll_search(true);
     }
 
-    fn refilter_scroll_search_inner(&mut self, prefer_latest: bool) {
+    /// Rebuild the find bar's matches and select the latest, or with `live`
+    /// keep the selected block while it still matches.
+    fn refilter_scroll_search(&mut self, live: bool) {
+        let Some((query, selected, matches)) = &mut self.scroll_search else {
+            return;
+        };
         self.find_previews.clear();
-        {
-            let Some((query, selected, matches)) = &mut self.scroll_search else {
-                return;
-            };
-            let prev_bi = matches.get(*selected).copied();
-            *matches = self.transcript.filter_matches(query);
-            if matches.is_empty() {
-                *selected = 0;
-            } else if prefer_latest {
-                *selected = matches.len() - 1;
-            } else if let Some(bi) = prev_bi {
-                *selected = matches
-                    .iter()
-                    .position(|&m| m == bi)
-                    .unwrap_or(matches.len() - 1);
-            } else {
-                *selected = matches.len() - 1;
-            }
-        }
+        let kept = matches.get(*selected).copied().filter(|_| live);
+        *matches = self.transcript.filter_matches(query);
+        *selected = kept
+            .and_then(|block| matches.iter().position(|&m| m == block))
+            .unwrap_or(matches.len().saturating_sub(1));
         self.focus_scroll_match();
     }
 
@@ -2468,17 +2239,7 @@ impl App {
                 self.turn_started = Some(Instant::now());
                 self.first_token = None;
                 self.stream_chars = 0;
-                self.stream_text.clear();
-                self.stream_wrapped.clear();
-                self.stream_stable_len = 0;
-                self.stream_md.clear();
-                self.tail_content_len = 0;
-                self.tail_stable_len = 0;
-                self.tail_buf.clear();
-                self.thinking_chars = 0;
-                self.thinking_tail.clear();
-                self.thinking_source.clear();
-                self.thinking_wrapped.clear();
+                self.clear_live_tail();
                 self.dirty.mark_chat();
                 self.dirty.mark_chrome();
             }
@@ -2513,22 +2274,15 @@ impl App {
                 // exists to grow. Same shadowing rule as the popup: a
                 // template that collides with a built-in name never
                 // dispatches, so advertising it here would be a lie.
-                let templates = self.templates.iter().filter(|(name, _)| {
-                    !completion::COMMANDS.iter().any(|spec| spec.name == *name)
-                });
-                let mut first = true;
-                for (name, desc) in templates {
-                    if first {
-                        block.push(Line::default());
-                        first = false;
-                    }
-                    let usage = format!("/{name}");
-                    let desc: &str = if desc.is_empty() {
-                        "prompt template"
-                    } else {
-                        desc
-                    };
-                    block.push(help_line(&usage, desc));
+                let templates: Vec<_> = self
+                    .templates
+                    .iter()
+                    .filter(|(name, _)| !completion::COMMANDS.iter().any(|spec| spec.name == *name))
+                    .map(|(name, desc)| help_line(&format!("/{name}"), if desc.is_empty() { "prompt template" } else { desc }))
+                    .collect();
+                if !templates.is_empty() {
+                    block.push(Line::default());
+                    block.extend(templates);
                 }
                 self.transcript.push(block);
                 self.dirty.mark_chat();
@@ -2601,21 +2355,10 @@ impl App {
                     Err(e) => self.error(&format!("export to {} failed: {e}", target.display())),
                 }
             }
-            "copy" => {
-                if let Some(text) = self
-                    .last_assistant_response
-                    .clone()
-                    .or_else(|| self.transcript.last_assistant_text())
-                {
-                    if clipboard::copy_text(&mut self.term_out, &text) {
-                        self.note("copied latest assistant response");
-                    } else {
-                        self.note("copy failed (terminal may block OSC 52)");
-                    }
-                } else {
-                    self.note("no assistant response to copy");
-                }
-            }
+            "copy" => match self.last_assistant_response.clone().or_else(|| self.transcript.last_assistant_text()) {
+                Some(text) => self.note_copy(&text, "latest assistant response"),
+                None => self.note("no assistant response to copy"),
+            },
             "provider" => {
                 match rest.first() {
                     None => self.open_model_picker(),
@@ -2735,29 +2478,12 @@ impl App {
                 // turn runs (or with no session), preview what the next new
                 // session would freeze from today's config.
                 let frozen = match &self.session_id {
-                    Some(id) => self
-                        .core
-                        .sessions
-                        .lock()
-                        .await
-                        .get(id)
-                        .map(|data| data.prompt_breakdown.as_ref().clone()),
+                    Some(id) => self.core.sessions.lock().await.get(id).map(|data| data.prompt_breakdown.as_ref().clone()),
                     None => None,
                 };
                 let (breakdown, is_frozen) = match frozen {
                     Some(b) => (b, true),
-                    None => {
-                        let project = self.project.clone();
-                        let dd = self.core.data_dir.clone();
-                        let registry = tokio::task::spawn_blocking({
-                            let project = project.clone();
-                            move || registry::Registry::build(&dd, &project)
-                        })
-                        .await
-                        .unwrap_or_else(|_| registry::Registry::builtin_only());
-                        let (_, b) = prompt::system_prompt_with_breakdown(&project, &registry);
-                        (b, false)
-                    }
+                    None => (prompt::system_prompt_with_breakdown(&self.project, &self.preview_registry().await).1, false),
                 };
                 let session_cache = self
                     .session_id
@@ -2774,47 +2500,21 @@ impl App {
                     session_cache,
                 ));
             }
-            "tools" => {
+            "tools" | "skills" => {
+                let block = |registry: &registry::Registry, frozen| match head {
+                    "tools" => extensions::tools_block(registry, frozen),
+                    _ => extensions::skills_block(&registry.skills, &self.project, frozen),
+                };
                 // Hold the sessions lock only long enough to format a frozen
                 // registry. Disk preview runs after the lock is released so a
                 // slow tools/skills tree cannot stall other session access.
                 let frozen = {
                     let sessions = self.core.sessions.lock().await;
-                    self.session_id
-                        .as_ref()
-                        .and_then(|id| sessions.get(id))
-                        .map(|data| extensions::tools_block(&data.registry, true))
+                    self.session_id.as_ref().and_then(|id| sessions.get(id)).map(|data| block(&data.registry, true))
                 };
-                let lines = if let Some(lines) = frozen {
-                    lines
-                } else {
-                    let project = self.project.clone();
-                    let dd = self.core.data_dir.clone();
-                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&dd, &project))
-                        .await
-                        .unwrap_or_else(|_| registry::Registry::builtin_only());
-                    extensions::tools_block(&reg, false)
-                };
-                self.transcript.push(lines);
-            }
-            "skills" => {
-                let frozen = {
-                    let sessions = self.core.sessions.lock().await;
-                    self.session_id.as_ref().and_then(|id| {
-                        sessions.get(id).map(|data| {
-                            extensions::skills_block(&data.registry.skills, &self.project, true)
-                        })
-                    })
-                };
-                let lines = if let Some(lines) = frozen {
-                    lines
-                } else {
-                    let project = self.project.clone();
-                    let dd = self.core.data_dir.clone();
-                    let reg = tokio::task::spawn_blocking(move || registry::Registry::build(&dd, &project))
-                        .await
-                        .unwrap_or_else(|_| registry::Registry::builtin_only());
-                    extensions::skills_block(&reg.skills, &self.project, false)
+                let lines = match frozen {
+                    Some(lines) => lines,
+                    None => block(&self.preview_registry().await, false),
                 };
                 self.transcript.push(lines);
             }
@@ -2904,6 +2604,15 @@ impl App {
         }
     }
 
+    /// The registry the next new session would freeze from today's config,
+    /// built on a blocking thread so a slow tree cannot stall the loop.
+    async fn preview_registry(&self) -> registry::Registry {
+        let (data_dir, project) = (self.core.data_dir.clone(), self.project.clone());
+        tokio::task::spawn_blocking(move || registry::Registry::build(&data_dir, &project))
+            .await
+            .unwrap_or_else(|_| registry::Registry::builtin_only())
+    }
+
     // ---------- core events ----------
 
     async fn on_core_event(&mut self, env: AgentEventEnvelope) {
@@ -2939,16 +2648,51 @@ impl App {
         if self.queued.is_empty() {
             return;
         }
-        let mut text = self.queued.join("\n");
+        let text = self.queued.join("\n");
         self.queued.clear();
         self.steered = 0;
+        self.restore_to_composer(text);
+        self.note("queued input returned to the composer");
+    }
+
+    /// Put `text` back in the composer, ahead of any draft typed meanwhile.
+    fn restore_to_composer(&mut self, mut text: String) {
         if !self.composer.is_empty() {
             text.push('\n');
             text.push_str(&self.composer.text());
         }
         self.composer.load(&text);
         self.dirty.mark_chrome();
-        self.note("queued input returned to the composer");
+    }
+
+    /// A steer the running turn settled leaves the queue strip.
+    fn unqueue_steer(&mut self, text: &str) {
+        if let Some(i) = self.queued[..self.steered].iter().position(|q| q == text) {
+            self.queued.remove(i);
+            self.steered -= 1;
+        }
+    }
+
+    /// Drop the live stream, the reasoning shown with it and the tail
+    /// stitched from both. With the caches empty, `rebuild_tail` would see no
+    /// edge to rebuild on, so the tail goes too, or a finished body would
+    /// still paint under the spinner.
+    fn clear_live_tail(&mut self) {
+        self.stream_text.clear();
+        self.stream_wrapped.clear();
+        self.stream_stable_len = 0;
+        self.stream_md.clear();
+        self.clear_thinking();
+        self.tail_content_len = 0;
+        self.tail_stable_len = 0;
+        self.tail_buf.clear();
+    }
+
+    fn clear_thinking(&mut self) {
+        self.thinking_chars = 0;
+        self.thinking_tail.clear();
+        self.thinking_source.clear();
+        self.thinking_wrapped.clear();
     }
 
     /// A dim one-line record of a finished turn, kept only when the turn was
@@ -3008,20 +2752,7 @@ impl App {
                     self.transcript.push_assistant(rendered);
                     self.refilter_scroll_search_live();
                 }
-                self.stream_text.clear();
-                self.stream_wrapped.clear();
-                self.stream_stable_len = 0;
-                self.stream_md.clear();
-                self.thinking_tail.clear();
-                self.thinking_source.clear();
-                self.thinking_wrapped.clear();
-                self.thinking_chars = 0;
-                // Caches above are already empty, so rebuild_tail would not see a
-                // stream_changed edge; drop the stitched tail content here so the
-                // finished assistant body is not still painted under the spinner.
-                self.tail_content_len = 0;
-                self.tail_stable_len = 0;
-                self.tail_buf.clear();
+                self.clear_live_tail();
                 self.dirty.mark_chat();
             }
             AgentEvent::Budget { used_tokens, context_tokens } => {
@@ -3202,10 +2933,7 @@ impl App {
                 // The reasoning shown so far belongs to the attempt that
                 // failed; the fresh attempt starts its own. The reason can
                 // carry a backend body; the note is one line.
-                self.thinking_tail.clear();
-                self.thinking_source.clear();
-                self.thinking_wrapped.clear();
-                self.thinking_chars = 0;
+                self.clear_thinking();
                 self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
                 self.dirty.mark_tail();
             }
@@ -3242,10 +2970,7 @@ impl App {
             AgentEvent::SteerAccepted { text } => {
                 // The steer leaves the queue strip for its place in the
                 // transcript, the one a resumed session replays it at.
-                if let Some(i) = self.queued[..self.steered].iter().position(|q| *q == text) {
-                    self.queued.remove(i);
-                    self.steered -= 1;
-                }
+                self.unqueue_steer(&text);
                 self.insert_user_block(&text);
                 self.refilter_scroll_search_live();
                 self.dirty.mark_chat();
@@ -3257,17 +2982,8 @@ impl App {
                 // it again and start work the user was told is blocked. Back
                 // to the composer, ahead of any draft, as a blocked prompt
                 // comes back.
-                if let Some(i) = self.queued[..self.steered].iter().position(|q| *q == text) {
-                    self.queued.remove(i);
-                    self.steered -= 1;
-                }
-                let mut restored = text;
-                if !self.composer.is_empty() {
-                    restored.push('\n');
-                    restored.push_str(&self.composer.text());
-                }
-                self.composer.load(&restored);
-                self.dirty.mark_chrome();
+                self.unqueue_steer(&text);
+                self.restore_to_composer(text);
                 self.error(&format!("steer blocked: {reason}"));
             }
             AgentEvent::Done { stop_reason } => {
@@ -3279,66 +2995,34 @@ impl App {
                 // Spinner/status clear plus any transcript note/stats.
                 self.dirty.mark_chat();
                 self.dirty.mark_chrome();
+                let submitted = self.pending_submit.take();
                 match stop_reason.as_str() {
-                    "stop" | "tool_calls" => {
-                        self.pending_submit = None;
-                        self.push_turn_stats();
-                    }
-                    "cancelled" => {
-                        self.pending_submit = None;
-                        self.note("cancelled");
-                    }
-                    "length" => {
-                        self.pending_submit = None;
-                        self.note("stopped: hit the response token limit");
-                    }
-                    "max_iterations" => {
-                        self.pending_submit = None;
-                        self.note(
-                            "stopped: reached the tool-call limit for one turn (send a follow-up to continue)",
-                        );
-                    }
-                    "budget_exhausted" => {
-                        self.pending_submit = None;
-                        self.note(
-                            "stopped: reached the token budget for one turn (send a follow-up to continue)",
-                        );
-                    }
-                    "unverified" => {
-                        self.pending_submit = None;
-                        self.note(
-                            "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
-                        );
-                    }
-                    "error" => {
-                        self.pending_submit = None;
-                    }
+                    "stop" | "tool_calls" => self.push_turn_stats(),
+                    "cancelled" => self.note("cancelled"),
+                    "length" => self.note("stopped: hit the response token limit"),
+                    "max_iterations" => self.note(
+                        "stopped: reached the tool-call limit for one turn (send a follow-up to continue)",
+                    ),
+                    "budget_exhausted" => self.note(
+                        "stopped: reached the token budget for one turn (send a follow-up to continue)",
+                    ),
+                    "unverified" => self.note(
+                        "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
+                    ),
+                    "error" => {}
                     "blocked" => {
                         // Core never accepted the text: drop the optimistic
-                        // user bubble and restore it to the composer. An
-                        // open find popup indexes blocks, so its matches
+                        // user bubble and restore it to the composer, ahead
+                        // of any draft typed while the block was in flight.
+                        // An open find popup indexes blocks, so its matches
                         // and previews must rebuild with the block gone.
                         let _ = self.transcript.pop_last_user();
                         self.refilter_scroll_search_live();
-                        if let Some(text) = self.pending_submit.take() {
-                            if self.composer.is_empty() {
-                                self.composer.load(&text);
-                            } else {
-                                // Preserve any draft the user started typing
-                                // while the block was in flight.
-                                let mut combined = text;
-                                combined.push('\n');
-                                combined.push_str(&self.composer.text());
-                                self.composer.load(&combined);
-                            }
+                        if let Some(text) = submitted {
+                            self.restore_to_composer(text);
                         }
-                        self.dirty.mark_chat();
-                        self.dirty.mark_chrome();
                     }
-                    other => {
-                        self.pending_submit = None;
-                        self.note(&format!("stopped: {other}"));
-                    }
+                    other => self.note(&format!("stopped: {other}")),
                 }
                 if !self.queued.is_empty() {
                     // An interrupted or failed turn returns the queue to the
@@ -4002,16 +3686,11 @@ impl App {
     }
 
     fn tok_per_sec(&self) -> f64 {
-        match self.first_token {
-            Some(t) => {
-                let secs = t.elapsed().as_secs_f64();
-                if secs < 0.5 {
-                    0.0
-                } else {
-                    (self.stream_chars as f64 / 4.0) / secs
-                }
-            }
-            None => 0.0,
+        let secs = self.first_token.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        if secs < 0.5 {
+            0.0
+        } else {
+            (self.stream_chars as f64 / 4.0) / secs
         }
     }
 
@@ -4123,6 +3802,19 @@ impl App {
     }
 }
 
+/// Backspace and typed characters edit a search overlay's query. Returns
+/// whether `key` was one of them.
+fn edit_query(query: &mut String, key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Backspace => {
+            query.pop();
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => query.push(c),
+        _ => return false,
+    }
+    true
+}
+
 fn command_parts(command: &str) -> (&str, &str) {
     let command = command.trim();
     let head_end = command
@@ -4191,8 +3883,6 @@ enum Presence {
     NeedsApproval,
 }
 
-/// Humanized token count for the status line: `842`, `16.8k`, `2.4M`,
-/// with a whole `.0` dropped (`17k`, never `17.0k`).
 /// The widest status tier: the labeled metrics and the approval mode are the
 /// point of the tier, so the tail is built first and the model id gives way,
 /// clipped to the width the tail leaves over. Rendering the full id let a
@@ -4221,6 +3911,8 @@ fn wide_status_right(
     format!("{}{tail}", clip(short_model, model_max))
 }
 
+/// Humanized token count for the status line: `842`, `16.8k`, `2.4M`,
+/// with a whole `.0` dropped (`17k`, never `17.0k`).
 fn compact_count(n: u64) -> String {
     let (value, suffix) = if n >= 1_000_000 {
         (n as f64 / 1e6, "M")
@@ -4289,54 +3981,14 @@ fn history_search_lines(
     items: &[String],
     width: u16,
 ) -> Vec<Line<'static>> {
-    let width = width as usize;
-    let mut lines = vec![Line::from(vec![
-        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
-        Span::styled(
-            if query.is_empty() {
-                "history…".to_string()
-            } else {
-                query.to_string()
-            },
-            if query.is_empty() {
-                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)
-            } else {
-                Style::default()
-            },
-        ),
-    ])];
-    if items.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no matches",
-            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-        )));
-        return lines;
-    }
-    let visible = items.len().min(6);
-    let first = selected.saturating_sub(visible - 1).min(items.len() - visible);
-    for (i, item) in items.iter().enumerate().skip(first).take(visible) {
-        let on = i == selected;
-        let marker = if on {
-            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
-        } else {
-            Span::raw("  ")
-        };
-        let style = if on {
-            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::DIM())
-        };
-        let one_line = item.replace('\n', " ");
-        lines.push(Line::from(vec![
-            marker,
-            Span::styled(clip(&one_line, width.saturating_sub(4)), style),
-        ]));
-    }
+    let mut lines = search_lines("history…", query, None, selected, items.len(), width, |i, max| {
+        clip(&items[i].replace('\n', " "), max)
+    });
     // The window shows six; without this the other N look like they do not
     // exist, unlike the sibling completion popup which always says so.
-    if items.len() > visible {
+    if items.len() > SEARCH_ROWS {
         lines.push(Line::from(Span::styled(
-            format!("  … {} more (keep typing)", items.len() - visible),
+            format!("  … {} more (keep typing)", items.len() - SEARCH_ROWS),
             Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
         )));
     }
@@ -4351,66 +4003,71 @@ fn scroll_search_lines(
     previews: &mut std::collections::HashMap<usize, String>,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let width = width as usize;
     let count = if matches.is_empty() {
         "0/0".to_string()
     } else {
         format!("{}/{}", selected + 1, matches.len())
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
-        Span::styled(
-            if query.is_empty() {
-                "find in conversation…".to_string()
-            } else {
-                query.to_string()
-            },
-            if query.is_empty() {
-                Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)
-            } else {
-                Style::default()
-            },
-        ),
-        Span::raw("  "),
-        Span::styled(count, Style::default().fg(theme::DIM())),
-    ])];
-    if matches.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no matches",
-            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-        )));
-        return lines;
-    }
-    let visible = matches.len().min(6);
-    let first = selected
-        .saturating_sub(visible - 1)
-        .min(matches.len() - visible);
-    for (i, &bi) in matches.iter().enumerate().skip(first).take(visible) {
-        let on = i == selected;
-        let marker = if on {
-            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
-        } else {
-            Span::raw("  ")
-        };
-        let style = if on {
-            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::DIM())
-        };
+    search_lines("find in conversation…", query, Some(count), selected, matches.len(), width, |i, max| {
         // Built once per (query, block): this renders on every frame while
         // the popup is open, including every streaming frame, and a preview
         // walks the block's text. The caller clears the cache when matches
         // rebuild.
+        let bi = matches[i];
         let preview = previews.entry(bi).or_insert_with(|| {
             transcript
                 .block_preview(bi, query)
                 .unwrap_or_else(|| format!("block {bi}"))
                 .replace('\n', " ")
         });
-        lines.push(Line::from(vec![
-            marker,
-            Span::styled(clip(preview, width.saturating_sub(4)), style),
-        ]));
+        clip(preview, max)
+    })
+}
+
+/// Rows a search overlay shows at once.
+const SEARCH_ROWS: usize = 6;
+
+/// A search overlay: the query, or `placeholder` while it is empty, and any
+/// `count` after it, then a window of up to `SEARCH_ROWS` of the `total` rows
+/// around the selected one, each the text `row` gives for its index clipped
+/// to the width it is passed.
+fn search_lines(
+    placeholder: &str,
+    query: &str,
+    count: Option<String>,
+    selected: usize,
+    total: usize,
+    width: u16,
+    mut row: impl FnMut(usize, usize) -> String,
+) -> Vec<Line<'static>> {
+    let dim_italic = Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC);
+    let mut header = vec![
+        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
+        if query.is_empty() {
+            Span::styled(placeholder.to_string(), dim_italic)
+        } else {
+            Span::styled(query.to_string(), Style::default())
+        },
+    ];
+    if let Some(count) = count {
+        header.push(Span::raw("  "));
+        header.push(Span::styled(count, Style::default().fg(theme::DIM())));
+    }
+    let mut lines = vec![Line::from(header)];
+    if total == 0 {
+        lines.push(Line::from(Span::styled("  no matches", dim_italic)));
+        return lines;
+    }
+    let visible = total.min(SEARCH_ROWS);
+    let first = selected.saturating_sub(visible - 1).min(total - visible);
+    for i in first..first + visible {
+        let (marker, style) = if i == selected {
+            let accent = Style::default().fg(theme::ACCENT());
+            (Span::styled("▸ ", accent), accent.add_modifier(Modifier::BOLD))
+        } else {
+            (Span::raw("  "), Style::default().fg(theme::DIM()))
+        };
+        lines.push(Line::from(vec![marker, Span::styled(row(i, (width as usize).saturating_sub(4)), style)]));
     }
     lines
 }
@@ -4529,27 +4186,15 @@ fn header_path_line(project: &std::path::Path, width: usize) -> Line<'static> {
 }
 
 fn home_shortened(path: &str, home: Option<&str>) -> String {
-    let Some(home) = home else {
-        return path.to_string();
-    };
-    if home.is_empty() || home == "/" {
-        return path.to_string();
-    }
-    if path == home {
-        return "~".to_string();
-    }
-    match path.strip_prefix(home) {
+    match home.filter(|home| !home.is_empty() && *home != "/").and_then(|home| path.strip_prefix(home)) {
+        Some("") => "~".to_string(),
         Some(rest) if rest.starts_with('/') => format!("~{rest}"),
         _ => path.to_string(),
     }
 }
 
 fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        format!("{n} {word}")
-    } else {
-        format!("{n} {word}s")
-    }
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
 fn kv(k: &str, v: &str) -> Line<'static> {
@@ -6574,6 +6219,56 @@ mod tests {
         assert!(text.contains("… 4 more (keep typing)"), "{text}");
     }
 
+    /// Both search overlays show the query (or what to type) and a window of
+    /// six rows that follows the selection, marked; with nothing to list they
+    /// say so, and a list that fits names nothing hidden.
+    #[test]
+    fn search_overlays_window_six_rows_around_the_selection() {
+        let text = |lines: &[Line<'_>]| lines.iter().map(line_text).collect::<Vec<_>>();
+        let items: Vec<String> = (0..10).map(|i| format!("prompt {i}")).collect();
+        let shown = text(&super::history_search_lines("", 8, &items, 40));
+        assert_eq!(shown[0], "⌕ history…");
+        assert_eq!(&shown[1..7], ["  prompt 3", "  prompt 4", "  prompt 5", "  prompt 6", "  prompt 7", "▸ prompt 8"]);
+        assert_eq!(shown[7], "  … 4 more (keep typing)");
+        // A selection past the list still shows its last six.
+        let shown = text(&super::history_search_lines("p", 20, &items, 40));
+        assert_eq!(shown[1], "  prompt 4");
+        assert_eq!(shown[6], "  prompt 9");
+        let shown = text(&super::history_search_lines("p", 0, &items[..6], 40));
+        assert_eq!(shown.len(), 7, "{shown:?}");
+        assert_eq!(shown[1], "▸ prompt 0");
+        assert_eq!(text(&super::history_search_lines("zz", 0, &[], 40)), ["⌕ zz", "  no matches"]);
+
+        let mut transcript = Transcript::new();
+        transcript.set_width(40);
+        for block in ["needle one", "hay", "needle two"] {
+            transcript.push_user(vec![Line::from(block)]);
+        }
+        let mut previews = std::collections::HashMap::new();
+        let shown = text(&super::scroll_search_lines("needle", 1, &[0, 2], &transcript, &mut previews, 40));
+        assert_eq!(shown.len(), 3, "{shown:?}");
+        assert_eq!(shown[0], "⌕ needle  2/2");
+        assert!(shown[1].starts_with("  ") && shown[1].contains("needle one"), "{shown:?}");
+        assert!(shown[2].starts_with("▸ ") && shown[2].contains("needle two"), "{shown:?}");
+        let shown = text(&super::scroll_search_lines("", 0, &[], &transcript, &mut previews, 40));
+        assert_eq!(shown, ["⌕ find in conversation…  0/0", "  no matches"]);
+    }
+
+    /// The live rate counts four characters a token, and only once half a
+    /// second of streaming makes it a rate.
+    #[test]
+    fn throughput_counts_four_chars_a_token_after_half_a_second() {
+        let (mut app, dir) = app_fixture();
+        assert_eq!(app.tok_per_sec(), 0.0);
+        app.stream_chars = 400;
+        app.first_token = Some(std::time::Instant::now());
+        assert_eq!(app.tok_per_sec(), 0.0, "under half a second there is no rate yet");
+        app.first_token = Some(std::time::Instant::now() - Duration::from_secs(2));
+        let rate = app.tok_per_sec();
+        assert!((49.0..=50.0).contains(&rate), "{rate}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A fully typed `@` file mention is mid-prompt, not a finished command:
     /// Enter must accept it and keep composing (the separator closes the
     /// popup), never submit the draft out from under the user.
@@ -6786,6 +6481,7 @@ mod tests {
         assert_eq!(home_shortened("/srv/data", home), "/srv/data");
         assert_eq!(home_shortened("/srv/data", None), "/srv/data");
         assert_eq!(home_shortened("/srv/data", Some("/")), "/srv/data");
+        assert_eq!(home_shortened("/srv/data", Some("")), "/srv/data");
     }
 
     /// The reasoning tail shown during a turn belongs to one attempt. A
@@ -8756,4 +8452,307 @@ mod tests {
         assert_eq!(plural(8, "tool"), "8 tools");
     }
 
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    async fn type_keys(app: &mut App, keys: &[KeyEvent]) {
+        for key in keys {
+            app.on_key(*key).await.unwrap();
+        }
+    }
+
+    /// Every scrollback binding moves the block selection the way the help
+    /// screen says: turn jumps with `[`/`]` and Shift+arrows, a block at a
+    /// time with arrows and j/k, g and G to the ends, Enter/l and o to fold,
+    /// n/N through the last find query, and Esc or Space back to the prompt.
+    #[tokio::test]
+    async fn scrollback_keys_move_the_block_selection_the_help_screen_names() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(40);
+        app.transcript.push_user(vec![Line::from("first question")]);
+        app.transcript.push_assistant(vec![Line::from("an answer")]);
+        app.transcript.push_user(vec![Line::from("second question")]);
+        app.transcript.push_tool(vec![Line::from("ran a tool")], "tool output line".into(), true);
+        app.transcript.push_user(vec![Line::from("third question")]);
+        app.focus = Focus::Scrollback;
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        for (key, selected) in [
+            (press(KeyCode::Char('[')), Some(4)),
+            (press(KeyCode::Char('[')), Some(2)),
+            (press(KeyCode::Char(']')), Some(4)),
+            (shift(KeyCode::Up), Some(2)),
+            (shift(KeyCode::Up), Some(0)),
+            (shift(KeyCode::Down), Some(2)),
+            (press(KeyCode::Up), Some(1)),
+            (press(KeyCode::Down), Some(2)),
+            (press(KeyCode::Char('k')), Some(1)),
+            (press(KeyCode::Char('j')), Some(2)),
+            (press(KeyCode::Char('g')), Some(0)),
+            (shift(KeyCode::Char('G')), None),
+        ] {
+            app.on_key(key).await.unwrap();
+            assert_eq!(app.transcript.selected(), selected, "after {key:?}");
+            assert!(app.focus == Focus::Scrollback, "after {key:?}");
+        }
+
+        // The tool block folds and unfolds under Enter, Right and l, and o
+        // opens the last tool block from anywhere.
+        let shows_output = |app: &mut App| buffer_text(&render_app(app, 60, 20)).contains("tool output line");
+        assert!(!shows_output(&mut app));
+        type_keys(&mut app, &[press(KeyCode::Char('o'))]).await;
+        assert_eq!(app.transcript.selected(), Some(3));
+        assert!(shows_output(&mut app));
+        for key in [press(KeyCode::Enter), press(KeyCode::Right), press(KeyCode::Char('l'))] {
+            let before = shows_output(&mut app);
+            app.on_key(key).await.unwrap();
+            assert_ne!(shows_output(&mut app), before, "{key:?} did not toggle the fold");
+        }
+
+        // n and N step the last find query's matches, both ways around.
+        app.scroll_search_last = Some("question".into());
+        for (key, selected) in [
+            (press(KeyCode::Char('n')), Some(4)),
+            (press(KeyCode::Char('n')), Some(0)),
+            (shift(KeyCode::Char('N')), Some(4)),
+            (shift(KeyCode::Char('N')), Some(2)),
+        ] {
+            app.on_key(key).await.unwrap();
+            assert_eq!(app.transcript.selected(), selected, "after {key:?}");
+        }
+
+        for key in [press(KeyCode::Esc), press(KeyCode::Char(' '))] {
+            app.focus = Focus::Scrollback;
+            app.on_key(key).await.unwrap();
+            assert!(app.focus == Focus::Composer, "{key:?} did not return to the prompt");
+            assert_eq!(app.transcript.selected(), None);
+            assert!(app.composer.is_empty(), "{key:?} reached the composer");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// PageUp and PageDown scroll the conversation by a page from the prompt.
+    #[tokio::test]
+    async fn page_keys_scroll_the_conversation_by_a_page() {
+        let (mut app, dir) = app_fixture();
+        for index in 0..40 {
+            app.transcript.push(vec![Line::from(format!("history line {index}"))]);
+        }
+        render_app(&mut app, 40, 12);
+        let page = app.page_h as usize;
+        app.on_key(press(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(app.transcript.offset(), page);
+        app.on_key(press(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(app.transcript.offset(), 2 * page);
+        app.on_key(press(KeyCode::PageDown)).await.unwrap();
+        assert_eq!(app.transcript.offset(), page);
+        assert!(app.composer.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The model picker owns the keys while it is open: arrows and Tab move
+    /// the selection, typing filters, a control chord types nothing, and
+    /// Enter saves the pick and returns to the chat.
+    #[tokio::test]
+    async fn the_model_picker_moves_filters_and_picks_from_the_keyboard() {
+        let (mut app, dir) = app_fixture();
+        fs::write(
+            dir.join("providers.json"),
+            r#"{"providers":{"alpha":{"base_url":"http://127.0.0.1:9/v1",
+               "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+        )
+        .unwrap();
+        app.handle_submit("/provider alpha".into()).await.unwrap();
+        app.handle_submit("/model".into()).await.unwrap();
+        assert!(app.mode == Mode::ModelPicker);
+        let selected = |app: &App| app.model_picker.as_ref().unwrap().selected;
+        let start = selected(&app);
+        let listed = app.model_picker.as_ref().unwrap().filtered.len();
+        assert!(listed > 2, "need a list to step through");
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        assert_eq!(selected(&app), (start + 1) % listed);
+        app.on_key(press(KeyCode::Tab)).await.unwrap();
+        assert_eq!(selected(&app), (start + 2) % listed);
+        app.on_key(press(KeyCode::Up)).await.unwrap();
+        assert_eq!(selected(&app), (start + 1) % listed);
+
+        type_keys(&mut app, &[press(KeyCode::Char('t')), press(KeyCode::Char('h')), press(KeyCode::Char('x'))]).await;
+        assert_eq!(app.model_picker.as_ref().unwrap().query, "thx");
+        app.on_key(press(KeyCode::Backspace)).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)).await.unwrap();
+        assert_eq!(app.model_picker.as_ref().unwrap().query, "th");
+        let choice = app.model_picker.as_ref().unwrap().selected_choice().unwrap().id.clone();
+        assert_eq!(choice, "three");
+
+        app.on_key(press(KeyCode::Enter)).await.unwrap();
+        assert!(app.mode == Mode::Chat);
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.core.settings.lock().unwrap().model, "three");
+        assert!(app.composer.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ctrl+R searches this project's prompt history: it opens on the newest
+    /// entry, arrows stop at either end, typing narrows the list, Enter loads
+    /// the pick into the composer, and Esc closes it leaving the draft alone.
+    #[tokio::test]
+    async fn history_search_steps_narrows_and_loads_from_the_keyboard() {
+        let (mut app, dir) = app_fixture();
+        for prompt in ["alpha one", "beta two", "alpha three"] {
+            app.composer.load(prompt);
+            app.composer.take();
+        }
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_r).await.unwrap();
+        let selected = |app: &App| app.history_search.as_ref().unwrap().1;
+        assert_eq!(selected(&app), 2, "opens on the newest entry");
+        for (key, expected) in [
+            (KeyCode::Up, 1),
+            (KeyCode::Up, 0),
+            (KeyCode::Up, 0),
+            (KeyCode::Down, 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Down, 2),
+        ] {
+            app.on_key(press(key)).await.unwrap();
+            assert_eq!(selected(&app), expected, "after {key:?}");
+        }
+
+        // A selection past the narrowed list clamps to its end.
+        let typed: Vec<KeyEvent> = "alph".chars().map(|c| press(KeyCode::Char(c))).collect();
+        type_keys(&mut app, &typed).await;
+        assert_eq!(selected(&app), 1);
+        app.on_key(press(KeyCode::Char('x'))).await.unwrap();
+        app.on_key(press(KeyCode::Backspace)).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)).await.unwrap();
+        let (query, selected, matches) = app.history_search.clone().unwrap();
+        assert_eq!(query, "alph");
+        assert_eq!(matches, ["alpha one", "alpha three"]);
+        assert_eq!(selected, 0, "no match left nothing to keep selected");
+        assert!(app.composer.is_empty(), "the query took the keys");
+
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        app.on_key(press(KeyCode::Enter)).await.unwrap();
+        assert!(app.history_search.is_none());
+        assert!(app.focus == Focus::Composer);
+        assert_eq!(app.composer.text(), "alpha three");
+
+        app.on_key(ctrl_r).await.unwrap();
+        app.on_key(press(KeyCode::Up)).await.unwrap();
+        app.on_key(press(KeyCode::Esc)).await.unwrap();
+        assert!(app.history_search.is_none());
+        assert_eq!(app.composer.text(), "alpha three");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ctrl+F's arrows step its matches and wrap, and Esc keeps the query
+    /// for n/N.
+    #[tokio::test]
+    async fn the_find_bar_steps_its_matches_and_keeps_its_query() {
+        let (mut app, dir) = app_fixture();
+        app.transcript.set_width(40);
+        for text in ["needle one", "hay", "needle two", "needle three"] {
+            app.transcript.push_user(vec![Line::from(text)]);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)).await.unwrap();
+        // It opens on every block, the latest selected.
+        assert_eq!(app.scroll_search.as_ref().unwrap().1, 3);
+        assert_eq!(app.transcript.selected(), Some(3));
+        let typed: Vec<KeyEvent> = "needle".chars().map(|c| press(KeyCode::Char(c))).collect();
+        type_keys(&mut app, &typed).await;
+        assert_eq!(app.scroll_search.as_ref().unwrap().2, [0, 2, 3]);
+        for (key, block) in [(KeyCode::Up, 2), (KeyCode::Up, 0), (KeyCode::Up, 3), (KeyCode::Down, 0)] {
+            app.on_key(press(key)).await.unwrap();
+            assert_eq!(app.transcript.selected(), Some(block), "after {key:?}");
+        }
+        // A block that arrives under the open bar joins its matches, and the
+        // block being looked at stays selected.
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        app.on_agent_event(AgentEvent::MessageDone { text: "needle four".into() });
+        assert_eq!(app.scroll_search.as_ref().unwrap().2, [0, 2, 3, 4]);
+        assert_eq!(app.transcript.selected(), Some(2));
+        app.on_key(press(KeyCode::Esc)).await.unwrap();
+        assert!(app.scroll_search.is_none());
+        assert_eq!(app.scroll_search_last.as_deref(), Some("needle"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// /tools and /skills list what the next new session would load when no
+    /// session has frozen its own, and /context counts the same tools.
+    #[tokio::test]
+    async fn tools_skills_and_context_preview_the_next_session() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/tools".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("tools (preview of the next new session)"), "{shown}");
+        assert!(shown.contains("read_file") && shown.contains("built-in"), "{shown}");
+        app.handle_submit("/skills".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("skills (preview of the next new session)"), "{shown}");
+        assert!(shown.contains("(none loaded)") && shown.contains("0 skills"), "{shown}");
+        app.handle_submit("/context".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("context (preview of the next new session)"), "{shown}");
+        assert!(!shown.contains("tools (0 built-in)"), "{shown}");
+        assert!(!shown.contains("unknown command"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An open command menu takes the arrows: Down and Up step through it.
+    #[tokio::test]
+    async fn the_command_menu_takes_the_arrow_keys() {
+        let (mut app, dir) = app_fixture();
+        app.on_key(press(KeyCode::Char('/'))).await.unwrap();
+        let selected = |app: &App| app.completion.as_ref().unwrap().selected;
+        assert_eq!(selected(&app), 0);
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        assert_eq!(selected(&app), 1);
+        app.on_key(press(KeyCode::Down)).await.unwrap();
+        app.on_key(press(KeyCode::Up)).await.unwrap();
+        assert_eq!(selected(&app), 1);
+        assert_eq!(app.composer.text(), "/");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The mouse in the conversation: a paste lands in the prompt, a drag
+    /// selects as it moves, a release extends to its own cell, double and
+    /// triple clicks take the word and the line, and nothing reaches the
+    /// chat while a picker is open.
+    #[tokio::test]
+    async fn the_mouse_selects_conversation_text_and_pastes_into_the_prompt() {
+        let (mut app, dir) = app_fixture();
+        app.on_term_event(TermEvent::Paste("pasted words".into())).await.unwrap();
+        assert_eq!(app.composer.text(), "pasted words");
+        app.composer.clear();
+        app.transcript.push_user(vec![Line::from("alpha beta gamma")]);
+        let painted = rows(&render_app(&mut app, 40, 12));
+        let row = painted.iter().position(|text| text.contains("alpha beta")).unwrap() as u16;
+        let shown = &painted[row as usize];
+        let from = shown[..shown.find("alpha").unwrap()].chars().count() as u16;
+        let event = |kind, column| mouse(kind, column, row);
+
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), from)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::Drag(MouseButton::Left), from + 4)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("alpha"), "a drag selects as it moves");
+        app.on_term_event(event(MouseEventKind::Up(MouseButton::Left), from + 9)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("alpha beta"), "a release reaches its cell");
+
+        // A second and third press on one cell, quickly: the word, then the line.
+        let word = from + 7;
+        app.last_click = None;
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), word)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), word)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("beta"));
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), word)).await.unwrap();
+        assert_eq!(app.transcript.selected_text().as_deref(), Some("alpha beta gamma"));
+
+        app.transcript.clear_text_selection();
+        app.mode = Mode::ModelPicker;
+        app.on_term_event(event(MouseEventKind::Down(MouseButton::Left), from)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::Up(MouseButton::Left), from + 4)).await.unwrap();
+        app.on_term_event(event(MouseEventKind::ScrollUp, from)).await.unwrap();
+        assert_eq!(app.transcript.selected_text(), None, "a picker's mouse reached the chat");
+        assert_eq!(app.transcript.offset(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
