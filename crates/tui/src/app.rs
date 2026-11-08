@@ -4866,6 +4866,9 @@ fn is_shift_tab(key: &KeyEvent) -> bool {
 }
 
 #[cfg(test)]
+mod interaction_tests;
+
+#[cfg(test)]
 mod thesis_frames;
 
 #[cfg(test)]
