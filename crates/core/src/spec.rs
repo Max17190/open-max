@@ -192,7 +192,7 @@ script itself before first use:
 
 The tools array is the one the session began with, so a write never moves
 the cached prompt prefix. A tool file written or changed after that is a
-line of the trailing note at the end of each request, `- name: description
+line of the note stored in your history when it changes, `- name: description
 <params as JSON>; bash: printf '%s\n' '<JSON arguments>' | command args`
 (command and args shell-quoted): run it with that bash command, the JSON
 arguments filled in (a `'` in them written `'\''`), from your next step on.
@@ -324,8 +324,8 @@ budget first. More skills or longer descriptions can push a skill out of the
 prompt entirely (`openmax --check` names each one it drops). The prompt
 shows each indexed skill as `- name: description — path/to/SKILL.md`.
 A skill written or changed after the prompt was built shows the same line
-in the trailing note at the end of each request until `/reload` or a new
-session puts it in the prompt.
+in the note stored in your history when it changes, until `/reload` or a
+new session puts it in the prompt.
 
 Example (`.agents/skills/release/SKILL.md`):
 
@@ -940,7 +940,7 @@ history that keeps a fact alive.
 Activation: a memory write does not re-freeze. The index is frozen with the
 prompt for the whole session, so the provider's prompt cache survives every
 write. A memory added, edited, or deleted after the prompt was built is a
-line of the trailing note at the end of each request: from your next step
+line of the note stored in your history when it changes: from your next step
 when you write it with write_file or edit_file, and otherwise (bash, another
 process) from the next re-freeze a tool or skill change causes (that receipt
 then says "Memory index rebuilt with this refreeze (indexed: <name>)") or the
@@ -1076,7 +1076,7 @@ fields. Parse by field name, never by key order. Only two lines carry no
 `session_id`: `protocol_error` and the `approval_mode` acknowledgement
 (`hello`, `transcript`, and `forked` are not events either, but carry one). Types: `token` (text), `thinking`
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
-the tool schemas and any trailing note sent on every request, context_tokens),
+the tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
 (call_id, name, args), `tool_end` (call_id, ok, output), `harness_note`
 (call_id, text: a note the harness wrote into the MODEL's transcript - a
@@ -1092,7 +1092,7 @@ path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt, one line
 per tool or skill file added, modified, or removed), `schemas_over_budget`
-(schema_tokens, budget_tokens: the tool schemas and any trailing note take
+(schema_tokens, budget_tokens: the tool schemas take
 most of what the window can spend, so compaction runs early and stops
 entirely once they reach it; advisory, at most once per session), `compacted` (tokens_before,
 tokens_after, compacted_messages: the receipt of a forced compaction;

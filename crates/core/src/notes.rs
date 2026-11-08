@@ -107,6 +107,28 @@ pub(crate) fn append_and_emit_note(
     core.send_agent(session_id, AgentEvent::HarnessNote { call_id, text: note.to_string() });
 }
 
+/// Store `note`, what the session changed since its prompt was built, unless
+/// the last one stored says the same: after `NOTE_SEPARATOR` at the end of
+/// the last message when that is the user's prompt or a tool result, which
+/// every endpoint takes, else as a user message of its own. Stored where it
+/// changes and never moved, it is history every later request repeats, so a
+/// prompt cache keeps it and the thinking a provider binds to it stays
+/// valid. Each note carries every change since the prompt and replaces those
+/// before it; once nothing differs, the header alone says so. Only user and
+/// tool messages are searched, and tool output has the header defused.
+pub(crate) fn store_note(messages: &mut Vec<ChatMessage>, note: Option<&str>) {
+    let (header, note) = (crate::prompt::NOTE_HEADER, note.unwrap_or(crate::prompt::NOTE_HEADER));
+    let carries = |m: &ChatMessage| m.role == "user" || m.role == "tool";
+    let stored = messages.iter().rev().filter(|m| carries(m)).find_map(|m| m.content.as_deref().filter(|text| text.contains(header)));
+    if stored.map_or(note == header, |text| text.ends_with(note)) {
+        return;
+    }
+    match messages.last_mut().filter(|m| carries(m)) {
+        Some(last) => last.content.get_or_insert_default().push_str(&format!("{}{note}", crate::prompt::NOTE_SEPARATOR)),
+        None => messages.push(ChatMessage::user(note)),
+    }
+}
+
 /// A settings.json drift note, when the file moved outside this process's
 /// own writes. Settings are launch-frozen by design (base_url/api_key are
 /// credential routing, approval_mode hot-adoption would be self-approval),
@@ -312,8 +334,8 @@ pub(crate) async fn narrate_outside_approvals(
     }
 }
 
-/// Tell the frontend, once per session, that the installed tool schemas and
-/// any trailing note cost more than the window can spend. It holds on every
+/// Tell the frontend, once per session, that the installed tool schemas
+/// cost more than the window can spend. It holds on every
 /// turn once it holds at all, so repeating it per turn would be noise; the
 /// turn still runs, because this is the user's configuration to fix, not a
 /// failure of this turn.
@@ -351,7 +373,7 @@ pub(crate) async fn report_schemas_over_budget(
         // a note beside it renders the same advisory twice (the same reason
         // the post-approval receipt rides `outcome.output`).
         let note = crate::text::one_line(&format!(
-            "[tool schemas and any trailing note cost ~{schema_tokens} tokens of the \
+            "[tool schemas cost ~{schema_tokens} tokens of the \
              ~{budget_tokens} this context window can spend on a request. They are resent \
              whole every request, so history compacts early and a long turn may not fit at \
              all. Price each tool with bash: openmax --spec usage, retire one you are not \
@@ -736,4 +758,68 @@ fn approval_state(
             (s.name.clone(), state)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prompt::{NOTE_HEADER, NOTE_SEPARATOR};
+
+    fn call() -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: crate::types::ToolCallFunction { name: "write_file".into(), arguments: "{}".into() },
+            extra_content: None,
+        }
+    }
+
+    /// A note is stored once, where it changes: at the end of the newest
+    /// tool result or prompt, adding no message, and as a user message of its
+    /// own only after an assistant reply or the system prompt alone. The same
+    /// note again stores nothing; a changed one is stored after the earlier,
+    /// which stays; once nothing differs, the header alone supersedes it. A
+    /// copy of the header in an assistant reply is not a stored note.
+    #[test]
+    fn a_note_is_stored_once_where_it_changes() {
+        let (first, second) = (format!("{NOTE_HEADER}\n\n- wordfreq: top"), format!("{NOTE_HEADER}\n\n- lint: lint"));
+        let round = vec![
+            ChatMessage::system("p"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant(None, Some(vec![call()])),
+            ChatMessage::tool("c1", "wrote it"),
+        ];
+        let json = |messages: &[ChatMessage]| serde_json::to_string(messages).unwrap();
+        let mut messages = round.clone();
+        store_note(&mut messages, None);
+        assert_eq!(json(&messages), json(&round), "no note, nothing stored");
+        store_note(&mut messages, Some(&first));
+        assert_eq!(messages.len(), round.len(), "and adds no message");
+        assert_eq!(messages[3].content.as_deref(), Some(format!("wrote it{NOTE_SEPARATOR}{first}").as_str()));
+        let stored = messages.clone();
+        store_note(&mut messages, Some(&first));
+        assert_eq!(json(&messages), json(&stored), "the same note again stores nothing");
+
+        messages.push(ChatMessage::assistant(Some(format!("quoting {second}")), None));
+        messages.push(ChatMessage::user("next"));
+        store_note(&mut messages, Some(&second));
+        assert_eq!(json(&messages[..4]), json(&stored), "the earlier note stays where it was stored");
+        assert_eq!(messages[5].content.as_deref(), Some(format!("next{NOTE_SEPARATOR}{second}").as_str()), "it ends the prompt");
+        store_note(&mut messages, None);
+        assert!(messages[5].content.as_deref().unwrap().ends_with(&format!("{second}{NOTE_SEPARATOR}{NOTE_HEADER}")), "the header alone");
+        let settled = messages.clone();
+        store_note(&mut messages, None);
+        assert_eq!(json(&messages), json(&settled), "which nothing differing keeps");
+
+        for history in [vec![ChatMessage::system("p")], vec![ChatMessage::user("hi"), ChatMessage::assistant(Some("done".into()), None)]] {
+            let mut messages = history.clone();
+            store_note(&mut messages, Some(&first));
+            assert_eq!(messages.len(), history.len() + 1, "a message of its own after {history:?}");
+            assert_eq!(json(&messages[history.len()..]), json(&[ChatMessage::user(first.clone())]));
+        }
+        let mut empty = round.clone();
+        empty[3].content = None;
+        store_note(&mut empty, Some(&first));
+        assert_eq!(empty[3].content.as_deref(), Some(format!("{NOTE_SEPARATOR}{first}").as_str()), "a result with no text carries it");
+    }
 }

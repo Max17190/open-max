@@ -353,9 +353,9 @@ async fn harness_time_per_tool_round() {
 /// manifest (a refreeze), writes a project memory, reads a file and answers;
 /// turn two reads three files and answers. The test checks that all six
 /// tool calls succeeded, that both files exist, and that the new tool's
-/// index line is absent from the first request's last message and present
-/// in the last request's, where the trailing note carries it, and never in
-/// any request's `tools`, since a write that failed or a manifest the
+/// index line is absent from the first request and present in the last
+/// request's history, where the note stored at the write carries it, and
+/// never in any request's `tools`, since a write that failed or a manifest the
 /// registry refused would leave the prefix alone and raise the rate. A
 /// request is a hit when the raw wire bytes of its `messages[0]` and of its
 /// `tools` array, sliced out of the body unparsed, both equal the previous
@@ -402,23 +402,23 @@ async fn prefix_cache_hit_rate() {
     assert_eq!(served.len(), requests, "the scripted session makes exactly {requests} requests");
     // The exact bytes the client wrote: a parse into `Value` and back would
     // sort keys and normalize escapes, hiding a reorder in the frozen wire.
-    let (prefixes, lasts): (Vec<(String, String)>, Vec<String>) = served
+    let prefixes: Vec<(String, String)> = served
         .iter()
         .map(|s| {
             let top: std::collections::HashMap<String, Box<RawValue>> =
                 serde_json::from_str(&s.body).unwrap();
             let messages: Vec<&RawValue> = serde_json::from_str(top["messages"].get()).unwrap();
             let tools = top.get("tools").map(|t| t.get().to_owned()).unwrap_or_default();
-            ((messages[0].get().to_owned(), tools), messages.last().unwrap().get().to_owned())
+            (messages[0].get().to_owned(), tools)
         })
-        .unzip();
+        .collect();
     assert!(
         prefixes.iter().all(|(system, _)| system.contains("\"role\":\"system\"")),
         "every request opens with a system message"
     );
     let index_line = "- wordfreq: top-n words {";
     assert!(
-        !lasts[0].contains(index_line) && lasts[requests - 1].contains(index_line),
+        !served[0].body.contains(index_line) && served[requests - 1].body.contains(index_line),
         "the written tool reaches the wire: its index line is absent from request 1 and present in request {requests}"
     );
     assert!(

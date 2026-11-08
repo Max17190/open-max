@@ -54,7 +54,7 @@ use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
     narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
-    settings_drift_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
+    settings_drift_note, store_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
 };
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 pub use crate::refreeze::reload_session;
@@ -117,8 +117,8 @@ pub const APPROVAL_TIMEOUT_MESSAGE: &str =
     "Approval request timed out with no response. Stop and summarize what you were about to do.";
 
 fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
-    // The trailing note can end this very message, so what a file or a
-    // command printed never carries the note's header.
+    // The note can be stored at the end of this very message, so what a
+    // file or a command printed never carries the note's header.
     let output = crate::prompt::defuse_note_header(&outcome.output);
     if outcome.ok || outcome.output == APPROVAL_TIMEOUT_MESSAGE {
         output.into_owned()
@@ -427,7 +427,7 @@ async fn run_compact(
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
-    let (messages, registry, note, take_seq, factor) = {
+    let (messages, registry, take_seq, factor) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
             .get_mut(session_id)
@@ -438,15 +438,13 @@ async fn run_compact(
             return Err("a turn is in flight; run /compact after it finishes".into());
         }
         let registry = data.registry.clone();
-        let note = data.trailing_note.clone();
         let factor = token_factor(route_ratio(data.prompt_ratio.as_ref(), &client.origin()));
         let (messages, seq) = take_messages(data);
-        (messages, registry, note, seq, factor)
+        (messages, registry, seq, factor)
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
-    // The same overhead the turn loop budgets with: the tool schemas and the
-    // trailing note the next request sends after the history.
-    let schema_tokens = request_overhead(&registry.schemas_wire_arc(), note.as_deref());
+    // The same overhead the turn loop budgets with: the tool schemas.
+    let schema_tokens = request_overhead(&registry.schemas_wire_arc());
     // In estimator units, like the turn loop's; the receipt converts back.
     let budget = to_estimate(
         endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024),
@@ -469,7 +467,7 @@ async fn run_compact(
     if schemas_exceed_budget(trigger, schema_tokens) {
         guard.commit().await;
         return Err(
-            "the frozen tool schemas and any trailing note alone fill the window, so pruning \
+            "the frozen tool schemas alone fill the window, so pruning \
              cannot help; uninstall tools (`openmax --spec usage` ranks what each costs) and \
              /reload, or raise context_tokens"
                 .into(),
@@ -638,6 +636,7 @@ async fn run_loop(
         let data = sessions_map.get_mut(session_id).expect("session was hydrated");
         let first_turn = data.messages.len() <= 1;
         data.messages.push(ChatMessage::user(user_text));
+        store_note(&mut data.messages, data.trailing_note.as_deref());
         let (messages, seq) = take_messages(data);
         (messages, data.registry.clone(), data.trailing_note.clone(), seq, first_turn)
     };
@@ -777,12 +776,10 @@ async fn run_loop(
         reload_approval_policy(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions);
         accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await;
         narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
-        // The tool schemas and the note are re-sent whole on every request,
-        // so they are as real as the transcript: the overhead every request
-        // carries besides the history. Read per iteration: a mid-turn
-        // refreeze swaps the note, and the overhead must follow the current
-        // generation, not the one this turn started with.
-        let schema_tokens = request_overhead(&schemas_wire, note.as_deref());
+        // The tool schemas are re-sent whole on every request, so they are
+        // as real as the transcript: the overhead every request carries
+        // besides the history, the note stored in it included.
+        let schema_tokens = request_overhead(&schemas_wire);
         // The window is counted in the server's tokens and everything
         // compaction compares is an estimate, so the window side converts
         // here, once. `compaction_tokens` converts with it (inside the
@@ -828,7 +825,7 @@ async fn run_loop(
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
         let result = client
-            .stream_chat_with_note(guard.messages(), note.as_deref(), &schemas_wire, cancelled.clone(), move |delta| {
+            .stream_chat(guard.messages(), &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -1458,10 +1455,13 @@ async fn run_loop(
             changes.resync_approvals(core, &registry, project_root, &canonical_root);
         } else if memory_written {
             // A memory write changes no extension byte, so no refreeze ran,
-            // and the note, sent after the history as the harness's account
-            // of what changed, must not go on presenting the line it replaced.
+            // and the note, the harness's account of what changed, must not
+            // go on presenting the line it replaced.
             refresh_note_after_memory_write(core, session_id, project_root, &registry, &mut note).await;
         }
+        // A note this iteration changed goes on its last tool result, the
+        // receipt's, before the save that writes that result.
+        store_note(guard.messages(), note.as_deref());
         save_messages(core, session_id, guard.messages(), false).await;
     }
 
@@ -1768,7 +1768,7 @@ mod tests {
     use crate::client::StreamDelta;
     use crate::compaction::tests::msg;
     use crate::compaction::{
-        enforce_budget, is_digest_message, CompactionDigest, DIGEST_PREFIX, DROPPED_TEXT_CAP_FLOOR, MAX_DIGEST_SNIPPET_BYTES,
+        is_digest_message, CompactionDigest, DIGEST_PREFIX, DROPPED_TEXT_CAP_FLOOR, MAX_DIGEST_SNIPPET_BYTES,
     };
     use crate::notes::{
         canonical_notice, execution_policy_note, outside_approval_note, policy_notice_hash, rehydrate_policy_notices,
@@ -5352,7 +5352,7 @@ mod tests {
         let map = core.sessions.lock().await;
         let data = &map[id];
         let sent = &data.messages[..data.messages.len() - 1];
-        request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
+        request_overhead(&data.registry.schemas_wire_arc())
             + sent.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
     }
 
@@ -5593,7 +5593,7 @@ mod tests {
         let (pruned, raised) = {
             let map = core.sessions.lock().await;
             let data = &map[&id];
-            let sent = request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
+            let sent = request_overhead(&data.registry.schemas_wire_arc())
                 + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
             (sent, data.prompt_ratio.as_ref().unwrap().1)
         };
@@ -6378,7 +6378,7 @@ mod tests {
         let message = error.expect("the failed turn must surface an error");
         assert!(message.contains("maximum context length exceeded"), "{message}");
         assert!(message.contains("over budget before it was sent"), "{message}");
-        assert!(message.contains("frozen tool schemas and any trailing note, re-sent every request"), "{message}");
+        assert!(message.contains("frozen tool schemas, re-sent every request"), "{message}");
         assert!(message.contains("and /reload"), "a frozen schema leaves the request only at /reload: {message}");
         assert!(message.contains("context_tokens 1200"), "{message}");
         assert_eq!(stop.as_deref(), Some("error"));
@@ -7381,7 +7381,7 @@ mod tests {
             }
             // The fat tail puts the automatic path in its fallback band:
             // enforce_budget must hold still on this exact transcript.
-            let schema_tokens = request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref());
+            let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
                 compaction_trigger(budget, schema_tokens, Some(20_000), 1.0, &data.messages),
@@ -7523,7 +7523,7 @@ mod tests {
         let used = {
             let map = core.sessions.lock().await;
             let data = &map[id];
-            request_overhead(&data.registry.schemas_wire_arc(), data.trailing_note.as_deref())
+            request_overhead(&data.registry.schemas_wire_arc())
                 + data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>()
         };
         let mut s = core.settings.lock().unwrap();
@@ -7730,7 +7730,7 @@ mod tests {
         let notes: Vec<&str> = msgs
             .iter()
             .filter_map(|m| m.content.as_deref())
-            .filter(|c| c.contains("tool schemas and any trailing note cost"))
+            .filter(|c| c.contains("tool schemas cost"))
             .collect();
         assert_eq!(notes.len(), 1, "{msgs:?}");
 
@@ -7768,10 +7768,11 @@ mod tests {
     }
 
     /// A mid-turn refreeze leaves the wire schemas alone and grows the note,
-    /// so the overhead the budget carries must follow the current
-    /// generation's note, not the one the session started with.
+    /// which is stored on the iteration's last tool result: the budget counts
+    /// it with the history it is stored in, and the overhead every request
+    /// carries besides the history stays the schemas.
     #[tokio::test]
-    async fn budget_overhead_tracks_the_refrozen_note() {
+    async fn the_budget_counts_a_refrozen_note_with_the_history() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -7789,16 +7790,17 @@ mod tests {
             let (messages, _seq) = take_messages(data);
             (messages, data.registry.clone(), data.trailing_note.clone())
         };
+        messages.push(ChatMessage::assistant(None, Some(vec![ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "write_file".into(), arguments: "{}".into() },
+            extra_content: None,
+        }])));
+        messages.push(ChatMessage::tool("c1", "wrote it"));
         let wire = registry.schemas_wire_arc();
-        let carried = |note: &Option<Arc<str>>| {
-            note.as_deref().map_or(0, |n| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + n.len()))
-        };
-        let before = request_overhead(&wire, note.as_deref());
-        assert_eq!(
-            before,
-            estimate_tokens(wire.len()) + carried(&note),
-            "overhead must be the bytes the request actually carries: the schemas, and the note with its separator"
-        );
+        let history = |messages: &[ChatMessage]| messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+        let before = history(&messages);
+        assert_eq!(note, None, "a session that changed nothing has no note");
 
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
@@ -7808,36 +7810,19 @@ mod tests {
         .unwrap();
         assert!(refreeze_between_iterations(&core, id, &project, &mut registry, &mut note, &mut messages).await);
         assert_eq!(registry.tool_schemas_wire(), &*wire, "the schemas never move");
-        let after = request_overhead(&wire, note.as_deref());
-        assert_eq!(after, estimate_tokens(wire.len()) + carried(&note), "the refrozen note, priced the same way");
-        assert!(after > before, "a new tool must grow the overhead: {before} -> {after}");
-
-        // And enforcement follows: a window that fit the old generation with
-        // this transcript no longer fits the new one.
-        let mut transcript = vec![msg("system", 200), msg("user", 200)];
-        for _ in 0..4 {
-            transcript.push(msg("assistant", 200));
-            transcript.push(msg("tool", 4000));
-        }
-        let budget: usize =
-            before + transcript.iter().map(|m| m.estimated_tokens()).sum::<usize>();
-        let mut old_generation = transcript.clone();
-        assert!(!enforce_budget(&mut old_generation, budget, before).0);
-        assert!(
-            enforce_budget(&mut transcript, budget, after).0,
-            "the refrozen note must be what pushes the turn over"
-        );
+        store_note(&mut messages, note.as_deref());
+        let stored = note.as_deref().expect("a new tool is a change");
+        assert!(messages.last().unwrap().content.as_deref().unwrap().ends_with(stored), "the note ends the tool result");
+        assert!(history(&messages) >= before + estimate_tokens(stored.len()), "the history carries the note");
+        assert_eq!(request_overhead(&wire), estimate_tokens(wire.len()), "and the overhead is the schemas alone");
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `/compact` prices a request the way the turn loop does: the tool
-    /// schemas plus the trailing note the next request sends after the
-    /// history. Pricing the schemas alone under-reported its receipt by the
-    /// note and aimed the prune at a target the next request overshoots by
-    /// the same amount, so the next turn's own budget pass pruned again.
+    /// schemas plus the history, the note stored in it included.
     #[tokio::test]
-    async fn compact_prices_the_trailing_note_like_the_turn_loop() {
+    async fn compact_prices_the_stored_note_like_the_turn_loop() {
         use crate::state::{CancelToken, Core};
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -7854,25 +7839,24 @@ mod tests {
             s.max_tokens = 1_024;
         }
         let mut data = build_session_data(&core, &id, &project).unwrap();
+        // The note a tool written after the prompt leaves, stored on it.
+        data.trailing_note = Some(Arc::from(format!("{}\n\n- wordfreq: top-n words {{}}\n", crate::prompt::NOTE_HEADER)));
         data.messages.push(ChatMessage::user("ship it".to_string()));
+        store_note(&mut data.messages, data.trailing_note.as_deref());
         data.messages.push(ChatMessage::assistant(Some("shipped".into()), None));
         assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
-        // The note a tool written after the prompt leaves.
-        data.trailing_note = Some(Arc::from(format!("{}\n\n- wordfreq: top-n words {{}}\n", crate::prompt::NOTE_HEADER)));
         let transcript: usize = data.messages.iter().map(ChatMessage::estimated_tokens).sum();
         let wire = data.registry.schemas_wire_arc();
-        let note = data.trailing_note.clone();
         core.sessions.lock().await.insert(id.clone(), data);
 
-        let turn_loop = request_overhead(&wire, note.as_deref());
-        assert!(turn_loop > estimate_tokens(wire.len()), "the note must cost something here");
+        let turn_loop = request_overhead(&wire);
 
         let receipt = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
         assert_eq!(receipt.compacted_messages, 0, "the transcript is already under the target");
         assert_eq!(
             receipt.tokens_before,
             turn_loop + transcript,
-            "/compact must count what the turn loop counts: the schemas, the note, and the transcript"
+            "/compact must count what the turn loop counts: the schemas and the transcript, the note in it"
         );
 
         let _ = std::fs::remove_dir_all(dir);
