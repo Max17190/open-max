@@ -22,9 +22,12 @@ impl Scratch {
         self.0.join("data")
     }
     fn configure(&self, url: &str) {
+        self.configure_model(url, "test-model");
+    }
+    fn configure_model(&self, url: &str, model: &str) {
         std::fs::write(
             self.data().join("settings.json"),
-            json!({"provider":"test", "model":"test-model","context_tokens":32768}).to_string(),
+            json!({"provider":"test", "model":model,"context_tokens":32768}).to_string(),
         )
         .unwrap();
         std::fs::write(
@@ -55,9 +58,16 @@ fn call(name: &str, args: Value) -> Value {
 }
 
 async fn server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    serve(replies, false).await
+}
+
+/// `server`, refusing when `strict` a request whose input holds an item the
+/// open Responses input does not define (anything but a message, a function
+/// call, its output or reasoning), as xAI's does: HTTP 422 with its error.
+async fn serve(replies: Vec<String>, strict: bool) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let records = Arc::new(Mutex::new(Vec::new()));
+    let records = Arc::new(Mutex::new(Vec::<Value>::new()));
     let out = records.clone();
     let job = tokio::spawn(async move {
         for reply in replies {
@@ -82,6 +92,15 @@ async fn server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>, tokio:
                         break;
                     }
                 }
+            }
+            let request = out.lock().unwrap().last().unwrap().clone();
+            let defined = |item: &Value| matches!(item.get("type").and_then(Value::as_str),
+                None | Some("message" | "function_call" | "function_call_output" | "reasoning"));
+            if strict && !request["input"].as_array().unwrap().iter().all(defined) {
+                let refusal = json!({"error":"Failed to deserialize the JSON body into the target type: data did not match any variant of untagged enum ModelInput"}).to_string();
+                let head = format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", refusal.len());
+                socket.write_all((head + &refusal).as_bytes()).await.unwrap();
+                continue;
             }
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).as_bytes()).await.unwrap();
             // Deliberately split Unicode and SSE frames across network writes.
@@ -169,6 +188,36 @@ async fn tool_round_and_resume_case(streamed_items: bool, terminal_output: bool)
         let items = request["input"].as_array().unwrap();
         assert!(items.contains(&reasoning));
         assert!(items.iter().any(|i| i["type"] == "function_call_output" && i["call_id"] == "call-1"));
+    }
+}
+
+/// A Responses server whose input has no `additional_tools` item refuses
+/// the whole request that carries one, as xAI's does: its input is an
+/// untagged enum with no such variant, so the reply is HTTP 422 and the turn
+/// ends at its first request. A grok conversation, here behind a local
+/// proxy, carries its tools in `tools` instead, the seven functions the item
+/// carries elsewhere, so the tool round runs and the answer arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_without_the_tools_item_runs_the_tool_round() {
+    let scratch = Scratch::new();
+    let replies = vec![done(json!([call("list_dir", json!({"path":"."}))])), done(json!([message("listed")]))];
+    let (url, requests, job) = serve(replies, true).await;
+    scratch.configure_model(&url, "grok-4.7");
+    open_max_core::trust::grant_trust(&scratch.data(), &scratch.project(), ApprovalMode::Ask).unwrap();
+    let (core, mut rx) = Core::new(scratch.data()).unwrap();
+    let session = open_max_core::sessions::create(&core, scratch.project().display().to_string()).unwrap().id;
+    let events = common::drive_turn(&core, &mut rx, &session, &scratch.project(), "list").await;
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolEnd { ok: true, .. })), "{events:?}");
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Token { text } if text == "listed")), "{events:?}");
+    job.await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        let tools = request["tools"].as_array().expect("the tools go in `tools`");
+        assert_eq!(tools.len(), 7);
+        assert!(tools.iter().all(|tool| tool["type"] == "function" && tool["name"].is_string()));
+        assert_eq!(request["tools"], requests[0]["tools"]);
     }
 }
 
