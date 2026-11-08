@@ -41,10 +41,10 @@ pub fn age(updated_at: u64, now: u64) -> String {
 pub fn render(frame: &mut Frame, area: Rect, state: &SessionsState, now: u64) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("resume", Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD)),
+        Span::styled("resume", theme::ACCENT_BOLD),
         Span::styled(
             format!("  {} session{} in this project", state.items.len(), if state.items.len() == 1 { "" } else { "s" }),
-            Style::default().fg(theme::DIM()),
+            Style::default().fg(theme::DIM),
         ),
     ]));
 
@@ -62,14 +62,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &SessionsState, now: u64) {
             .map(|s| s.title.clone())
             .unwrap_or_else(|| id.clone());
         lines.push(Line::from(vec![
-            Span::styled("delete ", Style::default().fg(theme::ERR()).add_modifier(Modifier::BOLD)),
+            Span::styled("delete ", Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD)),
             Span::raw(format!("\u{201c}{}\u{201d}?  ", clip(&title, 50))),
-            Span::styled("[y] yes  [n] no", Style::default().fg(theme::DIM())),
+            Span::styled("[y] yes  [n] no", Style::default().fg(theme::DIM)),
         ]));
     } else {
         lines.push(Line::from(Span::styled(
             "↑/↓ navigate · enter resume · x delete · esc close",
-            Style::default().fg(theme::DIM()),
+            Style::default().fg(theme::DIM),
         )));
     }
 
@@ -102,7 +102,7 @@ fn row_title(item: &SessionMeta) -> String {
 /// part that falls off the edge.
 fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line<'static> {
     let marker = if selected {
-        Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
+        Span::styled("▸ ", Style::default().fg(theme::ACCENT))
     } else {
         Span::raw("  ")
     };
@@ -120,7 +120,7 @@ fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line
     if (width as usize) < 2 + age_txt.len() {
         return Line::from(Span::styled(
             clip(&age_txt, width as usize),
-            Style::default().fg(theme::DIM()),
+            Style::default().fg(theme::DIM),
         ));
     }
     let title_w = (width as usize)
@@ -132,7 +132,7 @@ fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line
             super::text::pad_right(&clip(&row_title(item), title_w.saturating_sub(2)), title_w),
             title_style,
         ),
-        Span::styled(age_txt, Style::default().fg(theme::DIM())),
+        Span::styled(age_txt, Style::default().fg(theme::DIM)),
     ])
 }
 

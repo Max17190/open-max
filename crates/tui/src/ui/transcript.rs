@@ -24,7 +24,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::theme;
-use crate::ui::text::{cell_width, paint_line, strip_escapes, TAB_WIDTH};
+use crate::ui::text::{cell_width, paint_line, strip_escapes, Selection, TAB_WIDTH};
 
 /// Frames go through one large buffer per flush: bare `Stdout` is
 /// line-buffered at 1 KiB, which turns a busy streaming frame into dozens of
@@ -158,31 +158,6 @@ fn content_width(kind: BlockKind, width: u16) -> u16 {
 pub struct TextPoint {
     pub block: usize,
     pub offset: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TextSelection {
-    anchor: TextPoint,
-    head: TextPoint,
-    dragging: bool,
-    /// Set by a word or line gesture, which picks a real range even when it is
-    /// one character wide. Endpoints are inclusive, so a drag that has not
-    /// moved yet is indistinguishable from a one-character selection; this is
-    /// what tells them apart, and it keeps a plain click from selecting.
-    explicit: bool,
-    /// The inclusive range the press picked: the word or line under a
-    /// gesture, the single character under a plain press. A drag extends
-    /// from it but never shrinks the selection below it, so a gesture's own
-    /// release (and a drag that wanders back inside the range) keeps the
-    /// word or line the user was shown.
-    origin: (TextPoint, TextPoint),
-}
-
-impl TextSelection {
-    /// Whether this covers any text at all.
-    fn is_empty(&self) -> bool {
-        !self.explicit && self.anchor == self.head
-    }
 }
 
 /// The one place a block's search text is lowered, so the test oracle can
@@ -472,7 +447,7 @@ pub struct Transcript {
     /// resurrect a count the user already saw.
     unread: usize,
     selected: Option<usize>,
-    text_selection: Option<TextSelection>,
+    text_selection: Option<Selection<TextPoint>>,
     /// Rows and live-tail rows of the viewport the last frame settled.
     view: (usize, usize),
     /// Width changes, each of which re-measures every block. Oracle for the
@@ -578,24 +553,12 @@ impl Transcript {
                 self.selected = Some(sel - 1);
             }
         }
-        if let Some(selection) = self.text_selection {
-            let (start, end) = normalized_selection(selection);
-            if i >= start.block && i <= end.block {
-                self.text_selection = None;
-            } else {
-                let retreat = |point: TextPoint| TextPoint {
-                    block: point.block.saturating_sub(usize::from(point.block > i)),
-                    offset: point.offset,
-                };
-                self.text_selection = Some(TextSelection {
-                    anchor: retreat(selection.anchor),
-                    head: retreat(selection.head),
-                    dragging: selection.dragging,
-                    explicit: selection.explicit,
-                    origin: (retreat(selection.origin.0), retreat(selection.origin.1)),
-                });
-            }
-        }
+        let retreat = |point: TextPoint| TextPoint {
+            block: point.block.saturating_sub(usize::from(point.block > i)),
+            offset: point.offset,
+        };
+        self.text_selection =
+            self.text_selection.filter(|selection| !selection_contains_block(*selection, i)).map(|s| s.map(retreat));
         true
     }
 
@@ -960,7 +923,7 @@ impl Transcript {
             }
             let mut line = self.blocks[bi].cache[li].clone();
             if selected_bi == Some(bi) {
-                line = surface_line(line, self.width, theme::BORDER());
+                line = surface_line(line, self.width, theme::BORDER);
             }
             out.push(line);
             li += 1;
@@ -998,7 +961,7 @@ impl Transcript {
             if let Some(line) = line {
                 let row = Rect { y, height: 1, ..area };
                 if selected_bi == Some(bi) {
-                    let line = surface_line(line.clone(), self.width, theme::BORDER());
+                    let line = surface_line(line.clone(), self.width, theme::BORDER);
                     paint_line(buf, row, None, &line);
                 } else {
                     paint_line(buf, row, None, line);
@@ -1392,13 +1355,7 @@ impl Transcript {
         let Some(point) = self.hit_test(line_idx, x) else {
             return false;
         };
-        self.text_selection = Some(TextSelection {
-            anchor: point,
-            head: point,
-            dragging: true,
-            explicit: false,
-            origin: (point, point),
-        });
+        self.text_selection = Some(Selection::press(point));
         true
     }
 
@@ -1427,13 +1384,7 @@ impl Transcript {
         };
         // Fall back to what a plain press does, so the gesture still places an
         // anchor a drag can extend from.
-        self.text_selection = Some(TextSelection {
-            anchor: point,
-            head: point,
-            dragging: true,
-            explicit: false,
-            origin: (point, point),
-        });
+        self.text_selection = Some(Selection::press(point));
         let Some(block) = self.blocks.get(point.block) else {
             return false;
         };
@@ -1441,16 +1392,9 @@ impl Transcript {
         if start >= end {
             return false;
         }
-        let lo = TextPoint { block: point.block, offset: start };
         // Endpoints are inclusive, matching what a copy carries.
-        let hi = TextPoint { block: point.block, offset: end - 1 };
-        self.text_selection = Some(TextSelection {
-            anchor: lo,
-            head: hi,
-            dragging: true,
-            explicit: true,
-            origin: (lo, hi),
-        });
+        let (lo, hi) = (TextPoint { offset: start, ..point }, TextPoint { offset: end - 1, ..point });
+        self.text_selection = Some(Selection::range(lo, hi));
         true
     }
 
@@ -1461,20 +1405,7 @@ impl Transcript {
         let Some(selection) = &mut self.text_selection else {
             return false;
         };
-        // The selection grows from the origin range and never shrinks below
-        // it: past either edge the far edge anchors and the pointer leads;
-        // inside it the selection is exactly the range the press picked.
-        let (lo, hi) = selection.origin;
-        if point > hi {
-            selection.anchor = lo;
-            selection.head = point;
-        } else if point < lo {
-            selection.anchor = hi;
-            selection.head = point;
-        } else {
-            selection.anchor = lo;
-            selection.head = hi;
-        }
+        selection.drag_to(point);
         true
     }
 
@@ -1490,14 +1421,9 @@ impl Transcript {
     }
 
     pub fn finish_text_selection(&mut self) {
-        if let Some(selection) = &mut self.text_selection {
-            selection.dragging = false;
-            // A click that never moved is not a selection; a word or line
-            // gesture is one even at a single character.
-            if selection.is_empty() {
-                self.text_selection = None;
-            }
-        }
+        // A click that never moved is not a selection; a word or line
+        // gesture is one even at a single character.
+        self.text_selection = self.text_selection.filter(|selection| !selection.is_empty());
     }
 
     /// Block and column map of wrapped history line `line_idx`. Rows reach
@@ -1534,7 +1460,7 @@ impl Transcript {
         if selection.is_empty() {
             return None;
         }
-        let (start, end) = normalized_selection(selection);
+        let (start, end) = selection.ordered();
         let (block, map) = self.row(line_idx)?;
         if block < start.block || block > end.block {
             return None;
@@ -1570,7 +1496,7 @@ impl Transcript {
         if selection.is_empty() {
             return None;
         }
-        let (start, end) = normalized_selection(selection);
+        let (start, end) = selection.ordered();
         if start.block >= self.blocks.len() || end.block >= self.blocks.len() {
             return None;
         }
@@ -1640,7 +1566,7 @@ impl Transcript {
 /// screen shows output without its escape sequences; the exact bytes stay
 /// in `full_output` for copy and export.
 fn open_view(compact: &[Line<'static>], output: &str) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(theme::DIM());
+    let dim = Style::default().fg(theme::DIM);
     let mut lines = vec![compact.first().cloned().unwrap_or_else(|| Line::from("tool"))];
     for line in output.lines().take(80) {
         lines.push(Line::from(Span::styled(format!("  {}", strip_escapes(line)), dim)));
@@ -1977,7 +1903,7 @@ fn decorate_line(kind: BlockKind, mut line: Line<'static>, first: bool) -> (Line
                 Span::styled(
                     prefix,
                     Style::default()
-                        .fg(theme::USER())
+                        .fg(theme::USER)
                         .add_modifier(Modifier::BOLD),
                 ),
             );
@@ -2006,16 +1932,8 @@ fn surface_line(
     line
 }
 
-fn normalized_selection(selection: TextSelection) -> (TextPoint, TextPoint) {
-    if selection.anchor <= selection.head {
-        (selection.anchor, selection.head)
-    } else {
-        (selection.head, selection.anchor)
-    }
-}
-
-fn selection_contains_block(selection: TextSelection, block: usize) -> bool {
-    let (start, end) = normalized_selection(selection);
+fn selection_contains_block(selection: Selection<TextPoint>, block: usize) -> bool {
+    let (start, end) = selection.ordered();
     block >= start.block && block <= end.block
 }
 
@@ -3539,7 +3457,7 @@ mod tests {
         // User block lines receive the block-selection surface without
         // shifting text geometry.
         for (idx, line) in marked.iter().enumerate() {
-            let selected_surface = line.style.bg == Some(theme::BORDER());
+            let selected_surface = line.style.bg == Some(theme::BORDER);
             assert_eq!(selected_surface, t.is_selected_block_for_line(idx));
             assert_eq!(selected_surface, t.locate(idx).unwrap().0 == 0);
         }

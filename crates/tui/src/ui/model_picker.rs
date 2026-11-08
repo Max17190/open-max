@@ -4,7 +4,7 @@ use std::path::Path;
 
 use open_max_core::providers;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
@@ -135,17 +135,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::BORDER()))
-        .title(Span::styled(
-            " Model ",
-            Style::default()
-                .fg(theme::ACCENT())
-                .add_modifier(Modifier::BOLD),
-        ));
+        .border_style(Style::default().fg(theme::BORDER))
+        .title(Span::styled(" Model ", theme::ACCENT_BOLD));
     let inner = block.inner(area);
     block.render(area, frame.buffer_mut());
     let mut lines = vec![Line::from(vec![
-        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
+        Span::styled("⌕ ", Style::default().fg(theme::ACCENT)),
         Span::styled(
             if state.query.is_empty() {
                 "type to filter".to_string()
@@ -153,9 +148,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
                 state.query.clone()
             },
             if state.query.is_empty() {
-                Style::default()
-                    .fg(theme::DIM())
-                    .add_modifier(Modifier::ITALIC)
+                theme::DIM_ITALIC
             } else {
                 Style::default()
             },
@@ -175,9 +168,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
         let marker = if selected { "▸" } else { " " };
         let active = if item.active { "●" } else { " " };
         let base = if selected {
-            Style::default()
-                .fg(theme::ACCENT())
-                .add_modifier(Modifier::BOLD)
+            theme::ACCENT_BOLD
         } else {
             Style::default()
         };
@@ -208,22 +199,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
                     &clip(provider, provider_width.saturating_sub(1)),
                     provider_width,
                 ),
-                base.fg(theme::DIM()),
+                base.fg(theme::DIM),
             ),
-            Span::styled(clip(&item.id, id_width), base.fg(theme::DIM())),
+            Span::styled(clip(&item.id, id_width), base.fg(theme::DIM)),
         ]));
     }
     if state.filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no matching configured models",
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
-        )));
+        lines.push(Line::from(Span::styled("  no matching configured models", theme::DIM_ITALIC)));
     }
     lines.push(Line::from(Span::styled(
         "↑/↓ navigate · enter select · type to filter · esc close",
-        Style::default().fg(theme::DIM()),
+        Style::default().fg(theme::DIM),
     )));
     Paragraph::new(lines).render(inner, frame.buffer_mut());
     if inner.width > 2 && inner.height > 0 {
@@ -243,6 +229,7 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
     use std::fs;
 
     fn fixture() -> std::path::PathBuf {

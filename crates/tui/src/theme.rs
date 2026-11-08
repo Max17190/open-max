@@ -8,45 +8,23 @@
 //! glyphs and borders instead. There is nothing to switch and nothing to
 //! persist, and nothing here carries a hue.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
-// Call-site names match the old consts so a simple rename keeps working.
-#[allow(non_snake_case)]
-pub fn ACCENT() -> Color {
-    Color::Reset
-}
-#[allow(non_snake_case)]
-pub fn DIM() -> Color {
-    Color::DarkGray
-}
-#[allow(non_snake_case)]
-pub fn CODE() -> Color {
-    Color::Reset
-}
-#[allow(non_snake_case)]
-pub fn OK() -> Color {
-    Color::Reset
-}
-#[allow(non_snake_case)]
-pub fn ERR() -> Color {
-    Color::Reset
-}
-#[allow(non_snake_case)]
-pub fn WARN() -> Color {
-    Color::Reset
-}
-#[allow(non_snake_case)]
-pub fn BORDER() -> Color {
-    Color::DarkGray
-}
-#[allow(non_snake_case)]
-pub fn USER() -> Color {
-    Color::Reset
-}
-#[allow(non_snake_case)]
-pub fn SELECT() -> Color {
-    Color::DarkGray
-}
+pub const ACCENT: Color = Color::Reset;
+pub const DIM: Color = Color::DarkGray;
+pub const CODE: Color = Color::Reset;
+pub const OK: Color = Color::Reset;
+pub const ERR: Color = Color::Reset;
+pub const WARN: Color = Color::Reset;
+pub const BORDER: Color = Color::DarkGray;
+pub const USER: Color = Color::Reset;
+pub const SELECT: Color = Color::DarkGray;
+
+/// The emphasis styles the chrome repeats: placeholders and footers, the
+/// selected or titled row, and the approval card's warnings.
+pub const DIM_ITALIC: Style = Style::new().fg(DIM).add_modifier(Modifier::ITALIC);
+pub const ACCENT_BOLD: Style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+pub const WARN_BOLD: Style = Style::new().fg(WARN).add_modifier(Modifier::BOLD);
 
 #[cfg(test)]
 mod tests {
@@ -55,17 +33,7 @@ mod tests {
     /// `Reset` follows the terminal's theme, light or dark.
     #[test]
     fn tokens_are_the_terminals_own_colors_or_the_chrome_gray() {
-        let colors = [
-            ACCENT(),
-            DIM(),
-            CODE(),
-            OK(),
-            ERR(),
-            WARN(),
-            BORDER(),
-            USER(),
-            SELECT(),
-        ];
+        let colors = [ACCENT, DIM, CODE, OK, ERR, WARN, BORDER, USER, SELECT];
         for color in colors {
             assert!(matches!(color, Color::Reset | Color::DarkGray), "{color:?}");
         }

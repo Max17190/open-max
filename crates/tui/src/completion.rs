@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -34,85 +34,30 @@ const fn command(
     description: &'static str,
     submits: bool,
 ) -> CommandSpec {
-    CommandSpec {
-        name,
-        args,
-        description,
-        submits,
-    }
+    CommandSpec { name, args, description, submits }
 }
 
 pub const COMMANDS: &[CommandSpec] = &[
     command("help", "", "keybindings and commands", true),
     command("login", "[provider]", "sign in or configure a provider", true),
     command("logout", "[provider]", "remove saved provider credentials", true),
-    command(
-        "model",
-        "[id]",
-        "pick a configured model or use an exact id",
-        true,
-    ),
+    command("model", "[id]", "pick a configured model or use an exact id", true),
     command("effort", "[level]", "choose reasoning effort (model-dependent)", true),
-    command(
-        "provider",
-        "[name]",
-        "pick a configured provider and model",
-        false,
-    ),
+    command("provider", "[name]", "pick a configured provider and model", false),
     command("permissions", "[auto|ask|readonly]", "choose saved project permissions", true),
-    command(
-        "approvals",
-        "auto|ask|readonly",
-        "alias for /permissions",
-        false,
-    ),
+    command("approvals", "auto|ask|readonly", "alias for /permissions", false),
     command("new", "", "start a fresh session", true),
     command("fork", "", "branch this session into a new one and switch to it", true),
-    command(
-        "rewind",
-        "<turn>",
-        "branch this session at the end of a turn and switch to it",
-        false,
-    ),
-    command(
-        "resume",
-        "",
-        "pick an earlier session in this project",
-        true,
-    ),
+    command("rewind", "<turn>", "branch this session at the end of a turn and switch to it", false),
+    command("resume", "", "pick an earlier session in this project", true),
     command("copy", "", "copy the latest assistant response", true),
-    command(
-        "export",
-        "[path]",
-        "write the whole transcript to a markdown file",
-        true,
-    ),
+    command("export", "[path]", "write the whole transcript to a markdown file", true),
     command("tools", "", "list tools frozen for this session", true),
     command("skills", "", "list skills frozen for this session", true),
-    command(
-        "reload",
-        "",
-        "re-freeze tools, skills, and prompt from current config",
-        true,
-    ),
-    command(
-        "compact",
-        "",
-        "prune history to the compacted target now",
-        true,
-    ),
-    command(
-        "context",
-        "",
-        "prompt token costs, cache hits, and budget",
-        true,
-    ),
-    command(
-        "status",
-        "",
-        "endpoint, cache, performance, privacy, and network details",
-        true,
-    ),
+    command("reload", "", "re-freeze tools, skills, and prompt from current config", true),
+    command("compact", "", "prune history to the compacted target now", true),
+    command("context", "", "prompt token costs, cache hits, and budget", true),
+    command("status", "", "endpoint, cache, performance, privacy, and network details", true),
     command("quit", "", "exit", true),
 ];
 
@@ -378,20 +323,10 @@ pub fn scan_files(root: &Path) -> Vec<String> {
 pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'static>> {
     let width = width as usize;
     if indexing {
-        return vec![Line::from(Span::styled(
-            "  indexing files…",
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
-        ))];
+        return vec![Line::from(Span::styled("  indexing files…", theme::DIM_ITALIC))];
     }
     if popup.items.is_empty() {
-        return vec![Line::from(Span::styled(
-            "  no matches",
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
-        ))];
+        return vec![Line::from(Span::styled("  no matches", theme::DIM_ITALIC))];
     }
     let visible = popup.items.len().min(MAX_VISIBLE);
     // Window keeps the selection in view, pinned to the edges at the ends.
@@ -403,14 +338,12 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
     for (i, item) in popup.items.iter().enumerate().skip(first).take(visible) {
         let selected = i == popup.selected;
         let marker = if selected {
-            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
+            Span::styled("▸ ", Style::default().fg(theme::ACCENT))
         } else {
             Span::raw("  ")
         };
         let label_style = if selected {
-            Style::default()
-                .fg(theme::ACCENT())
-                .add_modifier(Modifier::BOLD)
+            theme::ACCENT_BOLD
         } else {
             Style::default()
         };
@@ -422,7 +355,7 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
             if room > 4 {
                 spans.push(Span::styled(
                     format!("  {}", clip(&item.detail, room)),
-                    Style::default().fg(theme::DIM()),
+                    Style::default().fg(theme::DIM),
                 ));
             }
         }
@@ -431,9 +364,7 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
     if popup.total_matches > visible {
         lines.push(Line::from(Span::styled(
             format!("  … {} more (keep typing)", popup.total_matches - visible),
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
+            theme::DIM_ITALIC,
         )));
     }
     lines
@@ -446,6 +377,7 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     #[test]
     fn slash_triggers_only_at_message_start() {

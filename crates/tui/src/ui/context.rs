@@ -6,7 +6,7 @@
 
 use open_max_core::prompt::PromptBreakdown;
 use open_max_core::types::estimate_tokens as tok;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -22,11 +22,11 @@ fn row(label: &str, tokens: usize, detail: &str) -> Line<'static> {
 /// A row of the block: its label, its value, and any dim detail after it.
 fn measure(label: &str, value: String, detail: &str) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(format!("  {label:<LABEL_W$}"), Style::default().fg(theme::ACCENT())),
+        Span::styled(format!("  {label:<LABEL_W$}"), Style::default().fg(theme::ACCENT)),
         Span::raw(value),
     ];
     if !detail.is_empty() {
-        spans.push(Span::styled(format!("   {detail}"), Style::default().fg(theme::DIM())));
+        spans.push(Span::styled(format!("   {detail}"), Style::default().fg(theme::DIM)));
     }
     Line::from(spans)
 }
@@ -74,10 +74,7 @@ pub fn context_block(
             "context (preview from today's config; the resumed session's frozen context loads with its next message)"
         }
     };
-    lines.push(Line::from(Span::styled(
-        header.to_string(),
-        Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
-    )));
+    lines.push(Line::from(Span::styled(header.to_string(), theme::DIM_ITALIC)));
 
     let mut total_chars = 0usize;
     for (label, chars) in &breakdown.components {
@@ -110,7 +107,7 @@ pub fn context_block(
     if !breakdown.note.is_empty() {
         lines.push(Line::from(Span::styled(
             "  latest note (changes since the prompt; history, counted in the budget, not here)".to_string(),
-            Style::default().fg(theme::DIM()),
+            Style::default().fg(theme::DIM),
         )));
         for (label, chars) in &breakdown.note {
             lines.push(row(label, tok(*chars), ""));
@@ -119,7 +116,7 @@ pub fn context_block(
 
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat(38)),
-        Style::default().fg(theme::DIM()),
+        Style::default().fg(theme::DIM),
     )));
     lines.push(row("total per request", tok(total_chars), ""));
 
