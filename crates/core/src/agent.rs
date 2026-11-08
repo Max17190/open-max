@@ -49,7 +49,7 @@ use crate::compaction::{
     request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
     to_estimate, to_real, token_factor, CompactionCtx, RequestSpend,
 };
-use crate::config::{ApprovalMode, Settings};
+use crate::config::{ApprovalMode, ReasoningEffort, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
@@ -723,6 +723,8 @@ async fn run_loop(
         }
     };
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
+    if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(format!("{} {}", client.reasoning_effort.map_or("default", ReasoningEffort::as_str), client.origin())); }
     // Frozen wire form: every request of the session injects the same tool
     // schema bytes without re-serializing the Value array. A refreeze swaps
     // the registry and keeps these (a tool file written since rides the

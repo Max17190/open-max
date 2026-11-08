@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
+use crate::config::ReasoningEffort;
 use crate::types::{ChatMessage, ToolCall, ToolCallFunction};
 
 /// OpenAI-compatible `/chat/completions` request body. Built once per
@@ -79,7 +80,7 @@ struct ChatCompletionRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<crate::config::ReasoningEffort>,
+    reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,7 +319,7 @@ pub struct ChatClient {
     pub api_key: Option<String>,
     pub model: String,
     pub temperature: Option<f32>,
-    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tokens: usize,
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,
@@ -527,6 +528,35 @@ impl ChatClient {
             && crate::providers::CACHE_MARKS.iter().any(|(h, prefix)| host.as_deref() == Some(*h) && model.starts_with(prefix))
     }
 
+    /// The effort a request names at its top, which both providers render
+    /// ahead of the history, and each later choice it sends as history,
+    /// `(i, level)` just ahead of message `i`, its turn's prompt. A model that
+    /// takes one (`providers::EFFORT_UPDATES`; never on a ChatGPT plan) keeps
+    /// its opening effort at the top. Only prompts this route ran (`origin`)
+    /// and a reply answered count, and the newest; if they do not end on the
+    /// current effort (a prune dropped its prompt) or return to the default,
+    /// which no change names, the current effort goes.
+    pub(crate) fn effort_plan(&self, messages: &[ChatMessage]) -> (Option<ReasoningEffort>, Vec<(usize, ReasoningEffort)>) {
+        let (current, model, origin) = ((self.reasoning_effort, Vec::new()), self.model.rsplit('/').next().unwrap_or_default().to_ascii_lowercase(), self.origin());
+        if self.chatgpt.is_some() || !crate::providers::EFFORT_UPDATES.iter().any(|(wire, prefix)| *wire == self.wire_api && model.starts_with(prefix)) {
+            return current;
+        }
+        let mut chosen = messages.iter().enumerate().filter_map(|(i, m)| {
+            let (level, route) = m.effort.as_deref()?.split_once(' ')?;
+            let answered = messages[i + 1..].iter().find(|m| m.effort.is_some() || m.role == "assistant").is_none_or(|m| m.role == "assistant");
+            Some((i, ReasoningEffort::parse(level).ok().filter(|_| route == origin && answered)?))
+        });
+        let Some((_, opening)) = chosen.next() else { return current };
+        let (mut running, mut changes) = (opening, Vec::new());
+        for (i, effort) in chosen {
+            if effort == running { continue; }
+            let Some(level) = effort else { return current };
+            changes.push((i, level));
+            running = effort;
+        }
+        if running == self.reasoning_effort { (opening, changes) } else { current }
+    }
+
     fn endpoint(&self) -> String {
         format!("{}/{}", self.base_url.trim_end_matches('/'), match self.wire_api {
             crate::providers::WireApi::ChatCompletions => "chat/completions",
@@ -608,6 +638,8 @@ impl ChatClient {
         } else if self.wire_api == crate::providers::WireApi::Responses {
             responses::serialize(self, messages, tools_wire)?
         } else { serialize_chat_request_body(self, messages, tools_wire)? };
+        // Native Messages takes an effort change as history under its beta.
+        let beta = (self.wire_api == crate::providers::WireApi::Anthropic && !self.effort_plan(messages).1.is_empty()).then_some(("anthropic-beta", crate::providers::EFFORT_BETA));
 
         let mut attempt = 0u32;
         // Attempts in a row that never reached the endpoint; any other
@@ -634,7 +666,7 @@ impl ChatClient {
             if self.wire_api == crate::providers::WireApi::Anthropic && !self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("anthropic-version")) {
                 req = req.header("anthropic-version", "2023-06-01");
             }
-            for (name, value) in self.headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).chain(self.cache_route()) {
+            for (name, value) in self.headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).chain(self.cache_route()).chain(beta) {
                 req = req.header(name, value);
             }
             // An endpoint can spend a long time in prompt processing before the
