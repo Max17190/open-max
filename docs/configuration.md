@@ -184,11 +184,16 @@ override the first two.
   never sent again. A return to Default, which no such change can name,
   sends the field as before. See the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
   and [compatibility documentation](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk).
-- `max_output_bytes` (default 16384, floor 1000): per tool-result cap; bash
-  keeps up to a quarter of each stream's share of the cap from its start and
-  the rest from its end, marks the cut with the bytes it dropped, and spills
-  up to 16 MiB of each stream to `~/.openmax/cmd-logs`. Before any of that,
-  bash keeps only the final text of a line redrawn with carriage returns
+- `max_output_bytes` (default 16384, floor 1000): per tool-result cap; a
+  result that fits is sent whole. One over it spills up to 16 MiB of each
+  stream to a log in `~/.openmax/cmd-logs` that the result names, and is
+  sent as a preview a quarter of the cap's size when the log holds all the
+  output. An incomplete or missing log keeps the full cap. Bash keeps up to
+  a quarter of each stream's share from its start and the rest from its
+  end, and marks the cut with the bytes it dropped. Every later request
+  re-sends a result, and the next call after a flood narrows it, so the
+  preview is sized to steer that call. Before any of that, bash keeps only
+  the final text of a line redrawn with carriage returns
   (a progress bar): text that follows a `\r` on the same line replaces the
   whole line so far, so only its final text counts against the cap and
   reaches the log. `\r\n` stays a line ending, a run of `\r` before a `\n`
