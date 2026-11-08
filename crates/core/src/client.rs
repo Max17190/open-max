@@ -2628,12 +2628,11 @@ mod tests {
     /// Nothing listening is not a fault worth a minute of backoff: after
     /// [`UNREACHED_ATTEMPTS`] in a row the request gives up early, and the
     /// retry line counts to that attempt rather than to a budget it never
-    /// spends. The port was bound and released by this test, so nothing
-    /// answers on it; the deadline keeps a stray listener from turning that
-    /// into a hang.
+    /// spends. Nothing listens on the address ([`refused_address`]); the
+    /// deadline keeps a stray listener from turning that into a hang.
     #[tokio::test]
     async fn an_address_that_never_answers_gives_up_before_the_budget() {
-        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (addr, _held) = refused_address();
         let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
         let reason = format!("cannot connect to {addr} (connection refused)");
         assert_eq!(deltas, [2, 3].map(|n| format!("{n}/{UNREACHED_ATTEMPTS}:{reason}")));
@@ -2651,9 +2650,11 @@ mod tests {
         use std::io::{BufRead as _, Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            // Gone before it answers, so every later attempt is refused.
+            // Gone before it answers, so every later attempt is refused,
+            // while the connection it accepted, returned open, holds its
+            // port as [`refused_address`] does.
             drop(listener);
             let mut reader = std::io::BufReader::new(stream);
             let mut length = 0;
@@ -2668,8 +2669,11 @@ mod tests {
             }
             reader.read_exact(&mut vec![0; length]).unwrap();
             let _ = reader.get_mut().write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy");
+            reader.into_inner()
         });
         let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
+        // The first attempt was answered, so the server is done.
+        let _held = server.join().unwrap();
         let refused = format!("cannot connect to {addr} (connection refused)");
         assert_eq!(
             deltas,
@@ -2680,6 +2684,21 @@ mod tests {
             ]
         );
         assert!(err.starts_with(&format!("{refused}: nothing is listening there")), "{err}");
+    }
+
+    /// A loopback address nothing listens on, kept so while the connections
+    /// returned with it live. It was a listener's, closed again, so a
+    /// connect to it is refused; the connection that listener accepted
+    /// stays open and keeps its port, which Linux gives no bind of port 0
+    /// meanwhile. A port released outright is the next such bind's to take,
+    /// in any process: in CI's Suite time job, which runs every test binary
+    /// at once, a request meant to be refused there met another test's
+    /// listener instead, and was reset.
+    fn refused_address() -> (std::net::SocketAddr, [std::net::TcpStream; 2]) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = std::net::TcpStream::connect(addr).unwrap();
+        (addr, [held, listener.accept().unwrap().0])
     }
 
     /// The error a request to `url` ends with and its retry announcements,

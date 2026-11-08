@@ -1808,11 +1808,12 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
 ///
 /// Each run waits out its backoff, a millisecond per second in a debug
 /// build (`OPENMAX_TEST_BACKOFF_UNIT_MS`) and the real one in a release
-/// build, so the three runs go at once.
+/// build, so the three runs go at once. Nothing listens on the endpoint or
+/// the proxy ([`refused_address`]).
 #[test]
 fn refused_connection_names_the_host_and_the_cause() {
     let (project, home) = fresh_dirs("refused");
-    let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let (addr, _endpoint) = refused_address();
     write_settings(&home, &format!("http://{addr}/v1"));
     let start = |env: &[(&str, &str)]| {
         let mut command = cmd(&project, &home);
@@ -1829,7 +1830,8 @@ fn refused_connection_names_the_host_and_the_cause() {
     };
     // Through a proxy that refuses, the refusal is the proxy's; a proxy
     // that NO_PROXY exempts the endpoint from never sees the request.
-    let proxy = format!("http://{}", TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    let (proxy, _proxy) = refused_address();
+    let proxy = format!("http://{proxy}");
     let started = std::time::Instant::now();
     let direct = start(&[]);
     let proxied = start(&[("HTTP_PROXY", &proxy)]);
@@ -1868,6 +1870,19 @@ fn refused_connection_names_the_host_and_the_cause() {
         "the runs took {waited:?}: a debug build waited the real backoff of {backoff:?} out"
     );
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A loopback address nothing listens on, kept so while the connections
+/// returned with it live. It was a listener's, closed again, so a connect to
+/// it is refused; the connection that listener accepted stays open and keeps
+/// its port, which Linux gives no bind of port 0 meanwhile. A port released
+/// outright is the next such bind's to take, in any process, and CI's Suite
+/// time job runs every test binary at once.
+fn refused_address() -> (std::net::SocketAddr, [std::net::TcpStream; 2]) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let held = std::net::TcpStream::connect(addr).unwrap();
+    (addr, [held, listener.accept().unwrap().0])
 }
 
 /// Prompt templates are a harness feature, not a TUI one: the delegate

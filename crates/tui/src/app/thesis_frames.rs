@@ -4,8 +4,6 @@
 //! the binary has no library target, and a frame needs the `App` the draw
 //! path renders.
 
-use std::time::Instant;
-
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -27,6 +25,36 @@ const HEIGHT: u16 = 45;
 
 fn quantile(sorted: &[f64], q: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+}
+
+/// Starts timing a frame: the closure it returns reads the milliseconds
+/// since. A release build reads the wall clock, the time a user waits,
+/// which its target holds. A debug build holds each phase's median to a
+/// sanity bound only, and reads this thread's CPU clock, which runs only
+/// while the thread does: in the parallel unit suite, and in CI's Suite
+/// time job beside every other test binary, the wall clock also counts the
+/// time the thread waited for a core, which the machine's load decides,
+/// not the frame. There a debug scrolling median at 1,000,000 lines read
+/// 5.49 ms on the wall clock, past its 5 ms bound, while the phase after
+/// it, the same work, read 1.89 ms.
+fn stopwatch() -> impl Fn() -> f64 {
+    #[cfg(debug_assertions)]
+    {
+        let cpu_ms = || {
+            let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: the call writes only `now`, a valid timespec.
+            let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+            assert_eq!(read, 0, "this thread's CPU clock could not be read");
+            now.tv_sec as f64 * 1e3 + now.tv_nsec as f64 / 1e6
+        };
+        let started = cpu_ms();
+        move || cpu_ms() - started
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let started = std::time::Instant::now();
+        move || started.elapsed().as_secs_f64() * 1e3
+    }
 }
 
 /// Transcript frame time at 100,000 lines, idle and while scrolling.
@@ -53,12 +81,12 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
 /// other builds running, where the fill takes 25,000 blocks for 100,000
 /// rows. Three release runs: idle median 0.066 to 0.067 ms, p99 0.075 to
 /// 0.077 ms; scrolling median 0.074 to 0.081 ms, p99 0.084 to 0.095 ms.
-/// Debug, 101 frames inside the parallel unit suite: idle median 0.299 ms,
-/// p99 0.305 ms; scrolling median 0.309 ms, p99 0.374 ms. A release build
-/// asserts the target on each phase's p99. A debug build asserts a 20x
-/// sanity bound on each phase's median, not its p99: over 101 frames the
-/// p99 is the second-slowest frame, which two scheduler preemptions in the
-/// parallel unit suite would decide.
+/// Debug, 101 frames on this thread's CPU clock ([`stopwatch`]): idle
+/// median 0.303 ms, p99 0.326 ms; scrolling median 0.329 ms, p99 0.401 ms.
+/// A release build asserts the target on each phase's p99. A debug build
+/// asserts a 20x sanity bound on each phase's median, not its p99: over
+/// 101 frames the p99 is the second-slowest frame, which two scheduler
+/// preemptions in the parallel unit suite would decide.
 #[test]
 fn transcript_frame_p99_at_100k_lines() {
     const TARGET_MS: f64 = 0.5;
@@ -79,13 +107,13 @@ fn transcript_frame_p99_at_100k_lines() {
     }
     let rows = app.transcript.len();
     let mut frame = |app: &mut App, scroll: bool| {
-        let started = Instant::now();
+        let elapsed = stopwatch();
         if scroll {
             app.transcript.scroll_up(1);
         }
         app.dirty.mark_chat();
         terminal.draw(|f| app.draw(f)).unwrap();
-        started.elapsed().as_secs_f64() * 1e3
+        elapsed()
     };
     for _ in 0..50 {
         frame(&mut app, false);
@@ -93,20 +121,20 @@ fn transcript_frame_p99_at_100k_lines() {
     let mut idle: Vec<f64> = (0..FRAMES).map(|_| frame(&mut app, false)).collect();
     let mut scrolling: Vec<f64> = (0..FRAMES).map(|_| frame(&mut app, true)).collect();
     assert_eq!(app.transcript.offset(), FRAMES, "every scrolling frame moved the view one row");
-    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let clock = if cfg!(debug_assertions) { "debug, this thread's CPU time" } else { "release" };
     let mut stats = Vec::new();
     for (phase, samples) in [("idle", &mut idle), ("scrolling", &mut scrolling)] {
         samples.sort_by(f64::total_cmp);
         let (median, p99) = (quantile(samples, 0.5), quantile(samples, 0.99));
         println!(
-            "MEASURE transcript_frame_p99_at_100k_lines {phase} n={} median={median:.3}ms p99={p99:.3}ms ({blocks} blocks, {rows} rows; target {TARGET_MS}ms, {build})",
+            "MEASURE transcript_frame_p99_at_100k_lines {phase} n={} median={median:.3}ms p99={p99:.3}ms ({blocks} blocks, {rows} rows; target {TARGET_MS}ms, {clock})",
             samples.len()
         );
         stats.push((phase, median, p99));
     }
     for (phase, median, p99) in stats {
         if cfg!(debug_assertions) {
-            assert!(median < TARGET_MS * 20.0, "debug {phase} frame median {median:.3}ms is past the 20x sanity bound");
+            assert!(median < TARGET_MS * 20.0, "debug {phase} frame median {median:.3}ms of this thread's CPU time is past the 20x sanity bound");
         } else {
             assert!(p99 <= TARGET_MS, "{phase} frame p99 {p99:.3}ms at {rows} lines is past the {TARGET_MS}ms target");
         }
@@ -198,7 +226,8 @@ fn push_marathon(app: &mut App, from: usize, blocks: usize) {
 /// measured again, 3 times in all, and fails only when each is
 /// over, since a burst of other work on the machine slows a measurement or
 /// two where a change that adds work slows every one. A debug build asserts
-/// the 20x sanity bound on each phase's median.
+/// the 20x sanity bound on each phase's median, on this thread's CPU clock
+/// ([`stopwatch`]).
 ///
 /// Also asserted in every build: the conversation's part of an idle frame
 /// allocates nothing; the heap this thread holds after the fill, counted by
@@ -220,8 +249,8 @@ fn push_marathon(app: &mut App, from: usize, blocks: usize) {
 /// row index, with each folded tool card holding its open view and each
 /// block its wrap, scrolling at the top measured p99 1.329 to 1.430 ms,
 /// 843 bytes a row, and 1,265.8 MB after reading every row. Debug, 101
-/// frames over 27,450 rows inside the parallel unit suite: idle median
-/// 0.371 ms, scrolling 0.463 ms, at the top 0.463 ms; 571 bytes a row.
+/// frames over 27,450 rows on this thread's CPU clock: idle median
+/// 0.405 ms, scrolling 0.502 ms, at the top 0.482 ms; 571 bytes a row.
 #[test]
 fn transcript_frame_p99_at_1m_lines() {
     const TARGET_MS: f64 = 0.25;
@@ -263,17 +292,18 @@ fn transcript_frame_p99_at_1m_lines() {
     type Scroll = fn(&mut Transcript);
     let mut frame = |app: &mut App, scroll: Scroll| {
         let allocations = crate::allocations();
-        let started = Instant::now();
+        let elapsed = stopwatch();
         scroll(&mut app.transcript);
         app.dirty.mark_chat();
         terminal.draw(|f| app.draw(f)).unwrap();
-        (started.elapsed().as_secs_f64() * 1e3, crate::allocations() - allocations)
+        (elapsed(), crate::allocations() - allocations)
     };
     let still: Scroll = |_| {};
     for _ in 0..50 {
         frame(&mut app, still);
     }
     let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let clock = if cfg!(debug_assertions) { "debug, this thread's CPU time" } else { "release" };
     let phases: [(&str, Scroll); 3] =
         [("idle", still), ("scrolling", |t| t.scroll_up(1)), ("scrolling-at-top", |t| t.scroll_down(1))];
     let mut stats = Vec::new();
@@ -295,7 +325,7 @@ fn transcript_frame_p99_at_1m_lines() {
             samples.sort_by(f64::total_cmp);
             let (median, p99) = (quantile(&samples, 0.5), quantile(&samples, 0.99));
             println!(
-                "MEASURE transcript_frame_p99_at_1m_lines {phase} n={} median={median:.3}ms p99={p99:.3}ms allocations/frame={allocations:.1} ({blocks} blocks, {rows} rows; target {TARGET_MS}ms, {build})",
+                "MEASURE transcript_frame_p99_at_1m_lines {phase} n={} median={median:.3}ms p99={p99:.3}ms allocations/frame={allocations:.1} ({blocks} blocks, {rows} rows; target {TARGET_MS}ms, {clock})",
                 samples.len()
             );
             stats.push((phase, median, p99));
@@ -339,7 +369,7 @@ fn transcript_frame_p99_at_1m_lines() {
         let measured: Vec<_> = stats.iter().filter(|stat| stat.0 == phase).collect();
         if cfg!(debug_assertions) {
             let median = measured[0].1;
-            assert!(median < TARGET_MS * 20.0, "debug {phase} frame median {median:.3}ms is past the 20x sanity bound");
+            assert!(median < TARGET_MS * 20.0, "debug {phase} frame median {median:.3}ms of this thread's CPU time is past the 20x sanity bound");
         } else {
             let p99s: Vec<f64> = measured.iter().map(|stat| stat.2).collect();
             assert!(
