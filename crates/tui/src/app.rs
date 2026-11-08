@@ -6720,7 +6720,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
             // File content that happens to look like an edit summary.
             open_max_core::types::ChatMessage {
@@ -6731,7 +6731,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
         ];
         let mut persisted = 0usize;
@@ -6783,7 +6783,7 @@ mod tests {
                     reasoning_content: None,
                     reasoning: None,
                     reasoning_details: None,
-                    reasoning_origin: None, effort: None,
+                    reasoning_origin: None, effort: None, archived_tool_output: None,
                 });
                 messages.push(open_max_core::types::ChatMessage {
                     role: "tool".into(),
@@ -6793,7 +6793,7 @@ mod tests {
                     reasoning_content: None,
                     reasoning: None,
                     reasoning_details: None,
-                    reasoning_origin: None, effort: None,
+                    reasoning_origin: None, effort: None, archived_tool_output: None,
                 });
             }
             let mut persisted = 0usize;
@@ -6913,7 +6913,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
@@ -6923,7 +6923,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
             // A SUCCESSFUL command whose output merely opens with the same
             // sentence: equality, not a prefix, decides, so this replays ok
@@ -6936,7 +6936,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
         ];
         let mut persisted = 0usize;
@@ -6991,7 +6991,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
@@ -7001,7 +7001,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
             open_max_core::types::ChatMessage {
                 role: "assistant".into(),
@@ -7011,7 +7011,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None,
+                reasoning_origin: None, effort: None, archived_tool_output: None,
             },
         ];
         let mut persisted = 0usize;

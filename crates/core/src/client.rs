@@ -4178,6 +4178,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn archive_provenance_does_not_change_provider_requests_or_token_estimates() {
+        let client = ChatClient::new("http://127.0.0.1/v1".into(), None, "fixture".into(), None, 512);
+        let original = ChatMessage::tool("call", "shortened result");
+        let marked = ChatMessage { archived_tool_output: Some("archive-reference".into()), ..original.clone() };
+        let (original, marked) = (&[original], &[marked]);
+        assert_eq!(original[0].estimated_tokens(), marked[0].estimated_tokens());
+        assert_eq!(serialize_chat_request_body(&client, original, "[]").unwrap(),
+                   serialize_chat_request_body(&client, marked, "[]").unwrap());
+        assert_eq!(responses::serialize(&client, original, "[]").unwrap(),
+                   responses::serialize(&client, marked, "[]").unwrap());
+    }
+
+    #[test]
     fn serialize_chat_request_body_is_byte_stable_for_retries() {
         let messages = vec![ChatMessage::user("stable body")];
         let tools_wire = json!([{

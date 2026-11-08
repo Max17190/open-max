@@ -1073,7 +1073,7 @@ mod tests {
             reasoning_content: None,
             reasoning: None,
             reasoning_details: None,
-            reasoning_origin: None, effort: None,
+            reasoning_origin: None, effort: None, archived_tool_output: None,
         };
         let messages = vec![
             mk("system", "hidden"),
