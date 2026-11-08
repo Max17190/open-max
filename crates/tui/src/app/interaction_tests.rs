@@ -542,6 +542,22 @@ async fn an_open_find_takes_in_new_blocks_and_keeps_its_place() {
     assert_eq!(matches, [1, 3, 5, 7]);
     assert_eq!((at, app.transcript.selected()), (1, Some(3)), "the reader keeps their place");
 
+    // A refused prompt takes its block away: the find moves to the newest
+    // match left.
+    let (mut app, dir3) = app_fixture();
+    fruit(&mut app);
+    app.insert_user_block("apple pie");
+    press(&mut app, ctrl('f')).await;
+    for c in "apple".chars() {
+        press(&mut app, key(KeyCode::Char(c))).await;
+    }
+    assert_eq!(app.transcript.selected(), Some(7));
+    app.on_agent_event(AgentEvent::Done { stop_reason: "blocked".into() });
+    let (_, at, matches) = app.scroll_search.clone().unwrap();
+    assert_eq!((at, matches.as_slice()), (2, &[1, 3, 5][..]));
+    assert_eq!(app.transcript.selected(), Some(5));
+    let _ = std::fs::remove_dir_all(dir3);
+
     // A query that matched nothing takes the first block that does.
     let (mut app, dir2) = app_fixture();
     fruit(&mut app);
