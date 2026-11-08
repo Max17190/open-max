@@ -532,6 +532,9 @@ pub(crate) async fn compact_messages(
         Some(digest) => prepare_compaction_digest(ctx, &mut candidate, digest, spend).await,
         None => (Vec::new(), None),
     };
+    // A prune that dropped or shortened the stored note stores it again.
+    let note = ctx.core.sessions.lock().await.get(ctx.session_id).and_then(|data| data.trailing_note.clone());
+    crate::notes::store_note(&mut candidate, note.as_deref());
     sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, record.as_ref(), messages.len(), head)?;
     if let Some(data) = ctx.core.sessions.lock().await.get_mut(ctx.session_id) {
         data.persisted_count = candidate.len();
@@ -547,14 +550,11 @@ pub(crate) async fn compact_messages(
 }
 
 /// What every request carries besides the history, in estimated tokens: the
-/// tool schemas and the trailing note, both re-sent whole each time. The
-/// note is priced as it rides the last message, its separator included; a
-/// history ending with an assistant reply sends it as a message of its own,
-/// one message's framing more than this counts. The turn loop and `/compact`
-/// both price a request here, so both count the same bytes.
-pub(crate) fn request_overhead(schemas_wire: &str, note: Option<&str>) -> usize {
+/// tool schemas, re-sent whole each time. The note is history, priced with
+/// the message it is stored in. The turn loop and `/compact` both price a
+/// request here, so both count the same bytes.
+pub(crate) fn request_overhead(schemas_wire: &str) -> usize {
     estimate_tokens(schemas_wire.len())
-        + note.map_or(0, |note| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + note.len()))
 }
 
 /// What a prune aims for, in percent of the budget (`prune_target`; see the module doc).
@@ -751,7 +751,7 @@ pub(crate) fn over_budget_error_context(
     context_tokens: usize,
 ) -> String {
     format!(
-        "this request was over budget before it was sent: ~{used_tokens} tokens ({schema_tokens} of them frozen tool schemas and any trailing note, re-sent every request) against a send budget of {budget} (context_tokens {context_tokens} minus response headroom). if the provider refused it for length: uninstall tools (`openmax --spec usage` ranks what each costs) and /reload, or raise context_tokens to what the endpoint really serves"
+        "this request was over budget before it was sent: ~{used_tokens} tokens ({schema_tokens} of them frozen tool schemas, re-sent every request) against a send budget of {budget} (context_tokens {context_tokens} minus response headroom). if the provider refused it for length: uninstall tools (`openmax --spec usage` ranks what each costs) and /reload, or raise context_tokens to what the endpoint really serves"
     )
 }
 

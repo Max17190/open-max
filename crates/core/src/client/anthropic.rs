@@ -6,7 +6,6 @@ use ring::digest::{Context, SHA256};
 pub(super) fn serialize(
     client: &ChatClient,
     messages: &[ChatMessage],
-    note: Option<&str>,
     tools: &str,
 ) -> Result<Vec<u8>, String> {
     let origin = client.origin();
@@ -97,19 +96,11 @@ pub(super) fn serialize(
     }
     // The cache is asked for at two markers: the end of the system prompt
     // (tools and system, the prefix every request and session shares) and
-    // the newest stored block, so each request reads what the one before it
-    // wrote. The note goes after that block, in a block of its own, since the
-    // next request drops it: inside, it would void the entry. Thinking blocks
-    // take no marker.
+    // the newest block, so each request reads what the one before it wrote.
+    // Thinking blocks take no marker.
     let tail = input.last_mut().and_then(|m| m["content"].as_array_mut()?.last_mut());
     if let Some(block) = tail.filter(|b| matches!(b["type"].as_str(), Some("text" | "tool_use" | "tool_result"))) {
         block["cache_control"] = json!({"type":"ephemeral"});
-    }
-    if let Some(note) = note.map(|note| json!({"type":"text","text":note})) {
-        match input.last_mut().filter(|m| m["role"] == "user").and_then(|m| m["content"].as_array_mut()) {
-            Some(content) => content.push(note),
-            None => input.push(json!({"role":"user","content":[note]})),
-        }
     }
     let mut body =
         json!({"model":client.model,"max_tokens":client.max_tokens,"stream":true,"messages":input});

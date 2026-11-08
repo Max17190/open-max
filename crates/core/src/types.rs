@@ -219,7 +219,7 @@ pub enum AgentEvent {
         /// `approved` | `declined` | `timed_out` | `cancelled`
         outcome: String,
     },
-    /// The session's tools, skills, and trailing note were re-frozen from
+    /// The session's tools, skills, and note were re-frozen from
     /// current config (extension files changed, or the user forced /reload,
     /// which also rebuilds the system prompt and the tools array).
     /// `changes` is the refreeze receipt: one line per tool or skill file
@@ -246,7 +246,7 @@ pub enum AgentEvent {
     /// event. `compacted_messages` of 0 means the transcript was already at
     /// or under the prune target and nothing changed.
     Compacted { tokens_before: usize, tokens_after: usize, compacted_messages: usize },
-    /// The frozen tool schemas and any trailing note take most of what the
+    /// The frozen tool schemas take most of what the
     /// window has to spend, so the transcript is squeezed into what little
     /// they leave: compaction runs early and hard, and once `schema_tokens`
     /// reaches `budget_tokens` it stops entirely, because pruning messages

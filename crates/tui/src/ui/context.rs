@@ -1,6 +1,6 @@
 //! The /context block: where each request of the session spends its tokens
-//! (the frozen prompt and tools, then any trailing note of changes sent after
-//! the history), plus the live cache-hit and budget state. Every line here is
+//! (the frozen prompt and tools, then any note of changes stored in the
+//! history), plus the live cache-hit and budget state. Every line here is
 //! sent on every request, so the point is to make the cost of each component
 //! visible.
 
@@ -53,7 +53,7 @@ pub fn context_block(
     let mut lines = Vec::new();
     let header = match provenance {
         Provenance::Frozen => {
-            "context (frozen at session creation; later changes ride a trailing note until /reload)"
+            "context (frozen at session creation; later changes ride a note in the history until /reload)"
         }
         Provenance::NewPreview => "context (preview of the next new session)",
         // A resumed session continues with its OWN frozen prompt, which is
@@ -118,7 +118,7 @@ pub fn context_block(
 
     if !breakdown.note.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  trailing note (changes since the prompt, sent after the history)".to_string(),
+            "  note (changes since the prompt, stored in the history when they change)".to_string(),
             Style::default().fg(theme::DIM()),
         )));
         for (label, chars) in &breakdown.note {
@@ -208,7 +208,7 @@ mod tests {
         };
         let lines: Vec<String> = context_block(&bd, Provenance::Frozen, None, None, None).iter().map(plain).collect();
         let at = |label: &str| lines.iter().position(|l| l.trim_start().starts_with(label)).unwrap_or_else(|| panic!("no {label} row: {lines:#?}"));
-        assert!(at("memory (1)") < at("trailing note") && at("trailing note") < at("note header"), "{lines:#?}");
+        assert!(at("memory (1)") < at("note (changes") && at("note (changes") < at("note header"), "{lines:#?}");
         assert!(lines[at("tool files changes")].contains("~   25 tok"), "{lines:#?}");
         assert!(lines[at("external tools (1)")].contains("~   15 tok"), "{lines:#?}");
         assert!(lines[at("total per request")].contains(&format!("~{:>5} tok", (400 + 200 + 60 + 52 + 100) / 4)), "{lines:#?}");
@@ -219,7 +219,7 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("skills (") || l.contains("memory (")), "no rows for none: {lines:#?}");
         let without = PromptBreakdown { note: Vec::new(), ..bd };
         let lines: Vec<String> = context_block(&without, Provenance::Frozen, None, None, None).iter().map(plain).collect();
-        assert!(!lines.iter().any(|l| l.contains("trailing note (changes")), "no note, no note heading: {lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("note (changes")), "no note, no note heading: {lines:#?}");
     }
 
     /// Three provenances, three true sentences. A resumed session's next

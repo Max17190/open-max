@@ -15,27 +15,6 @@ use open_max_core::state::Core;
 use open_max_core::types::{estimate_tokens, AgentEvent};
 use serde_json::value::RawValue;
 
-/// One message's raw JSON with the trailing note cut out of its content:
-/// from the note's escaped marker to the quote that closes that string, so
-/// every other byte stays as sent.
-fn without_note(raw: &str, marker: &str) -> String {
-    let escaped_marker = serde_json::to_string(marker).unwrap();
-    let escaped_marker = &escaped_marker[1..escaped_marker.len() - 1];
-    let at = raw.find(escaped_marker).expect("the message carries the note");
-    let rest = &raw[at..];
-    let mut escaped = false;
-    let end = rest
-        .char_indices()
-        .find(|&(_, c)| {
-            let closes = c == '"' && !escaped;
-            escaped = c == '\\' && !escaped;
-            closes
-        })
-        .map(|(i, _)| i)
-        .expect("the note ends inside a JSON string");
-    format!("{}{}", &raw[..at], &rest[end..])
-}
-
 /// The bytes `now` differs from `then` by: each position that holds another
 /// byte, plus the difference in length.
 fn changed_bytes(then: &str, now: &str) -> usize {
@@ -257,7 +236,7 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
 /// The frozen prefix is messages[0] plus the `tools` array, what a
 /// provider's prompt cache keys on. Method: a scripted endpoint records each
 /// request body of a session whose first turn writes a tool file, runs it
-/// with the bash line the trailing note gives it, writes a memory and a
+/// with the bash line the note gives it, writes a memory and a
 /// skill, whose second turn answers, and whose third turn runs in a new
 /// `Core` after the first let the session go, as a resume in a new process
 /// does; the test slices the raw wire bytes of messages[0] and
@@ -268,15 +247,15 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
 /// and some gateways hoist it into the system prompt, which moves the prefix
 /// there) and that no `tools` array names the written tool, which joins it
 /// only at /reload or in a new session. The first body, sent before any
-/// write, carries the layout map in messages[0] and no trailing note; every
-/// later one ends the content of its last message, a tool result or the
-/// user's prompt, with a note that adds no message (a message of its own
-/// after a tool result is what some hosted validators refuse) and holds only
-/// what was written: the tool's line after the tool write, the skill's and
-/// the memory's once the skill write refreezes, and the same three in the
-/// resumed sitting, whose note is built from the session's files. Each body's history,
-/// with the note cut from its raw bytes, starts with the one before it byte
-/// for byte. The tool's line ends with the bash form that runs it as the
+/// write, carries the layout map in messages[0] and no note. Each body's
+/// messages start with every message the one before it sent, byte for byte,
+/// and a note is stored only where it changes: at the end of the write's
+/// tool result, adding no message (a message of its own after a tool result
+/// is what some hosted validators refuse), holding only what was written:
+/// the tool's line after the tool write, the memory's with it after the
+/// memory write, the skill's with both after the skill write, and none after
+/// that, the resumed sitting's included, whose note, built from the
+/// session's files, is the one stored. The tool's line ends with the bash form that runs it as the
 /// harness does, `command` and `args` shell-quoted with the JSON arguments
 /// on stdin; the scripted bash call is that line with the arguments filled
 /// in, and its reply is the tool's own output, which echoes the arguments
@@ -390,39 +369,28 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
     let mut notes = Vec::new();
     for (i, body) in bodies.iter().enumerate() {
         let n = i + 1;
-        let sent = messages(body);
-        let parsed: Vec<serde_json::Value> = sent.iter().map(|m| serde_json::from_str(m.get()).unwrap()).collect();
-        let (last, history) = parsed.split_last().unwrap();
-        assert!(!history.iter().any(|m| m.to_string().contains(NOTE_HEADER)), "request {n} sent a stored note");
-        let mut raw: Vec<String> = sent.iter().map(|m| m.get().to_string()).collect();
-        let content = last["content"].as_str().unwrap_or_default();
-        if n == 1 {
-            // Nothing was written yet, so nothing changed since the prompt.
-            assert!(!content.contains(NOTE_HEADER), "request 1 sent a note before any write: {last}");
-        } else {
-            // The note ends the last message and adds none.
-            let (text, note) = content
-                .split_once(&marker)
-                .unwrap_or_else(|| panic!("request {n} sent the note as a message of its own, or not at all: {last}"));
-            assert!(
-                matches!(last["role"].as_str(), Some("user" | "tool")) && !text.is_empty(),
-                "request {n} hung the note on a message that is not the newest prompt or tool result: {last}"
-            );
-            notes.push(note.to_string());
-            let cut = without_note(raw.last().unwrap(), &marker);
-            *raw.last_mut().unwrap() = cut;
-        }
-        // The history is only appended to: the next request keeps every
-        // byte before the note.
+        let raw: Vec<String> = messages(body).iter().map(|m| m.get().to_string()).collect();
+        // The history is only appended to: each request repeats every byte
+        // of every message the request before it sent, its notes included.
         assert!(
             raw.len() > before.len() && raw[..before.len()] == before[..],
             "request {n} changed the history the request before it sent"
         );
+        for added in &raw[before.len()..] {
+            let added: serde_json::Value = serde_json::from_str(added).unwrap();
+            let Some((text, note)) = added["content"].as_str().unwrap_or_default().split_once(&marker) else { continue };
+            assert!(
+                added["role"] == "tool" && !text.is_empty(),
+                "request {n} stored the note on a message that is not a write's tool result: {added}"
+            );
+            notes.push(note.to_string());
+        }
         before = raw;
     }
+    assert_eq!(notes.len(), 3, "a note is stored after each write but the bash run, and nowhere else: {notes:?}");
 
-    // What was written mid-session reaches the model after the history, so
-    // the cached prefix never has to change to carry it, and only what was
+    // What was written mid-session reaches the model in the history, so the
+    // cached prefix never has to change to carry it, and only what was
     // written: the tool's line alone after the tool write, its schema and
     // the bash form that runs it.
     let index_lines = |note: &str| note.lines().filter(|l| l.starts_with("- ")).map(str::to_string).collect::<Vec<_>>();
@@ -449,7 +417,7 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
     let last = notes.last().unwrap();
     assert_eq!(index_lines(last).len(), 3, "the tool, the skill, and the memory: {last}");
     for needle in ["- wordfreq: top-n words", ".agents/skills/release/SKILL.md", ".openmax/memory/build.md"] {
-        assert!(last.contains(needle), "the trailing note does not name {needle}: {last}");
+        assert!(last.contains(needle), "the latest note does not name {needle}: {last}");
     }
     assert!(!last.contains(map_line), "the note repeats the prompt's index: {last}");
     let _ = std::fs::remove_dir_all(PathBuf::from(&dir));
@@ -466,9 +434,10 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 ///
 /// Method: one session against a scripted endpoint, in a project trusted in
 /// `ask`, with a 16,384-token window and a 1,024-token reply. Turn one writes
-/// a tool manifest, a refreeze that turns the trailing note on for every later
-/// request but the compaction's summary, and a steer sent while that write
-/// waits for approval joins the next request; it reads the README, lists the
+/// a tool manifest, a refreeze that stores the note once, on the write's
+/// result, which every later request but the compaction's summary carries,
+/// and a steer sent while that write waits for approval joins the next
+/// request; it reads the README, lists the
 /// project and answers. Turn two reads fourteen small files and one of 300
 /// lines, which takes the transcript past the window's budget, so the harness
 /// compacts, with its summary request, and the turn answers. Turn three runs
@@ -492,22 +461,22 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// system prompt) whole with no earlier request, and the request after it,
 /// whose history the prune rewrote, so that it repeats only the frozen prefix
 /// and the opening the prune keeps. Every other request repeats every byte
-/// the request before it sent ahead of that one's trailing note, and every
-/// request after the first but the summary shares its whole frozen prefix
-/// with an earlier one. The share holds the 75% target and a ratchet, the
+/// the request before it sent, and every request after the first but the
+/// summary shares its whole frozen prefix with an earlier one. The share holds the 75% target and a ratchet, the
 /// share measured when the ratchet was set less half a point, rounded down to
 /// a tenth; README.md states the ratchet and the session's length, held here.
 /// Measured on this tree, when the ratchets were set: 85.51% (167,050 of
 /// 195,365 prompt tokens) on Chat Completions, 85.51% (168,222 of 196,730) on
 /// Responses and 84.34% (70,531 of 83,630) on native Messages. A byte count,
-/// so it holds in debug and release alike.
+/// so it holds in debug and release alike. Once the note was stored where it
+/// changes rather than sent after the history, they were 86.60%, 86.62% and
+/// 87.02%.
 ///
 /// Where a provider's cache ends its entries at message or block boundaries
 /// rather than at any byte, the Responses and native Messages twins also
 /// print what its documented rule reads back, the share it bills as cached.
 /// On Responses that is OpenAI's implicit caching on GPT-5.6 and later: an
-/// entry ends at a request's latest user message or tool output, so the
-/// trailing note, a developer message after them, is in none. On native
+/// entry ends at a request's latest user message or tool output. On native
 /// Messages it is Anthropic's: an entry ends at each block a request marks
 /// with `cache_control`, the end of the system prompt and the newest stored
 /// block. An entry holds at least 1,024 tokens. The ratchet holds the billed
@@ -518,7 +487,8 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// Responses share was 0.00%; measured when its ratchet was set, 84.74%
 /// (166,870 of 196,910 prompt tokens). With no block marked, the native
 /// Messages share was 0.00%; measured when its ratchet was set, 82.81%
-/// (69,363 of 83,762).
+/// (69,363 of 83,762). Once the note was stored where it changes, the two
+/// read back 85.84% and 86.14%.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_prompt_is_75_percent_cacheable() {
     cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0, None).await;
@@ -596,8 +566,8 @@ struct Prompt {
     text: String,
     /// Where its frozen prefix, the tools and the system prompt, ends.
     frozen: usize,
-    /// Where its trailing note starts, if it carries one.
-    note: Option<usize>,
+    /// How many notes its history carries.
+    notes: usize,
     /// Where the provider's cache writes this request's entries, of at least
     /// `MIN_CACHED_TOKENS`, and where it looks for an earlier request's, by
     /// its documented rule: none on Chat Completions, whose servers cache a
@@ -703,16 +673,11 @@ impl Prompt {
             WireApi::Responses => implicit_breakpoints(&parts[0]),
             WireApi::Anthropic => marked_breakpoints(marked),
         };
-        // The note starts at its separator where it ends a message, and at
-        // the comma ahead of the item or block that holds it alone.
         let text = parts.concat();
         let header = serde_json::to_string(NOTE_HEADER).unwrap();
-        let note = text.find(&header[1..header.len() - 1]).map(|at| match text[..at].strip_suffix(r"\n\n") {
-            Some(ahead) => ahead.len(),
-            None => text[..at].rfind('{').map(|open| open - usize::from(text[..open].ends_with(','))).unwrap(),
-        });
+        let notes = text.matches(&header[1..header.len() - 1]).count();
         let writes = writes.into_iter().filter(|&at| estimate_tokens(at) >= MIN_CACHED_TOKENS).collect();
-        Self { parts, text, frozen, note, writes, lookups }
+        Self { parts, text, frozen, notes, writes, lookups }
     }
 
     fn len(&self) -> usize {
@@ -741,9 +706,9 @@ impl Prompt {
     }
 
     /// What a request that only appends to this one repeats of it: every
-    /// byte ahead of its trailing note, or ahead of the brackets closing it.
+    /// byte ahead of the brackets closing it.
     fn stable(&self) -> usize {
-        self.note.unwrap_or_else(|| self.text.trim_end_matches([']', '}']).len())
+        self.text.trim_end_matches([']', '}']).len()
     }
 }
 
@@ -946,14 +911,15 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
             .join("\n")
     };
     // The fixture: the steer sent while the tool write waited for approval
-    // first rides the request after it; the write turned the note on for
-    // every later request but the summary, which carries none; the summary
-    // request sends no tools, and the request after it is the first turn
-    // request with the compaction's digest note (its persisted opening,
+    // first rides the request after it; the write stored the note once, on
+    // its result, which every later request carries but the summary's; the
+    // summary request sends no tools, and the request after it is the first
+    // turn request with the compaction's digest note (its persisted opening,
     // `[context note:`).
     assert!(!bodies[0].contains(steer) && bodies[1].contains(steer), "the steer joins request 2");
-    let unnoted: Vec<usize> = (0..prompts.len()).filter(|&i| prompts[i].note.is_none()).map(|i| i + 1).collect();
-    assert_eq!(unnoted, [1, SUMMARY + 1], "the trailing note rides every request after the tool write but the summary's");
+    let notes: Vec<usize> = prompts.iter().map(|prompt| prompt.notes).collect();
+    let once: Vec<usize> = (0..prompts.len()).map(|i| usize::from(i > 0 && i != SUMMARY)).collect();
+    assert_eq!(notes, once, "the note, stored once, rides every request after the tool write but the summary's");
     assert!(
         !bodies[SUMMARY].contains("\"tools\":"),
         "request {} is not the compaction's summary request: the fixture's compaction moved",
@@ -1043,7 +1009,12 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
 /// earlier request's bytes could serve, where a provider's rule is modeled
 /// the share it bills as cached (as `a_session_prompt_is_75_percent_cacheable`
 /// models it), and on native Messages the thinking blocks replayed of those
-/// a request could replay. A byte count, so it holds in debug and release.
+/// a request could replay; README.md states the design, held here. Sent
+/// after the history of each request and dropped by the next, the note left
+/// every request after the second short of repeating the one before it,
+/// native Messages replaying 8 of 36 thinking blocks, and 74.59%
+/// (Responses) and 74.33% (native Messages) billed; stored, 36 of 36,
+/// 76.72% and 76.64%. A byte count, so it holds in debug and release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_note_is_stored_once_where_it_changes() {
     let mut failures = Vec::new();
@@ -1148,6 +1119,8 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
         .collect();
     let dropped: Vec<usize> =
         (0..prompts.len()).filter(|&i| wire == WireApi::Anthropic && replayed[i] < i).map(|i| i + 1).collect();
+    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let claim = "rides a note stored once, where it changes";
     close(&core, &id).await;
     let _ = std::fs::remove_dir_all(&dir);
     [
@@ -1155,6 +1128,7 @@ async fn note_storage_case(wire: WireApi) -> Vec<String> {
         (!unread.is_empty()).then(|| format!("requests {unread:?} read back no entry the request before them wrote")),
         (copies != 2).then(|| format!("the last request carries {copies} notes, not each of the two once")),
         (!dropped.is_empty()).then(|| format!("requests {dropped:?} replay the thinking of fewer replies than came before them")),
+        (!readme.contains(claim)).then(|| format!("README.md does not say \"{claim}\", which this test holds")),
     ]
     .into_iter()
     .flatten()

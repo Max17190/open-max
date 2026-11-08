@@ -48,7 +48,7 @@ the files. Hooks are capped at 32 per event the same way.
 
 A session's `tools` array is the one it began with, so writing a tool file
 mid-session moves no byte of the cached prompt prefix. From the agent's next
-step the new tool is a line of the trailing note (see
+step the new tool is a line of the note (see
 [Freezing and re-freezing](#freezing-and-re-freezing)): its name, description,
 and `params` schema, then the bash command that runs it the way the harness
 does, `printf '%s\n' '<JSON arguments>' | 'command' 'arg'...` in the project
@@ -117,7 +117,7 @@ base-level activation (each past access at age `t` hours contributes
 memory) and injected as one index line each under a 1500-byte budget. The
 index is frozen with the prompt: writing a memory mid-session does not
 re-freeze, so the prompt cache survives the write. The new line rides the
-trailing note from the agent's next step when it writes the memory with
+note from the agent's next step when it writes the memory with
 `write_file` or `edit_file`, and otherwise from the next re-freeze a tool or
 skill change causes or the next resume; it reaches the prompt at the next
 session or `/reload`. The
@@ -584,7 +584,7 @@ from the built-ins and the tool files that load then. The prompt is persisted
 with the session, and its manifest records the array's tool files and what the
 prompt's index shows.
 
-What the session changes after that rides the trailing note: each tool file
+What the session changes after that rides the note: each tool file
 the array lacks or carries with another description or schema, by its line
 (schema and bash command included, see [Tools](#tools)); each skill and memory
 added or changed, by its new index line; each tool file, skill, and memory the
@@ -593,14 +593,20 @@ compared whole though the prompt carries it capped. An entry that only moved
 in or out of the index (a memory that faded, a skill the byte cap now leaves
 out) is not a change, and the layout map stays the prompt's. The note is built
 when a generation activates, at a resume, and after the agent writes a memory
-with `write_file` or `edit_file`, never persisted, and sent after
-the whole history of each request: it ends the content of the last message
-(the user's prompt or the newest tool result) after a blank line and a header
-that names the harness as its source, or, after an assistant reply, goes as a
-user message of its own, so the endpoint sees the stored role order (see
-[configuration](configuration.md#multiple-providers)) and a provider's prompt
-cache covers the prompt and the whole conversation. A session that changes
-nothing sends no note. The note holds at most 6000 bytes, with the skills and
+with `write_file` or `edit_file`, and stored in the transcript each time it
+changes, never moved or rewritten: it ends the content of the newest tool
+result (after the receipt of the write that changed it) or, at the start of a
+turn, of the user's prompt, after a blank line and a header that names the
+harness as its source and says the latest note replaces any earlier one, or,
+after an assistant reply, goes as a user message of its own, so the endpoint
+sees the stored role order (see
+[configuration](configuration.md#multiple-providers)). Every later request
+repeats it as history, so a provider's prompt cache covers the prompt and the
+whole conversation, notes included. A prune that drops or shortens the stored
+note stores it again, a resumed session stores one only when what it builds
+differs from the last one stored, and when nothing differs from the prompt any
+more, the header alone is stored. A session that changes nothing stores no
+note. The note holds at most 6000 bytes, with the skills and
 memory sections under their prompt sections' caps (3000 and 1500), and counts
 what it leaves out. A copy of the note's header in tool output has its
 brackets turned to parentheses where the output is captured, so a file the
