@@ -296,6 +296,27 @@ pub struct CompletionResult {
     pub usage: Option<Usage>,
 }
 
+impl CompletionResult {
+    pub(crate) fn hit_output_cap(&self, max_tokens: usize) -> bool {
+        // Some servers report tool_calls even when the arguments hit the cap.
+        self.finish_reason == "length"
+            || self.usage.is_some_and(|u| u.completion_tokens == max_tokens as u64)
+    }
+
+    fn normalize_empty_tool_arguments(mut self, max_tokens: usize) -> Self {
+        // A completed no-argument call may omit the empty object. Leave the
+        // last call's blank arguments alone at the cap: it may have been cut
+        // before its first argument byte, so dispatch must reject it.
+        let complete = self.tool_calls.len().saturating_sub(usize::from(self.hit_output_cap(max_tokens)));
+        for call in self.tool_calls.iter_mut().take(complete) {
+            if call.function.arguments.trim().is_empty() {
+                call.function.arguments = "{}".into();
+            }
+        }
+        self
+    }
+}
+
 /// Ground-truth token usage from the server. `cached_tokens` is the number of
 /// prompt tokens served from the prompt cache (servers report it under
 /// `prompt_tokens_details` or as `prompt_cache_hit_tokens`): if it stays
@@ -799,7 +820,8 @@ impl ChatClient {
                     }
                     return Err(naming_wait(failure.message, beyond_cap));
                 }
-                return parse_complete_response(&v, &mut on_delta);
+                return parse_complete_response(&v, &mut on_delta)
+                    .map(|reply| reply.normalize_empty_tool_arguments(self.max_tokens));
             }
 
             let (reply, unfinished) = read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await;
@@ -815,7 +837,7 @@ impl ChatClient {
                 // Never a truncated reply: the server said this one failed,
                 // and a tool call it carried must not run.
                 Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
-                _ => return Ok(reply),
+                _ => return Ok(reply.normalize_empty_tool_arguments(self.max_tokens)),
             };
             if !resend_after(attempt, MAX_ATTEMPTS, &reason, wait, &cancelled, &mut on_delta).await {
                 return Ok(cancelled_response());
@@ -1410,9 +1432,7 @@ fn finalize_tool_calls(partials: Vec<PartialToolCall>) -> Vec<ToolCall> {
             kind: "function".into(),
             function: ToolCallFunction {
                 name: p.name,
-                // A call to a tool without parameters can come with no
-                // arguments at all, which means the empty object.
-                arguments: if p.arguments.trim().is_empty() { "{}".into() } else { p.arguments },
+                arguments: p.arguments,
             },
             extra_content: p.extra_content,
         })
@@ -2149,7 +2169,8 @@ pub(crate) mod tests {
             {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
             {"id": "c2", "type": "function", "function": {"name": "ping", "arguments": ""}},
         ]}, "finish_reason": "tool_calls"}]});
-        let calls = parse_complete_response(&one_shot, &mut |_| {}).unwrap().tool_calls;
+        let calls = parse_complete_response(&one_shot, &mut |_| {}).unwrap()
+            .normalize_empty_tool_arguments(4096).tool_calls;
         let calls: Vec<_> = calls.into_iter().map(|c| (c.id, c.function.name, c.function.arguments)).collect();
         assert_eq!(calls, vec![call("c1", "read_file", r#"{"path":"a.txt"}"#), call("c2", "ping", "{}")]);
     }
