@@ -17,6 +17,18 @@
 # core, libtest's default, leaves the tests that wait queued behind each
 # other on a 4-core runner while the cores sit idle.
 #
+# Two tests time their own work and hold it to a bound in a debug build
+# too: harness_time_per_tool_round and
+# a_hundred_extensions_load_in_under_10_ms (`alone_tests` below). Beside
+# every other binary they time the runner instead. Over 40 runs of CI's
+# Suite time job that ran them there, the first failed beside the others
+# in 37 and the second in 7, and each passed when run again alone. So a
+# binary that holds one runs beside the others without it, and then runs
+# it alone, after them and on the same clock, with libtest's own pool, as
+# `cargo test` runs it (and as cargo-nextest runs
+# harness_time_per_tool_round, with every test thread its own). Such a
+# test fails the check when it fails alone.
+#
 # The budget is 5 seconds times the multiplier, set for each CI runner from
 # its runs. CI's Suite time job gates a multiplier of 3 on ubuntu-latest
 # (4 cores), and the Reports workflow reports
@@ -104,13 +116,38 @@ built=$(cargo test --workspace --locked --no-run --message-format=json |
 tab=$(printf '\t')
 binaries=$(printf '%s\n' "$built" | sed -n "s/^true$tab//p")
 [ -n "$binaries" ] || { echo "error: cargo listed no test binaries" >&2; exit 1; }
-# A test binary lists its tests; any other binary prints its version.
-printf '%s\n' "$built" | {
-  while IFS="$tab" read -r test _ _ exe; do
-    case "$test" in true) "$exe" --list ;; *) "$exe" --version ;; esac > /dev/null 2>&1 &
-  done
-  wait
-}
+
+logs=$(mktemp -d)
+trap 'rm -rf "$logs"' EXIT
+
+# The tests that run alone (see above).
+alone_tests="harness_time_per_tool_round a_hundred_extensions_load_in_under_10_ms"
+# A test binary lists its tests, the n-th in the file listed-n; any other
+# binary prints its version.
+n=0
+while IFS="$tab" read -r test _ _ exe; do
+  case "$test" in
+    true) n=$((n + 1)); "$exe" --list > "$logs/listed-$n" 2> /dev/null & ;;
+    *) "$exe" --version > /dev/null 2>&1 & ;;
+  esac
+done <<EOF
+$built
+EOF
+wait
+# Each test binary's line gains the tests it holds that run alone, if any,
+# separated by spaces.
+binaries=$(
+  n=0
+  while IFS="$tab" read -r dir name exe; do
+    n=$((n + 1)) held=
+    for test in $alone_tests; do
+      ! grep -qxF "$test: test" "$logs/listed-$n" || held="$held $test"
+    done
+    printf '%s\t%s\t%s\t%s\n' "$dir" "$name" "$exe" "${held# }"
+  done <<EOF
+$binaries
+EOF
+)
 
 # A shell starts a background job with SIGINT and SIGQUIT ignored, and the
 # binary under test keeps a signal it inherited as ignored: put the defaults
@@ -126,7 +163,8 @@ printf '%s\n' "$built" | {
 # none starts another past the sweep, then kills them.
 #
 # The test pool is $3: unset, this script's wide one; empty, libtest's own,
-# one thread per core, which is the pool `cargo test` gives it.
+# one thread per core, which is the pool `cargo test` gives it. Any
+# arguments after it go to the binary after the pool.
 run_test() {
   local pools=${3-$threads} pool=()
   [ -z "$pools" ] || pool=(--test-threads "$pools")
@@ -151,7 +189,7 @@ run_test() {
     alarm $bound if $bound > 0;
     waitpid $pid, 0;
     exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
-  ' "$bound_ms" "$2.stopped" "$1" ${pool[@]+"${pool[@]}"} > "$2" 2>&1
+  ' "$bound_ms" "$2.stopped" "$1" ${pool[@]+"${pool[@]}"} "${@:4}" > "$2" 2>&1
   ended_as=$?
   [ ! -e "$2.stopped" ] || ended_as=stopped
 }
@@ -159,11 +197,12 @@ run_test() {
 ended() { case $1 in 0) ;; stopped) echo " FAILED (stopped at $(secs "$bound_ms"))" ;; *) echo " FAILED (exit $1)" ;; esac; }
 # libtest's account of the failures in log $1 of executable $3, whose run
 # ended as $2, or the end of whatever it printed; for a binary stopped at
-# the bound, the tests it lists that the log does not report finished.
+# the bound, the tests it lists that the log does not report finished,
+# listed with the arguments after $3 that chose the run's tests.
 failures() {
   if [ "$2" = stopped ]; then
     echo "still running at $(secs "$bound_ms"), when it was stopped:"
-    "$3" --list 2> /dev/null | sed -n 's/: test$//p' | LC_ALL=C sort > "$1.listed"
+    "$3" --list "${@:4}" 2> /dev/null | sed -n 's/: test$//p' | LC_ALL=C sort > "$1.listed"
     sed -n 's/^test \(.*\) \.\.\. .*$/\1/p' "$1" | LC_ALL=C sort | LC_ALL=C comm -23 "$1.listed" -
   elif grep -q '^failures:$' "$1"; then
     sed -n '/^failures:$/,$p' "$1"
@@ -172,32 +211,45 @@ failures() {
   fi
 }
 
-logs=$(mktemp -d)
-trap 'rm -rf "$logs"' EXIT
+# The arguments that leave the tests named in $1 out of a binary's run.
+skips() { [ -z "$1" ] || { printf -- '--exact'; printf -- ' --skip %s' $1; }; }
 
-# Run number $1 of the suite: every test binary at once, then each one's
-# time and the failures of any that failed. Sets `elapsed_ms`, `slowest`
-# (the slowest binary's time and name, or `unknown`) and `retried` (how
-# many binaries passed only when run again alone), and returns 1 when a
-# binary did not report, a test failed or the run took longer than its
-# budget.
+# Run number $1 of the suite: every test binary at once, then the tests that
+# run alone, then each one's time and the failures of any that failed. Sets
+# `elapsed_ms`, `slowest` (the slowest binary's time and name, or
+# `unknown`) and `retried` (how many binaries passed only when run again
+# alone), and returns 1 when a binary did not report, a test failed or the
+# run took longer than its budget.
 run_suite() {
   local out="$logs/$1" count=0 start failed=0
-  mkdir "$out"
+  mkdir "$out" "$out/alone"
   retried=0 slowest=unknown
   start=$(now_ms)
-  while IFS="$tab" read -r dir name exe; do
+  while IFS="$tab" read -r dir name exe held; do
     count=$((count + 1))
     (
       cd "$dir" || exit
       began=$(now_ms)
-      run_test "$exe" "$out/$count.log"
-      printf '%s\t%s\t%s\t%s\t%s\n' "$(($(now_ms) - began))" "$ended_as" "$name" "$dir" "$exe" > "$out/$count.status"
+      run_test "$exe" "$out/$count.log" "$threads" $(skips "$held")
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(($(now_ms) - began))" "$ended_as" "$name" "$dir" "$exe" "$held" > "$out/$count.status"
     ) &
   done <<EOF
 $binaries
 EOF
   wait
+  # The tests that run alone (see above), one binary at a time.
+  while IFS="$tab" read -r dir name exe held; do
+    [ -n "$held" ] || continue
+    count=$((count + 1))
+    (
+      cd "$dir" || exit
+      began=$(now_ms)
+      run_test "$exe" "$out/alone/$count.log" "" --exact $held
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(($(now_ms) - began))" "$ended_as" "$held in $name, alone" "$dir" "$exe" "$held" > "$out/alone/$count.status"
+    )
+  done <<EOF
+$binaries
+EOF
   elapsed_ms=$(($(now_ms) - start))
 
   reported=$(find "$out" -name '*.status' | wc -l | tr -d ' ')
@@ -206,8 +258,13 @@ EOF
   cat "$out"/*.status | sort -rn | while IFS="$tab" read -r ms status name _; do
     printf '%9s  %s%s\n' "$(secs "$ms")" "$name" "$(ended "$status")"
   done
+  for report in "$out"/alone/*.status; do
+    [ -e "$report" ] || continue
+    IFS="$tab" read -r ms status name _ < "$report"
+    printf '%9s  %s%s\n' "$(secs "$ms")" "$name" "$(ended "$status")"
+  done
   for report in "$out"/*.status; do
-    IFS="$tab" read -r _ status name dir exe < "$report"
+    IFS="$tab" read -r _ status name dir exe held < "$report"
     [ "$status" = 0 ] && continue
     log=${report%.status}.log
     echo
@@ -217,16 +274,26 @@ EOF
     # It runs with libtest's own pool, not this script's wide one, or the
     # retry would starve the same waits the wide pool starved beside the
     # other binaries, and the comparison would prove nothing.
-    alone=$(cd "$dir" && run_test "$exe" "$log.alone" "" && echo "$ended_as")
+    alone=$(cd "$dir" && run_test "$exe" "$log.alone" "" $(skips "$held") && echo "$ended_as")
     if [ "$alone" = 0 ]; then
       echo "${GITHUB_ACTIONS:+::warning::}$name failed beside the other binaries and passed alone:"
-      failures "$log" "$status" "$exe"
+      failures "$log" "$status" "$exe" $(skips "$held")
       retried=$((retried + 1))
       continue
     fi
     failed=1
     echo "${GITHUB_ACTIONS:+::error::}$name failed:"
-    failures "$log.alone" "$alone" "$exe"
+    failures "$log.alone" "$alone" "$exe" $(skips "$held")
+  done
+  # A test that ran alone has no second run: its failure is the check's.
+  for report in "$out"/alone/*.status; do
+    [ -e "$report" ] || continue
+    IFS="$tab" read -r _ status name dir exe held < "$report"
+    [ "$status" = 0 ] && continue
+    failed=1
+    echo
+    echo "${GITHUB_ACTIONS:+::error::}$name failed:"
+    failures "${report%.status}.log" "$status" "$exe" --exact $held
   done
   [ "$failed" = 0 ] || return 1
 

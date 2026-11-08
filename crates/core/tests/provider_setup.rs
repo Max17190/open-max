@@ -58,12 +58,12 @@ async fn concurrent_setup_and_account_catalog_preserve_unrelated_configuration()
         .await
         .unwrap();
     });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        setup.await.unwrap();
-        account.await.unwrap();
-    })
-    .await
-    .unwrap();
+    // No deadline of its own: the account's wait for the lock is edit_catalog's,
+    // which gives up after 5 seconds (a_busy_catalog_lock_has_a_bounded_wait). A
+    // 2-second one here timed the runner instead: beside every other test binary
+    // on a 4-core CI runner, the two saves outlasted it in 18 of 40 runs.
+    setup.await.unwrap();
+    account.await.unwrap();
     let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved["extra"], original["extra"]);
     assert_eq!(saved["providers"]["existing"], original["providers"]["existing"]);

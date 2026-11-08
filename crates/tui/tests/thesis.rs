@@ -142,7 +142,11 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// times the multiplier, and fails one over it or with a binary that fails
 /// again when run alone (or that a signal ends, SIGALRM included), naming
 /// the binary and showing its failures, and passes one whose binary failed
-/// only beside the others. A binary still running at three times the budget
+/// only beside the others. A test the script runs alone, as it times its
+/// own work, is left out of its binary's run beside the others and then runs
+/// alone once they have ended, on the clock, and fails the gate when it
+/// fails there, with no second run; each such test is one the suite holds.
+/// A binary still running at three times the budget
 /// is stopped, with every process still under it (a grandchild and one in a
 /// session of its own among them; on Linux, with no `ps` on the PATH), and
 /// fails the gate, which names the test it had not finished. Run several
@@ -214,6 +218,19 @@ fn the_suite_fails_over_its_time_budget() {
             script.contains(&format!("a multiplier of {multiplier} on {runner}")),
             "the script does not give the reason for the multiplier of {multiplier} on {runner}"
         );
+    }
+    // The tests the script runs alone are tests of the suite under those
+    // names: one renamed would run beside the others again and time the
+    // runner.
+    let named = script.lines().find_map(|line| line.strip_prefix("alone_tests=\"")?.strip_suffix('"')).unwrap_or("");
+    assert!(!named.is_empty(), "the script names no test that runs alone");
+    let sources: String = ["crates/core/tests", "crates/tui/tests"]
+        .iter()
+        .flat_map(|tests| std::fs::read_dir(repo().join(tests)).unwrap())
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default())
+        .collect();
+    for test in named.split(' ') {
+        assert!(sources.contains(&format!("fn {test}()")), "the script runs {test} alone, which no test is named");
     }
 
     let nonce = std::time::SystemTime::now()
@@ -301,6 +318,36 @@ fn the_suite_fails_over_its_time_budget() {
         path
     };
     let (contended, flaky) = (fails_once("contended"), fails_once("flaky"));
+    // A binary that holds a test the gate runs alone, and a binary beside it
+    // that marks when it ended: beside the others the first must be run
+    // without that test, then alone with only it, with libtest's own pool,
+    // once every other binary has ended, and once only. Alone, its test
+    // takes 0.3 seconds and ends with `code`.
+    let held_alone = |name: &str, code: u8| {
+        let (path, ended, runs) = (dir.join(name), dir.join(format!("{name}-lagging-ended")), dir.join(format!("{name}-alone-runs")));
+        executable(
+            &path,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --list ] && {{ printf 'beside: test\\nharness_time_per_tool_round: test\\n'; exit 0; }}\n\
+                 case \"$*\" in\n\
+                 \"--test-threads \"*\" --exact --skip harness_time_per_tool_round\") exit 0 ;;\n\
+                 \"--exact harness_time_per_tool_round\") echo run >> '{runs}' ;;\n\
+                 *) echo \"run with $*\"; exit 1 ;;\n\
+                 esac\n\
+                 [ -e '{ended}' ] || {{ echo 'run alone beside another binary'; exit 1; }}\n\
+                 sleep 0.3\n\
+                 [ {code} = 0 ] || printf 'failures:\\n\\n---- harness_time_per_tool_round stdout ----\\npast its bound\\n'\n\
+                 exit {code}\n",
+                runs = runs.display(),
+                ended = ended.display(),
+            ),
+        );
+        let lagging = dir.join(format!("{name}-lagging"));
+        executable(&lagging, &format!("#!/bin/sh\n[ \"$1\" = --list ] && exit 0\nsleep 0.4\n: > '{}'\n", ended.display()));
+        (path, lagging, runs)
+    };
+    let (timed, timed_lagging, timed_runs) = held_alone("timed", 0);
+    let (slow_alone, slow_lagging, slow_runs) = held_alone("slow-alone", 101);
     // A binary whose n-th run sleeps the n-th of `sleeps` seconds, for the
     // gate run several times over. In each series below the median is a
     // tenth of a second or more from the mean, the last run and the middle
@@ -377,6 +424,8 @@ fn the_suite_fails_over_its_time_budget() {
         (repeated_failed, repeated_failed_report),
         (unreported, unreported_report),
         (no_runs, _),
+        (alone, alone_report),
+        (alone_failed, alone_failed_report),
     ) = std::thread::scope(|scope| {
         let passed = scope.spawn(|| {
             let mut binaries: Vec<(&str, Option<&Path>)> =
@@ -409,6 +458,13 @@ fn the_suite_fails_over_its_time_budget() {
         let unreported =
             scope.spawn(|| run_gate("unreported", &["--runs", "2", "1"], &[("vanishing", Some(vanishing.as_path()))], None));
         let no_runs = scope.spawn(|| run_gate("no-runs", &["--runs", "0", "1"], &[], None));
+        let alone = scope.spawn(|| {
+            run_gate("alone", &["1"], &[("timed", Some(timed.as_path())), ("lagging", Some(timed_lagging.as_path()))], None)
+        });
+        let alone_failed = scope.spawn(|| {
+            let binaries = [("slow-alone", Some(slow_alone.as_path())), ("lagging", Some(slow_lagging.as_path()))];
+            run_gate("alone-failed", &["1"], &binaries, None)
+        });
         (
             passed.join().unwrap(),
             over.join().unwrap(),
@@ -423,8 +479,12 @@ fn the_suite_fails_over_its_time_budget() {
             repeated_failed.join().unwrap(),
             unreported.join().unwrap(),
             no_runs.join().unwrap(),
+            alone.join().unwrap(),
+            alone_failed.join().unwrap(),
         )
     });
+    let ran_alone = |runs: &Path| std::fs::read_to_string(runs).map_or(0, |text| text.lines().count());
+    let (timed_ran, slow_ran) = (ran_alone(&timed_runs), ran_alone(&slow_runs));
     // What the processes the hanging binary left running wrote, and whether
     // one of them still holds the lifeline two seconds on.
     let (mut said, mut chunk) = (Vec::new(), [0_u8; 64]);
@@ -547,6 +607,30 @@ fn the_suite_fails_over_its_time_budget() {
         "the run whose binary never reported does not say why: {unreported_report}"
     );
     assert_eq!(no_runs, Some(2), "a run count that is not a positive number is not refused");
+    // A test that times its own work runs alone: beside the others its
+    // binary runs without it, then it runs alone, once every other binary
+    // has ended, and its time counts toward the suite's. Alone, its failure
+    // fails the gate, with no second run.
+    let took = alone_report
+        .lines()
+        .find_map(|line| line.strip_prefix("the test suite took ")?.strip_suffix("s of its 5.00s budget")?.parse::<f64>().ok());
+    assert!(
+        alone == Some(0)
+            && alone_report.contains("harness_time_per_tool_round in timed (test), alone\n")
+            && timed_ran == 1
+            && took.is_some_and(|took| took >= 0.7),
+        "a test that runs alone did not run once, alone, after the others and on the clock: {alone_report}"
+    );
+    assert!(
+        alone_failed == Some(1)
+            && alone_failed_report.contains("harness_time_per_tool_round in slow-alone (test), alone FAILED (exit 101)")
+            && alone_failed_report.contains(
+                "harness_time_per_tool_round in slow-alone (test), alone failed:\nfailures:\n\n---- harness_time_per_tool_round stdout ----\npast its bound"
+            )
+            && !alone_failed_report.contains("passed alone")
+            && slow_ran == 1,
+        "a test that fails alone passes the gate, or runs a second time: {alone_failed_report}"
+    );
 }
 
 /// What scripts/count-core-lines.sh prints for `checkout` with `flags`, or,
