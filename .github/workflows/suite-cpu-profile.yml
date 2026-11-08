@@ -41,36 +41,22 @@ jobs:
       - name: Build the tests
         run: cargo test --workspace --locked --no-run
 
-      - name: Pools and faults per binary
+      - name: The whole suite under perf, every CPU
         run: |
           mkdir -p prof
-          cargo test --workspace --locked --no-run --message-format=json 2>/dev/null |
-            perl -MJSON::PP -ne 'my $m = decode_json($_); next unless $m->{reason} eq "compiler-artifact" && defined $m->{executable} && $m->{profile}{test};
-              (my $d = $m->{manifest_path}) =~ s{/Cargo\.toml$}{}; print join("\t", $d, "$m->{target}{name}($m->{target}{kind}[0])", $m->{executable}), "\n"' > prof/binaries.tsv
-          for name in 'open_max_core(lib)' 'cli(test)' 'openmax(bin)' 'stream_faults(test)'; do
-            IFS=$'\t' read -r dir _ exe < <(grep -F "	$name	" prof/binaries.tsv)
-            for pool in 32 8 4; do
-              (cd "$dir" && /usr/bin/time -v "$exe" --test-threads $pool > /dev/null 2> "$GITHUB_WORKSPACE/prof/v.txt") || true
-              echo "$name pool=$pool $(grep -E 'Elapsed|User time|System time|Minor|Voluntary context|Involuntary context' prof/v.txt | sed -E 's/^\s+//; s/ \(.*\)//' | tr '\n' ';')"
-            done
-          done | tee prof/pools.txt
-
-      - name: Where the core library's system time goes
-        run: |
-          IFS=$'\t' read -r dir _ exe < <(grep -F "	open_max_core(lib)	" prof/binaries.tsv)
-          cd "$dir"
-          if command -v perf > /dev/null; then
-            perf stat -e task-clock,page-faults,minor-faults,context-switches,cpu-migrations -- "$exe" --test-threads 32 > /dev/null 2> "$GITHUB_WORKSPACE/prof/perf-stat.txt" || true
-            cat "$GITHUB_WORKSPACE/prof/perf-stat.txt"
-            perf record -F 999 -g -o "$GITHUB_WORKSPACE/prof/perf.data" -- "$exe" --test-threads 32 > /dev/null 2>&1 || true
-            perf report -i "$GITHUB_WORKSPACE/prof/perf.data" --no-children --sort dso,symbol --stdio 2>/dev/null | grep -v '^$' | grep -E '^ +[0-9]' | head -60
-            echo; echo "by comm:"
-            perf report -i "$GITHUB_WORKSPACE/prof/perf.data" --no-children --sort comm --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -20
-            echo; echo "kernel callers of the top kernel symbols:"
-            perf report -i "$GITHUB_WORKSPACE/prof/perf.data" --no-children --sort symbol --stdio -G 2>/dev/null | grep -v '^$' | head -150
-          fi
-          strace -f -c -e trace=clone,clone3,fork,vfork,execve -o "$GITHUB_WORKSPACE/prof/strace.txt" "$exe" --test-threads 32 > /dev/null 2>&1 || true
-          cat "$GITHUB_WORKSPACE/prof/strace.txt"
+          sudo sysctl -w kernel.kptr_restrict=0 kernel.perf_event_paranoid=-1
+          perf record -a -g -F 499 -o prof/suite.data -- scripts/check-suite-time.sh 3 > prof/suite-perf.log 2>&1 || true
+          tail -n 3 prof/suite-perf.log
+          r() { perf report -i prof/suite.data --no-children "$@" --stdio 2>/dev/null | grep -E '^ +[0-9]' | sed -n '1,45p'; }
+          echo "== by command"; r --sort comm -g none
+          echo "== by dso"; r --sort dso -g none
+          echo "== by symbol"; r --sort dso,sym -g none
+          echo "== kernel symbols"; r --sort sym -g none --dsos '[kernel.kallsyms]'
+          echo "== kernel symbols with callers (top)"
+          perf report -i prof/suite.data --no-children --sort sym --dsos '[kernel.kallsyms]' --stdio -G 2>/dev/null | grep -v '^$' | sed -n '1,200p'
+          exe=$(ls -t target/debug/openmax | head -n 1)
+          echo "== the debug openmax binary: $(stat -c %s "$exe") bytes, $(readelf -r "$exe" | grep -c R_X86_64_RELATIVE) relative relocations, $(readelf -r "$exe" | grep -c R_X86_64_) relocations"
+          perf stat -r 50 -e task-clock,page-faults "$exe" --version 2>&1 > /dev/null | grep -E 'task-clock|page-faults|elapsed'
 
       - name: Suite at three pool widths, interleaved
         run: |
@@ -94,4 +80,4 @@ jobs:
           name: suite-cpu-profile-2
           path: |
             prof
-            !prof/perf.data
+            !prof/suite.data
