@@ -852,7 +852,7 @@ impl App {
             if boundaries.contains(&(i as u64)) {
                 self.transcript.push(vec![Line::from(Span::styled(
                     "• resumed",
-                    Style::default().fg(theme::DIM()),
+                    Style::default().fg(theme::DIM),
                 ))]);
             }
             match m.role.as_str() {
@@ -1237,7 +1237,7 @@ impl App {
                     .map(|l| {
                         Line::from(Span::styled(
                             format!("  {l}"),
-                            Style::default().fg(theme::DIM()),
+                            Style::default().fg(theme::DIM),
                         ))
                     })
                     .collect();
@@ -1631,11 +1631,13 @@ impl App {
         }
     }
 
+    /// The levels the selected route takes, so the picker and Shift+Tab never
+    /// offer one it would refuse.
     fn effort_levels(&self) -> &'static [&'static str] {
-        let provider = self.core.settings.lock().unwrap().provider.clone();
-        provider.and_then(|name| open_max_core::providers::load_providers(&self.core.data_dir)
-            .get(&name).map(|provider| provider.wire_api))
-            .unwrap_or_default().effort_levels()
+        let settings = self.core.settings.lock().unwrap().clone();
+        let provider = settings.provider.and_then(|name| open_max_core::providers::load_providers(&self.core.data_dir).remove(&name));
+        let (base, wire) = provider.map_or((settings.base_url, Default::default()), |p| (p.base_url, p.wire_api));
+        open_max_core::providers::effort_levels(&base, wire, settings.model.trim())
     }
 
     /// The mode the status line shows. Reads no filesystem.
@@ -2585,10 +2587,7 @@ impl App {
                     kv("session", self.session_id.as_deref().unwrap_or("none yet")),
                     kv("project", &self.project.display().to_string()),
                     kv("data", &self.core.data_dir.display().to_string()),
-                    Line::from(Span::styled(
-                        "  network".to_string(),
-                        Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
-                    )),
+                    Line::from(Span::styled("  network".to_string(), theme::ACCENT_BOLD)),
                     kv("  dest", &endpoint),
                     kv(
                         "  privacy",
@@ -2713,7 +2712,7 @@ impl App {
         }
         self.transcript.push(vec![Line::from(Span::styled(
             meta,
-            Style::default().fg(theme::DIM()),
+            Style::default().fg(theme::DIM),
         ))]);
         self.dirty.mark_chat();
     }
@@ -3141,13 +3140,8 @@ impl App {
 
     fn note(&mut self, text: &str) {
         self.transcript.push(vec![Line::from(vec![
-            Span::styled("• ", Style::default().fg(theme::ACCENT())),
-            Span::styled(
-                text.to_string(),
-                Style::default()
-                    .fg(theme::DIM())
-                    .add_modifier(Modifier::ITALIC),
-            ),
+            Span::styled("• ", Style::default().fg(theme::ACCENT)),
+            Span::styled(text.to_string(), theme::DIM_ITALIC),
         ])]);
         self.dirty.mark_chat();
     }
@@ -3158,7 +3152,7 @@ impl App {
             let prefix = if i == 0 { "✗ " } else { "  " };
             lines.push(Line::from(Span::styled(
                 format!("{prefix}{l}"),
-                Style::default().fg(theme::ERR()),
+                Style::default().fg(theme::ERR),
             )));
         }
         self.transcript.push(lines);
@@ -3262,12 +3256,10 @@ impl App {
                 .take(layout.queue.height as usize)
                 .map(|q| {
                     Line::from(vec![
-                        Span::styled("↳ ", Style::default().fg(theme::ACCENT())),
+                        Span::styled("↳ ", Style::default().fg(theme::ACCENT)),
                         Span::styled(
                             clip(&q.replace('\n', " "), area.width.saturating_sub(4) as usize),
-                            Style::default()
-                                .fg(theme::DIM())
-                                .add_modifier(Modifier::ITALIC),
+                            theme::DIM_ITALIC,
                         ),
                     ])
                 })
@@ -3279,7 +3271,7 @@ impl App {
                         "↳ … {} more queued",
                         self.queued.len() as u16 - layout.queue.height + 1
                     ),
-                    Style::default().fg(theme::DIM()),
+                    Style::default().fg(theme::DIM),
                 )));
             }
             Paragraph::new(qlines).render(layout.queue, frame.buffer_mut());
@@ -3334,13 +3326,8 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::WARN()))
-            .title(Span::styled(
-                " Approval ",
-                Style::default()
-                    .fg(theme::WARN())
-                    .add_modifier(Modifier::BOLD),
-            ));
+            .border_style(Style::default().fg(theme::WARN))
+            .title(Span::styled(" Approval ", theme::WARN_BOLD));
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
         let lines = approval_card_lines(name, summary, detail, env, inner.width);
@@ -3503,7 +3490,7 @@ impl App {
         };
         if sticky_rows > 0 {
             if let Some(line) = self.transcript.sticky_user_line(start) {
-                let gutter = Span::styled("❯ ", Style::default().fg(theme::DIM()));
+                let gutter = Span::styled("❯ ", Style::default().fg(theme::DIM));
                 paint_line(frame.buffer_mut(), row_at(0), Some(&gutter), line);
             }
         }
@@ -3560,7 +3547,7 @@ impl App {
                 area.y + marker_y as u16,
             )) {
                 cell.set_symbol("▐");
-                cell.set_style(Style::default().fg(theme::DIM()));
+                cell.set_style(Style::default().fg(theme::DIM));
             }
         }
     }
@@ -3609,7 +3596,7 @@ impl App {
             if self.thinking_tail != self.thinking_source {
                 thinking_changed = true;
                 self.thinking_source = self.thinking_tail.clone();
-                let dim = Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC);
+                let dim = theme::DIM_ITALIC;
                 let raw: Vec<Line<'static>> = self
                     .thinking_tail
                     .lines()
@@ -3646,7 +3633,7 @@ impl App {
                 self.tail_buf.extend(self.thinking_wrapped.iter().cloned().map(|mut line| {
                     line.spans.insert(
                         0,
-                        Span::styled("◌ ", Style::default().fg(theme::DIM())),
+                        Span::styled("◌ ", Style::default().fg(theme::DIM)),
                     );
                     line
                 }));
@@ -3677,8 +3664,8 @@ impl App {
             }
             meta.push_str(" · esc to cancel");
             self.tail_buf.push(Line::from(vec![
-                Span::styled(SPINNER[self.spinner_i].to_string(), Style::default().fg(theme::ACCENT())),
-                Span::styled(meta, Style::default().fg(theme::DIM())),
+                Span::styled(SPINNER[self.spinner_i].to_string(), Style::default().fg(theme::ACCENT)),
+                Span::styled(meta, Style::default().fg(theme::DIM)),
             ]));
         }
         // Queued messages render in dedicated chrome above the composer.
@@ -3753,9 +3740,9 @@ impl App {
             let left = clip(&left, left_max);
             let padding = width.saturating_sub(crate::ui::text::width(&left) + right_len);
             self.status_line = Line::from(vec![
-                Span::styled(left, Style::default().fg(theme::DIM())),
+                Span::styled(left, Style::default().fg(theme::DIM)),
                 Span::raw(" ".repeat(padding)),
-                Span::styled(right, Style::default().fg(theme::DIM())),
+                Span::styled(right, Style::default().fg(theme::DIM)),
             ]);
         }
         (&self.status_line).render(area, frame.buffer_mut());
@@ -3832,7 +3819,7 @@ fn render_ready(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     if area.width < 5 || area.height == 0 {
         return;
     }
-    Paragraph::new(Line::from(Span::styled("READY", Style::default().fg(theme::DIM()))))
+    Paragraph::new(Line::from(Span::styled("READY", Style::default().fg(theme::DIM))))
         .render(Rect { height: 1, ..area }, buf);
 }
 
@@ -3969,9 +3956,9 @@ fn help_line(key: &str, description: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("  {key:<32} "),
-            Style::default().fg(theme::ACCENT()),
+            Style::default().fg(theme::ACCENT),
         ),
-        Span::styled(description.to_string(), Style::default().fg(theme::DIM())),
+        Span::styled(description.to_string(), Style::default().fg(theme::DIM)),
     ])
 }
 
@@ -3989,7 +3976,7 @@ fn history_search_lines(
     if items.len() > SEARCH_ROWS {
         lines.push(Line::from(Span::styled(
             format!("  … {} more (keep typing)", items.len() - SEARCH_ROWS),
-            Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC),
+            theme::DIM_ITALIC,
         )));
     }
     lines
@@ -4040,9 +4027,9 @@ fn search_lines(
     width: u16,
     mut row: impl FnMut(usize, usize) -> String,
 ) -> Vec<Line<'static>> {
-    let dim_italic = Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC);
+    let dim_italic = theme::DIM_ITALIC;
     let mut header = vec![
-        Span::styled("⌕ ", Style::default().fg(theme::ACCENT())),
+        Span::styled("⌕ ", Style::default().fg(theme::ACCENT)),
         if query.is_empty() {
             Span::styled(placeholder.to_string(), dim_italic)
         } else {
@@ -4051,7 +4038,7 @@ fn search_lines(
     ];
     if let Some(count) = count {
         header.push(Span::raw("  "));
-        header.push(Span::styled(count, Style::default().fg(theme::DIM())));
+        header.push(Span::styled(count, Style::default().fg(theme::DIM)));
     }
     let mut lines = vec![Line::from(header)];
     if total == 0 {
@@ -4062,10 +4049,10 @@ fn search_lines(
     let first = selected.saturating_sub(visible - 1).min(total - visible);
     for i in first..first + visible {
         let (marker, style) = if i == selected {
-            let accent = Style::default().fg(theme::ACCENT());
+            let accent = Style::default().fg(theme::ACCENT);
             (Span::styled("▸ ", accent), accent.add_modifier(Modifier::BOLD))
         } else {
-            (Span::raw("  "), Style::default().fg(theme::DIM()))
+            (Span::raw("  "), Style::default().fg(theme::DIM))
         };
         lines.push(Line::from(vec![marker, Span::styled(row(i, (width as usize).saturating_sub(4)), style)]));
     }
@@ -4083,7 +4070,7 @@ fn draw_composer(
     cursor: bool,
 ) -> Rect {
     if area.height >= 3 {
-        let border_color = if focused { theme::ACCENT() } else { theme::BORDER() };
+        let border_color = if focused { theme::ACCENT } else { theme::BORDER };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -4165,20 +4152,18 @@ fn header_path_line(project: &std::path::Path, width: usize) -> Line<'static> {
         Some(i) if i + 1 < display.len() => display.split_at(i + 1),
         _ => ("", display.as_str()),
     };
-    let base_style = Style::default()
-        .fg(theme::ACCENT())
-        .add_modifier(Modifier::BOLD);
+    let base_style = theme::ACCENT_BOLD;
     let parent_w = crate::ui::text::width(parent);
     let base_w = crate::ui::text::width(base);
     if parent_w + base_w <= width {
         return Line::from(vec![
-            Span::styled(parent.to_string(), Style::default().fg(theme::DIM())),
+            Span::styled(parent.to_string(), Style::default().fg(theme::DIM)),
             Span::styled(base.to_string(), base_style),
         ]);
     }
     if base_w + 2 <= width {
         return Line::from(vec![
-            Span::styled("…/", Style::default().fg(theme::DIM())),
+            Span::styled("…/", Style::default().fg(theme::DIM)),
             Span::styled(base.to_string(), base_style),
         ]);
     }
@@ -4199,7 +4184,7 @@ fn plural(n: usize, word: &str) -> String {
 
 fn kv(k: &str, v: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {k:<11}"), Style::default().fg(theme::ACCENT())),
+        Span::styled(format!("  {k:<11}"), Style::default().fg(theme::ACCENT)),
         Span::raw(v.to_string()),
     ])
 }
@@ -4239,7 +4224,7 @@ fn paint_text_selection(
     line_map: &[Option<RowRef>],
     area: Rect,
 ) {
-    let select_bg = theme::SELECT();
+    let select_bg = theme::SELECT;
     for (row, painted) in line_map.iter().copied().enumerate() {
         let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else {
             continue;
@@ -4263,14 +4248,9 @@ const APPROVAL_LABELS: [&str; 3] =
 
 fn approval_choice_line() -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            APPROVAL_LABELS[0],
-            Style::default()
-                .fg(theme::WARN())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(APPROVAL_LABELS[1], Style::default().fg(theme::DIM())),
-        Span::styled(APPROVAL_LABELS[2], Style::default().fg(theme::DIM())),
+        Span::styled(APPROVAL_LABELS[0], theme::WARN_BOLD),
+        Span::styled(APPROVAL_LABELS[1], Style::default().fg(theme::DIM)),
+        Span::styled(APPROVAL_LABELS[2], Style::default().fg(theme::DIM)),
     ])
 }
 
@@ -4288,12 +4268,7 @@ fn approval_body_line(detail: &str, env: &[String], width: usize) -> Line<'stati
     if !env.is_empty() {
         let text = clip(&format!("receives env: {}", env.join(", ")), width);
         used = text.chars().count();
-        spans.push(Span::styled(
-            text,
-            Style::default()
-                .fg(theme::WARN())
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(text, theme::WARN_BOLD));
     }
     if !detail.is_empty() && used < width {
         let sep = if used > 0 { "  " } else { "" };
@@ -4303,7 +4278,7 @@ fn approval_body_line(detail: &str, env: &[String], width: usize) -> Line<'stati
             if !sep.is_empty() {
                 spans.push(Span::raw(sep));
             }
-            spans.push(Span::styled(d, Style::default().fg(theme::DIM())));
+            spans.push(Span::styled(d, Style::default().fg(theme::DIM)));
         }
     }
     if spans.is_empty() {
@@ -4336,12 +4311,7 @@ fn compact_approval_lines(
         lines.push(approval_body_line(body, env, width));
     } else {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{}  ", tool_card::human_name(name)),
-                Style::default()
-                    .fg(theme::WARN())
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{}  ", tool_card::human_name(name)), theme::WARN_BOLD),
             Span::raw(clip(summary, width.saturating_sub(name.len() + 2))),
         ]));
         if height >= 3 {
@@ -4421,12 +4391,7 @@ fn approval_env_lines(env: &[String], width: usize) -> Vec<Line<'static>> {
     approval_env_wrap(env, width)
         .into_iter()
         .map(|l| {
-            Line::from(Span::styled(
-                l,
-                Style::default()
-                    .fg(theme::WARN())
-                    .add_modifier(Modifier::BOLD),
-            ))
+            Line::from(Span::styled(l, theme::WARN_BOLD))
         })
         .collect()
 }
@@ -4447,12 +4412,7 @@ fn approval_card_lines(
     let width = width as usize;
     let body = if detail.is_empty() { summary } else { detail };
     let mut lines = vec![Line::from(vec![
-        Span::styled(
-            tool_card::human_name(name),
-            Style::default()
-                .fg(theme::WARN())
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(tool_card::human_name(name), theme::WARN_BOLD),
         Span::raw("  "),
         Span::styled(
             clip(summary, width.saturating_sub(name.len() + 2)),
@@ -4465,7 +4425,7 @@ fn approval_card_lines(
     lines.extend(approval_env_lines(env, width));
     lines.push(Line::from(Span::styled(
         clip(body, width),
-        Style::default().fg(theme::DIM()),
+        Style::default().fg(theme::DIM),
     )));
     lines.push(approval_choice_line());
     lines
@@ -5393,8 +5353,8 @@ mod tests {
         paint_text_selection(&mut buffer, &mut transcript, &rows, area);
 
         assert_eq!(buffer[(1, 0)].bg, ratatui::style::Color::Reset);
-        assert_eq!(buffer[(2, 0)].bg, theme::SELECT());
-        assert_eq!(buffer[(6, 0)].bg, theme::SELECT());
+        assert_eq!(buffer[(2, 0)].bg, theme::SELECT);
+        assert_eq!(buffer[(6, 0)].bg, theme::SELECT);
         assert_eq!(buffer[(7, 0)].bg, ratatui::style::Color::Reset);
     }
 
@@ -5416,7 +5376,7 @@ mod tests {
 
             let row = area.y;
             let highlighted: String = (area.x..area.right())
-                .filter(|x| buffer[(*x, row)].bg == theme::SELECT())
+                .filter(|x| buffer[(*x, row)].bg == theme::SELECT)
                 .map(|x| buffer[(x, row)].symbol().to_string())
                 .collect();
             assert_eq!(
@@ -5425,7 +5385,7 @@ mod tests {
                 "highlight and copy disagree at release cell {release}",
             );
             // The release cell itself is carried, never dropped.
-            assert_eq!(buffer[(area.x + release, row)].bg, theme::SELECT());
+            assert_eq!(buffer[(area.x + release, row)].bg, theme::SELECT);
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -7215,11 +7175,11 @@ mod tests {
             .iter()
             .position(|row| row.starts_with('╭'))
             .unwrap() as u16;
-        assert_eq!(focused[(0, border_y)].fg, theme::ACCENT());
+        assert_eq!(focused[(0, border_y)].fg, theme::ACCENT);
 
         app.focus = Focus::Scrollback;
         let unfocused = render_app(&mut app, 64, 12);
-        assert_eq!(unfocused[(0, border_y)].fg, theme::BORDER());
+        assert_eq!(unfocused[(0, border_y)].fg, theme::BORDER);
         fs::remove_dir_all(dir).unwrap();
     }
 

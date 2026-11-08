@@ -158,7 +158,13 @@ override the first two.
   sends `reasoning_effort`. Native Anthropic Messages sends
   `output_config.effort` and offers `low`, `medium`, `high`, `xhigh`, and `max`
   plus Default. It rejects `none` and `minimal`; the picker and shortcut leave
-  them out. Supported levels still depend on the model and endpoint;
+  them out. xAI's grok-4.x models (`api.x.ai`, or a model id starting
+  `grok-4.` behind a proxy or gateway) take `low`, `medium`, `high`, and
+  `xhigh` plus Default on every wire, as xAI documents; their reasoning cannot
+  be disabled and the API refuses `none` and `max` only after the request is
+  spent, so Open Max refuses every other level before sending, naming the
+  levels the route takes, and the picker and shortcut offer only those.
+  Elsewhere supported levels depend on the model and endpoint;
   the server validates explicit selections. A rejection is reported without
   retrying at another level. Sampling and protocol settings are unchanged.
   The Anthropic compatibility endpoint ignores effort, so explicit selections
