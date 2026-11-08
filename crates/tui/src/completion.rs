@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -378,20 +378,10 @@ pub fn scan_files(root: &Path) -> Vec<String> {
 pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'static>> {
     let width = width as usize;
     if indexing {
-        return vec![Line::from(Span::styled(
-            "  indexing files…",
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
-        ))];
+        return vec![Line::from(Span::styled("  indexing files…", theme::DIM_ITALIC))];
     }
     if popup.items.is_empty() {
-        return vec![Line::from(Span::styled(
-            "  no matches",
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
-        ))];
+        return vec![Line::from(Span::styled("  no matches", theme::DIM_ITALIC))];
     }
     let visible = popup.items.len().min(MAX_VISIBLE);
     // Window keeps the selection in view, pinned to the edges at the ends.
@@ -403,14 +393,12 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
     for (i, item) in popup.items.iter().enumerate().skip(first).take(visible) {
         let selected = i == popup.selected;
         let marker = if selected {
-            Span::styled("▸ ", Style::default().fg(theme::ACCENT()))
+            Span::styled("▸ ", Style::default().fg(theme::ACCENT))
         } else {
             Span::raw("  ")
         };
         let label_style = if selected {
-            Style::default()
-                .fg(theme::ACCENT())
-                .add_modifier(Modifier::BOLD)
+            theme::ACCENT_BOLD
         } else {
             Style::default()
         };
@@ -422,7 +410,7 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
             if room > 4 {
                 spans.push(Span::styled(
                     format!("  {}", clip(&item.detail, room)),
-                    Style::default().fg(theme::DIM()),
+                    Style::default().fg(theme::DIM),
                 ));
             }
         }
@@ -431,9 +419,7 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
     if popup.total_matches > visible {
         lines.push(Line::from(Span::styled(
             format!("  … {} more (keep typing)", popup.total_matches - visible),
-            Style::default()
-                .fg(theme::DIM())
-                .add_modifier(Modifier::ITALIC),
+            theme::DIM_ITALIC,
         )));
     }
     lines
@@ -446,6 +432,7 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     #[test]
     fn slash_triggers_only_at_message_start() {

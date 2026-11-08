@@ -6,7 +6,7 @@ use std::path::Path;
 
 use open_max_core::registry::{Registry, ToolKind};
 use open_max_core::skills::SkillSpec;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -146,19 +146,16 @@ pub fn skills_block(skills: &[SkillSpec], project_root: &Path, frozen: bool) -> 
 
 /// A listing's dim italic line: its header, an empty state, its footer.
 fn aside(text: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(text.into(), Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)))
+    Line::from(Span::styled(text.into(), theme::DIM_ITALIC))
 }
 
 /// A listing's row: the name padded to `name_w`, a tag padded to `tag_w`,
 /// and the description clipped to `max`.
 fn entry(name: &str, name_w: usize, tag: &str, tag_w: usize, description: &str, max: usize) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("  {}", super::text::pad_right(name, name_w)),
-            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("{tag:<tag_w$}"), Style::default().fg(theme::DIM())),
-        Span::styled(clip(description, max), Style::default().fg(theme::DIM())),
+        Span::styled(format!("  {}", super::text::pad_right(name, name_w)), theme::ACCENT_BOLD),
+        Span::styled(format!("{tag:<tag_w$}"), Style::default().fg(theme::DIM)),
+        Span::styled(clip(description, max), Style::default().fg(theme::DIM)),
     ])
 }
 

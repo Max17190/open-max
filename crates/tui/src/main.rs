@@ -2542,12 +2542,6 @@ fn prompt_trust(
     Ok(())
 }
 
-/// A data directory no other test can be handed. Tests delete their directory
-/// when they finish, so a name two of them share makes one delete the other's
-/// fixture mid-run. A timestamp alone does not separate them: `SystemTime`
-/// advances in microsecond steps on macOS, and parallel test threads routinely
-/// read the same value. The counter is what actually guarantees uniqueness;
-/// pid and clock only keep leftovers from earlier runs out of the way.
 /// One row of the `--check` human report, naming the file relative to
 /// `project` when it is under it (see doctor::report_path). The whole row
 /// rides one terminal line: a file's own name is author-controlled bytes
@@ -2672,6 +2666,12 @@ mod alloc_count {
 #[global_allocator]
 static COUNTING_ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
 
+/// A data directory no other test can be handed. Tests delete their directory
+/// when they finish, so a name two of them share makes one delete the other's
+/// fixture mid-run. A timestamp alone does not separate them: `SystemTime`
+/// advances in microsecond steps on macOS, and parallel test threads routinely
+/// read the same value. The counter is what actually guarantees uniqueness;
+/// pid and clock only keep leftovers from earlier runs out of the way.
 #[cfg(test)]
 pub fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

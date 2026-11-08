@@ -37,29 +37,26 @@ pub fn render_line(raw: &str, st: &mut LineState) -> Option<Line<'static>> {
 
     if st.in_fence {
         return Some(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(theme::DIM())),
-            Span::styled(raw.to_string(), Style::default().fg(theme::CODE())),
+            Span::styled("│ ", Style::default().fg(theme::DIM)),
+            Span::styled(raw.to_string(), Style::default().fg(theme::CODE)),
         ]));
     }
 
     // Headings.
     if let Some(rest) = strip_heading(trimmed) {
-        return Some(Line::from(Span::styled(
-            rest.to_string(),
-            Style::default().fg(theme::ACCENT()).add_modifier(Modifier::BOLD),
-        )));
+        return Some(Line::from(Span::styled(rest.to_string(), theme::ACCENT_BOLD)));
     }
     // Horizontal rule.
     if trimmed == "---" || trimmed == "***" {
         return Some(Line::from(Span::styled(
             "─".repeat(24),
-            Style::default().fg(theme::DIM()),
+            Style::default().fg(theme::DIM),
         )));
     }
     // Blockquote.
     if let Some(rest) = trimmed.strip_prefix("> ") {
-        let mut spans = vec![Span::styled("▎", Style::default().fg(theme::DIM()))];
-        spans.extend(inline(rest, Style::default().fg(theme::DIM()).add_modifier(Modifier::ITALIC)));
+        let mut spans = vec![Span::styled("▎", Style::default().fg(theme::DIM))];
+        spans.extend(inline(rest, theme::DIM_ITALIC));
         return Some(Line::from(spans));
     }
     // Bullets keep their indent.
@@ -67,7 +64,7 @@ pub fn render_line(raw: &str, st: &mut LineState) -> Option<Line<'static>> {
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
         let mut spans = vec![
             Span::raw(" ".repeat(indent_len)),
-            Span::styled("• ", Style::default().fg(theme::ACCENT())),
+            Span::styled("• ", Style::default().fg(theme::ACCENT)),
         ];
         spans.extend(inline(&trimmed[2..], Style::default()));
         return Some(Line::from(spans));
@@ -284,7 +281,7 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 // reads as a heavier emphasis than the prose it is quoted
                 // inside and breaks up a paragraph you are trying to read
                 // straight through.
-                spans.push(Span::styled(code, base.fg(theme::CODE())));
+                spans.push(Span::styled(code, base.fg(theme::CODE)));
                 i = close + 1;
                 continue;
             }
@@ -375,7 +372,7 @@ mod tests {
             .iter()
             .find(|span| span.content == "PLAN.md")
             .unwrap();
-        assert_ne!(code.style.fg, Some(theme::DIM()));
+        assert_ne!(code.style.fg, Some(theme::DIM));
     }
 
     /// Inline code is quoted inside prose, so it must never carry a heavier
