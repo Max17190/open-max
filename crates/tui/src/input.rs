@@ -8,12 +8,12 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme;
-use crate::ui::text;
+use crate::ui::text::{self, Selection};
 
 const MAX_HISTORY: usize = 200;
 
@@ -51,28 +51,6 @@ pub enum ComposerAction {
     Submit(String),
 }
 
-/// A mouse selection over the draft, endpoints inclusive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Selection {
-    anchor: Point,
-    head: Point,
-    /// Set by a word or line gesture, which picks a real range even when it is
-    /// one character wide. With inclusive endpoints a drag that has not moved
-    /// looks identical to a one-character selection; this tells them apart and
-    /// keeps a plain click from selecting.
-    explicit: bool,
-    /// The inclusive range the press picked: the word or line under a
-    /// gesture, the character under a plain press. A drag extends from it
-    /// but never shrinks the selection below it, matching the transcript.
-    origin: (Point, Point),
-}
-
-impl Selection {
-    fn is_empty(&self) -> bool {
-        !self.explicit && self.anchor == self.head
-    }
-}
-
 /// One display row: a soft-wrapped slice `start..end` (char columns) of
 /// logical line `line`. `last` marks the row that ends the logical line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,10 +71,8 @@ pub struct Composer {
     /// Whether the viewport tracks the cursor. The wheel detaches it; the
     /// next edit or cursor move re-attaches, so typing is never lost offscreen.
     follow: bool,
-    /// Mouse selection in logical coordinates. Both endpoints are inclusive,
-    /// matching the transcript: what is highlighted is exactly what a copy
-    /// carries, down to the character under the release cell.
-    selection: Option<Selection>,
+    /// Mouse selection in logical coordinates.
+    selection: Option<Selection<Point>>,
     /// Whether the mouse button is still down on that selection.
     dragging: bool,
     /// Ticks on every entry point that can change the text, via `touch`, so a
@@ -317,9 +293,6 @@ impl Composer {
         out
     }
 
-    /// Splice the collapsed paste whose marker sits under the cursor back
-    /// into the draft, for editing it in place. Returns false when the
-    /// cursor's row holds no intact marker under the cursor.
     /// Append `text` at the very end of the draft on its own line, leaving
     /// the cursor after it. Whole-block arrivals (a p-quote from the
     /// transcript) land here: splicing at the cursor would merge them into
@@ -334,6 +307,9 @@ impl Composer {
         self.insert_str(text);
     }
 
+    /// Splice the collapsed paste whose marker sits under the cursor back
+    /// into the draft, for editing it in place. Returns false when the
+    /// cursor's row holds no intact marker under the cursor.
     pub fn expand_paste_at_cursor(&mut self) -> bool {
         let row_text = self.lines[self.row].clone();
         for i in 0..self.pastes.len() {
@@ -750,26 +726,16 @@ impl Composer {
             // the draft, where `…` is the only signal that the view is
             // scrolled and there is more text above.
             let prefix = if row.line == 0 && row.start == 0 {
-                Span::styled(
-                    "❯ ",
-                    Style::default()
-                        .fg(theme::ACCENT())
-                        .add_modifier(Modifier::BOLD),
-                )
+                Span::styled("❯ ", theme::ACCENT_BOLD)
             } else if seen == 0 {
-                Span::styled("… ", Style::default().fg(theme::DIM()))
+                Span::styled("… ", Style::default().fg(theme::DIM))
             } else {
                 Span::raw("  ")
             };
             if self.is_empty() {
                 out.push(Line::from(vec![
                     prefix,
-                    Span::styled(
-                        "Describe a task",
-                        Style::default()
-                            .fg(theme::DIM())
-                            .add_modifier(Modifier::ITALIC),
-                    ),
+                    Span::styled("Describe a task", theme::DIM_ITALIC),
                 ]));
                 continue;
             }
@@ -779,7 +745,7 @@ impl Composer {
             let (sel_start, sel_end) = selected.unwrap_or((row.start, row.start));
             for (from, to, style) in [
                 (row.start, sel_start, Style::default()),
-                (sel_start, sel_end, Style::default().bg(theme::SELECT())),
+                (sel_start, sel_end, Style::default().bg(theme::SELECT)),
                 (sel_end, row.end, Style::default()),
             ] {
                 if from >= to {
@@ -809,39 +775,22 @@ impl Composer {
     /// area, and start a selection there.
     pub fn click_at(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
         let point = self.point_at(width, max_h, cell, row);
-        self.row = point.0;
-        self.col = point.1;
+        (self.row, self.col) = point;
         self.follow = true;
         self.hist_idx = None;
-        self.selection = Some(Selection {
-            anchor: point,
-            head: point,
-            explicit: false,
-            origin: (point, point),
-        });
+        self.selection = Some(Selection::press(point));
         self.dragging = true;
     }
 
     /// Extend an in-progress click selection to `(cell, row)`.
     pub fn drag_to(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
-        let Some(current) = self.selection.filter(|_| self.dragging) else {
+        if self.selection.is_none() || !self.dragging {
             return;
-        };
+        }
         let point = self.point_at(width, max_h, cell, row);
-        // The selection grows from the origin range and never shrinks below
-        // it: past either edge the far edge anchors and the pointer leads;
-        // inside it the selection is exactly the range the press picked.
-        let (lo, hi) = current.origin;
-        let (anchor, head) = if point > hi {
-            (lo, point)
-        } else if point < lo {
-            (hi, point)
-        } else {
-            (lo, hi)
-        };
-        self.selection = Some(Selection { anchor, head, ..current });
-        self.row = head.0;
-        self.col = head.1;
+        let Some(selection) = &mut self.selection else { return };
+        selection.drag_to(point);
+        (self.row, self.col) = selection.head;
         self.follow = true;
     }
 
@@ -863,35 +812,18 @@ impl Composer {
         row: u16,
         bounds: fn(&str, usize) -> (usize, usize),
     ) -> bool {
-        let point = self.point_at(width, max_h, cell, row);
         // A press replaces whatever was selected, including with nothing. An
         // empty line has no word and no line to take, and leaving the old
         // highlight standing would make it lie about what a copy carries, so
         // this falls back to exactly what a plain press does.
-        self.row = point.0;
-        self.col = point.1;
-        self.follow = true;
-        self.hist_idx = None;
-        self.selection = Some(Selection {
-            anchor: point,
-            head: point,
-            explicit: false,
-            origin: (point, point),
-        });
-        self.dragging = true;
-
-        let (start, end) = bounds(&self.lines[point.0], point.1);
+        self.click_at(width, max_h, cell, row);
+        let (line, col) = (self.row, self.col);
+        let (start, end) = bounds(&self.lines[line], col);
         if start >= end {
             return false;
         }
         self.col = end;
-        let (lo, hi) = ((point.0, start), (point.0, end - 1));
-        self.selection = Some(Selection {
-            anchor: lo,
-            head: hi,
-            explicit: true,
-            origin: (lo, hi),
-        });
+        self.selection = Some(Selection::range((line, start), (line, end - 1)));
         true
     }
 
@@ -899,9 +831,7 @@ impl Composer {
     /// only a cursor, so the next drag in the transcript is not swallowed.
     pub fn finish_selection(&mut self) {
         self.dragging = false;
-        if self.selection_bounds().is_none() {
-            self.selection = None;
-        }
+        self.selection = self.selection.filter(|selection| !selection.is_empty());
     }
 
     /// Whether a click started in the prompt and the button is still down.
@@ -965,15 +895,7 @@ impl Composer {
 
     /// Selection as (low, high) logical points, or `None` when it is empty.
     fn selection_bounds(&self) -> Option<(Point, Point)> {
-        let selection = self.selection?;
-        if selection.is_empty() {
-            return None;
-        }
-        Some(if selection.anchor <= selection.head {
-            (selection.anchor, selection.head)
-        } else {
-            (selection.head, selection.anchor)
-        })
+        self.selection?.bounds()
     }
 
     /// The highlighted text, newline-joined across logical lines.
@@ -1101,38 +1023,19 @@ fn boundary_iter(s: &str) -> impl Iterator<Item = usize> + '_ {
     }))
 }
 
+/// The last boundary before `col`, or 0 at the start of `s`.
 fn previous_grapheme_boundary(s: &str, col: usize) -> usize {
-    let mut prev = 0;
-    for boundary in boundary_iter(s) {
-        if boundary >= col {
-            break;
-        }
-        prev = boundary;
-    }
-    prev
+    boundary_iter(s).take_while(|&boundary| boundary < col).last().unwrap_or(0)
 }
 
+/// The first boundary after `col`, or the final one, the char count of `s`.
 fn next_grapheme_boundary(s: &str, col: usize) -> usize {
-    // Falls through to the final boundary, which is the char count of `s`.
-    let mut last = 0;
-    for boundary in boundary_iter(s) {
-        if boundary > col {
-            return boundary;
-        }
-        last = boundary;
-    }
-    last
+    boundary_iter(s).find(|&boundary| boundary > col).unwrap_or_else(|| s.chars().count())
 }
 
+/// The last boundary at or before `col`.
 fn floor_grapheme_boundary(s: &str, col: usize) -> usize {
-    let mut prev = 0;
-    for boundary in boundary_iter(s) {
-        if boundary > col {
-            break;
-        }
-        prev = boundary;
-    }
-    prev
+    boundary_iter(s).take_while(|&boundary| boundary <= col).last().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1763,7 +1666,7 @@ mod tests {
         let highlighted = |line: &Line<'static>| -> String {
             line.spans
                 .iter()
-                .filter(|span| span.style.bg == Some(theme::SELECT()))
+                .filter(|span| span.style.bg == Some(theme::SELECT))
                 .map(|span| span.content.as_ref())
                 .collect()
         };

@@ -18,11 +18,12 @@ use serde_json::{json, Value};
 
 const FIXTURE: &str = "--mcp-fixture";
 
-const TESTS: [(&str, fn()); 8] = [
+const TESTS: [(&str, fn()); 9] = [
     ("a_proxy_tool_written_from_the_spec_lists_and_calls_through_openmax", proxy_tool_from_the_spec),
     ("an_is_error_result_exits_nonzero_with_its_text", is_error_result),
     ("a_malformed_reply_is_reported_and_exits_nonzero", malformed_reply),
     ("a_server_that_never_answers_times_out_and_is_stopped", silent_server),
+    ("a_server_that_exits_before_answering_is_reported_with_its_status", exiting_server),
     ("a_server_that_stops_reading_cannot_stall_a_large_call", stalled_server),
     ("every_page_of_tools_is_listed", paginated_list),
     ("a_server_request_is_answered_and_a_notification_ignored", server_traffic_mid_call),
@@ -136,9 +137,10 @@ fn test_threads(args: &[String], env: Option<&str>) -> usize {
 /// `paged` (four tools over three tools/list pages), `malformed` (answers
 /// initialize with a line that is not JSON-RPC), `numeric-content` (answers
 /// every tools/call with a number for content), `unsupported` (answers with
-/// a protocol version no client knows), `silent <pidfile>` (never reads or
-/// writes, and ignores its closed stdin), and `stalled <pidfile>` (answers
-/// initialize, then never reads again).
+/// a protocol version no client knows), `exits` (reads initialize, then
+/// exits with status 3), `silent <pidfile>` (never reads or writes, and
+/// ignores its closed stdin), and `stalled <pidfile>` (answers initialize,
+/// then never reads again).
 fn serve(args: &[String]) {
     let mode = args.first().map(String::as_str).unwrap_or("basic");
     // A line on stderr, which the bridge must pass through to its caller.
@@ -170,6 +172,9 @@ fn serve(args: &[String]) {
             "initialize" => {
                 let requested = msg["params"]["protocolVersion"].as_str().unwrap_or_default();
                 let version = if mode == "unsupported" { "2099-01-01" } else { requested };
+                if mode == "exits" {
+                    std::process::exit(3);
+                }
                 if mode == "malformed" {
                     writeln!(out, "this line is not JSON-RPC").unwrap();
                     out.flush().unwrap();
@@ -617,6 +622,18 @@ fn silent_server() {
     // SAFETY: signal 0 only asks whether the process exists.
     assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the silent server outlived the run");
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// A server that exits before it answers is reported with its exit status,
+/// not as one that only closed its stdio.
+fn exiting_server() {
+    let run = bridge(&["--mcp-list"], &["exits"], "");
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("the MCP server exited (exit status: 3) before answering initialize"),
+        "{}",
+        run.stderr
+    );
 }
 
 /// A server that stops reading its stdin cannot hold the bridge on a write:

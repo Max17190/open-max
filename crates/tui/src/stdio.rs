@@ -99,10 +99,11 @@ pub async fn run(
     let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
         return crate::quit_status();
     };
-    let (session_id, continued, history) = match opened {
+    let (session_id, history) = match opened {
         Ok(opened) => opened,
         Err(code) => return code,
     };
+    let continued = args.continue_session;
     if stop_by.is_some() {
         // A signal landed while the session opened, so no turn ever ran.
         if !continued {
@@ -122,49 +123,26 @@ pub async fn run(
     drive(core, core_rx, session_id, project, stdin_rx, &args.quit, &mut stdout, !continued).await
 }
 
-/// Create or find the session, claim it, and read its history to replay:
-/// Ok(id, whether it was continued, history), or Err(the exit status) once
-/// the reason is on stderr.
+/// Create or find the session as print mode does, claim it, and read the
+/// history of a continued one to replay: Ok(id, history), or Err(the exit
+/// status) once the reason is on stderr.
 fn open_session(
     core: &Core,
     project_key: &str,
     continue_session: bool,
-) -> Result<(String, bool, Vec<open_max_core::types::ChatMessage>), i32> {
-    let (session_id, continued) = if continue_session {
-        match sessions::latest(core, project_key) {
-            Ok(Some(meta)) => (meta.id, true),
-            Ok(None) => {
-                eprintln!("openmax: no prior session in this directory to continue");
-                return Err(2);
-            }
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(core, e);
-                eprintln!("openmax: {}", open_max_core::text::one_line(&refusal));
-                return Err(1);
-            }
-        }
-    } else {
-        match sessions::create(core, project_key.to_string()) {
-            Ok(meta) => (meta.id, false),
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(core, e);
-                eprintln!("openmax: failed to create session: {}", open_max_core::text::one_line(&refusal));
-                return Err(1);
-            }
-        }
-    };
-
+) -> Result<(String, Vec<open_max_core::types::ChatMessage>), i32> {
+    let session_id = crate::headless::open_session(core, project_key.to_string(), continue_session)?;
     if let Err(e) = sessions::attach(core, &session_id) {
         eprintln!("openmax: {e}");
         return Err(1);
     }
-    let history = if continued {
+    let history = if continue_session {
         match sessions::load_messages(core, &session_id) {
             Ok(messages) => messages.unwrap_or_default(),
             Err(e) => { eprintln!("openmax: {e}"); return Err(1); }
         }
     } else { Vec::new() };
-    Ok((session_id, continued, history))
+    Ok((session_id, history))
 }
 
 /// The blocking stdin reader on its own thread; malformed input travels as
@@ -737,11 +715,7 @@ pub fn validate_line(line: &str) -> Result<String, String> {
         .ok_or_else(|| "object has neither 'cmd' nor 'type'".to_string())?;
     match ty {
         "hello" => {
-            for field in ["proto", "session_id", "version", "project"] {
-                if !obj.get(field).map(serde_json::Value::is_string).unwrap_or(false) {
-                    return Err(format!("hello missing string '{field}'"));
-                }
-            }
+            require_strings(obj, ty, &["proto", "session_id", "version", "project"])?;
             // Conformance is against the contract THIS binary implements, so a
             // foreign proto or version is a real mismatch, not just a
             // well-typed line. Otherwise the validator would bless a stream it
@@ -754,52 +728,27 @@ pub fn validate_line(line: &str) -> Result<String, String> {
             {
                 return Err(format!("unsupported protocol_version; expected {PROTO_VERSION}"));
             }
-            Ok("hello".to_string())
         }
-        "protocol_error" => {
-            if !obj.get("message").map(serde_json::Value::is_string).unwrap_or(false) {
-                return Err("protocol_error missing string 'message'".to_string());
-            }
-            Ok("protocol_error".to_string())
-        }
+        "protocol_error" => require_strings(obj, ty, &["message"])?,
+        "approval_mode" => require_strings(obj, ty, &["mode"])?,
         "forked" => {
-            for field in ["session_id", "parent_id"] {
-                if !obj.get(field).map(serde_json::Value::is_string).unwrap_or(false) {
-                    return Err(format!("forked missing string '{field}'"));
-                }
-            }
-            if !obj.get("message_index").map(serde_json::Value::is_u64).unwrap_or(false) {
+            require_strings(obj, ty, &["session_id", "parent_id"])?;
+            if !obj.get("message_index").is_some_and(serde_json::Value::is_u64) {
                 return Err("forked missing integer 'message_index'".to_string());
             }
-            Ok("forked".to_string())
-        }
-        "approval_mode" => {
-            if !obj.get("mode").map(serde_json::Value::is_string).unwrap_or(false) {
-                return Err("approval_mode missing string 'mode'".to_string());
-            }
-            Ok("approval_mode".to_string())
         }
         "transcript" => {
-            if !obj.get("session_id").map(serde_json::Value::is_string).unwrap_or(false) {
-                return Err("transcript missing string 'session_id'".to_string());
-            }
+            require_strings(obj, ty, &["session_id"])?;
             let Some(messages) = obj.get("messages").and_then(serde_json::Value::as_array) else {
                 return Err("transcript missing array 'messages'".to_string());
             };
-            for m in messages {
-                let ok = m.get("role").map(serde_json::Value::is_string).unwrap_or(false)
-                    && m.get("content").map(serde_json::Value::is_string).unwrap_or(false);
-                if !ok {
-                    return Err("transcript message missing string 'role'/'content'".to_string());
-                }
+            if messages.iter().any(|m| m.as_object().is_none_or(|m| require_strings(m, ty, &["role", "content"]).is_err())) {
+                return Err("transcript message missing string 'role'/'content'".to_string());
             }
-            Ok("transcript".to_string())
         }
         // An event envelope carries a flattened session_id plus the event.
         _ => {
-            if !obj.get("session_id").map(serde_json::Value::is_string).unwrap_or(false) {
-                return Err(format!("event '{ty}' missing string 'session_id'"));
-            }
+            require_strings(obj, &format!("event '{ty}'"), &["session_id"])?;
             let event = serde_json::from_value::<AgentEvent>(value.clone())
                 .map_err(|e| format!("bad event '{ty}': {e}"))?;
             // Well-typed is not enough for the one event a human must act on:
@@ -813,8 +762,17 @@ pub fn validate_line(line: &str) -> Result<String, String> {
                     );
                 }
             }
-            Ok(format!("event {ty}"))
+            return Ok(format!("event {ty}"));
         }
+    }
+    Ok(ty.to_string())
+}
+
+/// Err naming the first of `fields` that is not a string in `obj`.
+fn require_strings(obj: &serde_json::Map<String, serde_json::Value>, line: &str, fields: &[&str]) -> Result<(), String> {
+    match fields.iter().find(|field| !obj.get(**field).is_some_and(serde_json::Value::is_string)) {
+        Some(field) => Err(format!("{line} missing string '{field}'")),
+        None => Ok(()),
     }
 }
 
@@ -1133,6 +1091,16 @@ mod tests {
         assert!(long.chars().count() <= TRANSCRIPT_MSG_CHARS + 1);
         assert_eq!(t["truncated"], true);
         assert_eq!(validate_line(&line).unwrap(), "transcript");
+        // Each message is an object with both strings: a bare value has
+        // neither, and one string alone is half a message.
+        for messages in [r#"[1]"#, r#"["hello"]"#, r#"[{"role":"user"}]"#] {
+            let line = format!(r#"{{"type":"transcript","session_id":"s1","messages":{messages}}}"#);
+            assert_eq!(
+                validate_line(&line).unwrap_err(),
+                "transcript message missing string 'role'/'content'",
+                "{messages}"
+            );
+        }
         // `type` first, then the fields and each message's keys in the order
         // docs/stdio-protocol.md shows.
         assert_eq!(
