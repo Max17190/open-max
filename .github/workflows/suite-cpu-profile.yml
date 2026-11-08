@@ -1,0 +1,97 @@
+name: Suite CPU profile
+
+# Temporary: measures the CPU each test binary and each test spends on one
+# runner, to find what to cut. Removed before review.
+on:
+  push:
+    branches: [test/suite-time-headroom]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      - name: Install cargo-nextest
+        env:
+          NEXTEST_VERSION: 0.9.151
+        run: |
+          asset=x86_64-unknown-linux-gnu sha256=1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4
+          curl -sSfL --retry 3 "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-$asset.tar.gz" -o "$RUNNER_TEMP/cargo-nextest.tar.gz"
+          echo "$sha256  $RUNNER_TEMP/cargo-nextest.tar.gz" | shasum -a 256 --check --strict -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C "$RUNNER_TEMP/bin" cargo-nextest
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          [ -x /usr/bin/time ] || sudo apt-get install -y time
+          nproc; cat /proc/cpuinfo | grep 'model name' | head -1; free -m
+
+      - name: Build the tests
+        run: cargo test --workspace --locked --no-run
+
+      - name: Suite time with whole-machine CPU
+        run: |
+          mkdir -p prof
+          busy() { awk '/^cpu /{ print $2+$3+$4+$7+$8 }' /proc/stat; }
+          for i in 1 2 3; do
+            b=$(busy); s=$(date +%s.%N)
+            scripts/check-suite-time.sh 3 > prof/suite-$i.log 2>&1 || true
+            e=$(date +%s.%N); a=$(busy)
+            echo "suite run $i: wall $(echo "$e - $s" | bc) s, cpu $(echo "($a - $b) / $(getconf CLK_TCK)" | bc -l) s; $(grep -E 'test suite took' prof/suite-$i.log)" | tee -a prof/summary.txt
+          done
+          cat prof/suite-1.log
+
+      - name: Each binary alone, wide pool, CPU
+        run: |
+          cargo test --workspace --locked --no-run --message-format=json 2>/dev/null |
+            perl -MJSON::PP -ne 'my $m = decode_json($_); next unless $m->{reason} eq "compiler-artifact" && defined $m->{executable} && $m->{profile}{test};
+              (my $d = $m->{manifest_path}) =~ s{/Cargo\.toml$}{}; print join("\t", $d, "$m->{target}{name}($m->{target}{kind}[0])", $m->{executable}), "\n"' > prof/binaries.tsv
+          while IFS=$'\t' read -r dir name exe; do
+            (cd "$dir" && /usr/bin/time -o "$GITHUB_WORKSPACE/prof/t" -f '%e %U %S %M' "$exe" --test-threads 32 > "$GITHUB_WORKSPACE/prof/bin-$name.log" 2>&1) || echo "FAILED $name"
+            echo "$(cat prof/t) $name" | tee -a prof/binaries-cpu.txt
+          done < prof/binaries.tsv
+          echo; echo "wall user sys maxrss name, by user+sys:"; awk '{ printf "%7.2f %s\n", $2 + $3, $0 }' prof/binaries-cpu.txt | sort -rn
+
+      - name: Each test in its own process, CPU
+        run: |
+          cat > "$RUNNER_TEMP/cpu-wrap.sh" <<'EOF'
+          #!/bin/bash
+          f=$(mktemp)
+          /usr/bin/time -o "$f" -f '%e %U %S' "$@"
+          st=$?
+          case " $* " in *" --exact "*) printf '%s %s\n' "$(tail -n 1 "$f")" "$*" >> "$CPU_LOG" ;; esac
+          rm -f "$f"
+          exit $st
+          EOF
+          chmod +x "$RUNNER_TEMP/cpu-wrap.sh"
+          export CPU_LOG="$GITHUB_WORKSPACE/prof/tests-cpu.txt"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$RUNNER_TEMP/cpu-wrap.sh" cargo nextest run --workspace --locked --profile ci > prof/nextest.log 2>&1 || echo "nextest failed"
+          tail -n 5 prof/nextest.log
+          wc -l prof/tests-cpu.txt
+          echo "top 80 by user+sys (wall user sys binary --exact name):"
+          awk '{ printf "%7.2f %s\n", $2 + $3, $0 }' prof/tests-cpu.txt | sort -rn | head -n 80 | cut -c1-260
+          awk '{ s += $2 + $3 } END { print "total cpu", s }' prof/tests-cpu.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: suite-cpu-profile
+          path: prof
