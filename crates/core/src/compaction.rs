@@ -398,15 +398,15 @@ impl RequestSpend {
             sessions::append_usage(core, session_id, &sessions::TokenUsage {
                 ts: sessions::unix_now(),
                 prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
+                completion_tokens: u.output_tokens,
                 cached_tokens: u.cached_tokens,
             });
             core.send_agent(session_id, AgentEvent::Usage {
                 prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
+                completion_tokens: u.output_tokens,
                 cached_tokens: u.cached_tokens,
             });
-            u.prompt_tokens.saturating_add(u.completion_tokens) as usize
+            u.prompt_tokens.saturating_add(u.output_tokens) as usize
         } else {
             estimated.saturating_add(estimate_tokens(result.content.len()
                 + result.tool_calls.iter().map(|c| c.function.arguments.len()).sum::<usize>()))

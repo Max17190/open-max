@@ -108,7 +108,7 @@ events either, but carry one).
 | `thinking` | `text` |
 | `message_done` | `text` |
 | `budget` | `used_tokens` (estimated: transcript plus the frozen tool schemas re-sent every request, scaled up when the server reported more prompt tokens than estimated for the session's last request, or refused a request for length (recognized by the error's wording) that the estimate said fit), `context_tokens` |
-| `usage` | `prompt_tokens`, `completion_tokens`, `cached_tokens` (or null) |
+| `usage` | `prompt_tokens`, `completion_tokens` (the reply's output as the provider bills it, reasoning included: a server that reports reasoning beside its own `completion_tokens` and in its `total_tokens`, as xAI's Chat Completions does, has it added), `cached_tokens` (or null) |
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
 | `harness_note` | `call_id`, `text` (a note the harness wrote into the model's transcript: a refreeze receipt; an execution policy, policy, permission, hook, providers, settings, or approval notice; or the repeated identical call note. `--print` without `--json` prints no line for it. `call_id` links it to the tool result it rode; it is empty for a note inserted before the next prompt, such as a turn-start receipt) |

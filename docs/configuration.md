@@ -244,7 +244,10 @@ The model reads the mode in a one-line `[execution policy: <mode>; ...]` note
 placed ahead of a session's first prompt, and written again only when the mode
 changes or a resumed session's history no longer holds it. The history resends
 it on every later request, so it states only the mode's limits; content
-approval detail is in `openmax --spec tools`, `hooks`, and `permissions`.
+approval detail is in `openmax --spec tools`, `hooks`, and `permissions`. The
+tools and hooks contracts state each mode's rule and leave what applies only
+outside auto to `openmax --spec tools.approval` and `hooks.approval`, which
+they name, so a session in auto never re-sends it.
 
 Only a human can select a saved mode: at the trust grant, or with the
 selectors above in a human-controlled frontend. Agent-spawned processes can
