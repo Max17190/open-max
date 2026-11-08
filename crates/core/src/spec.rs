@@ -850,11 +850,11 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
 - `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,
-  `xhigh`, or `max`. Unset leaves the provider default. Native Anthropic
-  accepts low through max; model support varies. Its compatibility route
-  ignores effort and is refused when set. Humans use /effort or Shift+Tab
-  for live changes; these never change permissions. Explicit in-session
-  selections persist unless the endpoint is a temporary launch override.
+  `xhigh`, or `max`. Unset leaves the provider default. A level the route
+  refuses fails before any request: native Anthropic takes low to max, xAI's
+  grok-4.x low to xhigh, Anthropic's compatibility route none. Humans use
+  /effort or Shift+Tab for live changes; these never change permissions.
+  Explicit selections persist unless the endpoint is a launch override.
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
 - `compaction_tokens`: optional early-compaction trigger; only ever earlier.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
