@@ -698,9 +698,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // The terminal app folds its repeated key handling, search overlays, state resets and listing rows into
-    // one helper each: 445 lines fewer, no crate but the terminal app touched.
-    const BASELINE: usize = 44_010;
+    // A Responses server with no tools item gets the tools field, and the Responses reader states four
+    // of its steps more simply: 4 lines fewer, the frozen prompt unchanged.
+    const BASELINE: usize = 44_006;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
