@@ -366,6 +366,8 @@ mod tests {
         let (s, e) = line_bounds("a\n\nb", 2);
         assert_eq!(s, e);
         assert_eq!(line_bounds("", 0), (0, 0));
+        // An offset past the end takes the last line.
+        assert_eq!(line_bounds("ab", 99), (0, 2));
     }
 
     #[test]
