@@ -1631,11 +1631,13 @@ impl App {
         }
     }
 
+    /// The levels the selected route takes, so the picker and Shift+Tab never
+    /// offer one it would refuse.
     fn effort_levels(&self) -> &'static [&'static str] {
-        let provider = self.core.settings.lock().unwrap().provider.clone();
-        provider.and_then(|name| open_max_core::providers::load_providers(&self.core.data_dir)
-            .get(&name).map(|provider| provider.wire_api))
-            .unwrap_or_default().effort_levels()
+        let settings = self.core.settings.lock().unwrap().clone();
+        let provider = settings.provider.and_then(|name| open_max_core::providers::load_providers(&self.core.data_dir).remove(&name));
+        let (base, wire) = provider.map_or((settings.base_url, Default::default()), |p| (p.base_url, p.wire_api));
+        open_max_core::providers::effort_levels(&base, wire, settings.model.trim())
     }
 
     /// The mode the status line shows. Reads no filesystem.

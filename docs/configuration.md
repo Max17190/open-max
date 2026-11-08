@@ -158,24 +158,31 @@ override the first two.
   sends `reasoning_effort`. Native Anthropic Messages sends
   `output_config.effort` and offers `low`, `medium`, `high`, `xhigh`, and `max`
   plus Default. It rejects `none` and `minimal`; the picker and shortcut leave
-  them out. Both providers render that field ahead of the conversation, so
-  changing it mid-session makes the whole history a prompt cache miss once.
-  Where the model takes an effort change inside the conversation (GPT-6 and
-  later over Responses, not on a ChatGPT plan; Claude Opus 5 and 5.5, Sonnet
-  5.5, Haiku 5.5, Fable 5.1 and Mythos 5.1 over native Messages), the field
-  keeps the first effort the session ran at on that route and each later
-  choice goes just ahead of the prompt of the turn it was made for: a
-  `configuration_update` input item, or an effort-only system message under
-  the `mid-conversation-output-config-2026-07-01` beta header. Each prompt
-  records its turn's effort and route (endpoint, model and credentials,
-  hashed) in the session file, and only prompts the current route ran and
-  answered count, so an effort another model took or the server refused is
-  never sent again. A return to Default, which no such change can name, sends
-  the field as before. Supported levels still depend on the model and endpoint;
+  them out. xAI's grok-4.x models (`api.x.ai`, or a model id starting
+  `grok-4.` behind a proxy or gateway) take `low`, `medium`, `high`, and
+  `xhigh` plus Default on every wire, as xAI documents; their reasoning cannot
+  be disabled and the API refuses `none` and `max` only after the request is
+  spent, so Open Max refuses every other level before sending, naming the
+  levels the route takes, and the picker and shortcut offer only those.
+  Elsewhere supported levels depend on the model and endpoint;
   the server validates explicit selections. A rejection is reported without
   retrying at another level. Sampling and protocol settings are unchanged.
   The Anthropic compatibility endpoint ignores effort, so explicit selections
-  there are refused before saving or sending. See the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
+  there are refused before saving or sending. Responses and native Messages
+  render that field ahead of the conversation, so changing it mid-session
+  makes the whole history a prompt cache miss once. Where the model takes an
+  effort change inside the conversation (GPT-6 and later over Responses, not
+  on a ChatGPT plan; Claude Opus 5 and 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1
+  and Mythos 5.1 over native Messages), the field keeps the first effort the
+  session ran at on that route and each later choice goes just ahead of the
+  prompt of the turn it was made for: a `configuration_update` input item, or
+  an effort-only system message under the
+  `mid-conversation-output-config-2026-07-01` beta header. Each prompt
+  records its turn's effort and route (endpoint, model and credentials,
+  hashed) in the session file, and only prompts the current route ran and
+  answered count, so an effort another model took or the server refused is
+  never sent again. A return to Default, which no such change can name,
+  sends the field as before. See the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
   and [compatibility documentation](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk).
 - `max_output_bytes` (default 16384, floor 1000): per tool-result cap; bash
   keeps up to a quarter of each stream's share of the cap from its start and

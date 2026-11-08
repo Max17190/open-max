@@ -61,9 +61,10 @@ session or trust flags. `--account` defaults to `main`. See
 context-window configuration, and billing behavior.
 
 `--effort high` requests a reasoning effort level at launch. **Shift+Tab**
-cycles the active provider's effort levels. Choose `default`,
+cycles the levels the active endpoint and model take. Choose `default`,
 `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Levels depend on
-model support; provider errors are preserved. The setting follows the same
+model support; a level the route is known to refuse (for example `max` on
+xAI's grok-4.x) is refused before any request, and provider errors are preserved. The setting follows the same
 initial-configuration and run-only override rules as the endpoint flags below.
 
 `--base-url`, `--model`, `--api-key` (a literal or `'$ENV_VAR'`) and
