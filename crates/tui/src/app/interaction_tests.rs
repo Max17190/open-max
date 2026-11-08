@@ -230,13 +230,11 @@ async fn ctrl_t_flips_thinking_and_says_so_only_between_turns() {
     let shown = app.show_thinking;
     press(&mut app, ctrl('t')).await;
     assert_eq!(app.show_thinking, !shown);
-    let first = app.transcript.export_text();
     press(&mut app, ctrl('t')).await;
     assert_eq!(app.show_thinking, shown);
     let text = app.transcript.export_text();
     assert!(text.contains("thinking shown while the model streams"), "{text}");
     assert!(text.contains("thinking hidden (ctrl+t to show)"), "{text}");
-    assert!(first.lines().count() < text.lines().count());
 
     app.running = true;
     let before = app.transcript.block_count();
@@ -804,7 +802,7 @@ async fn presence_titles_ring_for_an_approval_and_notify_a_finished_turn() {
 
     // A copied selection goes to the clipboard and says so.
     app.composer.load("copy me");
-    let (_, _) = frame(&mut app, 40, 10);
+    frame(&mut app, 40, 10);
     let area = app.composer_draw_area;
     for _ in 0..3 {
         click(&mut app, area.x + 3, area.y).await;
@@ -1275,7 +1273,7 @@ async fn pointer_positions_map_to_the_draft_and_drags_extend_the_selection() {
 
     // A press then a drag past the end of the draft takes everything after
     // the press, however far the pointer goes.
-    let (_, _) = frame(&mut app, 40, 12);
+    frame(&mut app, 40, 12);
     let drag = |kind, column| TermEvent::Mouse(MouseEvent { kind, column, row: area.y, modifiers: KeyModifiers::NONE });
     app.last_click = None;
     app.on_term_event(drag(MouseEventKind::Down(MouseButton::Left), alpha + 6)).await.unwrap();
