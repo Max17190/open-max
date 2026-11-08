@@ -45,9 +45,9 @@ use tokio::sync::oneshot;
 use crate::batch::{batchable_call, execute_readonly_batch, parallel_tool_limit, partition_concurrent_runs, ReadonlyBatchCtx};
 use crate::client::{ChatClient, CompletionResult, TRUNCATED};
 use crate::compaction::{
-    achievable_target, compact_messages, compaction_trigger, observed_prompt_ratio, over_budget_error_context, refusal_ratio,
+    achievable_target, compact_messages, compaction_trigger, over_budget_error_context, refusal_ratio,
     request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
-    to_estimate, to_real, token_factor, CompactionCtx, RequestSpend,
+    to_estimate, to_real, token_factor, updated_prompt_ratio, CompactionCtx, RequestSpend,
 };
 use crate::config::{ApprovalMode, ReasoningEffort, Settings};
 use crate::hooks::{Hooks, PreToolResult};
@@ -427,7 +427,7 @@ async fn run_compact(
     let endpoint =
         crate::providers::resolve(&settings, &core.data_dir).map_err(|e| e.to_string())?;
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
-    let (messages, registry, take_seq, factor) = {
+    let (messages, registry, take_seq, prompt_ratio) = {
         let mut sessions_map = core.sessions.lock().await;
         let data = sessions_map
             .get_mut(session_id)
@@ -438,21 +438,22 @@ async fn run_compact(
             return Err("a turn is in flight; run /compact after it finishes".into());
         }
         let registry = data.registry.clone();
-        let factor = token_factor(route_ratio(data.prompt_ratio.as_ref(), &client.origin()));
+        let prompt_ratio = route_ratio(data.prompt_ratio.as_ref(), &client.origin());
         let (messages, seq) = take_messages(data);
-        (messages, registry, seq, factor)
+        (messages, registry, seq, prompt_ratio)
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
     // The same overhead the turn loop budgets with: the tool schemas.
     let schema_tokens = request_overhead(&registry.schemas_wire_arc());
     // In estimator units, like the turn loop's; the receipt converts back.
+    let factor = token_factor(prompt_ratio);
     let budget = to_estimate(
         endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024),
         factor,
     );
     // A one-shot command can prune even when the protected tail will not fit
     // its target. Fall back only when schemas leave no room at the trigger.
-    let trigger = requested_trigger(endpoint.compaction_tokens, factor, budget);
+    let trigger = requested_trigger(endpoint.compaction_tokens, prompt_ratio, budget);
     let trigger = if schemas_exceed_budget(trigger, schema_tokens) { budget } else { trigger };
     let tokens_before =
         schema_tokens + guard.messages().iter().map(|m| m.estimated_tokens()).sum::<usize>();
@@ -774,11 +775,9 @@ async fn run_loop(
         // as real as the transcript: the overhead every request carries
         // besides the history, the note stored in it included.
         let schema_tokens = request_overhead(&schemas_wire);
-        // The window is counted in the server's tokens and everything
-        // compaction compares is an estimate, so the window side converts
-        // here, once. `compaction_tokens` converts with it (inside the
-        // trigger, after its floor): the user reads it against the same
-        // context number the UI shows, and the trigger caps it by the budget.
+        // Convert the provider's window to estimator units with the
+        // conservative factor used for spend admission. The soft trigger
+        // can use a lower ratio and is capped by that window budget.
         let factor = token_factor(prompt_ratio);
         let window_budget = context_tokens.saturating_sub(max_tokens + 1024);
         let budget = to_estimate(window_budget, factor);
@@ -788,7 +787,7 @@ async fn run_loop(
                 .await;
         }
         let trigger = compaction_trigger(
-            budget, schema_tokens, endpoint.compaction_tokens, factor, guard.messages(),
+            budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(),
         );
         let ctx = CompactionCtx {
             core, session_id, project_root, client: &client, hooks: &hooks, cancelled: &cancelled,
@@ -829,14 +828,14 @@ async fn run_loop(
         let result = match result {
             Ok(r) => r,
             Err(mut message) => {
-                // No usage comes back with a refusal, so without this a
-                // request the estimate wrongly let through is refused again
-                // on every later turn: nothing calibrates, and the transcript
-                // stays under a budget it does not fit.
+                // Keep a stronger refusal floor or an earlier ratio that
+                // tightens the window. Failed requests cannot relax it.
                 let fits = context_tokens.saturating_sub(max_tokens);
-                if let Some(ratio) = refusal_ratio(&message, used, fits, factor) {
+                let next_ratio = refusal_ratio(&message, used, fits, factor)
+                    .or(prompt_ratio.filter(|&ratio| ratio >= 1.0));
+                if next_ratio != prompt_ratio {
                     if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                        data.prompt_ratio = Some((origin.clone(), ratio));
+                        data.prompt_ratio = next_ratio.map(|ratio| (origin.clone(), ratio));
                     }
                 }
                 // A knowingly oversized request that then fails owes the user
@@ -856,10 +855,11 @@ async fn run_loop(
         // Learned from turn requests only: the compaction summary is another
         // shape (no tool schemas, a different prompt) and would teach a ratio
         // no turn request has.
-        if let Some(ratio) = observed_prompt_ratio(&result, used) {
-            prompt_ratio = Some(ratio);
+        let next_ratio = updated_prompt_ratio(prompt_ratio, &result, used);
+        if next_ratio != prompt_ratio {
+            prompt_ratio = next_ratio;
             if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                data.prompt_ratio = Some((origin.clone(), ratio));
+                data.prompt_ratio = next_ratio.map(|ratio| (origin.clone(), ratio));
             }
         }
 
@@ -5425,6 +5425,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    struct SoftCompactionSession {
+        dir: PathBuf,
+        core: Arc<Core>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>,
+        project: PathBuf,
+        id: String,
+        requests: Arc<StdMutex<usize>>,
+    }
+
+    impl SoftCompactionSession {
+        async fn new(window: usize, spend_cap: Option<usize>, second_reply: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!("openmax-soft-ceiling-{}", uuid::Uuid::new_v4()));
+            let (core, rx) = Core::new(dir.join("data")).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 137_000 {
+                data.messages.push(ChatMessage::user("q ".repeat(2_000)));
+                data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
+            }
+            assert!(sessions::save_messages(&core, &id, &data.messages, &mut 0, true));
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+            let reported = |tokens| STOP_SSE.replace(
+                "data: [DONE]\n\n",
+                &format!("data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{tokens},\"completion_tokens\":1}}}}\n\ndata: [DONE]\n\n"),
+            );
+            let (base_url, requests) = scripted_endpoint(&[
+                &reported(90_000),
+                second_reply.unwrap_or(&reported(108_000)),
+                STOP_SSE,
+            ]).await;
+            {
+                let mut settings = core.settings.lock().unwrap();
+                settings.base_url = base_url;
+                settings.model = "fixture".into();
+                settings.context_tokens = Some(window);
+                settings.max_tokens = 1_024;
+                settings.max_agent_tokens = spend_cap;
+            }
+            let mut session = Self { dir, core, rx, project, id, requests };
+            let (stop, budgets) = session.turn("first".into()).await;
+            assert_eq!(stop, "stop");
+            let [first] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+            assert!((137_000..150_000).contains(&first), "{first}");
+            assert_eq!(session.ratio().await, Some(90_000.0 / first as f64));
+            session
+        }
+
+        async fn turn(&mut self, prompt: String) -> (String, Vec<usize>) {
+            start_turn(self.core.clone(), self.id.clone(), self.project.clone(), prompt).unwrap();
+            budgets_until_done(&mut self.rx).await
+        }
+
+        async fn ratio(&self) -> Option<f64> {
+            self.core.sessions.lock().await[&self.id].prompt_ratio.as_ref().map(|r| r.1)
+        }
+
+        fn request_count(&self) -> usize {
+            *self.requests.lock().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_usage_calibrates_the_soft_ceiling_for_current_context() {
+        let mut session = SoftCompactionSession::new(300_000, None, None).await;
+        let (stop, budgets) = session.turn("new context ".repeat(7_000)).await;
+        assert_eq!(stop, "stop");
+        let [used] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        assert!((155_000..165_000).contains(&used), "the added context fits: {used}");
+        assert_eq!(session.request_count(), 2);
+
+        // The last provider count still fits. The current transcript crosses
+        // the calibrated ceiling before another normal request goes out.
+        let ratio = 108_000.0 / used as f64;
+        let (stop, budgets) = session.turn("more context ".repeat(25_000)).await;
+        assert_eq!(stop, "stop");
+        let [used] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        let target = (150_000.0 / ratio) as usize * 70 / 100;
+        assert!((target - 3_000..=target).contains(&used), "pruned to {used}, target {target}");
+        assert_eq!(session.request_count(), 4, "the third turn makes one summary and one completion");
+        let _ = std::fs::remove_dir_all(session.dir);
+    }
+
+    #[tokio::test]
+    async fn forced_compaction_keeps_calibration_until_usage_is_missing() {
+        let mut session = SoftCompactionSession::new(300_000, None, None).await;
+        let (stop, budgets) = session.turn("new context ".repeat(7_000)).await;
+        assert_eq!(stop, "stop");
+        let [used] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        let ratio = 108_000.0 / used as f64;
+        let target = (150_000.0 / ratio) as usize * 70 / 100;
+        let receipt = run_compact(
+            &session.core, &session.id, &session.project, &Arc::new(CancelToken::default()),
+        ).await.unwrap();
+        assert!(receipt.compacted_messages > 0);
+        assert!((150_001..=target).contains(&receipt.tokens_after));
+        assert_eq!(session.ratio().await, Some(ratio));
+
+        let (stop, budgets) = session.turn("continue".into()).await;
+        assert_eq!(stop, "stop");
+        assert!(budgets[0] > 150_000, "the calibrated target does not immediately prune again");
+        assert_eq!(session.request_count(), 4);
+        assert_eq!(session.ratio().await, None, "the completion reported no usage");
+
+        let (stop, budgets) = session.turn("continue again".into()).await;
+        assert_eq!(stop, "stop");
+        assert!(budgets[0] <= 105_000, "missing usage restores the plain target");
+        assert_eq!(session.request_count(), 6);
+        let _ = std::fs::remove_dir_all(session.dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_discards_low_compaction_calibration() {
+        let error = "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"rejected\"}}\n\n";
+        let mut session = SoftCompactionSession::new(300_000, None, Some(error)).await;
+        let (stop, budgets) = session.turn("new context ".repeat(7_000)).await;
+        assert_eq!(stop, "error");
+        assert!(budgets[0] > 155_000, "the failed request used the prior calibration");
+        assert_eq!(session.request_count(), 2);
+        assert_eq!(session.ratio().await, None, "the failure supplied no usable usage");
+
+        let (stop, budgets) = session.turn("try again".into()).await;
+        assert_eq!(stop, "stop");
+        assert!(budgets[0] <= 105_000, "the next request uses the plain target");
+        assert_eq!(session.request_count(), 4);
+        let _ = std::fs::remove_dir_all(session.dir);
+    }
+
+    #[tokio::test]
+    async fn low_prompt_usage_keeps_the_window_and_spend_guards_conservative() {
+        let mut window = SoftCompactionSession::new(157_000, None, None).await;
+        let (stop, budgets) = window.turn("new context ".repeat(7_000)).await;
+        assert_eq!(stop, "stop");
+        assert!(budgets[0] <= (157_000 - 2_048) * 70 / 100);
+        assert_eq!(window.request_count(), 3);
+        let _ = std::fs::remove_dir_all(window.dir);
+
+        let mut spend = SoftCompactionSession::new(300_000, Some(155_000), None).await;
+        let (stop, budgets) = spend.turn("new context ".repeat(7_000)).await;
+        assert_eq!(stop, "budget_exhausted");
+        assert!(budgets.is_empty());
+        assert_eq!(spend.request_count(), 1);
+        let _ = std::fs::remove_dir_all(spend.dir);
+    }
+
     /// A provider that counts tokens denser than bytes/4 and refuses, the way
     /// a window does, every request whose body is over `limit` bytes; the rest
     /// get `STOP_SSE` and report no usage, so only a refusal can teach the
@@ -7379,7 +7526,7 @@ mod tests {
             let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
-                compaction_trigger(budget, schema_tokens, 20_000, 1.0, &data.messages),
+                compaction_trigger(budget, schema_tokens, 20_000, None, &data.messages),
                 budget,
                 "fixture must sit in the fallback band"
             );

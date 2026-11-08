@@ -674,9 +674,11 @@ const COMPACTION_TOKENS_FLOOR: usize = 20_000;
 
 /// The trigger a `compaction_tokens` setting asks for, in estimator units:
 /// floored in the setting's real tokens, then converted, then capped by the
-/// budget. Flooring after the conversion would floor the estimate instead,
-/// and under a 4x factor a 30k setting would compact at 80k real tokens.
-pub(crate) fn requested_trigger(requested: usize, factor: f64, budget: usize) -> usize {
+/// budget. The observed ratio can relax this soft trigger within the window.
+pub(crate) fn requested_trigger(requested: usize, ratio: Option<f64>, budget: usize) -> usize {
+    let factor = ratio
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .map_or(1.0, |r| r.min(MAX_TOKEN_FACTOR));
     to_estimate(requested.max(COMPACTION_TOKENS_FLOOR), factor).min(budget)
 }
 
@@ -715,16 +717,16 @@ const TRUNCATION_NOTE_ALLOWANCE_TOKENS: usize = 120;
 /// what the target must contain. Counting more would fall back while a
 /// configured prune could in fact succeed, silently disabling the setting.
 ///
-/// `ceiling` is in real tokens; `budget`, `schema_tokens`, and the
-/// result are estimator units under `factor`.
+/// `ceiling` is in real tokens. The budget, schema cost, and trigger use
+/// estimator units so the window can cap the trigger independently.
 pub(crate) fn compaction_trigger(
     budget: usize,
     schema_tokens: usize,
     ceiling: usize,
-    factor: f64,
+    ratio: Option<f64>,
     messages: &[ChatMessage],
 ) -> usize {
-    let trigger = requested_trigger(ceiling, factor, budget);
+    let trigger = requested_trigger(ceiling, ratio, budget);
     if trigger == budget || schemas_outgrow_budget(trigger, schema_tokens) {
         return budget;
     }
@@ -764,11 +766,23 @@ pub(crate) fn over_budget_error_context(
     )
 }
 
-/// The server's `prompt_tokens` over the estimate of the same request, when
-/// the server reported a prompt size at all.
-pub(crate) fn observed_prompt_ratio(result: &CompletionResult, estimated: usize) -> Option<f64> {
-    let prompt_tokens = result.usage?.prompt_tokens;
-    (prompt_tokens > 0 && estimated > 0).then(|| prompt_tokens as f64 / estimated as f64)
+/// Calibrate against the reported size of the same prompt. A ratio below
+/// one needs a complete response with usable usage. If the response cannot
+/// calibrate, keep any prior ratio that tightened the budget.
+pub(crate) fn updated_prompt_ratio(
+    previous: Option<f64>,
+    result: &CompletionResult,
+    estimated: usize,
+) -> Option<f64> {
+    let complete = !matches!(result.finish_reason.as_str(), TRUNCATED | "cancelled");
+    result.usage
+        .filter(|usage| usage.prompt_tokens > 0 && estimated > 0)
+        .and_then(|usage| {
+            let ratio = usage.prompt_tokens as f64 / estimated as f64;
+            let cache_count_fits = usage.cached_tokens.is_none_or(|cached| cached <= usage.prompt_tokens);
+            (ratio >= 1.0 || (complete && cache_count_fits)).then_some(ratio)
+        })
+        .or(previous.filter(|&ratio| ratio >= 1.0))
 }
 
 /// The ratio a refusal for length proves, when it proves more than `factor`
@@ -842,8 +856,7 @@ pub(crate) fn to_estimate(tokens: usize, factor: f64) -> usize {
     (tokens as f64 / factor) as usize
 }
 
-/// An estimate in real tokens, for every number shown against the window:
-/// what the UI reports and where compaction fires stay one quantity.
+/// A conservative estimate in real tokens for display and request admission.
 pub(crate) fn to_real(estimate: usize, factor: f64) -> usize {
     (estimate as f64 * factor).round() as usize
 }
@@ -1898,7 +1911,7 @@ pub(crate) mod tests {
             messages.push(msg("assistant", 2_000));
             messages.push(msg("user", 2_000));
         }
-        let trigger = compaction_trigger(budget, schema_tokens, 30_000, 1.0, &messages);
+        let trigger = compaction_trigger(budget, schema_tokens, 30_000, None, &messages);
         assert_eq!(trigger, 30_000);
         let (changed, _) = enforce_budget(&mut messages, trigger, schema_tokens);
         assert!(changed, "over the setting must prune with the window budget still far away");
@@ -1919,7 +1932,7 @@ pub(crate) mod tests {
     /// endpoint.
     #[test]
     fn the_compaction_setting_never_raises_the_trigger() {
-        assert_eq!(compaction_trigger(50_000, 500, 400_000, 1.0, &[]), 50_000);
+        assert_eq!(compaction_trigger(50_000, 500, 400_000, None, &[]), 50_000);
     }
 
     /// A setting whose prune target the frozen schemas outgrow can never be
@@ -1931,7 +1944,7 @@ pub(crate) mod tests {
         let budget = 150_000;
         let schema_tokens = 18_000;
         assert!(schemas_outgrow_budget(20_000, schema_tokens));
-        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, 1.0, &[]), budget);
+        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &[]), budget);
     }
 
     /// The other unachievable shape: a protected tail the setting's target
@@ -1951,13 +1964,13 @@ pub(crate) mod tests {
             messages.push(msg("tool", 30_000));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, 20_000, 1.0, &messages),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &messages),
             budget,
             "an unreachable target must not arm per-iteration compaction"
         );
         // The same setting over a lean transcript stays in force.
         let lean = vec![msg("system", 400), msg("user", 400)];
-        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, 1.0, &lean), 20_000);
+        assert_eq!(compaction_trigger(budget, schema_tokens, 20_000, None, &lean), 20_000);
 
         // And the floor counts only what a maximal prune actually leaves:
         // the pinned head, the note, and the newest three. Six mid-sized
@@ -1968,7 +1981,7 @@ pub(crate) mod tests {
             boundary.push(msg("assistant", 9_600));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, 20_000, 1.0, &boundary),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &boundary),
             20_000,
             "a reachable target must keep the setting in force"
         );
@@ -1982,7 +1995,7 @@ pub(crate) mod tests {
             note_first.push(msg("assistant", 400));
         }
         assert_eq!(
-            compaction_trigger(budget, schema_tokens, 20_000, 1.0, &note_first),
+            compaction_trigger(budget, schema_tokens, 20_000, None, &note_first),
             budget,
             "the floor must count the whole pinned head"
         );
@@ -2076,7 +2089,7 @@ pub(crate) mod tests {
     #[test]
     fn a_tiny_compaction_setting_is_floored() {
         assert_eq!(
-            compaction_trigger(100_000, 500, 1_000, 1.0, &[]),
+            compaction_trigger(100_000, 500, 1_000, None, &[]),
             COMPACTION_TOKENS_FLOOR
         );
     }
@@ -2088,21 +2101,25 @@ pub(crate) mod tests {
     /// rides the floor in real tokens too. `/compact` aims at the same mark.
     #[test]
     fn a_calibrated_setting_is_floored_in_real_tokens() {
-        let factor = token_factor(Some(4.0));
+        let ratio = Some(4.0);
         let mut transcript = vec![msg("system", 200), msg("user", 200)];
         // ~12k estimated, ~48k real: past the 30k the setting asks for.
         while transcript.iter().map(ChatMessage::estimated_tokens).sum::<usize>() < 12_000 {
             transcript.push(msg("assistant", 2_000));
             transcript.push(msg("user", 2_000));
         }
-        let trigger = compaction_trigger(100_000, 500, 30_000, factor, &transcript);
+        let trigger = compaction_trigger(100_000, 500, 30_000, ratio, &transcript);
         assert_eq!(trigger, 7_500);
-        assert_eq!(requested_trigger(30_000, factor, 100_000), trigger);
+        assert_eq!(requested_trigger(30_000, ratio, 100_000), trigger);
         assert!(enforce_budget(&mut transcript, trigger, 500).0, "compaction fires at 30k real");
         assert_eq!(
-            compaction_trigger(100_000, 500, 1_000, factor, &[]),
-            to_estimate(COMPACTION_TOKENS_FLOOR, factor)
+            compaction_trigger(100_000, 500, 1_000, ratio, &[]),
+            to_estimate(COMPACTION_TOKENS_FLOOR, token_factor(ratio))
         );
+        assert_eq!(requested_trigger(1_000, Some(0.5), 100_000), 40_000);
+        for invalid in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(requested_trigger(1_000, Some(invalid), 100_000), 20_000);
+        }
     }
 
     /// What the server reports can only tighten the budget: no observation
@@ -2132,9 +2149,22 @@ pub(crate) mod tests {
         let reported = |prompt_tokens| {
             completion(Some(crate::client::Usage { prompt_tokens, ..Default::default() }))
         };
-        assert_eq!(observed_prompt_ratio(&reported(1_200), 1_000), Some(1.2));
-        assert_eq!(observed_prompt_ratio(&reported(0), 1_000), None, "an unreported prompt size");
-        assert_eq!(observed_prompt_ratio(&completion(None), 1_000), None);
+        assert_eq!(updated_prompt_ratio(None, &reported(1_200), 1_000), Some(1.2));
+        assert_eq!(updated_prompt_ratio(Some(0.6), &reported(0), 1_000), None);
+        assert_eq!(updated_prompt_ratio(Some(1.2), &completion(None), 1_000), Some(1.2));
+        let mut limited = reported(600);
+        limited.finish_reason = "length".into();
+        assert_eq!(updated_prompt_ratio(None, &limited, 1_000), Some(0.6));
+        for reason in [TRUNCATED, "cancelled"] {
+            limited.finish_reason = reason.into();
+            assert_eq!(updated_prompt_ratio(Some(0.6), &limited, 1_000), None);
+            assert_eq!(updated_prompt_ratio(Some(1.2), &limited, 1_000), Some(1.2));
+        }
+        let inconsistent = |prompt_tokens| completion(Some(crate::client::Usage {
+            prompt_tokens, cached_tokens: Some(prompt_tokens + 1), ..Default::default()
+        }));
+        assert_eq!(updated_prompt_ratio(Some(0.6), &inconsistent(600), 1_000), None);
+        assert_eq!(updated_prompt_ratio(None, &inconsistent(1_200), 1_000), Some(1.2));
     }
 
     /// A refusal for length is a floor on the ratio: what the window leaves
