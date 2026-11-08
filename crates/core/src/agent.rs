@@ -1425,7 +1425,7 @@ async fn run_loop(
                     // the parse reason and the turn-scoped rule.
                     let fail_closed_now = current.fail_closed_reason().map(str::to_string);
                     permissions.reload(current);
-                    narrate_permissions_reload(core, session_id, &permissions, fail_closed_now, inert, guard.messages()).await;
+                    narrate_permissions_reload(core, session_id, project_root, &permissions, fail_closed_now, inert, guard.messages()).await;
                     changes.after_mutation(core, session_id, project_root, &canonical_root, &registry, guard.messages());
                 }
             }

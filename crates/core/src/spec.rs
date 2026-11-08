@@ -603,9 +603,10 @@ What the regex matches:
 - `bash` → the command string.
 - `read_file`, `write_file`, `edit_file`, `list_dir` → the path the tool will
   touch, resolved and root-relative however the call spells it (a directory
-  ends in `/`); a `deny` also reads it absolute, and ignores case.
-- `glob` → the pattern; `grep` → the pattern or the resolved search root.
-  A `deny` on `grep` ignores case.
+  ends in `/`); a `deny` also matches the resolved absolute path and ignores
+  case on resolved paths. A `deny` or `ask` also matches the supplied spelling.
+- `glob` and `grep` → the pattern; `deny` and `ask` for `grep` also match its
+  search root using the same path rules.
 - any other tool → the full serialized JSON arguments.
 
 A rule (and a `pre_tool_use` hook) sees TEXT, not effects. A `deny` on

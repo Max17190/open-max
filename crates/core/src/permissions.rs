@@ -113,6 +113,7 @@ struct Rule {
     tool: String,
     /// Compiled optional arg filter. Invalid patterns are dropped at load.
     arg_regex: Option<Regex>,
+    deny_path_regex: Option<Regex>,
     /// Where this rule was written: the 1-based `[[rules]]` position as the
     /// file spells it, and the file it came from. Carried from load so a deny
     /// can point at one rule instead of at the policy as a whole.
@@ -318,7 +319,15 @@ impl Permissions {
             }
             if let Some(re) = &rule.arg_regex {
                 let haystacks = haystacks.get_or_insert_with(|| arg_haystacks(&self.project_root, tool, args));
-                if !haystacks.iter().any(|(haystack, deny_only)| (!deny_only || rule.effect == Effect::Deny) && re.is_match(haystack)) {
+                let path_re = rule.deny_path_regex.as_ref().unwrap_or(re);
+                if !haystacks.iter().any(|arg| match arg {
+                    RuleArgument::Text(text) => re.is_match(text),
+                    RuleArgument::RelativePath(path) => {
+                        (tool != "grep" || rule.effect != Effect::Allow) && path_re.is_match(path)
+                    }
+                    RuleArgument::AbsolutePath(path) => rule.effect == Effect::Deny && path_re.is_match(path),
+                    RuleArgument::OriginalPath(path) => rule.effect != Effect::Allow && re.is_match(path),
+                }) {
                     continue;
                 }
             }
@@ -530,14 +539,16 @@ fn load_file(path: &Path) -> FileLoad {
                 ));
             }
         };
-        let arg_regex = match raw.arg_regex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            None => None,
-            // A case variant can name the same target on a case-insensitive volume.
-            Some(pat) => match regex::RegexBuilder::new(pat)
-                .case_insensitive(effect == Effect::Deny && matches!(tool.as_str(), "read_file" | "write_file" | "edit_file" | "list_dir" | "grep"))
-                .build()
-            {
-                Ok(re) => Some(re),
+        let (arg_regex, deny_path_regex) = match raw.arg_regex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => (None, None),
+            Some(pat) => match Regex::new(pat).and_then(|re| {
+                // A case variant can name the same target on a case-insensitive volume.
+                let deny_path = effect == Effect::Deny
+                    && matches!(tool.as_str(), "read_file" | "write_file" | "edit_file" | "list_dir" | "grep");
+                let path_re = deny_path.then(|| regex::RegexBuilder::new(pat).case_insensitive(true).build()).transpose()?;
+                Ok((Some(re), path_re))
+            }) {
+                Ok(regexes) => regexes,
                 // The regex engine's own caret block pinpoints the character;
                 // this only has to say which rule it is under.
                 Err(e) => {
@@ -551,6 +562,7 @@ fn load_file(path: &Path) -> FileLoad {
             effect,
             tool,
             arg_regex,
+            deny_path_regex,
             index,
             source: path.to_path_buf(),
         });
@@ -577,29 +589,40 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// The strings an `arg_regex` is matched against, any one sufficing, each
-/// with whether only a deny reads it. A file tool's path, and grep's beside
-/// its pattern, is the path the tool will touch as `tools::resolve` finds it,
-/// root-relative, a directory's ending in `/`: every spelling of one file
-/// (`./p`, `d/../p`, an absolute path, a link in the project) is the same
-/// string. A deny reads it absolute too, as a call could spell it before. A
-/// path the tool refuses stays as written.
-fn arg_haystacks(root: &Path, tool: &str, args: &Value) -> Vec<(String, bool)> {
+enum RuleArgument {
+    Text(String),
+    RelativePath(String),
+    AbsolutePath(String),
+    OriginalPath(String),
+}
+
+/// Match the target that `tools::resolve` finds, with `/` after a directory.
+/// Denies can also match an absolute target. Denies and asks keep matching
+/// the supplied spelling so existing rules continue to apply.
+fn arg_haystacks(root: &Path, tool: &str, args: &Value) -> Vec<RuleArgument> {
     let arg = |key: &str| args[key].as_str().unwrap_or_default().to_string();
     let resolved = |path: String| match (crate::tools::resolve(root, &path), root.canonicalize()) {
         (Ok(abs), Ok(root)) if abs.starts_with(&root) => {
             let slash = if abs.is_dir() && abs != root { "/" } else { "" };
             let rel = abs.strip_prefix(&root).unwrap_or(&abs).display();
-            vec![(format!("{rel}{slash}"), false), (format!("{}{slash}", abs.display()), true)]
+            vec![
+                RuleArgument::RelativePath(format!("{rel}{slash}")),
+                RuleArgument::AbsolutePath(format!("{}{slash}", abs.display())),
+                RuleArgument::OriginalPath(path),
+            ]
         }
-        _ => vec![(path, false)],
+        _ => vec![RuleArgument::Text(path)],
     };
     match tool {
-        "bash" => vec![(arg("command"), false)],
+        "bash" => vec![RuleArgument::Text(arg("command"))],
         "write_file" | "edit_file" | "read_file" | "list_dir" => resolved(arg("path")),
-        "grep" => [vec![(arg("pattern"), false)], resolved(arg("path"))].concat(),
-        "glob" => vec![(arg("pattern"), false)],
-        _ => vec![(serde_json::to_string(args).unwrap_or_default(), false)],
+        "grep" => {
+            let mut arguments = resolved(arg("path"));
+            arguments.push(RuleArgument::Text(arg("pattern")));
+            arguments
+        }
+        "glob" => vec![RuleArgument::Text(arg("pattern"))],
+        _ => vec![RuleArgument::Text(serde_json::to_string(args).unwrap_or_default())],
     }
 }
 
@@ -653,7 +676,12 @@ mod tests {
             ("deny", "read_file", "^secrets/".into()),
             ("deny", "read_file", format!("^{}/notes/", regex::escape(&abs))),
             ("deny", "grep", "^secrets/".into()),
+            ("deny", "grep", "^testpattern$".into()),
+            ("allow", "grep", "^$".into()),
+            ("deny", "grep", "^restricted$".into()),
             ("deny", "bash", "^example$".into()),
+            ("deny", "write_file", r"^\./notes/".into()),
+            ("ask", "read_file", r"^\./src/".into()),
             ("allow", "write_file", "^src/".into()),
             ("allow", "write_file", "docs/".into()),
         ];
@@ -693,8 +721,13 @@ mod tests {
             assert!(denied("grep", json!({"pattern": ".", "path": path})), "grep over {path} is not denied");
         }
         assert_eq!(decide("grep", json!({"pattern": ".", "path": "src"})), PermissionDecision::Default);
+        assert!(denied("grep", json!({"pattern": "testpattern", "path": "src"})));
+        assert_eq!(decide("grep", json!({"pattern": "TESTPATTERN", "path": "src"})), PermissionDecision::Default);
+        assert!(denied("grep", json!({"pattern": "restricted"})));
         assert!(denied("bash", json!({"command": "example"})));
         assert_eq!(decide("bash", json!({"command": "EXAMPLE"})), PermissionDecision::Default);
+        assert!(denied("write_file", json!({"path": "./notes/plan.md"})));
+        assert_eq!(decide("read_file", json!({"path": "./src/main.rs"})), PermissionDecision::Ask);
         for path in ["src/main.rs", "./src/main.rs", "src/new/mod.rs"] {
             assert_eq!(decide("write_file", json!({"path": path, "content": "x"})), PermissionDecision::Allow, "{path}");
         }

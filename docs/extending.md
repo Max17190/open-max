@@ -291,8 +291,8 @@ arg_regex = "^cargo (test|check|build)"
 ```
 
 `effect` is `allow`, `deny`, or `ask`. `arg_regex` is optional: command for
-`bash`, pattern for `glob`, and for `grep` its pattern or the path it
-searches. For custom tools it matches the full serialized JSON arguments.
+`bash` and pattern for `glob` and `grep`. A `deny` or `ask` for `grep` also
+matches its search root. For custom tools it matches the full serialized JSON arguments.
 Omit `arg_regex` (or leave it empty) to match every call of that tool.
 
 For `read_file`, `write_file`, `edit_file`, `list_dir` and `grep`'s path, the
@@ -302,14 +302,14 @@ ending in `/`. `./src/x`, `lib/../src/x`, the absolute path and a link in the
 project to `src` are all `src/x`, so `^src/` matches each of them and nothing
 outside `src/`. A `deny` also reads the absolute path and ignores case, since
 a case variant names the same file on a case-insensitive volume, even in a
-directory not created yet. `allow` and `ask` read only the relative path,
-case and all. A path the tool refuses (one that leaves the project) is
-matched as written, and the tool refuses it anyway.
+directory not created yet. A `deny` or `ask` also matches the supplied path
+spelling so existing restrictions continue to apply. File tool `allow`
+rules match the resolved relative path with case. A path the tool refuses
+is matched as supplied.
 
 A rule names one tool. A `deny read_file` on `secrets/` gates reads through
 `read_file`. A `grep` path rule matches the search root, so a search rooted
-above `secrets/` can still reach it. A deny regex for `grep` also matches
-its pattern case-insensitively. For broader protection, deny `grep` and
+above `secrets/` can still reach it. For broader protection, deny `grep` and
 `bash` calls or move the files out of the project.
 
 `tool` is matched by exact name, so a rule naming a tool that does not exist

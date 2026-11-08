@@ -524,6 +524,7 @@ pub(crate) fn repeated_result_note(n: usize) -> String {
 pub(crate) async fn narrate_permissions_reload(
     core: &Arc<Core>,
     session_id: &str,
+    project_root: &Path,
     permissions: &TurnPermissions,
     fail_closed_now: Option<String>,
     inert: Vec<String>,
@@ -536,14 +537,16 @@ pub(crate) async fn narrate_permissions_reload(
             // file, but an earlier snapshot this turn may have explicitly
             // DENIED one of them, and the most restrictive answer wins - so
             // the receipt must not promise a repair tool a rule already
-            // blocks. File rules match the resolved target, so one spelling
-            // is enough to check each tool.
-            let probe = serde_json::json!({ "path": ".openmax/permissions.toml" });
+            // blocks. Restrictions also match the original argument, so
+            // check the conventional spellings of the repair path.
+            let abs = project_root.join(".openmax/permissions.toml").to_string_lossy().into_owned();
             let repair_denied = |tool: &str| {
-                matches!(
-                    permissions.evaluate(tool, &probe),
-                    crate::permissions::PermissionDecision::Deny { .. }
-                )
+                [abs.as_str(), ".openmax/permissions.toml", "./.openmax/permissions.toml"].iter().any(|p| {
+                    matches!(
+                        permissions.evaluate(tool, &serde_json::json!({ "path": p })),
+                        crate::permissions::PermissionDecision::Deny { .. }
+                    )
+                })
             };
             let allowed: Vec<&str> = ["write_file", "edit_file"].into_iter().filter(|t| !repair_denied(t)).collect();
             let repair_clause = if allowed.is_empty() {
