@@ -3421,6 +3421,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn a_tool_loop_replays_only_details_on_a_compatible_route() {
+        let dir = std::env::temp_dir().join(format!("openmax-details-route-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.join("data")).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (url, bodies) = capturing_endpoint(DETAILED_TOOL_SSE).await;
+        std::fs::write(
+            crate::providers::providers_path(&core.data_dir),
+            serde_json::json!({"providers":{"fixture":{
+                "base_url":url, "compat":{"prefer_reasoning_details":true},
+                "models":[{"id":"stub","context_tokens":16384}]
+            }}}).to_string(),
+        ).unwrap();
+        {
+            let mut settings = core.settings.lock().unwrap();
+            settings.provider = Some("fixture".into());
+            settings.model = "stub".into();
+            settings.approval_mode = ApprovalMode::Auto;
+        }
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id, project, "Read a.txt".into()).unwrap();
+        let (stop, _) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        let reply = &sent_replies(&bodies[1])[0];
+        assert!(reply.get("reasoning").is_none(), "the details are the wire representation");
+        assert!(reply.get("reasoning_content").is_none());
+        assert_eq!(reply["reasoning_details"], serde_json::json!([
+            {"type":"reasoning.text","text":"read a.txt first","signature":"EqQBsig==","id":"rs-1","format":"unknown","index":0},
+            {"type":"reasoning.encrypted","data":"opaque==","id":"enc-1","format":"unknown","index":1},
+        ]));
+        let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(second["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], reply["tool_calls"][0]["id"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// One read as OpenRouter streams it for a model that does not reason:
     /// `"reasoning":null,"reasoning_details":[]` on every delta.
     const EMPTY_DETAILS_TOOL_SSE: &str = concat!(

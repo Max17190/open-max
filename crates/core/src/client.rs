@@ -103,8 +103,8 @@ struct StreamOptions {
 /// copies it. Each message goes out as it serializes on disk, except that
 /// reasoning, `reasoning_details`, and each tool call's `extra_content` go
 /// only to the endpoint that produced them (`origin` matches the message's
-/// `reasoning_origin`), and the stamp itself never goes. What does go is
-/// the stored bytes, unchanged.
+/// `reasoning_origin`), and the stamp itself never goes. Compatible routes
+/// receive unchanged structured blocks in place of the plaintext field.
 ///
 /// `marks` is for a route that caches a prompt only up to a `cache_control`
 /// marker (`ChatClient::cache_marks`): the system prompt and the newest
@@ -117,6 +117,14 @@ struct WireMessages<'a> {
     messages: &'a [ChatMessage],
     origin: &'a str,
     marks: bool,
+    prefer_reasoning_details: bool,
+}
+
+fn has_reasoning_blocks(raw: &RawValue) -> bool {
+    // Normal replies store a nonempty array of blocks. Retain plaintext for
+    // older transcripts carrying an empty array or another shape.
+    raw.get().trim_start().strip_prefix('[')
+        .is_some_and(|body| body.trim_start().starts_with('{'))
 }
 
 impl Serialize for WireMessages<'_> {
@@ -124,6 +132,8 @@ impl Serialize for WireMessages<'_> {
         let last = self.messages.len().saturating_sub(1);
         serializer.collect_seq(self.messages.iter().enumerate().map(|(at, m)| {
             let replay = m.reasoning_origin.as_deref() == Some(self.origin);
+            let details = m.reasoning_details.as_deref().filter(|_| replay);
+            let plain = replay && !(self.prefer_reasoning_details && details.is_some_and(has_reasoning_blocks));
             let mark = self.marks && (at == last || m.role == "system");
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             WireMessage {
@@ -131,9 +141,9 @@ impl Serialize for WireMessages<'_> {
                 content: m.content.as_deref().map(|text| WireContent { text, mark: text_mark }),
                 tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
-                reasoning_content: m.reasoning_content.as_deref().filter(|_| replay),
-                reasoning: m.reasoning.as_deref().filter(|_| replay),
-                reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
+                reasoning_content: m.reasoning_content.as_deref().filter(|_| plain),
+                reasoning: m.reasoning.as_deref().filter(|_| plain),
+                reasoning_details: details,
                 cache_control: (mark && !text_mark).then(|| serde_json::json!({"type": "ephemeral"})),
             }
         }))
@@ -228,7 +238,10 @@ fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], to
     let (origin, completion) = (client.origin(), client.use_max_completion_tokens);
     let req = ChatCompletionRequest {
         model: &client.model,
-        messages: WireMessages { messages, origin: &origin, marks: client.cache_marks() },
+        messages: WireMessages {
+            messages, origin: &origin, marks: client.cache_marks(),
+            prefer_reasoning_details: client.prefers_reasoning_details(),
+        },
         temperature: client.temperature,
         reasoning_effort: client.reasoning_effort,
         max_tokens: (!completion).then_some(client.max_tokens),
@@ -324,6 +337,7 @@ pub struct ChatClient {
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,
     pub send_stream_options: bool,
+    prefer_reasoning_details: bool,
     /// How long the endpoint may send nothing before an attempt ends.
     idle_timeout: std::time::Duration,
     /// Why the settings key was withheld from this endpoint, for a 401 to
@@ -467,6 +481,7 @@ impl ChatClient {
             headers: Vec::new(),
             use_max_completion_tokens: false,
             send_stream_options: true,
+            prefer_reasoning_details: false,
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
             cache_key: None,
@@ -485,6 +500,7 @@ impl ChatClient {
             headers: ep.headers.clone(),
             use_max_completion_tokens: ep.compat.use_max_completion_tokens,
             send_stream_options: ep.compat.send_stream_options,
+            prefer_reasoning_details: ep.compat.prefer_reasoning_details,
             ..Self::new(ep.base_url.clone(), ep.api_key.clone(), ep.model.clone(), ep.temperature, ep.max_tokens)
         }
     }
@@ -504,6 +520,12 @@ impl ChatClient {
         key.truncate(16);
         self.cache_key = Some(key);
         self
+    }
+
+    fn prefers_reasoning_details(&self) -> bool {
+        self.wire_api == crate::providers::WireApi::ChatCompletions
+            && (self.prefer_reasoning_details || reqwest::Url::parse(self.base_url.trim())
+                .is_ok_and(|url| url.host_str() == Some("openrouter.ai")))
     }
 
     /// The header a Chat Completions provider this client serves
@@ -4053,7 +4075,34 @@ pub(crate) mod tests {
 
     /// The messages array exactly as `origin` would receive it.
     fn wire(messages: &[ChatMessage], origin: &str) -> String {
-        serde_json::to_string(&WireMessages { messages, origin, marks: false }).unwrap()
+        serde_json::to_string(&WireMessages { messages, origin, marks: false, prefer_reasoning_details: false }).unwrap()
+    }
+
+    #[test]
+    fn chat_reasoning_replay_uses_structured_blocks_only_on_compatible_routes() {
+        let cases = [
+            ("https://openrouter.ai/api/v1", true),
+            ("https://openrouter.ai.example/v1", false),
+            ("https://api.deepseek.com", false),
+        ];
+        for (url, prefers_details) in cases {
+            let client = ChatClient::new(url.into(), None, "fixture".into(), None, 512);
+            let mut reply = ChatMessage::assistant(Some("done".into()), None);
+            reply.reasoning_origin = Some(client.origin());
+            reply.reasoning_content = Some("reasoning text".into());
+            for (raw, has_blocks) in [
+                (r#"[ {"type":"reasoning.text","text":"reasoning text","signature":"sig"} ]"#, true),
+                ("[ ]", false),
+                ("null", false),
+            ] {
+                reply.reasoning_details = Some(RawValue::from_string(raw.into()).unwrap());
+                let body = request_body(&client, &[reply.clone()]);
+                assert!(body.contains(&format!(r#""reasoning_details":{raw}"#)));
+                assert_eq!(body.contains(r#""reasoning_content":"reasoning text""#), !(prefers_details && has_blocks));
+            }
+            reply.reasoning_details = None;
+            assert!(request_body(&client, &[reply]).contains(r#""reasoning_content":"reasoning text""#));
+        }
     }
 
     /// The whole request body `client` would send for `messages`.
@@ -4102,7 +4151,7 @@ pub(crate) mod tests {
         assert!(!responses.cache_marks(), "only Chat Completions");
 
         let marked = |text: &str| json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
-        let sent = |messages: &[ChatMessage]| serde_json::to_value(WireMessages { messages, origin: "o", marks: true }).unwrap();
+        let sent = |messages: &[ChatMessage]| serde_json::to_value(WireMessages { messages, origin: "o", marks: true, prefer_reasoning_details: false }).unwrap();
         let round = vec![
             ChatMessage::system("p"),
             ChatMessage::user("hi"),

@@ -24,6 +24,8 @@ pub struct CompatFlags {
     pub send_stream_options: bool,
     /// When true, omit temperature for servers that choose it themselves.
     pub omit_temperature: bool,
+    /// Replay structured reasoning on compatible Chat Completions routes.
+    pub prefer_reasoning_details: bool,
 }
 
 // serde default for send_stream_options is false via Default; we want true when
@@ -34,6 +36,7 @@ struct CompatFlagsFile {
     use_max_completion_tokens: Option<bool>,
     send_stream_options: Option<bool>,
     omit_temperature: Option<bool>,
+    prefer_reasoning_details: Option<bool>,
 }
 
 impl From<CompatFlagsFile> for CompatFlags {
@@ -42,6 +45,7 @@ impl From<CompatFlagsFile> for CompatFlags {
             use_max_completion_tokens: f.use_max_completion_tokens.unwrap_or(false),
             send_stream_options: f.send_stream_options.unwrap_or(true),
             omit_temperature: f.omit_temperature.unwrap_or(false),
+            prefer_reasoning_details: f.prefer_reasoning_details.unwrap_or(false),
         }
     }
 }
@@ -348,7 +352,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
         if let Some(compat) = provider.get("compat").and_then(|v| v.as_object()) {
             unknown_keys(
                 compat,
-                &["use_max_completion_tokens", "send_stream_options", "omit_temperature"],
+                &["use_max_completion_tokens", "send_stream_options", "omit_temperature", "prefer_reasoning_details"],
                 &format!("in provider '{name}' compat"),
                 &mut out,
             );
