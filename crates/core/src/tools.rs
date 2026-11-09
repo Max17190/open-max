@@ -994,14 +994,7 @@ impl ReadWindow {
     /// the first `MAX_LINE_CHARS` bytes of a longer one. False once the byte
     /// cap is reached and the read should stop.
     fn push(&mut self, n: usize, line: &str, len: usize) -> bool {
-        // A clipped line must say so: silently dropping its tail sends the
-        // model into edit_file with an old_string that can never match.
-        let formatted = if len > MAX_LINE_CHARS {
-            let end = floor_char(line, MAX_LINE_CHARS);
-            format!("{n} {}… [line clipped; {} more bytes]\n", &line[..end], len - end)
-        } else {
-            format!("{n} {line}\n")
-        };
+        let formatted = numbered_line(n, line, len);
         if self.out.len() + formatted.len() > MAX_READ_BYTES {
             self.cut_at = Some(n);
             return false;
@@ -1125,6 +1118,16 @@ fn floor_char(s: &str, mut idx: usize) -> usize {
         idx -= 1;
     }
     idx
+}
+
+/// A clipped line must say so; its displayed prefix cannot be copied as a full line.
+fn numbered_line(n: usize, line: &str, len: usize) -> String {
+    if len > MAX_LINE_CHARS {
+        let end = floor_char(line, MAX_LINE_CHARS);
+        format!("{n} {}… [line clipped; {} more bytes]\n", &line[..end], len - end)
+    } else {
+        format!("{n} {line}\n")
+    }
 }
 
 /// Longest an edit spends on a closest-line hint or a display diff. Both are
@@ -1309,6 +1312,48 @@ fn closest_line_hint_until(content: &str, old_string: &str, deadline: Instant) -
     )
 }
 
+/// When the first complete line uniquely anchors a multiline edit, show the
+/// first difference and nearby source so the caller can retry with exact text.
+fn anchored_edit_hint(content: &str, old_string: &str) -> Option<String> {
+    let (first, rest) = old_string.split_at(old_string.find('\n')? + 1);
+    if first.trim().is_empty() || rest.is_empty() {
+        return None;
+    }
+    let mut lines = content.split_inclusive('\n').enumerate();
+    // An exact edit may start inside a line. A suffix match elsewhere is
+    // another possible anchor, even if only one complete line matches.
+    let (anchor, line) = lines.find(|&(_, line)| line.ends_with(first))?;
+    let mut actual = lines.clone();
+    if line != first || lines.any(|(_, line)| line.ends_with(first)) {
+        return None;
+    }
+
+    for (i, expected) in rest.split_inclusive('\n').enumerate() {
+        let Some((line_no, line)) = actual.next() else {
+            return Some(format!(
+                "old_string not found. The file ends at line {} before the requested block ends.",
+                anchor + i + 1,
+            ));
+        };
+        if line == expected {
+            continue;
+        }
+        let mut hint = format!(
+            "old_string not found. First difference at line {}. Current text:\n",
+            line_no + 1
+        );
+        for (line_no, raw) in std::iter::once((line_no, line)).chain(actual).take(3) {
+            let line = raw.lines().next().unwrap_or_default();
+            hint.push_str(&numbered_line(line_no + 1, line, line.len()));
+            if !raw.ends_with('\n') {
+                hint.push_str("[no newline at end of file]\n");
+            }
+        }
+        return Some(hint);
+    }
+    None
+}
+
 /// `text` with every bare LF written as CRLF; existing CRLFs are kept.
 fn to_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
@@ -1376,8 +1421,14 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
             old.replacen(&old_string, &new_string, 1)
         }
     } else {
+        let mixed_endings = crlf > 0 && crlf < lf && old_string.contains('\n');
+        if !mixed_endings {
+            if let Some(hint) = anchored_edit_hint(&old, &old_string) {
+                return ToolOutcome::err(hint);
+            }
+        }
         let mut hint = closest_line_hint(&old, &old_string);
-        if crlf > 0 && crlf < lf && old_string.contains('\n') {
+        if mixed_endings {
             hint.push_str(&format!(
                 " Note: {rel} mixes CRLF and LF line endings, which read_file does not show, so a multi-line old_string must match each line ending exactly; edit one line at a time or rewrite the file with write_file."
             ));
@@ -4741,16 +4792,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The hint on an edit miss names the line most like the first line of
-    /// the copied text, scored against both lengths: not a short line that
-    /// shares a letter with it, and an exact copy of that first line when
-    /// the miss is in a later one. Of lines equally close it names the first.
+    /// Without a unique anchor, the hint compares both lengths and names
+    /// the most similar line. Of lines equally close it names the first.
     #[test]
     fn an_edit_miss_names_the_most_similar_line() {
         let root = temp_project();
         for (content, old_string, line) in [
             ("h\nhello world!\n", "hello, world", 2),
-            ("foo()\nbaz()\n", "foo()\nbar()", 1),
+            ("foo()\nbaz()\nfoo()\nqux()\n", "foo()\nbar()", 1),
             ("ba\nba\n", "ab", 1),
         ] {
             std::fs::write(root.join("docs/hint.txt"), content).unwrap();
