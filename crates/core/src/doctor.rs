@@ -1039,19 +1039,30 @@ fn dir_has_md(dir: &Path) -> bool {
 fn memory_findings(project_root: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
     let dir = project_root.join(crate::memory::MEMORY_DIR);
-    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+    let Some((root, target)) = crate::memory::project_memory_dir(project_root) else {
+        if dir.is_dir() {
+            findings.push(Finding {
+                kind: "memory",
+                path: dir,
+                status: Status::Warn("memory directory must resolve inside the project".into()),
+            });
+        }
+        return findings;
+    };
+    let Ok(read_dir) = std::fs::read_dir(target) else {
         return findings;
     };
     let scan = crate::memory::scan(project_root, crate::memory::unix_now());
     for entry in read_dir.flatten() {
-        let path = entry.path();
+        let path = dir.join(entry.file_name());
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-        if path.is_dir() {
+        let target = crate::memory::local_path(&root, &entry.path());
+        if let Some(target) = target.as_ref().filter(|path| path.is_dir()) {
             // Memory is flat: the scan indexes only top-level `.md` files, so
             // notes tucked into a subfolder are silently never read. Name that
             // rather than pass it in a clean bill of health. A dotfile dir (a
             // stray `.git`, an editor cache) is noise and stays skipped.
-            if !name.starts_with('.') && dir_has_md(&path) {
+            if !name.starts_with('.') && dir_has_md(target) {
                 findings.push(Finding {
                     kind: "memory",
                     path,
@@ -1067,7 +1078,8 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-        if let Some(memory) = scan.entries.iter().find(|e| e.name == stem) {
+        let is_local_file = target.is_some_and(|path| path.is_file());
+        if let Some(memory) = scan.entries.iter().find(|e| e.name == stem && is_local_file) {
             let visibility = if memory.in_index {
                 "indexed at the next prompt freeze (session start, /reload, or any refreeze); a running session sees it once its prefix rebuilds".to_string()
             } else {
@@ -1094,6 +1106,8 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
             || stem.len() > 64
         {
             "memory names are 1-64 chars of [a-z0-9-]; rename it to be indexed".to_string()
+        } else if !is_local_file {
+            "memory must resolve to a regular file inside the project".to_string()
         } else {
             "no describable first line; give it one non-empty line to be indexed".to_string()
         };
