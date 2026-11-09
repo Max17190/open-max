@@ -623,6 +623,18 @@ fn pinned_head(messages: &[ChatMessage]) -> usize {
     head.max(2)
 }
 
+/// Keep the last three messages, plus the start of a tool exchange if
+/// the boundary would otherwise cut through its results.
+fn protected_tail_start(messages: &[ChatMessage], head: usize) -> usize {
+    let tail = messages.len().saturating_sub(3).max(head);
+    if messages.get(tail).is_none_or(|msg| msg.role != "tool") {
+        return tail;
+    }
+    (head..tail).rev().find(|&index| messages[index].role != "tool")
+        .filter(|&index| messages[index].role == "assistant" && messages[index].tool_calls.is_some())
+        .unwrap_or(tail)
+}
+
 /// The text a prune is keeping: the pinned head (through the standing
 /// request) and the tail that survives untouched. Used as the relevance
 /// signal for which slice of an old tool output to keep, so it must describe
@@ -728,9 +740,9 @@ const TRUNCATION_NOTE_ALLOWANCE_TOKENS: usize = 120;
 ///
 /// Irreducible means exactly what a maximal prune leaves: the drop loop's
 /// length floor ends at the pinned head, the digest note, and the newest
-/// three messages, so those (plus the note's own allowance) are
-/// what the target must contain. Counting more would fall back while a
-/// configured prune could in fact succeed, silently disabling the setting.
+/// three messages, including any tool exchange that crosses that boundary.
+/// Those are what the target must contain. Counting more would fall back
+/// while a configured prune could succeed, silently disabling the setting.
 ///
 /// `ceiling` is in real tokens. The budget, schema cost, and trigger use
 /// estimator units so the window can cap the trigger independently.
@@ -747,7 +759,7 @@ pub(crate) fn compaction_trigger(
         return budget;
     }
     let head = pinned_head(messages).min(messages.len());
-    let tail = head.max(messages.len().saturating_sub(3));
+    let tail = protected_tail_start(messages, head);
     let irreducible: usize = schema_tokens
         + DIGEST_NOTE_ALLOWANCE_TOKENS
         + messages[..head]
@@ -921,26 +933,24 @@ fn prune_transcript(
     // Fixed for the whole prune: once an exchange is dropped, later user
     // messages would join the opening run and pin themselves.
     let head = pinned_head(messages);
-    let original_len = messages.len();
-    let keep_tail = original_len.saturating_sub(6);
+    let recent = messages.len().saturating_sub(6);
+    let protected_start = protected_tail_start(messages, head);
+    let protected = messages.len().saturating_sub(protected_start);
     // What the transcript will still be about once this prune is done: the
     // original request plus the surviving tail. Truncation keeps the slice of
     // each old tool output that speaks to *this*, so the bytes that stay are
     // the ones the live conversation refers to.
-    let live_context = live_context(messages, head, keep_tail);
+    let live_context = live_context(messages, head, recent);
     let mut digest = CompactionDigest::new(dropped_text_cap(budget));
     // Room for the note a truncation-only prune leaves below, so meeting the
     // target and then gaining the note cannot end above it. Zero when the
     // slot after the head already holds a real digest note: that note carries
     // the archive address and fields (Files touched, the model summary) this
     // one does not, so it is left alone and nothing new is inserted.
-    let note_reserve = if messages.len() > head && is_digest_message(&messages[head]) {
-        0
-    } else {
-        TRUNCATION_NOTE_ALLOWANCE_TOKENS
-    };
+    let has_note = messages.get(head).is_some_and(is_digest_message);
+    let note_reserve = if has_note { 0 } else { TRUNCATION_NOTE_ALLOWANCE_TOKENS };
     let mut reached = false;
-    for msg in messages.iter_mut().take(keep_tail).skip(1) {
+    for msg in messages.iter_mut().take(recent.min(protected_start)).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
                 if c.len() > 600 {
@@ -980,7 +990,10 @@ fn prune_transcript(
         };
     // Drop whole exchanges starting after the pinned head. Keep tool
     // replies consistent with the assistant message that requested them.
-    while total > target && messages.len() > head + 4 {
+    // Leave an existing digest alone if it is the only thing before the
+    // protected tail. Otherwise this prune would only summarize itself.
+    let can_drop = messages.len() > head + protected + usize::from(has_note);
+    while can_drop && total > target && messages.len() > (head + 4).max(head + protected) {
         let removed = remove_and_record(messages, &mut digest, head);
         total = total.saturating_sub(estimate(&removed));
         if removed.role == "assistant" && removed.tool_calls.is_some() {
@@ -1003,7 +1016,7 @@ fn prune_transcript(
         // Record dropped messages into the same digest so the note stays a
         // faithful summary of everything removed (not only the first pass).
         total = schema_tokens + messages.iter().map(estimate).sum::<usize>();
-        while total > target && messages.len() > head + 4 {
+        while total > target && messages.len() > (head + 4).max(head + 1 + protected) {
             let removed = remove_and_record(messages, &mut digest, head + 1);
             total = total.saturating_sub(estimate(&removed));
             if removed.role == "assistant" && removed.tool_calls.is_some() {
