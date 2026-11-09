@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,9 +34,9 @@ def commit(repo, message):
     git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", message)
 
 
-def memory(repo, artifact, action, *args, code=0, repository=REPOSITORY):
+def memory(repo, artifact, action, *args, code=0, repository=REPOSITORY, env=None):
     return run([sys.executable, EXAMPLE, "--repo", repo, "--repository", repository,
-                "--artifact", artifact, action, *args], code=code)
+                "--artifact", artifact, action, *args], cwd=repo, env=env, code=code)
 
 
 def clone(seed, path):
@@ -103,6 +104,23 @@ def exercise(root, binary):
     (seed / CHECK).write_bytes(RECIPE)
     assert "verification exited" in memory(seed, artifact, "capture", *capture[:-2], "false", code=1)
     assert not artifact.exists()
+    path_marker = seed / "ran-path-git"
+    (seed / "tools").mkdir()
+    for local_git in (seed / "git", seed / "tools/git"):
+        local_git.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(path_marker))}\nexit 70\n")
+        local_git.chmod(0o700)
+    for path in (f"tools:{os.defpath}", f":{os.defpath}"):
+        env = {**os.environ, "PATH": path}
+        assert "PATH must contain only absolute directories" in memory(
+            seed, artifact, "capture", *capture, env=env, code=1)
+        assert not artifact.exists() and not path_marker.exists()
+        assert not (seed / CHECK.parent / "ran-recipe").exists()
+    (seed / "tools/git").write_text(
+        "#!/bin/sh\nif test \"$1\" = --version; then echo 'git version 2.35.1'; exit 0; fi\n"
+        f"touch {shlex.quote(str(path_marker))}\nexit 70\n")
+    env = {**os.environ, "PATH": f"{seed / 'tools'}:{os.defpath}"}
+    assert "Git 2.36 or later is required" in memory(seed, artifact, "capture", *capture, env=env, code=1)
+    assert not artifact.exists() and not path_marker.exists()
     pin = memory(seed, artifact, "capture", *capture)
     assert (seed / CHECK.parent / "ran-recipe").exists()
     assert "artifact already exists" in memory(seed, artifact, "capture", *capture, code=1)
@@ -129,10 +147,27 @@ def exercise(root, binary):
     assert (warm / MEMORY).read_bytes() == original
     assert not (warm / CHECK.parent / "ran-recipe").exists()
 
+    configured = clone(seed, root / "configured")
+    marker = root / "ran-fsmonitor"
+    hook = root / "fsmonitor"
+    hook.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nprintf 'clock\\0'\n")
+    hook.chmod(0o700)
+    git(configured, "config", "core.fsmonitor", str(hook))
+    assert memory(configured, artifact, "stage", *stage) == "staged"
+    assert not marker.exists()
+    assert memory(configured, artifact, "evict", "--sha256", pin) == "evicted"
+    assert not marker.exists()
+    git(configured, "config", "--unset", "core.fsmonitor")
+
+    assert memory(configured, artifact, "stage", *stage) == "staged"
+    git(configured, "remote", "add", "origin", "https://example.invalid/other.git")
+    git(configured, "config", "--add", "remote.origin.url", REPOSITORY)
+    assert "origin does not match" in memory(configured, artifact, "stage", *stage, code=1)
+    assert "origin does not match" in memory(configured, artifact, "evict", "--sha256", pin, code=1)
+    assert (configured / MEMORY).read_bytes() == original
+    git(configured, "remote", "remove", "origin")
+    assert memory(configured, artifact, "evict", "--sha256", pin) == "evicted"
     other = clone(seed, root / "other")
-    git(other, "remote", "add", "origin", "https://example.invalid/other.git")
-    assert "origin does not match" in memory(other, artifact, "stage", *stage, code=1)
-    git(other, "remote", "remove", "origin")
     guard = root / "guard"
     guard.mkdir()
     (other / ".openmax").symlink_to(guard, target_is_directory=True)
@@ -140,7 +175,7 @@ def exercise(root, binary):
     assert not list(guard.iterdir())
     (other / ".openmax").unlink()
     destination = other / MEMORY
-    destination.parent.mkdir(parents=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     protected = guard / "memory.md"
     protected.write_bytes(original)
     destination.symlink_to(protected)
@@ -152,6 +187,31 @@ def exercise(root, binary):
     assert "belongs to the user" in memory(other, artifact, "stage", *stage, code=1)
     assert "belongs to the user" in memory(other, artifact, "evict", "--sha256", pin, code=1)
     assert destination.read_bytes() == original + b"User edit.\n"
+
+    grafted = clone(seed, root / "grafted")
+    git(grafted, "switch", "--orphan", "unrelated")
+    (grafted / CHECK.parent).mkdir(exist_ok=True)
+    (grafted / CHECK).write_bytes(RECIPE)
+    git(grafted, "add", str(CHECK))
+    commit(grafted, "Add check to unrelated history")
+    tip = git(grafted, "rev-parse", "HEAD")
+    (grafted / ".git/info/grafts").write_text(f"{tip} {recipe['source_commit']}\n")
+    git(grafted, "merge-base", "--is-ancestor", recipe["source_commit"], tip)
+    assert memory(grafted, artifact, "stage", *stage) == "stale"
+    assert not (grafted / MEMORY).exists()
+
+    case_alias = clone(seed, root / "case-alias")
+    assert memory(case_alias, artifact, "stage", *stage) == "staged"
+    lower = case_alias / MEMORY
+    upper = lower.with_name(lower.name.upper())
+    lower.rename(upper)
+    git(case_alias, "add", str(upper.relative_to(case_alias)))
+    assert "memory path is tracked" in memory(case_alias, artifact, "stage", *stage, code=1)
+    assert "memory path is tracked" in memory(case_alias, artifact, "evict", "--sha256", pin, code=1)
+    commit(case_alias, "Track memory under an uppercase name")
+    git(case_alias, "rm", "--cached", "--", str(upper.relative_to(case_alias)))
+    assert "memory path is tracked" in memory(case_alias, artifact, "evict", "--sha256", pin, code=1)
+    assert upper.read_bytes() == original
 
     descendant = clone(seed, root / "descendant")
     (descendant / "notes.md").write_text("Independent work.\n")
@@ -176,6 +236,15 @@ def exercise(root, binary):
         assert warm_requests[0]["tools"] == cold_requests[0]["tools"]
         access = (warm / MEMORY).with_name(".access.jsonl").read_text()
         assert any(json.loads(line)["kind"] == "read" for line in access.splitlines())
+
+    for watched in (warm / CHECK, warm / CHECK.parent):
+        moved = watched.with_name(watched.name + "-original")
+        watched.rename(moved)
+        watched.symlink_to(moved)
+        assert "explicitly evict" in memory(warm, artifact, "stage", *stage, code=1)
+        assert (warm / MEMORY).read_bytes() == original
+        watched.unlink()
+        moved.rename(watched)
 
     (warm / CHECK).write_bytes(b"exit 1\n")
     assert "explicitly evict" in memory(warm, artifact, "stage", *stage, code=1)

@@ -2,6 +2,7 @@
 """Capture and stage one verified repository recipe for Open Max."""
 import argparse
 from contextlib import contextmanager, suppress
+import errno
 import fcntl
 import hashlib
 import json
@@ -100,9 +101,13 @@ def create_at(fd, name, data):
             os.unlink(temp, dir_fd=fd)
 
 
-def git(repo, *argv, missing_ok=False):
-    command = ["git", "--literal-pathspecs", "-C", str(repo), *argv]
-    env = {**process_env(), "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": ""}
+def git(repo, *argv, missing_ok=False, literal=True):
+    command = ["git", "-c", "core.fsmonitor=false", "-C", str(repo)]
+    if literal:
+        command.append("--literal-pathspecs")
+    env = {**process_env(), "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull,
+           "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": ""}
+    command.extend(argv)
     result = subprocess.run(command, env=env, capture_output=True, check=False)
     if missing_ok and result.returncode == 1:
         return None
@@ -114,8 +119,8 @@ def head(repo, identity):
     with directory(repo):
         require(Path(git(repo, "rev-parse", "--show-toplevel").decode().strip()) == repo,
                 "pass the repository root")
-        origin = git(repo, "config", "--get", "remote.origin.url", missing_ok=True)
-        require(origin is None or origin.decode().strip().removesuffix(".git") == identity,
+        origins = git(repo, "config", "--null", "--get-all", "remote.origin.url", missing_ok=True)
+        require(origins is None or all(url.decode().removesuffix(".git") == identity for url in origins.split(b"\0")[:-1]),
                 "origin does not match the declared public repository")
         return git(repo, "rev-parse", "--verify", "HEAD").decode().strip()
 
@@ -144,7 +149,20 @@ def checkout_matches(repo, hashes):
 
 
 def process_env():
-    return {**{name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}, "LC_ALL": "C"}
+    path = os.environ.get("PATH", os.defpath)
+    require(all(os.path.isabs(entry) for entry in path.split(os.pathsep)), "PATH must contain only absolute directories")
+    env = {"PATH": path, "LC_ALL": "C"}
+    if "HOME" in os.environ:
+        env["HOME"] = os.environ["HOME"]
+    return env
+
+
+def require_git_version():
+    # Older Git treats a boolean fsmonitor setting as a hook path.
+    result = subprocess.run(["git", "--version"], env=process_env(), capture_output=True, check=False)
+    version = re.match(rb"git version ([0-9]+)\.([0-9]+)(?:[.\s]|$)", result.stdout)
+    require(result.returncode == 0 and version is not None and
+            tuple(map(int, version.groups())) >= (2, 36), "Git 2.36 or later is required")
 
 
 def fingerprint(command, tag):
@@ -239,7 +257,11 @@ def current(args, artifact, commit):
             return (committed_inputs(args.repo, source, paths) == artifact["inputs"] ==
                     committed_inputs(args.repo, commit, paths) and checkout_matches(args.repo, artifact["inputs"]) and
                     fingerprint(artifact["argv"][0], args.environment)[1] == artifact["environment"])
-    except (FileNotFoundError, ValueError):
+    except OSError as error:
+        if error.errno not in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+            raise
+        return False
+    except ValueError:
         return False
 
 
@@ -253,8 +275,9 @@ def apply_memory(args, artifact, fresh):
     try:
         with directory(path.parent, create=fresh) as parent:
             fcntl.flock(parent, fcntl.LOCK_EX)
-            require(not git(args.repo, "ls-files", "-z", "--", str(MEMORY)) and
-                    not git(args.repo, "ls-tree", "--name-only", "HEAD", "--", str(MEMORY)),
+            # Match filesystem case aliases against both the index and HEAD.
+            pathspec = ":(icase,literal)" + str(MEMORY)
+            require(not git(args.repo, "ls-files", "-z", "--with-tree=HEAD", "--", pathspec, literal=False),
                     "memory path is tracked")
             try:
                 existing, info = read_at(parent, path.name, MAX_MEMORY)
@@ -300,6 +323,7 @@ def main():
                 "pass a canonical public HTTPS repository URL")
         if args.action != "evict":
             require(matches(r"[A-Za-z0-9_.-]{1,80}", args.environment), "pass a public environment identifier")
+        require_git_version()
         if args.action == "capture":
             if args.argv[:1] == ["--"]:
                 args.argv = args.argv[1:]

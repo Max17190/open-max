@@ -7,10 +7,11 @@ body on demand.
 
 ## Capture and stage
 
-Use Python 3.11 or later and Git on Linux or macOS. Run capture from the
-repository root. Select the files that define the verification path, including
-its entry point and relevant manifests and lockfiles. Use public argv and an
-environment identifier that binds the runtime and toolchain you provisioned.
+Use Python 3.11 or later and Git 2.36 or later on Linux or macOS. Use absolute
+entries in `PATH` and run capture from the repository root. Select the files
+that define the verification path, including its entry point and relevant
+manifests and lockfiles. Use public argv and an environment identifier that
+binds the runtime and toolchain you provisioned.
 Use an immutable runtime image identifier when comparing sandbox runs.
 The following commands use the Open Max repository root.
 
