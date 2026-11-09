@@ -807,6 +807,9 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     // The index of the compaction's summary request, the 20th; the one after
     // it is the first whose history the prune rewrote.
     const SUMMARY: usize = 19;
+    const ORIGINAL_REQUEST: &str = "add a word count tool";
+    const FOLLOW_UP: &str = "read the README too";
+    const SUMMARY_REPLY: &str = "User instructions: read the README too. Done: added the tool and read README.md.";
     let name = match wire {
         WireApi::ChatCompletions => "Chat Completions",
         WireApi::Responses => "Responses",
@@ -842,7 +845,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     ];
     replies.extend((0..14).map(|i| read(format!("f{i}.rs"))));
     replies.push(read("large.rs".into()));
-    replies.push(Reply::Answer("Goal: read every source file. Done: fourteen small files and large.rs. Now: answer."));
+    replies.push(Reply::Answer(SUMMARY_REPLY));
     replies.push(Reply::Answer("read them all"));
     replies.extend((0..4).map(|i| read(format!("f{i}.rs"))));
     replies.push(Reply::Answer("resumed"));
@@ -877,14 +880,13 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     std::fs::write(data.join("trust.json"), json!({ "version": 1, "projects": [project.to_string_lossy()] }).to_string())
         .unwrap();
 
-    let steer = "read the README too";
     let mut events = Vec::new();
     let id = {
         let (core, mut rx) = Core::new(data.clone()).unwrap();
         let id = open_max_core::sessions::create(&core, project.display().to_string()).unwrap().id;
-        events.extend(drive_steered_turn(&core, &mut rx, &id, &project, "add a word count tool", Some(steer)).await);
+        events.extend(drive_steered_turn(&core, &mut rx, &id, &project, ORIGINAL_REQUEST, Some(FOLLOW_UP)).await);
         assert!(
-            events.iter().any(|event| matches!(event, AgentEvent::SteerAccepted { text } if text == steer)),
+            events.iter().any(|event| matches!(event, AgentEvent::SteerAccepted { text } if text == FOLLOW_UP)),
             "the steer joined turn one: {events:?}"
         );
         events.extend(drive_turn(&core, &mut rx, &id, &project, "read every source file").await);
@@ -948,7 +950,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     // summary request sends no tools, and the request after it is the first
     // turn request with the compaction's digest note (its persisted opening,
     // `[context note:`).
-    assert!(!bodies[0].contains(steer) && bodies[1].contains(steer), "the steer joins request 2");
+    assert!(!bodies[0].contains(FOLLOW_UP) && bodies[1].contains(FOLLOW_UP), "the steer joins request 2");
     let notes: Vec<usize> = prompts.iter().map(|prompt| prompt.notes).collect();
     let once: Vec<usize> = (0..prompts.len()).map(|i| usize::from(i > 0 && i != SUMMARY)).collect();
     assert_eq!(notes, once, "the note, stored once, rides every request after the tool write but the summary's");
@@ -960,6 +962,22 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     let digests: Vec<usize> =
         (0..bodies.len()).filter(|&i| i != SUMMARY && bodies[i].contains("[context note:")).map(|i| i + 1).collect();
     assert_eq!(digests.first(), Some(&(rewritten + 1)), "the compaction's digest note first rides request {}", rewritten + 1);
+    if wire == WireApi::ChatCompletions {
+        let summary: serde_json::Value = serde_json::from_str(&bodies[SUMMARY]).unwrap();
+        let instructions = summary["messages"][0]["content"].as_str().unwrap();
+        let excerpt = summary["messages"][1]["content"].as_str().unwrap();
+        assert!(instructions.contains("Retained user instructions are outside this excerpt."));
+        assert!(instructions.contains("Do not infer missing goals or revise retained instructions."));
+        assert!(instructions.contains("explicit requests and constraints in the excerpt"));
+        assert!(instructions.contains("Omit this part if none appear."));
+        assert!(!excerpt.contains(ORIGINAL_REQUEST), "the pinned request stays out of the excerpt");
+        assert!(excerpt.contains(&format!("user: {FOLLOW_UP}")), "the excerpt includes the dropped follow-up");
+
+        let next: serde_json::Value = serde_json::from_str(&bodies[rewritten]).unwrap();
+        let messages = next["messages"].as_array().unwrap();
+        let original = messages.iter().position(|msg| msg["role"] == "user" && msg["content"] == ORIGINAL_REQUEST).unwrap();
+        assert!(messages[original + 1]["content"].as_str().unwrap().contains(SUMMARY_REPLY));
+    }
 
     // Every request repeats what the request before it sent ahead of its
     // note, but the two the compaction makes.
