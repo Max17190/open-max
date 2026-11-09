@@ -560,7 +560,7 @@ fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
 
 /// Why `open_regular` or `write_regular` found no regular file to read or
 /// write.
-enum NotRegular {
+pub(crate) enum NotRegular {
     Directory,
     /// What stands at the path instead: a named pipe, a socket or a device.
     Special(&'static str),
@@ -589,7 +589,7 @@ impl NotRegular {
 /// close. So the kind is looked up before the open, and read again from
 /// the descriptor the open returns, which does not wait, so a path swapped
 /// in between cannot slip into the read.
-fn open_regular(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), NotRegular> {
+pub(crate) fn open_regular(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), NotRegular> {
     if let Some(kind) = std::fs::metadata(path).ok().as_ref().and_then(not_regular) {
         return Err(kind);
     }

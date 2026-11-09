@@ -642,9 +642,8 @@ fn bounded_jsonl<T: serde::de::DeserializeOwned>(
 }
 
 /// Read at most `MAX_CHUNK_BYTES` of a text file, lossy at the cut.
-fn bounded_text(path: &Path) -> Option<String> {
+fn bounded_text(file: std::fs::File) -> Option<String> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
     file.take(MAX_CHUNK_BYTES as u64).read_to_end(&mut buf).ok()?;
     Some(String::from_utf8_lossy(&buf).into_owned())
@@ -685,7 +684,9 @@ fn collect_chunks(
     let memory_ceiling =
         if session_filters.is_empty() { scan_ceiling.min(MEMORY_SCAN_BYTES) } else { 0 };
     let memory_dir = project_root.join(crate::memory::MEMORY_DIR);
-    if let Ok(read_dir) = std::fs::read_dir(&memory_dir) {
+    let entries = crate::memory::project_memory_dir(project_root)
+        .and_then(|(root, dir)| std::fs::read_dir(dir).ok().map(|entries| (root, entries)));
+    if let Some((root, read_dir)) = entries {
         for entry in read_dir.flatten() {
             if bytes >= memory_ceiling {
                 break;
@@ -695,10 +696,11 @@ fn collect_chunks(
             if path.extension().and_then(|e| e.to_str()) != Some("md") || name.starts_with('.') {
                 continue;
             }
-            let Some(text) = bounded_text(&path) else { continue };
-            let ts = entry
-                .metadata()
-                .and_then(|m| m.modified())
+            let Some(target) = crate::memory::local_path(&root, &path) else { continue };
+            let Ok((file, meta)) = crate::tools::open_regular(&target) else { continue };
+            let Some(text) = bounded_text(file) else { continue };
+            let ts = meta
+                .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
@@ -707,7 +709,7 @@ fn collect_chunks(
             // Absolute, like every other citation: a consumer that keeps an
             // address and resolves it later cannot be asked to also remember
             // which working directory it was relative to.
-            let source = path.display().to_string();
+            let source = memory_dir.join(entry.file_name()).display().to_string();
             // The stem is the one piece of a memory file's address that names
             // the fact rather than the store: every memory lives under
             // .openmax/memory/ beneath the project root, so `path:` may

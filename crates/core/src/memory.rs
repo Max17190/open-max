@@ -105,8 +105,19 @@ fn memory_dir(project_root: &Path) -> PathBuf {
     project_root.join(MEMORY_DIR)
 }
 
-fn log_path(project_root: &Path) -> PathBuf {
-    memory_dir(project_root).join(ACCESS_LOG)
+/// The canonical project and memory roots. A symlinked store may live
+/// anywhere inside the project.
+pub(crate) fn project_memory_dir(project_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = memory_dir(project_root).canonicalize().ok()?;
+    let root = project_root.canonicalize().ok()?;
+    dir.starts_with(&root).then_some((root, dir))
+}
+
+/// Resolve a memory entry as the file tools would: its target must stay
+/// inside the canonical project root.
+pub(crate) fn local_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let target = path.canonicalize().ok()?;
+    target.starts_with(root).then_some(target)
 }
 
 pub fn unix_now() -> u64 {
@@ -147,8 +158,7 @@ pub fn record_accesses(project_root: &Path, events: &[(String, String)]) {
     if events.is_empty() {
         return;
     }
-    let dir = memory_dir(project_root);
-    if !dir.is_dir() {
+    if !memory_dir(project_root).is_dir() {
         return;
     }
     let ts = unix_now();
@@ -169,11 +179,17 @@ pub fn record_accesses(project_root: &Path, events: &[(String, String)]) {
     if lines.is_empty() {
         return;
     }
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path(project_root))
-        .and_then(|mut f| f.write_all(lines.as_bytes()));
+    let Ok(path) = crate::tools::resolve(project_root, &format!("{MEMORY_DIR}/{ACCESS_LOG}")) else {
+        return;
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let Ok(mut file) = options.open(path) else { return };
+    if file.metadata().is_ok_and(|meta| meta.is_file()) {
+        let _ = file.write_all(lines.as_bytes());
+    }
 }
 
 /// The file tools' view of a call against the memory directory, for the turn
@@ -217,23 +233,22 @@ fn normalize(path: &str, project_root: &Path) -> Option<String> {
     joined.to_str().map(str::to_string)
 }
 
-fn load_log(project_root: &Path) -> Vec<AccessRecord> {
-    let Ok(text) = std::fs::read_to_string(log_path(project_root)) else {
+fn load_log(path: &Path) -> Vec<AccessRecord> {
+    let Ok((mut file, _)) = crate::tools::open_regular(path) else {
         return Vec::new();
     };
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() {
+        return Vec::new();
+    }
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
 }
 
-/// Scan the memory directory and score every valid entry, strongest first
-/// (ties by name for determinism). Pure with respect to the filesystem: no
-/// writes or deletions.
 /// Score one memory file into an index entry from ALREADY-READ content, or
-/// None if it has no describable first line. Kept separate from the directory
-/// walk so `scan` and `freeze_snapshot` (which reads bytes and mtime as one
-/// generation) score a file identically.
+/// None if it has no describable first line.
 fn entry_from(
     name: &str,
     text: &str,
@@ -313,11 +328,19 @@ fn fill_index(mut entries: Vec<MemoryEntry>) -> MemoryScan {
     MemoryScan { entries, omitted }
 }
 
+/// Scan the project memory directory, strongest entries first. Read each
+/// file and its timestamp together so the index and receipt agree.
 pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
-    let Ok(read_dir) = std::fs::read_dir(memory_dir(project_root)) else {
+    #[cfg(test)]
+    scan_test::wait(project_root);
+
+    let Some((root, dir)) = project_memory_dir(project_root) else {
         return MemoryScan::default();
     };
-    let log = load_log(project_root);
+    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+        return MemoryScan::default();
+    };
+    let log = local_path(&root, &dir.join(ACCESS_LOG)).map(|path| load_log(&path)).unwrap_or_default();
     let mut entries: Vec<MemoryEntry> = Vec::new();
     for dirent in read_dir.flatten() {
         let path = dirent.path();
@@ -325,9 +348,10 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
         if path.extension().and_then(|e| e.to_str()) != Some("md") || !valid_name(name) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let mtime = dirent.metadata().and_then(|m| m.modified()).ok();
-        if let Some(entry) = entry_from(name, &text, mtime, &log, now) {
+        let Some(target) = local_path(&root, &path) else { continue };
+        let Some((bytes, mtime)) = read_coherent(&target) else { continue };
+        let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+        if let Some(entry) = entry_from(name, text, mtime, &log, now) {
             entries.push(entry);
         }
     }
@@ -353,12 +377,11 @@ pub struct MemoryFreeze {
 /// and the body (either order), pairing one generation's content with
 /// another's timestamp. Read mtime, then bytes, then mtime again; if it moved,
 /// the file changed mid-read - retry so the pair always matches.
-/// Bounded: on persistent churn the last read is self-consistent bytes with
-/// the mtime observed immediately after them.
+/// Skip entries that are still changing after eight attempts.
 fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)> {
     for _ in 0..8 {
-        let mut file = std::fs::File::open(path).ok()?;
-        let before = file.metadata().and_then(|m| m.modified()).ok();
+        let (mut file, meta) = crate::tools::open_regular(path).ok()?;
+        let before = meta.modified().ok();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).ok()?;
         let after = file.metadata().and_then(|m| m.modified()).ok();
@@ -374,31 +397,7 @@ fn read_coherent(path: &Path) -> Option<(Vec<u8>, Option<std::time::SystemTime>)
 }
 
 pub fn freeze_snapshot(project_root: &Path, now: u64) -> MemoryFreeze {
-    let Ok(read_dir) = std::fs::read_dir(memory_dir(project_root)) else {
-        return MemoryFreeze { section: None, identities: Vec::new(), lines: Vec::new() };
-    };
-    let log = load_log(project_root);
-    let mut entries: Vec<MemoryEntry> = Vec::new();
-    for dirent in read_dir.flatten() {
-        let path = dirent.path();
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        if path.extension().and_then(|e| e.to_str()) != Some("md") || !valid_name(name) {
-            continue;
-        }
-        // Bytes AND mtime describe the SAME generation of the file, so the
-        // index line (from the bytes) and its rank (from the mtime) can never
-        // be captured from two different generations - a rename OR an
-        // in-place rewrite during the read would otherwise pair one
-        // generation's bytes with another's mtime.
-        let Some((bytes, mtime)) = read_coherent(&path) else { continue };
-        // A describable, UTF-8 file enters the index.
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            if let Some(entry) = entry_from(name, text, mtime, &log, now) {
-                entries.push(entry);
-            }
-        }
-    }
-    let scan = fill_index(entries);
+    let scan = scan(project_root, now);
     let (section, identities) = section_and_identities(&scan);
     let lines = scan.entries.iter().map(|e| (e.name.clone(), index_line(e), e.in_index)).collect();
     MemoryFreeze { section, identities, lines }
@@ -457,6 +456,36 @@ fn section_and_identities(scan: &MemoryScan) -> (IndexSection, Vec<(String, u64)
 #[cfg(test)]
 fn index_and_identities(project_root: &Path, now: u64) -> (IndexSection, Vec<(String, u64)>) {
     section_and_identities(&scan(project_root, now))
+}
+
+#[cfg(test)]
+pub(crate) mod scan_test {
+    use std::path::{Path, PathBuf};
+    use std::sync::{mpsc, Mutex};
+    use std::thread::ThreadId;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    type Pause = (PathBuf, oneshot::Sender<ThreadId>, mpsc::Receiver<()>);
+    static PAUSES: Mutex<Vec<Pause>> = Mutex::new(Vec::new());
+
+    pub(crate) fn hold(project: &Path) -> (oneshot::Receiver<ThreadId>, mpsc::Sender<()>) {
+        let (started, seen) = oneshot::channel();
+        let (release, released) = mpsc::channel();
+        PAUSES.lock().unwrap().push((project.to_path_buf(), started, released));
+        (seen, release)
+    }
+
+    pub(super) fn wait(project: &Path) {
+        let pause = {
+            let mut pauses = PAUSES.lock().unwrap();
+            pauses.iter().position(|(root, ..)| root == project).map(|i| pauses.swap_remove(i))
+        };
+        if let Some((_, started, released)) = pause {
+            let _ = started.send(std::thread::current().id());
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -722,7 +751,7 @@ mod tests {
                 ("fact".into(), "write".into()),
             ],
         );
-        let log = load_log(&root);
+        let log = load_log(&memory_dir(&root).join(ACCESS_LOG));
         assert_eq!(log.len(), 2, "same (name, kind) collapses within a turn");
         let _ = std::fs::remove_dir_all(root);
     }

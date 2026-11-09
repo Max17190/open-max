@@ -3594,6 +3594,46 @@ fn spec_usage_names_memory_cost_and_never_claims_zero() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn memory_commands_require_local_regular_files() {
+    use std::os::unix::fs::symlink;
+
+    let (project, home) = fresh_dirs("memory-boundary");
+    let store = project.join(".openmax/memory");
+    let outside = project.parent().unwrap().join("outside");
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("escaped.md"), "# External synthetic memory\n").unwrap();
+    symlink(&outside, &store).unwrap();
+
+    let run = |args: &[&str]| {
+        let output = finish_with_deadline(cmd(&project, &home).args(args)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(run(&["--check", "--all"]).contains("memory directory must resolve inside the project"));
+    assert!(!run(&["--spec", "usage"]).contains("escaped"));
+    assert!(!run(&["--recall", "synthetic memory", "--json"]).contains("External synthetic memory"));
+
+    std::fs::remove_file(&store).unwrap();
+    let local = project.join("local-store");
+    std::fs::create_dir(&local).unwrap();
+    symlink("../local-store", &store).unwrap();
+    std::fs::write(local.join("local.md"), "# Local synthetic memory\n").unwrap();
+    let fifo = local.join("pipe.md");
+    let fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let check = run(&["--check", "--all"]);
+    assert!(check.contains("memory must resolve to a regular file inside the project"), "{check}");
+    let usage = run(&["--spec", "usage"]);
+    assert!(usage.contains("local") && !usage.contains("pipe"), "{usage}");
+    assert!(run(&["--recall", "synthetic memory", "--json"]).contains("Local synthetic memory"));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// The tools and hooks contracts name `openmax --spec <surface>.approval`
 /// for their content approval detail outside auto, and an agent runs that in
 /// bash: the binary must print the part, or the pointer is a dead end.

@@ -498,6 +498,54 @@ async fn a_memory_write_refreshes_the_note() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_project_local_memories_reach_the_provider() {
+    use std::os::unix::fs::symlink;
+
+    let dir = std::env::temp_dir().join(format!("omx-index-{}", uuid::Uuid::new_v4()));
+    let (data, project) = (dir.join("data"), project_with_one_of_each(&dir));
+    let escaped = ".openmax/memory/escaped.md";
+    write(&dir, "outside.md", "# Synthetic outside memory\n");
+    write(&dir, "outside.jsonl", "outside access log\n");
+    write(&project, "src/release.md", "# Synthetic inside memory\n");
+    symlink(dir.join("outside.md"), project.join(escaped)).unwrap();
+    symlink(dir.join("outside.jsonl"), project.join(".openmax/memory/.access.jsonl")).unwrap();
+    symlink("../../src/release.md", project.join(".openmax/memory/inside.md")).unwrap();
+    symlink(dir.join("outside.md"), project.join("pending-link")).unwrap();
+
+    let (base_url, bodies) = recording_endpoint(vec![
+        call("c1", "read_file", serde_json::json!({ "path": escaped })),
+        call("c2", "bash", serde_json::json!({ "command": "mv pending-link .openmax/memory/late.md" })),
+        call("c3", "write_file", serde_json::json!({
+            "path": ".openmax/memory/new.md", "content": "# Synthetic new memory\n"
+        })),
+        text("done"),
+    ])
+    .await;
+    configure(&data, &base_url, &project);
+    let (core, mut rx) = Core::new(data).unwrap();
+    drive_turn(&core, &mut rx, "project-memory", &project, "Inspect project memory").await;
+
+    let report = open_max_core::recall::recall(&core, &project, "synthetic memory").unwrap();
+    let memory_hits: Vec<_> = report.hits.iter().filter(|hit| hit.kind == "memory").collect();
+    let outside_log = std::fs::read_to_string(dir.join("outside.jsonl")).unwrap();
+    let sent = sent(&bodies.lock().unwrap());
+    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(sent.len(), 4);
+    assert!(sent[0].prompt.contains("Synthetic inside memory"), "the local link is indexed");
+    assert!(sent[1].last.contains("path escapes the project root"), "the file tool refuses the outside link");
+    assert!(sent[3].last.contains("Synthetic new memory"), "the live note was refreshed");
+    assert!(memory_hits.iter().any(|hit| hit.source.ends_with("/.openmax/memory/inside.md")));
+    assert!(memory_hits.iter().all(|hit| !hit.excerpt.contains("Synthetic outside memory")));
+    assert_eq!(outside_log, "outside access log\n");
+    for request in &sent {
+        assert_eq!((&request.prompt, &request.tools), (&sent[0].prompt, &sent[0].tools));
+        assert!(!request.prompt.contains("Synthetic outside memory"), "outside file in frozen prompt");
+        assert!(!request.last.contains("Synthetic outside memory"), "outside file in live note");
+    }
+}
+
 /// The note is stored at the end of a tool result, so a file the agent reads
 /// must not be able to open a fake one: a copy of the header in tool output
 /// is defused where the output is captured, and the real note, on the

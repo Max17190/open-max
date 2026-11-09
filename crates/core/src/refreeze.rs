@@ -561,7 +561,6 @@ mod tests {
     use crate::tools;
     use serde_json::Value;
     use std::time::Duration;
-    use tokio::sync::oneshot;
 
     /// A reload's prompt replaces messages[0] only when that is the prompt:
     /// a transcript assembled without one gets the prompt in front, and no
@@ -669,25 +668,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Activating a generation reads every memory file and the access log,
-    /// which grows with the memory store. /reload must do that read on a
-    /// blocking thread: on the runtime thread it stalls every other task
-    /// there, frontend work included, until the scan finishes. A FIFO in the
-    /// memory directory holds the scan open; while it is held, a task on this
-    /// single-threaded runtime must still answer.
-    ///
-    /// The scan reads the FIFO to its end, which comes once every copy of the
-    /// write end has closed, and a child forked in this process holds a copy
-    /// of each descriptor open here until it execs, as other tests' children
-    /// do all the while. So a shell of its own holds the write end, and the
-    /// task that answers catches a spawn between fork and exec while the
-    /// scan is held: the scan must still end when the shell lets go.
-    #[cfg(unix)]
+    /// A reload reads memory on a blocking thread. Hold its scan long
+    /// enough to check which thread ran it and that the frontend can respond.
     #[tokio::test(flavor = "current_thread")]
     async fn reload_reads_memory_off_the_runtime_thread() {
         use crate::state::Core;
-        use std::io::{BufRead, Write};
-        use std::os::unix::ffi::OsStrExt;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, _rx) = Core::new(dir.clone()).unwrap();
@@ -700,61 +685,19 @@ mod tests {
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert(id.clone(), data);
         }
-        let fifo = project.join(crate::memory::MEMORY_DIR).join("held.md");
-        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
 
-        // The shell's open of the write end waits for the scan's; then it
-        // says so, and exits once a line comes, letting go of the write end
-        // without a write, which leaves the FIFO's mtime alone, so the scan
-        // finishes in one read.
-        let mut shell = std::process::Command::new("/bin/sh")
-            .args(["-c", r#"exec 3> "$0" && echo held && read -r line"#])
-            .arg(&fifo)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let (mut release, said) = (shell.stdin.take().unwrap(), shell.stdout.take().unwrap());
-        let (said_tx, said_rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(said).read_line(&mut line);
-            let _ = said_tx.send(line);
-        });
-        let (ping_tx, ping_rx) = oneshot::channel::<()>();
-        let (pong_tx, pong_rx) = std::sync::mpsc::channel::<()>();
-        // None: the scan never opened the FIFO. Some(answered): whether the
-        // runtime ran another task while the scan was held open.
-        let holder = std::thread::spawn(move || {
-            let held = said_rx.recv_timeout(Duration::from_secs(10)).is_ok_and(|line| line == "held\n");
-            let answered = held.then(|| {
-                let _ = ping_tx.send(());
-                pong_rx.recv_timeout(Duration::from_secs(5)).is_ok()
-            });
-            // A line, as an end of file would wait on the copies of this
-            // pipe's write end too; sent even if the scan never came, so a
-            // scan that comes late is let go at once.
-            let _ = release.write_all(b"\n");
-            answered
-        });
-
-        let (reloaded, spawning) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(10), reload_session(&core, &id, &project)),
+        let runtime_thread = std::thread::current().id();
+        let (started, release) = crate::memory::scan_test::hold(&project);
+        let (reloaded, ()) = tokio::join!(
+            reload_session(&core, &id, &project),
             async {
-                let spawning = ping_rx.await.ok().map(|()| crate::execution::PausedSpawn::start());
-                let _ = pong_tx.send(());
-                spawning
+                let scan_thread = tokio::time::timeout(Duration::from_secs(5), started)
+                    .await.expect("the reload scanned memory").unwrap();
+                let _ = release.send(());
+                assert_ne!(scan_thread, runtime_thread, "the scan ran on the runtime thread");
             }
         );
-        // The child caught mid-spawn execs now, and so lets go of its copies.
-        drop(spawning);
-        let _ = shell.kill();
-        let _ = shell.wait();
-        let answered = holder.join().unwrap().expect("the reload scanned the memory directory");
-        assert!(answered, "the memory scan behind /reload stalled the runtime thread");
-        reloaded.expect("the scan was still reading the FIFO 10 s after the reload began").unwrap();
+        reloaded.unwrap();
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1639,18 +1582,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The turn-start check reads the session's generation, activates the one
-    /// on disk, and re-checks under the lock before it installs: a `/reload`
-    /// a frontend runs while a turn starts can install that same generation
-    /// in between, and then the check stands down, keeping the registry the
-    /// reload installed and announcing nothing. The activation's memory scan
-    /// is held on a FIFO in the memory directory while the reload lands.
-    #[cfg(unix)]
+    /// The turn-start check stands down if another caller installs the same
+    /// generation while it activates.
     #[tokio::test]
     async fn a_turn_start_refreeze_stands_down_for_a_generation_installed_while_it_activates() {
-        use std::io::{BufRead, Write};
-        use std::os::unix::ffi::OsStrExt;
-
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let id = sessions::create(&core, "/tmp/p".into()).unwrap().id;
@@ -1662,8 +1597,7 @@ mod tests {
             data.messages.push(ChatMessage::user("hi"));
             core.sessions.lock().await.insert(id.clone(), data);
         }
-        // A tool written since the session froze, and the generation a reload
-        // installs for it, activated before the FIFO exists.
+        // Prepare the same generation a concurrent reload would install.
         std::fs::create_dir_all(project.join(".openmax/tools")).unwrap();
         std::fs::write(
             project.join(".openmax/tools/deploy.toml"),
@@ -1671,42 +1605,16 @@ mod tests {
         )
         .unwrap();
         let reloaded = Arc::new(Registry::build(&core.data_dir, &project));
-        let fifo = project.join(crate::memory::MEMORY_DIR).join("held.md");
-        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
-        // The shell's open of the write end waits for the scan's; then it says
-        // so, and exits once a line comes, which ends the scan's read.
-        let mut shell = std::process::Command::new("/bin/sh")
-            .args(["-c", r#"exec 3> "$0" && echo held && read -r line"#])
-            .arg(&fifo)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let (mut release, said) = (shell.stdin.take().unwrap(), shell.stdout.take().unwrap());
-        let (said_tx, said_rx) = oneshot::channel::<bool>();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(said).read_line(&mut line);
-            let _ = said_tx.send(line == "held\n");
-        });
-
-        let (checked, held) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(10), refreeze_if_extensions_changed(&core, &id, &project)),
+        let (started, release) = crate::memory::scan_test::hold(&project);
+        let (receipt, ()) = tokio::join!(
+            refreeze_if_extensions_changed(&core, &id, &project),
             async {
-                let held = matches!(tokio::time::timeout(Duration::from_secs(10), said_rx).await, Ok(Ok(true)));
-                if held {
-                    core.sessions.lock().await.get_mut(&id).unwrap().registry = reloaded.clone();
-                }
-                let _ = release.write_all(b"\n");
-                held
+                tokio::time::timeout(Duration::from_secs(5), started)
+                    .await.expect("the turn-start check activated a generation").unwrap();
+                core.sessions.lock().await.get_mut(&id).unwrap().registry = reloaded.clone();
+                release.send(()).unwrap();
             }
         );
-        let _ = shell.kill();
-        let _ = shell.wait();
-        assert!(held, "the turn-start check never activated a generation");
-        let receipt = checked.expect("the scan was still held 10 s after the check began");
         assert!(receipt.is_none(), "the check refroze a generation the session already held: {receipt:?}");
         let map = core.sessions.lock().await;
         assert!(Arc::ptr_eq(&map.get(&id).unwrap().registry, &reloaded), "the check replaced the reload's registry");
