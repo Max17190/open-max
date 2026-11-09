@@ -100,6 +100,11 @@ jobs:
       - name: Check test count
         run: scripts/check-test-count.sh
 
+      - name: Test repository memory example
+        run: |
+          cargo build --locked -p openmax
+          python3 examples/repo-memory/test_repo_memory.py target/debug/openmax
+
   # The whole suite's wall time after compilation with every test binary run
   # at once, each with a thread pool of its own, which the test job, running
   # each test in a process of its own, does not show.
