@@ -1320,9 +1320,11 @@ fn anchored_edit_hint(content: &str, old_string: &str) -> Option<String> {
         return None;
     }
     let mut lines = content.split_inclusive('\n').enumerate();
-    let (anchor, _) = lines.find(|&(_, line)| line == first)?;
+    // An exact edit may start inside a line. A suffix match elsewhere is
+    // another possible anchor, even if only one complete line matches.
+    let (anchor, line) = lines.find(|&(_, line)| line.ends_with(first))?;
     let mut actual = lines.clone();
-    if lines.any(|(_, line)| line == first) {
+    if line != first || lines.any(|(_, line)| line.ends_with(first)) {
         return None;
     }
 

@@ -69,15 +69,16 @@ async fn edit_miss_evidence_is_bounded_and_requires_a_unique_anchor() {
     assert!(!miss.output.contains("omitted line"));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
 
-    let duplicate = original.repeat(2);
-    std::fs::write(&file, &duplicate).unwrap();
-    let miss = edit(&root, stale, "struct Summary {}").await;
-    assert!(
-        !miss.ok && miss.output.contains("Closest match is at line 1"),
-        "{}",
-        miss.output
-    );
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), duplicate);
+    for duplicate in [original.repeat(2), format!("{original}pub {original}")] {
+        std::fs::write(&file, &duplicate).unwrap();
+        let miss = edit(&root, stale, "struct Summary {}").await;
+        assert!(
+            !miss.ok && miss.output.contains("Closest match is at line 1"),
+            "{}",
+            miss.output
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), duplicate);
+    }
 
     std::fs::remove_dir_all(root).unwrap();
 }
