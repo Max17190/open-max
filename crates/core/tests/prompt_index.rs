@@ -506,18 +506,21 @@ async fn only_project_local_memories_reach_the_provider() {
     let dir = std::env::temp_dir().join(format!("omx-index-{}", uuid::Uuid::new_v4()));
     let (data, project) = (dir.join("data"), project_with_one_of_each(&dir));
     let escaped = ".openmax/memory/escaped.md";
+    let requires_dir = ".openmax/memory/requires-dir.md";
     write(&dir, "outside.md", "# Synthetic outside memory\n");
     write(&dir, "outside.jsonl", "outside access log\n");
     write(&project, "src/release.md", "# Synthetic inside memory\n");
     symlink(dir.join("outside.md"), project.join(escaped)).unwrap();
     symlink(dir.join("outside.jsonl"), project.join(".openmax/memory/.access.jsonl")).unwrap();
     symlink("../../src/release.md", project.join(".openmax/memory/inside.md")).unwrap();
+    symlink(format!("{}/", project.join("src/release.md").display()), project.join(requires_dir)).unwrap();
     symlink(dir.join("outside.md"), project.join("pending-link")).unwrap();
 
     let (base_url, bodies) = recording_endpoint(vec![
         call("c1", "read_file", serde_json::json!({ "path": escaped })),
-        call("c2", "bash", serde_json::json!({ "command": "mv pending-link .openmax/memory/late.md" })),
-        call("c3", "write_file", serde_json::json!({
+        call("c2", "read_file", serde_json::json!({ "path": requires_dir })),
+        call("c3", "bash", serde_json::json!({ "command": "mv pending-link .openmax/memory/late.md" })),
+        call("c4", "write_file", serde_json::json!({
             "path": ".openmax/memory/new.md", "content": "# Synthetic new memory\n"
         })),
         text("done"),
@@ -532,11 +535,14 @@ async fn only_project_local_memories_reach_the_provider() {
     let outside_log = std::fs::read_to_string(dir.join("outside.jsonl")).unwrap();
     let sent = sent(&bodies.lock().unwrap());
     let _ = std::fs::remove_dir_all(dir);
-    assert_eq!(sent.len(), 4);
+    assert_eq!(sent.len(), 5);
     assert!(sent[0].prompt.contains("Synthetic inside memory"), "the local link is indexed");
     assert!(sent[1].last.contains("path escapes the project root"), "the file tool refuses the outside link");
-    assert!(sent[3].last.contains("Synthetic new memory"), "the live note was refreshed");
+    assert!(sent[2].last.contains("not a directory"), "the file tool honors the trailing slash");
+    assert!(sent[4].last.contains("Synthetic new memory"), "the live note was refreshed");
+    assert!(!sent[0].prompt.contains(requires_dir), "the directory-only link cannot be indexed");
     assert!(memory_hits.iter().any(|hit| hit.source.ends_with("/.openmax/memory/inside.md")));
+    assert!(memory_hits.iter().all(|hit| !hit.source.ends_with(requires_dir)));
     assert!(memory_hits.iter().all(|hit| !hit.excerpt.contains("Synthetic outside memory")));
     assert_eq!(outside_log, "outside access log\n");
     for request in &sent {

@@ -117,7 +117,8 @@ pub(crate) fn project_memory_dir(project_root: &Path) -> Option<(PathBuf, PathBu
 /// inside the canonical project root.
 pub(crate) fn local_path(root: &Path, path: &Path) -> Option<PathBuf> {
     let target = path.canonicalize().ok()?;
-    target.starts_with(root).then_some(target)
+    // Canonicalization can strip a trailing slash required by a symlink target.
+    (target.starts_with(root) && (path == target || path.metadata().is_ok())).then_some(target)
 }
 
 pub fn unix_now() -> u64 {
