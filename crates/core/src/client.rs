@@ -7,7 +7,7 @@
 //!
 //! Retries cover what can end one request before the reply exists: a
 //! transport failure on send, a rate limit or transient server error (429,
-//! 500, 502, 503, 504, 529), and a stream that died, went silent, or
+//! 500, 502, 503, 504, 520, 529), and a stream that died, went silent, or
 //! carried a data line this client cannot read, or a stream or reply the
 //! server failed with a rate limit, an overload, or a server fault, before
 //! any reply text arrived. Each attempt resends the same bytes after an
@@ -1684,11 +1684,11 @@ const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 /// Statuses that say the server could not take the request just now: a rate
 /// limit (429), or an upstream that failed or shed load (500, 502, 503, 504,
-/// and the 529 an overloaded provider sends). Resending is safe: a chat
-/// completion changes nothing, tools run only once the agent loop holds a
-/// finished reply, and a refused status carries no reply text the caller
-/// could show twice. A gateway's 500 or 502 can follow work the upstream
-/// already did, so a resend may pay for that work twice. The chat
+/// 520 when a gateway cannot use the upstream response, and 529 for
+/// overload). Resending is safe: a chat completion changes nothing, tools
+/// run only once the agent loop holds a finished reply, and a refused status
+/// carries no reply text the caller could show twice. A gateway error can
+/// follow work the upstream already did, so a resend may pay twice. The chat
 /// completions API has no idempotency key to collapse the two, and failing
 /// the turn saves nothing: it ends with no reply, and the only way to one
 /// is the same request sent again. A stream cut before any reply text, and
@@ -1696,7 +1696,7 @@ const RETRY_AFTER_CAP_SECS: u64 = 60;
 /// of these codes (see [`server_failure`]), are resent on the same terms. A
 /// 429 for an exhausted quota is excluded by [`quota_exhausted`].
 fn is_retryable_status(code: u16) -> bool {
-    matches!(code, 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(code, 429 | 500 | 502 | 503 | 504 | 520 | 529)
 }
 
 /// Whether an error body reports an exhausted quota (`insufficient_quota` as
@@ -3050,6 +3050,7 @@ pub(crate) mod tests {
         "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
+    const GATEWAY_520: &str = "520 Web Server Returned an Unknown Error";
 
     /// The bug this guards: an overloaded or failing upstream ended the turn
     /// on a refusal the next attempt would not have seen. A refused status
@@ -3057,7 +3058,7 @@ pub(crate) mod tests {
     /// the agent loop dispatches tools, so it is resent like a 429.
     #[tokio::test]
     async fn a_transient_server_error_is_resent_until_a_reply_arrives() {
-        for status in ["500 Internal Server Error", "502 Bad Gateway", "503 Service Unavailable", "504 Gateway Timeout", "529 Overloaded"] {
+        for status in ["500 Internal Server Error", "502 Bad Gateway", "503 Service Unavailable", "504 Gateway Timeout", GATEWAY_520, "529 Overloaded"] {
             let refused = status_response(status, "", r#"{"error":{"message":"upstream overloaded"}}"#);
             let (result, deltas, served) = stream_sequence(vec![refused, FINISHED.into()]).await;
             assert_eq!(served, 2, "{status} was resent");
@@ -3071,6 +3072,37 @@ pub(crate) mod tests {
             );
             assert_eq!(deltas[1], "content:all of it");
         }
+    }
+
+    #[tokio::test]
+    async fn a_persistent_gateway_error_stops_at_the_attempt_limit_or_retry_after_cap() {
+        for (headers, attempts) in [("", MAX_ATTEMPTS), ("Retry-After: 3600\r\n", 1)] {
+            let refusal = status_response(GATEWAY_520, headers, r#"{"error":{"message":"upstream failed"}}"#);
+            let mut replies = vec![refusal; attempts as usize];
+            replies.push(FINISHED.into());
+            let (result, deltas, served) = try_stream_sequence(replies).await;
+            let err = result.err().expect("the gateway refusal is reported");
+            assert!(err.starts_with("backend returned 520 ") && err.contains("upstream failed"), "{err}");
+            assert_eq!(served, attempts as usize, "{headers:?}");
+            assert_eq!(deltas.len(), attempts as usize - 1, "{deltas:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gateway_retry_can_be_cancelled_before_the_resend() {
+        let refusal = status_response(GATEWAY_520, "Retry-After: 40\r\n", r#"{"error":{"message":"upstream failed"}}"#);
+        let (url, served) = spawn_sse_sequence(vec![refusal, FINISHED.into()]);
+        let cancelled = Arc::new(crate::state::CancelToken::default());
+        let reply = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], "[]", cancelled.clone(), |delta| {
+                if matches!(delta, StreamDelta::Retry { .. }) {
+                    cancelled.cancel();
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.finish_reason, "cancelled");
+        assert_eq!(*served.lock().unwrap(), 1);
     }
 
     /// The bug this guards: finish_reason `error` read as a clean end, so a
@@ -3091,18 +3123,20 @@ pub(crate) mod tests {
 
         // A retryable failure after reply text streamed is reported, not
         // resent: the caller has already shown that text.
-        let (result, deltas, served) = try_stream_sequence(vec![
-            format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"half an ans\"}},\"finish_reason\":null}}]}}\n\n{}",
-                gateway_error_chunk(json!("server_error"), "upstream disconnected unexpectedly")
-            ),
-            FINISHED.into(),
-        ])
-        .await;
-        let err = result.err().expect("a failure after reply text is still an error");
-        assert!(err.contains("upstream disconnected unexpectedly"), "{err}");
-        assert_eq!(served, 1);
-        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+        for code in [json!("server_error"), json!(520)] {
+            let (result, deltas, served) = try_stream_sequence(vec![
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"half an ans\"}},\"finish_reason\":null}}]}}\n\n{}",
+                    gateway_error_chunk(code, "upstream disconnected unexpectedly")
+                ),
+                FINISHED.into(),
+            ])
+            .await;
+            let err = result.err().expect("a failure after reply text is still an error");
+            assert!(err.contains("upstream disconnected unexpectedly"), "{err}");
+            assert_eq!(served, 1);
+            assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+        }
     }
 
     /// A rate limit, an overloaded upstream, or a server fault reported
@@ -3155,7 +3189,7 @@ pub(crate) mod tests {
     /// 200 is resent exactly when that status would be.
     #[tokio::test]
     async fn a_status_inside_a_200_is_resent_on_the_terms_of_that_status() {
-        for code in [429, 500, 502, 503, 504, 529, 501, 505] {
+        for code in [429, 500, 502, 503, 504, 520, 529, 501, 505] {
             let failure = gateway_error_chunk(json!(code), "upstream failed");
             let (result, deltas, served) = try_stream_sequence(vec![failure, FINISHED.into()]).await;
             if is_retryable_status(code) {
@@ -3308,14 +3342,13 @@ pub(crate) mod tests {
     /// a fresh attempt can outlast it.
     #[tokio::test]
     async fn a_failure_in_a_json_reply_is_reported_like_one_in_a_stream() {
-        let (result, deltas, served) = try_stream_sequence(vec![
-            r#"JSON:{"error":{"code":503,"message":"upstream overloaded"}}"#.into(),
-            FINISHED.into(),
-        ])
-        .await;
-        assert_eq!(result.expect("the second attempt finished").content, "all of it");
-        assert_eq!(served, 2);
-        assert!(deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:")) && deltas[0].contains("upstream overloaded"), "{deltas:?}");
+        for code in [503, 520] {
+            let error = json!({"error": {"code": code, "message": "upstream failed"}});
+            let (result, deltas, served) = try_stream_sequence(vec![format!("JSON:{error}"), FINISHED.into()]).await;
+            assert_eq!(result.expect("the second attempt finished").content, "all of it", "{code}");
+            assert_eq!(served, 2, "{code}");
+            assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:backend reported an error ({code}): upstream failed"));
+        }
 
         let (result, _, served) = try_stream_sequence(vec![
             r#"JSON:{"error":{"type":"invalid_request_error","message":"unknown parameter: tools"}}"#.into(),
@@ -3763,7 +3796,7 @@ pub(crate) mod tests {
     #[test]
     fn retryable_status_codes() {
         // A rate limit, or an upstream that cannot serve the request right now.
-        for code in [429, 500, 502, 503, 504, 529] {
+        for code in [429, 500, 502, 503, 504, 520, 529] {
             assert!(is_retryable_status(code), "{code}");
         }
         // A refusal of the request itself: every attempt gets the same answer.
