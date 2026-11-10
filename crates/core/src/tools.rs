@@ -199,7 +199,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create a file or fully rewrite one; prefer edit_file for changes.",
+                "description": "Create or rewrite a file; prefer edit_file for changes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -214,7 +214,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace old_string with new_string; old_string must match exactly and be unique unless replace_all.",
+                "description": "Replace old_string (exact; unique unless replace_all) with new_string.",
                 "parameters": {
                     "type": "object",
                     "properties": {
