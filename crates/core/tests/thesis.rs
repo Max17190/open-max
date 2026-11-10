@@ -108,8 +108,11 @@ const REPOSITORY_TREE: [&str; 17] = [
 /// write_file prefers edit_file for changes, and the closing summary does not
 /// repeat file contents. It holds the batching rule too: every response
 /// resends the whole conversation, so a session that makes one small call per
-/// response pays for its context once per call, and the rule asks for calls,
-/// shell steps and file reads to share a response instead.
+/// response pays for its context once per call, and the rule asks for calls
+/// and file reads to share a response instead. For the same reason it holds
+/// the line that names the four core tools, bash steps chained in one
+/// command among them, and the absence of the two rules that made a read
+/// before every change and a build or test after it per-step obligations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frozen_prefix_is_under_700_tokens() {
     frozen_prefix_case("frozen_prefix_is_under_700_tokens", false).await;
@@ -232,9 +235,18 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
         "the closing summary must not echo files back:\n{system}"
     );
     assert!(
-        system.contains("Batch tool calls per response; chain shell commands; read whole files."),
+        system.contains("Batch tool calls per response"),
         "the rules must ask for batched calls, not one small call per response:\n{system}"
     );
+    let tools_line = system.lines().find(|line| line.starts_with("Tools: ")).unwrap_or_default();
+    for tool in ["bash", "read_file", "edit_file", "write_file"] {
+        assert!(tools_line.contains(tool), "the prompt names what {tool} is for:\n{system}");
+    }
+    assert!(tools_line.contains("chain steps"), "bash steps share a command:\n{system}");
+    // No rule makes a read or a check a per-step obligation.
+    for rule in ["Read code before changing it", "verify by build or test"] {
+        assert!(!system.contains(rule), "the rules must not ask for a per-step {rule:?}:\n{system}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

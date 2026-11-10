@@ -225,20 +225,26 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
     // Tool-specific guidance lives in each tool's schema description (which
-    // rides in every request anyway); rules here are only the cross-cutting
-    // ones. Both sides count against the frozen prompt budget in
-    // `frozen_prompt_fits_token_budget`.
+    // rides in every request anyway). The prompt names what the four core
+    // tools are for, once, and its rules are only the cross-cutting ones. No
+    // rule asks for a read before every change or a build or test after it:
+    // a model reads such a rule as a per-step obligation, re-reading what it
+    // already holds and re-running checks after each small edit, and every
+    // one of those rounds resends the conversation. When to read and verify
+    // is left to the model. Both sides count against the frozen prompt
+    // budget in `frozen_prompt_fits_token_budget`.
     let mut prompt = format!(
-        "You are Open Max, a coding agent working on the project at {root}.\n\
+        "You are Open Max, an expert coding agent working on the project at {root}.\n\
+        \n\
+        Tools: bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files.\n\
         \n\
         Rules:\n\
         - Paths are project-relative.\n\
-        - Read code before changing it; never guess paths or contents.\n\
-        - Batch tool calls per response; chain shell commands; read whole files.\n\
-        - Keep the diff minimal, in the existing style; verify by build or test.\n\
+        - Batch tool calls per response; read whole files.\n\
+        - Keep the diff minimal, in the existing style.\n\
         - On a tool error, fix the call; never repeat it.\n\
         - Call tools via the API, never as JSON or XML text.\n\
-        - When done, stop calling tools; summarize briefly without repeating file contents."
+        - Be concise. When done, stop calling tools; summarize briefly without repeating file contents."
     );
     breakdown.components.push(("base rules".into(), prompt.len()));
     // The extension pointer rides the bash schema (`tools::BASH_DESCRIPTION`),
@@ -1313,9 +1319,13 @@ mod tests {
     }
 
     /// The path-free base rules and builtin schemas, the extension pointer
-    /// among them in the bash description, must fit in 2,537 bytes (576
-    /// o200k tokens), what they measured when the pointer moved from the
-    /// system prompt into that description. Before that the cap was 2,597
+    /// among them in the bash description, must fit in 2,595 bytes (591
+    /// o200k tokens), what they measured when the rules began naming the
+    /// four core tools and stopped asking for a read before every change and
+    /// a build or test after it. That spends 58 of the 60 bytes freed when
+    /// the pointer moved from the system prompt into the bash description,
+    /// where the cap was 2,537 (576 tokens), so the payload stays 2 bytes
+    /// under the 2,597 it measured before the move. Before that the cap was 2,597
     /// (592 tokens), what they measured when the rules began asking for
     /// batched tool calls, and before that it was
     /// 2,662, 63 over the 2,599 bytes (589 tokens) they measured when the cap
@@ -1350,7 +1360,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_537;
+        const CAP: usize = 2_595;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \

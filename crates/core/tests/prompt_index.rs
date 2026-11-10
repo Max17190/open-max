@@ -381,7 +381,7 @@ async fn a_session_without_a_current_manifest_rebuilds_its_prompt_once() {
 
     let sent = sent(&bodies.lock().unwrap());
     let rebuilt = &sent[0].prompt;
-    assert!(rebuilt.starts_with("You are Open Max, a coding agent") && rebuilt.contains("- release: cut a release —"), "{rebuilt}");
+    assert!(rebuilt.starts_with("You are Open Max, an expert coding agent") && rebuilt.contains("- release: cut a release —"), "{rebuilt}");
     assert!(sent[0].tools.contains("\"name\":\"wordfreq\""), "and the tools array: {}", sent[0].tools);
     assert_eq!(&sent[1].prompt, rebuilt, "the second sitting sends the rebuilt bytes");
     assert_eq!(sent[1].tools, sent[0].tools, "and the same tools array");
