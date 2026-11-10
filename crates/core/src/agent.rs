@@ -715,7 +715,7 @@ async fn run_loop(
     // the registry and keeps these (a tool file written since rides the
     // note), so they never move until /reload.
     let schemas_wire = registry.schemas_wire_arc();
-    let caps = tools::OutputCaps::from_settings(&settings);
+    let caps = tools::OutputCaps::from_settings(&settings, Some(endpoint.context_tokens));
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
     if first_turn {

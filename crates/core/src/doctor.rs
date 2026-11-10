@@ -1359,7 +1359,11 @@ async fn run_examples_within(
     // configuration error, not a silent reset to defaults (and it carries the
     // approval_mode this run has to honor).
     let settings = crate::config::load(data_dir)?;
-    let caps = crate::tools::OutputCaps::from_settings(&settings);
+    // The caps a session on this configuration would run the tool under; a
+    // configuration that does not resolve has no window, and runs at the cap
+    // that has none.
+    let window = crate::providers::resolve(&settings, data_dir).ok().map(|endpoint| endpoint.context_tokens);
+    let caps = crate::tools::OutputCaps::from_settings(&settings, window);
     let mode = crate::trust::approval_mode(data_dir, project_root, settings.approval_mode)?;
     let gates = ExampleGates {
         hooks: crate::hooks::Hooks::discover_for_mode(project_root, data_dir, mode),
