@@ -189,6 +189,17 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
     }
 }
 
+/// The bash schema's description, which also carries the extension pointer:
+/// the surfaces `openmax --spec` prints a contract for, the verifier, and
+/// recall. Paths, formats, approval, and activation rules live in the
+/// contracts, read on demand. In the system prompt the pointer suppressed
+/// the reasoning phase of a reasoning model's first response in a session:
+/// the model often answered that request without reasoning, in fewer and
+/// narrower tool calls. Carried in this description instead, the same
+/// content does not, and the first response reasons as it does with no
+/// pointer at all. Every command it names runs through bash.
+pub(crate) const BASH_DESCRIPTION: &str = "Run a shell command in the project root. Extend Open Max: openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp|subagent> prints a contract; openmax --check verifies; openmax --recall \"<query>\" searches past sessions.";
+
 /// Tool schemas in the OpenAI `tools` wire format. Kept deliberately small and
 /// strict — small local models do much better with fewer, simpler parameters.
 pub fn tool_schemas() -> &'static Value {
@@ -291,7 +302,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a shell command in the project root.",
+                "description": BASH_DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {

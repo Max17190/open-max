@@ -584,10 +584,11 @@ loop never loads it and so never fails closed on it.
 
 `openmax --spec <surface>` prints the complete authoring contract for one
 surface (`tools`, `skills`, `prompts`, `hooks`, `permissions`, `providers`,
-`settings`, `memory`, `recall`, `stdio`, or `mcp`): file grammar, field caps
-and defaults, hook stdin payload shapes, and activation timing. The frozen
-prompt carries only a one-line pointer to it, so the full contract costs zero
-tokens until the agent reads it, and the printed examples are parsed by the
+`settings`, `memory`, `recall`, `stdio`, `mcp`, or `subagent`): file
+grammar, field caps and defaults, hook stdin payload shapes, and activation
+timing. Only a one-line pointer to it rides each request, in the `bash`
+tool's description rather than the system prompt, so the full contract costs
+zero tokens until the agent reads it, and the printed examples are parsed by the
 same validation code in tests so the text cannot drift from the binary. The
 tools and hooks contracts state each mode's content approval rule and name
 `openmax --spec tools.approval` and `hooks.approval` for the detail that
@@ -599,9 +600,10 @@ request after the read.
 The frozen prefix of every request is the system prompt (messages[0]) and the
 `tools` array, and both are byte-identical for the whole session, a resume
 included. Both are built when the session is created: the prompt from the base
-rules, the extension pointer, `AGENTS.md` (capped at 2000 bytes), the memory
-index, the layout map, and the skills index as they stand then, and the array
-from the built-ins and the tool files that load then. The prompt is persisted
+rules, `AGENTS.md` (capped at 2000 bytes), the memory index, the layout map,
+and the skills index as they stand then, and the array from the built-ins
+(the `bash` schema carries the extension pointer) and the tool files that
+load then. The prompt is persisted
 with the session, and its manifest records the array's tool files and what the
 prompt's index shows.
 

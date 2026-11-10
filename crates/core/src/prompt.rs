@@ -225,27 +225,30 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
     // Tool-specific guidance lives in each tool's schema description (which
-    // rides in every request anyway); rules here are only the cross-cutting
-    // ones. Both sides count against the frozen prompt budget in
-    // `frozen_prompt_fits_token_budget`.
+    // rides in every request anyway). The prompt names what the four core
+    // tools are for, once, and its rules are only the cross-cutting ones. No
+    // rule asks for a read before every change or a build or test after it:
+    // a model reads such a rule as a per-step obligation, re-reading what it
+    // already holds and re-running checks after each small edit, and every
+    // one of those rounds resends the conversation. When to read and verify
+    // is left to the model. Both sides count against the frozen prompt
+    // budget in `frozen_prompt_fits_token_budget`.
     let mut prompt = format!(
-        "You are Open Max, a coding agent working on the project at {root}.\n\
+        "You are Open Max, an expert coding agent working on the project at {root}.\n\
+        \n\
+        Tools: bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files.\n\
         \n\
         Rules:\n\
         - Paths are project-relative.\n\
-        - Read code before changing it; never guess paths or contents.\n\
-        - Batch tool calls per response; chain shell commands; read whole files.\n\
-        - Keep the diff minimal, in the existing style; verify by build or test.\n\
+        - Batch tool calls per response; read whole files.\n\
+        - Keep the diff minimal, in the existing style.\n\
         - On a tool error, fix the call; never repeat it.\n\
         - Call tools via the API, never as JSON or XML text.\n\
-        - When done, stop calling tools; summarize briefly without repeating file contents."
+        - Be concise. When done, stop calling tools; summarize briefly without repeating file contents."
     );
     breakdown.components.push(("base rules".into(), prompt.len()));
-    {
-        let before = prompt.len();
-        prompt.push_str(SELF_EXTENSION);
-        breakdown.components.push(("self-extension guide".into(), prompt.len() - before));
-    }
+    // The extension pointer rides the bash schema (`tools::BASH_DESCRIPTION`),
+    // not this prompt: see the comment there.
     let instructions = agents_md(project_root);
     if let Some(instructions) = &instructions {
         let before = prompt.len();
@@ -573,13 +576,6 @@ fn tools_trailer(omitted: usize) -> String {
     )
 }
 
-/// The extension pointer, paid in every frozen prompt: which surfaces exist
-/// and the one command that prints each surface's contract. Paths, formats,
-/// approval, and activation rules all live in `--spec`, read on demand, so
-/// the prefix carries the index and never the manual. It is one line, resent
-/// on every request for the life of the session.
-const SELF_EXTENSION: &str = "\n\nFor a reusable capability, first run openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp> in bash; verify with openmax --check. Past sessions and memories: openmax --recall \"<query>\". Sub-agent: openmax -p, in tmux to outlive the turn.";
-
 /// One line per skill: name, description, and the SKILL.md path the model
 /// reads on demand. Project skills show a project-relative path (read_file
 /// reaches it); global skills keep their absolute path (bash reaches it).
@@ -778,6 +774,7 @@ fn map_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::BASH_DESCRIPTION;
 
     fn temp_project() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("openmax-prompt-{}", uuid::Uuid::new_v4()));
@@ -805,33 +802,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The extension pointer is part of every frozen prompt: the agent must
+    /// The extension pointer is part of every frozen payload: the agent must
     /// be able to find the surfaces, the command that prints each contract,
-    /// the verifier, preserved history, and the sub-agent flag, all in one
-    /// line. Paths, formats, and activation timing live in the contracts,
-    /// not here: the prefix is resent on every request, and the manual that
-    /// used to ride it measured over a quarter of the fixed payload before it
-    /// was cut to this pointer.
+    /// the verifier, preserved history, and the sub-agent recipe's topic,
+    /// all in one line. It rides the bash schema, never the system prompt
+    /// (see `tools::BASH_DESCRIPTION` for why). Paths, formats, and
+    /// activation timing live in the contracts, not here: the prefix is
+    /// resent on every request, and the manual that used to ride it measured
+    /// over a quarter of the fixed payload before it was cut to this pointer.
     #[test]
-    fn prompt_carries_self_extension_guide() {
+    fn the_bash_schema_carries_the_extension_pointer() {
         let dir = temp_project();
         let prompt = builtin_prompt(&dir);
-        assert_eq!(SELF_EXTENSION.trim_start().lines().count(), 1, "the pointer is one line: {SELF_EXTENSION}");
-        assert!(prompt.contains("reusable capability"));
-        assert!(prompt.contains("openmax --spec <tools|"));
-        assert!(prompt.contains("openmax --check"));
-        assert!(prompt.contains("openmax --recall"), "preserved history must be findable");
+        for pointer in ["openmax --spec", "openmax --check", "openmax --recall", "Sub-agent", "reusable capability"] {
+            assert!(!prompt.contains(pointer), "the system prompt carries no extension pointer: {pointer}");
+        }
+        let pointer = BASH_DESCRIPTION;
+        assert_eq!(pointer.lines().count(), 1, "the pointer is one line: {pointer}");
+        let bash = crate::tools::tool_schemas()
+            .as_array()
+            .expect("schemas are an array")
+            .iter()
+            .find(|t| t["function"]["name"] == "bash")
+            .expect("bash is a builtin");
+        assert_eq!(bash["function"]["description"], pointer);
+        assert!(pointer.contains("openmax --spec <tools|"));
+        assert!(pointer.contains("openmax --check"));
+        assert!(pointer.contains("openmax --recall"), "preserved history must be findable");
         // Capability-file history is no longer recorded, so a pointer to it
         // would be bytes every request pays for a command with nothing to show.
-        assert!(!prompt.contains("openmax --ledger"), "no pointer to history that is not kept");
-        assert!(prompt.contains("Sub-agent: openmax -p"));
-        assert!(prompt.contains("tmux"));
+        assert!(!pointer.contains("openmax --ledger"), "no pointer to history that is not kept");
+        // Delegation is one contract away; the recipe names print mode and
+        // the tmux session that outlives the turn.
+        let recipe = crate::spec::render("subagent").expect("the sub-agent recipe renders");
+        assert!(recipe.contains("openmax -p \"<task>\""), "{recipe}");
+        assert!(recipe.contains("tmux new-session"), "{recipe}");
         // The per-surface paths moved into the contracts the pointer names.
         // A path here is prefix bytes every request pays for a file the
         // model writes at most a few times per session.
-        assert!(!prompt.contains(".openmax/tools/<name>.toml"));
-        assert!(!prompt.contains(".agents/skills/<name>/SKILL.md"));
-        assert!(!prompt.contains("providers.json"));
+        for payload in [prompt.as_str(), pointer] {
+            assert!(!payload.contains(".openmax/tools/<name>.toml"));
+            assert!(!payload.contains(".agents/skills/<name>/SKILL.md"));
+            assert!(!payload.contains("providers.json"));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1248,8 +1261,8 @@ mod tests {
     /// its trigger.
     #[test]
     fn the_guide_defers_activation_timing_to_the_contracts() {
-        assert!(!SELF_EXTENSION.contains("mutating call"));
-        assert!(!SELF_EXTENSION.contains("next turn"));
+        assert!(!BASH_DESCRIPTION.contains("mutating call"));
+        assert!(!BASH_DESCRIPTION.contains("next turn"));
         let states = |surface: &str, trigger: &str| {
             let spec = crate::spec::render(surface).expect("the contract renders");
             assert!(spec.contains(trigger), "{surface} spec must state its activation trigger: {trigger:?}");
@@ -1266,17 +1279,18 @@ mod tests {
     #[test]
     fn the_guide_pointer_names_only_real_surfaces() {
         // Every surface the pointer names must exist, and the omissions must
-        // be exactly the deliberate ones: settings, recall, subagent, and
-        // usage are not authoring surfaces, and the moments that need them
-        // carry their own pointer (--check settings rows print "openmax --spec
-        // settings"; the pointer names openmax --recall itself; its Sub-agent
-        // entry names delegation, and `openmax --help` lists --subagent and
-        // its recipe). A new --spec surface must
+        // be exactly the deliberate ones: settings, recall, and usage are not
+        // authoring surfaces, and the moments that need them carry their own
+        // pointer (--check settings rows print "openmax --spec settings"; the
+        // pointer names openmax --recall itself). `subagent` is not one
+        // either, but it is named: it is how the agent finds delegation, and
+        // `openmax --help` lists --subagent and its recipe too. A new --spec
+        // surface must
         // either join the pointer or this list, consciously. `mcp` adds no
         // file kind of its own, but it is named: it is the recipe that turns
         // an MCP server into a tool and a skill, and without it a request
         // for a server leaves the agent writing its own protocol client.
-        let pointer: Vec<&str> = SELF_EXTENSION
+        let pointer: Vec<&str> = BASH_DESCRIPTION
             .split_once("openmax --spec <")
             .and_then(|(_, rest)| rest.split_once('>'))
             .expect("the guide lists its authoring contracts")
@@ -1284,6 +1298,7 @@ mod tests {
             .split('|')
             .collect();
         assert!(pointer.contains(&"mcp"), "the pointer names the MCP recipe: {pointer:?}");
+        assert!(pointer.contains(&"subagent"), "the pointer names the sub-agent recipe: {pointer:?}");
         for s in &pointer {
             assert!(crate::spec::SURFACES.contains(s), "the pointer names a surface --spec lacks: {s}");
             assert!(crate::spec::render(s).is_some(), "the named contract must render: {s}");
@@ -1298,14 +1313,21 @@ mod tests {
         // here, only the SET of deliberate omissions is.
         assert_eq!(
             omitted,
-            ["recall", "settings", "subagent", "usage"],
+            ["recall", "settings", "usage"],
             "a new surface joins the pointer or the deliberate-omission list"
         );
     }
 
-    /// The path-free base rules, extension pointer, and builtin schemas must
-    /// fit in 2,597 bytes (592 o200k tokens), what they measured when the
-    /// rules began asking for batched tool calls. Before that the cap was
+    /// The path-free base rules and builtin schemas, the extension pointer
+    /// among them in the bash description, must fit in 2,595 bytes (591
+    /// o200k tokens), what they measured when the rules began naming the
+    /// four core tools and stopped asking for a read before every change and
+    /// a build or test after it. That spends 58 of the 60 bytes freed when
+    /// the pointer moved from the system prompt into the bash description,
+    /// where the cap was 2,537 (576 tokens), so the payload stays 2 bytes
+    /// under the 2,597 it measured before the move. Before that the cap was 2,597
+    /// (592 tokens), what they measured when the rules began asking for
+    /// batched tool calls, and before that it was
     /// 2,662, 63 over the 2,599 bytes (589 tokens) they measured when the cap
     /// came down from 3,450; before that cut they measured 3,362 bytes (762
     /// tokens). It is a ratchet: a cut lowers it, and growth needs the
@@ -1321,7 +1343,7 @@ mod tests {
         let base_chars = breakdown
             .components
             .iter()
-            .filter(|(name, _)| name == "base rules" || name == "self-extension guide")
+            .filter(|(name, _)| name == "base rules")
             .map(|(_, c)| *c)
             .sum::<usize>();
         let path_free = base_chars - dir.to_string_lossy().len();
@@ -1338,7 +1360,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_597;
+        const CAP: usize = 2_595;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
@@ -1450,7 +1472,7 @@ mod tests {
         let base_chars: usize = breakdown
             .components
             .iter()
-            .filter(|(name, _)| name == "base rules" || name == "self-extension guide")
+            .filter(|(name, _)| name == "base rules")
             .map(|(_, c)| *c)
             .sum();
         let path_free = prompt[..base_chars].replace(&dir.to_string_lossy().to_string(), "");
