@@ -36,6 +36,21 @@ whether or not a human approved their content; outside `auto`, an unapproved
 one is never batched: it takes the serial path, which asks for approval or,
 in `readonly`, refuses the call.
 
+Every request resends the whole conversation, so a run of responses that
+each carry one tool call costs a request per step. The call that completes
+such a run of 4 gets a note on its result naming the count and asking the
+model to send independent calls together, chain the shell steps it already
+knows in one command, and read whole files; when every response in the run
+edited one file, the note names it and asks for its remaining edits in one
+response instead. The second and third notes come at runs of 12 and 28,
+and no more come once three have: each turn starts from the notes the
+transcript holds, so one that compaction dropped is not counted. A run is
+counted within a turn: a response with no call or with several ends it, and
+a failed call, or one whose approval timed out, is not counted toward it.
+The note is added to the newest tool result only, so no earlier byte of the
+conversation changes, and a model whose responses always carry several calls
+never sees it.
+
 A missing settings file means defaults, and the default `base_url` and `model`
 are empty: endpoint resolution fails until `base_url`, `model` and
 `context_tokens` are set, here or through a named provider, and one error

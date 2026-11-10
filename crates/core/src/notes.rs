@@ -2,7 +2,7 @@
 //! frontend on the wire, about state the model did not produce (hook and
 //! policy notices, approvals made elsewhere, the execution mode, settings
 //! drift, what a mutating call changed that no refreeze covers, an
-//! over-budget toolbox, a repeating call).
+//! over-budget toolbox, a repeating call, a run of one-call responses).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -517,6 +517,54 @@ pub(crate) fn repeated_result_note(n: usize) -> String {
          a short plain-text summary now.]"
     )
 }
+
+/// Consecutive responses in a turn that each made one tool call, each a full request since every
+/// request resends the conversation. The calls that complete runs of 4, 12 and 28 carry a note, at
+/// most three per transcript (counted from the notes it holds, so one compaction dropped is not).
+/// No call or several ends a run; a failed or timed-out call (a correction) is not counted.
+#[derive(Default)]
+pub(crate) struct SingleCallRuns {
+    run: usize,
+    notes: usize,
+    edited: Option<String>,
+}
+
+/// The note's opening, so tests, readers and the count can find it.
+pub(crate) const SINGLE_CALL_NOTE_MARK: &str = "[openmax: the last ";
+
+impl SingleCallRuns {
+    /// Starts a turn with the notes `messages`, the transcript, already holds.
+    pub(crate) fn new(messages: &[ChatMessage]) -> Self {
+        let notes = messages.iter().filter(|m| m.role == "tool").filter_map(|m| m.content.as_deref());
+        Self { notes: notes.flat_map(str::lines).filter(|l| l.starts_with(SINGLE_CALL_NOTE_MARK)).count(), ..Self::default() }
+    }
+
+    /// Records one response's calls and the replies they drew; the note when it completes a run that earns one.
+    pub(crate) fn observe(&mut self, calls: &[ToolCall], messages: &[ChatMessage]) -> Option<String> {
+        let [call] = calls else { *self = Self { notes: self.notes, ..Self::default() }; return None };
+        let args = serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
+        let path = args.as_ref().and_then(|a| a.get("path")?.as_str()).filter(|_| call.function.name == "edit_file");
+        // The edit form names a file only while every step since the run began edited it, a failed one included.
+        self.edited = if self.run == 0 { path.map(str::to_string) } else { self.edited.take().filter(|e| Some(e.as_str()) == path) };
+        let reply = messages.iter().rev().find(|m| m.role == "tool").and_then(|m| m.content.as_deref());
+        if reply.is_none_or(|r| r.starts_with("Error: ") || r.starts_with(crate::agent::APPROVAL_TIMEOUT_MESSAGE)) { return None; }
+        self.run += 1;
+        if self.run < *[4, 12, 28].get(self.notes)? { return None; }
+        self.notes += 1;
+        Some(single_call_note(self.run, self.edited.as_deref()))
+    }
+}
+
+/// The note for a run of `n` one-call responses, naming `edited` when every response since it began edited that file.
+pub(crate) fn single_call_note(n: usize, edited: Option<&str>) -> String {
+    let ask = match edited {
+        Some(path) => format!("one edit to {path}. When you know the file's remaining edits, send them together in one response"),
+        None => "one tool call, and each resends the conversation. Send independent calls together, chain shell steps you \
+                 already know in one command, and read whole files".into(),
+    };
+    format!("{SINGLE_CALL_NOTE_MARK}{n} responses each made {ask}.]")
+}
+
 /// What a mutating call's permissions reload found, said on that call's
 /// result: that it left permissions.toml malformed (`fail_closed_now`, the
 /// parse reason, with the repair `permissions`, as reloaded, still allows),
@@ -770,6 +818,22 @@ mod tests {
             function: crate::types::ToolCallFunction { name: "write_file".into(), arguments: "{}".into() },
             extra_content: None,
         }
+    }
+
+    /// A call whose approval timed out ran nothing, so it counts toward a run
+    /// of one-call responses no more than a failed one: the run holds across
+    /// it. A reply that only mentions the note's text later in a line is not
+    /// counted as a note the transcript holds.
+    #[test]
+    fn a_timed_out_approval_does_not_count_toward_a_one_call_run() {
+        let reply = |text: &str| vec![ChatMessage::tool("c1", text)];
+        let mut runs = SingleCallRuns::new(&reply(&format!("x {SINGLE_CALL_NOTE_MARK}2 responses")));
+        let timed_out = reply(crate::agent::APPROVAL_TIMEOUT_MESSAGE);
+        let seen: Vec<Option<String>> = [reply("ok"), reply("ok"), reply("ok"), timed_out, reply("ok")]
+            .iter()
+            .map(|messages| runs.observe(&[call()], messages))
+            .collect();
+        assert_eq!(seen, [None, None, None, None, Some(single_call_note(4, None))]);
     }
 
     /// A note is stored once, where it changes: at the end of the newest

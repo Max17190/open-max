@@ -2297,6 +2297,52 @@ fn a_print_run_keeps_harness_notes_off_stderr() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// The note on a run of one-call responses rides the result of the call
+/// that completes the run, as every mid-turn harness note does: `--json` prints it as
+/// a `harness_note` line, the session's event log replays that line, and a
+/// continued session resends the result with the note on it, unchanged.
+#[test]
+fn the_one_call_note_is_printed_replayed_and_resent_on_resume() {
+    let (project, home) = fresh_dirs("one-call-note");
+    let mut script = Vec::new();
+    for i in 0..4 {
+        std::fs::write(project.join(format!("f{i}.txt")), "text\n").unwrap();
+        script.push((sse_tool_call("read_file", serde_json::json!({"path": format!("f{i}.txt")})), true));
+    }
+    script.extend([(sse_text("read them"), true), (sse_text("again"), true)]);
+    let (base_url, requests, _server) = spawn_scripted_server(script);
+    write_settings(&home, &base_url);
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    let note = "[openmax: the last 4 responses each made one tool call, and each resends the conversation. Send \
+                independent calls together, chain shell steps you already know in one command, and read whole files.]";
+
+    let out = cmd(&project, &home).args(["--json", "-p", "read the files"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let is_note = |line: &&str| line.contains("\"type\":\"harness_note\"") && line.contains("[openmax: the last ");
+    let printed: Vec<&str> = stdout.lines().filter(is_note).collect();
+    assert_eq!(printed.len(), 1, "{stdout}");
+    let line: serde_json::Value = serde_json::from_str(printed[0]).unwrap();
+    assert_eq!(line["text"], note);
+
+    let log = home.join(".openmax/sessions").join(format!("{}.events.jsonl", line["session_id"].as_str().unwrap()));
+    let replay = cmd(&project, &home).arg("--replay").arg(&log).arg("--json").output().unwrap();
+    let replayed = String::from_utf8_lossy(&replay.stdout).into_owned();
+    assert_eq!(replayed.lines().filter(is_note).collect::<Vec<_>>(), printed, "{replayed}");
+
+    let out = cmd(&project, &home).args(["--continue", "-p", "and again"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let resumed: serde_json::Value = serde_json::from_str(&requests[5]).unwrap();
+    let results: Vec<&str> =
+        resumed["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap()).collect();
+    assert_eq!(results.len(), 4, "{resumed}");
+    assert!(results[3].ends_with(&format!("\n{note}")), "{}", results[3]);
+    assert!(results[..3].iter().all(|r| !r.contains("[openmax: the last ")), "{results:?}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// OpenRouter caches an Anthropic model's prompt only up to a
 /// `cache_control` marker, and requests carried none, so every one paid its
 /// whole prompt at the uncached price. A run against it (the scripted

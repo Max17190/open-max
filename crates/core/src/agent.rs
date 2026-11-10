@@ -54,7 +54,7 @@ use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
     narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
-    settings_drift_note, store_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
+    settings_drift_note, store_note, ChangeWatch, RepeatTracker, SingleCallRuns, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
 };
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 pub use crate::refreeze::reload_session;
@@ -752,6 +752,7 @@ async fn run_loop(
     );
     let max_iterations = settings.max_agent_iterations.max(1);
     let mut repeats = RepeatTracker::default();
+    let mut single_calls = SingleCallRuns::new(guard.messages());
 
     'turns: for iteration in 0..max_iterations {
         // One refresh, split around the steers. The mode in force first, so
@@ -947,9 +948,10 @@ async fn run_loop(
         // when the cut lands before the first byte.
         let capped = result.hit_output_cap(max_tokens);
         if tool_calls.is_empty() {
-            // A reply with no calls ends the run of identical iterations, even
-            // when a turn_end refusal below sends the loop round again.
+            // A reply with no calls ends both runs (identical iterations, one-call
+            // responses), even when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
+            single_calls.observe(&[], &[]);
             // A steer sent while the model wrote its answer is not answered
             // yet, so this is not the end: take it now and round again for
             // the model to read it. Taken here, through its gate, so a blocked
@@ -1414,9 +1416,12 @@ async fn run_loop(
             }
         }
 
-        // Every call above executed; this only annotates the reply the model
-        // reads next when the iteration repeated the previous one exactly.
+        // Every call above executed; this only annotates the reply the model reads next (a repeated
+        // iteration, a run of one-call responses). The repeat count hashes the replies, so it goes first.
         let streak = repeats.observe(&tool_calls, guard.messages());
+        if let Some(note) = single_calls.observe(&tool_calls, guard.messages()) {
+            append_and_emit_note(core, session_id, guard.messages(), &note);
+        }
         if streak >= REPEAT_NOTE_AT {
             append_and_emit_note(core, session_id, guard.messages(), &repeated_result_note(streak));
         }
@@ -1757,7 +1762,7 @@ mod tests {
     };
     use crate::notes::{
         canonical_notice, execution_policy_note, outside_approval_note, policy_notice_hash, rehydrate_policy_notices,
-        REPEAT_NOTE_MARK,
+        single_call_note, REPEAT_NOTE_MARK, SINGLE_CALL_NOTE_MARK,
     };
     use crate::state::SessionData;
     use crate::stream::FLUSH_INTERVAL;
@@ -4753,6 +4758,10 @@ mod tests {
         }
         assert!(!tool_replies[0].contains(REPEAT_NOTE_MARK), "first call: {}", tool_replies[0]);
         assert!(!tool_replies[1].contains(REPEAT_NOTE_MARK), "first repeat: {}", tool_replies[1]);
+        // The fourth one-call response also draws the one-call note, which
+        // the repeat count does not read: the fifth pair still counts 5.
+        let both = format!("\n{}\n{}", single_call_note(4, None), repeated_result_note(4));
+        assert!(tool_replies[3].ends_with(&both), "{}", tool_replies[3]);
         for (n, reply) in tool_replies.iter().enumerate().skip(2) {
             let expected = repeated_result_note(n + 1);
             assert!(
@@ -4898,6 +4907,170 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One response carrying `calls`, each a (tool, arguments) pair; a plain answer when there are none.
+    fn calls_sse(calls: &[(&str, Value)]) -> String {
+        if calls.is_empty() {
+            return STOP_SSE.to_string();
+        }
+        let calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| {
+                serde_json::json!({"index": i, "id": format!("c{i}"), "function": {"name": name, "arguments": args.to_string()}})
+            })
+            .collect();
+        let delta = serde_json::json!({"choices": [{"delta": {"tool_calls": calls}, "finish_reason": null}]});
+        format!("data: {delta}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+    }
+
+    fn read(path: &str) -> (&'static str, Value) {
+        ("read_file", serde_json::json!({ "path": path }))
+    }
+
+    /// One turn of `responses` against a project holding `files`, in auto, to
+    /// the iteration cap: the tool replies in order, and the notes on the wire.
+    async fn one_call_run(responses: &[Vec<(&str, Value)>], files: &[(&str, &str)]) -> (Vec<String>, Vec<String>) {
+        one_call_turn(responses, files, false).await
+    }
+
+    /// `one_call_run`, with an approved blocking turn_end hook refusing every
+    /// end when `refuse_end`, so an answer with no call sends the loop round again.
+    async fn one_call_turn(responses: &[Vec<(&str, Value)>], files: &[(&str, &str)], refuse_end: bool) -> (Vec<String>, Vec<String>) {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        for (path, text) in files {
+            std::fs::write(project.join(path), text).unwrap();
+        }
+        if refuse_end {
+            std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+            let (script, toml) = (project.join("verify.sh"), project.join(".openmax/hooks/verify.toml"));
+            write_exec(&script, "#!/bin/sh\necho 'not done yet'\nexit 1\n");
+            std::fs::write(&toml, format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n", script.display())).unwrap();
+            approve_hook(&core, &project, &toml);
+        }
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let streams: Vec<String> = responses.iter().map(|calls| calls_sse(calls)).collect();
+        let (base_url, _) = scripted_endpoint(&streams.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(262_144);
+            s.approval_mode = ApprovalMode::Auto;
+            s.max_agent_iterations = responses.len();
+        }
+        start_turn(core.clone(), "sess-one-call".into(), project, "go".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "max_iterations");
+        let replies = transcript(&core, "sess-one-call").await.into_iter().filter(|m| m.role == "tool");
+        let replies = replies.map(|m| m.content.unwrap_or_default()).collect();
+        let notes = events.into_iter().filter_map(|e| match e {
+            AgentEvent::HarnessNote { text, .. } if text.starts_with(SINGLE_CALL_NOTE_MARK) => Some(text),
+            _ => None,
+        });
+        let _ = std::fs::remove_dir_all(dir);
+        (replies, notes.collect())
+    }
+
+    /// Which replies carry the one-call note, and its text on each.
+    fn one_call_notes(replies: &[String]) -> Vec<(usize, String)> {
+        let at = |r: &String| r.find(&format!("\n{SINGLE_CALL_NOTE_MARK}"));
+        replies.iter().enumerate().filter_map(|(i, r)| Some((i + 1, r[at(r)? + 1..].lines().next()?.to_string()))).collect()
+    }
+
+    /// A stretch of responses that each make one call costs a full request
+    /// per step. The calls that complete runs of 4, 12 and 28 (8 and then 16
+    /// after the note before) carry a note naming the count, on the tool
+    /// result the model reads next and on the wire; after three notes the
+    /// session hears no more of it.
+    #[tokio::test]
+    async fn one_call_responses_draw_a_note_at_4_12_and_28_and_never_a_fourth() {
+        let names: Vec<String> = (0..40).map(|i| format!("f{i}.txt")).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "text\n")).collect();
+        let responses: Vec<Vec<(&str, Value)>> = names.iter().map(|n| vec![read(n)]).collect();
+        let (replies, wire) = one_call_run(&responses, &files).await;
+        assert_eq!(replies.len(), 40, "every response ran its call");
+        let expected: Vec<(usize, String)> = [4, 12, 28].map(|n| (n, single_call_note(n, None))).to_vec();
+        assert_eq!(one_call_notes(&replies), expected, "{replies:?}");
+        assert_eq!(wire, expected.into_iter().map(|(_, note)| note).collect::<Vec<_>>());
+        assert!(single_call_note(28, None).len() < 200, "one short line");
+    }
+
+    /// A response with two calls ends the run, so the note waits for 4 one-call
+    /// responses after it; one with two calls every time never draws it, and
+    /// a run broken after a note starts over toward the next note's full run.
+    #[tokio::test]
+    async fn a_response_with_two_calls_ends_the_run() {
+        let files = [("a.txt", "a\n"), ("b.txt", "b\n")];
+        let mut responses: Vec<Vec<(&str, Value)>> = vec![vec![read("a.txt")]; 3];
+        responses.push(vec![read("a.txt"), read("b.txt")]);
+        responses.extend(vec![vec![read("b.txt")]; 4]);
+        let (replies, _) = one_call_run(&responses, &files).await;
+        assert_eq!(one_call_notes(&replies), [(9, single_call_note(4, None))], "{replies:?}");
+
+        let (replies, wire) = one_call_run(&vec![vec![read("a.txt"), read("b.txt")]; 10], &files).await;
+        assert_eq!(replies.len(), 20);
+        assert!(one_call_notes(&replies).is_empty() && wire.is_empty(), "{replies:?}");
+
+        // After a note, the next one waits for a whole run of 12, not 8 more after the break.
+        let mut responses: Vec<Vec<(&str, Value)>> = vec![vec![read("a.txt")]; 4];
+        responses.push(vec![read("a.txt"), read("b.txt")]);
+        responses.extend(vec![vec![read("b.txt")]; 12]);
+        let (replies, _) = one_call_run(&responses, &files).await;
+        assert_eq!(one_call_notes(&replies), [(4, single_call_note(4, None)), (18, single_call_note(12, None))], "{replies:?}");
+    }
+
+    /// An answer with no call ends the run too, even when a turn_end hook
+    /// refuses it and the loop goes round again: the note waits for 4 after it.
+    #[tokio::test]
+    async fn an_answer_with_no_call_ends_the_run_when_the_turn_goes_on() {
+        let files = [("a.txt", "a\n")];
+        let mut responses: Vec<Vec<(&str, Value)>> = vec![vec![read("a.txt")]; 3];
+        responses.push(vec![]);
+        responses.extend(vec![vec![read("a.txt")]; 4]);
+        let (replies, _) = one_call_turn(&responses, &files, true).await;
+        assert_eq!(replies.len(), 7, "the refused answer drew no tool reply: {replies:?}");
+        assert_eq!(one_call_notes(&replies), [(7, single_call_note(4, None))], "{replies:?}");
+    }
+
+    /// A failed call is not counted: a correction after an error is one step
+    /// by nature. The run holds across it, and the fifth response completes 4.
+    #[tokio::test]
+    async fn a_failed_call_does_not_count_toward_the_run() {
+        let files = [("a.txt", "a\n")];
+        let mut responses: Vec<Vec<(&str, Value)>> = vec![vec![read("a.txt")]; 3];
+        responses.push(vec![read("missing.txt")]);
+        responses.push(vec![read("a.txt")]);
+        let (replies, _) = one_call_run(&responses, &files).await;
+        assert!(replies[3].starts_with("Error: "), "{}", replies[3]);
+        assert_eq!(one_call_notes(&replies), [(5, single_call_note(4, None))], "{replies:?}");
+    }
+
+    /// A run of single edits to one file names the file and asks for its
+    /// remaining edits together. One edit elsewhere in the run, or a step
+    /// between the edits, is the general form.
+    #[tokio::test]
+    async fn a_run_of_edits_to_one_file_names_the_file() {
+        let edit = |path: &str, from: &str| ("edit_file", serde_json::json!({"path": path, "old_string": from, "new_string": from.to_uppercase()}));
+        let files = [("a.txt", "one two three four\n"), ("b.txt", "five\n")];
+        let responses: Vec<Vec<(&str, Value)>> = ["one", "two", "three", "four"].iter().map(|w| vec![edit("a.txt", w)]).collect();
+        let (replies, _) = one_call_run(&responses, &files).await;
+        assert_eq!(one_call_notes(&replies), [(4, single_call_note(4, Some("a.txt")))], "{replies:?}");
+        assert!(single_call_note(4, Some("a.txt")).contains("one edit to a.txt. When you know the file's remaining edits"));
+
+        for between in [edit("b.txt", "five"), ("bash", serde_json::json!({"command": "exit 1"}))] {
+            let mut responses = responses.clone();
+            responses.insert(2, vec![between]);
+            let (replies, _) = one_call_run(&responses, &files).await;
+            let at = if replies[2].starts_with("Error: ") { 5 } else { 4 };
+            assert_eq!(one_call_notes(&replies), [(at, single_call_note(4, None))], "{replies:?}");
+        }
     }
 
     /// One tool call to `brokentool`, so the loop stops for its content card.
