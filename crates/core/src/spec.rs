@@ -861,6 +861,7 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   /effort or Shift+Tab for live changes; these never change permissions.
   Explicit selections persist unless the endpoint is a launch override.
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
+  Unset, it follows the model's window, from 16 KiB to 48 KiB.
 - `compaction_tokens`: optional global ceiling for compaction. Unset uses the
   active model's ceiling or 150,000 tokens; the window budget always caps it.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including

@@ -102,11 +102,14 @@ const REPOSITORY_TREE: [&str; 17] = [
 /// bytes), priced here only once the tree above lists it. A byte cap is not a
 /// token count: text at fewer than 4.4 bytes per token (short words,
 /// punctuation, identifiers) can pass it above the target, which is why the
-/// budget ratchet in prompt.rs pins the harness's fixed part 63 bytes over its
-/// size and asks for a tokenizer count before its cap moves. The cut keeps the
-/// two instructions models break without them, and the gate holds them:
+/// budget ratchet in prompt.rs pins the harness's fixed part at its size and
+/// asks for a tokenizer count before its cap moves. The cut keeps the two
+/// instructions models break without them, and the gate holds them:
 /// write_file prefers edit_file for changes, and the closing summary does not
-/// repeat file contents.
+/// repeat file contents. It holds the batching rule too: every response
+/// resends the whole conversation, so a session that makes one small call per
+/// response pays for its context once per call, and the rule asks for calls,
+/// shell steps and file reads to share a response instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frozen_prefix_is_under_700_tokens() {
     frozen_prefix_case("frozen_prefix_is_under_700_tokens", false).await;
@@ -227,6 +230,10 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
     assert!(
         system.contains("without repeating file contents"),
         "the closing summary must not echo files back:\n{system}"
+    );
+    assert!(
+        system.contains("Batch tool calls per response; chain shell commands; read whole files."),
+        "the rules must ask for batched calls, not one small call per response:\n{system}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
