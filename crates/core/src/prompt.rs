@@ -232,12 +232,13 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
         "You are Open Max, a coding agent working on the project at {root}.\n\
         \n\
         Rules:\n\
-        - Tool paths are project-relative.\n\
+        - Paths are project-relative.\n\
         - Read code before changing it; never guess paths or contents.\n\
-        - Make small changes in the existing style; verify by build, test, or re-read.\n\
+        - Batch tool calls per response; chain shell commands; read whole files.\n\
+        - Keep the diff minimal, in the existing style; verify by build or test.\n\
         - On a tool error, fix the call; never repeat it.\n\
         - Call tools via the API, never as JSON or XML text.\n\
-        - When done, stop calling tools; briefly summarize changes and verification without repeating file contents."
+        - When done, stop calling tools; summarize briefly without repeating file contents."
     );
     breakdown.components.push(("base rules".into(), prompt.len()));
     {
@@ -1303,10 +1304,12 @@ mod tests {
     }
 
     /// The path-free base rules, extension pointer, and builtin schemas must
-    /// fit in 2,662 bytes, 63 over the 2,599 bytes (589 o200k tokens) they
-    /// measured when the cap came down from 3,450; before that cut they
-    /// measured 3,362 bytes (762 tokens). It is a ratchet: a cut lowers it,
-    /// and growth needs the argument for why every request pays for it.
+    /// fit in 2,597 bytes (592 o200k tokens), what they measured when the
+    /// rules began asking for batched tool calls. Before that the cap was
+    /// 2,662, 63 over the 2,599 bytes (589 tokens) they measured when the cap
+    /// came down from 3,450; before that cut they measured 3,362 bytes (762
+    /// tokens). It is a ratchet: a cut lowers it, and growth needs the
+    /// argument for why every request pays for it.
     /// Grounding sections have separate caps. Measure the payload with
     /// dump_frozen_prompt_payload_for_tokenizer and a real tokenizer before
     /// changing this budget; provider framing is not included.
@@ -1335,7 +1338,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_662;
+        const CAP: usize = 2_597;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
