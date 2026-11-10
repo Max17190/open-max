@@ -521,12 +521,13 @@ pub(crate) fn repeated_result_note(n: usize) -> String {
 /// Consecutive responses in a turn that each made one tool call, each a full request since every
 /// request resends the conversation. The calls that complete runs of 4, 12 and 28 carry a note, at
 /// most three per transcript (counted from the notes it holds, so one compaction dropped is not).
-/// No call or several ends a run; a failed or timed-out call (a correction) is not counted.
+/// No call or several ends a run; a call the loop did not mark `ok` (a correction) is not counted.
 #[derive(Default)]
 pub(crate) struct SingleCallRuns {
     run: usize,
     notes: usize,
     edited: Option<String>,
+    pub(crate) ok: bool,
 }
 
 /// The note's opening, so tests, readers and the count can find it.
@@ -539,15 +540,14 @@ impl SingleCallRuns {
         Self { notes: notes.flat_map(str::lines).filter(|l| l.starts_with(SINGLE_CALL_NOTE_MARK)).count(), ..Self::default() }
     }
 
-    /// Records one response's calls and the replies they drew; the note when it completes a run that earns one.
-    pub(crate) fn observe(&mut self, calls: &[ToolCall], messages: &[ChatMessage]) -> Option<String> {
+    /// Records one response's calls, after the loop ran them; the note when it completes a run that earns one.
+    pub(crate) fn observe(&mut self, calls: &[ToolCall]) -> Option<String> {
         let [call] = calls else { *self = Self { notes: self.notes, ..Self::default() }; return None };
         let args = serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
         let path = args.as_ref().and_then(|a| a.get("path")?.as_str()).filter(|_| call.function.name == "edit_file");
         // The edit form names a file only while every step since the run began edited it, a failed one included.
         self.edited = if self.run == 0 { path.map(str::to_string) } else { self.edited.take().filter(|e| Some(e.as_str()) == path) };
-        let reply = messages.iter().rev().find(|m| m.role == "tool").and_then(|m| m.content.as_deref());
-        if reply.is_none_or(|r| r.starts_with("Error: ") || r.starts_with(crate::agent::APPROVAL_TIMEOUT_MESSAGE)) { return None; }
+        if !std::mem::take(&mut self.ok) { return None; }
         self.run += 1;
         if self.run < *[4, 12, 28].get(self.notes)? { return None; }
         self.notes += 1;
@@ -555,9 +555,9 @@ impl SingleCallRuns {
     }
 }
 
-/// The note for a run of `n` one-call responses, naming `edited` when every response since it began edited that file.
+/// The note for a run of `n` one-call responses, naming `edited` when each edited it and it fits (64 bytes: a note under 200).
 pub(crate) fn single_call_note(n: usize, edited: Option<&str>) -> String {
-    let ask = match edited {
+    let ask = match edited.filter(|path| path.len() <= 64) {
         Some(path) => format!("one edit to {path}. When you know the file's remaining edits, send them together in one response"),
         None => "one tool call, and each resends the conversation. Send independent calls together, chain shell steps you \
                  already know in one command, and read whole files".into(),
@@ -820,20 +820,31 @@ mod tests {
         }
     }
 
-    /// A call whose approval timed out ran nothing, so it counts toward a run
-    /// of one-call responses no more than a failed one: the run holds across
-    /// it. A reply that only mentions the note's text later in a line is not
-    /// counted as a note the transcript holds.
+    /// A call the loop did not mark `ok` (failed, declined, or its approval
+    /// timed out) counts toward a run of one-call responses no more than a
+    /// correction does: the run holds across it. A reply that only mentions
+    /// the note's text later in a line is not counted as a note the
+    /// transcript holds.
     #[test]
-    fn a_timed_out_approval_does_not_count_toward_a_one_call_run() {
-        let reply = |text: &str| vec![ChatMessage::tool("c1", text)];
-        let mut runs = SingleCallRuns::new(&reply(&format!("x {SINGLE_CALL_NOTE_MARK}2 responses")));
-        let timed_out = reply(crate::agent::APPROVAL_TIMEOUT_MESSAGE);
-        let seen: Vec<Option<String>> = [reply("ok"), reply("ok"), reply("ok"), timed_out, reply("ok")]
-            .iter()
-            .map(|messages| runs.observe(&[call()], messages))
+    fn a_call_not_marked_ok_does_not_count_toward_a_one_call_run() {
+        let mut runs = SingleCallRuns::new(&[ChatMessage::tool("c1", format!("x {SINGLE_CALL_NOTE_MARK}2 responses"))]);
+        let seen: Vec<Option<String>> = [true, true, true, false, true]
+            .into_iter()
+            .map(|ok| {
+                runs.ok = ok;
+                runs.observe(&[call()])
+            })
             .collect();
         assert_eq!(seen, [None, None, None, None, Some(single_call_note(4, None))]);
+    }
+
+    /// The edit form names its file only while the note stays under 200
+    /// bytes; a longer path gets the general form.
+    #[test]
+    fn a_long_edited_path_gets_the_general_form() {
+        let (short, long) = ("p".repeat(64), "p".repeat(65));
+        assert!(single_call_note(28, Some(&short)).contains(&short) && single_call_note(28, Some(&short)).len() < 200);
+        assert_eq!(single_call_note(28, Some(&long)), single_call_note(28, None));
     }
 
     /// A note is stored once, where it changes: at the end of the newest

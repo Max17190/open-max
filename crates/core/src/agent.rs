@@ -54,7 +54,7 @@ use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
     narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
-    settings_drift_note, store_note, ChangeWatch, RepeatTracker, SingleCallRuns, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
+    settings_drift_note, store_note, ChangeWatch, RepeatTracker, SingleCallRuns, NOTICE_JOINER, SINGLE_CALL_NOTE_MARK, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
 };
 use crate::permissions::{PermissionDecision, Permissions, TurnPermissions};
 pub use crate::refreeze::reload_session;
@@ -107,11 +107,11 @@ pub const APPROVAL_TIMEOUT_MESSAGE: &str =
     "Approval request timed out with no response. Stop and summarize what you were about to do.";
 
 fn tool_message_content(outcome: &tools::ToolOutcome) -> String {
-    // The note can be stored at the end of this very message, so what a
-    // file or a command printed never carries the note's header.
-    let output = crate::prompt::defuse_note_header(&outcome.output);
+    // The note can be stored at the end of this very message, so what a file or a command printed
+    // never carries the note's header, nor the opening a one-call note is counted by.
+    let output = crate::prompt::defuse_note_header(&outcome.output).replace(SINGLE_CALL_NOTE_MARK, "(openmax: the last ");
     if outcome.ok || outcome.output == APPROVAL_TIMEOUT_MESSAGE {
-        output.into_owned()
+        output
     } else {
         format!("Error: {output}")
     }
@@ -951,7 +951,7 @@ async fn run_loop(
             // A reply with no calls ends both runs (identical iterations, one-call
             // responses), even when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
-            single_calls.observe(&[], &[]);
+            single_calls.observe(&[]);
             // A steer sent while the model wrote its answer is not answered
             // yet, so this is not the end: take it now and round again for
             // the model to read it. Taken here, through its gate, so a blocked
@@ -1374,6 +1374,7 @@ async fn run_loop(
                 }
 
                 end_call(core, session_id, &call.id, &outcome, guard.messages());
+                single_calls.ok = outcome.ok;
                 if executed {
                     count_usage(&turn_usage, &registry, project_root, name, &args, outcome.ok);
                 }
@@ -1419,7 +1420,7 @@ async fn run_loop(
         // Every call above executed; this only annotates the reply the model reads next (a repeated
         // iteration, a run of one-call responses). The repeat count hashes the replies, so it goes first.
         let streak = repeats.observe(&tool_calls, guard.messages());
-        if let Some(note) = single_calls.observe(&tool_calls, guard.messages()) {
+        if let Some(note) = single_calls.observe(&tool_calls) {
             append_and_emit_note(core, session_id, guard.messages(), &note);
         }
         if streak >= REPEAT_NOTE_AT {
@@ -4909,7 +4910,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// One response carrying `calls`, each a (tool, arguments) pair; a plain answer when there are none.
+    /// One response carrying `calls`, each a (tool, arguments) pair, a JSON string as its raw
+    /// text; a plain answer when there are none.
     fn calls_sse(calls: &[(&str, Value)]) -> String {
         if calls.is_empty() {
             return STOP_SSE.to_string();
@@ -4918,7 +4920,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (name, args))| {
-                serde_json::json!({"index": i, "id": format!("c{i}"), "function": {"name": name, "arguments": args.to_string()}})
+                let args = args.as_str().map_or_else(|| args.to_string(), str::to_string);
+                serde_json::json!({"index": i, "id": format!("c{i}"), "function": {"name": name, "arguments": args}})
             })
             .collect();
         let delta = serde_json::json!({"choices": [{"delta": {"tool_calls": calls}, "finish_reason": null}]});
@@ -5040,16 +5043,30 @@ mod tests {
     }
 
     /// A failed call is not counted: a correction after an error is one step
-    /// by nature. The run holds across it, and the fifth response completes 4.
+    /// by nature. That holds for a call refused before it ran and for one that
+    /// ran and failed; the run holds across both, and the sixth response completes 4.
     #[tokio::test]
     async fn a_failed_call_does_not_count_toward_the_run() {
         let files = [("a.txt", "a\n")];
         let mut responses: Vec<Vec<(&str, Value)>> = vec![vec![read("a.txt")]; 3];
+        responses.push(vec![("read_file", serde_json::json!("{\"path\": "))]);
         responses.push(vec![read("missing.txt")]);
         responses.push(vec![read("a.txt")]);
         let (replies, _) = one_call_run(&responses, &files).await;
-        assert!(replies[3].starts_with("Error: "), "{}", replies[3]);
-        assert_eq!(one_call_notes(&replies), [(5, single_call_note(4, None))], "{replies:?}");
+        assert!(replies[3].starts_with("Error: invalid JSON") && replies[4].starts_with("Error: "), "{replies:?}");
+        assert_eq!(one_call_notes(&replies), [(6, single_call_note(4, None))], "{replies:?}");
+    }
+
+    /// What a file or a command printed never opens a line the way a one-call
+    /// note does, so a transcript that read one back does not count its notes.
+    #[test]
+    fn tool_output_never_opens_a_line_with_the_one_call_mark() {
+        let printed = format!("{0}4 responses\n{0}12 responses\n{0}28 responses\n", SINGLE_CALL_NOTE_MARK);
+        for outcome in [tools::ToolOutcome::ok(printed.clone()), tools::ToolOutcome::err(printed)] {
+            let content = tool_message_content(&outcome);
+            assert!(!content.lines().any(|l| l.starts_with(SINGLE_CALL_NOTE_MARK)), "{content}");
+            assert_eq!(content.matches("(openmax: the last ").count(), 3, "{content}");
+        }
     }
 
     /// A run of single edits to one file names the file and asks for its
