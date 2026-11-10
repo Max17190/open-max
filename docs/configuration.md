@@ -188,8 +188,14 @@ and the run that writes a key already uses it.
   never sent again. A return to Default, which no such change can name,
   sends the field as before. See the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
   and [compatibility documentation](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk).
-- `max_output_bytes` (default 16384, floor 1000): per tool-result cap; a
-  result that fits is sent whole. One over it spills up to 16 MiB of each
+- `max_output_bytes` (default 16384 with no known window, floor 1000): per
+  tool-result cap. Unset, it follows the model's window: three eighths of a
+  byte per token of `context_tokens`, between 16384 and 49152, so 16384 up
+  to a window of about 43,700 tokens and 49152 from 131,072 tokens up. A
+  value set here is the cap at any window, past 49152 too. `read_file`
+  returns up to this cap held between 24,000 and 49152 bytes, and ends a
+  read it cuts with the offset to continue from. A result that fits the
+  cap is sent whole. One over it spills up to 16 MiB of each
   stream to a log in `~/.openmax/cmd-logs` that the result names, and is
   sent as a preview a quarter of the cap's size when the log holds all the
   output. An incomplete or missing log keeps the full cap. Bash keeps up to

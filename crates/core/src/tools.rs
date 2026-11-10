@@ -40,7 +40,12 @@ const MAX_RESULTS: usize = 200;
 /// re-prefilled on every subsequent turn. 50 is plenty to act on.
 const MAX_GREP_RESULTS: usize = 50;
 /// Every later request re-sends a result; past this the spill log keeps the rest.
+/// The cap when the model's window is unknown, and the least it follows one
+/// down to: a 16k-token window cannot afford more per result.
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+/// The most a command result holds however large the window: three eighths
+/// of a byte per window token reaches it at 128Ki tokens.
+const MAX_WINDOW_OUTPUT_BYTES: usize = 48 * 1024;
 /// A command result over the cap uses this fraction of the cap when its
 /// complete output is available in the spill log. Later model requests
 /// resend the preview, and the full cap remains available when the log
@@ -57,8 +62,8 @@ const MAX_READ_BYTES: usize = 24_000;
 const MAX_DIR_ENTRIES: usize = 200;
 
 /// Output limits threaded into command-running tools (bash and external
-/// tools). Settings can widen or tighten the command cap; everything else
-/// keeps the tuned constants above.
+/// tools) and read_file. Settings can widen or tighten the command cap;
+/// everything else keeps the tuned constants above.
 #[derive(Clone, Copy)]
 pub struct OutputCaps {
     pub command_bytes: usize,
@@ -71,8 +76,33 @@ impl Default for OutputCaps {
 }
 
 impl OutputCaps {
-    pub fn from_settings(settings: &crate::config::Settings) -> Self {
-        Self { command_bytes: settings.max_output_bytes.unwrap_or(MAX_OUTPUT_BYTES).max(1_000) }
+    /// The caps for a session on a model whose context window is
+    /// `window_tokens`, when it is known. An explicit `max_output_bytes`
+    /// wins, held to its floor. Unset, the command cap follows the window:
+    /// one fixed cap sized for the smallest window cut a whole-file or
+    /// multi-file read to a quarter-cap preview on a model with many times
+    /// the room, and the model then read in narrow line windows for the
+    /// rest of the session, one round each, every round re-sending the
+    /// whole conversation. Three eighths of a byte per window token is
+    /// about a tenth of the window at four bytes a token.
+    pub fn from_settings(settings: &crate::config::Settings, window_tokens: Option<usize>) -> Self {
+        let command_bytes = match (settings.max_output_bytes, window_tokens) {
+            (Some(bytes), _) => bytes.max(1_000),
+            (None, Some(tokens)) => (tokens.saturating_mul(3) / 8).clamp(MAX_OUTPUT_BYTES, MAX_WINDOW_OUTPUT_BYTES),
+            (None, None) => MAX_OUTPUT_BYTES,
+        };
+        Self { command_bytes }
+    }
+
+    /// The bytes one read_file call may return: the command cap, held
+    /// between `MAX_READ_BYTES` and the large-window ceiling. A read ends on
+    /// a whole line with the offset to continue from and has no log behind
+    /// it, so it never shrinks below the size reads have always had; on a
+    /// large window it takes the same room a `cat` of the file would, and a
+    /// `max_output_bytes` set past the ceiling for long logs does not let
+    /// one read pull a whole large file into the context.
+    pub(crate) fn read_bytes(self) -> usize {
+        self.command_bytes.clamp(MAX_READ_BYTES, MAX_WINDOW_OUTPUT_BYTES)
     }
 }
 const MAX_LINE_CHARS: usize = 500;
@@ -430,7 +460,7 @@ pub(crate) async fn execute_in_session(
     let task_cancel = cancel.clone();
     let task = tokio::task::spawn_blocking(move || match name.as_str() {
             "list_dir" => list_dir(&root, &args),
-            "read_file" => read_file(&root, &args, &task_cancel),
+            "read_file" => read_file(&root, &args, caps.read_bytes(), &task_cancel),
             "write_file" => write_file(&root, &args),
             "edit_file" => edit_file(&root, &args),
             "glob" => glob_tool(&root, &args),
@@ -498,7 +528,7 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome::ok(output)
 }
 
-fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
+fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) -> ToolOutcome {
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
@@ -512,6 +542,7 @@ fn read_file(root: &Path, args: &Value, cancel: &CancelToken) -> ToolOutcome {
     let mut window = ReadWindow {
         offset: offset.unwrap_or(1).max(1) as usize,
         limit: limit.unwrap_or(MAX_READ_LINES as u64).min(MAX_READ_LINES as u64) as usize,
+        max_bytes,
         out: String::new(),
         cut_at: None,
     };
@@ -979,8 +1010,10 @@ struct ReadWindow {
     offset: usize,
     /// Most lines to show.
     limit: usize,
+    /// Most bytes to show (`OutputCaps::read_bytes`).
+    max_bytes: usize,
     out: String,
-    /// The first line that did not fit under `MAX_READ_BYTES`, if one did not.
+    /// The first line that did not fit under `max_bytes`, if one did not.
     cut_at: Option<usize>,
 }
 
@@ -995,7 +1028,7 @@ impl ReadWindow {
     /// cap is reached and the read should stop.
     fn push(&mut self, n: usize, line: &str, len: usize) -> bool {
         let formatted = numbered_line(n, line, len);
-        if self.out.len() + formatted.len() > MAX_READ_BYTES {
+        if self.out.len() + formatted.len() > self.max_bytes {
             self.cut_at = Some(n);
             return false;
         }
@@ -1005,7 +1038,7 @@ impl ReadWindow {
 
     /// The result for a file of `total` lines.
     fn finish(self, rel: &str, total: usize) -> ToolOutcome {
-        let Self { offset, limit, mut out, cut_at } = self;
+        let Self { offset, limit, mut out, cut_at, .. } = self;
         // An offset past the end must not read like an empty file: the model
         // would conclude the content is gone rather than that its offset is
         // stale.
@@ -2759,7 +2792,7 @@ mod tests {
 
     /// read_file in a call nothing cancels.
     fn read_file(root: &Path, args: &Value) -> ToolOutcome {
-        super::read_file(root, args, &CancelToken::default())
+        super::read_file(root, args, OutputCaps::default().read_bytes(), &CancelToken::default())
     }
 
     /// A bash call in a session of its own, which no result has yet told
@@ -4280,7 +4313,7 @@ mod tests {
         std::fs::write(root.join("big.log"), line.repeat(MAX_FILE_BYTES as usize / line.len() + 1)).unwrap();
         let cancel = CancelToken::default();
         cancel.cancel();
-        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), &cancel);
+        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), MAX_READ_BYTES, &cancel);
         assert_eq!((out.ok, out.output.as_str()), (false, "tool cancelled by user"));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4620,20 +4653,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// docs/configuration.md with each run of whitespace read as one space,
+    /// so a sentence the test looks for may wrap anywhere.
+    fn configuration_doc() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/configuration.md");
+        std::fs::read_to_string(path).unwrap().split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The command cap for a `max_output_bytes` setting and a window.
+    fn cap_for(max_output_bytes: Option<usize>, window: Option<usize>) -> usize {
+        OutputCaps::from_settings(&crate::config::Settings { max_output_bytes, ..Default::default() }, window).command_bytes
+    }
+
     /// `max_output_bytes` sets the cap a command's result is held to, and
     /// docs/configuration.md gives its default and its floor: unset, the cap
-    /// is that default, and a setting under the floor is held to it.
+    /// is that default, and a setting under the floor is held to it, with or
+    /// without a known window.
     #[test]
     fn the_output_cap_follows_its_setting_down_to_the_documented_floor() {
-        let cap = |max_output_bytes| {
-            OutputCaps::from_settings(&crate::config::Settings { max_output_bytes, ..Default::default() }).command_bytes
-        };
-        let (default, floor) = (cap(None), cap(Some(0)));
-        let docs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/configuration.md")).unwrap();
-        let documented = format!("`max_output_bytes` (default {default}, floor {floor})");
+        let (default, floor) = (cap_for(None, None), cap_for(Some(0), None));
+        let documented = format!("`max_output_bytes` (default {default} with no known window, floor {floor})");
+        let docs = configuration_doc();
         assert!(docs.contains(&documented), "docs/configuration.md does not say {documented}");
-        assert_eq!(cap(Some(floor + 1)), floor + 1, "a setting over the floor is the cap");
-        assert_eq!(cap(Some(floor - 1)), floor, "a setting under the floor is held to it");
+        for window in [None, Some(16_384), Some(1_000_000)] {
+            assert_eq!(cap_for(Some(floor + 1), window), floor + 1, "a setting over the floor is the cap");
+            assert_eq!(cap_for(Some(floor - 1), window), floor, "a setting under the floor is held to it");
+        }
+    }
+
+    /// Unset, the cap follows the window: three eighths of a byte per window
+    /// token, never under the cap with no window nor over the large-window
+    /// ceiling, and docs/configuration.md states both bounds and the slope.
+    /// Each regime is checked against that formula: a window too small to
+    /// lift the cap off its floor, one between the bounds, and two at the
+    /// ceiling.
+    #[test]
+    fn the_output_cap_follows_the_window_between_its_bounds() {
+        let (floor, ceiling) = (cap_for(None, None), cap_for(None, Some(usize::MAX)));
+        let formula = |tokens: usize| (tokens * 3 / 8).clamp(floor, ceiling);
+        assert!(floor < ceiling, "{floor} {ceiling}");
+        for (window, regime) in [(32_768, "floor"), (65_536, "between"), (131_072, "ceiling"), (1_000_000, "ceiling")] {
+            let cap = cap_for(None, Some(window));
+            assert_eq!(cap, formula(window), "a {window}-token window");
+            let expected = match regime {
+                "floor" => floor,
+                "ceiling" => ceiling,
+                _ => window * 3 / 8,
+            };
+            assert_eq!(cap, expected, "a {window}-token window sits at the {regime}");
+        }
+        assert!(floor < cap_for(None, Some(65_536)) && cap_for(None, Some(65_536)) < ceiling);
+        let docs = configuration_doc();
+        let documented = format!("three eighths of a byte per token of `context_tokens`, between {floor} and {ceiling}");
+        assert!(docs.contains(&documented), "docs/configuration.md does not say {documented}");
+    }
+
+    /// A 20 KB result of one stream is sent whole to a model whose window
+    /// lifts the cap above it, and as a quarter-cap preview of its log to one
+    /// whose window keeps the cap below it. Over the cap, the preview keeps
+    /// its fraction of whichever cap applies.
+    #[tokio::test]
+    async fn a_result_is_whole_on_a_large_window_and_previewed_on_a_small_one() {
+        let root = temp_project();
+        let data = root.join("data");
+        let size = 20_000;
+        let caps = |window| OutputCaps::from_settings(&crate::config::Settings::default(), Some(window));
+        let (small, large) = (caps(32_768), caps(131_072));
+        assert!(small.command_bytes < size && size <= large.command_bytes, "{} {}", small.command_bytes, large.command_bytes);
+        let fill = json!({"command": format!("head -c {size} /dev/zero | tr '\\0' a")});
+        let whole = bash_tool(&data, &root, &fill, large, Arc::new(CancelToken::default())).await;
+        assert_eq!((whole.ok, whole.output.len(), whole.process_truncated), (true, size, false));
+        let cut = bash_tool(&data, &root, &fill, small, Arc::new(CancelToken::default())).await;
+        let (notice, body) = cut.output.split_once('\n').unwrap();
+        assert!(cut.process_truncated && notice.contains("bounded output log saved to "), "{notice}");
+        assert!(body.len() <= small.command_bytes / PREVIEW_DIVISOR, "a {}-byte preview", body.len());
+        // A flood past the large cap is previewed at that cap's fraction,
+        // which is more than the small cap's whole preview.
+        let flood = json!({"command": format!("head -c {} /dev/zero | tr '\\0' a", large.command_bytes * 2)});
+        let out = bash_tool(&data, &root, &flood, large, Arc::new(CancelToken::default())).await;
+        let body = out.output.split_once('\n').unwrap().1;
+        assert!(out.process_truncated, "{}", out.output.len());
+        assert!(body.len() <= large.command_bytes / PREVIEW_DIVISOR, "a {}-byte preview", body.len());
+        assert!(body.len() > small.command_bytes / PREVIEW_DIVISOR, "a {}-byte preview", body.len());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// read_file shares the command budget, held between its own and the
+    /// large-window ceiling: a file that `cat` would show whole on a large
+    /// window is read whole in one call there, and needs a continuation
+    /// where the cap has no window to follow.
+    #[tokio::test]
+    async fn read_file_takes_the_command_cap_when_it_is_larger() {
+        let root = temp_project();
+        let large = OutputCaps::from_settings(&crate::config::Settings::default(), Some(131_072));
+        assert_eq!(OutputCaps::default().read_bytes(), MAX_READ_BYTES);
+        assert_eq!(large.read_bytes(), large.command_bytes);
+        // An explicit cap moves reads only within those same bounds.
+        let set = |bytes| OutputCaps::from_settings(&crate::config::Settings { max_output_bytes: Some(bytes), ..Default::default() }, None);
+        assert_eq!(set(1_000).read_bytes(), MAX_READ_BYTES);
+        assert_eq!(set(usize::MAX).read_bytes(), large.command_bytes);
+        let line = format!("{}\n", "r".repeat(59));
+        let rows = (MAX_READ_BYTES + large.command_bytes) / 2 / (line.len() + 5);
+        assert!(rows < MAX_READ_LINES, "{rows}");
+        std::fs::write(root.join("docs/mid.txt"), line.repeat(rows)).unwrap();
+        let (args, data) = (json!({"path": "docs/mid.txt"}), root.join("data"));
+        let read = |caps| execute("read_file", &args, &data, &root, caps, Arc::new(CancelToken::default()));
+        let whole = read(large).await;
+        assert!(whole.ok && whole.output.len() > MAX_READ_BYTES, "{}", whole.output.len());
+        assert_eq!(whole.output.lines().count(), rows, "every line and no continuation");
+        let cut = read(OutputCaps::default()).await;
+        assert!(cut.output.len() <= MAX_READ_BYTES + 200, "{}", cut.output.len());
+        assert!(cut.output.contains("output limit reached at line"), "{}", cut.output.lines().last().unwrap_or_default());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A cancelled command's output is not spent back into the context, but
