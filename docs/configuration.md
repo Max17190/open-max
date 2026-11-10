@@ -140,9 +140,14 @@ and the run that writes a key already uses it.
   run; the model is told why and to send large content in parts.
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
-  model's value in `providers.json`, then the shared default of 150,000
-  tokens. To keep more history on a large-window model, raise the cap in
-  that model's entry and leave the global setting unset.
+  model's value in `providers.json`, then a default that follows the
+  model's context window: 150,000 tokens, or a quarter of the window when
+  that is larger (262,144 for a 1,048,576-token window). Fewer prunes on a
+  large window mean fewer re-reads of shortened tool results and fewer
+  requests that re-send the whole context uncached; the price is a larger
+  context on every request while no prune fires. To keep more or less
+  history on a model, set the cap in that model's entry and leave the
+  global setting unset.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's
@@ -234,8 +239,9 @@ differently. A normal turn request that fails or returns no usable prompt
 count discards a lower calibration.
 
 The input budget always bounds the trigger. With the defaults before
-calibration, a 128,000-token window triggers at 122,880 tokens and a
-500,000-token window triggers at 150,000 tokens. If the frozen schemas or the
+calibration, a 128,000-token window triggers at 122,880 tokens, a
+500,000-token window triggers at 150,000 tokens, and a 1,048,576-token
+window triggers at 262,144 tokens. If the frozen schemas or the
 messages a prune must keep make the target unreachable, automatic compaction
 falls back to the input budget. The `/compact` command aims for 70% of the
 calibrated trigger and uses the input budget if the frozen schemas alone
@@ -348,7 +354,8 @@ requests.
 ```
 
 Add `"compaction_tokens": 220000` to a model object to set that model's
-compaction cap. See [context window and compaction](#context-window-and-compaction).
+compaction cap. Without one, the cap follows that model's `context_tokens`:
+150,000 tokens, or a quarter of the window when larger. See [context window and compaction](#context-window-and-compaction).
 
 Set `"provider"` in settings, use the provider CLI option, or use `/provider <name>`
 when you only want to change the endpoint. Bare `/provider` opens the searchable
