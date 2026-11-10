@@ -6971,6 +6971,11 @@ mod tests {
             Some((1, 1)),
             "file text shown under the summary cannot shadow its counts"
         );
+        assert_eq!(
+            parse_change_counts("wrote notes\\nold.txt (+1 −0)"),
+            Some((1, 0)),
+            "a line break in a path is written escaped, so the summary stays one line"
+        );
     }
 
     #[test]

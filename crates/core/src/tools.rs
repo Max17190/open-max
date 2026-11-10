@@ -1141,9 +1141,13 @@ const DIFF_BUDGET: Duration = Duration::from_millis(200);
 /// estimate for the size of its edit. The caveat follows the "(+N −M)"
 /// group rather than going inside it: session replay reads the counts back
 /// from that exact group, and a replayed edit card would lose its badge.
+/// Replay reads it from the first line, since an edit's numbered lines
+/// follow, so a line break in the path is written as `\n` (or `\r`), the
+/// way the model spells one in its arguments, to keep the summary one line.
 fn changed_file(verb: &str, root: &Path, path: &Path, old: &str, new: &str) -> ToolOutcome {
     let (diff, complete) = diff_strings(&rel_display(root, path), old, new);
-    let mut summary = format!("{verb} {} (+{} −{})", diff.path, diff.added, diff.removed);
+    let shown = diff.path.replace('\n', "\\n").replace('\r', "\\r");
+    let mut summary = format!("{verb} {shown} (+{} −{})", diff.added, diff.removed);
     if !complete {
         summary.push_str(" · counts are an upper bound");
     }
@@ -4677,6 +4681,18 @@ mod tests {
         assert_eq!(out.output, "edited c.txt (+1 −2)", "a single match under replace_all is still counts alone");
         let out = write_file(&root, &json!({"path": "c.txt", "content": "w\n"}));
         assert_eq!(out.output, "wrote c.txt (+1 −1)");
+    }
+
+    /// A file name may hold a line break, and the summary line, which
+    /// replay reads the counts from, must stay one line above the rows.
+    #[test]
+    fn a_line_break_in_a_path_keeps_the_summary_on_one_line() {
+        let root = temp_project();
+        let out = write_file(&root, &json!({"path": "notes\nold.txt", "content": "one\n"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output, "wrote notes\\nold.txt (+1 −0)");
+        let out = edit_file(&root, &json!({"path": "notes\nold.txt", "old_string": "one", "new_string": "two"}));
+        assert_eq!(out.output, "edited notes\\nold.txt (+1 −1)\n1 two");
     }
 
     /// A CRLF file's rows carry no carriage return, as read_file's do, and
