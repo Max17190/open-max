@@ -1439,7 +1439,63 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     if let Err(e) = write_regular(&path, rel, new.as_bytes()) {
         return ToolOutcome::err(e);
     }
-    changed_file("edited", root, &path, &old, &new)
+    let mut outcome = changed_file("edited", root, &path, &old, &new);
+    // A replace_all edit can land anywhere in the file, many times over, so
+    // it keeps the counts alone. A single replacement starts where its
+    // old_string started, since the text before it is unchanged.
+    if !replace_all {
+        if let Some(at) = old.find(&old_string) {
+            outcome.output.push_str(&edited_region(&new, at, new_string.len()));
+        }
+    }
+    outcome
+}
+
+/// Most lines, context included, an edit result shows of the file.
+const EDITED_REGION_LINES: usize = 30;
+/// Most bytes of numbered lines an edit result shows of the file.
+const EDITED_REGION_BYTES: usize = 2_048;
+
+/// What the file holds around a single replacement of `len` bytes written
+/// at byte `at` of `new`: the lines the replacement touched (for a deletion,
+/// the line where the two sides now meet) and one line of context each side,
+/// one per line under the summary, numbered as read_file numbers them so a
+/// number can be its `offset`. Without them the model has only the
+/// "(+N −M)" counts, so it spends its next call re-reading the file to see
+/// where the text landed and which line numbers a following edit starts
+/// from. This text stays in the transcript like any tool result, so it is
+/// bounded: at most `EDITED_REGION_LINES` lines and `EDITED_REGION_BYTES`
+/// bytes, then a line under 100 bytes naming the offset that continues it,
+/// read_file's own continuation form. That is under 2.2 KB per edit, and
+/// under 130 KB for 60 edits, until compaction shortens old results as it
+/// does any other. Most edits write a few lines and cost far less. Empty
+/// when the file is left empty.
+fn edited_region(new: &str, at: usize, len: usize) -> String {
+    let total = new.lines().count();
+    if total == 0 {
+        return String::new();
+    }
+    let line_of = |byte: usize| new.as_bytes()[..byte].iter().filter(|&&b| b == b'\n').count() + 1;
+    // An edit at the very end of a file that ends in a newline starts on a
+    // line that does not exist; its last line is the one it reaches.
+    let first = line_of(at).min(total);
+    let last = if len == 0 { first } else { line_of(at + len - 1).clamp(first, total) };
+    let start = first.saturating_sub(1).max(1);
+    let end = (last + 1).min(total);
+    let mut out = String::new();
+    for (i, line) in new.lines().enumerate().skip(start - 1).take(end + 1 - start) {
+        let n = i + 1;
+        let row = numbered_line(n, line, line.len());
+        if n - start == EDITED_REGION_LINES || out.len() + 1 + row.len() > EDITED_REGION_BYTES {
+            out.push_str(&format!(
+                "… {} more lines of this region (file has {total} lines; continue with offset={n})\n",
+                end + 1 - n
+            ));
+            break;
+        }
+        out.push_str(&row);
+    }
+    format!("\n{}", out.trim_end_matches('\n'))
 }
 
 /// The walk glob and grep share, from `walk_root` in the project whose
@@ -4557,6 +4613,141 @@ mod tests {
             let score = line_similarity(line, needle);
             assert!(ceiling >= score, "{line:?} vs {needle:?}: ceiling {ceiling} under score {score}");
         }
+    }
+
+    /// The region rows below an edit's summary, one per line.
+    fn region_rows(output: &str) -> Vec<&str> {
+        output.lines().skip(1).collect()
+    }
+
+    /// A multi-line edit shows the lines it wrote with one line of context
+    /// each side, and each row is the row read_file prints for that line, so
+    /// its number works as read_file's offset and the model need not re-read
+    /// the file to see where the text landed.
+    #[test]
+    fn an_edit_result_shows_the_lines_it_wrote_as_read_file_numbers_them() {
+        let root = temp_project();
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "a.txt", "old_string": "three", "new_string": "THREE\n3b"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output, "edited a.txt (+2 −1)\n2 two\n3 THREE\n4 3b\n5 four");
+        let read = read_file(&root, &json!({"path": "a.txt", "offset": 2, "limit": 4}));
+        assert_eq!(read.output.lines().take(4).collect::<Vec<_>>(), region_rows(&out.output));
+
+        // A replacement that ends in a newline wrote no part of the line after it.
+        let out = edit_file(&root, &json!({"path": "a.txt", "old_string": "two\n", "new_string": "2a\n2b\n"}));
+        assert_eq!(region_rows(&out.output), ["1 one", "2 2a", "3 2b", "4 THREE"]);
+    }
+
+    /// The region text stays in the transcript, so it is bounded: 30 lines,
+    /// context included, and 2,048 bytes of rows, then read_file's
+    /// continuation line, whose offset reads on from the first line left out.
+    #[test]
+    fn an_edit_result_stops_at_its_line_and_byte_caps() {
+        let root = temp_project();
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.join("b.txt"), "head\nold\ntail\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "b.txt", "old_string": "old\n", "new_string": body}));
+        assert!(out.ok, "{}", out.output);
+        let rows = region_rows(&out.output);
+        assert_eq!(rows.len(), EDITED_REGION_LINES + 1, "{}", out.output);
+        assert_eq!((rows[0], rows[1]), ("1 head", "2 line 1"));
+        assert_eq!(rows[EDITED_REGION_LINES], "… 72 more lines of this region (file has 102 lines; continue with offset=31)");
+        let next = read_file(&root, &json!({"path": "b.txt", "offset": 31, "limit": 1}));
+        assert_eq!(next.output.lines().next(), Some("31 line 30"));
+
+        let wide: String = (0..10).map(|i| format!("{i}{}\n", "x".repeat(299))).collect();
+        std::fs::write(root.join("c.txt"), "head\nold\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "c.txt", "old_string": "old\n", "new_string": wide}));
+        let (shown, note) = out.output.split_once('\n').unwrap().1.rsplit_once('\n').unwrap();
+        assert!(shown.len() < EDITED_REGION_BYTES, "{} bytes of rows", shown.len());
+        assert_eq!(shown.lines().count(), 7, "{shown}");
+        assert_eq!(note, "… 4 more lines of this region (file has 11 lines; continue with offset=8)");
+    }
+
+    /// A replace_all edit can land anywhere, many times over, so its result
+    /// stays the counts alone, as does a whole-file write.
+    #[test]
+    fn a_replace_all_edit_reports_its_counts_alone() {
+        let root = temp_project();
+        std::fs::write(root.join("c.txt"), "x\nx\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "c.txt", "old_string": "x", "new_string": "y", "replace_all": true}));
+        assert_eq!(out.output, "edited c.txt (+2 −2)");
+        let out = edit_file(&root, &json!({"path": "c.txt", "old_string": "y\ny", "new_string": "z", "replace_all": true}));
+        assert_eq!(out.output, "edited c.txt (+1 −2)", "a single match under replace_all is still counts alone");
+        let out = write_file(&root, &json!({"path": "c.txt", "content": "w\n"}));
+        assert_eq!(out.output, "wrote c.txt (+1 −1)");
+    }
+
+    /// A CRLF file's rows carry no carriage return, as read_file's do, and
+    /// the line numbers count CRLF breaks like LF ones.
+    #[test]
+    fn an_edit_of_a_crlf_file_shows_rows_as_read_file_does() {
+        let root = temp_project();
+        std::fs::write(root.join("w.txt"), "a\r\nb\r\nc\r\nd\r\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "w.txt", "old_string": "b\nc", "new_string": "B\nC"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(region_rows(&out.output), ["1 a", "2 B", "3 C", "4 d"]);
+        let read = read_file(&root, &json!({"path": "w.txt"}));
+        assert_eq!(read.output.lines().collect::<Vec<_>>(), region_rows(&out.output));
+    }
+
+    /// At the first or last line there is no context on that side, and the
+    /// region shows only lines the file has, with or without a final newline.
+    #[test]
+    fn an_edit_at_the_first_or_last_line_shows_the_context_that_exists() {
+        let root = temp_project();
+        std::fs::write(root.join("e.txt"), "one\ntwo\nthree\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "e.txt", "old_string": "one", "new_string": "ONE"}));
+        assert_eq!(region_rows(&out.output), ["1 ONE", "2 two"]);
+        let out = edit_file(&root, &json!({"path": "e.txt", "old_string": "three\n", "new_string": "THREE\n"}));
+        assert_eq!(region_rows(&out.output), ["2 two", "3 THREE"]);
+        let out = edit_file(&root, &json!({"path": "e.txt", "old_string": "THREE\n", "new_string": "THREE\nfour"}));
+        assert_eq!(region_rows(&out.output), ["2 two", "3 THREE", "4 four"]);
+        let out = edit_file(&root, &json!({"path": "e.txt", "old_string": "ONE\ntwo\nTHREE\nfour", "new_string": "\n"}));
+        assert_eq!(region_rows(&out.output), ["1 "], "{}", out.output);
+    }
+
+    /// A deletion writes no line of its own, so the region is the seam: the
+    /// line where the text before and after the deleted text now meet, with
+    /// its neighbors. A deletion that empties the file shows no rows.
+    #[test]
+    fn a_deletion_shows_the_seam_it_leaves() {
+        let root = temp_project();
+        std::fs::write(root.join("d.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "d.txt", "old_string": "three\n", "new_string": ""}));
+        assert_eq!(out.output, "edited d.txt (+0 −1)\n2 two\n3 four\n4 five");
+        let out = edit_file(&root, &json!({"path": "d.txt", "old_string": "ou", "new_string": ""}));
+        assert_eq!(region_rows(&out.output), ["2 two", "3 fr", "4 five"]);
+        let out = edit_file(&root, &json!({"path": "d.txt", "old_string": "five\n", "new_string": ""}));
+        assert_eq!(region_rows(&out.output), ["2 two", "3 fr"], "a deleted last line leaves the new last line");
+        let out = edit_file(&root, &json!({"path": "d.txt", "old_string": "one\ntwo\nfr\n", "new_string": ""}));
+        assert_eq!(out.output, "edited d.txt (+0 −3)", "{:?}", out.output);
+    }
+
+    /// Compaction shortens an old edit result like any other tool output
+    /// over its size: the region rows are file text, not a part it keeps.
+    #[test]
+    fn compaction_shortens_an_old_edit_result_like_any_tool_output() {
+        use crate::compaction::tests::msg;
+        use crate::types::ChatMessage;
+        let root = temp_project();
+        let body: String = (1..=30).map(|i| format!("    let value_{i} = compute_the_value_of({i}, &input);\n")).collect();
+        std::fs::write(root.join("f.rs"), "fn f() {\n}\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "f.rs", "old_string": "}\n", "new_string": format!("{body}}}\n")}));
+        assert!(out.output.len() > 1_500, "{}", out.output);
+        let mut messages = vec![msg("system", 100), msg("user", 100), ChatMessage::tool("c1", out.output.clone())];
+        messages.push(msg("assistant", 100));
+        for _ in 0..3 {
+            messages.push(msg("user", 100));
+            messages.push(msg("assistant", 100));
+        }
+        let (changed, _) = crate::compaction::enforce_budget(&mut messages, 700, 0, &ChatMessage::estimated_tokens);
+        assert!(changed);
+        let edit = messages.iter().find(|m| m.role == "tool").expect("the edit result survives as a stub");
+        let shortened = edit.content.as_deref().unwrap();
+        assert!(shortened.len() < 500, "{shortened}");
+        assert!(shortened.ends_with("…[older tool output truncated]"), "{shortened}");
     }
 
     /// A full rewrite shares no lines with the file it replaces, so the line

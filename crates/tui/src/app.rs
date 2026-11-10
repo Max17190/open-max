@@ -4197,6 +4197,9 @@ fn clip(s: &str, max: usize) -> String {
 /// (+N −N) change counts from a persisted write/edit result, so a replayed
 /// card keeps its badge even though Diff events are not persisted.
 fn parse_change_counts(content: &str) -> Option<(usize, usize)> {
+    // The counts sit on the summary line; an edit result's later lines are
+    // file text, which can hold "(+" of its own.
+    let content = content.lines().next()?;
     let open = content.rfind("(+")?;
     let rest = &content[open + 2..];
     let digits = rest.find(|c: char| !c.is_ascii_digit())?;
@@ -6963,6 +6966,11 @@ mod tests {
         );
         assert_eq!(parse_change_counts("hello world"), None);
         assert_eq!(parse_change_counts("odd (+x −1)"), None);
+        assert_eq!(
+            parse_change_counts("edited a.rs (+1 −1)\n4 let x = f(+1 −2);"),
+            Some((1, 1)),
+            "file text shown under the summary cannot shadow its counts"
+        );
     }
 
     #[test]
@@ -7027,6 +7035,45 @@ mod tests {
         assert!(text.contains("−0"), "{text}");
         // The sitting boundary renders as a divider.
         assert!(text.contains("• resumed"), "{text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An edit result carries the numbered lines it wrote under its summary.
+    /// A replayed card still badges the summary's counts, not counts-like
+    /// text in the file, and stays one folded line like the live card.
+    #[test]
+    fn replay_badges_an_edit_result_that_shows_its_lines() {
+        let (mut app, dir) = app_fixture();
+        let meta = open_max_core::sessions::create(&app.core, app.project.display().to_string()).unwrap();
+        let mut call = open_max_core::types::ChatMessage::assistant(
+            Some(String::new()),
+            Some(vec![open_max_core::types::ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: open_max_core::types::ToolCallFunction {
+                    name: "edit_file".into(),
+                    arguments: "{\"path\":\"src/a.rs\",\"old_string\":\"x\",\"new_string\":\"y\"}".into(),
+                },
+                extra_content: None,
+            }]),
+        );
+        call.content = Some(String::new());
+        let messages = vec![
+            open_max_core::types::ChatMessage::user("fix it"),
+            call,
+            open_max_core::types::ChatMessage::tool(
+                "c1",
+                "edited src/a.rs (+2 −1)\n3 fn f() {\n4     let shown = g(+7 −9);\n5 }",
+            ),
+            open_max_core::types::ChatMessage::assistant(Some("done".into()), None),
+        ];
+        let mut persisted = 0usize;
+        open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
+        app.replay(&meta.id);
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        assert!(text.contains("src/a.rs  +2 −1"), "{text}");
+        assert!(!text.contains("+7"), "file text never becomes the badge: {text}");
+        assert!(!text.contains("let shown"), "a successful edit's card stays folded: {text}");
         fs::remove_dir_all(dir).unwrap();
     }
 

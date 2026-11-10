@@ -4,6 +4,8 @@ The built-in file tools (`list_dir`, `read_file`, `write_file`, `edit_file`, `gl
 
 `write_file` and `edit_file` write the new contents to a temp file beside the target and rename it into place, so a write that fails (a full disk, a quota) leaves the file as it was.
 
+An `edit_file` result gives the change counts, `edited <path> (+N −M)`, and under them the lines the replacement wrote with one line of context on each side, numbered as `read_file` numbers them, so a number can be its `offset`. A deletion shows the line where the text on either side of it now meets. The lines stop at 30, context included, or 2,048 bytes, whichever comes first, followed by `read_file`'s continuation line naming the offset to read on from, so the lines add under 2.2 KB to the result. A `replace_all` edit and `write_file` give the counts alone.
+
 - The temp file that replaces a file is created with mode `0600`, readable and writable only by its creator, until it has the target's owner, group and permissions.
 - The temp file takes the target's permissions (less setuid and setgid), owner, group and access control list. It does not take the directory's default list, or the target's other extended attributes or file flags.
 - The temp file needs room for the whole new file beside the old one, so on a full disk even a write that would shrink a file is refused, and the file is left unchanged.
