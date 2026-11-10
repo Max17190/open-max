@@ -242,8 +242,14 @@ calibrated trigger and uses the input budget if the frozen schemas alone
 fill the trigger.
 
 Between prunes the history stays byte-stable so the server can reuse its
-prompt cache. A prune truncates old tool outputs first, then drops the oldest
-exchanges. Everything dropped is appended verbatim to
+prompt cache. A prune shortens old reasoning first, then truncates old tool
+outputs, then drops the oldest exchanges, and stops at the first step that
+meets its target. Shortened reasoning is plain text the model's server sent
+unsigned: each old reply's reasoning over 600 bytes keeps its last 200 bytes
+and ends with `…[older reasoning shortened]`, in the same field it arrived
+in. Signed, encrypted, or summarized reasoning, and the reasoning of the
+newest replies, go back unchanged. The session's event log keeps the full
+text. Everything dropped is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note that replaces
 the dropped span names that path, so compaction stays reversible: the model
 summary (or its heuristic fallback) is the bounded view, the archive is the

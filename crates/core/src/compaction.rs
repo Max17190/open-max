@@ -1,11 +1,12 @@
-//! Keeping the transcript inside the model's context window: first truncate
-//! old tool outputs, then drop the oldest exchanges (always preserving the
-//! system prompt and the original user request, see `pinned_head`), leaving
-//! one digest note in their place that names the archive holding every byte
-//! the prune removed. A model-written summary upgrades the note when the
-//! endpoint gives one, a request charged like any other (`RequestSpend`). A
-//! request costs its history plus `request_overhead`, in estimated tokens the
-//! server's own counts calibrate (`token_factor`).
+//! Keeping the transcript inside the model's context window: first shorten
+//! old plain-text reasoning, then truncate old tool outputs, then drop the
+//! oldest exchanges (always preserving the system prompt and the original
+//! user request, see `pinned_head`), leaving one digest note in their place
+//! that names the archive holding the messages it dropped and the tool
+//! outputs it truncated. A model-written summary upgrades the note when the endpoint gives
+//! one, a request charged like any other (`RequestSpend`). A request costs
+//! its history plus `request_overhead`, in estimated tokens the server's own
+//! counts calibrate (`token_factor`).
 //!
 //! Prunes with hysteresis: once the budget is crossed, compact well below it
 //! (PRUNE_TARGET_PCT) in a single pass. The server-side prompt cache re-prefills
@@ -591,6 +592,60 @@ const PRUNE_TARGET_PCT: usize = 70;
 /// separate decision from choosing which bytes it holds.
 const TRUNCATED_WIDTH: usize = 160;
 
+/// Bytes of an old reply's plain-text reasoning that survive a prune: its
+/// end, where the model settled on the calls that follow. Wider than
+/// TRUNCATED_WIDTH because a tool output can be fetched again and reasoning
+/// cannot, yet with its marker still under the 600-byte floor below which
+/// nothing is shortened, so a shortened block is never shortened again.
+const REASONING_KEPT: usize = 200;
+
+/// `msg` with its reasoning cut to the last REASONING_KEPT bytes and a
+/// marker, or None. Only text the harness owns is cut: the plain fields and
+/// `reasoning_details` made only of unsigned `reasoning.text` blocks. Signed,
+/// encrypted, or summary blocks, and other wires' stored shapes, must go
+/// back unmodified, so a message carrying any of them is left alone. Every
+/// field that was present stays present, since some servers refuse a reply
+/// whose reasoning does not come back, and fields that held one text still
+/// hold one, so a route that sends one of two equal copies still does.
+fn shortened_reasoning(msg: &ChatMessage) -> Option<ChatMessage> {
+    let mut blocks = match msg.reasoning_details.as_deref() {
+        Some(raw) => serde_json::from_str::<Vec<Value>>(raw.get()).ok()?,
+        None => Vec::new(),
+    };
+    let plain = |b: &Value| b["type"] == "reasoning.text" && b["text"].is_string()
+        && b.get("signature").is_none_or(|s| s.is_null() || s == "");
+    if !blocks.iter().all(plain) {
+        return None;
+    }
+    let mut fields = [&msg.reasoning_content, &msg.reasoning].into_iter().flatten().filter(|t| !t.is_empty());
+    let text: String = if blocks.is_empty() {
+        fields.next()?.clone()
+    } else {
+        blocks.iter().filter_map(|b| b["text"].as_str()).collect()
+    };
+    // A plain field that is not the same text is not one copy to shorten.
+    if text.len() <= 600 || fields.any(|t| *t != text) {
+        return None;
+    }
+    let mut start = text.len() - REASONING_KEPT;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let short = format!("…{}\n…[older reasoning shortened]", &text[start..]);
+    let mut out = msg.clone();
+    for field in [&mut out.reasoning_content, &mut out.reasoning].into_iter().flatten() {
+        if !field.is_empty() {
+            field.clone_from(&short);
+        }
+    }
+    if !blocks.is_empty() {
+        blocks.truncate(1);
+        blocks[0]["text"] = Value::String(short);
+        out.reasoning_details = Some(serde_json::value::to_raw_value(&blocks).ok()?);
+    }
+    Some(out)
+}
+
 /// How many leading messages a prune keeps: the system prompt and the
 /// conversation's opening, through the user's original request. Turn-start
 /// notes (the execution policy, a refreeze receipt, a policy notice) are
@@ -919,9 +974,9 @@ pub(crate) fn enforce_budget(
 
 /// The prune itself, shared by the budget path and the forced `/compact`,
 /// which fires inside the hysteresis gap where `enforce_budget` correctly
-/// holds still. Truncates old tool outputs toward the live context first,
-/// then drops whole exchanges into the digest until `achievable_target` is
-/// met.
+/// holds still. Shortens old plain-text reasoning first, then truncates old
+/// tool outputs toward the live context, then drops whole exchanges into
+/// the digest until `achievable_target` is met.
 fn prune_transcript(
     messages: &mut Vec<ChatMessage>,
     budget: usize,
@@ -949,8 +1004,24 @@ fn prune_transcript(
     // one does not, so it is left alone and nothing new is inserted.
     let has_note = messages.get(head).is_some_and(is_digest_message);
     let note_reserve = if has_note { 0 } else { TRUNCATION_NOTE_ALLOWANCE_TOKENS };
-    let mut reached = false;
-    for msg in messages.iter_mut().take(recent.min(protected_start)).skip(1) {
+    let (mut reached, mut shortened) = (false, false);
+    // Old reasoning goes before any tool output: every later request
+    // re-sends it, while the outputs are what the model would re-read. Each
+    // shortened block carries its own marker, so it needs no note, and the
+    // event log keeps the full text, so the archive does not.
+    for msg in messages.iter_mut().take(recent.min(protected_start)).skip(1).filter(|m| m.role == "assistant") {
+        let old = estimate(msg);
+        if let Some(short) = shortened_reasoning(msg).filter(|s| estimate(s) < old) {
+            total = total.saturating_sub(old).saturating_add(estimate(&short));
+            (*msg, shortened) = (short, true);
+        }
+        if total + note_reserve <= target {
+            reached = true;
+            break;
+        }
+    }
+    let truncate_end = if reached { 0 } else { recent.min(protected_start) };
+    for msg in messages.iter_mut().take(truncate_end).skip(1) {
         if msg.role == "tool" {
             if let Some(c) = &msg.content {
                 if c.len() > 600 {
@@ -1033,7 +1104,7 @@ fn prune_transcript(
         }
         (true, Some(digest))
     } else {
-        (!digest.truncated.is_empty(), Some(digest).filter(CompactionDigest::has_archive_material))
+        (shortened || !digest.truncated.is_empty(), Some(digest).filter(CompactionDigest::has_archive_material))
     }
 }
 
@@ -1326,6 +1397,148 @@ pub(crate) mod tests {
         let tool = messages.iter().find(|m| m.role == "tool").expect("the stub survives");
         let tool_len = tool.content.as_deref().unwrap().len();
         assert!(tool_len < 500, "old tool output should be truncated, got {tool_len}");
+    }
+
+    fn with_details(mut msg: ChatMessage, details: Value) -> ChatMessage {
+        msg.reasoning_details = Some(serde_json::value::to_raw_value(&details).unwrap());
+        msg
+    }
+
+    fn plain_details(text: &str) -> Value {
+        serde_json::json!([{"format": "unknown", "index": 0, "text": text, "type": "reasoning.text"}])
+    }
+
+    /// `[system, user, assistant + reasoning, tool, then three user/assistant
+    /// pairs]`: the reply with reasoning and its tool output sit outside the
+    /// protected tail, whose last reply also carries reasoning. Returns it
+    /// with a budget one token under its size, so the prune fires.
+    fn reasoning_transcript(old: ChatMessage, tool_len: usize, newest: ChatMessage) -> (Vec<ChatMessage>, usize) {
+        let mut messages = vec![msg("system", 100), msg("user", 100), old, msg("tool", tool_len)];
+        for _ in 0..2 {
+            messages.push(msg("user", 100));
+            messages.push(msg("assistant", 100));
+        }
+        messages.push(msg("user", 100));
+        messages.push(newest);
+        let total: usize = messages.iter().map(ChatMessage::estimated_tokens).sum();
+        (messages, total - 1)
+    }
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        serde_json::to_string(a).unwrap() == serde_json::to_string(b).unwrap()
+    }
+
+    /// Each stored shape whose reasoning is plain text the harness owns:
+    /// Chat Completions `reasoning_content` and `reasoning`, and
+    /// `reasoning_details` of `reasoning.text` blocks with no signature (absent,
+    /// null or empty), alone, beside the plain field the same reply streamed,
+    /// or empty beside one. Each keeps every field it had, holding the end
+    /// of the reasoning and a marker, its one block keeping its other keys,
+    /// and the plain field and the block stay equal, so a route that sends
+    /// only one of two equal copies still does.
+    #[test]
+    fn a_prune_shortens_old_reasoning_before_any_tool_output() {
+        let thought = format!("{}the call below reads the parser", "weighing the options. ".repeat(400));
+        let newest = with_details(msg("assistant", 100), plain_details(&"latest ".repeat(100)));
+        let field = |name: &str| {
+            let mut old = msg("assistant", 100);
+            *if name == "reasoning" { &mut old.reasoning } else { &mut old.reasoning_content } = Some(thought.clone());
+            old
+        };
+        let half = thought.len() / 2;
+        let block = |extra: Value| {
+            let mut details = plain_details(&thought);
+            details[0].as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            details
+        };
+        let shapes = [
+            field("reasoning_content"),
+            field("reasoning"),
+            with_details(msg("assistant", 100), plain_details(&thought)),
+            with_details(msg("assistant", 100), block(serde_json::json!({"signature": null}))),
+            with_details(msg("assistant", 100), block(serde_json::json!({"signature": ""}))),
+            with_details(field("reasoning"), plain_details(&thought)),
+            with_details(field("reasoning"), serde_json::json!([
+                {"type": "reasoning.text", "text": &thought[..half], "index": 0},
+                {"type": "reasoning.text", "text": &thought[half..], "index": 0}])),
+            with_details(field("reasoning_content"), serde_json::json!([])),
+        ];
+        for old in shapes {
+            let (mut messages, budget) = reasoning_transcript(old.clone(), 4000, newest.clone());
+            // Shortening the old reasoning alone meets the target.
+            let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
+            assert!(changed, "shortened reasoning is a change to the transcript");
+            assert!(digest.is_none(), "no tool output was truncated and nothing was dropped");
+            assert_eq!(messages.len(), 10, "nothing dropped and no note inserted");
+            assert_eq!(messages[3].content.as_deref().map(str::len), Some(4000), "the tool output stays whole");
+            assert!(same(&messages[9], &newest), "the protected tail's reasoning is never shortened");
+            let short = &messages[2];
+            assert_eq!(
+                (short.reasoning_content.is_some(), short.reasoning.is_some(), short.reasoning_details.is_some()),
+                (old.reasoning_content.is_some(), old.reasoning.is_some(), old.reasoning_details.is_some()),
+                "every field stays present"
+            );
+            let mut texts: Vec<String> = [&short.reasoning_content, &short.reasoning].into_iter().flatten().cloned().collect();
+            let blocks: Vec<Value> = short.reasoning_details.as_deref().map_or(Vec::new(), |d| serde_json::from_str(d.get()).unwrap());
+            if let Some(first) = blocks.first() {
+                assert_eq!(blocks.len(), 1, "{blocks:?}");
+                let kept = |b: &Value| b.as_object().unwrap().keys().filter(|k| *k != "text").cloned().collect::<Vec<_>>();
+                let was: Vec<Value> = serde_json::from_str(old.reasoning_details.as_deref().unwrap().get()).unwrap();
+                assert_eq!(kept(first), kept(&was[0]), "the block keeps its other keys: {first}");
+                texts.push(first["text"].as_str().unwrap().to_string());
+            }
+            assert!(!texts.is_empty() && texts.iter().all(|t| t == &texts[0]), "{texts:?}");
+            assert!(texts[0].ends_with("the call below reads the parser\n…[older reasoning shortened]"), "{}", texts[0]);
+            assert!(texts[0].len() < 300, "{}", texts[0]);
+        }
+    }
+
+    /// A shortened block is under the floor, so a later prune leaves it as
+    /// the first one did and shortens tool outputs instead. The cut lands
+    /// inside a two-byte character and moves past it.
+    #[test]
+    fn shortened_reasoning_is_never_shortened_again() {
+        let mut old = msg("assistant", 100);
+        old.reasoning_content = Some(format!("{}a", "é".repeat(2000)));
+        let (mut messages, budget) = reasoning_transcript(old, 4000, msg("assistant", 100));
+        enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
+        let once = messages[2].clone();
+        let kept = once.reasoning_content.as_deref().unwrap();
+        assert_eq!(kept, format!("…{}a\n…[older reasoning shortened]", "é".repeat(99)));
+        assert!(shortened_reasoning(&once).is_none());
+        let budget = messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() - 1;
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
+        assert!(changed && digest.is_some_and(|d| d.truncated.len() == 1), "the tool output is truncated next");
+        assert!(same(&messages[3], &once), "{:?}", messages[3].reasoning_content);
+    }
+
+    /// Reasoning the server signed or encrypted, a summary of it, other
+    /// wires' stored shapes (Responses reasoning items, native Messages
+    /// content behind its prefix hash, thinking or redacted), and details
+    /// whose text a plain field beside them does not repeat go back as sent.
+    #[test]
+    fn a_prune_never_edits_signed_or_encrypted_reasoning() {
+        let long = "x".repeat(4000);
+        let opaque = [
+            serde_json::json!([{"type": "reasoning.text", "text": long, "signature": "sig", "format": "anthropic-claude-v1"}]),
+            serde_json::json!([{"type": "reasoning.text", "text": long}, {"type": "reasoning.encrypted", "data": "opaque"}]),
+            serde_json::json!([{"type": "reasoning.summary", "summary": long}]),
+            serde_json::json!([{"type": "reasoning", "encrypted_content": long, "summary": []}]),
+            serde_json::json!({"prefix": "00", "content": [{"type": "thinking", "thinking": long, "signature": "sig"}]}),
+            serde_json::json!({"prefix": "00", "content": [{"type": "redacted_thinking", "data": long}]}),
+        ];
+        // Unsigned text, but beside a plain field holding other text.
+        let differs = serde_json::json!([{"type": "reasoning.text", "text": format!("{long}y")}]);
+        let cases = opaque.into_iter().flat_map(|d| [(d.clone(), false), (d, true)]).chain([(differs, true)]);
+        for (details, plain) in cases {
+            let mut old = with_details(msg("assistant", 100), details);
+            old.reasoning = plain.then(|| long.clone());
+            let (mut messages, budget) = reasoning_transcript(old.clone(), 16_000, msg("assistant", 100));
+            let (changed, _) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
+            assert!(changed);
+            assert!(same(&messages[3], &old), "left as the server sent it: {:?}", messages[3].reasoning_details);
+            assert!(messages[4].content.as_deref().unwrap().len() < 500, "the tool output is truncated instead");
+        }
     }
 
     /// The note is inserted after the target is met, so the target check has

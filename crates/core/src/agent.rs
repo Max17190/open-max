@@ -11,8 +11,8 @@
 //! 2. Refreeze if extension files changed on disk since the last freeze, so a
 //!    capability the agent wrote in the previous turn is usable in this one
 //!    without `/reload`.
-//! 3. Budget enforcement, which truncates old tool output and then drops whole
-//!    exchanges, always keeping the system prompt and the conversation's
+//! 3. Budget enforcement, which shortens old reasoning, then truncates old
+//!    tool output, then drops whole exchanges, always keeping the system prompt and the conversation's
 //!    opening through the user's first request (see `compaction::pinned_head`)
 //!    so the cache prefix and the original request survive.
 //! 4. Per tool call: permissions, then `approval_mode`, then the human, then
