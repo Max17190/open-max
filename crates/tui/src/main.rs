@@ -2313,8 +2313,9 @@ fn print_usage_economics() {
         })
         .collect();
     // The frozen prompt prefix is paid on every request whether or not any
-    // tool or skill is installed: the base rules, the self-extension guide,
-    // AGENTS.md, the memory index, and the layout map all ride it. Report the
+    // tool or skill is installed: the base rules, AGENTS.md, the memory
+    // index, the layout map, and the builtin schemas (the bash one carries
+    // the extension pointer) all ride it. Report the
     // real breakdown here so "what does my prompt cost" is answered truthfully
     // and never as a false zero - a project with only an AGENTS.md or a memory
     // note pays real bytes the old "zero extension cost" line hid.
