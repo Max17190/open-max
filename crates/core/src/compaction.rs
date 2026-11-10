@@ -2,8 +2,8 @@
 //! old plain-text reasoning, then truncate old tool outputs, then drop the
 //! oldest exchanges (always preserving the system prompt and the original
 //! user request, see `pinned_head`), leaving one digest note in their place
-//! that names the archive holding the messages it dropped and the tool
-//! outputs it truncated. A model-written summary upgrades the note when the endpoint gives
+//! that names the archive holding every message as it was before the prune
+//! dropped or shortened it. A model-written summary upgrades the note when the endpoint gives
 //! one, a request charged like any other (`RequestSpend`). A request costs
 //! its history plus `request_overhead`, in estimated tokens the server's own
 //! counts calibrate (`token_factor`).
@@ -112,6 +112,9 @@ pub(crate) struct CompactionDigest {
     /// Pre-truncation originals of tool outputs phase 1 cut in place: that
     /// edit is as destructive as a drop, so the archive covers it too.
     pub(crate) truncated: Vec<ChatMessage>,
+    /// Replies as they were before their reasoning was shortened, for the
+    /// archive alone: some replies' reasoning is stored nowhere else.
+    reasoning: Vec<ChatMessage>,
 }
 
 impl CompactionDigest {
@@ -121,7 +124,7 @@ impl CompactionDigest {
 
     /// True when this prune has anything the archive must record.
     fn has_archive_material(&self) -> bool {
-        !self.dropped.is_empty() || !self.truncated.is_empty()
+        !self.dropped.is_empty() || !self.truncated.is_empty() || !self.reasoning.is_empty()
     }
 
     fn dropped_text(&self, archive: Option<(&Core, &str)>) -> String {
@@ -484,8 +487,8 @@ async fn prepare_compaction_digest(
             let path = sessions::archive_display(core, session_id);
             messages[slot] = ChatMessage::user(digest.format_truncation_only(Some(&path)));
         }
-        let mut archive = digest.truncated;
-        archive.extend(digest.dropped);
+        let mut archive = digest.reasoning;
+        archive.extend(digest.truncated.into_iter().chain(digest.dropped));
         return (archive, None);
     }
     // Structured fields from the previous record carry forward by
@@ -507,8 +510,8 @@ async fn prepare_compaction_digest(
         messages[slot] = ChatMessage::user(note.clone());
     }
     let record = digest.to_record(note);
-    let mut archive = digest.truncated;
-    archive.extend(digest.dropped);
+    let mut archive = digest.reasoning;
+    archive.extend(digest.truncated.into_iter().chain(digest.dropped));
     (archive, Some(record))
 }
 
@@ -950,7 +953,8 @@ pub(crate) fn to_real(estimate: usize, factor: f64) -> usize {
 /// several hundred tokens, and by more with every tool the agent writes.
 ///
 /// Returns `(changed, digest)`, where `digest` is set when the prune dropped
-/// exchanges or truncated tool outputs, since the archive must record both.
+/// exchanges, truncated tool outputs or shortened reasoning, since the
+/// archive must record all three.
 pub(crate) fn enforce_budget(
     messages: &mut Vec<ChatMessage>,
     budget: usize,
@@ -1004,18 +1008,18 @@ fn prune_transcript(
     // one does not, so it is left alone and nothing new is inserted.
     let has_note = messages.get(head).is_some_and(is_digest_message);
     let note_reserve = if has_note { 0 } else { TRUNCATION_NOTE_ALLOWANCE_TOKENS };
-    let (mut reached, mut shortened) = (false, false);
+    let mut reached = false;
     // Old reasoning goes before any tool output: every later request
     // re-sends it, while the outputs are what the model would re-read. Each
-    // shortened block carries its own marker, so it needs no note, and the
-    // event log keeps the full text, so the archive does not.
+    // shortened block carries its own marker, so it needs no note and no
+    // room for one; the original goes to the archive.
     for msg in messages.iter_mut().take(recent.min(protected_start)).skip(1).filter(|m| m.role == "assistant") {
         let old = estimate(msg);
         if let Some(short) = shortened_reasoning(msg).filter(|s| estimate(s) < old) {
             total = total.saturating_sub(old).saturating_add(estimate(&short));
-            (*msg, shortened) = (short, true);
+            digest.reasoning.push(std::mem::replace(msg, short));
         }
-        if total + note_reserve <= target {
+        if total <= target {
             reached = true;
             break;
         }
@@ -1104,7 +1108,7 @@ fn prune_transcript(
         }
         (true, Some(digest))
     } else {
-        (shortened || !digest.truncated.is_empty(), Some(digest).filter(CompactionDigest::has_archive_material))
+        (digest.has_archive_material(), Some(digest).filter(CompactionDigest::has_archive_material))
     }
 }
 
@@ -1468,7 +1472,9 @@ pub(crate) mod tests {
             // Shortening the old reasoning alone meets the target.
             let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
             assert!(changed, "shortened reasoning is a change to the transcript");
-            assert!(digest.is_none(), "no tool output was truncated and nothing was dropped");
+            let digest = digest.expect("the original reasoning must reach the archive");
+            assert!(digest.truncated.is_empty() && digest.dropped.is_empty(), "no tool output truncated, nothing dropped");
+            assert!(digest.reasoning.len() == 1 && same(&digest.reasoning[0], &old), "the reply as it was is archived");
             assert_eq!(messages.len(), 10, "nothing dropped and no note inserted");
             assert_eq!(messages[3].content.as_deref().map(str::len), Some(4000), "the tool output stays whole");
             assert!(same(&messages[9], &newest), "the protected tail's reasoning is never shortened");
@@ -1508,8 +1514,27 @@ pub(crate) mod tests {
         assert!(shortened_reasoning(&once).is_none());
         let budget = messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() - 1;
         let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
-        assert!(changed && digest.is_some_and(|d| d.truncated.len() == 1), "the tool output is truncated next");
+        let digest = digest.expect("the truncated tool output reaches the archive");
+        assert!(changed && digest.truncated.len() == 1 && digest.reasoning.is_empty(), "the tool output is truncated next");
         assert!(same(&messages[3], &once), "{:?}", messages[3].reasoning_content);
+    }
+
+    /// The reasoning pass inserts no note, so it holds no room for one: a
+    /// prune that lands within the note's allowance of its target by
+    /// shortening reasoning stops there and leaves the tool output whole.
+    #[test]
+    fn a_reasoning_only_prune_stops_at_its_target() {
+        let mut old = msg("assistant", 100);
+        old.reasoning_content = Some("r".repeat(4000));
+        let (mut messages, _) = reasoning_transcript(old.clone(), 4000, msg("assistant", 100));
+        let after = messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() - old.estimated_tokens()
+            + shortened_reasoning(&old).unwrap().estimated_tokens();
+        let budget = (after * 100).div_ceil(PRUNE_TARGET_PCT);
+        assert!(prune_target(budget) >= after && prune_target(budget) < after + TRUNCATION_NOTE_ALLOWANCE_TOKENS);
+        let (changed, digest) = enforce_budget(&mut messages, budget, 0, &ChatMessage::estimated_tokens);
+        assert!(changed && digest.is_some_and(|d| d.truncated.is_empty()), "no tool output is truncated");
+        assert_eq!(messages.len(), 10, "no note is inserted");
+        assert_eq!(messages[3].content.as_deref().map(str::len), Some(4000));
     }
 
     /// Reasoning the server signed or encrypted, a summary of it, other

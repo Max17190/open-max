@@ -1011,6 +1011,12 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
             .count();
         assert!(shortened > 0, "request {} sends the shortened reasoning back under its own key", rewritten + 1);
         assert!(!bodies[rewritten].contains("[older tool output truncated]"), "no tool output was shortened");
+        let archive = std::fs::read_to_string(open_max_core::sessions::archive_display(&core, &id)).unwrap();
+        let originals = archive
+            .lines()
+            .filter(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["reasoning_content"] == thought.as_str())
+            .count();
+        assert_eq!(originals, shortened, "the archive keeps each shortened reply's reasoning as it was");
     }
 
     // Every request repeats what the request before it sent ahead of its

@@ -248,8 +248,8 @@ meets its target. Shortened reasoning is plain text the model's server sent
 unsigned: each old reply's reasoning over 600 bytes keeps its last 200 bytes
 and ends with `…[older reasoning shortened]`, in the same field it arrived
 in. Signed, encrypted, or summarized reasoning, and the reasoning of the
-newest replies, go back unchanged. The session's event log keeps the full
-text. Everything dropped is appended verbatim to
+newest replies, go back unchanged. Every reply as it was before its
+reasoning was shortened, and everything dropped, is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note that replaces
 the dropped span names that path, so compaction stays reversible: the model
 summary (or its heuristic fallback) is the bounded view, the archive is the
