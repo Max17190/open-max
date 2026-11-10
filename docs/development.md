@@ -1,6 +1,6 @@
 # Development
 
-Open Max is early software. File an issue or send a PR if something breaks.
+Found a bug or want a change? Open an issue or send a PR.
 
 ```sh
 cargo check
