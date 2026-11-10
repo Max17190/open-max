@@ -5850,11 +5850,14 @@ fn settings_flags_beside_a_selected_provider_say_what_the_run_uses() {
 fn compaction_uses_the_selected_ceiling_within_the_model_window() {
     use serde_json::{Value, json};
 
+    // Unset in settings and in the model entry, the ceiling follows the
+    // window: 150,000 tokens, or a quarter of the window when larger.
+    let window_default = |window: usize| (window / 4).max(150_000);
     // Cases with a model select it from the named catalog via --model.
     // The others use a flat endpoint.
     for (window, reserve, model, global, trigger) in [
-        (500_000, 4_096, None, None, 150_000),
-        (1_000_000, 4_096, Some("stub-model"), None, 150_000),
+        (500_000, 4_096, None, None, window_default(500_000)),
+        (1_000_000, 4_096, Some("stub-model"), None, window_default(1_000_000)),
         (128_000, 65_536, None, None, 61_440),
         (500_000, 4_096, Some("short-history"), None, 100_000),
         (500_000, 4_096, Some("long-history"), None, 200_000),

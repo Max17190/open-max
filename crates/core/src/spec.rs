@@ -863,7 +863,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
   Unset, it follows the model's window, from 16 KiB to 48 KiB.
 - `compaction_tokens`: optional global ceiling for compaction. Unset uses the
-  active model's ceiling or 150,000 tokens; the window budget always caps it.
+  active model's ceiling, else 150,000 tokens or a quarter of the window when
+  larger; the window budget always caps it.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction summaries. An unaffordable summary uses the deterministic digest.
 - `max_agent_iterations`: tool/model iteration cap per turn (default 50).

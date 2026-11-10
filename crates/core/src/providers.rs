@@ -14,6 +14,17 @@ pub use setup::{edit_catalog, read_catalog};
 
 const DEFAULT_COMPACTION_TOKENS: usize = 150_000;
 
+/// The soft compaction ceiling when neither settings nor the selected model
+/// entry sets one: 150,000 tokens, or a quarter of the context window when
+/// that is larger. A fixed 150,000 sized for small windows prunes a
+/// 1,048,576-token window at a seventh of its size, and each prune changes
+/// the prefix, so the next request re-bills the remaining context uncached
+/// and the model re-reads the tool results the prune shortened. Windows up
+/// to 600,000 tokens keep 150,000; the input budget still caps the trigger.
+fn default_compaction_tokens(context_tokens: usize) -> usize {
+    DEFAULT_COMPACTION_TOKENS.max(context_tokens / 4)
+}
+
 /// Wire quirks for picky OpenAI-compatible servers.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -695,7 +706,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             max_tokens,
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
-                .unwrap_or(DEFAULT_COMPACTION_TOKENS),
+                .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
             temperature: if p.compat.omit_temperature { None } else { settings.temperature },
             reasoning_effort: settings.reasoning_effort,
             compat: p.compat.clone(),
@@ -735,7 +746,9 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         model: model.to_string(),
         context_tokens,
         max_tokens,
-        compaction_tokens: settings.compaction_tokens.unwrap_or(DEFAULT_COMPACTION_TOKENS),
+        compaction_tokens: settings
+            .compaction_tokens
+            .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
         temperature: settings.temperature,
         reasoning_effort: settings.reasoning_effort,
         compat: CompatFlagsFile::default().into(),
@@ -1144,6 +1157,73 @@ mod tests {
         assert_eq!(ep.context_tokens, 64000);
         assert_eq!(ep.max_tokens, 2048);
         assert!(ep.headers.iter().any(|(k, v)| k == "X-Title" && v == "Open Max"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With `compaction_tokens` unset in settings and in the model entry, the
+    /// soft ceiling follows the window: 150,000 tokens up to a 600,000-token
+    /// window, a quarter of the window above it. An explicit setting wins over
+    /// the model entry's value, and both win over the window default.
+    #[test]
+    fn the_default_compaction_ceiling_follows_the_context_window() {
+        let expected = |window: usize| (window / 4).max(DEFAULT_COMPACTION_TOKENS);
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(
+            &dir,
+            r#"{"providers":{"p":{"base_url":"http://127.0.0.1:9/v1","models":[
+                {"id":"w200k","context_tokens":200000},
+                {"id":"w400k","context_tokens":400000},
+                {"id":"w600k","context_tokens":600000},
+                {"id":"w1m","context_tokens":1048576},
+                {"id":"pinned","context_tokens":1048576,"compaction_tokens":220000},
+                {"id":"unsized"}
+            ]}}}"#,
+        );
+        invalidate_providers_cache();
+        let resolve_with = |model: &str, setting: Option<usize>, window: Option<usize>| {
+            let s = Settings {
+                provider: Some("p".into()),
+                model: model.into(),
+                compaction_tokens: setting,
+                context_tokens: window,
+                ..Default::default()
+            };
+            resolve(&s, &dir)
+        };
+        let ceiling = |model: &str, setting: Option<usize>, window: Option<usize>| {
+            resolve_with(model, setting, window).unwrap().compaction_tokens
+        };
+        for (model, window) in [("w200k", 200_000), ("w400k", 400_000), ("w600k", 600_000), ("w1m", 1_048_576)] {
+            assert_eq!(ceiling(model, None, None), expected(window), "{model}");
+        }
+        assert_eq!(expected(600_000), DEFAULT_COMPACTION_TOKENS, "windows up to 600,000 keep the old default");
+        assert_eq!(ceiling("w1m", None, None), 262_144);
+        // An entry without a window takes the settings window, and the
+        // ceiling follows that; with no window anywhere nothing resolves.
+        assert_eq!(ceiling("unsized", None, Some(1_048_576)), expected(1_048_576));
+        assert!(matches!(resolve_with("unsized", None, None), Err(ResolveError::MissingContextTokens)));
+        // The model entry's value beats the window default; the setting
+        // beats both.
+        assert_eq!(ceiling("pinned", None, None), 220_000);
+        assert_eq!(ceiling("pinned", Some(180_000), None), 180_000);
+        assert_eq!(ceiling("w1m", Some(100_000), None), 100_000);
+
+        // The flat settings path, with no provider selected, follows the
+        // same rule.
+        let flat = |setting: Option<usize>, window: usize| {
+            let s = Settings {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "m".into(),
+                compaction_tokens: setting,
+                context_tokens: Some(window),
+                ..Default::default()
+            };
+            resolve(&s, &dir).unwrap().compaction_tokens
+        };
+        for window in [200_000, 400_000, 600_000, 1_048_576] {
+            assert_eq!(flat(None, window), expected(window), "flat {window}");
+        }
+        assert_eq!(flat(Some(120_000), 1_048_576), 120_000);
         let _ = std::fs::remove_dir_all(dir);
     }
 
