@@ -3501,7 +3501,8 @@ mod tests {
     /// helper is the test's own child, reaped as it exits, so a host whose
     /// init does not reap orphans cannot keep it in the group as a zombie.
     /// Its teardown is 5 ms of work rather than a timer, which a QoS clamp on
-    /// macOS would stretch past the window.
+    /// macOS would stretch past the window, and the program exits only once
+    /// the helper says it is ready, so a slow start is not counted in it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_helper_that_exits_just_after_its_program_is_not_reported() {
@@ -3511,12 +3512,16 @@ mod tests {
         program.as_std_mut().process_group(0);
         let mut program = program.spawn().unwrap();
         let group = program.id();
-        let teardown = "use Time::HiRes qw(time); <STDIN>; my $end = time + 0.005; 1 while time < $end";
+        let teardown =
+            "use Time::HiRes qw(time); $| = 1; print qq(ready\\n); <STDIN>; my $end = time + 0.005; 1 while time < $end";
         let mut helper = Command::new("perl");
-        helper.args(["-e", teardown]).stdin(std::process::Stdio::piped()).kill_on_drop(true);
-        helper.as_std_mut().process_group(i32::try_from(group.unwrap()).unwrap());
+        helper.args(["-e", teardown]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+        helper.kill_on_drop(true).as_std_mut().process_group(i32::try_from(group.unwrap()).unwrap());
         let mut helper = helper.spawn().unwrap();
         let pipe = helper.stdin.take();
+        let mut ready = [0; 1];
+        let said = helper.stdout.take().unwrap().read(&mut ready).await.unwrap();
+        assert_eq!(said, 1, "the helper never started");
         program.start_kill().unwrap();
         program.wait().await.unwrap();
         drop(pipe);
