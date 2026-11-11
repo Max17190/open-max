@@ -875,12 +875,13 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                 kind: "settings",
                 path: settings_path,
                 status: match crate::providers::resolve(&settings, data_dir) {
-                    Ok(endpoint) => Status::Ok(format!(
-                        "model {} via {}, {}-token window; read at launch, not hot (openmax --spec settings)",
-                        endpoint.model,
-                        endpoint.provider.as_deref().unwrap_or("base_url"),
-                        endpoint.context_tokens,
-                    )),
+                    Ok(endpoint) => {
+                        let entry = endpoint.provider.as_ref().and_then(|p| crate::providers::load_providers(data_dir).remove(p)).and_then(|p| p.models.into_iter().find(|m| m.id == endpoint.model)?.max_tokens);
+                        let from = if entry.is_some() { "the model entry" } else if settings.max_tokens != crate::config::Settings::default().max_tokens { "settings" } else if endpoint.chatgpt.is_some() { "the default, a local reserve on this route" } else { "" };
+                        let row = format!("model {} via {}, {}-token window, reply limit max_tokens = {}", endpoint.model, endpoint.provider.as_deref().unwrap_or("base_url"), endpoint.context_tokens, endpoint.max_tokens);
+                        if !from.is_empty() { Status::Ok(format!("{row} from {from}; read at launch, not hot (openmax --spec settings)")) }
+                        else { Status::Warn(format!("{row}, the default: a reply longer than this, its reasoning included, is cut and ends the turn; set max_tokens on the model's providers.json entry (or in settings.json) to its documented output maximum; read at launch, not hot (openmax --spec settings)")) }
+                    }
                     Err(reason) => Status::Warn(format!(
                         "parses, but every turn will refuse until this resolves: {}; read at launch, not hot (openmax --spec settings)",
                         reason.to_string().lines().next().unwrap_or_default().trim_end_matches('.')
@@ -4416,6 +4417,16 @@ mod tests {
         std::fs::write(
             data.join("settings.json"),
             r#"{"base_url":"http://x/v1","model":"m","approval_mode":"auto","context_tokens":32768}"#,
+        )
+        .unwrap();
+        let findings = check_at(&root, &data);
+        let s = findings.iter().find(|f| f.kind == "settings").unwrap();
+        // It resolves, at the default reply limit, which is worth acting on.
+        assert!(matches!(s.status, Status::Warn(_)), "{:?}", s.status);
+        assert!(s.status.summary().contains("max_tokens = 4096, the default"), "{}", s.status.summary());
+        std::fs::write(
+            data.join("settings.json"),
+            r#"{"base_url":"http://x/v1","model":"m","approval_mode":"auto","context_tokens":32768,"max_tokens":8192}"#,
         )
         .unwrap();
         let findings = check_at(&root, &data);

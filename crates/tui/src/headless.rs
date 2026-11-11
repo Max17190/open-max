@@ -267,6 +267,8 @@ async fn run_turn_events(
                         let how = "Run openmax --continue -p \"<follow-up>\" to continue, \
                                    after raising max_agent_iterations in settings.json if it needs more rounds";
                         let _ = writeln!(stderr, "openmax: stopped (max_iterations): {}", iteration_cap_note(cap, how));
+                    } else if stop_reason == "length" {
+                        let _ = writeln!(stderr, "openmax: stopped (length): {}", reply_limit_note(core, "Run openmax --continue -p \"<follow-up>\" to continue, after raising it if replies need more room"));
                     } else if stop_reason != "stop" && stop_reason != "tool_calls" && !reported {
                         let _ = writeln!(stderr, "openmax: stopped ({stop_reason})");
                     }
@@ -412,6 +414,13 @@ pub(crate) fn iteration_cap_note(cap: usize, how_to_continue: &str) -> String {
     let cap = cap.max(1);
     let rounds = if cap == 1 { "round" } else { "rounds" };
     format!("reached the limit of {cap} tool-call {rounds} for one turn. {how_to_continue}")
+}
+
+/// What a person reads when a reply is cut at its output limit: the limit in force, where it is set, then `how_to_continue`.
+pub(crate) fn reply_limit_note(core: &Core, how_to_continue: &str) -> String {
+    let limit = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir).map_or(String::new(), |e| format!(" = {}", e.max_tokens));
+    format!("the reply reached its output limit (max_tokens{limit}, reasoning included) before it finished. \
+             The limit is max_tokens on the model's providers.json entry, else in settings.json. {how_to_continue}")
 }
 
 #[cfg(test)]

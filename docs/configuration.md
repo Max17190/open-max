@@ -137,7 +137,14 @@ and the run that writes a key already uses it.
   eats the window (at most `context_tokens - 2048`), and sent as the reply's
   length limit. When the server reports the cut (finish_reason `length`, or
   a usage count at the limit), a tool call cut off at that limit does not
-  run; the model is told why and to send large content in parts.
+  run; the model is told why and to send large content in parts. A
+  reasoning model's reasoning counts toward the limit, so at 4096 a reply
+  can be cut inside its reasoning, with no text and no call; the turn then
+  ends with `length`, and the terminal UI and print mode say which
+  `max_tokens` cut it and where it is set. Send a follow-up to continue.
+  Set it to the model's documented output maximum, at most about a quarter
+  of the window, since the same number is reserved out of the input budget.
+  `openmax --check` warns while the active model runs at the default.
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
   model's value in `providers.json`, then a default that follows the
@@ -536,7 +543,13 @@ API setup loads the endpoint's model catalog and lets you choose an exact
 model. OpenAI setup omits known dedicated embedding, image, speech, realtime,
 and moderation model families; other providers retain their own catalogs.
 When the API does not report its context window, enter the value from
-the model's documentation. An endpoint without a model-list route can be
+the model's documentation. When the catalog reports the model's output
+maximum (`max_completion_tokens`, `max_output_tokens`, `max_tokens`, or
+`top_provider.max_completion_tokens`), setup also writes the model entry's
+`max_tokens`: that maximum, capped at a quarter of the window (the cap is
+never under the 4096 default, so a model whose own maximum is lower gets
+that maximum), and never replacing a `max_tokens` the entry already has. A catalog that reports no maximum gets no guess; `openmax
+--check` then warns that the model runs at the default. An endpoint without a model-list route can be
 configured with an exact model ID; setup reports that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.
 Run login again to add another. Choose the connection with `/model` afterward,
