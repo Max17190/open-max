@@ -34,6 +34,10 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 pub const LEFT_BEHIND_GRACE: Duration = Duration::from_millis(50);
 /// How often a group given a grace is checked for members still running.
 const GROUP_EXIT_POLL: Duration = Duration::from_millis(2);
+/// How long members of a group whose shell exited get to exit on their own
+/// before they count as left running and are stopped. A program's helpers,
+/// such as a test runner's worker pool, exit a few milliseconds after it.
+const LEFT_RUNNING_AFTER: Duration = Duration::from_millis(50);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// The longest a cancelled command takes to settle: a SIGTERM grace for its
 /// shell and one for the rest of its group, one for a stdin writer the
@@ -1152,7 +1156,7 @@ async fn supervise_child(
             // and the caller is handed a successful exit. Report it so the
             // caller learns the rule from the result instead of from a failing
             // request later.
-            let background_terminated = terminate_remaining_group(pid).await;
+            let background_terminated = stop_what_was_left_running(pid).await;
             Ok((Termination::Exited(status), background_terminated))
         }
         _ = cancel.cancelled() => {
@@ -1179,6 +1183,22 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
     }
     let _ = terminate_remaining_group(pid).await;
     Ok(())
+}
+
+/// Stops what a command whose shell exited left running in its group, and
+/// returns true when there was any. Members that exit within
+/// `LEFT_RUNNING_AFTER` were on their way out, not left running: reporting
+/// them told the caller of nearly every test run with a worker pool that its
+/// background processes were cut short, when it had started none.
+async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
+    let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
+    while process_group_exists(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            return terminate_remaining_group(pid).await;
+        }
+        tokio::time::sleep(GROUP_EXIT_POLL).await;
+    }
+    false
 }
 
 /// Returns true when group members outlived the leader and were terminated
@@ -3472,6 +3492,47 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "background descendant survived process cleanup");
+        assert!(output.background_terminated, "a stopped background child was not reported");
+    }
+
+    /// A program whose helpers exit a few milliseconds after it, as a test
+    /// runner's worker pool does once its pipe to them closes, left nothing
+    /// running: the call reports no background process terminated. Each
+    /// helper's teardown is 5 ms of work rather than a timer, which a QoS
+    /// clamp on macOS would stretch past the window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn helpers_that_exit_just_after_their_program_are_not_reported() {
+        let program = "use Time::HiRes qw(time); pipe(my $r, my $w) or die; for (1..4) { if (!fork) { \
+                       close $w; <$r>; my $end = time + 0.005; 1 while time < $end; exit } } close $r; \
+                       print qq(passed\\n)";
+        let output = run_process(request("perl", &["-e", program]), Arc::new(CancelToken::default()))
+            .await
+            .unwrap();
+        assert!(matches!(output.termination, Termination::Exited(status) if status.success()));
+        assert!(!output.background_terminated, "helpers on their way out were reported as left running");
+    }
+
+    /// A script that daemonizes a server, a subshell that backgrounds it with
+    /// its output detached and exits, still left it running in the group: it
+    /// is stopped and reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemonized_process_is_stopped_and_reported() {
+        let mut lifeline = Lifeline::new();
+        let pid_file = std::env::temp_dir().join(format!("openmax-daemon-{}", uuid::Uuid::new_v4()));
+        let script = format!(
+            "{}; (sleep 6848 </dev/null >/dev/null 2>&1 & echo $! > '{}'); exec 3>&-; echo started",
+            lifeline.open_in_shell(),
+            pid_file.display()
+        );
+        let output = run_process(request("/bin/sh", &["-c", &script]), Arc::new(CancelToken::default()))
+            .await
+            .unwrap();
+        let pid = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(!lifeline.survived(pid), "the daemonized process survived the call");
+        assert!(output.background_terminated, "the stopped daemon was not reported");
     }
 
     /// A process group whose leader has exited and left `member` running in
@@ -3506,7 +3567,9 @@ mod tests {
     /// whole grace, though such a child is gone within milliseconds. Only the
     /// cleanup is timed, from a group whose leader has already exited: on a
     /// loaded machine, starting a shell alone can take longer than the grace,
-    /// and that is not the wait. The fastest of five runs is the one measured.
+    /// and that is not the wait. The time includes `LEFT_RUNNING_AFTER`,
+    /// which the cleanup waits before it signals anything. The fastest of
+    /// five runs is the one measured.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_background_child_that_stops_on_sigterm_does_not_hold_the_call() {
@@ -3515,7 +3578,7 @@ mod tests {
         for _ in 0..5 {
             let (group, mut member) = group_whose_leader_exited(&["sleep", "6845"]).await;
             let started = std::time::Instant::now();
-            let (found, exited) = tokio::join!(terminate_remaining_group(group), member.wait());
+            let (found, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
             fastest = fastest.min(started.elapsed());
             assert!(found, "the background child was not found");
             assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the background child did not stop on SIGTERM");
