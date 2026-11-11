@@ -2237,6 +2237,28 @@ fn a_turn_at_its_iteration_cap_exits_four_with_every_call_answered() {
     env.resume(&run, &run.after);
 }
 
+/// In text mode the stop at the cap says what happened and how to go on:
+/// the cap it reached and the command that resumes.
+#[test]
+fn text_mode_at_the_iteration_cap_says_how_to_continue() {
+    let env = Env::with_settings(
+        "cap-text",
+        "a turn at its iteration cap",
+        vec![Step::Finished(sse_call("cap1", "capped"))],
+        r#","max_agent_iterations":1"#,
+    );
+    let (code, stderr) = env.text("go");
+    assert_eq!(code, Some(4), "{stderr}");
+    let said: Vec<&str> = stderr.lines().filter(|l| l.starts_with("openmax: stopped")).collect();
+    assert_eq!(
+        said,
+        ["openmax: stopped (max_iterations): reached the limit of 1 tool-call round for one turn. \
+          Run openmax --continue -p \"<follow-up>\" to continue, \
+          after raising max_agent_iterations in settings.json if it needs more rounds"],
+        "{stderr}"
+    );
+}
+
 /// A record cut off mid-write never became a message: the resume does not
 /// send it, the next save removes it, and the complete records before it
 /// stay as they were.

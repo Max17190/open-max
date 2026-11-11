@@ -2999,9 +2999,12 @@ impl App {
                     "stop" | "tool_calls" => self.push_turn_stats(),
                     "cancelled" => self.note("cancelled"),
                     "length" => self.note("stopped: hit the response token limit"),
-                    "max_iterations" => self.note(
-                        "stopped: reached the tool-call limit for one turn (send a follow-up to continue)",
-                    ),
+                    "max_iterations" => {
+                        let cap = self.core.settings.lock().unwrap().max_agent_iterations;
+                        let how = "Send a follow-up to continue. A higher max_agent_iterations in settings.json \
+                                   applies once openmax is restarted with --continue";
+                        self.note(&format!("stopped: {}", crate::headless::iteration_cap_note(cap, how)));
+                    }
                     "budget_exhausted" => self.note(
                         "stopped: reached the token budget for one turn (send a follow-up to continue)",
                     ),
@@ -7140,6 +7143,25 @@ mod tests {
         assert!(app.flush_queue, "the entry behind the blocked steer goes out after the turn");
         assert_eq!(app.queued, vec!["after".to_string()], "and only that entry");
         assert_eq!(app.composer.text(), "steer\ndraft", "the blocked steer stays the user's to edit");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A turn stopped at its iteration cap says which cap it reached and how
+    /// to go on, with the cap in force.
+    #[tokio::test]
+    async fn a_turn_at_its_iteration_cap_says_how_to_continue() {
+        let (mut app, dir) = app_fixture();
+        app.core.settings.lock().unwrap().max_agent_iterations = 7;
+        app.running = true;
+        app.on_agent_event(AgentEvent::Done { stop_reason: "max_iterations".into() });
+        let text = app.transcript.export_text();
+        assert!(
+            text.contains(
+                "stopped: reached the limit of 7 tool-call rounds for one turn. Send a follow-up to continue. \
+                 A higher max_agent_iterations in settings.json applies once openmax is restarted with --continue"
+            ),
+            "{text}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
