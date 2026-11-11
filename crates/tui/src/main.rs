@@ -2326,7 +2326,7 @@ fn print_usage_economics() {
     let schema_chars = registry.tool_schemas_wire().len();
     let component_chars: usize = breakdown.components.iter().map(|(_, c)| *c).sum();
     let frozen_chars = component_chars + schema_chars;
-    println!("frozen prompt prefix (paid on every request):");
+    println!("frozen prompt prefix with all seven built-ins (paid on every request; a session built in auto sends bash alone):");
     for (name, chars) in &breakdown.components {
         println!("  {name:<26} {chars:>7} chars  ~{} tok", chars / 4);
     }

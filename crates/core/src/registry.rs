@@ -11,9 +11,8 @@
 //! creation, `/reload`) builds it from the current generation. An unchanged
 //! disk is a no-op.
 //!
-//! With no external tools or skills installed, the schema JSON is
-//! byte-identical to the built-in `tools::tool_schemas()` array and the
-//! prompt gains nothing: extensibility costs zero tokens by default.
+//! With no tool files or skills installed, the array holds only built-ins
+//! (`Registry::send_builtins`): extensibility costs zero tokens by default.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -529,6 +528,25 @@ impl Registry {
         self.frozen_memory_rows = sent.frozen_memory_rows.clone();
     }
 
+    /// The tool files' entries in the tools array, which follow its built-ins.
+    fn file_entries(&self) -> Vec<Value> {
+        let entries = self.schemas.as_array().into_iter().flatten();
+        entries.filter(|entry| !tools::TOOL_NAMES.contains(&entry_name(entry))).cloned().collect()
+    }
+
+    /// Send all seven built-ins in the tools array of a new prompt, or with
+    /// `bash_alone`, for a session whose `bash` runs without asking, `bash`
+    /// alone of them. The others still run when called.
+    pub(crate) fn send_builtins(&mut self, bash_alone: bool) {
+        self.schemas = with_builtins(self.file_entries(), bash_alone);
+        self.schemas_wire = self.schemas.to_string().into();
+    }
+
+    /// Whether the tools array sends `bash` alone of the built-ins.
+    pub(crate) fn sends_bash_alone(&self) -> bool {
+        self.schemas.as_array().into_iter().flatten().map(entry_name).filter(|name| tools::TOOL_NAMES.contains(name)).eq(["bash"])
+    }
+
     /// A registry with built-ins only: the shape a session without a
     /// manifest resolves to until its first turn re-freezes from disk, and
     /// the baseline tests build on.
@@ -548,6 +566,7 @@ impl Registry {
 
         let schemas = with_builtins(
             tools_list.iter().filter(|s| !matches!(s.kind, ToolKind::Builtin)).map(schema_entry),
+            false,
         );
 
         let by_name = tools_list
@@ -756,6 +775,10 @@ pub struct RegistryManifest {
     /// re-freeze keeps: a resume sends the built-ins and these, whatever has
     /// loaded since (`external_tools` is what runs).
     pub frozen_tools: Vec<Value>,
+    /// The tools array sends `bash` alone of the built-ins. Absent in older
+    /// manifests, whose sessions sent all seven and resume sending them.
+    #[serde(default)]
+    pub bash_alone: bool,
     /// What the session's persisted prompt indexes, which the trailing note
     /// is the difference from.
     pub prompt_index: crate::prompt::PromptIndex,
@@ -853,14 +876,8 @@ impl Registry {
             external_tools,
             skills: self.skills.clone(),
             ext_fingerprint: self.ext_fingerprint,
-            frozen_tools: self
-                .schemas
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|entry| !tools::TOOL_NAMES.contains(&entry_name(entry)))
-                .cloned()
-                .collect(),
+            frozen_tools: self.file_entries(),
+            bash_alone: self.sends_bash_alone(),
             prompt_index: self.prompt_index.as_ref().clone(),
             tools_omitted: self.tools_omitted,
         }
@@ -903,10 +920,10 @@ impl Registry {
         registry.frozen_memory_rows = manifest.memory_rows.clone();
         registry.read_paths = manifest.read_files.map(|files| files.into_iter().collect());
         // The array the session sends is the one its prompt was built with,
-        // not the generation's: today's built-ins, then the tool files it
-        // carried, a name a built-in now takes excepted.
+        // not the generation's: today's built-ins, as many as it sent, then
+        // the tool files it carried, a name a built-in now takes excepted.
         let frozen = manifest.frozen_tools.into_iter().filter(|e| !tools::TOOL_NAMES.contains(&entry_name(e)));
-        registry.schemas = with_builtins(frozen);
+        registry.schemas = with_builtins(frozen, manifest.bash_alone);
         registry.schemas_wire = registry.schemas.to_string().into();
         registry.prompt_index = Arc::new(manifest.prompt_index);
         registry
@@ -933,10 +950,12 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
     }
 }
 
-/// The built-in schemas followed by `entries`: a tools array as sent.
-fn with_builtins(entries: impl IntoIterator<Item = Value>) -> Value {
+/// The built-in schemas, `bash` alone of them with `bash_alone`, followed by
+/// `entries`: a tools array as sent.
+fn with_builtins(entries: impl IntoIterator<Item = Value>, bash_alone: bool) -> Value {
     let mut schemas = tools::tool_schemas().clone();
     if let Some(arr) = schemas.as_array_mut() {
+        arr.retain(|entry| !bash_alone || entry_name(entry) == "bash");
         arr.extend(entries);
     }
     schemas
@@ -2301,6 +2320,39 @@ mutatng = true
             ]
         );
         assert!(!names.iter().any(|n| n == "task"));
+    }
+
+    /// An array that sends `bash` alone of the built-ins keeps every tool
+    /// file's entry after it and all seven runnable, and survives the
+    /// manifest; a manifest from before the choice was recorded restores all
+    /// seven, the array its session sent, and so does the next prompt that
+    /// sends them.
+    #[test]
+    fn an_array_with_bash_alone_survives_the_manifest_and_older_manifests_send_seven() {
+        let dir = temp_dir("bash-alone");
+        let (global, project) = (dir.join("g"), dir.join("p"));
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        write_tool(&project, "deploy.toml", "name = \"deploy\"\ndescription = \"ships it\"\ncommand = \"/bin/echo\"\n");
+        let mut registry = registry_from(&global, &project);
+        assert!(!registry.sends_bash_alone());
+        registry.send_builtins(true);
+        let sent = |r: &Registry| r.tool_schemas_json().as_array().unwrap().iter().map(|e| entry_name(e).to_string()).collect::<Vec<_>>();
+        assert_eq!(sent(&registry), ["bash", "deploy"]);
+        assert!(registry.sends_bash_alone());
+        assert_eq!(registry.tool_names().len(), tools::TOOL_NAMES.len() + 1, "every built-in still runs");
+        let manifest = serde_json::to_value(registry.to_manifest()).unwrap();
+        let restored = Registry::from_manifest(serde_json::from_value(manifest.clone()).unwrap());
+        assert_eq!(restored.tool_schemas_wire(), registry.tool_schemas_wire());
+        assert_eq!(restored.tool_names(), registry.tool_names(), "and every built-in still runs after a resume");
+        let mut older = manifest;
+        older.as_object_mut().unwrap().remove("bash_alone");
+        let older = Registry::from_manifest(serde_json::from_value(older).unwrap());
+        assert_eq!(sent(&older), ["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash", "deploy"]);
+        registry.send_builtins(false);
+        assert_eq!(registry.tool_schemas_wire(), older.tool_schemas_wire(), "and back to seven at the next prompt");
+        assert!(!registry.sends_bash_alone());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

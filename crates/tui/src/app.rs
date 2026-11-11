@@ -1619,7 +1619,7 @@ impl App {
             Ok(()) => {
                 // The save resolved the path itself; show the project it saved for.
                 self.refresh_project_root();
-                self.note(&format!("permissions: {} for this project (saved)", mode.as_str()));
+                self.note(&format!("permissions: {} for this project (saved; the tools array follows at /reload)", mode.as_str()));
                 self.status_mode = Some(mode);
                 self.dirty.mark_chrome();
                 true

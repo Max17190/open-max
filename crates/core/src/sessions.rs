@@ -2516,6 +2516,7 @@ mod tests {
             memory_rows: None,
             read_files: None,
             frozen_tools: Vec::new(),
+            bash_alone: false,
             prompt_index: Default::default(),
             tools_omitted: 0,
         });

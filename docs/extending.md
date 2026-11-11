@@ -602,10 +602,11 @@ The frozen prefix of every request is the system prompt (messages[0]) and the
 included. Both are built when the session is created: the prompt from the base
 rules, `AGENTS.md` (capped at 2000 bytes), the memory index, the layout map,
 and the skills index as they stand then, and the array from the built-ins
-(the `bash` schema carries the extension pointer) and the tool files that
-load then. The prompt is persisted
-with the session, and its manifest records the array's tool files and what the
-prompt's index shows.
+(the `bash` schema carries the extension pointer; a session built in `auto`
+sends `bash` alone of them, see [approvals](configuration.md#approvals)) and
+the tool files that load then, after the built-ins. The prompt is persisted
+with the session, and its manifest records the array's tool files, whether it
+sends `bash` alone of the built-ins, and what the prompt's index shows.
 
 What the session changes after that rides the note: each tool file
 the array lacks or carries with another description or schema, by its line

@@ -296,6 +296,26 @@ choice and needs its own.
   directory the session starts in; unlike the mode, it is not inherited.
 - `readonly` blocks mutating calls and calls that would require confirmation.
 
+The mode also picks the built-in tools a session's tools array sends. The
+array is built with the system prompt, when a session starts and at
+`/reload`, and holds until the next one, so a provider's prompt cache keeps
+it. Built in `auto`, it sends `bash` alone: there `bash` runs without
+asking, and one command can list, search, read and edit, several steps at
+once, where each typed tool call takes a model request of its own. Built in
+`ask` or `readonly`, where `bash` waits for approval or is refused, it sends
+all seven, and so it does in `auto` under a `deny` rule for `bash` that
+matches `ls` or an empty command, such as one with no `arg_regex`. The system
+prompt's tools line names only what the array sends. Headless, stdio and
+sub-agent sessions build it the same way, in the mode their project runs in.
+A mode chosen later gates calls at once, and the model reads it in the
+execution policy note below; the array changes at `/reload` or in a new
+session. Until then a session built in `auto` and switched to `ask` sends
+`bash` alone and each command waits for approval, and every built-in the
+array leaves out still runs when the model calls it, without approval where
+the mode allows that. Hooks see the call the model makes: a hook keyed to
+`edit_file` or `write_file` does not see a change made through `bash`, which
+in `auto` is how a session edits, so gate such changes on `bash` too.
+
 Deny rules, hook gates, parsing, output limits, and execution reports remain
 active in every mode. Rules are still first-match and cannot relax during a
 turn. Hook file edits apply at the next turn; explicit mode changes refresh

@@ -110,9 +110,10 @@ const REPOSITORY_TREE: [&str; 17] = [
 /// resends the whole conversation, so a session that makes one small call per
 /// response pays for its context once per call, and the rule asks for calls
 /// and file reads to share a response instead. For the same reason it holds
-/// the line that names the four core tools, bash steps chained in one
-/// command among them, and the absence of the two rules that made a read
-/// before every change and a build or test after it per-step obligations.
+/// the tools line, which names only what the array sends, `bash` alone in
+/// `auto` with edits and steps chained in one command among its uses, and
+/// the absence of the two rules that made a read before every change and a
+/// build or test after it per-step obligations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frozen_prefix_is_under_700_tokens() {
     frozen_prefix_case("frozen_prefix_is_under_700_tokens", false).await;
@@ -224,10 +225,13 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
         serde_json::from_str::<serde_json::Value>(tools).unwrap()["tools"].as_array().unwrap().iter()
             .map(|function| serde_json::json!({"type":"function","function":function})).collect()
     } else { serde_json::from_str::<Vec<serde_json::Value>>(tools).unwrap() };
-    let write_file = schemas
-        .iter()
-        .find(|tool| tool["function"]["name"] == "write_file")
-        .expect("write_file is a built-in tool");
+    // An auto session sends `bash` alone of the built-ins. A session that
+    // sends write_file (one built in `ask` or `readonly`) sends this schema,
+    // which points changes at edit_file.
+    let sent: Vec<&str> = schemas.iter().filter_map(|tool| tool["function"]["name"].as_str()).collect();
+    assert_eq!(sent, ["bash"], "an auto session sends bash alone of the built-ins");
+    let write_file = open_max_core::tools::tool_schemas().as_array().unwrap().iter()
+        .find(|tool| tool["function"]["name"] == "write_file").expect("write_file is a built-in tool");
     let write_file = write_file["function"]["description"].as_str().unwrap_or_default();
     assert!(write_file.contains("prefer edit_file"), "write_file must point changes at edit_file: {write_file}");
     assert!(
@@ -240,7 +244,10 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
     );
     let tools_line = system.lines().find(|line| line.starts_with("Tools: ")).unwrap_or_default();
     for tool in ["bash", "read_file", "edit_file", "write_file"] {
-        assert!(tools_line.contains(tool), "the prompt names what {tool} is for:\n{system}");
+        assert_eq!(tools_line.contains(tool), sent.contains(&tool), "the prompt names what {tool} is for where it is sent:\n{system}");
+    }
+    if !sent.contains(&"edit_file") {
+        assert!(tools_line.contains("edits"), "bash makes the edits where edit_file is not sent:\n{system}");
     }
     assert!(tools_line.contains("chain steps"), "bash steps share a command:\n{system}");
     // No rule makes a read or a check a per-step obligation.

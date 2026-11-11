@@ -31,6 +31,18 @@ fn seen_approval_events(core: &Core, project_root: &Path) -> Option<HashSet<u64>
     )
 }
 
+/// A new prompt and the tools array beside it, which hold until the next.
+/// Where `bash` runs without asking, in `auto` with no rule that denies `ls`
+/// or the empty command, the array sends `bash` alone of the built-ins.
+pub(crate) fn new_prompt(core: &Core, project_root: &Path, registry: &mut Registry) -> (String, Option<String>, PromptBreakdown) {
+    core.refresh_saved_approval_modes();
+    let mode = core.approval_mode(project_root);
+    let rules = crate::permissions::Permissions::discover_for_mode(project_root, &core.data_dir, mode);
+    let denied = |command: &str| matches!(rules.evaluate("bash", &serde_json::json!({ "command": command })), crate::permissions::PermissionDecision::Deny { .. });
+    registry.send_builtins(mode == ApprovalMode::Auto && !denied("") && !denied("ls"));
+    session_context(project_root, registry)
+}
+
 pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_root: &Path) -> Result<SessionData, String> {
     sessions::ensure_owned(core, session_id)?;
     Ok(if let Some(mut messages) = sessions::load_messages(core, session_id)? {
@@ -62,7 +74,7 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             }
             None => {
                 let mut registry = Registry::build(&core.data_dir, project_root);
-                let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+                let (prompt, note, breakdown) = new_prompt(core, project_root, &mut registry);
                 if needs_system {
                     messages.insert(0, ChatMessage::system(prompt));
                 } else {
@@ -143,7 +155,7 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             }
             None => Registry::build(&core.data_dir, project_root),
         };
-        let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+        let (prompt, note, breakdown) = new_prompt(core, project_root, &mut registry);
         // Always persisted (even builtin-only) so the extension fingerprint
         // and the record of what the prompt indexes travel with the session;
         // without them every resume would look like a self-modification and

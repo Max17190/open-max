@@ -182,8 +182,7 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
             // states, and the index line is what a model reads to decide
             // whether to open the skill at all. The run ends at the first
             // non-blank line no deeper than the key, so a sibling key never
-            // joins the value. A quoted value is a single token by
-            // definition and takes no continuation.
+            // joins the value.
             let raw = unquote(value);
             // A quoted value is one token by definition. A value that OPENS
             // like a block-scalar header but is not a legal one (`>0`, a zero
@@ -200,11 +199,9 @@ pub(crate) fn frontmatter_descriptions(block: &str) -> Vec<String> {
                     let next = lines[i];
                     // A blank line inside a plain scalar is a fold, not an
                     // end: YAML keeps reading while the following lines stay
-                    // deeper than the key. Breaking here dropped everything
-                    // after the first blank, which is the same truncation
-                    // this change exists to remove, one paragraph in. The
-                    // block-scalar branch above already skips blanks; these
-                    // two loops answer the same question and must agree.
+                    // deeper than the key. The block-scalar branch above
+                    // already skips blanks; these two loops answer the same
+                    // question and must agree.
                     if next.trim().is_empty() {
                         i += 1;
                         continue;

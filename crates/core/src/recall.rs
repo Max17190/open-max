@@ -765,8 +765,6 @@ fn collect_chunks(
             sessions::archive_display(core, &meta.id),
             sessions::compaction_display(core, &meta.id),
         ];
-        // An index entry whose files are all gone is listed history that
-        // cannot be read: reported as unreadable, never as scanned.
         if !stores.iter().any(|p| Path::new(p).exists()) {
             unreadable += 1;
             continue;
@@ -813,71 +811,38 @@ fn collect_chunks(
                 paths: record.paths,
             });
         }
-        let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
-        let messages_path = std::path::PathBuf::from(sessions::messages_display(core, &meta.id));
-        let (records, tail_cut) =
-            bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget);
-        cut |= tail_cut;
-        for (line, msg) in records {
-            if bytes >= scan_ceiling {
-                cut = true;
-                break;
-            }
-            if msg.role == "system" {
-                continue;
-            }
-            let Some(content) = msg.content else { continue };
-            if content.trim().is_empty() {
-                continue;
-            }
-            let content = bounded(content);
-            bytes += content.len();
-            let source = sessions::messages_display(core, &meta.id);
-            for page in pages(&content) {
-                chunks.push(Chunk {
-                    kind: "message",
-                    role: Some(msg.role.clone()),
-                    session: Some(meta.id.clone()),
-                    title: Some(meta.title.clone()),
-                    age_hours: age,
-                    doc: format!("{source}#{line}"),
-                    source: source.clone(),
-                    line: Some(line),
-                    text: page.to_string(),
-                    paths: Vec::new(),
-                });
-            }
-        }
-        let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
-        let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
-        let (records, tail_cut) =
-            bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget);
-        cut |= tail_cut;
-        for (line, msg) in records {
-            if bytes >= scan_ceiling {
-                cut = true;
-                break;
-            }
-            let Some(content) = msg.content else { continue };
-            if content.trim().is_empty() {
-                continue;
-            }
-            let content = bounded(content);
-            bytes += content.len();
-            let source = sessions::archive_display(core, &meta.id);
-            for page in pages(&content) {
-                chunks.push(Chunk {
-                    kind: "archive",
-                    role: Some(msg.role.clone()),
-                    session: Some(meta.id.clone()),
-                    title: Some(meta.title.clone()),
-                    age_hours: age,
-                    doc: format!("{source}#{line}"),
-                    source: source.clone(),
-                    line: Some(line),
-                    text: page.to_string(),
-                    paths: Vec::new(),
-                });
+        for (kind, source) in [("message", &stores[0]), ("archive", &stores[1])] {
+            let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
+            let (records, tail_cut) = bounded_jsonl::<crate::types::ChatMessage>(Path::new(source), io_budget);
+            cut |= tail_cut;
+            for (line, msg) in records {
+                if bytes >= scan_ceiling {
+                    cut = true;
+                    break;
+                }
+                if kind == "message" && msg.role == "system" {
+                    continue;
+                }
+                let Some(content) = msg.content else { continue };
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let content = bounded(content);
+                bytes += content.len();
+                for page in pages(&content) {
+                    chunks.push(Chunk {
+                        kind,
+                        role: Some(msg.role.clone()),
+                        session: Some(meta.id.clone()),
+                        title: Some(meta.title.clone()),
+                        age_hours: age,
+                        doc: format!("{source}#{line}"),
+                        source: source.clone(),
+                        line: Some(line),
+                        text: page.to_string(),
+                        paths: Vec::new(),
+                    });
+                }
             }
         }
         if cut {

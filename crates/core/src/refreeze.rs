@@ -15,11 +15,11 @@ use std::sync::Arc;
 use crate::agent::unapproved_capability;
 use crate::config::ApprovalMode;
 use crate::notes::append_and_emit_note;
-use crate::prompt::{session_context, trailing_note, PromptBreakdown};
+use crate::prompt::{trailing_note, PromptBreakdown};
 use crate::registry::{ExtensionSnapshot, Registry};
 use crate::sessions;
 use crate::state::{Core, SessionData};
-use crate::transcript::{ensure_session_hydrated, land_deferred_resume_edits};
+use crate::transcript::{ensure_session_hydrated, land_deferred_resume_edits, new_prompt};
 use crate::types::{AgentEvent, ChatMessage};
 
 /// Re-freeze a live session's registry, system prompt, and tools array from
@@ -52,7 +52,7 @@ pub async fn reload_session(
     let mut registry = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot))
         .await
         .map_err(|e| format!("reload discovery failed: {e}"))?;
-    let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+    let (prompt, note, breakdown) = new_prompt(core, project_root, &mut registry);
 
     ensure_session_hydrated(core, session_id, project_root).await?;
 

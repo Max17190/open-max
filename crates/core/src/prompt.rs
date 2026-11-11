@@ -233,10 +233,15 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     // one of those rounds resends the conversation. When to read and verify
     // is left to the model. Both sides count against the frozen prompt
     // budget in `frozen_prompt_fits_token_budget`.
+    let tools = if registry.sends_bash_alone() {
+        "bash runs shell commands (ls, rg, git, tests, edits; chain steps)."
+    } else {
+        "bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files."
+    };
     let mut prompt = format!(
         "You are Open Max, an expert coding agent working on the project at {root}.\n\
         \n\
-        Tools: bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files.\n\
+        Tools: {tools}\n\
         \n\
         Rules:\n\
         - Paths are project-relative.\n\
@@ -1330,45 +1335,46 @@ mod tests {
     /// batched tool calls, and before that it was
     /// 2,662, 63 over the 2,599 bytes (589 tokens) they measured when the cap
     /// came down from 3,450; before that cut they measured 3,362 bytes (762
-    /// tokens). It is a ratchet: a cut lowers it, and growth needs the
-    /// argument for why every request pays for it.
+    /// tokens). The payload of a prompt whose array sends `bash` alone of the
+    /// built-ins, as one built in `auto` does, has its own cap, AUTO_CAP, at
+    /// the 959 bytes (230 tokens) it measured when that began. Both are
+    /// ratchets: a cut lowers them, and growth needs the argument for why
+    /// every request pays for it.
     /// Grounding sections have separate caps. Measure the payload with
     /// dump_frozen_prompt_payload_for_tokenizer and a real tokenizer before
     /// changing this budget; provider framing is not included.
     #[test]
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
-        let registry = crate::registry::Registry::build(&dir.join("data"), &dir);
-        let (_, breakdown) = system_prompt_with_breakdown(&dir, &registry);
-        let base_chars = breakdown
-            .components
-            .iter()
-            .filter(|(name, _)| name == "base rules")
-            .map(|(_, c)| *c)
-            .sum::<usize>();
-        let path_free = base_chars - dir.to_string_lossy().len();
-        // Serialize the builtin entries as one array so brackets and commas
-        // count, exactly as the wire payload does.
-        let builtins: Vec<&serde_json::Value> = registry
-            .tool_schemas_json()
-            .as_array()
-            .expect("schemas are an array")
-            .iter()
-            .zip(&registry.tools)
-            .filter(|(_, spec)| matches!(spec.kind, crate::registry::ToolKind::Builtin))
-            .map(|(entry, _)| entry)
-            .collect();
-        let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
-        let total = path_free + tool_chars;
+        let mut registry = crate::registry::Registry::build(&dir.join("data"), &dir);
+        assert!(!registry.has_extensions(), "the budget prices the built-ins alone");
         const CAP: usize = 2_595;
-        assert!(
-            total <= CAP,
-            "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
-             {path_free} + builtin tools {tool_chars} = {total}, cap {CAP}. \
-             Re-measure with dump_frozen_prompt_payload_for_tokenizer and a real tokenizer \
-             before changing the budget.",
-            total - CAP,
-        );
+        const AUTO_CAP: usize = 959;
+        for (bash_alone, cap) in [(false, CAP), (true, AUTO_CAP)] {
+            // With no tool files the array holds only built-ins, serialized as
+            // one array so brackets and commas count, exactly as the wire
+            // payload does. The base rules name what the array sends.
+            registry.send_builtins(bash_alone);
+            let (_, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+            let base_chars = breakdown
+                .components
+                .iter()
+                .filter(|(name, _)| name == "base rules")
+                .map(|(_, c)| *c)
+                .sum::<usize>();
+            let path_free = base_chars - dir.to_string_lossy().len();
+            let tool_chars = registry.tool_schemas_wire().len();
+            let total = path_free + tool_chars;
+            println!("frozen prompt payload (bash_alone={bash_alone}): {path_free} + {tool_chars} = {total} bytes, cap {cap}");
+            assert!(
+                total <= cap,
+                "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
+                 {path_free} + builtin tools {tool_chars} = {total}, cap {cap} (bash_alone={bash_alone}). \
+                 Re-measure with dump_frozen_prompt_payload_for_tokenizer and a real tokenizer \
+                 before changing the budget.",
+                total - cap,
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1467,20 +1473,24 @@ mod tests {
     #[ignore]
     fn dump_frozen_prompt_payload_for_tokenizer() {
         let dir = temp_project();
-        let registry = crate::registry::Registry::build(&dir.join("data"), &dir);
-        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
-        let base_chars: usize = breakdown
-            .components
-            .iter()
-            .filter(|(name, _)| name == "base rules")
-            .map(|(_, c)| *c)
-            .sum();
-        let path_free = prompt[..base_chars].replace(&dir.to_string_lossy().to_string(), "");
-        let base_path = std::env::temp_dir().join("openmax-prompt-base.txt");
-        let tools_path = std::env::temp_dir().join("openmax-prompt-tools.json");
-        std::fs::write(&base_path, path_free).unwrap();
-        std::fs::write(&tools_path, registry.tool_schemas_wire()).unwrap();
-        eprintln!("wrote {} and {}", base_path.display(), tools_path.display());
+        let mut registry = crate::registry::Registry::build(&dir.join("data"), &dir);
+        // The `-auto` pair is the payload of an array that sends `bash` alone.
+        for (bash_alone, suffix) in [(false, ""), (true, "-auto")] {
+            registry.send_builtins(bash_alone);
+            let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+            let base_chars: usize = breakdown
+                .components
+                .iter()
+                .filter(|(name, _)| name == "base rules")
+                .map(|(_, c)| *c)
+                .sum();
+            let path_free = prompt[..base_chars].replace(&dir.to_string_lossy().to_string(), "");
+            let base_path = std::env::temp_dir().join(format!("openmax-prompt-base{suffix}.txt"));
+            let tools_path = std::env::temp_dir().join(format!("openmax-prompt-tools{suffix}.json"));
+            std::fs::write(&base_path, path_free).unwrap();
+            std::fs::write(&tools_path, registry.tool_schemas_wire()).unwrap();
+            eprintln!("wrote {} and {}", base_path.display(), tools_path.display());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
