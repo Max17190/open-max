@@ -348,10 +348,13 @@ async fn summarize_compaction(
     ];
     let estimated = messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
     if !spend.admits(estimated) { return None; }
-    let result = match tokio::time::timeout(
-        SUMMARY_TIMEOUT,
-        client.stream_chat(&messages, "[]", cancelled.clone(), |_| {}),
-    ).await {
+    let mut resent = Vec::new();
+    let outcome = tokio::time::timeout(SUMMARY_TIMEOUT, client.stream_chat(&messages, "[]", cancelled.clone(), |delta| {
+        if let crate::client::StreamDelta::Usage(usage) = delta { resent.push(usage); }
+    })).await;
+    // A summary the client asked for again was paid for, however this one ended.
+    for usage in resent { spend.charge(core, session_id, usage); }
+    let result = match outcome {
         Ok(Ok(result)) => result,
         _ => {
             // Without a completed response, reserve the configured output cap.
@@ -1150,6 +1153,41 @@ pub(crate) mod tests {
         let positions = tails.map(|tail| input.find(tail).unwrap_or_else(|| panic!("missing {tail:?}")));
         assert!(positions[0] < positions[1] && positions[1] < positions[2], "the summary follows transcript order");
         assert!(input.len() <= dropped_text_cap(BUDGET));
+    }
+
+    /// A summary the client asks for again after a cut is charged for both
+    /// replies: the usage the cut one reported and the finished one's.
+    #[tokio::test]
+    async fn a_summary_asked_for_again_charges_both_replies() {
+        let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("Find the build result.")];
+        messages.extend((0..20).map(|_| msg("assistant", 1_760)));
+        let (url, served) = crate::client::tests::spawn_sse_sequence(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Half\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":3}}\n\n".into(),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n",
+            )
+            .into(),
+        ]);
+        let dir = std::env::temp_dir().join(format!("openmax-summary-{}", uuid::Uuid::new_v4()));
+        let (core, _) = Core::new(dir.clone()).unwrap();
+        let session_id = sessions::create(&core, dir.display().to_string()).unwrap().id;
+        let ctx = CompactionCtx {
+            core: &core,
+            session_id: &session_id,
+            project_root: &dir,
+            client: &ChatClient::new(url, None, "fixture".into(), None, 512),
+            estimate: &ChatMessage::estimated_tokens,
+            hooks: &Hooks::default(),
+            cancelled: &Arc::new(CancelToken::default()),
+        };
+        assert!(sessions::save_messages(&core, &session_id, &messages, &mut 0, true));
+        let mut spend = RequestSpend::new(None);
+        assert!(compact_messages(&ctx, &mut messages, 2_000, 0, false, &mut spend).await.unwrap() > 0);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(*served.lock().unwrap(), 2);
+        assert!(messages.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains("Summary: Done."))));
+        assert_eq!(spend.tokens, 103 + 105);
     }
 
     #[tokio::test]

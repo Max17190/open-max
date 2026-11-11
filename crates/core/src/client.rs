@@ -2513,7 +2513,7 @@ pub(crate) mod tests {
     /// closes the connection after reading the request without answering:
     /// the shape of a transport fault on send. Returns the URL and the
     /// number of connections it served.
-    fn spawn_sse_sequence(bodies: Vec<String>) -> (String, Arc<std::sync::Mutex<usize>>) {
+    pub(crate) fn spawn_sse_sequence(bodies: Vec<String>) -> (String, Arc<std::sync::Mutex<usize>>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
