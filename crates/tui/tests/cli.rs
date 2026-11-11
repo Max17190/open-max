@@ -1900,8 +1900,8 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(4), "{stderr}");
     assert!(stderr.contains(
-        "openmax: stopped (length): the reply reached its output limit (max_tokens = 4096, reasoning included) before it finished. \
-         The limit is max_tokens on the model's providers.json entry, else in settings.json. \
+        "openmax: stopped (length): the reply reached its output limit before it finished; reasoning counts toward it. \
+         The limit is max_tokens (now 4096), on the model's providers.json entry, else in settings.json. \
          Run openmax --continue -p \"<follow-up>\" to continue, after raising it if replies need more room"), "{stderr}");
     let body: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
     assert_eq!(body["max_tokens"], 4096, "the stop line names the limit the request was sent with");
@@ -1927,6 +1927,18 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
     std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"ask"}"#).unwrap();
     let (_, all) = check(&["--check", "--all"]);
     assert!(all.contains("reply limit max_tokens = 3000 from the model entry"), "{all}");
+
+    // Every settings save writes 4096 when the limit is unset, so a 4096 in
+    // settings.json still reads as the default; on the model entry it is a choice.
+    std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"ask","max_tokens":4096}"#).unwrap();
+    std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384}}]}}}}}}"#)).unwrap();
+    let (_, report) = check(&["--check"]);
+    assert!(report.contains("max_tokens = 4096, the default") && report.contains("4096 counts as chosen only on the entry"), "{report}");
+    std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384,"max_tokens":4096}}]}}}}}}"#)).unwrap();
+    let (_, report) = check(&["--check"]);
+    assert!(!report.contains("max_tokens"), "a 4096 on the model entry is a choice:\n{report}");
+    let (_, all) = check(&["--check", "--all"]);
+    assert!(all.contains("reply limit max_tokens = 4096 from the model entry"), "{all}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

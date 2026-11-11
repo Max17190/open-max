@@ -880,7 +880,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                         let from = if entry.is_some() { "the model entry" } else if settings.max_tokens != crate::config::Settings::default().max_tokens { "settings" } else if endpoint.chatgpt.is_some() { "the default, a local reserve on this route" } else { "" };
                         let row = format!("model {} via {}, {}-token window, reply limit max_tokens = {}", endpoint.model, endpoint.provider.as_deref().unwrap_or("base_url"), endpoint.context_tokens, endpoint.max_tokens);
                         if !from.is_empty() { Status::Ok(format!("{row} from {from}; read at launch, not hot (openmax --spec settings)")) }
-                        else { Status::Warn(format!("{row}, the default: a reply longer than this, its reasoning included, is cut and ends the turn; set max_tokens on the model's providers.json entry (or in settings.json) to its documented output maximum; read at launch, not hot (openmax --spec settings)")) }
+                        else { Status::Warn(format!("{row}, the default: a reply longer than this, its reasoning included, is cut and ends the turn; set max_tokens on the model's providers.json entry (or in settings.json) to its documented output maximum (4096 counts as chosen only on the entry, since every settings save writes 4096 when it is unset); read at launch, not hot (openmax --spec settings)")) }
                     }
                     Err(reason) => Status::Warn(format!(
                         "parses, but every turn will refuse until this resolves: {}; read at launch, not hot (openmax --spec settings)",

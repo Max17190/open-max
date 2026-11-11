@@ -144,7 +144,9 @@ and the run that writes a key already uses it.
   `max_tokens` cut it and where it is set. Send a follow-up to continue.
   Set it to the model's documented output maximum, at most about a quarter
   of the window, since the same number is reserved out of the input budget.
-  `openmax --check` warns while the active model runs at the default.
+  `openmax --check` warns while the active model runs at the default. A
+  4096 counts as chosen only on the model's entry: every settings save
+  writes 4096 to settings.json when the limit is unset.
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
   model's value in `providers.json`, then a default that follows the

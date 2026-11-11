@@ -7181,8 +7181,8 @@ mod tests {
         let text = app.transcript.export_text();
         assert!(
             text.contains(
-                "stopped: the reply reached its output limit (max_tokens = 6000, reasoning included) before it finished. \
-                 The limit is max_tokens on the model's providers.json entry, else in settings.json. Send a follow-up to continue."
+                "stopped: the reply reached its output limit before it finished; reasoning counts toward it. \
+                 The limit is max_tokens (now 6000), on the model's providers.json entry, else in settings.json. Send a follow-up to continue."
             ),
             "{text}"
         );
