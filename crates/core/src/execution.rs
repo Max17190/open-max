@@ -3495,22 +3495,34 @@ mod tests {
         assert!(output.background_terminated, "a stopped background child was not reported");
     }
 
-    /// A program whose helpers exit a few milliseconds after it, as a test
+    /// A program whose helper exits a few milliseconds after it, as a test
     /// runner's worker pool does once its pipe to them closes, left nothing
-    /// running: the call reports no background process terminated. Each
-    /// helper's teardown is 5 ms of work rather than a timer, which a QoS
-    /// clamp on macOS would stretch past the window.
+    /// running: the helper is not signalled and nothing is reported. The
+    /// helper is the test's own child, reaped as it exits, so a host whose
+    /// init does not reap orphans cannot keep it in the group as a zombie.
+    /// Its teardown is 5 ms of work rather than a timer, which a QoS clamp on
+    /// macOS would stretch past the window.
     #[cfg(unix)]
     #[tokio::test]
-    async fn helpers_that_exit_just_after_their_program_are_not_reported() {
-        let program = "use Time::HiRes qw(time); pipe(my $r, my $w) or die; for (1..4) { if (!fork) { \
-                       close $w; <$r>; my $end = time + 0.005; 1 while time < $end; exit } } close $r; \
-                       print qq(passed\\n)";
-        let output = run_process(request("perl", &["-e", program]), Arc::new(CancelToken::default()))
-            .await
-            .unwrap();
-        assert!(matches!(output.termination, Termination::Exited(status) if status.success()));
-        assert!(!output.background_terminated, "helpers on their way out were reported as left running");
+    async fn a_helper_that_exits_just_after_its_program_is_not_reported() {
+        use std::os::unix::process::CommandExt;
+        let mut program = Command::new("sleep");
+        program.arg("6849").kill_on_drop(true);
+        program.as_std_mut().process_group(0);
+        let mut program = program.spawn().unwrap();
+        let group = program.id();
+        let teardown = "use Time::HiRes qw(time); <STDIN>; my $end = time + 0.005; 1 while time < $end";
+        let mut helper = Command::new("perl");
+        helper.args(["-e", teardown]).stdin(std::process::Stdio::piped()).kill_on_drop(true);
+        helper.as_std_mut().process_group(i32::try_from(group.unwrap()).unwrap());
+        let mut helper = helper.spawn().unwrap();
+        let pipe = helper.stdin.take();
+        program.start_kill().unwrap();
+        program.wait().await.unwrap();
+        drop(pipe);
+        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), helper.wait());
+        assert_eq!(exited.unwrap().code(), Some(0), "the helper was stopped instead of exiting on its own");
+        assert!(!reported, "a helper on its way out was reported as left running");
     }
 
     /// A script that daemonizes a server, a subshell that backgrounds it with
