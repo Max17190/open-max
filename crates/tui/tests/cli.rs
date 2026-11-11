@@ -3596,7 +3596,8 @@ fn spec_usage_names_memory_cost_and_never_claims_zero() {
 
 /// `openmax --spec usage` prices the tools array a new session in the
 /// project would send in its mode: `bash` alone of the built-ins in `auto`,
-/// all seven in `ask`, and the tools line of each prompt with it.
+/// whether the settings or the project's saved choice gives it, all seven in
+/// `ask`, and the tools line of each prompt with it.
 #[test]
 fn spec_usage_prices_the_array_a_new_session_sends() {
     let (project, home) = fresh_dirs("usage-array");
@@ -3612,6 +3613,8 @@ fn spec_usage_prices_the_array_a_new_session_sends() {
     assert_eq!(row("auto", "tool schemas"), serde_json::to_string(&bash).unwrap().len(), "auto prices bash alone");
     assert_eq!(row("ask", "tool schemas"), serde_json::to_string(schemas).unwrap().len(), "ask prices all seven");
     assert!(row("auto", "base rules") < row("ask", "base rules"), "and the tools line that names them");
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    assert_eq!(row("ask", "tool schemas"), serde_json::to_string(&bash).unwrap().len(), "a project saved in auto prices bash alone");
 }
 
 #[cfg(unix)]

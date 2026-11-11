@@ -2288,10 +2288,11 @@ fn print_usage_economics() {
     use open_max_core::registry::ToolKind;
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let data_dir = default_data_dir();
-    // Priced as a new session here sends it: `bash` alone of the built-ins
-    // where it runs without asking.
+    // Priced as a new session here sends it in its launch mode: `bash` alone of
+    // the built-ins where it runs without asking, all seven if settings fail.
     let mut registry = open_max_core::registry::Registry::build(&data_dir, &project);
-    registry.send_builtins(open_max_core::state::Core::read_only(data_dir.clone()).0.bash_runs_unasked(&project));
+    let core = open_max_core::state::Core::new(data_dir.clone()).ok();
+    registry.send_builtins(core.is_some_and(|(core, _)| core.bash_runs_unasked(&project)));
     let usage = open_max_core::ledger::load_usage(&data_dir, &project).unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
