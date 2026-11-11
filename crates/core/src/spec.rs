@@ -851,8 +851,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   in the model's providers.json entry (which wins); no default, nothing is
   queried from the server, and a guessed window is wrong in one direction or
   the other. `openmax --check` warns while it is missing.
-- `max_tokens`: completion reserve; a per-model `max_tokens` in
-  providers.json overrides.
+- `max_tokens`: the reply's limit and completion reserve (default 4096); a
+  per-model `max_tokens` in providers.json overrides.
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
 - `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,
@@ -882,6 +882,9 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   "max_tokens": 4096
 }
 ```
+
+A reasoning model's reasoning counts toward those 4096: a cut reply ends the
+turn (`length`). Set its output maximum, at most a quarter of the window.
 
 ## The supported model-switch recipe
 
