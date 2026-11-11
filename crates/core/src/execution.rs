@@ -34,6 +34,10 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 pub const LEFT_BEHIND_GRACE: Duration = Duration::from_millis(50);
 /// How often a group given a grace is checked for members still running.
 const GROUP_EXIT_POLL: Duration = Duration::from_millis(2);
+/// How long members of a group whose shell exited get to exit on their own
+/// before they count as left running and are stopped. A program's helpers,
+/// such as a test runner's worker pool, exit a few milliseconds after it.
+const LEFT_RUNNING_AFTER: Duration = Duration::from_millis(50);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// The longest a cancelled command takes to settle: a SIGTERM grace for its
 /// shell and one for the rest of its group, one for a stdin writer the
@@ -1152,7 +1156,7 @@ async fn supervise_child(
             // and the caller is handed a successful exit. Report it so the
             // caller learns the rule from the result instead of from a failing
             // request later.
-            let background_terminated = terminate_remaining_group(pid).await;
+            let background_terminated = stop_what_was_left_running(pid).await;
             Ok((Termination::Exited(status), background_terminated))
         }
         _ = cancel.cancelled() => {
@@ -1181,6 +1185,24 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
     Ok(())
 }
 
+/// Stops what a command whose shell exited left running in its group, and
+/// returns true when there was any. Members that exit within
+/// `LEFT_RUNNING_AFTER` were on their way out, not left running: reporting
+/// them told the caller of nearly every test run with a worker pool that its
+/// background processes were cut short, when it had started none. Members
+/// that exited and wait for a parent to collect them run nothing either
+/// ([`group_has_running_member`]).
+async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
+    let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
+    while group_has_running_member(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            return terminate_remaining_group(pid).await;
+        }
+        tokio::time::sleep(GROUP_EXIT_POLL).await;
+    }
+    false
+}
+
 /// Returns true when group members outlived the leader and were terminated
 /// here, which is the caller's only signal that a backgrounded child is gone.
 async fn terminate_remaining_group(pid: Option<u32>) -> bool {
@@ -1189,12 +1211,12 @@ async fn terminate_remaining_group(pid: Option<u32>) -> bool {
     // The wait ends when the last one exits: a fixed sleep held every call
     // that left a background process for the whole grace, though one that
     // exits on SIGTERM is gone within milliseconds.
-    if !process_group_exists(pid) {
+    if !group_has_running_member(pid) {
         return false;
     }
     send_termination_group(pid);
     let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
-    while process_group_exists(pid) {
+    while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
             send_kill_group(pid);
             break;
@@ -1943,6 +1965,16 @@ fn stat_started(stat: &str) -> Option<(u64, bool)> {
     Some((fields.nth(22 - 4)?.parse().ok()?, exited))
 }
 
+/// Field 5, the process group, of a `/proc/<pid>/stat` line, and whether
+/// field 3, the state, is Z, counted as [`stat_started`] counts them.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn stat_group(stat: &str) -> Option<(u32, bool)> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    let exited = fields.next()? == "Z";
+    Some((fields.nth(1)?.parse().ok()?, exited))
+}
+
 #[cfg(all(test, unix))]
 thread_local! {
     /// Set by [`PausedSpawn`] for the next spawn on its thread: the pipe the
@@ -2082,6 +2114,62 @@ fn process_group_exists(_: Option<u32>) -> bool {
     false
 }
 
+/// Whether the group led by `pid` holds a member that can still run. A member
+/// that has exited stays in its group, and answers the probe of
+/// [`process_group_exists`], until its parent waits for it, and in a container
+/// whose init never waits for orphans that is forever: the workers a test
+/// runner leaves when it exits would read as left running on every call. On
+/// Linux the members are read from `/proc`, and a group whose members found
+/// there have all exited runs nothing. Read twice, so a member forked while
+/// the first read was past its pid is seen. Elsewhere, or with no member
+/// found, the probe answers.
+#[cfg(target_os = "linux")]
+fn group_has_running_member(pid: Option<u32>) -> bool {
+    let Some(group) = pid.filter(|_| process_group_exists(pid)) else {
+        return false;
+    };
+    let proc = Path::new("/proc");
+    !(only_exited_members(proc, group) && only_exited_members(proc, group))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn group_has_running_member(pid: Option<u32>) -> bool {
+    process_group_exists(pid)
+}
+
+/// True when `proc` lists members of `group` and every one has exited.
+/// A member's own stat names its main thread only, which reads Z once that
+/// thread has ended even while others run, so a member has exited only
+/// when every thread under its `task` directory reads Z.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn only_exited_members(proc: &Path, group: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return false;
+    };
+    let exited = |stat: &Path| {
+        let stat = std::fs::read_to_string(stat).unwrap_or_default();
+        stat_group(&stat).map(|(member_of, exited)| (member_of == group, exited))
+    };
+    let mut found = false;
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().and_then(positive_pid).is_none() {
+            continue;
+        }
+        match exited(&entry.path().join("stat")) {
+            Some((true, false)) => return false,
+            Some((true, true)) => found = true,
+            _ => continue,
+        }
+        let Ok(tasks) = std::fs::read_dir(entry.path().join("task")) else {
+            return false;
+        };
+        if !tasks.flatten().all(|task| exited(&task.path().join("stat")).is_some_and(|(_, exited)| exited)) {
+            return false;
+        }
+    }
+    found
+}
+
 #[cfg(unix)]
 fn signal_group(pid: Option<u32>, signal: libc::c_int) {
     if let Some(pid) = pid {
@@ -2198,6 +2286,9 @@ mod tests {
         assert_eq!(stat_started(stat), Some((98765, false)));
         assert_eq!(stat_started(&stat.replace(") S ", ") Z ")), Some((98765, true)), "a state of Z is an exited process");
         assert_eq!(stat_started("4242 (cut"), None);
+        assert_eq!(stat_group(stat), Some((4242, false)), "the group is field 5");
+        assert_eq!(stat_group(&stat.replace(") S 1 4242", ") Z 1 77")), Some((77, true)));
+        assert_eq!(stat_group("4242 (cut) S 1"), None);
     }
 
     /// A process that has exited holds its pid until its parent waits for
@@ -3472,6 +3563,64 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "background descendant survived process cleanup");
+        assert!(output.background_terminated, "a stopped background child was not reported");
+    }
+
+    /// A program whose helper exits a few milliseconds after it, as a test
+    /// runner's worker pool does once its pipe to them closes, left nothing
+    /// running: the helper is not signalled and nothing is reported. The
+    /// helper is the test's own child, reaped as it exits, so a host whose
+    /// init does not reap orphans cannot keep it in the group as a zombie.
+    /// Its teardown is 5 ms of work rather than a timer, which a QoS clamp on
+    /// macOS would stretch past the window, and the program exits only once
+    /// the helper says it is ready, so a slow start is not counted in it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_exits_just_after_its_program_is_not_reported() {
+        use std::os::unix::process::CommandExt;
+        let mut program = Command::new("sleep");
+        program.arg("6849").kill_on_drop(true);
+        program.as_std_mut().process_group(0);
+        let mut program = program.spawn().unwrap();
+        let group = program.id();
+        let teardown =
+            "use Time::HiRes qw(time); $| = 1; print qq(ready\\n); <STDIN>; my $end = time + 0.005; 1 while time < $end";
+        let mut helper = Command::new("perl");
+        helper.args(["-e", teardown]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+        helper.kill_on_drop(true).as_std_mut().process_group(i32::try_from(group.unwrap()).unwrap());
+        let mut helper = helper.spawn().unwrap();
+        let pipe = helper.stdin.take();
+        let mut ready = [0; 1];
+        let said = helper.stdout.take().unwrap().read(&mut ready).await.unwrap();
+        assert_eq!(said, 1, "the helper never started");
+        program.start_kill().unwrap();
+        program.wait().await.unwrap();
+        drop(pipe);
+        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), helper.wait());
+        assert_eq!(exited.unwrap().code(), Some(0), "the helper was stopped instead of exiting on its own");
+        assert!(!reported, "a helper on its way out was reported as left running");
+    }
+
+    /// A script that daemonizes a server, a subshell that backgrounds it with
+    /// its output detached and exits, still left it running in the group: it
+    /// is stopped and reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemonized_process_is_stopped_and_reported() {
+        let mut lifeline = Lifeline::new();
+        let pid_file = std::env::temp_dir().join(format!("openmax-daemon-{}", uuid::Uuid::new_v4()));
+        let script = format!(
+            "{}; (sleep 6848 </dev/null >/dev/null 2>&1 & echo $! > '{}'); exec 3>&-; echo started",
+            lifeline.open_in_shell(),
+            pid_file.display()
+        );
+        let output = run_process(request("/bin/sh", &["-c", &script]), Arc::new(CancelToken::default()))
+            .await
+            .unwrap();
+        let pid = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(!lifeline.survived(pid), "the daemonized process survived the call");
+        assert!(output.background_terminated, "the stopped daemon was not reported");
     }
 
     /// A process group whose leader has exited and left `member` running in
@@ -3501,12 +3650,93 @@ mod tests {
         (Some(group), member)
     }
 
+    /// A member counts as exited only when every one of its threads has: a
+    /// main thread that ended while another runs reads Z in the member's own
+    /// stat, and only its `task` directory shows the thread still running.
+    /// Read from a made-up `/proc`, so the case needs no such program.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_whose_main_thread_ended_while_another_runs_has_not_exited() {
+        let proc = std::env::temp_dir().join(format!("openmax-proc-{}", uuid::Uuid::new_v4()));
+        let process = |pid: u32, group: u32, threads: &[(u32, &str)]| {
+            let stat = |tid: u32, state: &str| format!("{tid} (worker) {state} 1 {group} {group} 0 -1 0");
+            std::fs::create_dir_all(proc.join(pid.to_string()).join("task")).unwrap();
+            std::fs::write(proc.join(pid.to_string()).join("stat"), stat(pid, threads[0].1)).unwrap();
+            for &(tid, state) in threads {
+                let task = proc.join(pid.to_string()).join("task").join(tid.to_string());
+                std::fs::create_dir_all(&task).unwrap();
+                std::fs::write(task.join("stat"), stat(tid, state)).unwrap();
+            }
+        };
+        process(101, 77, &[(101, "Z")]);
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        assert!(only_exited_members(&proc, 77), "a group of one exited process");
+        assert!(!only_exited_members(&proc, 78), "a group with no member found");
+        process(102, 77, &[(102, "Z"), (103, "S")]);
+        assert!(!only_exited_members(&proc, 77), "a thread of 102 still runs");
+        let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    /// A process that has exited stays in its group until its parent waits
+    /// for it. Wait until `child`, which nothing waits for, has exited.
+    #[cfg(target_os = "linux")]
+    async fn until_exited(child: &std::process::Child) {
+        while !started(child.id()).is_some_and(|(_, exited)| exited) {
+            tokio::time::sleep(GROUP_EXIT_POLL).await;
+        }
+    }
+
+    /// A member that has exited and that nothing waits for, a zombie, stays
+    /// in its group, as the workers of a test runner do in a container whose
+    /// init does not wait for orphans. It runs nothing, so the group is not
+    /// signalled and nothing is reported. The zombie here is the test's own
+    /// child, left unwaited on purpose until the cleanup has answered.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_group_left_holding_only_a_zombie_is_not_reported() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = Command::new("sleep");
+        leader.arg("6854").kill_on_drop(true);
+        leader.as_std_mut().process_group(0);
+        let mut leader = leader.spawn().unwrap();
+        let group = leader.id().unwrap();
+        let mut worker = std::process::Command::new("true");
+        worker.process_group(i32::try_from(group).unwrap());
+        let mut worker = worker.spawn().unwrap();
+        leader.start_kill().unwrap();
+        leader.wait().await.unwrap();
+        until_exited(&worker).await;
+        assert!(process_group_exists(Some(group)), "the zombie does not hold its group");
+        let reported = stop_what_was_left_running(Some(group)).await;
+        worker.wait().unwrap();
+        assert!(!reported, "a group holding only a zombie was reported as left running");
+    }
+
+    /// A zombie beside a member that still runs hides nothing: the running
+    /// member is stopped and reported as before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_running_member_beside_a_zombie_is_still_stopped_and_reported() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let (group, mut member) = group_whose_leader_exited(&["sleep", "6855"]).await;
+        let mut zombie = std::process::Command::new("true");
+        zombie.process_group(i32::try_from(group.unwrap()).unwrap());
+        let mut zombie = zombie.spawn().unwrap();
+        until_exited(&zombie).await;
+        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+        zombie.wait().unwrap();
+        assert!(reported, "the running member was not reported");
+        assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the running member was not stopped");
+    }
+
     /// A background child that exits on SIGTERM ends the cleanup as soon as
     /// it is gone. A fixed wait held every call that left one behind for the
     /// whole grace, though such a child is gone within milliseconds. Only the
     /// cleanup is timed, from a group whose leader has already exited: on a
     /// loaded machine, starting a shell alone can take longer than the grace,
-    /// and that is not the wait. The fastest of five runs is the one measured.
+    /// and that is not the wait. The time includes `LEFT_RUNNING_AFTER`,
+    /// which the cleanup waits before it signals anything. The fastest of
+    /// five runs is the one measured.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_background_child_that_stops_on_sigterm_does_not_hold_the_call() {
@@ -3515,7 +3745,7 @@ mod tests {
         for _ in 0..5 {
             let (group, mut member) = group_whose_leader_exited(&["sleep", "6845"]).await;
             let started = std::time::Instant::now();
-            let (found, exited) = tokio::join!(terminate_remaining_group(group), member.wait());
+            let (found, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
             fastest = fastest.min(started.elapsed());
             assert!(found, "the background child was not found");
             assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the background child did not stop on SIGTERM");
