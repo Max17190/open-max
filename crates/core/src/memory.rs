@@ -194,14 +194,14 @@ pub fn record_accesses(project_root: &Path, events: &[(String, String)]) {
 }
 
 /// The file tools' view of a call against the memory directory, for the turn
-/// loop: `read_file` of a memory path is a recall, `write_file`/`edit_file`
-/// is a reinforcement. Paths are matched the way the tools resolve them -
+/// loop: `read_file` of a memory path is a recall, `write_file`/`edit_file`,
+/// or a `bash` command naming it, which may change it, a reinforcement. Paths are matched the way the tools resolve them -
 /// `subdir/../.openmax/memory/x.md` and an absolute path inside the project
 /// are the same access - or an actively used memory would starve and fade.
 pub fn access_of(tool: &str, path: &str, project_root: &Path) -> Option<(String, String)> {
     let kind = match tool {
         "read_file" => "read",
-        "write_file" | "edit_file" => "write",
+        "write_file" | "edit_file" | "bash" => "write",
         _ => return None,
     };
     let normalized = normalize(path, project_root)?;
@@ -735,7 +735,9 @@ mod tests {
         assert_eq!(access_of("read_file", "../elsewhere/.openmax/memory/deploy-port.md", root), None);
         assert_eq!(access_of("read_file", "/other/.openmax/memory/deploy-port.md", root), None);
         assert_eq!(access_of("read_file", "src/main.rs", root), None);
-        assert_eq!(access_of("bash", ".openmax/memory/deploy-port.md", root), None);
+        // A shell command that names the file may change it.
+        assert_eq!(access_of("bash", ".openmax/memory/deploy-port.md", root), write);
+        assert_eq!(access_of("grep", ".openmax/memory/deploy-port.md", root), None);
         assert_eq!(access_of("read_file", ".openmax/memory/.access.jsonl", root), None);
         assert_eq!(access_of("read_file", ".openmax/memory/Bad.md", root), None);
     }

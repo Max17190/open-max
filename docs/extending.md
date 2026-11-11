@@ -118,11 +118,11 @@ memory) and injected as one index line each under a 1500-byte budget. The
 index is frozen with the prompt: writing a memory mid-session does not
 re-freeze, so the prompt cache survives the write. The new line rides the
 note from the agent's next step when it writes the memory with
-`write_file` or `edit_file`, and otherwise from the next re-freeze a tool or
-skill change causes or the next resume; it reaches the prompt at the next
-session or `/reload`. The
-harness logs accesses through `read_file`, `write_file`, and `edit_file` to
-`.openmax/memory/.access.jsonl`. An entry whose most recent observed use is
+`write_file`, `edit_file`, or a `bash` command that names its file, and
+otherwise from the next re-freeze a tool or skill change causes or the next
+resume; it reaches the prompt at the next session or `/reload`. The
+harness logs accesses through `read_file`, `write_file`, `edit_file`, and
+`bash` commands that name a memory file to `.openmax/memory/.access.jsonl`. An entry whose most recent observed use is
 over 21 days old leaves the index but stays searchable on disk. The harness
 never deletes memory files automatically; the user or agent decides when a
 fact is obsolete. No memories, no section, zero prompt cost. Full

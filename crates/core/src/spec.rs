@@ -928,8 +928,8 @@ sum, so recency and frequency trade off in one number and one recall
 revives an old memory.
 Accesses are the file's mtime plus logged events in
 `.openmax/memory/.access.jsonl` (the harness appends `read` when read_file
-targets a memory path and `write` for write_file/edit_file, once per kind
-per turn). bash access is not tracked; prefer the file tools for recall.
+targets a memory path and `write` for write_file/edit_file or a bash command
+that names one as a word, once per kind per turn).
 
 Forgetting keys on recency of last use, not on activation: activation only
 ranks the index, so a fact used often but not lately still fades on schedule.

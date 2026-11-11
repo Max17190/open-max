@@ -149,7 +149,8 @@ pub(crate) struct TurnUsage {
 
 /// Count what only the dispatcher sees: external tool calls (by outcome),
 /// skill-body reads (a read_file whose path is a frozen skill's SKILL.md),
-/// and memory accesses (file tools on `.openmax/memory/*.md`).
+/// and memory accesses (file tools on `.openmax/memory/*.md`). A shell
+/// command reads or changes the files it names, word by word.
 pub(crate) fn count_usage(
     usage: &std::sync::Mutex<TurnUsage>,
     registry: &Registry,
@@ -167,8 +168,12 @@ pub(crate) fn count_usage(
         return;
     }
     if ok {
-        if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
-            if name == "read_file" {
+        let paths: Vec<&str> = match (name, args.get(if name == "bash" { "command" } else { "path" }).and_then(|v| v.as_str())) {
+            ("bash", Some(command)) => command.split(|c: char| c.is_whitespace() || "'\"<>|;&()".contains(c)).collect(),
+            (_, rel) => rel.into_iter().collect(),
+        };
+        for rel in paths {
+            if matches!(name, "read_file" | "bash") {
                 let absolute = project_root.join(rel);
                 if let Some(skill) = registry
                     .skills
@@ -7531,6 +7536,34 @@ mod tests {
             ],
             "one read and one successful write; the failed write and the source file do not count"
         );
+    }
+
+    /// Where the tools array sends `bash` alone, a session reads and edits
+    /// memories and skills by shell. A command that names a memory file is an
+    /// access, counted as a write since it may change the file, which makes
+    /// the turn refresh the note; one that names a skill's SKILL.md is a
+    /// skill read. A failed command and other paths count nothing.
+    #[test]
+    fn count_usage_counts_the_memory_and_skill_files_a_shell_command_names() {
+        let usage = std::sync::Mutex::new(TurnUsage::default());
+        let mut registry = Registry::builtin_only();
+        let root = Path::new("/tmp/p");
+        registry.skills.push(crate::skills::SkillSpec {
+            name: "deploy".into(),
+            description: "ships it".into(),
+            path: root.join(".openmax/skills/deploy/SKILL.md"),
+        });
+        let bash = |command: &str| serde_json::json!({ "command": command });
+        count_usage(&usage, &registry, root, "bash", &bash("cat ./.openmax/memory/deploy-port.md src/main.rs"), true);
+        count_usage(&usage, &registry, root, "bash", &bash("sed -i 's/1/2/' \"/tmp/p/.openmax/memory/db-host.md\""), true);
+        count_usage(&usage, &registry, root, "bash", &bash("cat .openmax/skills/deploy/SKILL.md|head"), true);
+        count_usage(&usage, &registry, root, "bash", &bash("cat .openmax/memory/failed.md"), false);
+        let delta = usage.lock().unwrap();
+        assert_eq!(
+            delta.memory,
+            vec![("deploy-port".to_string(), "write".to_string()), ("db-host".to_string(), "write".to_string())],
+        );
+        assert_eq!(delta.ledger.skills, ["deploy"]);
     }
 
     /// Measured: with two fat replies in the protected tail
