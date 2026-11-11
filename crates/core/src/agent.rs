@@ -607,6 +607,7 @@ async fn run_loop(
     // resume silently runs without the extensions the agent already wrote.
     if let Err(message) = ensure_session_hydrated(core, session_id, project_root).await {
         core.send_agent(session_id, AgentEvent::Error { message });
+        end_turn_hooks(core, session_id, &hooks, project_root, "error", 0).await;
         return "error".into();
     }
 
@@ -691,19 +692,7 @@ async fn run_loop(
                 guard.messages().pop();
             }
             guard.commit().await;
-            report_hook_failures(
-                core,
-                session_id,
-                hooks
-                    .turn_end(
-                        session_id,
-                        project_root,
-                        "error",
-                        crate::hooks::TurnEndAttempt::default(),
-                    )
-                    .await
-                    .failures,
-            );
+            end_turn_hooks(core, session_id, &hooks, project_root, "error", 0).await;
             return "error".into();
         }
     };
@@ -1492,21 +1481,16 @@ async fn run_loop(
     // nothing left to spend on doing what it asks, so it is reported and the
     // turn ends anyway.
     if !turn_end_fired {
-        report_hook_failures(
-            core,
-            session_id,
-            hooks
-                .turn_end(
-                    session_id,
-                    project_root,
-                    &stop_reason,
-                    crate::hooks::TurnEndAttempt { continuation, blockable: false },
-                )
-                .await
-                .failures,
-        );
+        end_turn_hooks(core, session_id, &hooks, project_root, &stop_reason, continuation).await;
     }
     stop_reason
+}
+
+/// Runs the `turn_end` hooks for an end no refusal can change, after
+/// `continuation` honored refusals, and reports the hooks that failed.
+async fn end_turn_hooks(core: &Arc<Core>, session_id: &str, hooks: &Hooks, root: &Path, stop_reason: &str, continuation: usize) {
+    let attempt = crate::hooks::TurnEndAttempt { continuation, blockable: false };
+    report_hook_failures(core, session_id, hooks.turn_end(session_id, root, stop_reason, attempt).await.failures);
 }
 
 /// The capability file behind a tool whose exact content no human has
@@ -4007,6 +3991,60 @@ mod tests {
                 .unwrap();
         assert_eq!(end["event"], "turn_end");
         assert_eq!(end["stop_reason"], "error");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A turn whose session cannot be loaded after `user_prompt_submit`
+    /// accepted the prompt has started, so it ends with exactly one
+    /// `turn_end` carrying `error`, as every other exit of a started turn does.
+    #[tokio::test]
+    async fn turn_end_hook_fires_once_when_the_session_cannot_be_loaded() {
+        use crate::state::Core;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // The gate accepts the prompt and damages the transcript on its way
+        // out, so the load that follows the accepted prompt fails.
+        let sessions = core.data_dir.join("sessions");
+        let scripts = [
+            ("gate", "user_prompt_submit", format!("mkdir -p '{0}' && printf 'not json\\n' > '{0}/sess-unloadable.messages.json'", sessions.display())),
+            ("end", "turn_end", format!("cat >> '{}/end.jsonl'; echo >> '{}/end.jsonl'", project.display(), project.display())),
+        ];
+        for (name, event, body) in scripts {
+            let script = project.join(format!("{name}.sh"));
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let manifest = hooks_dir.join(format!("{name}.toml"));
+            std::fs::write(&manifest, format!("event = \"{event}\"\ncommand = \"{}\"\n", script.display())).unwrap();
+            approve_hook(&core, &project, &manifest);
+        }
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        start_turn(core.clone(), "sess-unloadable".into(), project.clone(), "hi".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let (mut error, mut stop) = (None, None);
+        while stop.is_none() && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::Error { message } => error = Some(message),
+                    AgentEvent::Done { stop_reason } => stop = Some(stop_reason),
+                    _ => {}
+                },
+                _ => continue,
+            }
+        }
+        assert_eq!(stop.as_deref(), Some("error"));
+        assert!(error.is_some_and(|m| m.contains("is damaged")), "the load failure is reported first");
+        let ends = std::fs::read_to_string(project.join("end.jsonl")).unwrap_or_default();
+        let ends: Vec<Value> = ends.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(ends.len(), 1, "a started turn ends with exactly one turn_end: {ends:?}");
+        assert_eq!(ends[0]["event"], "turn_end");
+        assert_eq!(ends[0]["stop_reason"], "error");
 
         let _ = std::fs::remove_dir_all(dir);
     }
