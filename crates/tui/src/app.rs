@@ -6747,6 +6747,33 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A reply the output limit cut while the model was still reasoning is
+    /// kept as an assistant message with reasoning and no text. Reopened, the
+    /// session draws exactly what it draws without that message: no empty
+    /// reply block and no blank line for it.
+    #[test]
+    fn replay_draws_nothing_for_a_reasoning_only_reply() {
+        use open_max_core::types::ChatMessage;
+        let mut thought = ChatMessage::assistant(None, None);
+        thought.reasoning_content = Some("half a thought".into());
+        thought.reasoning_origin = Some("origin".into());
+        let note = ChatMessage::user("[reply cut: continue]");
+        let drawn = |messages: Vec<ChatMessage>| {
+            let (mut app, dir) = app_fixture();
+            let meta = open_max_core::sessions::create(&app.core, app.project.display().to_string()).unwrap();
+            open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut 0, false);
+            app.replay(&meta.id);
+            // The first row names the fixture's own project directory.
+            let text = buffer_text(&render_app(&mut app, 100, 30)).split_once('\n').unwrap().1.to_string();
+            fs::remove_dir_all(dir).unwrap();
+            text
+        };
+        let answer = ChatMessage::assistant(Some("done".into()), None);
+        let with = drawn(vec![ChatMessage::user("go"), thought, note.clone(), answer.clone()]);
+        assert_eq!(with, drawn(vec![ChatMessage::user("go"), note, answer]));
+        assert!(with.contains("done") && !with.contains("half a thought"), "{with}");
+    }
+
     /// Opening a marathon session from the /resume picker: the width is
     /// already set from prior paints, replay pushes every persisted message
     /// through the incremental append path, then one frame paints. Not a

@@ -52,7 +52,7 @@ use crate::compaction::{
 use crate::config::{ApprovalMode, ReasoningEffort, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
-    append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
+    append_and_emit_note, hook_clause, insert_note, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
     narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
     settings_drift_note, store_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
 };
@@ -93,6 +93,14 @@ fn cut_off_call_error(max_tokens: usize) -> String {
          (old_string is the last few lines you wrote, enough to be unique; new_string \
          is those lines followed by the next part)."
     )
+}
+
+/// A reply the output cap cut before its first tool call ran nothing and
+/// answered nothing, so the turn goes on this many times in a row, each
+/// after this note; one more such reply ends the turn `length`.
+const MAX_CUT_CONTINUATIONS: usize = 4;
+fn reply_cut_note(max_tokens: usize) -> String {
+    format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]")
 }
 
 /// The one failure persisted without the `Error: ` prefix: the model must
@@ -741,6 +749,8 @@ async fn run_loop(
     );
     let max_iterations = settings.max_agent_iterations.max(1);
     let mut repeats = RepeatTracker::default();
+    // Cut replies with no call since the last reply the cap did not cut.
+    let mut cuts = 0;
 
     'turns: for iteration in 0..max_iterations {
         // One refresh, split around the steers. The mode in force first, so
@@ -863,8 +873,14 @@ async fn run_loop(
         core.send_agent(session_id, AgentEvent::MessageDone { text: content.clone() });
 
         // Never persist a fully empty assistant message (e.g. a turn cancelled
-        // before the first token): chat templates can reject it on replay.
-        if !content.is_empty() || !tool_calls.is_empty() {
+        // before the first token): chat templates can reject it on replay. A
+        // reply the output cap cut while it was still reasoning keeps that
+        // reasoning, so the continuation resumes the thought instead of
+        // starting it over; the wire skips it wherever the reasoning does
+        // not go back (another endpoint, a path that does not replay it).
+        let cut_thought = result.hit_output_cap(max_tokens)
+            && (result.reasoning_content.is_some() || result.reasoning.is_some() || result.reasoning_details.is_some());
+        if !content.is_empty() || !tool_calls.is_empty() || cut_thought {
             // A call whose arguments are not JSON (a model's slip, or a call a
             // cancel or a cut stream left unfinished) is recorded with `{}`:
             // servers that re-parse the history refuse every later request
@@ -935,10 +951,25 @@ async fn run_loop(
         // model can split the work. The client keeps its raw arguments even
         // when the cut lands before the first byte.
         let capped = result.hit_output_cap(max_tokens);
+        if !capped {
+            cuts = 0;
+        }
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
+            // Cut while still thinking or writing, before any call: not an
+            // answer, so not an end and no turn_end consult. The reply stays
+            // as recorded above, the note goes after it, on disk before the
+            // next request, and the loop goes round. Never on the last
+            // iteration, which has no request left to carry the note.
+            if capped && cuts < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
+                cuts += 1;
+                let at = guard.messages().len();
+                insert_note(core, session_id, guard.messages(), at, reply_cut_note(max_tokens));
+                save_messages(core, session_id, guard.messages(), false).await;
+                continue 'turns;
+            }
             // A steer sent while the model wrote its answer is not answered
             // yet, so this is not the end: take it now and round again for
             // the model to read it. Taken here, through its gate, so a blocked
@@ -3182,6 +3213,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A reply the output cap cut while the model was still reasoning: no
+    /// text, no call, only reasoning.
+    const THOUGHT_CUT_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"half a thought\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// The bug this guards: a reply cut inside its reasoning was not kept, so
+    /// the continuation carried the note and nothing of the thought, and the
+    /// model started the same long thought again. The reasoning is kept and
+    /// goes back to its own endpoint ahead of the note, also after the session
+    /// is reopened from disk; an endpoint it does not go to gets no empty
+    /// assistant message in its place.
+    #[tokio::test]
+    async fn a_reply_cut_while_reasoning_keeps_its_reasoning_for_its_endpoint() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (thinking, thinking_bodies) = capturing_endpoint(THOUGHT_CUT_SSE).await;
+        let (other, other_bodies) = capturing_endpoint(STOP_SSE).await;
+        let thinking_url = thinking.clone();
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = thinking;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_tokens = 1024;
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        let id = &crate::sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id.into(), project.clone(), "go".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let bodies = thinking_bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "the cut reply, then its continuation");
+        let sent: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let sent = sent["messages"].as_array().unwrap();
+        let at = sent.iter().position(|m| m["role"] == "assistant").expect("the cut reply goes back");
+        assert_eq!(sent[at]["reasoning_content"], "half a thought", "{}", bodies[1]);
+        assert!(sent[at].get("content").is_none() && sent[at].get("tool_calls").is_none(), "{}", bodies[1]);
+        assert_eq!(sent[at + 1]["role"], "user");
+        assert!(sent[at + 1]["content"].as_str().unwrap().starts_with("[reply cut: it reached max_tokens (1024)"), "{}", bodies[1]);
+        assert!(!bodies[1].contains("reasoning_origin"));
+
+        let messages = transcript(&core, id).await;
+        let kept = messages.iter().find(|m| m.reasoning_content.as_deref() == Some("half a thought")).expect("kept on disk");
+        assert!(kept.content.is_none() && kept.tool_calls.is_none() && kept.reasoning_origin.is_some());
+
+        // Reopened from disk, the session sends the same messages first, byte for byte.
+        while crate::sessions::detach(&core, id).is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(core);
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens) = (thinking_url.clone(), "stub".into(), Some(16384));
+            (s.max_tokens, s.approval_mode) = (1024, ApprovalMode::Auto);
+        }
+        start_turn(core.clone(), id.into(), project.clone(), "again".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let bodies = thinking_bodies.lock().unwrap().clone();
+        let resumed: Value = serde_json::from_str(&bodies[2]).unwrap();
+        assert_eq!(resumed["messages"].as_array().unwrap()[..sent.len()], sent[..], "{}", bodies[2]);
+
+        // Another endpoint: the reasoning does not go there, so neither does the message.
+        core.settings.lock().unwrap().base_url = other;
+        start_turn(core.clone(), id.into(), project.clone(), "and now?".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+        let other_bodies = other_bodies.lock().unwrap().clone();
+        assert_eq!(other_bodies.len(), 1);
+        let replies = sent_replies(&other_bodies[0]);
+        assert_eq!(replies.len(), 2, "only the two answers go: {}", other_bodies[0]);
+        assert!(replies.iter().all(|reply| reply["content"] == "done"), "{}", other_bodies[0]);
+        assert!(!other_bodies[0].contains("reasoning") && !other_bodies[0].contains("half a thought"), "{}", other_bodies[0]);
+        assert!(other_bodies[0].contains("[reply cut"), "the note still goes: {}", other_bodies[0]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A finished reply whose one call has arguments that stop partway
     /// through the path string.
     const UNTERMINATED_TOOL_SSE: &str = concat!(
@@ -4380,6 +4499,7 @@ mod tests {
                     .unwrap()
             };
             let cut = reply("c2");
+            assert_eq!(user_messages(&messages, "[reply cut"), 0, "{case}: a reply with calls is not continued with a note");
             assert_eq!(cut.contains("max_tokens = 1024") && cut.contains("in parts"), capped, "{case}: {cut}");
             assert_eq!(cut.contains("invalid JSON"), !capped, "{case}: {cut}");
             // The cause belongs to the cut call alone: the model had finished
@@ -4392,6 +4512,165 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// A reply the output cap cut while the model was still writing: its text
+    /// so far, no call, finish_reason `length`.
+    const CUT_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"so far\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    const CUT_NOTE: &str = "[reply cut: it reached max_tokens (1024) before any tool call; continue from where it stopped: think briefly, then act.]";
+
+    /// The bug this guards: a reply the output cap cut before any call ran
+    /// nothing and answered nothing, yet it ended the turn, so a model that
+    /// thinks past max_tokens stopped mid-task. The reply is kept, a note after
+    /// it says what cut it, and the loop goes round, at most four times in a
+    /// row: a fifth cut ends the turn `length` as before, and so does a cut on
+    /// the last iteration. A reply the cap did not cut resets the count. The
+    /// turn_end hook runs once, for the real end.
+    #[tokio::test]
+    async fn a_reply_cut_before_any_call_continues_the_turn_at_most_four_times_in_a_row() {
+        use crate::state::Core;
+        use std::os::unix::fs::PermissionsExt;
+
+        // A case: name, the replies in order (the last repeats), the
+        // iteration cap, the stop reason, the requests, and the notes.
+        type Case = (&'static str, &'static [&'static str], usize, &'static str, usize, usize);
+        let cases: [Case; 4] = [
+            ("cut, then a call", &[CUT_SSE, TOOL_SSE, STOP_SSE], 10, "stop", 3, 1),
+            ("cut five times", &[CUT_SSE], 10, "length", 5, 4),
+            ("a call between cuts resets the count", &[CUT_SSE, CUT_SSE, CUT_SSE, CUT_SSE, TOOL_SSE, CUT_SSE, CUT_SSE, CUT_SSE, CUT_SSE, STOP_SSE], 12, "stop", 10, 8),
+            ("the iteration cap binds", &[CUT_SSE], 2, "length", 2, 1),
+        ];
+        for (case, streams, iterations, want, want_requests, want_notes) in cases {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            let hooks_dir = project.join(".openmax/hooks");
+            std::fs::create_dir_all(&hooks_dir).unwrap();
+            std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+            let script = project.join("end.sh");
+            std::fs::write(&script, format!("#!/bin/sh\ncat >> '{0}/end.jsonl'; echo >> '{0}/end.jsonl'\n", project.display())).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let manifest = hooks_dir.join("end.toml");
+            std::fs::write(&manifest, format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display())).unwrap();
+            approve_hook(&core, &project, &manifest);
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+            let (base_url, requests) = scripted_endpoint(streams).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                s.base_url = base_url;
+                s.model = "stub".into();
+                s.context_tokens = Some(16384);
+                s.max_tokens = 1024;
+                s.approval_mode = ApprovalMode::Auto;
+                s.max_agent_iterations = iterations;
+            }
+            let id = "sess-reply-cut";
+            start_turn(core.clone(), id.into(), project.clone(), "read a.txt".into()).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (mut wire, mut stop) = (Vec::new(), None);
+            while stop.is_none() && tokio::time::Instant::now() < deadline {
+                if let Ok(Some(env)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    match env.event {
+                        AgentEvent::HarnessNote { call_id, text } if text.starts_with("[reply cut") => wire.push((call_id, text)),
+                        AgentEvent::Done { stop_reason } => stop = Some(stop_reason),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(stop.as_deref(), Some(want), "{case}");
+            assert_eq!(*requests.lock().unwrap(), want_requests, "{case}");
+            assert_eq!(wire, vec![(String::new(), CUT_NOTE.to_string()); want_notes], "{case}: one notice per note, owned by no call");
+            // Each cut reply stays as it was, its note right after it.
+            let messages = transcript(&core, id).await;
+            let cuts: Vec<usize> = (0..messages.len()).filter(|&i| messages[i].content.as_deref() == Some("so far")).collect();
+            assert_eq!(cuts.len(), want_notes + usize::from(want == "length"), "{case}");
+            for &i in &cuts[..want_notes] {
+                assert_eq!(messages[i].role, "assistant", "{case}");
+                assert_eq!((messages[i + 1].role.as_str(), messages[i + 1].content.as_deref()), ("user", Some(CUT_NOTE)), "{case}");
+            }
+            assert_eq!(user_messages(&messages, "[reply cut"), want_notes, "{case}");
+            if case == "cut, then a call" {
+                assert!(messages[cuts[0] + 2].tool_calls.is_some(), "{case}: the call follows the note");
+            }
+            let ends = std::fs::read_to_string(project.join("end.jsonl")).unwrap();
+            let ends: Vec<Value> = ends.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect();
+            assert_eq!(ends.len(), 1, "{case}: one turn_end for one end");
+            assert_eq!(ends[0]["stop_reason"], want, "{case}");
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A cancel that lands after a cut reply's note, while its continuation is
+    /// in flight, ends the turn `cancelled` with the note kept.
+    #[tokio::test]
+    async fn a_cancel_after_a_cut_reply_ends_the_continuation() {
+        use crate::state::Core;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        // The first request gets the cut reply; the second is held unanswered.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(0usize));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                *seen.lock().unwrap() += 1;
+                if *seen.lock().unwrap() > 1 {
+                    held.push(sock);
+                    continue;
+                }
+                let mut buf = [0u8; 65536];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{CUT_SSE}");
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = format!("http://{addr}/v1");
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_tokens = 1024;
+        }
+        let id = "sess-cut-cancel";
+        start_turn(core.clone(), id.into(), project, "go".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut stop = None;
+        while stop.is_none() && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                match env.event {
+                    // The note goes out before the next request; cancel once
+                    // that request has reached the endpoint.
+                    AgentEvent::HarnessNote { text, .. } if text == CUT_NOTE => {
+                        while *requests.lock().unwrap() < 2 && tokio::time::Instant::now() < deadline {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        core.cancel(id);
+                    }
+                    AgentEvent::Done { stop_reason } => stop = Some(stop_reason),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(stop.as_deref(), Some("cancelled"));
+        assert_eq!(*requests.lock().unwrap(), 2, "the continuation went out and nothing after it");
+        let messages = transcript(&core, id).await;
+        assert_eq!(user_messages(&messages, CUT_NOTE), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// One reply carrying `calls` as (id, tool, arguments), in order.

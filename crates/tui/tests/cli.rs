@@ -1894,11 +1894,13 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
     let (project, home) = fresh_dirs("reply-limit");
     let cut = sse(&[serde_json::json!({"choices":[{"delta":{},"finish_reason":"length"}],
         "usage":{"prompt_tokens":10,"completion_tokens":4096}})]);
-    let (base_url, requests, _server) = spawn_scripted_server(vec![(cut, true)]);
+    // The turn continues after four cut replies; the fifth in a row ends it.
+    let (base_url, requests, _server) = spawn_scripted_server(vec![(cut, true); 5]);
     write_settings(&home, &base_url);
     let out = cmd(&project, &home).args(["--trust-project", "-p", "think it through"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert_eq!(requests.lock().unwrap().len(), 5, "{stderr}");
     assert!(stderr.contains(
         "openmax: stopped (length): the reply reached its output limit before it finished; reasoning counts toward it. \
          The limit is max_tokens (now 4096), on the model's providers.json entry, else in settings.json. \
@@ -1914,7 +1916,7 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
     assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");
     let row = report.lines().find(|l| l.contains("max_tokens")).unwrap_or_default();
     assert!(row.starts_with("warn settings") && row.contains("reply limit max_tokens = 4096, the default: a reply longer than this, \
-        its reasoning included, is cut and ends the turn; set max_tokens on the model's providers.json entry"), "{report}");
+        its reasoning included, is cut, and five cuts in a row before any tool call end the turn; set max_tokens on the model's providers.json entry"), "{report}");
 
     let dir = home.join(".openmax");
     std::fs::write(dir.join("settings.json"), format!(r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"ask","context_tokens":16384,"max_tokens":8192}}"#)).unwrap();
