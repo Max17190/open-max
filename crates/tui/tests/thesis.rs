@@ -698,8 +698,9 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // Return bounded current source when an exact multiline edit misses.
-    const BASELINE: usize = 43_945;
+    // Short conditionals and early exits written on one line, one locked read of the provider catalog,
+    // and one scan for a session's transcript and archive: 249 lines fewer, the frozen prompt unchanged.
+    const BASELINE: usize = 43_892;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

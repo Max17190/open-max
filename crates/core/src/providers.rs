@@ -165,6 +165,7 @@ pub fn providers_path(data_dir: &Path) -> PathBuf {
 }
 
 use std::sync::{Mutex, OnceLock};
+#[derive(Default)]
 struct ProvidersCache {
     data_dir: PathBuf,
     /// None when the file was missing or unreadable at last load.
@@ -193,10 +194,7 @@ static PROVIDERS_CACHE: OnceLock<Mutex<ProvidersCache>> = OnceLock::new();
 pub fn invalidate_providers_cache() {
     if let Some(lock) = PROVIDERS_CACHE.get() {
         if let Ok(mut cache) = lock.lock() {
-            cache.data_dir.clear();
-            cache.content_hash = None;
-            cache.map.clear();
-            cache.parse_error = None;
+            *cache = ProvidersCache::default();
         }
     }
 }
@@ -344,14 +342,10 @@ pub(crate) fn check_file(path: &Path) -> Option<Result<(usize, Vec<String>), Str
 /// JSON because serde discards the unknown keys it skips.
 fn unknown_key_warnings(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return out;
-    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return out };
     let Some(top) = value.as_object() else { return out };
     unknown_keys(top, &["providers"], "at the top level", &mut out);
-    let Some(providers) = top.get("providers").and_then(|v| v.as_object()) else {
-        return out;
-    };
+    let Some(providers) = top.get("providers").and_then(|v| v.as_object()) else { return out };
     for (name, provider) in providers {
         let Some(provider) = provider.as_object() else { continue };
         unknown_keys(
@@ -417,28 +411,20 @@ pub fn load_providers(data_dir: &Path) -> BTreeMap<String, ProviderConfig> {
 /// separate reads could straddle a file replacement and name the wrong
 /// version.
 fn load_snapshot(data_dir: &Path) -> (BTreeMap<String, ProviderConfig>, Option<String>) {
-    let path = providers_path(data_dir);
-    let lock = PROVIDERS_CACHE.get_or_init(|| {
-        Mutex::new(ProvidersCache {
-            data_dir: PathBuf::new(),
-            content_hash: None,
-            map: BTreeMap::new(),
-            parse_error: None,
-        })
-    });
-    let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
-    refresh_cache(&mut cache, data_dir, &path);
+    let cache = refreshed_cache(data_dir);
     (cache.map.clone(), cache.parse_error.clone())
 }
 
-/// Re-read disk into the cache when the content moved. Runs under the cache
-/// mutex; both `load_providers` and `providers_status` go through here so
-/// the catalog and its status can never disagree.
-fn refresh_cache(cache: &mut ProvidersCache, data_dir: &Path, path: &Path) {
+/// The locked cache, re-read from disk when the content moved. The read runs
+/// under the cache mutex; both `load_providers` and `providers_status` go
+/// through here so the catalog and its status can never disagree.
+fn refreshed_cache(data_dir: &Path) -> std::sync::MutexGuard<'static, ProvidersCache> {
+    let path = providers_path(data_dir);
+    let mut cache = PROVIDERS_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     let text = std::fs::read_to_string(path).ok();
     let hash = text.as_deref().map(content_hash);
     if cache.data_dir == data_dir && cache.content_hash == hash {
-        return;
+        return cache;
     }
     let (map, parse_error) = match text {
         None => (BTreeMap::new(), None),
@@ -451,22 +437,13 @@ fn refresh_cache(cache: &mut ProvidersCache, data_dir: &Path, path: &Path) {
     cache.content_hash = hash;
     cache.map = map;
     cache.parse_error = parse_error;
+    cache
 }
 
 /// The current read's outcome, through the same cache (and mutex) as
 /// [`load_providers`].
 pub fn providers_status(data_dir: &Path) -> ProvidersStatus {
-    let path = providers_path(data_dir);
-    let lock = PROVIDERS_CACHE.get_or_init(|| {
-        Mutex::new(ProvidersCache {
-            data_dir: PathBuf::new(),
-            content_hash: None,
-            map: BTreeMap::new(),
-            parse_error: None,
-        })
-    });
-    let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
-    refresh_cache(&mut cache, data_dir, &path);
+    let cache = refreshed_cache(data_dir);
     ProvidersStatus {
         count: cache.map.len(),
         names: cache.map.keys().cloned().collect(),

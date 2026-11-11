@@ -245,9 +245,7 @@ pub(crate) async fn novel_policy_notices(
         return Vec::new();
     }
     let mut map = core.sessions.lock().await;
-    let Some(data) = map.get_mut(session_id) else {
-        return Vec::new();
-    };
+    let Some(data) = map.get_mut(session_id) else { return Vec::new() };
     notices
         .into_iter()
         // Canonicalize BEFORE taking identity: see `canonical_notice`.

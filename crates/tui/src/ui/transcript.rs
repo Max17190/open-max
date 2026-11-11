@@ -274,11 +274,7 @@ impl Block {
         if self.is_wrapped_at(width) {
             return self.cache.len();
         }
-        let cells = if self.folded && self.compact.is_some() {
-            &self.compact_cells
-        } else {
-            &self.raw_cells
-        };
+        let cells = if self.folded && self.compact.is_some() { &self.compact_cells } else { &self.raw_cells };
         cells.rows(usize::from(content_width(self.kind, width))) + 1
     }
 
@@ -526,9 +522,7 @@ impl Transcript {
     /// `user_prompt_submit` before it entered the core transcript). Returns
     /// true when a user block was removed.
     pub fn pop_last_user(&mut self) -> bool {
-        let Some(&i) = self.users.last() else {
-            return false;
-        };
+        let Some(&i) = self.users.last() else { return false };
         // The view keeps its offset (the draw path clamps it once the view
         // is measured), so it moves by the rows removed.
         let held = self.held_block();
@@ -737,9 +731,7 @@ impl Transcript {
             if self.wrapped_rows <= budget {
                 break;
             }
-            let Some(id) = self.wraps.pop_front() else {
-                break;
-            };
+            let Some(id) = self.wraps.pop_front() else { break };
             match self.blocks.binary_search_by_key(&id, |block| block.id) {
                 Ok(bi) if view.is_some_and(|(first, last)| (first..=last).contains(&bi)) => self.wraps.push_back(id),
                 Ok(bi) => {
@@ -947,9 +939,7 @@ impl Transcript {
         painted: &mut Vec<Option<RowRef>>,
     ) {
         let end = end.min(self.total).min(start.saturating_add(usize::from(area.height)));
-        let Some((mut bi, mut li)) = self.locate(start) else {
-            return;
-        };
+        let Some((mut bi, mut li)) = self.locate(start) else { return };
         for (y, _) in (area.y..).zip(start..end) {
             while li >= self.blocks[bi].height {
                 bi += 1;
@@ -1208,9 +1198,7 @@ impl Transcript {
     }
 
     pub fn toggle_fold_selected(&mut self) -> bool {
-        let Some(i) = self.selected else {
-            return false;
-        };
+        let Some(i) = self.selected else { return false };
         self.toggle_fold_at(i)
     }
 
@@ -1220,9 +1208,7 @@ impl Transcript {
             .blocks
             .iter()
             .rposition(|b| b.kind == BlockKind::Tool && b.compact.is_some());
-        let Some(i) = i else {
-            return false;
-        };
+        let Some(i) = i else { return false };
         self.selected = Some(i);
         if self.blocks[i].folded {
             self.refold(i, false);
@@ -1233,9 +1219,7 @@ impl Transcript {
     }
 
     fn toggle_fold_at(&mut self, i: usize) -> bool {
-        let Some(block) = self.blocks.get(i) else {
-            return false;
-        };
+        let Some(block) = self.blocks.get(i) else { return false };
         if block.compact.is_none() {
             return false;
         }
@@ -1352,9 +1336,7 @@ impl Transcript {
     }
 
     pub fn begin_text_selection_at(&mut self, line_idx: usize, x: usize) -> bool {
-        let Some(point) = self.hit_test(line_idx, x) else {
-            return false;
-        };
+        let Some(point) = self.hit_test(line_idx, x) else { return false };
         self.text_selection = Some(Selection::press(point));
         true
     }
@@ -1379,15 +1361,11 @@ impl Transcript {
         // empty line has no word and no line to take, and leaving the old
         // highlight standing would make it lie about what a copy carries.
         self.text_selection = None;
-        let Some(point) = self.hit_test(line_idx, x) else {
-            return false;
-        };
+        let Some(point) = self.hit_test(line_idx, x) else { return false };
         // Fall back to what a plain press does, so the gesture still places an
         // anchor a drag can extend from.
         self.text_selection = Some(Selection::press(point));
-        let Some(block) = self.blocks.get(point.block) else {
-            return false;
-        };
+        let Some(block) = self.blocks.get(point.block) else { return false };
         let (start, end) = bounds(&block.selectable, point.offset);
         if start >= end {
             return false;
@@ -1399,12 +1377,8 @@ impl Transcript {
     }
 
     pub fn update_text_selection_at(&mut self, line_idx: usize, x: usize) -> bool {
-        let Some(point) = self.hit_test(line_idx, x) else {
-            return false;
-        };
-        let Some(selection) = &mut self.text_selection else {
-            return false;
-        };
+        let Some(point) = self.hit_test(line_idx, x) else { return false };
+        let Some(selection) = &mut self.text_selection else { return false };
         selection.drag_to(point);
         true
     }
@@ -1717,11 +1691,7 @@ fn wrap_lines_mapped(
                 let mut last_space: Option<usize> = None;
                 while end < chars.len() {
                     let ch = chars[end].0;
-                    let width_here = if ch == '\t' {
-                        TAB_WIDTH
-                    } else {
-                        ch.width().unwrap_or(0)
-                    };
+                    let width_here = if ch == '\t' { TAB_WIDTH } else { ch.width().unwrap_or(0) };
                     if used + width_here > avail {
                         break;
                     }

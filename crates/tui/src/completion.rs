@@ -235,11 +235,7 @@ pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
             // Templates may take arguments, so accepting never auto-submits.
             insert: format!("/{name} "),
             label: format!("/{name}"),
-            detail: if desc.is_empty() {
-                "prompt template".to_string()
-            } else {
-                format!("{desc} · template")
-            },
+            detail: if desc.is_empty() { "prompt template".to_string() } else { format!("{desc} · template") },
             submits: false,
         })
         .collect();
@@ -248,11 +244,7 @@ pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
             .iter()
             .filter(|spec| spec.name.starts_with(query))
             .map(|spec| Item {
-                insert: if spec.submits {
-                    format!("/{}", spec.name)
-                } else {
-                    format!("/{} ", spec.name)
-                },
+                insert: if spec.submits { format!("/{}", spec.name) } else { format!("/{} ", spec.name) },
                 label: format!("/{}", spec.name),
                 detail: if spec.args.is_empty() {
                     spec.description.to_string()
@@ -392,16 +384,8 @@ pub fn render_lines(popup: &Popup, width: u16, indexing: bool) -> Vec<Line<'stat
     let mut lines = Vec::with_capacity(visible);
     for (i, item) in popup.items.iter().enumerate().skip(first).take(visible) {
         let selected = i == popup.selected;
-        let marker = if selected {
-            Span::styled("▸ ", Style::default().fg(theme::ACCENT))
-        } else {
-            Span::raw("  ")
-        };
-        let label_style = if selected {
-            theme::ACCENT_BOLD
-        } else {
-            Style::default()
-        };
+        let marker = if selected { Span::styled("▸ ", Style::default().fg(theme::ACCENT)) } else { Span::raw("  ") };
+        let label_style = if selected { theme::ACCENT_BOLD } else { Style::default() };
         let label = clip(&item.label, width.saturating_sub(4));
         let label_width = crate::ui::text::width(&label);
         let mut spans = vec![marker, Span::styled(label, label_style)];

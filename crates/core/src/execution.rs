@@ -1048,9 +1048,7 @@ async fn combine_logs(
     if stdout.is_none() && stderr.is_none() && !force {
         return Ok(None);
     }
-    let Some(dir) = spill_dir else {
-        return Ok(None);
-    };
+    let Some(dir) = spill_dir else { return Ok(None) };
     if tokio::fs::create_dir_all(dir).await.is_err() {
         discard_spills(stdout, stderr).await;
         return Ok(None);
@@ -1100,9 +1098,7 @@ async fn combine_logs(
 /// invocation's tmpfiles are always orders of magnitude fresher than the
 /// seven-day cutoff. An unbounded-timeout caller would break that invariant.
 async fn prune_spill_dir(dir: &Path) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return;
-    };
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
     let now = std::time::SystemTime::now();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
@@ -1112,12 +1108,8 @@ async fn prune_spill_dir(dir: &Path) {
         if !ours {
             continue;
         }
-        let Ok(meta) = entry.metadata().await else {
-            continue;
-        };
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
+        let Ok(meta) = entry.metadata().await else { continue };
+        let Ok(modified) = meta.modified() else { continue };
         if now.duration_since(modified).is_ok_and(|age| age > SPILL_LOG_RETENTION) {
             let _ = tokio::fs::remove_file(entry.path()).await;
         }
@@ -2101,9 +2093,7 @@ fn send_termination_group(_: Option<u32>) {}
 
 #[cfg(unix)]
 fn process_group_exists(pid: Option<u32>) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
+    let Some(pid) = pid else { return false };
     // kill(..., 0) never changes process state. This harness owns the group,
     // so a failure is treated as absent and keeps the normal path fast.
     unsafe { libc::kill(-(pid as libc::pid_t), 0) == 0 }
@@ -2125,9 +2115,7 @@ fn process_group_exists(_: Option<u32>) -> bool {
 /// found, the probe answers.
 #[cfg(target_os = "linux")]
 fn group_has_running_member(pid: Option<u32>) -> bool {
-    let Some(group) = pid.filter(|_| process_group_exists(pid)) else {
-        return false;
-    };
+    let Some(group) = pid.filter(|_| process_group_exists(pid)) else { return false };
     let proc = Path::new("/proc");
     !(only_exited_members(proc, group) && only_exited_members(proc, group))
 }
@@ -2143,9 +2131,7 @@ fn group_has_running_member(pid: Option<u32>) -> bool {
 /// when every thread under its `task` directory reads Z.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn only_exited_members(proc: &Path, group: u32) -> bool {
-    let Ok(entries) = std::fs::read_dir(proc) else {
-        return false;
-    };
+    let Ok(entries) = std::fs::read_dir(proc) else { return false };
     let exited = |stat: &Path| {
         let stat = std::fs::read_to_string(stat).unwrap_or_default();
         stat_group(&stat).map(|(member_of, exited)| (member_of == group, exited))
@@ -2160,9 +2146,7 @@ fn only_exited_members(proc: &Path, group: u32) -> bool {
             Some((true, true)) => found = true,
             _ => continue,
         }
-        let Ok(tasks) = std::fs::read_dir(entry.path().join("task")) else {
-            return false;
-        };
+        let Ok(tasks) = std::fs::read_dir(entry.path().join("task")) else { return false };
         if !tasks.flatten().all(|task| exited(&task.path().join("stat")).is_some_and(|(_, exited)| exited)) {
             return false;
         }

@@ -988,9 +988,7 @@ fn write_in_place(
         file.write_all(bytes)?;
         crate::sessions::sync(file, Path::new(rel))
     };
-    let Err(e) = overwrite(&mut file, bytes) else {
-        return Ok(());
-    };
+    let Err(e) = overwrite(&mut file, bytes) else { return Ok(()) };
     Err(match overwrite(&mut file, &old) {
         Ok(()) => format!("cannot write {rel}: {e}; its old contents were written back"),
         Err(again) => format!(
@@ -1094,9 +1092,7 @@ fn stream_window(file: std::fs::File, window: &mut ReadWindow, cancel: &CancelTo
     let mut n = 0;
     loop {
         let keep = if window.wants(n + 1) { MAX_LINE_CHARS } else { 0 };
-        let Some(len) = next_line(&mut reader, &mut kept, keep)? else {
-            return Ok(n);
-        };
+        let Some(len) = next_line(&mut reader, &mut kept, keep)? else { return Ok(n) };
         n += 1;
         if keep == 0 {
             continue;
@@ -1571,9 +1567,7 @@ impl ProjectGitignores {
         } else {
             self.canon.join(entry.path().strip_prefix(&self.walk_root).unwrap_or(entry.path())).into()
         };
-        let Some(dir) = path.parent() else {
-            return false;
-        };
+        let Some(dir) = path.parent() else { return false };
         let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
         let rules = self.rules(dir);
         let chain = || std::iter::successors(Some(&*rules), |d| d.parent.as_deref());

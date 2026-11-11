@@ -167,11 +167,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ModelPickerState) {
         let provider = item.provider.as_deref().unwrap_or("direct");
         let marker = if selected { "▸" } else { " " };
         let active = if item.active { "●" } else { " " };
-        let base = if selected {
-            theme::ACCENT_BOLD
-        } else {
-            Style::default()
-        };
+        let base = if selected { theme::ACCENT_BOLD } else { Style::default() };
         let row_width = inner.width as usize;
         let name_width = if row_width >= 72 {
             24

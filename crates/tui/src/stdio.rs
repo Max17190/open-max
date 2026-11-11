@@ -662,9 +662,7 @@ fn transcript<'a>(
         if m.role != "user" && m.role != "assistant" {
             continue;
         }
-        let Some(content) = m.content.as_deref().filter(|c| !c.trim().is_empty()) else {
-            continue;
-        };
+        let Some(content) = m.content.as_deref().filter(|c| !c.trim().is_empty()) else { continue };
         if total >= TRANSCRIPT_TOTAL_CHARS {
             truncated = true;
             break;

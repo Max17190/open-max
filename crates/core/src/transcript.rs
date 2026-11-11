@@ -365,9 +365,7 @@ impl MessageGuard {
 
 impl Drop for MessageGuard {
     fn drop(&mut self) {
-        let Some(mut messages) = self.messages.take() else {
-            return;
-        };
+        let Some(mut messages) = self.messages.take() else { return };
         // No commit means an unwind (a panic, or the turn's task dropped),
         // possibly mid-tool: the call is on record and its reply is not. The
         // session stays live in this process, so hydration never sees this

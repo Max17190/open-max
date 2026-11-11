@@ -101,16 +101,8 @@ fn row_title(item: &SessionMeta) -> String {
 /// leading half of a title is its unique half, so the age must never be the
 /// part that falls off the edge.
 fn session_row(item: &SessionMeta, selected: bool, now: u64, width: u16) -> Line<'static> {
-    let marker = if selected {
-        Span::styled("▸ ", Style::default().fg(theme::ACCENT))
-    } else {
-        Span::raw("  ")
-    };
-    let title_style = if selected {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
+    let marker = if selected { Span::styled("▸ ", Style::default().fg(theme::ACCENT)) } else { Span::raw("  ") };
+    let title_style = if selected { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
     let age_txt = age(item.updated_at, now);
     // Below marker + age nothing else can fit: emit the age alone, clipped
     // as a last resort, so no width class ever overflows the panel. Above

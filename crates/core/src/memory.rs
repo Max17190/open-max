@@ -235,9 +235,7 @@ fn normalize(path: &str, project_root: &Path) -> Option<String> {
 }
 
 fn load_log(path: &Path) -> Vec<AccessRecord> {
-    let Ok((mut file, _)) = crate::tools::open_regular(path) else {
-        return Vec::new();
-    };
+    let Ok((mut file, _)) = crate::tools::open_regular(path) else { return Vec::new() };
     let mut text = String::new();
     if file.read_to_string(&mut text).is_err() {
         return Vec::new();
@@ -335,12 +333,8 @@ pub fn scan(project_root: &Path, now: u64) -> MemoryScan {
     #[cfg(test)]
     scan_test::wait(project_root);
 
-    let Some((root, dir)) = project_memory_dir(project_root) else {
-        return MemoryScan::default();
-    };
-    let Ok(read_dir) = std::fs::read_dir(&dir) else {
-        return MemoryScan::default();
-    };
+    let Some((root, dir)) = project_memory_dir(project_root) else { return MemoryScan::default() };
+    let Ok(read_dir) = std::fs::read_dir(&dir) else { return MemoryScan::default() };
     let log = local_path(&root, &dir.join(ACCESS_LOG)).map(|path| load_log(&path)).unwrap_or_default();
     let mut entries: Vec<MemoryEntry> = Vec::new();
     for dirent in read_dir.flatten() {

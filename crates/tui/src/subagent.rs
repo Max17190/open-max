@@ -358,9 +358,7 @@ impl Worktree {
         // NUL; a repository's commit has mode 160000.
         let mut fields = changes.split(|byte| *byte == 0);
         while let (Some(change), Some(path)) = (fields.next(), fields.next()) {
-            let Ok(change) = std::str::from_utf8(change) else {
-                continue;
-            };
+            let Ok(change) = std::str::from_utf8(change) else { continue };
             let [_, "160000", _, commit, _] = change.split(' ').collect::<Vec<_>>()[..] else {
                 continue;
             };

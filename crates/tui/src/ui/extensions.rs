@@ -87,9 +87,7 @@ pub fn endpoint_host(base_url: &str) -> Option<String> {
 
 /// Full base URL with userinfo redacted for `/status` and similar listings.
 pub fn display_base_url(base_url: &str) -> String {
-    let Some((scheme, authority, path)) = split_base_url(base_url) else {
-        return String::new();
-    };
+    let Some((scheme, authority, path)) = split_base_url(base_url) else { return String::new() };
     let hostport = strip_userinfo(authority);
     format!("{scheme}{hostport}{path}")
 }

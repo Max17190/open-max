@@ -75,9 +75,7 @@ pub(crate) fn batchable_call(
     if name.is_empty() {
         return false;
     }
-    let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments) else {
-        return false;
-    };
+    let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments) else { return false };
     if registry.get(name).is_none() || registry.is_mutating(name) {
         return false;
     }

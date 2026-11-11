@@ -303,11 +303,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         catalog.push(json!({"id":model,"context_tokens":window}));
     }
     entry["base_url"] = json!(base);
-    entry["api_key"] = json!(if key.starts_with('$') {
-        format!("${key}")
-    } else {
-        key
-    });
+    entry["api_key"] = json!(if key.starts_with('$') { format!("${key}") } else { key });
     entry.as_object_mut().unwrap().remove("api_key_env");
     api_defaults(&mut entry, &name, previous.is_none())?;
     providers::edit_catalog(dir, |entries| {

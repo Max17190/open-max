@@ -521,9 +521,7 @@ pub fn append_usage(core: &Core, id: &str, record: &TokenUsage) {
 
 /// Every recorded request for a session, oldest first (corrupt lines skipped).
 pub fn load_usage(core: &Core, id: &str) -> Vec<TokenUsage> {
-    let Ok(text) = std::fs::read_to_string(usage_path(core, id)) else {
-        return Vec::new();
-    };
+    let Ok(text) = std::fs::read_to_string(usage_path(core, id)) else { return Vec::new() };
     text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
@@ -690,9 +688,7 @@ pub fn save_manifest(core: &Core, id: &str, manifest: &crate::registry::Registry
         core.send_agent(id, AgentEvent::Error { message });
         return;
     }
-    let Ok(json) = serde_json::to_string_pretty(manifest) else {
-        return;
-    };
+    let Ok(json) = serde_json::to_string_pretty(manifest) else { return };
     // The last of the five session files to take the rule. A refreeze can be
     // in flight when the session is deleted, and cancellation is cooperative,
     // so without this the manifest outlives everything it described.

@@ -331,9 +331,7 @@ impl Composer {
             // reference is SPENT, so a surviving duplicate is literal text
             // on every later path instead of a second delivery, while the
             // occupied index keeps sibling markers' numbers stable.
-            let Some(paste) = self.pastes[i].take() else {
-                continue;
-            };
+            let Some(paste) = self.pastes[i].take() else { continue };
             self.on_input();
             self.touch();
             let before = row_text[..pos].to_string();
@@ -857,9 +855,7 @@ impl Composer {
         let visible = Self::visible(rows.len(), max_h);
         let scroll = self.scroll.min(rows.len().saturating_sub(visible));
         let index = (scroll + row as usize).min(rows.len().saturating_sub(1));
-        let Some(target) = rows.get(index) else {
-            return (0, 0);
-        };
+        let Some(target) = rows.get(index) else { return (0, 0) };
         let text = &self.lines[target.line];
         let cell = (cell as usize).saturating_sub(GUTTER);
         let mut col = target.start;
@@ -874,11 +870,7 @@ impl Composer {
             used += cells;
             col += grapheme.chars().count();
         }
-        let end = if target.last {
-            target.end
-        } else {
-            target.end.saturating_sub(1).max(target.start)
-        };
+        let end = if target.last { target.end } else { target.end.saturating_sub(1).max(target.start) };
         (target.line, col.min(end))
     }
 
@@ -911,11 +903,7 @@ impl Composer {
             let from = if index == lo.0 { lo.1.min(chars) } else { 0 };
             // Inclusive of the character under the release cell: a drag that
             // ends ON the closing brace must copy the brace.
-            let to = if index == hi.0 {
-                hi.1.saturating_add(1).min(chars)
-            } else {
-                chars
-            };
+            let to = if index == hi.0 { hi.1.saturating_add(1).min(chars) } else { chars };
             if index > lo.0 {
                 out.push('\n');
             }

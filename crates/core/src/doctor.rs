@@ -1049,9 +1049,7 @@ fn memory_findings(project_root: &Path) -> Vec<Finding> {
         }
         return findings;
     };
-    let Ok(read_dir) = std::fs::read_dir(target) else {
-        return findings;
-    };
+    let Ok(read_dir) = std::fs::read_dir(target) else { return findings };
     let scan = crate::memory::scan(project_root, crate::memory::unix_now());
     for entry in read_dir.flatten() {
         let path = dir.join(entry.file_name());
@@ -1485,9 +1483,7 @@ fn example_verdict(
     if !outcome.ok {
         return Err(format!("example run failed; got:\n{}", detail(&outcome.output)));
     }
-    let Some(pattern) = &example.expect_regex else {
-        return Ok(());
-    };
+    let Some(pattern) = &example.expect_regex else { return Ok(()) };
     // Tool parsing rejects a pattern that does not parse; one that parses can
     // still be past the compiler's size limit, and is named as that, not as
     // a mismatch. The match sees the output trimmed the same way `detail`
@@ -1708,11 +1704,7 @@ pub(crate) fn missing_command_reason(
         return None; // the parser already errors on this
     }
     if command.contains('/') {
-        let path = if Path::new(command).is_absolute() {
-            PathBuf::from(command)
-        } else {
-            project_root.join(command)
-        };
+        let path = if Path::new(command).is_absolute() { PathBuf::from(command) } else { project_root.join(command) };
         if !path.is_file() {
             return Some((
                 CommandProblem::Absent,

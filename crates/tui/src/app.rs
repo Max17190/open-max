@@ -790,11 +790,7 @@ impl App {
             last_content_w: 0,
             presence: Presence::Idle,
             term_focus: None,
-            term_out: if cfg!(test) {
-                Box::new(std::io::sink())
-            } else {
-                Box::new(std::io::stdout())
-            },
+            term_out: if cfg!(test) { Box::new(std::io::sink()) } else { Box::new(std::io::stdout()) },
             approval_hits: [None; 3],
             approval_grant_fully_shown: true,
             perf_layout_ms: 0.0,
@@ -1593,9 +1589,7 @@ impl App {
     }
 
     fn copy_text_selection(&mut self) -> bool {
-        let Some(text) = self.transcript.selected_text() else {
-            return false;
-        };
+        let Some(text) = self.transcript.selected_text() else { return false };
         // Dropping the highlight is what keeps a selection from swallowing
         // the next Ctrl+C: press once to copy, again to cancel or quit.
         self.transcript.clear_text_selection();
@@ -1665,9 +1659,7 @@ impl App {
     /// Approval hit regions use the fixed order allow once, auto for project,
     /// deny. Keyboard handling remains the authoritative path.
     fn respond_approval_choice(&mut self, choice: usize) {
-        let Some((id, _, _, _, _)) = self.pending_approval.clone() else {
-            return;
-        };
+        let Some((id, _, _, _, _)) = self.pending_approval.clone() else { return };
         match choice {
             0 => self.core.respond_approval(&id, true),
             1 => {
@@ -1788,9 +1780,7 @@ impl App {
 
     fn refilter_history_search(&mut self) {
         let entries = self.composer.history_entries();
-        let Some((query, selected, matches)) = &mut self.history_search else {
-            return;
-        };
+        let Some((query, selected, matches)) = &mut self.history_search else { return };
         let q = query.to_ascii_lowercase();
         *matches = entries
             .into_iter()
@@ -1864,9 +1854,7 @@ impl App {
     /// Rebuild the find bar's matches and select the latest, or with `live`
     /// keep the selected block while it still matches.
     fn refilter_scroll_search(&mut self, live: bool) {
-        let Some((query, selected, matches)) = &mut self.scroll_search else {
-            return;
-        };
+        let Some((query, selected, matches)) = &mut self.scroll_search else { return };
         self.find_previews.clear();
         let kept = matches.get(*selected).copied().filter(|_| live);
         *matches = self.transcript.filter_matches(query);
@@ -1878,9 +1866,7 @@ impl App {
 
     /// Scroll the currently highlighted scroll-search match into view.
     fn focus_scroll_match(&mut self) {
-        let Some((_, sel, matches)) = &self.scroll_search else {
-            return;
-        };
+        let Some((_, sel, matches)) = &self.scroll_search else { return };
         if matches.is_empty() {
             self.transcript.clear_selection();
             return;
@@ -1894,9 +1880,7 @@ impl App {
     /// Step match selection by `delta` (-1 prev, +1 next), wrapping.
     fn step_scroll_match(&mut self, delta: i32) {
         {
-            let Some((_, sel, matches)) = &mut self.scroll_search else {
-                return;
-            };
+            let Some((_, sel, matches)) = &mut self.scroll_search else { return };
             if matches.is_empty() {
                 return;
             }
@@ -1908,9 +1892,7 @@ impl App {
 
     /// n/N after find closed: jump using the last query from scrollback focus.
     fn step_last_scroll_search(&mut self, delta: i32) {
-        let Some(query) = self.scroll_search_last.clone() else {
-            return;
-        };
+        let Some(query) = self.scroll_search_last.clone() else { return };
         if query.is_empty() {
             return;
         }
@@ -1946,15 +1928,11 @@ impl App {
     /// The token under the cursor is compared to the item's insert text with
     /// its trailing space ignored.
     fn completion_is_typed_exactly(&self) -> bool {
-        let Some(popup) = &self.completion else {
-            return false;
-        };
+        let Some(popup) = &self.completion else { return false };
         if popup.kind != completion::Kind::Slash {
             return false;
         }
-        let Some(item) = popup.selected_item() else {
-            return false;
-        };
+        let Some(item) = popup.selected_item() else { return false };
         let (_, _, line) = self.composer.cursor_context();
         let token: String = line
             .chars()
@@ -3198,11 +3176,7 @@ impl App {
                 .saturating_add(2)
                 .max(3)
         };
-        let desired_queue_h = if self.queued.is_empty() {
-            0
-        } else {
-            (self.queued.len() as u16).min(3)
-        };
+        let desired_queue_h = if self.queued.is_empty() { 0 } else { (self.queued.len() as u16).min(3) };
         let hist_lines = self.history_search.as_ref().map(|(q, sel, items)| {
             history_search_lines(q, *sel, items, area.width)
         });
@@ -3299,9 +3273,7 @@ impl App {
     }
 
     fn draw_approval(&mut self, frame: &mut Frame, area: Rect) {
-        let Some((_, name, summary, detail, env)) = self.pending_approval.as_ref() else {
-            return;
-        };
+        let Some((_, name, summary, detail, env)) = self.pending_approval.as_ref() else { return };
         let env_empty = env.is_empty();
         if area.height < 5 {
             let lines = compact_approval_lines(name, summary, detail, env, area.width, area.height);
@@ -3497,11 +3469,7 @@ impl App {
                 paint_line(frame.buffer_mut(), row_at(0), Some(&gutter), line);
             }
         }
-        let selected_bi = if self.focus == Focus::Scrollback {
-            self.transcript.selected()
-        } else {
-            None
-        };
+        let selected_bi = if self.focus == Focus::Scrollback { self.transcript.selected() } else { None };
         self.chat_line_map.clear();
         self.chat_line_map.extend(std::iter::repeat_n(None, sticky_rows));
         self.transcript.paint_rows(
@@ -3583,11 +3551,7 @@ impl App {
         } else if width_changed || self.stream_md.text_len() != self.stream_text.len() {
             stream_reset = width_changed || self.stream_text.len() < self.stream_md.text_len();
             self.stream_md.update(&self.stream_text, prose_width);
-            let stable = if stream_reset {
-                0
-            } else {
-                self.stream_stable_len
-            };
+            let stable = if stream_reset { 0 } else { self.stream_stable_len };
             self.stream_stable_len = self
                 .stream_md
                 .sync_into(&mut self.stream_wrapped, stable);
@@ -3698,11 +3662,7 @@ impl App {
             };
             let width = area.width as usize;
             let hint = self.status_hint();
-            let left = if hint.is_empty() {
-                String::new()
-            } else {
-                format!(" {hint}")
-            };
+            let left = if hint.is_empty() { String::new() } else { format!(" {hint}") };
             let short_model = extensions::short_model(&model);
             let billed_model = self.chatgpt_account.as_ref().map(|account| format!("Using ChatGPT plan ({account}) · {short_model}"));
             let short_model = billed_model.as_deref().unwrap_or(short_model);
@@ -3993,11 +3953,7 @@ fn scroll_search_lines(
     previews: &mut std::collections::HashMap<usize, String>,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let count = if matches.is_empty() {
-        "0/0".to_string()
-    } else {
-        format!("{}/{}", selected + 1, matches.len())
-    };
+    let count = if matches.is_empty() { "0/0".to_string() } else { format!("{}/{}", selected + 1, matches.len()) };
     search_lines("find in conversation…", query, Some(count), selected, matches.len(), width, |i, max| {
         // Built once per (query, block): this renders on every frame while
         // the popup is open, including every streaming frame, and a preview
@@ -4229,12 +4185,8 @@ fn paint_text_selection(
 ) {
     let select_bg = theme::SELECT;
     for (row, painted) in line_map.iter().copied().enumerate() {
-        let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else {
-            continue;
-        };
-        let Some((start_col, end_col)) = transcript.selection_columns(line_idx) else {
-            continue;
-        };
+        let Some(line_idx) = painted.and_then(|at| transcript.line_of(at)) else { continue };
+        let Some((start_col, end_col)) = transcript.selection_columns(line_idx) else { continue };
         let max_col = end_col.min(area.width as usize);
         for column in start_col.min(max_col)..max_col {
             if let Some(cell) =

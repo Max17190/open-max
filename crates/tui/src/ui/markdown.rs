@@ -171,9 +171,7 @@ impl StreamingMarkdown {
         // Search only the uncommitted suffix. Completed lines can no longer
         // change, so the scan bound is independent of accumulated history.
         let uncommitted = &text[self.committed_bytes..];
-        let Some(last_nl) = uncommitted.rfind('\n') else {
-            return;
-        };
+        let Some(last_nl) = uncommitted.rfind('\n') else { return };
         let commit_end = self.committed_bytes + last_nl + 1;
 
         let newly = &text[self.committed_bytes..commit_end];

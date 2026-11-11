@@ -144,11 +144,7 @@ fn refreeze_receipt_text(
     project_root: &Path,
     mode: ApprovalMode,
 ) -> String {
-    let what = if changes.is_empty() {
-        "extension files changed".to_string()
-    } else {
-        changes.join("; ")
-    };
+    let what = if changes.is_empty() { "extension files changed".to_string() } else { changes.join("; ") };
     let mut note = format!("[extension refreeze: {what}.");
     if !broken.is_empty() {
         let listed: Vec<String> = broken
