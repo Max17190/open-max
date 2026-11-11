@@ -160,10 +160,22 @@ fn chat_replay(message: &ChatMessage, origin: &str, prefer_details: bool) -> (bo
     (replay, plain)
 }
 
+/// An assistant message that would go out with no text, no call and no
+/// reasoning: a reply cut while reasoning, sent to an endpoint its reasoning
+/// does not go to. Chat templates can reject an empty assistant turn, so it
+/// is not sent at all.
+pub(crate) fn blank_on_wire(message: &ChatMessage, replay: bool) -> bool {
+    message.role == "assistant"
+        && message.content.as_deref().is_none_or(str::is_empty)
+        && message.tool_calls.as_deref().is_none_or(<[_]>::is_empty)
+        && !(replay && (message.reasoning_content.is_some() || message.reasoning.is_some() || message.reasoning_details.is_some()))
+}
+
 impl Serialize for WireMessages<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let last = self.messages.len().saturating_sub(1);
-        serializer.collect_seq(self.messages.iter().enumerate().map(|(at, m)| {
+        let sent = |m: &&ChatMessage| !blank_on_wire(m, m.reasoning_origin.as_deref() == Some(self.origin));
+        let last = self.messages.iter().filter(sent).count().saturating_sub(1);
+        serializer.collect_seq(self.messages.iter().filter(sent).enumerate().map(|(at, m)| {
             let (replay, plain) = chat_replay(m, self.origin, self.prefer_reasoning_details);
             let mark = self.marks && (at == last || m.role == "system");
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");

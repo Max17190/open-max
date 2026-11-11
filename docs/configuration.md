@@ -139,9 +139,14 @@ and the run that writes a key already uses it.
   a usage count at the limit), a tool call cut off at that limit does not
   run; the model is told why and to send large content in parts. A
   reasoning model's reasoning counts toward the limit, so at 4096 a reply
-  can be cut inside its reasoning, with no text and no call; the turn then
-  ends with `length`, and the terminal UI and print mode say which
-  `max_tokens` cut it and where it is set. Send a follow-up to continue.
+  can be cut inside its reasoning, with no text and no call. A reply cut
+  before any tool call does not end the turn: it stays in the transcript
+  (its reasoning too, which goes back only to the endpoint that wrote it),
+  a note after it tells the model the limit and to continue briefly, and
+  the turn goes on. After four such continuations in a row, a fifth cut
+  reply ends the turn with `length` (so does a cut on the turn's last
+  iteration), and the terminal UI and print mode say which `max_tokens`
+  cut it and where it is set. Send a follow-up to continue.
   Set it to the model's documented output maximum, at most about a quarter
   of the window, since the same number is reserved out of the input budget.
   `openmax --check` warns while the active model runs at the default. A

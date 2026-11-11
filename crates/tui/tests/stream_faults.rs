@@ -745,6 +745,11 @@ fn check_windows(run: &Run, new: &[ChatMessage], stop: &str, log: &str) {
             let reply = disk.expect("tool", Some(&tool_reply(end, &notes)), "a tool reply");
             assert_eq!(reply.tool_call_id.as_deref(), end["call_id"].as_str(), "{log}");
         }
+        // A note owned by no call (a reply the output limit cut before any
+        // call) is a user message after the reply.
+        for note in notes.iter().filter(|n| n["call_id"] == "") {
+            disk.expect("user", note["text"].as_str(), "a note after the reply");
+        }
     }
     // Calls that never ran are answered with the stub for why the turn ended.
     let stub = match stop {
@@ -1599,7 +1604,7 @@ fn a_finish_reason_without_done_and_done_without_a_finish_reason_both_finish_the
     let closed = |body: String| Step::Cut { at: body.len(), body: body.into_bytes(), framing: Framing::CloseDelimited, pieces: Vec::new() };
     let cases = [
         ("finish-stop", closed(format!("{}{}", content("all of it"), finish("stop"))), "stop", ""),
-        ("finish-length", closed(format!("{}{}", content("up to the cap"), finish("length"))), "length", ""),
+        ("finish-length", closed(format!("{}{}", content("up to the cap"), finish("length"))), "stop", ""),
         ("finish-calls", closed(format!("{}{}", call("f1", "finish-calls"), finish("tool_calls"))), "stop", "finish-calls\n"),
         ("done-only", Step::Finished(format!("{}{DONE}", content("all of it"))), "stop", ""),
         ("done-calls", Step::Finished(format!("{}{DONE}", call("d1", "done-calls"))), "stop", "done-calls\n"),
@@ -1608,7 +1613,8 @@ fn a_finish_reason_without_done_and_done_without_a_finish_reason_both_finish_the
         for (tag, reply, stop, ran) in cases {
             scope.spawn(move || {
                 let mut script = vec![reply];
-                if !ran.is_empty() {
+                // A call that ran, or a reply the limit cut, asks once more.
+                if !ran.is_empty() || tag == "finish-length" {
                     script.push(Step::Finished(sse_text("after the call")));
                 }
                 script.push(Step::Finished(sse_text("resumed")));
@@ -2191,23 +2197,28 @@ fn a_truncated_first_prompt_skips_the_prompts_after_it() {
     assert!(!run.messages().iter().any(|m| m.content.as_deref() == Some("second")), "{log}");
 }
 
+/// A reply the limit cuts before any call is continued four times; the fifth
+/// in a row ends the turn `length`, which exits 4 and skips the prompts after
+/// it. The `stop` reply reports one token under the limit: a usage count equal
+/// to the limit counts as a cut whatever the finish reason, so a `stop` reply
+/// of exactly 32 tokens would be continued too.
 #[test]
 fn a_reply_cut_by_the_provider_exits_four_and_skips_later_prompts() {
-    let usage = data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":32}}));
-    for (reason, code, turns) in [("length", 4, 1), ("stop", 0, 2)] {
+    for (reason, used, code, turns, requests) in [("length", 32, 4, 1, 5), ("stop", 31, 0, 2, 2)] {
+        let usage = data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":used}}));
         let reply = format!("{}{}{usage}{DONE}", content("first answer"), finish(reason));
-        let env = Env::with_settings(
-            reason,
-            reason,
-            vec![Step::Finished(reply), Step::Finished(sse_text("second answer"))],
-            r#","max_tokens":32"#,
-        );
+        let mut script: Vec<Step> = (turns..=requests).map(|_| Step::Finished(reply.clone())).collect();
+        script.push(Step::Finished(sse_text("second answer")));
+        let env = Env::with_settings(reason, reason, script, r#","max_tokens":32"#);
         let run = env.run(&["--trust-project"], &["first", "second"], &[], &env.ctx);
         let log = run.log();
         assert_eq!(run.code, Some(code), "{log}");
-        assert_eq!(run.requests.len(), turns, "{log}");
+        assert_eq!(run.requests.len(), requests, "{log}");
         assert_eq!(serde_json::from_str::<Value>(&run.requests[0]).unwrap()["max_tokens"], 32, "{log}");
-        assert_eq!(run.of("usage").next().unwrap()["completion_tokens"], 32, "{log}");
+        assert_eq!(run.of("usage").next().unwrap()["completion_tokens"], used, "{log}");
+        let cut = "[reply cut: it reached max_tokens (32) before any tool call; continue from where it stopped: think briefly, then act.]";
+        let notes = run.messages().iter().filter(|m| m.role == "user" && m.content.as_deref() == Some(cut)).count();
+        assert_eq!(notes, if reason == "length" { 4 } else { 0 }, "{log}");
         assert_eq!(run.count("done"), turns, "{log}");
         assert_eq!(run.of("done").next().unwrap()["stop_reason"], reason, "{log}");
         assert_eq!(

@@ -58,7 +58,7 @@ pub(crate) fn insert_startup_note(
 
 /// Insert a harness note as a user message at `at` and emit it on the wire,
 /// as `insert_startup_note` does ahead of the pending prompt.
-fn insert_note(
+pub(crate) fn insert_note(
     core: &Arc<Core>,
     session_id: &str,
     msgs: &mut Vec<ChatMessage>,

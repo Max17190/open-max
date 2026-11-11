@@ -137,6 +137,8 @@ impl CompactionDigest {
         for msg in &self.dropped {
             let remaining = self.text_cap.saturating_sub(text.len());
             if remaining == 0 { break; }
+            // A reply cut while reasoning has no text for a summary to keep.
+            if crate::client::blank_on_wire(msg, false) { continue; }
             let mut line = format!("{}: ", msg.role);
             let original = msg.archived_tool_key().and_then(|key| {
                 originals.get(&key).copied().or_else(|| prior.get(&key).map(String::as_str))
@@ -1799,6 +1801,22 @@ pub(crate) mod tests {
         assert!(note.starts_with(DIGEST_PREFIX));
         assert!(note.contains("Summary: Was wiring auth middleware"));
         assert!(note.contains("src/auth.rs"));
+    }
+
+    /// A reply the output limit cut while it was still reasoning is kept as an
+    /// assistant message with reasoning and nothing else. Compacted, it adds
+    /// no empty line to the summary input; it is still archived.
+    #[test]
+    fn a_reasoning_only_reply_adds_nothing_to_the_summary_input() {
+        let mut digest = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
+        let mut thought = ChatMessage::assistant(None, None);
+        thought.reasoning_content = Some("half a thought".into());
+        thought.reasoning_origin = Some("origin".into());
+        for message in [ChatMessage::user("go"), thought, ChatMessage::user("[reply cut]")] {
+            digest.record_message(&message);
+        }
+        assert_eq!(digest.dropped_text(None), "user: go\nuser: [reply cut]\n");
+        assert_eq!(digest.dropped.len(), 3, "the archive still gets all three");
     }
 
     /// The old head-only excerpt cut every dropped message at 240 chars, so a
