@@ -1189,10 +1189,12 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
 /// returns true when there was any. Members that exit within
 /// `LEFT_RUNNING_AFTER` were on their way out, not left running: reporting
 /// them told the caller of nearly every test run with a worker pool that its
-/// background processes were cut short, when it had started none.
+/// background processes were cut short, when it had started none. Members
+/// that exited and wait for a parent to collect them run nothing either
+/// ([`group_has_running_member`]).
 async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
     let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
-    while process_group_exists(pid) {
+    while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
             return terminate_remaining_group(pid).await;
         }
@@ -1209,12 +1211,12 @@ async fn terminate_remaining_group(pid: Option<u32>) -> bool {
     // The wait ends when the last one exits: a fixed sleep held every call
     // that left a background process for the whole grace, though one that
     // exits on SIGTERM is gone within milliseconds.
-    if !process_group_exists(pid) {
+    if !group_has_running_member(pid) {
         return false;
     }
     send_termination_group(pid);
     let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
-    while process_group_exists(pid) {
+    while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
             send_kill_group(pid);
             break;
@@ -1963,6 +1965,16 @@ fn stat_started(stat: &str) -> Option<(u64, bool)> {
     Some((fields.nth(22 - 4)?.parse().ok()?, exited))
 }
 
+/// Field 5, the process group, of a `/proc/<pid>/stat` line, and whether
+/// field 3, the state, is Z, counted as [`stat_started`] counts them.
+#[cfg(any(target_os = "linux", test))]
+fn stat_group(stat: &str) -> Option<(u32, bool)> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    let exited = fields.next()? == "Z";
+    Some((fields.nth(1)?.parse().ok()?, exited))
+}
+
 #[cfg(all(test, unix))]
 thread_local! {
     /// Set by [`PausedSpawn`] for the next spawn on its thread: the pipe the
@@ -2102,6 +2114,49 @@ fn process_group_exists(_: Option<u32>) -> bool {
     false
 }
 
+/// Whether the group led by `pid` holds a member that can still run. A member
+/// that has exited stays in its group, and answers the probe of
+/// [`process_group_exists`], until its parent waits for it, and in a container
+/// whose init never waits for orphans that is forever: the workers a test
+/// runner leaves when it exits would read as left running on every call. On
+/// Linux the members are read from `/proc`, and a group whose members found
+/// there have all exited runs nothing. Read twice, so a member forked while
+/// the first read was past its pid is seen. Elsewhere, or with no member
+/// found, the probe answers.
+#[cfg(target_os = "linux")]
+fn group_has_running_member(pid: Option<u32>) -> bool {
+    let Some(group) = pid.filter(|_| process_group_exists(pid)) else {
+        return false;
+    };
+    !(only_exited_members(group) && only_exited_members(group))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn group_has_running_member(pid: Option<u32>) -> bool {
+    process_group_exists(pid)
+}
+
+/// True when `/proc` lists members of `group` and every one has exited.
+#[cfg(target_os = "linux")]
+fn only_exited_members(group: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    let mut found = false;
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(positive_pid) else {
+            continue;
+        };
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        match stat_group(&stat) {
+            Some((member_of, false)) if member_of == group => return false,
+            Some((member_of, true)) if member_of == group => found = true,
+            _ => {}
+        }
+    }
+    found
+}
+
 #[cfg(unix)]
 fn signal_group(pid: Option<u32>, signal: libc::c_int) {
     if let Some(pid) = pid {
@@ -2218,6 +2273,9 @@ mod tests {
         assert_eq!(stat_started(stat), Some((98765, false)));
         assert_eq!(stat_started(&stat.replace(") S ", ") Z ")), Some((98765, true)), "a state of Z is an exited process");
         assert_eq!(stat_started("4242 (cut"), None);
+        assert_eq!(stat_group(stat), Some((4242, false)), "the group is field 5");
+        assert_eq!(stat_group(&stat.replace(") S 1 4242", ") Z 1 77")), Some((77, true)));
+        assert_eq!(stat_group("4242 (cut) S 1"), None);
     }
 
     /// A process that has exited holds its pid until its parent waits for
@@ -3577,6 +3635,58 @@ mod tests {
         leader.start_kill().unwrap();
         leader.wait().await.unwrap();
         (Some(group), member)
+    }
+
+    /// A process that has exited stays in its group until its parent waits
+    /// for it. Wait until `child`, which nothing waits for, has exited.
+    #[cfg(target_os = "linux")]
+    async fn until_exited(child: &std::process::Child) {
+        while !started(child.id()).is_some_and(|(_, exited)| exited) {
+            tokio::time::sleep(GROUP_EXIT_POLL).await;
+        }
+    }
+
+    /// A member that has exited and that nothing waits for, a zombie, stays
+    /// in its group, as the workers of a test runner do in a container whose
+    /// init does not wait for orphans. It runs nothing, so the group is not
+    /// signalled and nothing is reported. The zombie here is the test's own
+    /// child, left unwaited on purpose until the cleanup has answered.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_group_left_holding_only_a_zombie_is_not_reported() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = Command::new("sleep");
+        leader.arg("6854").kill_on_drop(true);
+        leader.as_std_mut().process_group(0);
+        let mut leader = leader.spawn().unwrap();
+        let group = leader.id().unwrap();
+        let mut worker = std::process::Command::new("true");
+        worker.process_group(i32::try_from(group).unwrap());
+        let mut worker = worker.spawn().unwrap();
+        leader.start_kill().unwrap();
+        leader.wait().await.unwrap();
+        until_exited(&worker).await;
+        assert!(process_group_exists(Some(group)), "the zombie does not hold its group");
+        let reported = stop_what_was_left_running(Some(group)).await;
+        worker.wait().unwrap();
+        assert!(!reported, "a group holding only a zombie was reported as left running");
+    }
+
+    /// A zombie beside a member that still runs hides nothing: the running
+    /// member is stopped and reported as before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_running_member_beside_a_zombie_is_still_stopped_and_reported() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let (group, mut member) = group_whose_leader_exited(&["sleep", "6855"]).await;
+        let mut zombie = std::process::Command::new("true");
+        zombie.process_group(i32::try_from(group.unwrap()).unwrap());
+        let mut zombie = zombie.spawn().unwrap();
+        until_exited(&zombie).await;
+        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+        zombie.wait().unwrap();
+        assert!(reported, "the running member was not reported");
+        assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the running member was not stopped");
     }
 
     /// A background child that exits on SIGTERM ends the cleanup as soon as
