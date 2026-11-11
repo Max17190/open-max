@@ -520,13 +520,19 @@ pub(crate) async fn compact_messages(
     // it, so the prune keeps room for it.
     let note = ctx.core.sessions.lock().await.get(ctx.session_id).and_then(|data| data.trailing_note.clone());
     let room = note.as_deref().map_or(0, |note| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + note.len()));
-    // Once the archive lands the digest note gains its address, a summary at
-    // its cap and the fields the last record carries forward (each at most a
-    // path's cap and its separator); 100 bytes cover their labels and the
-    // estimate's rounding. The prune keeps that much room too.
-    let carried = sessions::last_compaction(ctx.core, ctx.session_id)
-        .map_or(0, |prior| prior.paths.iter().chain(&prior.tools).map(|field| field.len().min(MAX_DIGEST_PATH_BYTES) + 2).sum());
-    let growth = estimate_tokens(sessions::archive_display(ctx.core, ctx.session_id).len() + carried + MAX_SUMMARY_BYTES + 100);
+    // Once the archive lands the digest note gains its address, the paths the
+    // last record carries forward, and either a summary at its cap or the
+    // carried tools (a summary replaces the tool list), each field within
+    // `absorb_prior`'s caps; 100 bytes cover the labels, separators aside,
+    // and the estimate's rounding. The prune keeps that much room too.
+    let carried = |fields: &[String], count: usize, cap: usize| {
+        fields.iter().filter(|field| field.len() <= cap).map(|field| field.len() + 2).sum::<usize>().min(count * (cap + 2))
+    };
+    let (paths, tools) = sessions::last_compaction(ctx.core, ctx.session_id).map_or((0, 0), |prior| {
+        (carried(&prior.paths, MAX_DIGEST_PATHS, MAX_DIGEST_PATH_BYTES), carried(&prior.tools, MAX_DIGEST_TOOLS, MAX_DIGEST_TOOL_BYTES))
+    });
+    let address = sessions::archive_display(ctx.core, ctx.session_id).len();
+    let growth = estimate_tokens(address + paths + tools.max(MAX_SUMMARY_BYTES) + 100);
     let mut candidate = messages.clone();
     let (changed, digest) = if force {
         prune_transcript(&mut candidate, trigger, schema_tokens + room, total + room, growth, ctx.estimate)
@@ -1534,8 +1540,11 @@ pub(crate) mod tests {
             sessions::append_compaction(&core, &id, &sessions::CompactionRecord {
                 ts: 0,
                 message_count: 9,
-                tools: (0..MAX_DIGEST_TOOLS).map(|i| format!("{}{i:02}", "t".repeat(MAX_DIGEST_TOOL_BYTES - 2))).collect(),
-                paths: (0..MAX_DIGEST_PATHS).map(|i| format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_BYTES - 2))).collect(),
+                // More tools than carry forward, and a path past its cap.
+                tools: (0..4 * MAX_DIGEST_TOOLS).map(|i| format!("{}{i:02}", "t".repeat(MAX_DIGEST_TOOL_BYTES - 2))).collect(),
+                paths: std::iter::once("p".repeat(MAX_DIGEST_PATH_BYTES + 1))
+                    .chain((0..MAX_DIGEST_PATHS).map(|i| format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_BYTES - 2))))
+                    .collect(),
                 user_snippets: Vec::new(),
                 digest: String::new(),
             });
@@ -1557,6 +1566,9 @@ pub(crate) mod tests {
             let total: usize = messages.iter().map(ChatMessage::estimated_tokens).sum();
             let target = achievable_target(BUDGET, 0);
             assert!(total <= target, "with a {}-byte address the transcript is {total} tokens, past its target {target}", sessions::archive_display(&core, &id).len());
+            // Each dropped reply is 100 tokens, so a prune that keeps only the
+            // room the note can take ends within about one reply of the target.
+            assert!(total + 120 > target, "the prune keeps more room than the note can take: {total} of {target}");
             drop(core);
             std::fs::remove_dir_all(root).unwrap();
         }
