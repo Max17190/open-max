@@ -84,14 +84,17 @@ enum ApprovalOutcome {
 /// cuts at the same place. The advice is an example, since any tool can be
 /// the one cut (a bash heredoc as easily as a write_file), and it spells out
 /// how edit_file appends, because its old_string has to be unique and the
-/// last line alone of a large file is often a brace or blank.
-fn cut_off_call_error(max_tokens: usize) -> String {
+/// last line alone of a large file is often a brace or blank. Where the array
+/// sends `bash` alone, here-documents write and append the parts.
+fn cut_off_call_error(max_tokens: usize, bash_alone: bool) -> String {
+    let parts = [
+        "write_file the first part, then append the rest with edit_file (old_string is the last few lines you wrote, enough to be unique; new_string is those lines followed by the next part).",
+        "write the first part with a here-document (cat > file <<'EOF'), then append each next part with cat >> file <<'EOF'.",
+    ][usize::from(bash_alone)];
     format!(
         "Not run: your reply reached the output limit (max_tokens = {max_tokens}) while \
          writing this call, so its arguments were cut off. Send large content in parts: \
-         for a file, write_file the first part, then append the rest with edit_file \
-         (old_string is the last few lines you wrote, enough to be unique; new_string \
-         is those lines followed by the next part)."
+         for a file, {parts}"
     )
 }
 
@@ -1161,7 +1164,7 @@ async fn run_loop(
                         // fixes it.
                         let cut = capped && tool_calls.last().is_some_and(|last| std::ptr::eq(call, last));
                         let cause = if cut {
-                            cut_off_call_error(max_tokens)
+                            cut_off_call_error(max_tokens, registry.sends_bash_alone())
                         } else {
                             format!("invalid JSON in tool arguments: {e}. The call did not run.")
                         };
@@ -7536,6 +7539,23 @@ mod tests {
             ],
             "one read and one successful write; the failed write and the source file do not count"
         );
+    }
+
+    /// The advice on a call the output limit cut off reads as it always has
+    /// where the array sends the file tools, and where it sends `bash` alone
+    /// names here-documents and no file tool.
+    #[test]
+    fn the_cut_off_advice_names_only_what_the_array_sends() {
+        assert_eq!(
+            cut_off_call_error(64, false),
+            "Not run: your reply reached the output limit (max_tokens = 64) while writing this call, so its arguments \
+             were cut off. Send large content in parts: for a file, write_file the first part, then append the rest with \
+             edit_file (old_string is the last few lines you wrote, enough to be unique; new_string is those lines \
+             followed by the next part)."
+        );
+        let shell = cut_off_call_error(64, true);
+        assert!(shell.contains("cat > file <<'EOF'") && shell.contains("cat >> file <<'EOF'"), "{shell}");
+        assert!(!shell.contains("write_file") && !shell.contains("edit_file"), "{shell}");
     }
 
     /// Where the tools array sends `bash` alone, a session reads and edits

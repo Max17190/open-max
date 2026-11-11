@@ -325,6 +325,16 @@ impl Core {
         modes.stamp = seen;
     }
 
+    /// Whether `bash` runs without asking in this project now: in `auto`, with
+    /// no permission rule that denies `ls` or the empty command.
+    pub fn bash_runs_unasked(&self, project_root: &std::path::Path) -> bool {
+        self.refresh_saved_approval_modes();
+        let mode = self.approval_mode(project_root);
+        let rules = crate::permissions::Permissions::discover_for_mode(project_root, &self.data_dir, mode);
+        let denied = |command: &str| matches!(rules.evaluate("bash", &serde_json::json!({ "command": command })), crate::permissions::PermissionDecision::Deny { .. });
+        mode == ApprovalMode::Auto && !denied("") && !denied("ls")
+    }
+
     pub fn new(
         data_dir: PathBuf,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<AgentEventEnvelope>), String> {

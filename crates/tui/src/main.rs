@@ -2288,7 +2288,10 @@ fn print_usage_economics() {
     use open_max_core::registry::ToolKind;
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let data_dir = default_data_dir();
-    let registry = open_max_core::registry::Registry::build(&data_dir, &project);
+    // Priced as a new session here sends it: `bash` alone of the built-ins
+    // where it runs without asking.
+    let mut registry = open_max_core::registry::Registry::build(&data_dir, &project);
+    registry.send_builtins(open_max_core::state::Core::read_only(data_dir.clone()).0.bash_runs_unasked(&project));
     let usage = open_max_core::ledger::load_usage(&data_dir, &project).unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2326,7 +2329,7 @@ fn print_usage_economics() {
     let schema_chars = registry.tool_schemas_wire().len();
     let component_chars: usize = breakdown.components.iter().map(|(_, c)| *c).sum();
     let frozen_chars = component_chars + schema_chars;
-    println!("frozen prompt prefix with all seven built-ins (paid on every request; a session built in auto sends bash alone):");
+    println!("frozen prompt prefix (paid on every request):");
     for (name, chars) in &breakdown.components {
         println!("  {name:<26} {chars:>7} chars  ~{} tok", chars / 4);
     }

@@ -537,7 +537,7 @@ impl Registry {
     /// Send all seven built-ins in the tools array of a new prompt, or with
     /// `bash_alone`, for a session whose `bash` runs without asking, `bash`
     /// alone of them. The others still run when called.
-    pub(crate) fn send_builtins(&mut self, bash_alone: bool) {
+    pub fn send_builtins(&mut self, bash_alone: bool) {
         self.schemas = with_builtins(self.file_entries(), bash_alone);
         self.schemas_wire = self.schemas.to_string().into();
     }
@@ -649,7 +649,7 @@ impl Registry {
     ) -> ToolOutcome {
         match self.get(name).map(|s| s.kind.clone()) {
             Some(ToolKind::Builtin) => {
-                let noted = &self.background_noted;
+                let (noted, caps) = (&self.background_noted, tools::OutputCaps { bash_alone: self.sends_bash_alone(), ..caps });
                 tools::execute_in_session(name, args, data_dir, root, caps, cancel, noted).await
             }
             Some(ToolKind::External(tool)) => {
@@ -710,6 +710,10 @@ impl Registry {
             .rev()
             .find(|(_, occupied)| occupied.as_str() == name)
             .and_then(|(p, _)| self.broken.iter().find(|(bp, _)| bp == p));
+        // It names the built-ins the array sends, and every tool file.
+        let bash_alone = self.sends_bash_alone();
+        let names = self.tool_names().into_iter().filter(|n| !bash_alone || n == "bash" || !tools::TOOL_NAMES.contains(&n.as_str()));
+        let available = names.collect::<Vec<_>>().join(", ");
         if let Some((path, reason)) = named.or_else(|| {
             self.broken.iter().find(|(path, _)| {
                 path.file_stem().is_some_and(|stem| stem == name)
@@ -721,15 +725,11 @@ impl Registry {
             return ToolOutcome::err(format!(
                 "unknown tool: {name}; {} exists but did NOT load: {reason}. \
                  Fix the file and verify with bash: openmax --check. The \
-                 available tools are {}",
+                 available tools are {available}",
                 shown.display(),
-                self.tool_names().join(", ")
             ));
         }
-        ToolOutcome::err(format!(
-            "unknown tool: {name}; the available tools are {}",
-            self.tool_names().join(", ")
-        ))
+        ToolOutcome::err(format!("unknown tool: {name}; the available tools are {available}"))
     }
 }
 
@@ -2652,7 +2652,7 @@ mutatng = true
         // A session's first note is the full one, and it is the one the cap
         // has to make room for.
         registry.background_noted.store(false, std::sync::atomic::Ordering::Relaxed);
-        let tight = tools::OutputCaps { command_bytes: 1_000 };
+        let tight = tools::OutputCaps { command_bytes: 1_000, bash_alone: false };
         let plain = run("tight_plain", tight).await;
         assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
         assert!(!plain.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", plain.output);

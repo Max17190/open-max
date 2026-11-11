@@ -63,15 +63,17 @@ const MAX_DIR_ENTRIES: usize = 200;
 
 /// Output limits threaded into command-running tools (bash and external
 /// tools) and read_file. Settings can widen or tighten the command cap;
-/// everything else keeps the tuned constants above.
+/// everything else keeps the tuned constants above. With `bash_alone` (the
+/// array sends `bash` alone) a result names the shell way, not a file tool.
 #[derive(Clone, Copy)]
 pub struct OutputCaps {
     pub command_bytes: usize,
+    pub bash_alone: bool,
 }
 
 impl Default for OutputCaps {
     fn default() -> Self {
-        Self { command_bytes: MAX_OUTPUT_BYTES }
+        Self { command_bytes: MAX_OUTPUT_BYTES, bash_alone: false }
     }
 }
 
@@ -91,7 +93,7 @@ impl OutputCaps {
             (None, Some(tokens)) => (tokens.saturating_mul(3) / 8).clamp(MAX_OUTPUT_BYTES, MAX_WINDOW_OUTPUT_BYTES),
             (None, None) => MAX_OUTPUT_BYTES,
         };
-        Self { command_bytes }
+        Self { command_bytes, bash_alone: false }
     }
 
     /// The bytes one read_file call may return: the command cap, held
@@ -470,10 +472,10 @@ pub(crate) async fn execute_in_session(
     let root = root.to_path_buf();
     let task_cancel = cancel.clone();
     let task = tokio::task::spawn_blocking(move || match name.as_str() {
-            "list_dir" => list_dir(&root, &args),
-            "read_file" => read_file(&root, &args, caps.read_bytes(), &task_cancel),
+            "list_dir" => list_dir(&root, &args, caps.bash_alone),
+            "read_file" => read_file(&root, &args, caps, &task_cancel),
             "write_file" => write_file(&root, &args),
-            "edit_file" => edit_file(&root, &args),
+            "edit_file" => edit_file(&root, &args, caps.bash_alone),
             "glob" => glob_tool(&root, &args),
             "grep" => grep_tool(&root, &args),
             other => ToolOutcome::err(format!(
@@ -498,7 +500,7 @@ async fn finish_file_task(
     }
 }
 
-fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
+fn list_dir(root: &Path, args: &Value, bash_alone: bool) -> ToolOutcome {
     let rel = args["path"].as_str().unwrap_or(".");
     let dir = match resolve(root, rel) {
         Ok(p) => p,
@@ -532,14 +534,15 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
     let mut output = shown.join("\n");
     if total > MAX_DIR_ENTRIES {
         output.push_str(&format!(
-            "\n… {} more entries not shown (use glob to find specific files)",
-            total - MAX_DIR_ENTRIES
+            "\n… {} more entries not shown (use {} to find specific files)",
+            total - MAX_DIR_ENTRIES,
+            if bash_alone { "find or rg --files" } else { "glob" }
         ));
     }
     ToolOutcome::ok(output)
 }
 
-fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) -> ToolOutcome {
+fn read_file(root: &Path, args: &Value, caps: OutputCaps, cancel: &CancelToken) -> ToolOutcome {
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
@@ -553,7 +556,7 @@ fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) 
     let mut window = ReadWindow {
         offset: offset.unwrap_or(1).max(1) as usize,
         limit: limit.unwrap_or(MAX_READ_LINES as u64).min(MAX_READ_LINES as u64) as usize,
-        max_bytes,
+        max_bytes: caps.read_bytes(),
         out: String::new(),
         cut_at: None,
     };
@@ -566,7 +569,8 @@ fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) 
         // A directory fails to read like any unreadable path; calling it a
         // file that is not UTF-8 sends the model after an encoding problem.
         Err(NotRegular::Directory) => {
-            return ToolOutcome::err(format!("{rel} is a directory; use list_dir to see its entries"))
+            let list = if caps.bash_alone { "run ls on it" } else { "use list_dir" };
+            return ToolOutcome::err(format!("{rel} is a directory; {list} to see its entries"));
         }
         Err(e) => return ToolOutcome::err(e.message(rel)),
     };
@@ -1064,9 +1068,7 @@ impl ReadWindow {
         let end = (offset - 1).saturating_add(limit);
         if let Some(cut_at) = cut_at {
             // `cut_at` is the first line that did NOT fit, so the
-            // continuation resumes exactly there. The former `+ 1` skipped
-            // one line per capped read, and pointed past EOF when the cap
-            // landed on the final line.
+            // continuation resumes exactly there.
             out.push_str(&format!(
                 "… output limit reached at line {cut_at} (file has {total} lines; continue with offset={cut_at})\n"
             ));
@@ -1403,7 +1405,7 @@ fn to_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
-fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
+fn edit_file(root: &Path, args: &Value, bash_alone: bool) -> ToolOutcome {
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
@@ -1413,10 +1415,9 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     // An empty old_string matches between every pair of characters, so the
     // ambiguity error would steer the model to replace_all, which splices
     // new_string between every character of the file.
+    let write = if bash_alone { "a shell command" } else { "write_file" };
     if old_string.is_empty() {
-        return ToolOutcome::err(
-            "old_string is empty; give the exact text to replace, or use write_file to create or replace a whole file",
-        );
+        return ToolOutcome::err(format!("old_string is empty; give the exact text to replace, or use {write} to create or replace a whole file"));
     }
     if old_string == new_string {
         return ToolOutcome::err("old_string and new_string are identical");
@@ -1448,7 +1449,7 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     // as CRLF; writing it would report a change that never reached the file.
     if old_string == new_string {
         return ToolOutcome::err(format!(
-            "old_string and new_string differ only in line endings; {rel} uses CRLF throughout and edit_file keeps it, so use write_file to change line endings"
+            "old_string and new_string differ only in line endings; {rel} uses CRLF throughout and edit_file keeps it, so use {write} to change line endings"
         ));
     }
 
@@ -1473,8 +1474,9 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         }
         let mut hint = closest_line_hint(&old, &old_string);
         if mixed_endings {
+            let unseen = if bash_alone { "" } else { ", which read_file does not show" };
             hint.push_str(&format!(
-                " Note: {rel} mixes CRLF and LF line endings, which read_file does not show, so a multi-line old_string must match each line ending exactly; edit one line at a time or rewrite the file with write_file."
+                " Note: {rel} mixes CRLF and LF line endings{unseen}, so a multi-line old_string must match each line ending exactly; edit one line at a time or rewrite the file with {write}."
             ));
         }
         return ToolOutcome::err(hint);
@@ -2801,9 +2803,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A file tool's hints name the tool to use next. Called in a session
+    /// whose array sends all seven built-ins they read as they always have;
+    /// called where it sends `bash` alone, they name the shell way and no
+    /// built-in the array leaves out.
+    #[test]
+    fn a_file_tools_hints_name_only_what_the_array_sends() {
+        let root = temp_project();
+        std::fs::create_dir(root.join("many")).unwrap();
+        for n in 0..=MAX_DIR_ENTRIES {
+            std::fs::write(root.join(format!("many/f{n:03}.rs")), "").unwrap();
+        }
+        std::fs::write(root.join("ends.txt"), "a\r\nb\r\n").unwrap();
+        std::fs::write(root.join("mixed.txt"), "one\r\ntwo\nthree\r\n").unwrap();
+        let hints = |bash_alone: bool| {
+            let caps = OutputCaps { bash_alone, ..OutputCaps::default() };
+            let listed = super::list_dir(&root, &json!({"path": "many"}), bash_alone).output;
+            [
+                listed.lines().last().unwrap().to_string(),
+                super::read_file(&root, &json!({"path": "src"}), caps, &CancelToken::default()).output,
+                super::edit_file(&root, &json!({"path": "ends.txt", "old_string": "", "new_string": "x"}), bash_alone).output,
+                super::edit_file(&root, &json!({"path": "ends.txt", "old_string": "a\r\nb", "new_string": "a\nb"}), bash_alone).output,
+                super::edit_file(&root, &json!({"path": "mixed.txt", "old_string": "one\ntwo", "new_string": "1\n2"}), bash_alone).output,
+            ]
+        };
+        let [listed, read, empty, ends, mixed] = hints(false);
+        assert_eq!(listed, "… 1 more entries not shown (use glob to find specific files)");
+        assert_eq!(read, "src is a directory; use list_dir to see its entries");
+        assert_eq!(empty, "old_string is empty; give the exact text to replace, or use write_file to create or replace a whole file");
+        assert_eq!(ends, "old_string and new_string differ only in line endings; ends.txt uses CRLF throughout and edit_file keeps it, so use write_file to change line endings");
+        assert!(mixed.ends_with(" Note: mixed.txt mixes CRLF and LF line endings, which read_file does not show, so a multi-line old_string must match each line ending exactly; edit one line at a time or rewrite the file with write_file."), "{mixed}");
+        let shell = hints(true);
+        assert_eq!(shell[0], "… 1 more entries not shown (use find or rg --files to find specific files)");
+        assert_eq!(shell[1], "src is a directory; run ls on it to see its entries");
+        for hint in shell {
+            for name in ["list_dir", "read_file", "write_file", "glob", "grep"] {
+                assert!(!hint.contains(name), "{name} in {hint:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// read_file in a call nothing cancels.
     fn read_file(root: &Path, args: &Value) -> ToolOutcome {
-        super::read_file(root, args, OutputCaps::default().read_bytes(), &CancelToken::default())
+        super::read_file(root, args, OutputCaps::default(), &CancelToken::default())
+    }
+
+    /// edit_file and list_dir as a session whose tools array sends them calls them.
+    fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
+        super::edit_file(root, args, false)
+    }
+
+    fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
+        super::list_dir(root, args, false)
     }
 
     /// A bash call in a session of its own, which no result has yet told
@@ -3770,7 +3822,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 &"}),
-            OutputCaps { command_bytes: 1_000 },
+            OutputCaps { command_bytes: 1_000, bash_alone: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4014,7 +4066,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "echo RESULT; for i in $(seq 1 3000); do echo warn-$i >&2; done"}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, bash_alone: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4045,7 +4097,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, bash_alone: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4084,7 +4136,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, bash_alone: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4324,7 +4376,7 @@ mod tests {
         std::fs::write(root.join("big.log"), line.repeat(MAX_FILE_BYTES as usize / line.len() + 1)).unwrap();
         let cancel = CancelToken::default();
         cancel.cancel();
-        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), MAX_READ_BYTES, &cancel);
+        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), OutputCaps::default(), &cancel);
         assert_eq!((out.ok, out.output.as_str()), (false, "tool cancelled by user"));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5154,7 +5206,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_over_the_cap_is_a_quarter_cap_preview_of_its_log() {
         let root = temp_project();
-        let caps = OutputCaps { command_bytes: 4_000 };
+        let caps = OutputCaps { command_bytes: 4_000, bash_alone: false };
         let data = root.join("data");
         let fill = json!({"command": "head -c 4000 /dev/zero | tr '\\0' a"});
         let fits = bash_tool(&data, &root, &fill, caps, Arc::new(CancelToken::default())).await;

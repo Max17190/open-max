@@ -388,7 +388,8 @@ async fn a_session_without_a_current_manifest_rebuilds_its_prompt_once() {
     assert!(!sent[1].last.contains(NOTE_HEADER), "with nothing changed: {}", sent[1].last);
     assert_eq!(&sent[2].prompt, rebuilt, "an AGENTS.md edit leaves the prompt as it is");
     let (_, note) = sent[2].last.split_once(&note_marker()).expect("and rides the note");
-    assert!(note.contains("AGENTS.md changed after the system prompt was built: read_file AGENTS.md"), "{note}");
+    // The session runs in auto, whose array sends bash alone, so the notice names the shell way.
+    assert!(note.contains("AGENTS.md changed after the system prompt was built: cat AGENTS.md"), "{note}");
     assert!(sent[3].prompt.contains("Run the tests first."), "a lost manifest rebuilds the prompt from disk: {}", sent[3].prompt);
     assert!(sessions.join(format!("{id}.manifest.json")).exists(), "and saves it again");
     let _ = std::fs::remove_dir_all(dir);

@@ -51,20 +51,27 @@ pub const MAX_SKILLS_BYTES: usize = 3_000;
 /// it. 64 is the Agent Skills name-length limit, so a name this fix clips is
 /// already non-conforming and `openmax --check` warns about it separately.
 const MAX_SKILL_NAME_SHOWN: usize = 64;
-/// The memory section's header, shared by prompt assembly and the persisted
-/// parser so a resumed session recognizes exactly the section it carries.
-const MEMORY_SECTION_HEADER: &str =
-    "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n";
+/// The memory section's header. Each pair names the file tools, then the shell
+/// way for an array that sends `bash` alone (`Registry::sends_bash_alone`).
+const MEMORY_SECTION_HEADER: [&str; 2] = [
+    "\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n",
+    "\n\nMemory (facts saved by earlier turns or sessions; cat one before relying on it):\n",
+];
 /// The skills section's header. The trailing note reuses it, as it does the
 /// memory one, so a note line reads as a line of the section it amends.
-const SKILLS_SECTION_HEADER: &str = "\n\nSkills (before using one, read its SKILL.md. Use read_file for paths inside the project. For skill files outside the project (absolute paths), use bash: cat <path>.):\n";
+const SKILLS_SECTION_HEADER: [&str; 2] = [
+    "\n\nSkills (before using one, read its SKILL.md. Use read_file for paths inside the project. For skill files outside the project (absolute paths), use bash: cat <path>.):\n",
+    "\n\nSkills (before using one, read its SKILL.md with cat):\n",
+];
 /// The trailing note's section for tool files the tools array lacks or
 /// carries stale. A tool file written mid-session joins the array only with a
 /// new prompt, so its line says how to run it before then, on any endpoint;
 /// the note's header already says a line replaces the array's entry.
 const TOOLS_NOTE_HEADER: &str = "Tool files written since the tools array was built (run one with its bash line):\n";
-const AGENTS_MD_NOTICE: &str =
-    "AGENTS.md changed after the system prompt was built: read_file AGENTS.md for its current instructions.\n";
+const AGENTS_MD_NOTICE: [&str; 2] = [
+    "AGENTS.md changed after the system prompt was built: read_file AGENTS.md for its current instructions.\n",
+    "AGENTS.md changed after the system prompt was built: cat AGENTS.md for its current instructions.\n",
+];
 /// The whole trailing note, its header and trailer included. Each change
 /// stores the note again in the history, so it holds what a session changed,
 /// never a second index: past this a change is counted, and `/reload` moves
@@ -224,20 +231,17 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
 pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown, PromptIndex) {
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
-    // Tool-specific guidance lives in each tool's schema description (which
-    // rides in every request anyway). The prompt names what the four core
-    // tools are for, once, and its rules are only the cross-cutting ones. No
-    // rule asks for a read before every change or a build or test after it:
-    // a model reads such a rule as a per-step obligation, re-reading what it
-    // already holds and re-running checks after each small edit, and every
-    // one of those rounds resends the conversation. When to read and verify
-    // is left to the model. Both sides count against the frozen prompt
-    // budget in `frozen_prompt_fits_token_budget`.
-    let tools = if registry.sends_bash_alone() {
-        "bash runs shell commands (ls, rg, git, tests, edits; chain steps)."
-    } else {
-        "bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files."
-    };
+    // Tool-specific guidance lives in each tool's schema description. The
+    // prompt names what the core tools the array sends are for, once, and its
+    // rules are only the cross-cutting ones. No rule asks for a read before
+    // every change or a build or test after it: a model reads such a rule as
+    // a per-step obligation, and each extra round resends the conversation.
+    // Both forms count against `frozen_prompt_fits_token_budget`.
+    let shell = usize::from(registry.sends_bash_alone());
+    let tools = [
+        "bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files.",
+        "bash runs shell commands (ls, rg, git, tests, edits; chain steps).",
+    ][shell];
     let mut prompt = format!(
         "You are Open Max, an expert coding agent working on the project at {root}.\n\
         \n\
@@ -258,7 +262,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     if let Some(instructions) = &instructions {
         let before = prompt.len();
         prompt.push_str("\n\nProject instructions (AGENTS.md):\n");
-        prompt.push_str(&capped_agents_md(instructions));
+        prompt.push_str(&capped_agents_md(instructions, shell));
         breakdown.components.push(("AGENTS.md".into(), prompt.len() - before));
     }
     // The memory index rides the frozen prefix like the skills index: a line
@@ -267,7 +271,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     let (memory, memory_lines) = memory_index(project_root, registry);
     if let Some((index, rows)) = memory {
         let before = prompt.len();
-        prompt.push_str(MEMORY_SECTION_HEADER);
+        prompt.push_str(MEMORY_SECTION_HEADER[shell]);
         prompt.push_str(&index);
         breakdown.components.push(("memory index".into(), prompt.len() - before));
         breakdown.memory = rows;
@@ -280,7 +284,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     }
     if let Some(skills) = skills_section(project_root, &registry.skills, registry.skills_omitted) {
         let before = prompt.len();
-        prompt.push_str(SKILLS_SECTION_HEADER);
+        prompt.push_str(SKILLS_SECTION_HEADER[shell]);
         prompt.push_str(&skills);
         breakdown.components.push(("skills index".into(), prompt.len() - before));
     }
@@ -342,7 +346,7 @@ fn note_with_memory(
     registry: &Registry,
     memory: Vec<(String, String, bool)>,
 ) -> (Option<String>, Vec<(String, usize)>) {
-    let index = &registry.prompt_index;
+    let (index, shell) = (&registry.prompt_index, usize::from(registry.sends_bash_alone()));
     let mut note = Note::new();
     let (tools, removed) = changed_tools(registry);
     // A count the prompt's trailer gave that changed, to zero included, or
@@ -353,12 +357,12 @@ fn note_with_memory(
     });
     note.section("tool files changes", TOOLS_NOTE_HEADER, usize::MAX, tools, removed, trailer);
     let (skills, removed) = changed(&index.skills, skill_lines(project_root, &registry.skills));
-    note.section("skills changes", SKILLS_SECTION_HEADER.trim_start_matches('\n'), MAX_SKILLS_BYTES, skills, removed, None);
+    note.section("skills changes", SKILLS_SECTION_HEADER[shell].trim_start_matches('\n'), MAX_SKILLS_BYTES, skills, removed, None);
     let (memory, removed) = changed(&index.memory, memory);
-    let memory_header = MEMORY_SECTION_HEADER.trim_start_matches('\n');
+    let memory_header = MEMORY_SECTION_HEADER[shell].trim_start_matches('\n');
     note.section("memory changes", memory_header, crate::memory::MAX_MEMORY_BYTES, memory, removed, None);
     if agents_md(project_root).as_deref().map(line_id) != index.agents_md {
-        note.section("AGENTS.md notice", "", usize::MAX, vec![AGENTS_MD_NOTICE.to_string()], Vec::new(), None);
+        note.section("AGENTS.md notice", "", usize::MAX, vec![AGENTS_MD_NOTICE[shell].to_string()], Vec::new(), None);
     }
     note.finish()
 }
@@ -690,10 +694,9 @@ fn agents_md(project_root: &Path) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// AGENTS.md as the prompt carries it, capped. The de facto convention for
-/// handing agents project conventions; ignoring it wastes the user's own
-/// groundwork.
-fn capped_agents_md(text: &str) -> String {
+/// AGENTS.md as the prompt carries it, capped, with how to read the rest in
+/// form `shell` (see `MEMORY_SECTION_HEADER`).
+fn capped_agents_md(text: &str, shell: usize) -> String {
     if text.len() <= MAX_AGENTS_MD_BYTES {
         return text.to_string();
     }
@@ -701,7 +704,7 @@ fn capped_agents_md(text: &str) -> String {
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}\n…[AGENTS.md truncated; read_file it for the rest]", &text[..cut])
+    format!("{}\n…[AGENTS.md truncated; {} it for the rest]", &text[..cut], ["read_file", "cat"][shell])
 }
 
 /// A shallow, gitignore-aware file map, capped in depth and bytes. The first

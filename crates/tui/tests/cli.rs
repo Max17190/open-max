@@ -3594,6 +3594,26 @@ fn spec_usage_names_memory_cost_and_never_claims_zero() {
     );
 }
 
+/// `openmax --spec usage` prices the tools array a new session in the
+/// project would send in its mode: `bash` alone of the built-ins in `auto`,
+/// all seven in `ask`, and the tools line of each prompt with it.
+#[test]
+fn spec_usage_prices_the_array_a_new_session_sends() {
+    let (project, home) = fresh_dirs("usage-array");
+    let row = |mode: &str, label: &str| -> usize {
+        write_settings_with_mode(&home, "http://127.0.0.1:9", mode);
+        let out = cmd(&project, &home).args(["--spec", "usage"]).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let line = text.lines().find(|line| line.trim_start().starts_with(label)).unwrap_or_else(|| panic!("{text}"));
+        line.trim_start()[label.len()..].split_whitespace().next().unwrap().parse().unwrap()
+    };
+    let schemas = open_max_core::tools::tool_schemas().as_array().unwrap();
+    let bash: Vec<_> = schemas.iter().filter(|tool| tool["function"]["name"] == "bash").collect();
+    assert_eq!(row("auto", "tool schemas"), serde_json::to_string(&bash).unwrap().len(), "auto prices bash alone");
+    assert_eq!(row("ask", "tool schemas"), serde_json::to_string(schemas).unwrap().len(), "ask prices all seven");
+    assert!(row("auto", "base rules") < row("ask", "base rules"), "and the tools line that names them");
+}
+
 #[cfg(unix)]
 #[test]
 fn memory_commands_require_local_regular_files() {

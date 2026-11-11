@@ -226,10 +226,8 @@ fn refreeze_receipt_text(
         ));
     }
     if mode == ApprovalMode::Ask && !added.unapproved.is_empty() {
-        // This line used to say "callable" for these
-        // too, and the very next step was an approval card - the model
-        // called the receipt out as overselling. Registered is not callable
-        // until a human blesses the bytes; say which, and how.
+        // Registered is not callable until a human blesses the bytes; say
+        // which, and how.
         note.push_str(&format!(
             " New tools registered; the FIRST call of each stops for human approval of its \
              exact bytes: {}. Prove one first with bash: openmax --check --run-examples \

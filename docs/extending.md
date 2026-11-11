@@ -538,7 +538,8 @@ The dispatcher counts what only it can see: every external-tool call (with
 outcome) and every skill-body read, merged once per turn into the project's
 usage record beside the ledger. `openmax --spec usage` joins those counters
 with each extension's frozen-prompt cost - the characters every request pays
-while the file is installed - and its approval state, so the agent can see
+while the file is installed - and its approval state, beside the frozen prefix
+a new session in the project sends in its current mode, so the agent can see
 which of its own creations are pure tax and delete them. Nothing is pruned
 automatically: the core measures, the agent judges.
 

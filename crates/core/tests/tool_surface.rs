@@ -188,3 +188,90 @@ async fn ask_readonly_and_a_denied_shell_send_all_seven_built_ins() {
     let deny_some = "[[rules]]\neffect = \"deny\"\ntool = \"bash\"\narg_regex = \"rm\\\\s+-rf\"\n";
     assert_eq!(first_request_names("auto", Some(deny_some), None).await, ["bash"], "auto with some commands denied");
 }
+
+/// What a session in `mode` is told about files, from a project with a
+/// memory, a skill and an `AGENTS.md` past its cap, whose model calls the
+/// file tools anyway, from habit or its project's instructions: a read of a
+/// directory, an edit with an empty `old_string`, an edit and a read that
+/// work, and a tool no array sends. Then `AGENTS.md` changes and the session
+/// resumes, and in `readonly` an edit is called again. Returns the system prompt, each call's
+/// result by id, the note the change brought, the approval cards of the first
+/// turn, and whether the readonly edit left the file alone.
+async fn told(mode: &str) -> (String, BTreeMap<String, String>, String, usize, bool) {
+    let (base_url, bodies) = recording_endpoint(vec![
+        call("dir", "read_file", serde_json::json!({"path": "src"})),
+        call("empty", "edit_file", serde_json::json!({"path": "src/lib.rs", "old_string": "", "new_string": "x"})),
+        call("edit", "edit_file", serde_json::json!({"path": "src/lib.rs", "old_string": "needle", "new_string": "pin"})),
+        call("read", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        call("unknown", "view_file", serde_json::json!({"path": "src/lib.rs"})),
+        text("done"),
+        text("noted"),
+        call("refused", "edit_file", serde_json::json!({"path": "src/lib.rs", "old_string": "pin", "new_string": "tack"})),
+        text("explained"),
+    ])
+    .await;
+    let (dir, data, project) = fixture(&base_url, mode);
+    let write = |path: &str, body: &str| {
+        std::fs::create_dir_all(project.join(path).parent().unwrap()).unwrap();
+        std::fs::write(project.join(path), body).unwrap();
+    };
+    write(".openmax/memory/deploy-port.md", "# The deploy port is 7443\n");
+    write(".agents/skills/release/SKILL.md", "---\nname: release\ndescription: cut a release\n---\nSteps.\n");
+    write("AGENTS.md", &"Keep the build green.\n".repeat(120));
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    let id = open_max_core::sessions::create(&core, project.display().to_string()).unwrap().id;
+    let mut events = drive_turn(&core, &mut rx, &id, &project, "rename the needle").await;
+    let cards = cards(&events);
+    close(&core, &id).await;
+    write("AGENTS.md", "Keep the build green and the diff small.\n");
+    let (core, mut rx) = Core::new(data).unwrap();
+    events.extend(drive_turn(&core, &mut rx, &id, &project, "and now").await);
+    core.set_project_approval_mode(&project, ApprovalMode::Readonly).unwrap();
+    events.extend(drive_turn(&core, &mut rx, &id, &project, "tack it").await);
+    let untouched = std::fs::read_to_string(project.join("src/lib.rs")).unwrap() == "pub fn pin() {}\n";
+    let results = events.iter().filter_map(|event| match event {
+        AgentEvent::ToolEnd { call_id, output, .. } => Some((call_id.clone(), output.clone())),
+        _ => None,
+    }).collect();
+    let bodies: Vec<serde_json::Value> = bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect();
+    let system = bodies[0]["messages"][0]["content"].as_str().unwrap().to_string();
+    let note = bodies[6]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+    let _ = std::fs::remove_dir_all(dir);
+    (system, results, note, cards, untouched)
+}
+
+/// A session whose array sends `bash` alone is told the shell way wherever it
+/// was told a file tool: the memory and skills headers, the `AGENTS.md`
+/// truncation marker and change notice, a file tool's hints, and the tools an
+/// unknown-tool error lists. The file tools it still calls run, gated by the
+/// mode as usual: in `auto` without a card, in `readonly` refused. A session
+/// that sends all seven is told what it always was, byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_is_told_only_about_the_tools_its_array_sends() {
+    let (system, results, note, cards, untouched) = told("auto").await;
+    for (told, text) in [("the system prompt", &system), ("the note", &note)].into_iter().chain(results.iter().map(|(id, out)| (id.as_str(), out))) {
+        for name in ["list_dir", "read_file", "write_file", "edit_file", "glob", "grep"] {
+            assert!(!text.contains(name), "{told} names {name}, which the array leaves out:\n{text}");
+        }
+    }
+    assert!(system.contains("\n\nMemory (facts saved by earlier turns or sessions; cat one before relying on it):\n"), "{system}");
+    assert!(system.contains("\n\nSkills (before using one, read its SKILL.md with cat):\n"), "{system}");
+    assert!(system.contains("…[AGENTS.md truncated; cat it for the rest]"), "{system}");
+    assert!(note.contains("AGENTS.md changed after the system prompt was built: cat AGENTS.md for its current instructions."), "{note}");
+    assert_eq!(results["dir"], "src is a directory; run ls on it to see its entries");
+    assert_eq!(results["empty"], "old_string is empty; give the exact text to replace, or use a shell command to create or replace a whole file");
+    assert!(results["edit"].contains("src/lib.rs") && results["read"].contains("pub fn pin()"), "{results:?}");
+    assert_eq!(results["unknown"], "unknown tool: view_file; the available tools are bash");
+    assert_eq!(cards, 0, "in auto the edit runs without a card");
+    assert!(results["refused"].contains("read-only") && untouched, "in readonly the edit is refused: {results:?}");
+
+    let (system, results, note, cards, _) = told("ask").await;
+    assert!(system.contains("\n\nMemory (facts saved by earlier turns or sessions; read_file one before relying on it):\n"), "{system}");
+    assert!(system.contains("\n\nSkills (before using one, read its SKILL.md. Use read_file for paths inside the project. For skill files outside the project (absolute paths), use bash: cat <path>.):\n"), "{system}");
+    assert!(system.contains("…[AGENTS.md truncated; read_file it for the rest]"), "{system}");
+    assert!(note.contains("AGENTS.md changed after the system prompt was built: read_file AGENTS.md for its current instructions."), "{note}");
+    assert_eq!(results["dir"], "src is a directory; use list_dir to see its entries");
+    assert_eq!(results["empty"], "old_string is empty; give the exact text to replace, or use write_file to create or replace a whole file");
+    assert_eq!(results["unknown"], "unknown tool: view_file; the available tools are list_dir, read_file, write_file, edit_file, glob, grep, bash");
+    assert!(cards > 0, "in ask the edits wait for approval");
+}

@@ -305,7 +305,15 @@ once, where each typed tool call takes a model request of its own. Built in
 `ask` or `readonly`, where `bash` waits for approval or is refused, it sends
 all seven, and so it does in `auto` under a `deny` rule for `bash` that
 matches `ls` or an empty command, such as one with no `arg_regex`. The system
-prompt's tools line names only what the array sends. Headless, stdio and
+prompt's tools line names only what the array sends. Where that is `bash`
+alone, everything else a session is told about reading and writing files
+follows it: the memory and skills index headers, the `AGENTS.md` truncation
+marker and change notice, a file tool's error hints, the advice after a call
+the output limit cut off, and the tools an unknown-tool error lists name the
+shell way (`cat`, `ls`, a here-document) or no tool. The repair notes for a
+`permissions.toml` or hook that fails closed still name `write_file` and
+`edit_file`: a write through them is the one call those files leave open,
+and it runs when called. Headless, stdio and
 sub-agent sessions build it the same way, in the mode their project runs in.
 A mode chosen later gates calls at once, and the model reads it in the
 execution policy note below; the array changes at `/reload` or in a new

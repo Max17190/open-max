@@ -32,14 +32,10 @@ fn seen_approval_events(core: &Core, project_root: &Path) -> Option<HashSet<u64>
 }
 
 /// A new prompt and the tools array beside it, which hold until the next.
-/// Where `bash` runs without asking, in `auto` with no rule that denies `ls`
-/// or the empty command, the array sends `bash` alone of the built-ins.
+/// Where `bash` runs without asking (`Core::bash_runs_unasked`), the array
+/// sends `bash` alone of the built-ins.
 pub(crate) fn new_prompt(core: &Core, project_root: &Path, registry: &mut Registry) -> (String, Option<String>, PromptBreakdown) {
-    core.refresh_saved_approval_modes();
-    let mode = core.approval_mode(project_root);
-    let rules = crate::permissions::Permissions::discover_for_mode(project_root, &core.data_dir, mode);
-    let denied = |command: &str| matches!(rules.evaluate("bash", &serde_json::json!({ "command": command })), crate::permissions::PermissionDecision::Deny { .. });
-    registry.send_builtins(mode == ApprovalMode::Auto && !denied("") && !denied("ls"));
+    registry.send_builtins(core.bash_runs_unasked(project_root));
     session_context(project_root, registry)
 }
 
