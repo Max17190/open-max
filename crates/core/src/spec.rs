@@ -516,7 +516,8 @@ tool = "bash"
 timeout_secs = 5
 ```
 
-Verify with `openmax --check`. Test the script directly:
+Verify with `openmax --check`; before the project is trusted it grades in the
+settings default (ask when unset) and its first row says so. Test the script directly:
 `echo '{"event":"pre_tool_use","tool":"bash","args":{"command":"ls"}}' | sh ./scripts/deny-rm.sh`.
 "#;
 

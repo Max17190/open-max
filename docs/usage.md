@@ -94,6 +94,14 @@ row's path and in the paths and repair commands it writes into a message
 a manifest line in a parse error, prints as written.
 `openmax --check --all` prints every row.
 
+`--check` needs no trust, but no session runs in a project until it is
+trusted, so in an untrusted project the rows are graded in the settings
+default mode (ask when unset). When any row is a `warn` or `err` there, the
+report opens with one `warn trust` row that says so and names the command
+that trusts the project. A hook that is inert in ask, for one, loads without
+approval once `--trust-project` trusts the project in auto. The row never
+changes the exit code.
+
 `openmax --check --json` prints every finding as one JSON array of
 `{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),
 with absolute paths and the same exit code, so the agent can parse its own
