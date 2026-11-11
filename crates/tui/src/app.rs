@@ -3001,7 +3001,9 @@ impl App {
                     "length" => self.note("stopped: hit the response token limit"),
                     "max_iterations" => {
                         let cap = self.core.settings.lock().unwrap().max_agent_iterations;
-                        self.note(&format!("stopped: {}", crate::headless::iteration_cap_note(cap, "send a follow-up")));
+                        let how = "Send a follow-up to continue. A higher max_agent_iterations in settings.json \
+                                   applies once openmax is restarted with --continue";
+                        self.note(&format!("stopped: {}", crate::headless::iteration_cap_note(cap, how)));
                     }
                     "budget_exhausted" => self.note(
                         "stopped: reached the token budget for one turn (send a follow-up to continue)",
@@ -7144,8 +7146,8 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A turn stopped at its iteration cap says which cap it reached, that
-    /// its work is kept, and how to go on, with the cap in force.
+    /// A turn stopped at its iteration cap says which cap it reached and how
+    /// to go on, with the cap in force.
     #[tokio::test]
     async fn a_turn_at_its_iteration_cap_says_how_to_continue() {
         let (mut app, dir) = app_fixture();
@@ -7155,8 +7157,8 @@ mod tests {
         let text = app.transcript.export_text();
         assert!(
             text.contains(
-                "stopped: reached the limit of 7 tool-call rounds for one turn. The work so far is saved; \
-                 send a follow-up to continue, or raise max_agent_iterations in settings.json"
+                "stopped: reached the limit of 7 tool-call rounds for one turn. Send a follow-up to continue. \
+                 A higher max_agent_iterations in settings.json applies once openmax is restarted with --continue"
             ),
             "{text}"
         );

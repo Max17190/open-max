@@ -221,8 +221,9 @@ and the run that writes a key already uses it.
   with lone-`\r` line endings printed through bash shows only its last
   record the same way; `tr '\r' '\n' < file` shows every record.
 - `max_agent_iterations` (default 300): tool-call rounds one turn may take.
-  A turn that reaches it stops with its work saved and says so; a follow-up
-  message (or `openmax --continue -p "<follow-up>"`) carries on from there.
+  A turn that reaches it stops and says so; a follow-up message (or
+  `openmax --continue -p "<follow-up>"`) carries on from there. Settings are
+  read at start, so a raised cap applies from the next `openmax` run.
 
 The input budget for the transcript and frozen tool schemas is
 `context_tokens - (max_tokens + 1024)`, leaving room for the reply and 1024

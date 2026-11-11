@@ -2238,7 +2238,7 @@ fn a_turn_at_its_iteration_cap_exits_four_with_every_call_answered() {
 }
 
 /// In text mode the stop at the cap says what happened and how to go on:
-/// the cap it reached, that the work is saved, and the command that resumes.
+/// the cap it reached and the command that resumes.
 #[test]
 fn text_mode_at_the_iteration_cap_says_how_to_continue() {
     let env = Env::with_settings(
@@ -2253,8 +2253,8 @@ fn text_mode_at_the_iteration_cap_says_how_to_continue() {
     assert_eq!(
         said,
         ["openmax: stopped (max_iterations): reached the limit of 1 tool-call round for one turn. \
-          The work so far is saved; run openmax --continue -p \"<follow-up>\" to continue, \
-          or raise max_agent_iterations in settings.json"],
+          Run openmax --continue -p \"<follow-up>\" to continue, \
+          after raising max_agent_iterations in settings.json if it needs more rounds"],
         "{stderr}"
     );
 }
