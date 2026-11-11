@@ -938,6 +938,13 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
     findings.extend(unread_paths(project_root));
     findings.extend(global_unread_paths(data_dir));
     findings.extend(hygiene_findings(project_root, data_dir, &tool_meta, &skill_meta));
+    // An untrusted project runs no session, so its rows were graded in the
+    // settings default, not the mode a grant records: said once, first.
+    let flagged = findings.iter().any(|f| !matches!(f.status, Status::Ok(_)));
+    if flagged && crate::trust::is_trusted(data_dir, project_root) == Ok(false) {
+        let reason = format!("this project is not trusted, so these rows were graded in {} mode, the settings default; `{}` trusts it in auto mode", mode.as_str(), trust_command(project_root));
+        findings.insert(0, Finding { kind: "trust", path: project_root.to_path_buf(), status: Status::Warn(reason) });
+    }
     findings
 }
 
@@ -1016,23 +1023,16 @@ fn name_is_hidden(name: &std::ffi::OsStr) -> bool {
 /// empty or note-free subdir is left alone as it costs nothing.
 fn dir_has_md(dir: &Path) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else { return false };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        // Skip hidden entries the way the skill scan skips `.DS_Store`: a
-        // markdown file inside an editor's `.obsidian/` cache or a nested
-        // `.git` is not a memory note the author lost.
-        if path.file_name().is_some_and(name_is_hidden) {
-            continue;
-        }
-        if path.is_dir() {
-            if dir_has_md(&path) {
-                return true;
-            }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            return true;
-        }
-    }
-    false
+    // Skip hidden entries the way the skill scan skips `.DS_Store`: a
+    // markdown file inside an editor's `.obsidian/` cache or a nested
+    // `.git` is not a memory note the author lost.
+    rd.flatten()
+        .map(|entry| entry.path())
+        .filter(|path| !path.file_name().is_some_and(name_is_hidden))
+        .any(|path| match path.is_dir() {
+            true => dir_has_md(&path),
+            false => path.extension().is_some_and(|e| e == "md"),
+        })
 }
 
 /// writing a memory: will a future session see this, as written?
@@ -1170,15 +1170,11 @@ fn record_probe_receipt(data_dir: &Path, tool: &str, shas: &[String]) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let unix_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let receipt = serde_json::json!({
         "tool": tool,
         "shas": shas,
         "verdict": "example passed in sandbox (no network, writes confined)",
-        "unix_time": unix_time,
+        "unix_time": crate::memory::unix_now(),
     });
     // Atomic publish: a concurrent card lookup sees either the previous
     // complete receipt or this one, never a truncated document it would

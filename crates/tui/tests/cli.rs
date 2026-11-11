@@ -1024,6 +1024,47 @@ fn check_exit_codes_follow_findings() {
     assert!(stdout.contains("broken.toml"), "{stdout}");
 }
 
+/// A project is often checked before anyone trusts it (a setup script, a CI
+/// step). No session runs there yet, so its rows are graded in the settings
+/// default, ask when unset, where the hook `--spec hooks` shows is inert until
+/// a human approves it. The report says so once, first, with the command that
+/// trusts the project, and keeps its exit status. A trusted project has no
+/// such line, even in ask, where the same hook is still inert.
+#[test]
+fn check_names_an_untrusted_project_and_the_mode_it_was_graded_in() {
+    let (project, home) = fresh_dirs("check-untrusted");
+    let spec = open_max_core::spec::render("hooks").unwrap();
+    let hook = spec.split("```toml\n").nth(1).and_then(|rest| rest.split("```").next()).unwrap();
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    std::fs::write(project.join(".openmax/hooks/deny-rm.toml"), hook).unwrap();
+    std::fs::create_dir_all(project.join("scripts")).unwrap();
+    std::fs::write(project.join("scripts/deny-rm.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let check = |args: &[&str]| {
+        let out = cmd(&project, &home).args(args).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let trust = open_max_core::doctor::trust_command(&std::fs::canonicalize(&project).unwrap());
+
+    let (code, report) = check(&["--check"]);
+    assert_eq!(code, Some(1), "the inert hook still fails the check:\n{report}");
+    let first = report.lines().next().unwrap_or_default();
+    assert!(first.starts_with("warn trust "), "{report}");
+    assert!(first.contains("not trusted") && first.contains("graded in ask mode"), "{report}");
+    assert!(first.contains(&format!("`{trust}`")), "{report}");
+    assert_eq!(report.matches("not trusted").count(), 1, "{report}");
+    assert!(report.contains("err  hook        .openmax/hooks/deny-rm.toml  inert"), "{report}");
+    let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((rows[0]["surface"].as_str(), rows[0]["status"].as_str()), (Some("trust"), Some("warn")), "{rows}");
+
+    trust_in_ask(&project, &home);
+    let (code, report) = check(&["--check"]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(!report.contains("not trusted") && report.contains("inert"), "{report}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// An agent runs `--check` after every extension file it writes, and the
 /// report stays in its transcript, re-sent with every later request. So the
 /// default report prints only rows to act on (warn and err, plus a hook's row,

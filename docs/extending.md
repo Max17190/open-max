@@ -563,6 +563,12 @@ Each row is `ok`, `warn`, or `err`, and only `err` exits nonzero:
   that does not exist. Each of these is legitimate in some project, so none
   of them fails the check.
 
+A project nobody has trusted yet runs no session, so `--check` grades it in
+the settings default mode (ask when unset), where a hook no human approved is
+inert and fails the check. When any row is a `warn` or `err`, the report
+opens with one `warn trust` row naming that mode and the command that trusts
+the project; `--trust-project` records auto, where the same hook loads.
+
 The agent rereads the report with every later request of its session, so by
 default it prints only the rows of files with a `warn` or `err` and of hooks
 (a hook's `ok` row says what it enforces: its event, and whether it gates).
