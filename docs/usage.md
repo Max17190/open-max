@@ -277,16 +277,18 @@ openmax held it, each as the line `-p --json` prints for it.
 `openmax --replay <file> --json` prints those lines from that one file and
 reads nothing else, so a log copied to another machine replays there with no
 endpoint, settings, trust or data dir, and no tool runs; for a `-p --json` run
-it prints that run's stdout byte for byte. The log is written when a turn or a
-`/compact` ends, before the events that close it are sent; while a turn runs,
-each time 64 KiB of lines wait; and when the session is released. A turn that
-ends with its process (a crash, or a TUI quit while it runs) leaves out what it
-had not yet written, and a final line a crash cut off is passed over. A
-continued session appends to its log, a `/fork` or `/rewind` branch's log
-starts at the branch, a session saved before logs existed starts one when it
-is next continued, and deleting a session deletes its log. A file that is not
-an event log, a log in another format, or a damaged line exits 1 with the
-reason on stderr, after the lines before the damage.
+it prints that run's stdout byte for byte, for every turn that finished. The
+log is written when a turn or a `/compact` ends, before the events that close
+it are sent; while a turn runs, each time 64 KiB of lines wait; and when the
+session is released. A turn that ends with its process (a crash, or a TUI quit
+while it runs) leaves out what it had not yet written, often all of it, and a
+final line a crash cut off is passed over. The transcript is saved apart from
+the log, so `openmax -c` still continues such a session, and the log goes on
+from the continued turn. A continued session appends to its log, a `/fork` or
+`/rewind` branch's log starts at the branch, a session saved before logs
+existed starts one when it is next continued, and deleting a session deletes
+its log. A file that is not an event log, a log in another format, or a damaged
+line exits 1 with the reason on stderr, after the lines before the damage.
 
 A damaged or unreadable transcript stops continuation with its path and the
 failure reason. Open Max preserves the original bytes and does not silently
