@@ -144,8 +144,11 @@ pub struct Settings {
     pub max_parallel_tools: usize,
 }
 
+/// A change across several files with its tests routinely takes more than
+/// fifty tool rounds, so the default leaves room for that and still ends a
+/// turn that never stops calling tools.
 fn default_max_agent_iterations() -> usize {
-    50
+    300
 }
 
 fn default_max_parallel_tools() -> usize {
@@ -450,15 +453,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_iteration_cap_defaults_to_50() {
+    fn missing_iteration_cap_defaults_to_300() {
         let s: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(s.max_agent_iterations, 50);
+        assert_eq!(s.max_agent_iterations, 300);
     }
 
     #[test]
     fn default_settings_use_iteration_cap() {
         let s = Settings::default();
-        assert_eq!(s.max_agent_iterations, 50);
+        assert_eq!(s.max_agent_iterations, 300);
         assert_eq!(s.max_parallel_tools, 4);
     }
 
@@ -541,7 +544,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let s = load(&dir).unwrap();
-        assert_eq!(s.max_agent_iterations, 50);
+        assert_eq!(s.max_agent_iterations, 300);
         let _ = std::fs::remove_dir_all(dir);
     }
 

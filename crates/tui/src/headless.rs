@@ -262,7 +262,11 @@ async fn run_turn_events(
                     // A failed turn already printed its error line; a
                     // "stopped (error)" after it would only repeat it.
                     let reported = stop_reason == "error" && error_printed;
-                    if stop_reason != "stop" && stop_reason != "tool_calls" && !reported {
+                    if stop_reason == "max_iterations" {
+                        let cap = core.settings.lock().unwrap().max_agent_iterations;
+                        let how = "run openmax --continue -p \"<follow-up>\"";
+                        let _ = writeln!(stderr, "openmax: stopped (max_iterations): {}", iteration_cap_note(cap, how));
+                    } else if stop_reason != "stop" && stop_reason != "tool_calls" && !reported {
                         let _ = writeln!(stderr, "openmax: stopped ({stop_reason})");
                     }
                 }
@@ -397,6 +401,18 @@ fn approve_hint(source_path: &str, source_sha: &str) -> String {
     format!(
         "a human must approve this tool's content first: openmax --approve {} ({source_sha})",
         open_max_core::doctor::shell_quote(std::path::Path::new(source_path))
+    )
+}
+
+/// What a person reads when a turn stops at its iteration cap: the cap it
+/// reached, that what the turn did is kept (every call it ran is answered and
+/// saved), and the two ways on, `follow_up` being how this frontend continues.
+pub(crate) fn iteration_cap_note(cap: usize, follow_up: &str) -> String {
+    let cap = cap.max(1);
+    let rounds = if cap == 1 { "round" } else { "rounds" };
+    format!(
+        "reached the limit of {cap} tool-call {rounds} for one turn. The work so far is saved; \
+         {follow_up} to continue, or raise max_agent_iterations in settings.json"
     )
 }
 
