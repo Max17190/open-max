@@ -1967,7 +1967,7 @@ fn stat_started(stat: &str) -> Option<(u64, bool)> {
 
 /// Field 5, the process group, of a `/proc/<pid>/stat` line, and whether
 /// field 3, the state, is Z, counted as [`stat_started`] counts them.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn stat_group(stat: &str) -> Option<(u32, bool)> {
     let (_, fields) = stat.rsplit_once(')')?;
     let mut fields = fields.split_whitespace();
@@ -2128,7 +2128,8 @@ fn group_has_running_member(pid: Option<u32>) -> bool {
     let Some(group) = pid.filter(|_| process_group_exists(pid)) else {
         return false;
     };
-    !(only_exited_members(group) && only_exited_members(group))
+    let proc = Path::new("/proc");
+    !(only_exited_members(proc, group) && only_exited_members(proc, group))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2136,22 +2137,34 @@ fn group_has_running_member(pid: Option<u32>) -> bool {
     process_group_exists(pid)
 }
 
-/// True when `/proc` lists members of `group` and every one has exited.
-#[cfg(target_os = "linux")]
-fn only_exited_members(group: u32) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+/// True when `proc` lists members of `group` and every one has exited.
+/// A member's own stat names its main thread only, which reads Z once that
+/// thread has ended even while others run, so a member has exited only
+/// when every thread under its `task` directory reads Z.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn only_exited_members(proc: &Path, group: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc) else {
         return false;
+    };
+    let exited = |stat: &Path| {
+        let stat = std::fs::read_to_string(stat).unwrap_or_default();
+        stat_group(&stat).map(|(member_of, exited)| (member_of == group, exited))
     };
     let mut found = false;
     for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(positive_pid) else {
+        if entry.file_name().to_str().and_then(positive_pid).is_none() {
             continue;
+        }
+        match exited(&entry.path().join("stat")) {
+            Some((true, false)) => return false,
+            Some((true, true)) => found = true,
+            _ => continue,
+        }
+        let Ok(tasks) = std::fs::read_dir(entry.path().join("task")) else {
+            return false;
         };
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-        match stat_group(&stat) {
-            Some((member_of, false)) if member_of == group => return false,
-            Some((member_of, true)) if member_of == group => found = true,
-            _ => {}
+        if !tasks.flatten().all(|task| exited(&task.path().join("stat")).is_some_and(|(_, exited)| exited)) {
+            return false;
         }
     }
     found
@@ -3635,6 +3648,33 @@ mod tests {
         leader.start_kill().unwrap();
         leader.wait().await.unwrap();
         (Some(group), member)
+    }
+
+    /// A member counts as exited only when every one of its threads has: a
+    /// main thread that ended while another runs reads Z in the member's own
+    /// stat, and only its `task` directory shows the thread still running.
+    /// Read from a made-up `/proc`, so the case needs no such program.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_whose_main_thread_ended_while_another_runs_has_not_exited() {
+        let proc = std::env::temp_dir().join(format!("openmax-proc-{}", uuid::Uuid::new_v4()));
+        let process = |pid: u32, group: u32, threads: &[(u32, &str)]| {
+            let stat = |tid: u32, state: &str| format!("{tid} (worker) {state} 1 {group} {group} 0 -1 0");
+            std::fs::create_dir_all(proc.join(pid.to_string()).join("task")).unwrap();
+            std::fs::write(proc.join(pid.to_string()).join("stat"), stat(pid, threads[0].1)).unwrap();
+            for &(tid, state) in threads {
+                let task = proc.join(pid.to_string()).join("task").join(tid.to_string());
+                std::fs::create_dir_all(&task).unwrap();
+                std::fs::write(task.join("stat"), stat(tid, state)).unwrap();
+            }
+        };
+        process(101, 77, &[(101, "Z")]);
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        assert!(only_exited_members(&proc, 77), "a group of one exited process");
+        assert!(!only_exited_members(&proc, 78), "a group with no member found");
+        process(102, 77, &[(102, "Z"), (103, "S")]);
+        assert!(!only_exited_members(&proc, 77), "a thread of 102 still runs");
+        let _ = std::fs::remove_dir_all(&proc);
     }
 
     /// A process that has exited stays in its group until its parent waits
