@@ -817,6 +817,8 @@ async fn run_loop(
             .await;
         flusher.abort();
         batcher.lock().unwrap().flush();
+        // A reply the client asked for again was paid for, however this request ended.
+        for usage in std::mem::take(&mut batcher.lock().unwrap().resent) { spend.charge(core, session_id, usage); }
 
         let result = match result {
             Ok(r) => r,

@@ -298,10 +298,11 @@ pub(super) async fn read(
             next = tokio::time::timeout(idle, stream.next()) => next,
             _ = cancelled.cancelled() => { reply.finish_reason = "cancelled".into(); return (reply, None); }
         };
-        let chunk = match next {
-            Ok(Some(Ok(chunk))) => chunk,
-            Err(_) => return (reply, Some(Unfinished::Silent(silence(idle)))),
-            _ => return (reply, Some(Unfinished::Interrupted("Messages stream ended before message_stop".into()))),
+        let Ok(Some(Ok(chunk))) = next else {
+            // What the server already counted was paid for, whether or not this reply is sent again.
+            reply.usage = parse_usage(&usage).filter(|_| started);
+            let ended = if next.is_err() { Unfinished::Silent(silence(idle)) } else { Unfinished::Interrupted("Messages stream ended before message_stop".into()) };
+            return (reply, Some(ended));
         };
         if chunk.len() > MAX_RESPONSE_BYTES - received {
             return (reply, None);

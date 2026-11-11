@@ -301,6 +301,9 @@ pub enum StreamDelta {
     /// wait ends the request instead, and the attempt never goes out.
     /// Everything streamed for the failed attempt is void.
     Retry { attempt: u32, max_attempts: u32, reason: String },
+    /// What the server reported for an attempt about to be sent again: paid
+    /// for, so the caller charges it, but never the size of this reply.
+    Usage(Usage),
 }
 
 /// `finish_reason` for a stream the server never terminated: no `[DONE]` line
@@ -340,9 +343,6 @@ pub struct CompletionResult {
     pub finish_reason: String,
     /// Server-reported token accounting, when the backend provides it.
     pub usage: Option<Usage>,
-    /// What the server reported for replies of this request it cut short and
-    /// this client asked for again: paid for, but never this prompt's size.
-    pub cut_usage: Vec<Usage>,
 }
 
 impl CompletionResult {
@@ -742,8 +742,8 @@ impl ChatClient {
         // Attempts in a row that never reached the endpoint; any other
         // outcome, including a later transport fault, resets it.
         let mut unreached = 0u32;
-        // Replies cut after their text began, and what each one cost.
-        let (mut cuts, mut cut_usage) = (0u32, Vec::new());
+        // Replies cut after their text began.
+        let mut cuts = 0u32;
         loop {
             attempt += 1;
             let mut req = self
@@ -885,7 +885,7 @@ impl ChatClient {
                     .map(|reply| reply.normalize_empty_tool_arguments(self.max_tokens));
             }
 
-            let (mut reply, unfinished) = match self.wire_api {
+            let (reply, unfinished) = match self.wire_api {
                 crate::providers::WireApi::Anthropic => {
                     let (mut reply, unfinished) = Box::pin(anthropic::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await;
                     anthropic::stamp(&mut reply, &body)?;
@@ -894,7 +894,6 @@ impl ChatClient {
                 crate::providers::WireApi::Responses => Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await,
                 crate::providers::WireApi::ChatCompletions => read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await,
             };
-            reply.cut_usage.clone_from(&cut_usage);
             // The restart rules: nothing the caller keeps has streamed yet,
             // and the budget has an attempt left. A reply the network cut
             // after its text began is asked for again too, CUT_RETRIES times
@@ -907,7 +906,6 @@ impl ChatClient {
                 Some(Unfinished::Interrupted(reason) | Unfinished::Silent(reason)) if restartable => (reason, backoff(attempt, None), MAX_ATTEMPTS),
                 Some(Unfinished::Interrupted(reason)) if cut => {
                     cuts += 1;
-                    cut_usage.extend(reply.usage);
                     let reason = format!("the reply was cut short ({reason}) and is asked for again from its start");
                     (reason, backoff(attempt, None), MAX_ATTEMPTS.min(attempt + 1 + CUT_RETRIES - cuts))
                 }
@@ -919,8 +917,9 @@ impl ChatClient {
                 Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
                 _ => return Ok(reply.normalize_empty_tool_arguments(self.max_tokens)),
             };
+            if let Some(usage) = reply.usage { on_delta(StreamDelta::Usage(usage)); }
             if !resend_after(attempt, last, &reason, wait, &cancelled, &mut on_delta).await {
-                return Ok(CompletionResult { cut_usage, ..cancelled_response() });
+                return Ok(cancelled_response());
             }
         }
     }
@@ -1227,7 +1226,7 @@ async fn read_sse(
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
     let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
-    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage, cut_usage: Vec::new() }, unfinished)
+    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
 }
 
 /// Where each text or summary block of a streaming reply's
@@ -1423,7 +1422,7 @@ fn parse_complete_response(
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
     let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
-    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage, cut_usage: Vec::new() })
+    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage })
 }
 
 /// A value from a one-shot reply, kept to send back; null is absent. It is
@@ -1728,22 +1727,15 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// doubling backoff, or the server's Retry-After (`asked`, in seconds) when
 /// that is longer, up to [`RETRY_AFTER_CAP_SECS`]. A shorter ask never
 /// undercuts the backoff, so a server answering 0 to every client at once
-/// cannot pull this one into a tight loop.
+/// cannot pull this one into a tight loop. The unit is [`BACKOFF_UNIT`], or
+/// in a debug binary `OPENMAX_TEST_BACKOFF_UNIT_MS` milliseconds when set,
+/// for the CLI tests that wait a backoff out.
 fn backoff(attempt: u32, asked: Option<u64>) -> std::time::Duration {
-    let unit = backoff_unit();
+    let set = cfg!(all(debug_assertions, not(test))).then(|| std::env::var("OPENMAX_TEST_BACKOFF_UNIT_MS").ok()?.parse().ok()).flatten();
+    let unit = set.map_or(BACKOFF_UNIT, std::time::Duration::from_millis);
     let floor = unit.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
     let asked = unit.saturating_mul(asked.unwrap_or(0).min(RETRY_AFTER_CAP_SECS) as u32);
     floor.max(asked)
-}
-
-/// [`BACKOFF_UNIT`], or in a debug binary `OPENMAX_TEST_BACKOFF_UNIT_MS`
-/// milliseconds when set, for the CLI tests that wait a backoff out.
-fn backoff_unit() -> std::time::Duration {
-    #[cfg(all(debug_assertions, not(test)))]
-    if let Some(ms) = std::env::var("OPENMAX_TEST_BACKOFF_UNIT_MS").ok().and_then(|ms| ms.parse().ok()) {
-        return std::time::Duration::from_millis(ms);
-    }
-    BACKOFF_UNIT
 }
 
 /// Why an attempt ended when the endpoint sent nothing for `idle`.
@@ -2654,6 +2646,7 @@ pub(crate) mod tests {
                     StreamDelta::Content(t) => format!("content:{t}"),
                     StreamDelta::Reasoning(t) => format!("reasoning:{t}"),
                     StreamDelta::Retry { attempt, max_attempts, reason } => format!("retry:{attempt}/{max_attempts}:{reason}"),
+                    StreamDelta::Usage(usage) => format!("usage:{}", usage.completion_tokens),
                 })
             })
             .await;
@@ -2921,7 +2914,7 @@ pub(crate) mod tests {
     /// ended the turn, although nothing from the reply had run and the same
     /// request could be sent again. The reply is asked for again from its
     /// start, the announcement says the text shown is void, and the usage the
-    /// cut reply reported is kept apart from the reply's own.
+    /// cut reply reported goes to the caller apart from the reply's own.
     #[tokio::test]
     async fn a_stream_interrupted_after_reply_text_is_asked_for_again() {
         let (result, deltas, served) = stream_sequence(vec![
@@ -2944,12 +2937,12 @@ pub(crate) mod tests {
             deltas,
             [
                 "content:half an ans",
+                "usage:3",
                 "retry:2/3:the reply was cut short (the stream ended before the reply finished) and is asked for again from its start",
                 "content:all of it",
             ]
         );
         assert_eq!(result.usage.map(|u| u.completion_tokens), Some(5));
-        assert_eq!(result.cut_usage.iter().map(|u| u.completion_tokens).collect::<Vec<_>>(), [3]);
     }
 
     /// The reasoning an interrupted attempt streamed is void once the reply
