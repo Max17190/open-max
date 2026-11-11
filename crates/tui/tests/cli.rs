@@ -4268,6 +4268,27 @@ struct ToolTree {
     base: PathBuf,
 }
 
+/// Set SIGHUP to `disposition` in the child `command` spawns, whatever this
+/// test process inherited. A run honors a SIGHUP it inherited as ignored
+/// (`a_signal_the_run_inherited_as_ignored_stays_ignored`), and a suite
+/// started under `nohup` passes that ignore to every child, so a test that
+/// sends SIGHUP would otherwise test the invoking shell, not the run.
+fn sighup_in_child(command: &mut Command, disposition: libc::sighandler_t) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: sigaction is async-signal-safe, and nothing else runs between
+    // fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = disposition;
+            match libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        })
+    }
+}
+
 /// Start `args` (a print or a stdio run) and return once the bash call's
 /// shell and its background child are both running. `preamble` runs first in
 /// that shell.
@@ -4284,7 +4305,7 @@ fn start_tool_tree(tag: &str, args: &[&str], preamble: &str) -> ToolTree {
     ]);
     write_settings_with_mode(&home, &base_url, "auto");
     let stdio = args.contains(&"--stdio");
-    let mut child = cmd(&project, &home)
+    let mut child = sighup_in_child(&mut cmd(&project, &home), libc::SIG_DFL)
         .arg("--trust-project")
         .args(args)
         .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
@@ -4454,6 +4475,7 @@ fn sigint_sighup_and_sigquit_stop_a_sub_agent_and_keep_its_work() {
         write_settings_with_mode(&home, &base_url, "auto");
         open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
         let mut command = cmd(&project, &home);
+        sighup_in_child(&mut command, libc::SIG_DFL);
         command.envs(SUB_AGENT_GIT).args(["--subagent", "start the tree", "--worktree"]);
         if json {
             command.arg("--json");
@@ -5435,7 +5457,6 @@ fn a_signal_ends_a_stdio_session_waiting_on_the_trust_store_to_save_an_approval_
 /// A handler for it would cancel the turn the parent meant to keep.
 #[test]
 fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
-    use std::os::unix::process::CommandExt;
     let (project, home) = fresh_dirs("sighup-ignored");
     let pid_file = project.parent().unwrap().join("pids");
     let script = format!("echo $$ >> '{}'; sleep 1", pid_file.display());
@@ -5444,25 +5465,13 @@ fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
         (sse_text("done"), true),
     ]);
     write_settings_with_mode(&home, &base_url, "auto");
-    let mut command = cmd(&project, &home);
-    command
+    let mut child = sighup_in_child(&mut cmd(&project, &home), libc::SIG_IGN)
         .args(["--trust-project", "--json", "-p", "outlive the terminal"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: sigaction is async-signal-safe, and nothing else runs between
-    // fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            let mut ignore: libc::sigaction = std::mem::zeroed();
-            ignore.sa_sigaction = libc::SIG_IGN;
-            match libc::sigaction(libc::SIGHUP, &ignore, std::ptr::null_mut()) {
-                0 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            }
-        });
-    }
-    let mut child = command.spawn().unwrap();
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::fs::read_to_string(&pid_file).unwrap_or_default().trim().is_empty() {
         if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
