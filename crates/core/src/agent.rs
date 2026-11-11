@@ -5487,10 +5487,26 @@ mod tests {
             crate::trust::trust_project(&core.data_dir, &project).unwrap();
             let id = sessions::create(&core, project.display().to_string()).unwrap().id;
             let mut data = build_session_data(&core, &id, &project).unwrap();
-            while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 137_000 {
-                data.messages.push(ChatMessage::user("q ".repeat(2_000)));
-                data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
+            // Filled to exactly FILL estimated tokens, the system prompt
+            // included, so where a prune lands does not move with what the
+            // system prompt or the project path weigh.
+            const FILL: usize = 138_000;
+            let filled = |messages: &[ChatMessage]| messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+            let question = ChatMessage::user("q ".repeat(2_000));
+            let answer = ChatMessage::assistant(Some("a ".repeat(2_000)), None);
+            let pair = question.estimated_tokens() + answer.estimated_tokens();
+            while filled(&data.messages) + 2 * pair <= FILL {
+                data.messages.push(question.clone());
+                data.messages.push(answer.clone());
             }
+            data.messages.push(question.clone());
+            let short = FILL - filled(&data.messages);
+            let mut padding = "a".repeat(short * 4);
+            while ChatMessage::assistant(Some(padding.clone()), None).estimated_tokens() > short {
+                padding.pop();
+            }
+            data.messages.push(ChatMessage::assistant(Some(padding), None));
+            assert_eq!(filled(&data.messages), FILL, "the fixture fills to the same total everywhere");
             assert!(sessions::save_messages(&core, &id, &data.messages, &mut 0, true));
             sessions::save_manifest(&core, &id, &data.registry.to_manifest());
             let reported = |tokens| STOP_SSE.replace(
