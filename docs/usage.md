@@ -136,7 +136,9 @@ answers holds the turn for about 80 minutes at the default interval, sooner
 with a lower `idle_timeout_secs`. Any other silence fails the turn after one
 interval: a stream that stops partway through a reply ends it as truncated,
 and a server that stalls while sending a reply as one JSON body is not
-resent. An address with nothing listening fails within seconds. A tool that
+resent. A connection that drops partway through a reply is asked for the
+whole reply again, at most twice in a row; nothing from the cut reply runs,
+and the fresh reply prints from the start of a new line. An address with nothing listening fails within seconds. A tool that
 runs past its own timeout is stopped and the turn goes on; a `bash` call is
 stopped after 120 seconds unless it sets `timeout_secs` (1 to 600); a larger
 request is held to 600, and if that command times out, its result names the

@@ -331,6 +331,8 @@ async fn run_turn_events(
                 );
             }
             AgentEvent::Retry { attempt, max_attempts, reason } => {
+                // A cut reply's text stays printed; the fresh one starts on its own line.
+                if std::mem::take(saw_tokens) { let _ = writeln!(stdout); }
                 let _ = writeln!(stderr, "openmax: {}; retrying ({attempt} of {max_attempts})", one_line(reason));
             }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {

@@ -300,14 +300,8 @@ pub(super) async fn read(
         };
         let chunk = match next {
             Ok(Some(Ok(chunk))) => chunk,
-            _ => {
-                return (
-                    reply,
-                    Some(Unfinished::Interrupted(
-                        "Messages stream ended before message_stop".into(),
-                    )),
-                )
-            }
+            Err(_) => return (reply, Some(Unfinished::Silent(silence(idle)))),
+            _ => return (reply, Some(Unfinished::Interrupted("Messages stream ended before message_stop".into()))),
         };
         if chunk.len() > MAX_RESPONSE_BYTES - received {
             return (reply, None);

@@ -1095,7 +1095,8 @@ like a turn-start receipt), `retry` (attempt, max_attempts, reason: the
 model request is being resent after a transport failure, a 429 or transient
 5xx, or, before any reply text, a stream that died or went silent, or a
 stream or reply the provider failed with a rate limit, an overload, or a
-server fault; thinking already streamed for that attempt is void), `diff` (call_id,
+server fault, or a reply the network cut after its text began, at most
+twice; thinking and tokens streamed for that attempt are void), `diff` (call_id,
 path, diff, added, removed), `approval_request` (approval_id, name, summary,
 detail, reason, source_path, source_sha, and an optional `env`), `approval_settled` (approval_id,
 outcome), `refrozen` (tools, skills, changes: the refreeze receipt, one line
@@ -1167,9 +1168,10 @@ no turn (empty text, an untrusted project) still gets one, with stop_reason
 `refused`, after the `protocol_error` that says why. A turn that dies
 unexpectedly reports `error` and then `done` with stop_reason `error`; a
 provider stream that ends mid-answer with no completion signal is resent
-(each resend announced by a `retry`) while no reply text has streamed, and
-otherwise reports its partial `message_done`, then `error`, then `done` with
-stop_reason `truncated`, and no tool call it carried is run. A `user` sent
+(each resend announced by a `retry`) while no reply text has streamed, or
+twice more if the connection dropped after it, and otherwise reports its
+partial `message_done`, then `error`, then `done` with stop_reason
+`truncated`, and no tool call it carried is run. A `user` sent
 while a turn is in flight steers the running turn, which owns the next
 `done`, so it gets none of its own (one with empty text, one that would make
 the steers still waiting for the turn pass 8 MiB together, or one that

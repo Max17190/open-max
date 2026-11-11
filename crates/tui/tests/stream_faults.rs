@@ -34,6 +34,7 @@ const TRUNCATION_STUB: &str = "The provider stream ended before this call could 
 const CANCEL_STUB: &str = "The user cancelled this turn.";
 const INCOMPLETE: &str = "provider response was interrupted or exceeded client limits; the reply above is incomplete";
 const STREAM_ENDED: &str = "the stream ended before the reply finished";
+const CUT: &str = "the reply was cut short (";
 const SILENCE: &str = "the endpoint sent nothing for 1s";
 const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n";
 const JSON_TYPE: &str = "Content-Type: application/json\r\n";
@@ -382,6 +383,9 @@ struct Env {
     project: PathBuf,
     home: PathBuf,
     server: FaultServer,
+    /// Every backoff a millisecond: for a case that waits out several
+    /// resends and measures none of the waits.
+    fast: bool,
 }
 
 impl Env {
@@ -403,7 +407,20 @@ impl Env {
             ),
         )
         .unwrap();
-        Env { tag: tag.to_string(), ctx: ctx.to_string(), project, home, server }
+        Env { tag: tag.to_string(), ctx: ctx.to_string(), project, home, server, fast: false }
+    }
+
+    fn fast(mut self) -> Env {
+        self.fast = true;
+        self
+    }
+
+    fn command(&self) -> Command {
+        let mut command = cmd(&self.project, &self.home);
+        if self.fast {
+            command.env("OPENMAX_TEST_BACKOFF_UNIT_MS", "1");
+        }
+        command
     }
 
     /// The endpoint as a provider with a one second idle timeout, so silence
@@ -437,7 +454,7 @@ impl Env {
     /// and the requests this run made.
     fn run(&self, args: &[&str], prompts: &[&str], before: &[u8], ctx: &str) -> Run {
         let first = self.server.arrivals.lock().unwrap().len();
-        let mut command = cmd(&self.project, &self.home);
+        let mut command = self.command();
         command.args(args).arg("--json");
         for prompt in prompts {
             command.args(["-p", prompt]);
@@ -494,7 +511,7 @@ impl Env {
     /// script reads when it does not parse events.
     fn text(&self, prompt: &str) -> (Option<i32>, String) {
         let out = finish_with_deadline(
-            cmd(&self.project, &self.home)
+            self.command()
                 .args(["--trust-project", "-p", prompt])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -709,9 +726,20 @@ fn check_windows(run: &Run, new: &[ChatMessage], stop: &str, log: &str) {
         let last = w + 1 == opens.len();
         let window = &run.events[open + 1..opens.get(w + 1).copied().unwrap_or(run.events.len())];
         let of = |kind: &str| window.iter().filter(|e| e["type"] == kind).collect::<Vec<_>>();
-        if let Some(retry) = window.iter().rposition(|e| e["type"] == "retry") {
-            assert!(!window[..retry].iter().any(|e| e["type"] == "token"), "no reply text streams before a retry: {log}");
+        // Reply text streams before a retry only when the reply was cut, and
+        // the retry says so: what streamed before it is void.
+        let mut streamed = false;
+        for event in window {
+            match event["type"].as_str().unwrap() {
+                "token" => streamed = true,
+                "retry" if streamed => {
+                    assert!(event["reason"].as_str().unwrap().starts_with(CUT), "a retry after reply text names the cut: {log}");
+                    streamed = false;
+                }
+                _ => {}
+            }
         }
+        let fresh = &window[window.iter().rposition(|e| e["type"] == "retry").map_or(0, |at| at + 1)..];
         for (i, start) in window.iter().enumerate().filter(|(_, e)| e["type"] == "tool_start") {
             let ends = window[i + 1..].iter().filter(|e| e["type"] == "tool_end" && e["call_id"] == start["call_id"]).count();
             assert_eq!(ends, 1, "every tool_start has one tool_end in its window: {log}");
@@ -725,8 +753,8 @@ fn check_windows(run: &Run, new: &[ChatMessage], stop: &str, log: &str) {
             assert!(last && ends.is_empty() && !of("error").is_empty(), "a request without message_done ends the turn in an error: {log}");
             continue;
         };
-        let tokens: String = of("token").iter().map(|e| e["text"].as_str().unwrap()).collect();
-        assert_eq!(tokens, text, "the token lines join into the finished message: {log}");
+        let tokens: String = fresh.iter().filter(|e| e["type"] == "token").map(|e| e["text"].as_str().unwrap()).collect();
+        assert_eq!(tokens, text, "the token lines after the last retry join into the finished message: {log}");
         let mut calls = Vec::new();
         if disk.peek().is_some_and(|m| m.role == "assistant") {
             let reply = disk.expect("assistant", None, "the reply");
@@ -974,9 +1002,11 @@ fn split_args(marker: &str) -> (String, String, String) {
 enum Outcome {
     /// The finish line arrived: the reply stands and its call runs once.
     Finished,
-    /// Reply text arrived and the finish did not: the turn ends truncated
-    /// with that text, and the call is kept, never run, when its opening
-    /// line arrived (its arguments as far as they parse, else `{}`).
+    /// Reply text arrived and the finish did not: the reply is asked for
+    /// again from its start, twice at most. Cut the same way each time, the
+    /// turn ends truncated with that text, and the call is kept, never run,
+    /// when its opening line arrived (its arguments as far as they parse,
+    /// else `{}`).
     Truncated { text: String, call: Option<String> },
     /// No reply text arrived: the request is resent.
     Resent,
@@ -1103,35 +1133,52 @@ impl CutCase {
 fn run_cut(case: &CutCase) -> &'static str {
     let template = &case.template;
     let outcome = oracle(template, case.k);
-    let cut = Step::Cut { body: template.bytes.clone(), at: case.k, framing: case.framing, pieces: case.pieces.clone() };
+    let cut = || Step::Cut { body: template.bytes.clone(), at: case.k, framing: case.framing, pieces: case.pieces.clone() };
     let resumed = Step::Finished(sse_text("resumed"));
+    // Cuts after reply text at an even offset are answered whole when asked
+    // again, and the rest are cut the same way every time.
+    let recovers = matches!(outcome, Outcome::Truncated { .. }) && case.k.is_multiple_of(2);
     let script = match outcome {
-        Outcome::Finished => vec![cut, Step::Finished(sse_text("done")), resumed],
-        Outcome::Truncated { .. } => vec![cut, resumed],
-        Outcome::Resent => vec![cut, Step::Finished(template.text()), Step::Finished(sse_text("done")), resumed],
+        Outcome::Finished => vec![cut(), Step::Finished(sse_text("done")), resumed],
+        Outcome::Truncated { .. } if !recovers => vec![cut(), cut(), cut(), resumed],
+        Outcome::Truncated { .. } | Outcome::Resent => {
+            vec![cut(), Step::Finished(template.text()), Step::Finished(sse_text("done")), resumed]
+        }
     };
     let tag = format!("cut-{}-{}-{}", template.name, case.seed, case.k);
-    let env = Env::new(&tag, &format!("{} expecting {:?}", case.label(), outcome), script);
+    let env = Env::new(&tag, &format!("{} expecting {:?}", case.label(), outcome), script).fast();
     let run = env.first("go");
     let log = run.log();
     match &outcome {
-        Outcome::Finished | Outcome::Resent => {
+        Outcome::Finished | Outcome::Resent | Outcome::Truncated { .. } if !matches!(outcome, Outcome::Truncated { .. }) || recovers => {
             assert_eq!(run.code, Some(0), "{log}");
             assert_eq!(run.stop_reason(), "stop", "{log}");
             assert_eq!(env.ran_log(), format!("{}\n", template.marker), "the call runs exactly once: {log}");
             assert_eq!(run.count("tool_start"), 1, "{log}");
-            let resent = outcome == Outcome::Resent;
+            let resent = outcome != Outcome::Finished;
             assert_eq!(run.count("retry"), usize::from(resent), "{log}");
             assert_eq!(run.requests.len(), if resent { 3 } else { 2 }, "{log}");
             if resent && matches!(case.framing, Framing::CloseDelimited) {
-                assert_eq!(run.retry_reasons(), [STREAM_ENDED], "{log}");
+                let reason = if recovers { format!("{CUT}{STREAM_ENDED}) and is asked for again from its start") } else { STREAM_ENDED.into() };
+                assert_eq!(run.retry_reasons(), [reason.as_str()], "{log}");
+            }
+            if recovers {
+                // The cut text is nowhere on disk: the one reply kept is the whole one.
+                let replies: Vec<_> = run.messages().into_iter().filter(|m| m.role == "assistant").collect();
+                assert_eq!(replies[0].content.as_deref(), Some("Writing ✓ 日本語 🦀 é"), "{log}");
+                assert_eq!(replies.len(), 2, "the whole reply and the answer after its call: {log}");
             }
         }
+        Outcome::Finished | Outcome::Resent => unreachable!("matched above"),
         Outcome::Truncated { text, call } => {
             assert_eq!(run.code, Some(1), "{log}");
             assert_eq!(run.stop_reason(), "truncated", "{log}");
-            assert_eq!(run.requests.len(), 1, "{log}");
-            assert_eq!(run.count("retry") + run.count("tool_start"), 0, "{log}");
+            assert_eq!(run.requests.len(), 3, "the reply is asked for twice more, then given up: {log}");
+            assert_eq!(run.count("retry"), 2, "{log}");
+            assert!(run.retry_reasons().iter().all(|r| r.starts_with(CUT)), "{log}");
+            let counted: Vec<_> = run.of("retry").map(|e| (e["attempt"].clone(), e["max_attempts"].clone())).collect();
+            assert_eq!(counted, [(json!(2), json!(3)), (json!(3), json!(3))], "the announcement counts to the last resend: {log}");
+            assert_eq!(run.count("tool_start"), 0, "{log}");
             assert_eq!(env.ran_log(), "", "a call from an unfinished reply never runs: {log}");
             assert_eq!(run.message_done(), [text.as_str()], "{log}");
             let error = match call {
@@ -1149,7 +1196,7 @@ fn run_cut(case: &CutCase) -> &'static str {
         }
     }
     env.resume(&run, &run.after);
-    outcome.class()
+    if recovers { "cut and asked again" } else { outcome.class() }
 }
 
 /// Run cases on up to six threads, each in its own HOME and server, and
@@ -1179,7 +1226,8 @@ fn run_all<T: Sync>(cases: &[T], label: impl Fn(&T) -> String + Sync, run: impl 
 
 /// A reply cut at any byte leaves a transcript that pairs every call with
 /// its reply, a turn that ends the way the documented rule says (finished,
-/// truncated with the text that arrived, or resent with identical bytes),
+/// resent with identical bytes, or, after reply text, asked for again and
+/// truncated with the text that arrived if every answer is cut),
 /// and a session that resumes byte for byte. Thirty seeded cuts sample six
 /// strata of template A, and the three offsets around every line end are
 /// cut too, where an off-by-one in "only complete lines count" would show.
@@ -1217,7 +1265,7 @@ fn a_stream_cut_at_any_offset_keeps_the_transcript_paired_and_resumable() {
     // A template edit that moved every cut out of a class would leave that
     // part of the rule untested while the suite still passed.
     let classes = classes.into_inner().unwrap();
-    for class in ["finished", "truncated with its call", "truncated before any call", "resent"] {
+    for class in ["finished", "truncated with its call", "truncated before any call", "resent", "cut and asked again"] {
         assert!(classes.contains(class), "no case reached {class}: {classes:?}");
     }
     let positions = positions.into_inner().unwrap();
@@ -1661,12 +1709,15 @@ fn a_call_id_repeated_across_iterations_is_answered_in_its_own_run() {
     assert_eq!(run.of("tool_end").filter(|e| e["call_id"] == "dup").count(), 2, "{log}");
     finished.resume(&run, &run.after);
 
-    let cut = second.len();
+    let cut = || Step::Cut { body: second.clone().into_bytes(), at: second.len(), framing: Framing::CloseDelimited, pieces: Vec::new() };
     let truncated = Env::new("dup-cut", "a repeated call id in a cut reply", vec![
         Step::Finished(sse_call("dup", "1")),
-        Step::Cut { body: second.into_bytes(), at: cut, framing: Framing::CloseDelimited, pieces: Vec::new() },
+        cut(),
+        cut(),
+        cut(),
         Step::Finished(sse_text("resumed")),
-    ]);
+    ])
+    .fast();
     let run = truncated.first("go");
     let log = run.log();
     assert_eq!(run.code, Some(1), "{log}");
@@ -2175,19 +2226,14 @@ fn an_endpoint_silent_for_its_idle_timeout_is_resent_or_truncated_by_where_it_st
 /// never reach the endpoint or the transcript.
 #[test]
 fn a_truncated_first_prompt_skips_the_prompts_after_it() {
-    let half = content("half");
-    let env = Env::new("chain", "a truncated first prompt", vec![Step::Cut {
-        at: half.len(),
-        body: half.into_bytes(),
-        framing: Framing::CloseDelimited,
-        pieces: Vec::new(),
-    }]);
+    let half = || Step::Cut { at: content("half").len(), body: content("half").into_bytes(), framing: Framing::CloseDelimited, pieces: Vec::new() };
+    let env = Env::new("chain", "a truncated first prompt", vec![half(), half(), half()]).fast();
     let run = env.run(&["--trust-project"], &["first", "second"], &[], &env.ctx);
     check_contract(&run);
     let log = run.log();
     assert_eq!(run.code, Some(1), "{log}");
     assert_eq!(run.stop_reason(), "truncated", "{log}");
-    assert_eq!(run.requests.len(), 1, "{log}");
+    assert_eq!(run.requests.len(), 3, "{log}");
     assert!(!run.messages().iter().any(|m| m.content.as_deref() == Some("second")), "{log}");
 }
 
@@ -2294,9 +2340,10 @@ fn text_mode_exits_as_json_mode_does_and_names_the_failure_once() {
     std::thread::scope(|scope| {
         for (tag, step, lines) in cases {
             scope.spawn(move || {
-                let json_mode = Env::new(&format!("{tag}-json"), tag, vec![step()]);
+                // A cut reply is asked for twice more, so each endpoint answers three times.
+                let json_mode = Env::new(&format!("{tag}-json"), tag, vec![step(), step(), step()]).fast();
                 let run = json_mode.first("go");
-                let text_mode = Env::new(tag, tag, vec![step()]);
+                let text_mode = Env::new(tag, tag, vec![step(), step(), step()]).fast();
                 let (code, stderr) = text_mode.text("go");
                 assert_eq!(code, run.code, "{tag}: {stderr}");
                 let said: Vec<&str> = stderr.lines().filter(|l| l.starts_with("openmax: error:") || l.starts_with("openmax: stopped")).collect();
@@ -2304,4 +2351,128 @@ fn text_mode_exits_as_json_mode_does_and_names_the_failure_once() {
             });
         }
     });
+}
+
+/// A usage chunk reporting `completion` output tokens for a 20 token prompt.
+fn usage(completion: u64) -> String {
+    data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":completion}}))
+}
+
+fn cut_at_end(body: String) -> Step {
+    Step::Cut { at: body.len(), body: body.into_bytes(), framing: Framing::CloseDelimited, pieces: Vec::new() }
+}
+
+/// A reply whose connection drops after its text began is asked for again
+/// from its start rather than ending the turn: the resend is the same
+/// request byte for byte, the session file holds the whole reply once and
+/// matches a run that was never cut, and both replies' usage is counted.
+/// The text-mode run exits 0, says the reply was cut, and prints the fresh
+/// reply from the start of a new line.
+#[test]
+fn a_reply_cut_after_its_text_began_is_asked_for_again_and_kept_once() {
+    let whole = format!("{}{}{}{DONE}", content("The answer is 42."), finish("stop"), usage(7));
+    let cut = || cut_at_end(format!("{}{}{}", content("The answer "), usage(3), content("is")));
+    let reference = Env::new("never-cut", "a reply never cut", vec![Step::Finished(whole.clone()), Step::Finished(sse_text("resumed"))]);
+    let env = Env::new("cut-once", "a reply cut once after its text began", vec![cut(), Step::Finished(whole.clone()), Step::Finished(sse_text("resumed"))]).fast();
+    let (never, run) = (reference.first("go"), env.first("go"));
+    let log = run.log();
+    assert_eq!(run.code, Some(0), "{log}");
+    assert_eq!(run.stop_reason(), "stop", "{log}");
+    assert_eq!(run.retry_reasons(), [format!("{CUT}{STREAM_ENDED}) and is asked for again from its start").as_str()], "{log}");
+    assert_eq!(run.requests.len(), 2, "{log}");
+    assert_eq!(run.message_done(), ["The answer is 42."], "{log}");
+    let tail = |run: &Run| String::from_utf8(run.after.clone()).unwrap().lines().skip(1).map(without_route).collect::<Vec<_>>();
+    assert_eq!(tail(&run), tail(&never), "the session file is the one a run never cut writes: {log}");
+    let completions = |run: &Run| run.of("usage").map(|e| e["completion_tokens"].as_u64().unwrap()).collect::<Vec<_>>();
+    assert_eq!(completions(&run), [3, 7], "the cut reply's usage is counted beside the retry's: {log}");
+    assert_eq!(completions(&never), [7], "{log}");
+    let usage_file = std::fs::read_to_string(env.home.join(".openmax/sessions").join(format!("{}.usage.jsonl", run.sid))).unwrap();
+    assert_eq!(usage_file.lines().count(), 2, "{usage_file}");
+    env.resume(&run, &run.after);
+
+    let text = Env::new("cut-once-text", "a reply cut once, in text mode", vec![cut(), Step::Finished(whole)]).fast();
+    let out = finish_with_deadline(
+        text.command().args(["--trust-project", "-p", "go"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(),
+        "cut once in text mode",
+    );
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(stdout.trim_end(), "The answer is\nThe answer is 42.", "{stderr}");
+    assert!(stderr.contains(&format!("openmax: {CUT}{STREAM_ENDED}) and is asked for again from its start; retrying (2 of 3)")), "{stderr}");
+}
+
+/// A call in a reply the network cut never runs; the call in the reply sent
+/// when it is asked for again runs once.
+#[test]
+fn a_cut_reply_runs_none_of_its_calls_and_the_resent_reply_runs_its_own_once() {
+    let env = Env::new("cut-call", "a cut reply carrying a call", vec![
+        cut_at_end(format!("{}{}", content("Running "), call("never_kept", "cut"))),
+        Step::Finished(format!("{}{}{}{DONE}", content("Running "), call("c2", "whole"), finish("tool_calls"))),
+        Step::Finished(sse_text("done")),
+        Step::Finished(sse_text("resumed")),
+    ])
+    .fast();
+    let run = env.first("go");
+    let log = run.log();
+    assert_eq!(run.code, Some(0), "{log}");
+    assert_eq!(env.ran_log(), "whole\n", "{log}");
+    let started: Vec<&str> = run.of("tool_start").map(|e| e["call_id"].as_str().unwrap()).collect();
+    assert_eq!(started, ["c2"], "{log}");
+    assert!(!String::from_utf8_lossy(&run.after).contains("never_kept"), "nothing of the cut reply is kept: {log}");
+    env.resume(&run, &run.after);
+}
+
+/// A cancel while the client waits to ask for a cut reply again ends the
+/// turn there: the request is not sent again and the cut text is not kept,
+/// but the usage the cut reply reported is still counted.
+#[test]
+fn a_cancel_while_a_cut_reply_waits_to_be_asked_again_sends_nothing_more() {
+    let env = Env::new("cut-cancel", "a cancel during the wait after a cut", vec![
+        cut_at_end(format!("{}{}", content("half"), usage(3))),
+        Step::Finished(sse_text("never asked for")),
+    ]);
+    let mut child = cmd(&env.project, &env.home)
+        .args(["--trust-project", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    writeln!(stdin, r#"{{"cmd":"user","text":"go"}}"#).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut events: Vec<Value> = Vec::new();
+    loop {
+        let Ok(line) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+            let _ = child.kill();
+            panic!("no done within 30s: {events:?}");
+        };
+        let event: Value = serde_json::from_str(&line).unwrap();
+        if event["type"] == "retry" {
+            writeln!(stdin, r#"{{"cmd":"cancel"}}"#).unwrap();
+        }
+        let done = event["type"] == "done";
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    drop(stdin);
+    let _ = child.wait();
+    assert_eq!(events.last().unwrap()["stop_reason"], "cancelled", "{events:?}");
+    assert_eq!(env.server.bodies().len(), 1, "{events:?}");
+    let counted: Vec<&Value> = events.iter().filter(|e| e["type"] == "usage").map(|e| &e["completion_tokens"]).collect();
+    assert_eq!(counted, [&json!(3)], "{events:?}");
+    let sid = events[0]["session_id"].as_str().unwrap();
+    let saved = transcript_messages(&std::fs::read(env.transcript(sid)).unwrap(), "a cancel after a cut");
+    assert_eq!(saved.last().map(|m| (m.role.as_str(), m.content.as_deref())), Some(("user", Some("go"))), "{saved:?}");
 }

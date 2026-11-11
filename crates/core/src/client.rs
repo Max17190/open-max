@@ -15,9 +15,10 @@
 //! caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
 //! a Retry-After longer than a minute, are reported at once: no wait the
 //! turn would take lets the request succeed. Once reply text has streamed,
-//! a retry would duplicate what the caller already showed, so a cut after
-//! that point is reported as a truncation instead. A failure the server
-//! reports inside a 200 response (an `error` object on the chunk or reply
+//! a stream the network cut is resent at most [`CUT_RETRIES`] times, the
+//! announcement saying the caller's partial text is void; a cut after that,
+//! or silence past the idle deadline, is reported as a truncation. A
+//! failure the server reports inside a 200 response (an `error` object on the chunk or reply
 //! or on its choice, or finish_reason `error`) is never a reply, whatever
 //! partial output came with it: unless it is retried, it is an error
 //! carrying the server's own message. So is a reply the server finished as
@@ -293,12 +294,12 @@ pub enum StreamDelta {
     /// after `reason` ended the previous one, and `max_attempts` the one the
     /// request ends on if it keeps failing that way. That is the budget, or,
     /// while the latest attempts in a row failed to connect or timed out, the
-    /// one that makes [`UNREACHED_ATTEMPTS`] of them if that comes first, so
-    /// it rises again when an attempt ends any other way. It is announced
-    /// before the backoff wait, which is what the caller is waiting through;
-    /// a cancellation during the wait ends the request instead, and the
-    /// attempt never goes out. Any reasoning streamed for the failed attempt
-    /// is void; no content was.
+    /// one that makes [`UNREACHED_ATTEMPTS`] of them (or, after a cut reply,
+    /// spends [`CUT_RETRIES`]) if that comes first, so it rises again when an
+    /// attempt ends any other way. It is announced before the backoff wait,
+    /// which is what the caller is waiting through; a cancellation during the
+    /// wait ends the request instead, and the attempt never goes out.
+    /// Everything streamed for the failed attempt is void.
     Retry { attempt: u32, max_attempts: u32, reason: String },
 }
 
@@ -318,6 +319,7 @@ const MAX_TOOL_CALLS: usize = 128;
 /// held the turn forever.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+#[derive(Default)]
 pub struct CompletionResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
@@ -338,6 +340,9 @@ pub struct CompletionResult {
     pub finish_reason: String,
     /// Server-reported token accounting, when the backend provides it.
     pub usage: Option<Usage>,
+    /// What the server reported for replies of this request it cut short and
+    /// this client asked for again: paid for, but never this prompt's size.
+    pub cut_usage: Vec<Usage>,
 }
 
 impl CompletionResult {
@@ -737,6 +742,8 @@ impl ChatClient {
         // Attempts in a row that never reached the endpoint; any other
         // outcome, including a later transport fault, resets it.
         let mut unreached = 0u32;
+        // Replies cut after their text began, and what each one cost.
+        let (mut cuts, mut cut_usage) = (0u32, Vec::new());
         loop {
             attempt += 1;
             let mut req = self
@@ -780,7 +787,7 @@ impl ChatClient {
                     unreached = 0;
                     let msg = format!("request failed: {}", silence(self.idle_timeout));
                     if attempt < MAX_ATTEMPTS {
-                        if !retry_after(attempt, MAX_ATTEMPTS, &msg, &cancelled, &mut on_delta).await {
+                        if !resend_after(attempt, MAX_ATTEMPTS, &msg, backoff(attempt, None), &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
@@ -801,8 +808,8 @@ impl ChatClient {
                     };
                     let (msg, repair) = never_connected(&e, e.url().is_some_and(through_proxy))
                         .unwrap_or_else(|| (format!("request failed: {}", describe_transport(&e)), ""));
-                    if attempt < last && is_transient_transport(&e) {
-                        if !retry_after(attempt, last, &msg, &cancelled, &mut on_delta).await {
+                    if attempt < last && (e.is_connect() || e.is_timeout() || e.is_request()) {
+                        if !resend_after(attempt, last, &msg, backoff(attempt, None), &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
@@ -847,24 +854,7 @@ impl ChatClient {
                 }
                 return Err(naming_wait(err, beyond_cap));
             }
-            if matches!(self.wire_api, crate::providers::WireApi::Responses | crate::providers::WireApi::Anthropic) {
-                let (mut reply, unfinished) = if self.wire_api == crate::providers::WireApi::Anthropic {
-                    Box::pin(anthropic::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await
-                } else { Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await };
-                if self.wire_api == crate::providers::WireApi::Anthropic { anthropic::stamp(&mut reply, &body)?; }
-                let retry = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
-                let failure = match unfinished {
-                    Some(Unfinished::Interrupted(reason)) if retry => reason,
-                    Some(Unfinished::Failed(f)) if f.retryable && retry && beyond_cap.is_none() => f.message,
-                    Some(Unfinished::Failed(f)) => return Err(f.message),
-                    _ => return Ok(reply),
-                };
-                if !resend_after(attempt, MAX_ATTEMPTS, &failure, backoff(attempt, asked), &cancelled, &mut on_delta).await {
-                    return Ok(cancelled_response());
-                }
-                continue;
-            }
-            let is_json = resp
+            let is_json = self.wire_api == crate::providers::WireApi::ChatCompletions && resp
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
@@ -895,23 +885,42 @@ impl ChatClient {
                     .map(|reply| reply.normalize_empty_tool_arguments(self.max_tokens));
             }
 
-            let (reply, unfinished) = read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await;
+            let (mut reply, unfinished) = match self.wire_api {
+                crate::providers::WireApi::Anthropic => {
+                    let (mut reply, unfinished) = Box::pin(anthropic::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await;
+                    anthropic::stamp(&mut reply, &body)?;
+                    (reply, unfinished)
+                }
+                crate::providers::WireApi::Responses => Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await,
+                crate::providers::WireApi::ChatCompletions => read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await,
+            };
+            reply.cut_usage.clone_from(&cut_usage);
             // The restart rules: nothing the caller keeps has streamed yet,
-            // and the budget has an attempt left.
+            // and the budget has an attempt left. A reply the network cut
+            // after its text began is asked for again too, CUT_RETRIES times
+            // at most: the caller loses the partial text it showed, where
+            // keeping it would end the turn.
             let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
-            let (reason, wait) = match unfinished {
+            let cut = !restartable && attempt < MAX_ATTEMPTS && cuts < CUT_RETRIES;
+            let (reason, wait, last) = match unfinished {
                 // The network cut it: the server's headers never spoke to that.
-                Some(Unfinished::Interrupted(reason)) if restartable => (reason, backoff(attempt, None)),
+                Some(Unfinished::Interrupted(reason) | Unfinished::Silent(reason)) if restartable => (reason, backoff(attempt, None), MAX_ATTEMPTS),
+                Some(Unfinished::Interrupted(reason)) if cut => {
+                    cuts += 1;
+                    cut_usage.extend(reply.usage);
+                    let reason = format!("the reply was cut short ({reason}) and is asked for again from its start");
+                    (reason, backoff(attempt, None), MAX_ATTEMPTS.min(attempt + 1 + CUT_RETRIES - cuts))
+                }
                 Some(Unfinished::Failed(failure)) if failure.retryable && restartable && beyond_cap.is_none() => {
-                    (failure.message, backoff(attempt, asked))
+                    (failure.message, backoff(attempt, asked), MAX_ATTEMPTS)
                 }
                 // Never a truncated reply: the server said this one failed,
                 // and a tool call it carried must not run.
                 Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
                 _ => return Ok(reply.normalize_empty_tool_arguments(self.max_tokens)),
             };
-            if !resend_after(attempt, MAX_ATTEMPTS, &reason, wait, &cancelled, &mut on_delta).await {
-                return Ok(cancelled_response());
+            if !resend_after(attempt, last, &reason, wait, &cancelled, &mut on_delta).await {
+                return Ok(CompletionResult { cut_usage, ..cancelled_response() });
             }
         }
     }
@@ -922,6 +931,9 @@ enum Unfinished {
     /// The network ended the stream before the server did: EOF with no
     /// terminator, or a read error before one.
     Interrupted(String),
+    /// Nothing arrived for the idle interval: this client's own deadline,
+    /// which a reply cut by it after its text began would only meet again.
+    Silent(String),
     /// The server reported a failure inside the stream.
     Failed(ServerFailure),
 }
@@ -1016,7 +1028,7 @@ async fn read_sse(
         let Ok(next) = next else {
             if !saw_terminator {
                 finish_reason = TRUNCATED.into();
-                unfinished = Some(Unfinished::Interrupted(silence(idle)));
+                unfinished = Some(Unfinished::Silent(silence(idle)));
             }
             break;
         };
@@ -1215,7 +1227,7 @@ async fn read_sse(
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
     let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
-    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
+    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage, cut_usage: Vec::new() }, unfinished)
 }
 
 /// Where each text or summary block of a streaming reply's
@@ -1297,15 +1309,7 @@ fn reasoning_fields(
 }
 
 fn cancelled_response() -> CompletionResult {
-    CompletionResult {
-        content: String::new(),
-        tool_calls: Vec::new(),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_details: None,
-        finish_reason: "cancelled".into(),
-        usage: None,
-    }
+    CompletionResult { finish_reason: "cancelled".into(), ..CompletionResult::default() }
 }
 
 async fn read_body(
@@ -1419,7 +1423,7 @@ fn parse_complete_response(
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
     let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
-    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage })
+    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage, cut_usage: Vec::new() })
 }
 
 /// A value from a one-shot reply, kept to send back; null is absent. It is
@@ -1665,6 +1669,11 @@ const MAX_ATTEMPTS: u32 = 8;
 /// address fails in about three seconds; one that drops packets pays the
 /// connect timeout on each attempt as well.
 const UNREACHED_ATTEMPTS: u32 = 3;
+/// Times in a row a request is sent again after the network cut its reply
+/// once text had streamed. A dropped connection mid-reply would otherwise end
+/// an unattended turn although nothing from the reply ran; a reply cut this
+/// often is reported truncated rather than paid for again.
+const CUT_RETRIES: u32 = 2;
 
 /// One second: the step of the backoff and the unit a Retry-After header
 /// counts in.
@@ -1803,22 +1812,6 @@ fn same_server_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redirec
     }
 }
 
-fn is_transient_transport(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout() || err.is_request()
-}
-
-/// Announce the retry, then wait out the backoff for `attempt` (1-based, the
-/// one that just failed). Returns false when cancelled during the wait.
-async fn retry_after(
-    attempt: u32,
-    last: u32,
-    reason: &str,
-    cancelled: &crate::state::CancelToken,
-    on_delta: &mut impl FnMut(StreamDelta),
-) -> bool {
-    resend_after(attempt, last, reason, backoff(attempt, None), cancelled, on_delta).await
-}
-
 /// `err`, naming the server's wait when that is past
 /// [`RETRY_AFTER_CAP_SECS`]: why it was not resent, and when to try again.
 fn naming_wait(mut err: String, beyond_cap: Option<u64>) -> String {
@@ -1828,12 +1821,12 @@ fn naming_wait(mut err: String, beyond_cap: Option<u64>) -> String {
     err
 }
 
-/// [`retry_after`] with the wait chosen by the caller: a refused status, or
-/// a failure inside a 200, passes the server's Retry-After through
-/// [`backoff`]. `last` is the attempt the request ends on if this keeps
-/// failing, which the announcement counts to. Returns false when cancelled
-/// during the wait: one can reach [`RETRY_AFTER_CAP_SECS`], and a user who
-/// cancels must not sit through it.
+/// Announce the resend after `attempt` (1-based, the one that just failed),
+/// then wait `wait`: the backoff, or for a refused status or a failure inside
+/// a 200, the server's Retry-After through [`backoff`]. `last` is the attempt
+/// the request ends on if this keeps failing, which the announcement counts
+/// to. Returns false when cancelled during the wait: one can reach
+/// [`RETRY_AFTER_CAP_SECS`], and a user who cancels must not sit through it.
 async fn resend_after(
     attempt: u32,
     last: u32,
@@ -2054,14 +2047,21 @@ pub(crate) mod tests {
         }
     }
 
+    /// A body cut short of its length after reply text is a transport error:
+    /// the reply is asked for again [`CUT_RETRIES`] times, each announced
+    /// with the attempt the request ends on, and then comes back truncated
+    /// with its partial text.
     #[tokio::test]
     async fn a_transport_error_keeps_partial_text() {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"keep this\"}}]}\n\n";
-        let url = spawn_response_once(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\n\r\n{body}"), None);
-        let result = ChatClient::new(url, None, "m".into(), None, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+        let cut = format!("RAW:HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\n\r\n{body}");
+        let (result, deltas, served) = stream_sequence(vec![cut; 3]).await;
+        assert_eq!(served, 3);
         assert_eq!(result.content, "keep this");
         assert_eq!(result.finish_reason, TRUNCATED);
+        let retries: Vec<&String> = deltas.iter().filter(|d| d.starts_with("retry:")).collect();
+        assert_eq!(retries.len(), 2, "{deltas:?}");
+        assert!(retries[0].starts_with("retry:2/3:the reply was cut short (") && retries[1].starts_with("retry:3/3:"), "{deltas:?}");
     }
 
     #[tokio::test]
@@ -2275,10 +2275,9 @@ pub(crate) mod tests {
     /// finished one.
     #[tokio::test]
     async fn a_stream_that_ends_with_no_terminator_reports_truncation() {
-        let result = stream_once(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n",
-        )
-        .await;
+        let half = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+        let (result, _, served) = stream_sequence(vec![half.into(); 3]).await;
+        assert_eq!(served, 3, "asked for again twice before it is reported");
         assert_eq!(result.finish_reason, TRUNCATED);
         // The partial text still comes back: it lands in the transcript so the
         // session stays resumable.
@@ -2918,19 +2917,39 @@ pub(crate) mod tests {
         assert_eq!(result.finish_reason, TRUNCATED, "an unfinished stream is not a clean tool_calls stop");
     }
 
-    /// Reply text the caller has already shown is never duplicated: a stream
-    /// that dies after content streamed is a truncation, not a retry.
+    /// The bug this guards: a connection that dropped after reply text began
+    /// ended the turn, although nothing from the reply had run and the same
+    /// request could be sent again. The reply is asked for again from its
+    /// start, the announcement says the text shown is void, and the usage the
+    /// cut reply reported is kept apart from the reply's own.
     #[tokio::test]
-    async fn a_stream_interrupted_after_reply_text_is_not_retried() {
+    async fn a_stream_interrupted_after_reply_text_is_asked_for_again() {
         let (result, deltas, served) = stream_sequence(vec![
-            "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n".into(),
-            "data: {\"choices\":[{\"delta\":{\"content\":\"unreached\"},\"finish_reason\":\"stop\"}]}\n\n".into(),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+            )
+            .into(),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":5}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .into(),
         ])
         .await;
-        assert_eq!(served, 1);
-        assert_eq!(result.finish_reason, TRUNCATED);
-        assert_eq!(result.content, "half an ans");
-        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+        assert_eq!(served, 2);
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+        assert_eq!(
+            deltas,
+            [
+                "content:half an ans",
+                "retry:2/3:the reply was cut short (the stream ended before the reply finished) and is asked for again from its start",
+                "content:all of it",
+            ]
+        );
+        assert_eq!(result.usage.map(|u| u.completion_tokens), Some(5));
+        assert_eq!(result.cut_usage.iter().map(|u| u.completion_tokens).collect::<Vec<_>>(), [3]);
     }
 
     /// The reasoning an interrupted attempt streamed is void once the reply
@@ -2958,8 +2977,8 @@ pub(crate) mod tests {
     /// arguments streamed as `{"command": "rm -rf ./build`, `/cache`, `"}`
     /// came back without the middle piece as `rm -rf ./build`, finished as
     /// `tool_calls`, and ran. The attempt ends at that line instead: a reply
-    /// nothing of which has streamed starts over, and one that has comes
-    /// back truncated, which the agent loop never dispatches.
+    /// nothing of which has streamed starts over, and one that has streamed
+    /// is asked for again like any cut reply.
     #[tokio::test]
     async fn an_unreadable_stream_line_ends_the_attempt() {
         let piece = |call: Value| format!("data: {}\n\n", json!({"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": null}]}));
@@ -2978,9 +2997,12 @@ pub(crate) mod tests {
         assert!(deltas[0].starts_with(&format!("retry:2/{MAX_ATTEMPTS}:the stream carried a line this client cannot read")), "{}", deltas[0]);
 
         let shown = "data: {\"choices\":[{\"delta\":{\"content\":\"Clearing.\"},\"finish_reason\":null}]}\n\n";
-        let (result, _, served) = stream_sequence(vec![format!("{shown}{corrupted}"), good.into()]).await;
-        assert_eq!(served, 1, "reply text already shown is never generated twice");
-        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("Clearing.", TRUNCATED));
+        // After reply text it is a cut like a dropped connection: the reply is
+        // asked for again from its start.
+        let (result, deltas, served) = stream_sequence(vec![format!("{shown}{corrupted}"), good.into()]).await;
+        assert_eq!(served, 2, "{deltas:?}");
+        assert!(deltas[1].starts_with("retry:2/3:the reply was cut short (the stream carried a line"), "{deltas:?}");
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("cleaned", "stop"));
 
         // After the finish chunk, nothing of the reply was still due: an
         // unreadable usage line costs the usage alone.

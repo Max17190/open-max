@@ -2765,7 +2765,10 @@ fn json_turn(
     home: &Path,
     prompt: &str,
 ) -> (Option<i32>, Vec<serde_json::Value>, String) {
+    // A backoff is a millisecond: no caller times one, and a reply cut three
+    // times would otherwise wait out two.
     let out = cmd(project, home)
+        .env("OPENMAX_TEST_BACKOFF_UNIT_MS", "1")
         .args(["--trust-project", "--json", "-p", prompt])
         .output()
         .unwrap();
@@ -2814,7 +2817,8 @@ fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
     let (project, home) = fresh_dirs("truncated");
     let partial =
         "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
-    let (base_url, _requests, _server) = spawn_scripted_server(vec![(partial.to_string(), false)]);
+    // Cut on each of the three times it is asked for.
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![(partial.to_string(), false); 3]);
     write_settings(&home, &base_url);
 
     let (code, lines, stdout) = json_turn(&project, &home, "say hi");
@@ -2833,14 +2837,14 @@ fn a_truncated_stream_reports_truncation_instead_of_a_clean_stop() {
 /// call, so the arguments parse and nothing looks broken. A stream with no
 /// completion signal is not a response the model asked to act on (more calls
 /// may have been coming, or this one may still have been under revision), so
-/// the call must not run. Reply text streams first, so this is the
-/// interruption the client does not start over.
+/// the call must not run. Reply text streams first, so the client asks for
+/// the reply again twice and then reports it truncated.
 #[test]
 fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
     let (project, home) = fresh_dirs("truncated-native-call");
     let prose = "data: {\"choices\":[{\"delta\":{\"content\":\"writing it\"},\"finish_reason\":null}]}\n\n";
     let (base_url, _requests, _server) =
-        spawn_scripted_server(vec![(format!("{prose}{WRITE_CALL_SSE}"), false)]);
+        spawn_scripted_server(vec![(format!("{prose}{WRITE_CALL_SSE}"), false); 3]);
     // auto, so a refusal here is the truncation and not the approval gate.
     write_settings_with_mode(&home, &base_url, "auto");
 

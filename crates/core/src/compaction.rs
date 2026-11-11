@@ -405,7 +405,9 @@ impl RequestSpend {
     }
 
     pub(crate) fn record(&mut self, core: &Core, session_id: &str, estimated: usize, result: &CompletionResult) {
-        let charged = if let Some(u) = result.usage {
+        // A reply the provider cut short and the client asked for again was
+        // paid for as well, as far as the provider said.
+        for u in result.cut_usage.iter().chain(&result.usage) {
             sessions::append_usage(core, session_id, &sessions::TokenUsage {
                 ts: sessions::unix_now(),
                 prompt_tokens: u.prompt_tokens,
@@ -417,12 +419,12 @@ impl RequestSpend {
                 completion_tokens: u.output_tokens,
                 cached_tokens: u.cached_tokens,
             });
-            u.prompt_tokens.saturating_add(u.output_tokens) as usize
-        } else {
-            estimated.saturating_add(estimate_tokens(result.content.len()
-                + result.tool_calls.iter().map(|c| c.function.arguments.len()).sum::<usize>()))
-        };
-        self.tokens = self.tokens.saturating_add(charged);
+            self.tokens = self.tokens.saturating_add(u.prompt_tokens.saturating_add(u.output_tokens) as usize);
+        }
+        if result.usage.is_none() {
+            self.tokens = self.tokens.saturating_add(estimated.saturating_add(estimate_tokens(result.content.len()
+                + result.tool_calls.iter().map(|c| c.function.arguments.len()).sum::<usize>())));
+        }
     }
 }
 
@@ -2294,6 +2296,7 @@ pub(crate) mod tests {
             reasoning_details: None,
             finish_reason: "stop".into(),
             usage,
+            cut_usage: Vec::new(),
         };
         let reported = |prompt_tokens| {
             completion(Some(crate::client::Usage { prompt_tokens, ..Default::default() }))

@@ -503,7 +503,8 @@ long prompt, but an endpoint that sends nothing at all (no response headers, no
 reply bytes, not even an SSE keepalive comment) for 10 minutes ends the
 attempt. If no response arrives, or a stream goes silent before any reply
 text, the attempt is resent like a dropped connection; a stream that goes
-silent after reply text is reported truncated. A provider's
+silent after reply text is reported truncated, where one whose connection
+drops after reply text is asked for again, at most twice in a row. A provider's
 `idle_timeout_secs` sets a different interval for that provider, in seconds
 (0 does not disable it, and `--check` rejects it).
 
