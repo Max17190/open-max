@@ -222,14 +222,20 @@ fn setup_saves_the_reply_limit_a_catalog_reports() {
 }
 
 /// A Chat Completions connection continues a reply cut at its limit, so setup
-/// saves the model's window and writes no reply limit even when the catalog
-/// reports an output maximum; the default stays in force, and a `max_tokens`
-/// already on the entry, and every other model, is kept as it was.
+/// saves the model's window and writes no reply limit when the catalog reports
+/// an output maximum at or over the default; the default stays in force. A
+/// maximum under the default is what the model accepts, so it is saved. A
+/// `max_tokens` already on the entry, and every other model, is kept as it was.
 #[test]
 fn setup_saves_the_window_and_keeps_the_reply_limit_it_finds() {
-    let mut catalog = vec![json!({"id":"other","max_tokens":1})];
-    record_model(&mut catalog, "m", 131072, &json!({"max_completion_tokens":32768}), true);
-    assert_eq!(catalog, vec![json!({"id":"other","max_tokens":1}), json!({"id":"m","context_tokens":131072})]);
+    for most in [32768, 4096] {
+        let mut catalog = vec![json!({"id":"other","max_tokens":1})];
+        record_model(&mut catalog, "m", 131072, &json!({"max_completion_tokens":most}), true);
+        assert_eq!(catalog, vec![json!({"id":"other","max_tokens":1}), json!({"id":"m","context_tokens":131072})]);
+    }
+    let mut catalog = Vec::new();
+    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":2048}), true);
+    assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":2048})], "a lower maximum is what the model accepts");
     let mut catalog = vec![json!({"id":"m","context_tokens":1,"max_tokens":2048})];
     record_model(&mut catalog, "m", 131072, &json!({"max_tokens":65536}), true);
     assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":2048})], "a limit the user set is kept");

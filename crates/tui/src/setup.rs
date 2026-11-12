@@ -325,13 +325,13 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     Ok(())
 }
 
-/// Saves the model's window and, only for a connection whose wire is not Chat
-/// Completions, the output maximum a catalog reports as the reply limit, capped
-/// at a quarter of the window (not below the 4096 default) as it is also the
-/// input reserve. A limit on the entry is kept; with none reported none is guessed.
+/// Saves the model's window and the output maximum a catalog reports as the reply
+/// limit, on Chat Completions only when under the 4096 default; capped at a quarter
+/// of the window (not below the default) as it is also the input reserve. A limit
+/// on the entry is kept; with none reported none is guessed.
 fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value, chat: bool) {
     let most = ["max_completion_tokens", "max_output_tokens", "max_tokens"].iter().find_map(|k| metadata[*k].as_u64())
-        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0 && !chat);
+        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0 && (!chat || *n < 4096));
     let i = catalog.iter().position(|m| m["id"] == model).unwrap_or_else(|| { catalog.push(json!({"id":model})); catalog.len() - 1 });
     catalog[i]["context_tokens"] = json!(window);
     if let (Some(most), None) = (most, catalog[i].get("max_tokens")) { catalog[i]["max_tokens"] = json!(most.min((window / 4).max(4096))); }
