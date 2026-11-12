@@ -1086,7 +1086,8 @@ Unknown `cmd` values yield {"type":"protocol_error","message":"..."} and the
 session continues; extra fields on a known command are ignored; blank lines
 are skipped.
 
-`openmax --stdio --continue` reattaches to the directory's latest session.
+`openmax --stdio --continue` reattaches to the directory's latest session,
+or with `--session <id>` to that session of the directory.
 After `hello` it emits one
 {"type":"transcript","session_id":"...","messages":[{"role":"user"|"assistant","content":"..."},...],"truncated":bool}
 line so the client can render what came before: user and assistant text only,

@@ -21,6 +21,7 @@ pub struct HeadlessArgs {
     /// place in its worktree.
     pub project: PathBuf,
     pub continue_session: bool,
+    pub session: Option<String>,
     pub json: bool,
     /// Notified on a quit signal (see `watch_quit_signals`).
     pub quit: Arc<Notify>,
@@ -38,8 +39,8 @@ pub async fn run(
 
     // Finding or creating the session waits on the session index lock.
     let setup = {
-        let (core, continue_session) = (core.clone(), args.continue_session);
-        move || open_session(&core, project_key, continue_session)
+        let (core, continue_session, named) = (core.clone(), args.continue_session, args.session.clone());
+        move || open_session(&core, project_key, continue_session, named)
     };
     let mut stop_by = None;
     let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
@@ -65,31 +66,40 @@ pub async fn run(
     code
 }
 
-/// The latest session here, or a new one: Ok(its id), or Err(the exit
-/// status) once the reason is on stderr.
-pub(crate) fn open_session(core: &Core, project_key: String, continue_session: bool) -> Result<String, i32> {
-    if continue_session {
-        match sessions::latest(core, &project_key) {
-            Ok(Some(meta)) => Ok(meta.id),
-            Ok(None) => {
-                eprintln!("openmax: no prior session in this directory to continue");
-                Err(2)
-            }
-            Err(e) => {
-                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(core, e)));
-                Err(1)
-            }
+/// The session `named`, else the latest session here, or a new one: Ok(its
+/// id), or Err(the exit status) once the reason is on stderr.
+pub(crate) fn open_session(core: &Core, project_key: String, continue_session: bool, named: Option<String>) -> Result<String, i32> {
+    let (opened, failed) = match named {
+        Some(id) => return named_session(core, &project_key, &id),
+        None if continue_session => (sessions::latest(core, &project_key).map(|meta| meta.map(|m| m.id)), ""),
+        None => (sessions::create(core, project_key).map(|meta| Some(meta.id)), "failed to create session: "),
+    };
+    let refusal = match opened {
+        Ok(Some(id)) => return Ok(id),
+        Ok(None) => {
+            eprintln!("openmax: no prior session in this directory to continue");
+            return Err(2);
         }
-    } else {
-        match sessions::create(core, project_key) {
-            Ok(meta) => Ok(meta.id),
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(core, e);
-                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
-                Err(1)
-            }
-        }
-    }
+        Err(e) => sessions::refusal_with_repair(core, e),
+    };
+    eprintln!("openmax: {failed}{}", one_line(&refusal));
+    Err(1)
+}
+
+/// Session `id` if this project can continue it, else a usage error (exit 2).
+fn named_session(core: &Core, project: &str, id: &str) -> Result<String, i32> {
+    let why = match sessions::list(core, project) {
+        Err(e) => { eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(core, e))); return Err(1) }
+        Ok(here) if here.iter().any(|m| m.id == id) => match sessions::load_messages(core, id) {
+            Ok(Some(_)) => return Ok(id.to_string()),
+            Ok(None) => "has no saved transcript to resume".to_string(),
+            Err(e) => format!("cannot be resumed: {e}"),
+        },
+        Ok(_) if sessions::meta(core, id).is_some() => "belongs to another project".into(),
+        Ok(_) => "does not exist in this project".into(),
+    };
+    eprintln!("openmax: session {} {}", one_line(id), one_line(&why));
+    Err(2)
 }
 
 async fn run_prompts(
@@ -452,6 +462,7 @@ mod tests {
             prompts: Vec::new(),
             project: dir.clone(),
             continue_session: false,
+            session: None,
             json: true,
             quit: Arc::new(Notify::new()),
         };
@@ -517,6 +528,7 @@ mod tests {
             prompts: Vec::new(),
             project: dir.clone(),
             continue_session: false,
+            session: None,
             json: true,
             quit: Arc::new(Notify::new()),
         };

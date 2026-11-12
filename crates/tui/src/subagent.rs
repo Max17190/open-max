@@ -100,6 +100,7 @@ pub async fn run(
             prompts: vec![task.clone()],
             project: worktree.project.clone(),
             continue_session: false,
+            session: None,
             json,
             quit: quit.clone(),
         };

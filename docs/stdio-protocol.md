@@ -20,7 +20,8 @@ The first stdout line is:
 
 `protocol_version` is an integer a client compares directly; `proto` carries
 the same major as a readable id. Any wire change bumps both. `continued` is
-true when `--continue` resumed a prior session; the next line is then one
+true when `--continue` resumed a prior session (the latest in the directory,
+or the one `--session <id>` names); the next line is then one
 `transcript` object so the client can render history without synthetic events:
 
 ```json
@@ -256,8 +257,9 @@ before its `done` (send it again after that `done`), is refused with a
 `protocol_error` alone.
 
 The process exit code is 1 when any turn ended with `stop_reason` `error` or
-the session could not be opened, 2 on a usage or configuration error or when
-`--continue` finds no prior session in the directory, 3 when the project is
+the session could not be opened, 2 on a usage or configuration error, when
+`--continue` finds no prior session in the directory, or when `--session`
+names one this directory cannot continue, 3 when the project is
 not trusted or trust cannot be granted from this process, and 0
 otherwise, including `length`, `max_iterations`, `budget_exhausted`, and
 `unverified`. The client reads `done` and decides for itself. See the
