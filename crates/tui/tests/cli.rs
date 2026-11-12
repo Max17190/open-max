@@ -4386,24 +4386,26 @@ fn an_unknown_flag_is_a_usage_error() {
 }
 
 /// SIGKILL the watcher of the run whose record of its tool groups is
-/// `record`, and say whether there was one: the process whose command line
-/// names it (`openmax --lifeline <record> <start>`), which the record's
-/// first write starts, waited for up to 10 seconds. A run killed after it
+/// `record`, and say whether there was one (`watcher`). A run killed after it
 /// leaves its tools to the next launch, the backstop for a watcher that is
 /// gone too.
 fn kill_watcher(record: &Path) -> bool {
+    watcher(record).map(|watcher| unsafe { libc::kill(watcher, libc::SIGKILL) }).is_some()
+}
+
+/// The pid of the watcher of the run whose record of its tool groups is
+/// `record`: the process whose command line names it (`openmax --lifeline
+/// <record> <start>`), which the record's first write starts, waited for up
+/// to 10 seconds.
+fn watcher(record: &Path) -> Option<i32> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let out = Command::new("ps").args(["-A", "-ww", "-o", "pid=", "-o", "args="]).output().expect("ps runs");
         let (listing, needle) = (String::from_utf8_lossy(&out.stdout), record.to_string_lossy());
         let watcher: Option<i32> =
             listing.lines().filter(|line| line.contains(&*needle)).find_map(|line| line.split_whitespace().next()?.parse().ok());
-        if let Some(watcher) = watcher {
-            unsafe { libc::kill(watcher, libc::SIGKILL) };
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
+        if watcher.is_some() || std::time::Instant::now() >= deadline {
+            return watcher;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -4822,6 +4824,12 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
 
     let ToolTree { child, _stdin, pids, base } =
         start_tool_tree("record-killed", &["--json", "-p", "start the tree"], "trap '' TERM; ");
+    // The record's thread writes the group just after its spawn returns, which
+    // can be after the tree has written its pids, and then starts the watcher.
+    // Once the watcher runs, that thread has nothing left to do before the
+    // signals, so the exit's bounded wait for it covers removing the record.
+    let record = base.join("home").join(".openmax").join("run").join(format!("{}.groups", child.id()));
+    let watched = watcher(&record);
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     std::thread::sleep(std::time::Duration::from_millis(100));
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
@@ -4838,6 +4846,7 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
     assert_eq!(lines[2], format!("-{}", lines[1]), "a finished tool round left its group listed: {during:?}");
     assert!(!finished_left, "a run whose tool round finished left its record\n{stderr}");
     let stderr = String::from_utf8_lossy(&killed.stderr);
+    assert!(watched.is_some(), "the run's first tool started no watcher of {}\n{stderr}", record.display());
     assert_eq!(killed.status.code(), Some(143), "{:?}\n{stderr}", killed.status);
     assert!(!killed_left, "a run whose second signal killed its tools left their record\n{stderr}");
 }
