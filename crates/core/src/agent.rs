@@ -820,26 +820,36 @@ async fn run_loop(
         // A reply the client asked for again was paid for, however this request ended.
         for usage in std::mem::take(&mut batcher.lock().unwrap().resent) { spend.charge(core, session_id, usage); }
 
+        // Learned from turn requests only: the compaction summary is another
+        // shape (no tool schemas, a different prompt) and would teach a ratio
+        // no turn request has. A failed request keeps a stronger refusal floor
+        // or an earlier ratio that tightens the window: it cannot relax it.
+        let next_ratio = match &result {
+            Ok(result) => updated_prompt_ratio(prompt_ratio, result, used),
+            Err(message) => refusal_ratio(message, used, context_tokens.saturating_sub(max_tokens), factor).or(prompt_ratio.filter(|&ratio| ratio >= 1.0)),
+        };
+        if next_ratio != prompt_ratio {
+            prompt_ratio = next_ratio;
+            if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
+                data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
+            }
+        }
         let result = match result {
             Ok(r) => r,
             Err(mut message) => {
-                // Keep a stronger refusal floor or an earlier ratio that
-                // tightens the window. Failed requests cannot relax it.
-                let fits = context_tokens.saturating_sub(max_tokens);
-                let next_ratio = refusal_ratio(&message, used, fits, factor)
-                    .or(prompt_ratio.filter(|&ratio| ratio >= 1.0));
-                if next_ratio != prompt_ratio {
-                    if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                        data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
-                    }
+                // A server can refuse a request that carries a reply of reasoning alone. Such
+                // replies lose their stamp, so no wire sends them, and the request goes again.
+                let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
+                if (message.starts_with("backend returned 400") || message.starts_with("backend returned 422")) && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0 {
+                    save_messages(core, session_id, guard.messages(), true).await;
+                    if iteration + 1 < max_iterations { continue 'turns; }
                 }
                 // A knowingly oversized request that then fails owes the user
                 // the local accounting, not just the provider's opaque error.
                 if used > budget {
-                    let schema_real = to_real(schema_tokens, factor);
                     message = format!(
                         "{message}\n{}",
-                        over_budget_error_context(used_real, schema_real, window_budget, context_tokens)
+                        over_budget_error_context(used_real, to_real(schema_tokens, factor), window_budget, context_tokens)
                     );
                 }
                 core.send_agent(session_id, AgentEvent::Error { message });
@@ -847,16 +857,6 @@ async fn run_loop(
                 break 'turns;
             }
         };
-        // Learned from turn requests only: the compaction summary is another
-        // shape (no tool schemas, a different prompt) and would teach a ratio
-        // no turn request has.
-        let next_ratio = updated_prompt_ratio(prompt_ratio, &result, used);
-        if next_ratio != prompt_ratio {
-            prompt_ratio = next_ratio;
-            if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
-            }
-        }
 
         refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
         // Charged in the units admission used, so a reply without usage pays
@@ -3304,6 +3304,205 @@ mod tests {
         assert!(other_bodies[0].contains("[reply cut"), "the note still goes: {}", other_bodies[0]);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// How a server that requires text or a call beside reasoning refuses a
+    /// request carrying a reply of reasoning alone.
+    const REASONING_ALONE_REFUSAL: &str = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"message\":\"content items of type 'thinking' must be followed by content items of type 'text' for messages with empty 'tool_calls': 'messages[2].content[0]'\"}"}}}"#;
+
+    /// Whether a request body carries an assistant message with neither text nor calls.
+    fn carries_lone_reply(body: &str) -> bool {
+        sent_replies(body).iter().any(|m| m.get("content").is_none() && m.get("tool_calls").is_none())
+    }
+
+    /// A provider that answers the nth request with the nth stream (the last
+    /// one repeats), unless `refuse`, given the request's number and body,
+    /// names a status: that request gets it with a refusal body. Every request
+    /// body is kept.
+    async fn refusing_endpoint(
+        streams: &[&str],
+        refuse: impl Fn(usize, &str) -> Option<u16> + Send + 'static,
+    ) -> (String, Arc<StdMutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen = bodies.clone();
+        let streams: Vec<String> = streams.iter().map(|s| s.to_string()).collect();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut byte).await {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf).to_string();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut payload = vec![0u8; content_length];
+                if content_length > 0 && sock.read_exact(&mut payload).await.is_err() {
+                    continue;
+                }
+                let body = String::from_utf8_lossy(&payload).to_string();
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(body.clone());
+                    seen.len()
+                };
+                let resp = match refuse(n, &body) {
+                    Some(code) => format!(
+                        "HTTP/1.1 {code} Refused\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{REASONING_ALONE_REFUSAL}",
+                        REASONING_ALONE_REFUSAL.len()
+                    ),
+                    None => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
+                        streams[(n - 1).min(streams.len() - 1)]
+                    ),
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), bodies)
+    }
+
+    /// The bug this guards: a server that requires text or a call beside
+    /// reasoning refused the continuation of a reply cut while reasoning, so
+    /// the turn ended with its error, and so did every later turn of the
+    /// session, which kept the reply. The refused reply's reasoning stops
+    /// going back, the request goes once more without it, and the turn goes
+    /// on; the reasoning of the reply with a call still goes back, also after
+    /// the session is reopened from disk.
+    #[tokio::test]
+    async fn a_refused_reply_of_reasoning_alone_stops_going_back_and_the_turn_goes_on() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let streams = [THINKING_TOOL_SSE, THOUGHT_CUT_SSE, STOP_SSE];
+        let (base_url, bodies) = refusing_endpoint(&streams, |_, body| carries_lone_reply(body).then_some(400)).await;
+        let settings = |core: &Arc<Core>| {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens) = (base_url.clone(), "stub".into(), Some(16384));
+            (s.max_tokens, s.approval_mode) = (1024, ApprovalMode::Auto);
+        };
+        settings(&core);
+        let id = &crate::sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id.into(), project.clone(), "what is in a.txt".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "stop");
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 4, "the call, the cut, the refused continuation, and its resend");
+        let refused: Value = serde_json::from_str(&sent[2]).unwrap();
+        let refused = refused["messages"].as_array().unwrap();
+        let at = refused.iter().position(|m| m["role"] == "assistant" && m.get("tool_calls").is_none()).expect("the cut reply went back");
+        assert_eq!(refused[at], serde_json::json!({"role": "assistant", "reasoning_content": "half a thought"}), "{}", sent[2]);
+        assert!(refused[at + 1]["content"].as_str().unwrap().starts_with("[reply cut"), "{}", sent[2]);
+        let replies = sent_replies(&sent[3]);
+        assert_eq!(replies.len(), 1, "only the reply with the call: {}", sent[3]);
+        assert_eq!(replies[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(replies[0]["reasoning_content"], "read a.txt first", "{}", sent[3]);
+        assert!(sent[3].contains("[reply cut") && !sent[3].contains("half a thought"), "{}", sent[3]);
+
+        let messages = transcript(&core, id).await;
+        let lone = messages.iter().find(|m| m.reasoning_content.as_deref() == Some("half a thought")).expect("kept on disk");
+        assert!(lone.content.is_none() && lone.tool_calls.is_none() && lone.reasoning_origin.is_none());
+        let call = messages.iter().find(|m| m.tool_calls.is_some()).unwrap();
+        assert!(call.reasoning_origin.is_some() && call.reasoning_content.as_deref() == Some("read a.txt first"));
+
+        // Reopened from disk, the session no longer sends the refused reply.
+        while crate::sessions::detach(&core, id).is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(core);
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        settings(&core);
+        start_turn(core.clone(), id.into(), project.clone(), "again".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 5, "one request, not refused");
+        assert!(!carries_lone_reply(&sent[4]), "{}", sent[4]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Only a refusal (HTTP 400 or 422) withholds a reply of reasoning alone,
+    /// and only once: a second refusal ends the turn with the server's
+    /// error, another status leaves the reply as it was, the resend counts
+    /// against the iteration cap, and a refusal with no such reply ends the
+    /// turn as before.
+    #[tokio::test]
+    async fn only_a_refusal_withholds_a_reply_of_reasoning_alone_and_only_once() {
+        use crate::state::Core;
+
+        type Refuse = fn(usize, &str) -> Option<u16>;
+        // Name, first stream, refusal rule, iteration cap; then the stop
+        // reason, the requests, the error's start and whether the cut reply
+        // keeps its stamp.
+        type Case = (&'static str, &'static str, Refuse, usize, &'static str, usize, Option<&'static str>, Option<bool>);
+        let lone_400: Refuse = |_, body| carries_lone_reply(body).then_some(400);
+        let cases: [Case; 5] = [
+            ("every request after the first refused", THOUGHT_CUT_SSE, |n, _| (n > 1).then_some(400), 10, "error", 3, Some("backend returned 400"), Some(false)),
+            ("another status", THOUGHT_CUT_SSE, |_, body| carries_lone_reply(body).then_some(401), 10, "error", 2, Some("backend returned 401"), Some(true)),
+            ("422", THOUGHT_CUT_SSE, |_, body| carries_lone_reply(body).then_some(422), 10, "stop", 3, None, Some(false)),
+            ("no iteration left", THOUGHT_CUT_SSE, lone_400, 2, "error", 2, Some("backend returned 400"), Some(false)),
+            ("no cut", STOP_SSE, |n, _| (n == 1).then_some(400), 10, "error", 1, Some("backend returned 400"), None),
+        ];
+        for (name, first, refuse, iterations, want_stop, want_requests, want_error, stamped) in cases {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, bodies) = refusing_endpoint(&[first, STOP_SSE], refuse).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(16384));
+                (s.max_tokens, s.approval_mode, s.max_agent_iterations) = (1024, ApprovalMode::Auto, iterations);
+            }
+            let id = &crate::sessions::create(&core, project.display().to_string()).unwrap().id;
+            start_turn(core.clone(), id.into(), project.clone(), "go".into()).unwrap();
+            let (stop, events) = drive_turn_events(&mut rx).await;
+            assert_eq!(stop, want_stop, "{name}");
+            let sent = bodies.lock().unwrap().clone();
+            assert_eq!(sent.len(), want_requests, "{name}");
+            let error = events.iter().find_map(|e| match e { AgentEvent::Error { message } => Some(message.clone()), _ => None });
+            assert_eq!(error.is_some(), want_error.is_some(), "{name}: {error:?}");
+            if let (Some(error), Some(prefix)) = (&error, want_error) {
+                assert!(error.starts_with(prefix), "{name}: {error}");
+            }
+            let messages = transcript(&core, id).await;
+            let lone = messages.iter().find(|m| m.reasoning_content.as_deref() == Some("half a thought"));
+            assert_eq!(lone.map(|m| m.reasoning_origin.is_some()), stamped, "{name}");
+            if name == "every request after the first refused" {
+                assert!(sent_replies(&sent[2]).is_empty(), "the resend carries no assistant message: {}", sent[2]);
+            }
+            if name == "no iteration left" {
+                // The withheld reply stays withheld: the next turn is not refused.
+                start_turn(core.clone(), id.into(), project.clone(), "again".into()).unwrap();
+                assert_eq!(drive_turn(&mut rx).await.0, "stop", "{name}");
+                let sent = bodies.lock().unwrap().clone();
+                assert_eq!(sent.len(), want_requests + 1, "{name}");
+                assert!(!carries_lone_reply(&sent[want_requests]), "{name}: {}", sent[want_requests]);
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// A finished reply whose one call has arguments that stop partway

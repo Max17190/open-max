@@ -4217,6 +4217,37 @@ pub(crate) mod tests {
         serde_json::to_string(&WireMessages { messages, origin, marks: false, prefer_reasoning_details: false }).unwrap()
     }
 
+    /// A reply of reasoning alone whose reasoning a server refused loses its
+    /// stamp, and then goes out on no wire: no assistant entry, no reasoning
+    /// item, none of its text. With its stamp it goes back as reasoning only.
+    #[test]
+    fn a_reply_of_reasoning_alone_without_its_stamp_goes_out_on_no_wire() {
+        let mut lone = ChatMessage::assistant(None, None);
+        lone.reasoning_content = Some("half a thought".into());
+        lone.reasoning = Some("half a thought".into());
+        lone.reasoning_details = serde_json::value::to_raw_value(&json!([{"type": "reasoning.text", "text": "half a thought"}])).ok();
+        let messages = [ChatMessage::system("p"), ChatMessage::user("go"), lone, ChatMessage::user("[reply cut]")];
+        for wire_api in [crate::providers::WireApi::ChatCompletions, crate::providers::WireApi::Responses, crate::providers::WireApi::Anthropic] {
+            let client = ChatClient { wire_api, ..ChatClient::new("http://127.0.0.1:8080/v1".into(), None, "m".into(), None, 64) };
+            let body = match wire_api {
+                crate::providers::WireApi::ChatCompletions => serialize_chat_request_body(&client, &messages, "[]"),
+                crate::providers::WireApi::Responses => responses::serialize(&client, &messages, "[]"),
+                crate::providers::WireApi::Anthropic => anthropic::serialize(&client, &messages, "[]"),
+            };
+            let body: Value = serde_json::from_slice(&body.unwrap()).unwrap();
+            let entries = body.get("messages").or(body.get("input")).and_then(Value::as_array).unwrap();
+            assert!(!entries.iter().any(|e| e["role"] == "assistant" || e["type"] == "reasoning"), "{wire_api:?}: {body}");
+            assert!(!body.to_string().contains("half a thought"), "{wire_api:?}: {body}");
+        }
+
+        let client = ChatClient::new("http://127.0.0.1:8080/v1".into(), None, "m".into(), None, 64);
+        let mut stamped = ChatMessage::assistant(None, None);
+        stamped.reasoning_content = Some("half a thought".into());
+        stamped.reasoning_origin = Some(client.origin());
+        let body: Value = serde_json::from_str(&request_body(&client, &[stamped])).unwrap();
+        assert_eq!(body["messages"][0], json!({"role": "assistant", "reasoning_content": "half a thought"}));
+    }
+
     #[test]
     fn chat_reasoning_replay_uses_structured_blocks_only_on_compatible_routes() {
         let cases = [
