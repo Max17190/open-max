@@ -65,7 +65,7 @@ use crate::state::{CancelToken, Core};
 use crate::stream::{spawn_stale_flusher, TokenBatcher};
 use crate::tools;
 use crate::transcript::{complete_pending_tool_replies, ensure_session_hydrated, save_messages, take_messages, MessageGuard};
-use crate::types::{AgentEvent, ChatMessage, ToolCall};
+use crate::types::{AgentEvent, ChatMessage};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) const POLICY_CHANGED_DURING_HOOK: &str = "Execution mode changed during pre-tool checks; this call was not executed. Request it again under the current mode.";
@@ -841,7 +841,12 @@ async fn run_loop(
                 // replies lose their stamp, so no wire sends them, and the request goes again.
                 let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
                 if (message.starts_with("backend returned 400") || message.starts_with("backend returned 422")) && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0 {
-                    save_messages(core, session_id, guard.messages(), true).await;
+                    // A rewrite that fails leaves the file stale, so the next save writes it whole.
+                    if !save_messages(core, session_id, guard.messages(), true).await {
+                        if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
+                            data.persisted_count = sessions::PERSISTED_STALE;
+                        }
+                    }
                     if iteration + 1 < max_iterations { continue 'turns; }
                 }
                 // A knowingly oversized request that then fails owes the user
@@ -890,16 +895,10 @@ async fn run_loop(
             // that carries it, which would fail the rest of the session. Such
             // a call never runs; a dispatched one's tool reply names the error
             // and quotes what was sent.
-            let recorded: Vec<ToolCall> = tool_calls
-                .iter()
-                .map(|call| {
-                    let mut call = call.clone();
-                    if serde_json::from_str::<Value>(&call.function.arguments).is_err() {
-                        call.function.arguments = "{}".into();
-                    }
-                    call
-                })
-                .collect();
+            let mut recorded = tool_calls.clone();
+            for call in recorded.iter_mut().filter(|call| serde_json::from_str::<Value>(&call.function.arguments).is_err()) {
+                call.function.arguments = "{}".into();
+            }
             let mut reply = ChatMessage::assistant(
                 if content.is_empty() { None } else { Some(content.clone()) },
                 if recorded.is_empty() { None } else { Some(recorded) },
