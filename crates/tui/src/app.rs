@@ -2966,6 +2966,7 @@ impl App {
                 // enter its matches now, exactly as a finished message does.
                 self.refilter_scroll_search_live();
             }
+            AgentEvent::TurnVerified { hooks } => self.note(&format!("turn_end gates passed: {}", hooks.join(", "))),
             AgentEvent::SteerAccepted { text } => {
                 // The steer leaves the queue strip for its place in the
                 // transcript, the one a resumed session replays it at.

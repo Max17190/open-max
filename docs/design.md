@@ -33,7 +33,7 @@ The design starts with one question: **What is the smallest capability Open Max 
 | Lifecycle policy and events | Process hooks and permission files |
 | Compaction integration | The built-in model summary plus the `compaction` hook event |
 | Model endpoints | `providers.json`, including local servers, gateways, and private proxies |
-| Shortcuts or a completely different UI | Prompt templates, or a custom frontend speaking `openmax-stdio/8` |
+| Shortcuts or a completely different UI | Prompt templates, or a custom frontend speaking `openmax-stdio/9` |
 
 These are deliberate boundaries, not placeholders for hidden orchestration products. Open Max does not carry an MCP host, nested-agent scheduler, plan mode, background-job product, built-in TODO database, user-keybinding engine, pluggable compactor, or TUI plugin ABI. The agent composes those richer workflows from the same host tools a developer can inspect, edit, test, and remove.
 

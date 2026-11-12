@@ -146,6 +146,8 @@ struct Turn {
     notes: Vec<String>,
     hook_failures: Vec<(String, String)>,
     errors: Vec<String>,
+    /// The gates each `turn_verified` named.
+    verified: Vec<Vec<String>>,
 }
 
 impl Turn {
@@ -178,6 +180,7 @@ async fn drive_turn(
             AgentEvent::HarnessNote { text, .. } => turn.notes.push(text),
             AgentEvent::HookFailed { event, detail, .. } => turn.hook_failures.push((event, detail)),
             AgentEvent::Error { message } => turn.errors.push(message),
+            AgentEvent::TurnVerified { hooks } => turn.verified.push(hooks),
             AgentEvent::Done { stop_reason } => {
                 turn.stop = stop_reason;
                 break;
@@ -450,6 +453,7 @@ async fn a_completion_gate_that_cannot_start_ends_the_turn_unverified_without_re
     assert_eq!(told(&bodies[0]), 1, "the model is told: {}", bodies[0]);
     assert_eq!(told(&bodies[1]), 1, "once per session, kept in the transcript: {}", bodies[1]);
     assert_eq!(turn.stop, "unverified", "an end no gate could judge is not verified");
+    assert!(turn.verified.is_empty() && next.verified.is_empty(), "no pass is claimed for an end no gate judged");
     let failures: Vec<_> = turn.hook_failures.iter().filter(|(event, _)| event == "turn_end").collect();
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
@@ -479,6 +483,7 @@ async fn a_hook_file_failing_closed_ends_the_turn_unverified_without_refusals() 
 
     assert_eq!(turn.stop, "unverified", "an end a broken hook file might have judged is not verified");
     assert_eq!(next.stop, "unverified");
+    assert!(turn.verified.is_empty() && next.verified.is_empty(), "the working gate passed, yet the end is not verified");
     let bodies = bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 3, "the working gate's one refusal, and nothing spent on the broken file");
     let failures: Vec<_> = turn.hook_failures.iter().filter(|(event, _)| event == "turn_end").collect();
@@ -514,5 +519,6 @@ async fn a_turn_that_repairs_a_hook_file_failing_closed_ends_verified() {
     assert_eq!(turn.stop, "stop", "{:?}", turn.hook_failures);
     assert!(turn.hook_failures.is_empty(), "{:?}", turn.hook_failures);
     assert!(project.join("judged").exists(), "the repaired gate judged the end");
+    assert_eq!(turn.verified, [["gate"]], "the stream names the gate that passed the repaired end");
     let _ = std::fs::remove_dir_all(dir);
 }

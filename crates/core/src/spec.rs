@@ -444,7 +444,8 @@ like any other gate, and so does one that cannot start, except in auto
 gate changed or was deleted, a gate cannot run, or the approval store cannot
 be read), each turn's end is reported in `hook_failed` and ends `unverified`
 without a refusal; the model is told at turn start, once per session. A turn
-that repairs the file is judged by the hooks on disk at its end.
+that repairs the file is judged by the hooks on disk at its end. An end every
+gate passed is recorded as `turn_verified`, naming them (`--spec stdio`).
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:
 - pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
@@ -1026,14 +1027,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/8)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/9)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -1131,6 +1132,9 @@ event goes out - and the turn continues, so render it, or the live view shows
 the model finishing and then starting again with no visible cause while a
 replay of the same session from disk shows the injected message; the two
 counters are the numbers the hook's payload carried for this attempt),
+`turn_verified` (hooks: the model's end stands and every blocking `turn_end`
+gate that judged it passed, named in the order they ran, before `done`;
+no line when no gate judged the end or it ends any other way),
 `steer_accepted` (text: a `user` line sent while the turn ran entered the
 transcript as a user message here, after the output above it and before the
 next request, which carries it; `text` is the line's text after template
@@ -1909,6 +1913,7 @@ mod tests {
                 continuation: 0,
                 continuations_left: 0,
             },
+            AgentEvent::TurnVerified { hooks: Vec::new() },
             AgentEvent::SteerAccepted { text: String::new() },
             AgentEvent::SteerBlocked { text: String::new(), reason: String::new() },
             AgentEvent::Done { stop_reason: String::new() },
