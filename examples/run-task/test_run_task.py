@@ -114,6 +114,21 @@ def a_final_check_decides_the_verdict_without_gating_the_end(root, binary):
     assert (final["gates"], final["before"], final["after"]) == (False, None, 1), final
 
 
+def a_ceiling_ends_the_turn_as_open_max_s_flag_does(root, binary):
+    """The ceilings reach Open Max as its own flags, for this run only."""
+    with endpoint([FIX, DONE]) as (url, requests):
+        repo, env, out = fixture(root, "ceiling", binary, url)
+        settings = Path(env["HOME"]) / ".openmax" / "settings.json"
+        before = settings.read_bytes()
+        result = call(binary, repo, env, out, "--check", CHECK, "--max-agent-iterations", "1", code=4)
+        assert "positive number" in call(binary, repo, env, out, "--check", CHECK, "--max-agent-tokens", "0", code=2)
+    assert result["stop_reason"] == "max_iterations" and result["reason"] == "the turn ended max_iterations", result
+    assert result["ceilings"] == {"max_agent_tokens": None, "max_agent_iterations": 1} and len(requests) == 1, result
+    # The one round the ceiling allowed made the fix, so the checks pass afterwards.
+    assert result["checks"][0]["after"] == 0 and result["files_changed"] == ["greet.sh"], result
+    assert settings.read_bytes() == before
+
+
 def a_timeout_or_a_signal_stops_the_run(root, binary):
     sleep = {"tool": "bash", "args": {"command": "sleep 60"}}
     with endpoint([sleep]) as (url, requests):
@@ -229,6 +244,7 @@ if __name__ == "__main__":
         a_turn_whose_checks_never_pass_ends_unverified(root, binary)
         the_verdict_is_this_script_s_own_run_of_the_checks(root, binary)
         a_final_check_decides_the_verdict_without_gating_the_end(root, binary)
+        a_ceiling_ends_the_turn_as_open_max_s_flag_does(root, binary)
         a_timeout_or_a_signal_stops_the_run(root, binary)
         a_call_that_cannot_be_held_to_its_checks_does_not_start(root, binary)
         a_project_in_ask_mode_says_why_nothing_was_written(root, binary)

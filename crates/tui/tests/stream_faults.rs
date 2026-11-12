@@ -2270,6 +2270,85 @@ fn text_mode_at_the_iteration_cap_says_how_to_continue() {
     );
 }
 
+/// `--max-agent-iterations` and `--max-agent-tokens` bound one print run the
+/// way the settings keys of the same name do, with settings.json setting
+/// neither. Here the first reply is a tool call that reports spending the
+/// whole window: one round is the iteration flag's limit, and with the window
+/// as the token flag's ceiling, admission refuses the second request. Each
+/// run stops as the setting would (`max_iterations` or `budget_exhausted`,
+/// exit 4) after one request, the text-mode stop line names the flag, and
+/// settings.json is the same bytes afterwards.
+#[test]
+fn ceiling_flags_stop_one_run_and_leave_settings_unchanged() {
+    const WINDOW: usize = 16384;
+    let spent = data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":WINDOW}}));
+    let cases = [
+        ("--max-agent-iterations", "1".to_string(), "max_iterations",
+            "openmax: stopped (max_iterations): reached the limit of 1 tool-call round for one turn. \
+             --max-agent-iterations set it for this run. Run openmax --continue -p \"<follow-up>\" to continue".to_string()),
+        ("--max-agent-tokens", WINDOW.to_string(), "budget_exhausted",
+            format!("openmax: stopped (budget_exhausted): the turn reached its ceiling of {WINDOW} tokens, \
+                     set by --max-agent-tokens for this run. Run openmax --continue -p \"<follow-up>\" to continue")),
+    ];
+    for (flag, value, stop_reason, said) in cases {
+        for json in [true, false] {
+            let env = Env::new("ceiling-flag", flag, vec![
+                Step::Finished(format!("{}{}{spent}{DONE}", call("c1", "1"), finish("tool_calls"))),
+                Step::Finished(sse_text("past the ceiling")),
+            ]);
+            let settings = env.home.join(".openmax/settings.json");
+            let before = std::fs::read(&settings).unwrap();
+            let mut command = cmd(&env.project, &env.home);
+            command.args(["--trust-project", flag, &value, "-p", "go"]);
+            if json {
+                command.arg("--json");
+            }
+            let out = finish_with_deadline(command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(), flag);
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let log = format!("{flag} json={json}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert_eq!(out.status.code(), Some(4), "{log}");
+            assert_eq!(env.server.bodies().len(), 1, "{log}");
+            assert_eq!(std::fs::read(&settings).unwrap(), before, "settings.json changed:\n{log}");
+            if json {
+                let done: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+                assert_eq!(done["stop_reason"], stop_reason, "{log}");
+            } else {
+                let stops: Vec<&str> = stderr.lines().filter(|l| l.starts_with("openmax: stopped")).collect();
+                assert_eq!(stops, [said.as_str()], "{log}");
+            }
+        }
+    }
+}
+
+/// A ceiling flag with no number, or with 0, which would stop every turn
+/// before its first request, is a usage error, and so is one on an
+/// interactive session: each exits 2 with the reason, before any request,
+/// and writes nothing.
+#[test]
+fn a_ceiling_flag_without_a_usable_value_or_run_is_refused() {
+    let env = Env::new("ceiling-usage", "ceiling flag usage", vec![Step::Finished(sse_text("never sent"))]);
+    let settings = env.home.join(".openmax/settings.json");
+    let before = std::fs::read(&settings).unwrap();
+    let cases: [(&[&str], &str); 5] = [
+        (&["--max-agent-tokens", "0", "-p", "go"], "openmax: --max-agent-tokens takes a positive number"),
+        (&["--max-agent-iterations", "0", "-p", "go"], "openmax: --max-agent-iterations takes a positive number"),
+        (&["--max-agent-iterations", "ten", "-p", "go"], "\"ten\""),
+        (&["--max-agent-tokens", "-5", "-p", "go"], "\"-5\""),
+        (&["--max-agent-tokens", "5"], "openmax: --max-agent-tokens requires --stdio, --print, or --subagent"),
+    ];
+    for (args, said) in cases {
+        let out = finish_with_deadline(
+            cmd(&env.project, &env.home).arg("--trust-project").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap(),
+            "ceiling usage",
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.lines().next().is_some_and(|line| line.starts_with("openmax: ") && line.contains(said)), "{args:?}: {stderr}");
+    }
+    assert!(env.server.arrivals.lock().unwrap().is_empty(), "a refused flag sent a request");
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+}
+
 /// A record cut off mid-write never became a message: the resume does not
 /// send it, the next save removes it, and the complete records before it
 /// stay as they were.

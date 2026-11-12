@@ -84,7 +84,7 @@ def gate_is_ready(openmax, repo):
             stop(USAGE, f"the gate {row['path']} is not the hook this example ships: cp '{shipped}' over it")
 
 
-def run_openmax(openmax, task, repo, out, timeout):
+def run_openmax(openmax, task, repo, out, timeout, ceilings):
     """One print run, its stdout and stderr kept in `out`. Returns the exit
     code, 128 plus the signal's number when a signal ended the run, and
     whether the timeout did. At the timeout the run gets SIGTERM, which
@@ -105,7 +105,8 @@ def run_openmax(openmax, task, repo, out, timeout):
     try:
         with open(out / "stdout.jsonl", "wb") as stdout, open(out / "stderr.txt", "wb") as stderr:
             # A session of its own, so a signal reaches Open Max once, from here.
-            child = subprocess.Popen([openmax, "--json", "-p", "--", task], cwd=repo,
+            flags = [word for key, value in ceilings.items() if value for word in (f"--{key.replace('_', '-')}", str(value))]
+            child = subprocess.Popen([openmax, "--json", *flags, "-p", "--", task], cwd=repo,
                                      env={**os.environ, "RUN_TASK_DIR": str(out)}, stdin=subprocess.DEVNULL,
                                      stdout=stdout, stderr=stderr, start_new_session=True)
             if signalled:  # one that arrived while the run was starting
@@ -146,10 +147,15 @@ def main():
     parser.add_argument("--out", help="a new or empty directory outside the repository for the call's files")
     parser.add_argument("--timeout", type=float, metavar="SECONDS", help="stop the run after this long")
     parser.add_argument("--openmax", default="openmax", help="the openmax binary (default: openmax on PATH)")
+    parser.add_argument("--max-agent-tokens", type=int, metavar="N", help="the most tokens the turn may spend")
+    parser.add_argument("--max-agent-iterations", type=int, metavar="N", help="the most tool-call rounds the turn may take")
     args = parser.parse_args()
+    ceilings = {"max_agent_tokens": args.max_agent_tokens, "max_agent_iterations": args.max_agent_iterations}
 
     if not args.check and not args.final_check:
         stop(USAGE, "give at least one --check or --final-check: with none there is nothing to verify")
+    if any(value is not None and value < 1 for value in ceilings.values()):
+        stop(USAGE, "--max-agent-tokens and --max-agent-iterations take a positive number")
     if shutil.which("git") is None:
         stop(USAGE, "no executable git")
     # A caller inside a git command, a hook for one, passes on variables that
@@ -188,7 +194,7 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="run-task-index-") as scratch:
         start = work_tree(repo, Path(scratch), "start")
-        code, timed_out = run_openmax(openmax, args.task, repo, out, args.timeout)
+        code, timed_out = run_openmax(openmax, args.task, repo, out, args.timeout, ceilings)
         end = work_tree(repo, Path(scratch), "end")
     with open(out / "changes.patch", "wb") as patch:
         subprocess.run(["git", "-C", str(repo), "diff", "--binary", "--no-ext-diff", start, end],
@@ -246,6 +252,7 @@ def main():
         "session_id": session,
         "repo": str(repo),
         "checks": checks,
+        "ceilings": ceilings,
         "refusals": sum(1 for event in events if event.get("type") == "turn_refused" and event.get("hook") == HOOK),
         "gate_log": str(out / "gate.jsonl") if (out / "gate.jsonl").is_file() else None,
         "changes": str(out / "changes.patch"),

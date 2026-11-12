@@ -830,7 +830,8 @@ whose endpoint is not the one this file selects (a `--provider` other than
 save keeps this file's `model` and `reasoning_effort`, since they belong to that
 endpoint. `--api-key` beside a selected provider is refused.
 `--effort` sets `reasoning_effort` under the same write/override rules;
-`--effort default` leaves the request field unset.
+`--effort default` leaves the request field unset. `--max-agent-tokens` and
+`--max-agent-iterations` bound one unattended run and are never written here.
 
 Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 `context_tokens` fails at resolve, i.e. every turn refuses with the reason):

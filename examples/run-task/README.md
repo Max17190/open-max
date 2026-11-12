@@ -77,6 +77,11 @@ python3 examples/run-task/run_task.py --repo ~/code/my-app \
   call's files. Without it the script makes one and names it in the result.
 - `--timeout` stops the run after that many seconds. A print run has no
   deadline of its own.
+- `--max-agent-tokens` and `--max-agent-iterations` bound the turn for this
+  call only: the script passes each to Open Max as its flag of the same name,
+  and a turn that reaches one ends `budget_exhausted` or `max_iterations`
+  (exit 4). Neither is written to your settings. There is no ceiling in
+  money, since Open Max counts tokens and does not know their price.
 - `--openmax` names the binary when `openmax` is not on `PATH`.
 
 The shipped hook file lets the gate run for 600 seconds (`timeout_secs`, the
@@ -103,6 +108,7 @@ The script prints the result on stdout and writes it to `result.json`:
   "stop_reason": "stop",
   "session_id": "a92b42d0-63f8-4bb3-bc1d-284ca25822b8",
   "repo": "/home/me/code/my-app",
+  "ceilings": {"max_agent_tokens": null, "max_agent_iterations": null},
   "checks": [
     {
       "command": "cargo test -p parser",
@@ -130,6 +136,7 @@ The script prints the result on stdout and writes it to `result.json`:
 | `exit_code` | The script's exit code, from the table below |
 | `reason` | Why the result is not verified, or null |
 | `stop_reason` | The `stop_reason` of the run's `done` event |
+| `ceilings` | The `--max-agent-tokens` and `--max-agent-iterations` this call passed, or null |
 | `checks` | Each check: whether it `gates` the turn's end, its exit code `before` the work (null for a final check) and `after` it (null when the checks were not run again), and the time and the end of the output of that last run |
 | `refusals` | The ends of the turn the gate refused, counted from the `turn_refused` events |
 | `gate_log` | One JSON line for each end of a turn the gate judged: the session, the `continuation`, whether a refusal could be honored (`blockable`), and each check's exit code, time and output. A session the agent starts itself inherits the gate and is logged here too |
@@ -185,8 +192,9 @@ check reads, a test among them, so read `changes.patch` or check it with a
 `--final-check` of your own.
 
 The run keeps the limits of your installation: `max_agent_iterations` and
-`max_agent_tokens` in `~/.openmax/settings.json` bound a turn, and neither can
-be set for one call. Run one call at a time in a work tree.
+`max_agent_tokens` in `~/.openmax/settings.json` bound a turn, unless the
+call's `--max-agent-iterations` or `--max-agent-tokens` sets one for that run.
+Run one call at a time in a work tree.
 
 ## Test
 
@@ -197,7 +205,8 @@ python3 examples/run-task/test_run_task.py target/debug/openmax
 
 The test runs the script against a scripted endpoint on loopback: a turn
 whose first end is refused and whose second passes, a turn that spends all
-eight refusals, a turn that empties the gate's list, a final check, a timeout
+eight refusals, a turn that empties the gate's list, a final check, a turn
+stopped by a ceiling, a timeout
 and a signal, a project in `ask` mode, an endpoint that is down, the calls
 that are refused before any request, and the demo. The demo and the test share
 the scripted endpoint in `scripted_endpoint.py`.

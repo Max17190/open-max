@@ -49,6 +49,9 @@ options:
                          says which
       --effort <level>   reasoning effort: default, none, minimal, low, medium,
                          high, xhigh or max; support depends on the model
+      --max-agent-tokens <n>, --max-agent-iterations <n>
+                         with -p, --stdio or --subagent, bound each turn of this
+                         run like the settings keys of the same name; never saved
       --provider <name>  use a named provider from ~/.openmax/providers.json
                          for this run; --base-url and --api-key are refused
                          beside it
@@ -164,6 +167,8 @@ struct CliArgs {
     base_url: Option<String>,
     api_key: Option<String>,
     context_tokens: Option<usize>,
+    max_agent_tokens: Option<usize>,
+    max_agent_iterations: Option<usize>,
     print: bool,
     json: bool,
     stdio: bool,
@@ -225,6 +230,8 @@ where
         base_url: None,
         api_key: None,
         context_tokens: None,
+        max_agent_tokens: None,
+        max_agent_iterations: None,
         print: false,
         json: false,
         stdio: false,
@@ -282,6 +289,8 @@ where
             Long("base-url") => out.base_url = Some(parser.value()?.string()?),
             Long("api-key") => out.api_key = Some(parser.value()?.string()?),
             Long("context-tokens") => out.context_tokens = Some(parser.value()?.parse()?),
+            Long("max-agent-tokens") => out.max_agent_tokens = Some(parser.value()?.parse()?),
+            Long("max-agent-iterations") => out.max_agent_iterations = Some(parser.value()?.parse()?),
             Short('p') | Long("print") => {
                 if out.print {
                     // Subsequent -p closes the previous prompt; empty is an error.
@@ -456,6 +465,8 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         base_url,
         api_key,
         context_tokens,
+        max_agent_tokens,
+        max_agent_iterations,
         print,
         json,
         stdio,
@@ -511,7 +522,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // A sub-agent's child is a session too, but a new one in a new worktree.
     const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 14] = [
+    let options: [(bool, &str, &[Option<&str>]); 16] = [
         (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
@@ -521,6 +532,8 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         (base_url.is_some(), "--base-url", RUNS),
         (api_key.is_some(), "--api-key", RUNS),
         (context_tokens.is_some(), "--context-tokens", RUNS),
+        (max_agent_tokens.is_some(), "--max-agent-tokens", &RUNS[1..]), // runs a program starts
+        (max_agent_iterations.is_some(), "--max-agent-iterations", &RUNS[1..]),
         (*json, "--json", &[Some("--print"), Some("--subagent"), Some("--check"), Some("--recall"), Some("--replay"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
         (*all, "--all", &[Some("--check")]),
@@ -625,6 +638,8 @@ fn key_flags(cli: &CliArgs) -> open_max_core::config::KeyFlags {
         model: trimmed(&cli.model),
         context_tokens: cli.context_tokens,
         reasoning_effort: cli.reasoning_effort,
+        max_agent_tokens: cli.max_agent_tokens,
+        max_agent_iterations: cli.max_agent_iterations,
     }
 }
 
@@ -3725,6 +3740,8 @@ mod tests {
                 model: Some("m".into()),
                 context_tokens: Some(8),
                 reasoning_effort: None,
+                max_agent_tokens: None,
+                max_agent_iterations: None,
             }
         );
         let cli = parse_args_from(["--provider", " p "]).unwrap();
