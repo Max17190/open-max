@@ -21,6 +21,9 @@ import run_task_checks  # noqa: E402
 
 TASK = "Make greet.sh print hello."
 CHECK = 'test "$(sh greet.sh)" = hello || { echo "greet.sh printed: $(sh greet.sh)"; exit 1; }'
+# Fails at once when the script runs it. Under the hook, where Open Max marks
+# its children, it records its pid and process group and stays.
+HELD = 'test -n "$OPENMAX_SESSION" || exit 1; ps -o pid=,pgid= -p $$ > "$RUN_TASK_DIR/held"; sleep 60'
 DONE = {"text": "Done."}
 FIX = {"tool": "write_file", "args": {"path": "greet.sh", "content": "echo hello\n"}}
 
@@ -99,6 +102,24 @@ def call(binary, repo, env, out, *options, code=0):
     return json.loads(result.stdout) if result.stdout else result.stderr
 
 
+def wait_for(condition):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        value = condition()
+        if value:
+            return value
+        time.sleep(0.05)
+    raise AssertionError("timed out waiting")
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def gate_log(out):
     return [json.loads(line) for line in (out / "gate.jsonl").read_text().splitlines()]
 
@@ -106,7 +127,9 @@ def gate_log(out):
 def a_refused_end_goes_back_to_the_model_and_the_next_one_passes(root, binary):
     with endpoint([DONE, FIX, {"text": "Fixed."}]) as (url, requests):
         repo, env, out = fixture(root, "passes", binary, url)
-        result = call(binary, repo, env, out, "--check", CHECK)
+        # As a git hook's environment would, the caller's names another repository.
+        elsewhere = {**env, "GIT_DIR": str(root / "elsewhere" / ".git"), "GIT_WORK_TREE": str(root / "elsewhere")}
+        result = call(binary, repo, elsewhere, out, "--check", CHECK)
     assert result["verified"] and result["exit_code"] == 0 and result["reason"] is None, result
     assert result["stop_reason"] == "stop" and result["refusals"] == 1 and len(requests) == 3, result
     check, = result["checks"]
@@ -176,25 +199,34 @@ def a_timeout_or_a_signal_stops_the_run(root, binary):
         assert result["stop_reason"] == "cancelled" and result["reason"] == "stopped at the --timeout of 2 seconds"
         assert result["checks"][0]["before"] == 1 and result["checks"][0]["after"] is None, result
 
+    # A signal while the gate runs a check. Open Max lets a turn_end hook run
+    # on for up to three seconds, then exits and kills the hook's process
+    # group. The check is in that group, not one of its own, so it goes too.
+    with endpoint([DONE]) as (url, requests):
         repo, env, out = fixture(root, "signal", binary, url)
-        waiting = len(requests)
         child = subprocess.Popen([sys.executable, HERE / "run_task.py", "--repo", repo, "--out", out,
-                                  "--openmax", binary, "--check", CHECK, TASK], cwd=repo, env=env,
+                                  "--openmax", binary, "--check", HELD, TASK], cwd=repo, env=env,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
-        deadline = time.monotonic() + 30
-        while len(requests) == waiting and child.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert len(requests) > waiting, "the run never reached the endpoint"
+
+        def held():
+            words = (out / "held").read_text().split() if (out / "held").is_file() else []
+            return words if len(words) == 2 else None
+
+        pid, group = wait_for(held)
+        assert pid != group, (pid, group)
         child.send_signal(signal.SIGTERM)
         assert child.wait(timeout=30) == 143 and child.stdout.read() == b""
-        # Open Max took the signal and ended its turn before the script exited.
-        assert '"stop_reason":"cancelled"' in (out / "stdout.jsonl").read_text().splitlines()[-1]
+        wait_for(lambda: not alive(int(pid)))
 
 
 def a_call_that_cannot_be_held_to_its_checks_does_not_start(root, binary):
     with endpoint([DONE]) as (url, requests):
         repo, env, out = fixture(root, "no-gate", binary, url, gate=False)
         assert "the gate is not installed" in call(binary, repo, env, out, "--check", CHECK, code=2)
+        repo, env, out = fixture(root, "observer", binary, url)
+        hook = Path(env["HOME"]) / ".openmax" / "hooks" / "run-task-checks.toml"
+        hook.write_text(hook.read_text().replace("blocking = true\n", ""))
+        assert "is not the hook this example ships" in call(binary, repo, env, out, "--check", CHECK, code=2)
         repo, env, out = fixture(root, "untrusted", binary, url, trust=False)
         call(binary, repo, env, out, "--check", CHECK, code=3)
         repo, env, out = fixture(root, "usage", binary, url)

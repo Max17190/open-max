@@ -35,8 +35,9 @@ its environment, and the hook exits 0 at once. A project in `ask` or
 project with `openmax --approve ~/.openmax/hooks/run-task-checks.toml`.
 
 `run_task.py` runs `openmax --check --json` first and exits 2 unless the hook
-loads in the repository. A call it refuses before the run prints the reason on
-stderr and no result.
+loads in the repository and is the file this example ships: a hook of the
+same name without `blocking = true` loads too, and could refuse nothing. A
+call it refuses before the run prints the reason on stderr and no result.
 
 ## Call it
 
@@ -54,7 +55,7 @@ python3 examples/run-task/run_task.py --repo ~/code/my-app \
   the turn; and the script runs them once more after the process has exited.
 - `--final-check` is a command the script runs only after the process has
   exited. It decides the result and cannot refuse the turn's end. Use it for
-  a check that takes longer than the gate allows.
+  a check that takes longer than the gate allows. It has no time limit.
 - `--out` names a new or empty directory outside the repository for the
   call's files. Without it the script makes one and names it in the result.
 - `--timeout` stops the run after that many seconds. A print run has no
@@ -62,9 +63,9 @@ python3 examples/run-task/run_task.py --repo ~/code/my-app \
 - `--openmax` names the binary when `openmax` is not on `PATH`.
 
 A hook is stopped after 60 seconds at most, so the `--check` commands share 50
-seconds at each end of the turn. One that has no result in that time before
-the work starts is refused with exit 2, since a check that slow would refuse
-every end.
+seconds each time they run. One that has no result in that time before the
+work starts is refused with exit 2, since a check that slow would refuse every
+end.
 
 When a check fails at the turn's end, Open Max refuses the end and sends the
 model one message: each failing check, its exit code and the end of its
@@ -135,15 +136,23 @@ gives. The log can be copied to another machine and replayed there.
 | --- | --- |
 | 0 | The run ended and every check passed afterwards |
 | 1 | Open Max failed: the endpoint could not be reached or a reply was cut off. `reason` carries the error |
-| 2 | The call could not start: a usage error, a repository that is not a git work tree's root, a gate that is not installed or does not load, or a `--check` too slow for the gate |
+| 2 | The call could not start: a usage error, a repository that is not a git work tree's root, a gate that is not installed, does not load or is not the shipped file, or a `--check` too slow for the gate |
 | 3 | The repository is not trusted |
 | 4 | Not verified. The turn ended `unverified`, `length`, `max_iterations` or `budget_exhausted`, or it ended normally and a check failed afterwards |
-| 128 + N | Signal N stopped the run: 143 when `--timeout` expired |
+| 128 + N | Signal N stopped the run: 143 when `--timeout` expired, or 137 when the run had to be killed 10 seconds after that |
 
 Codes 1, 3 and 4 from a run are Open Max's own (see
 [usage](../../docs/usage.md)). A SIGINT or SIGTERM sent to the script is
 passed on to Open Max, which cancels the turn and stops its tools; the script
-then exits 128 plus the signal's number and prints no result.
+then exits 128 plus the signal's number and prints no result. The gate's
+checks run in the hook's process group, so a check in flight is stopped with
+the hook: Open Max gives a `turn_end` hook up to 3 seconds, then kills its
+group.
+
+The script drops the variables that point git at a repository (`GIT_DIR`,
+`GIT_WORK_TREE` and the others `git rev-parse --local-env-vars` lists) from
+its environment, so `--repo` decides the repository for git, for the checks
+and for Open Max even when a git hook makes the call.
 
 ## What a verified result means
 

@@ -71,18 +71,24 @@ def gate_is_ready(openmax, repo):
     for row in rows:
         if row["surface"] == "trust":
             stop(NOT_TRUSTED, row["message"])
+    shipped = HERE / f"{HOOK}.toml"
     gates = [row for row in rows if row["surface"] == "hook" and Path(row["path"]).stem == HOOK]
     if not gates:
-        stop(USAGE, f"the gate is not installed: cp '{HERE / (HOOK + '.toml')}' ~/.openmax/hooks/")
+        stop(USAGE, f"the gate is not installed: cp '{shipped}' ~/.openmax/hooks/")
     for row in gates:
         if row["status"] != "ok":
             stop(USAGE, f"the gate {row['path']} does not load here: {row['message']}")
+        # A hook of this name that loads is not yet this gate: one without
+        # `blocking = true` loads too, and could refuse nothing.
+        if Path(row["path"]).read_bytes() != shipped.read_bytes():
+            stop(USAGE, f"the gate {row['path']} is not the hook this example ships: cp '{shipped}' over it")
 
 
 def run_openmax(openmax, task, repo, out, timeout):
     """One print run, its stdout and stderr kept in `out`. Returns the exit
     code, 128 plus the signal's number when a signal ended the run, and
-    whether the timeout did."""
+    whether the timeout did. At the timeout the run gets SIGTERM, which
+    cancels the turn, and SIGKILL if it is still there 10 seconds later."""
     child, signalled, timed_out = None, [], threading.Event()
 
     def forward(signum, _frame):
@@ -95,7 +101,7 @@ def run_openmax(openmax, task, repo, out, timeout):
         child.terminate()
 
     previous = {signum: signal.signal(signum, forward) for signum in (signal.SIGINT, signal.SIGTERM)}
-    timer = threading.Timer(timeout, expire) if timeout else None
+    timers = [threading.Timer(timeout, expire), threading.Timer(timeout + 10, lambda: child.kill())] if timeout else []
     try:
         with open(out / "stdout.jsonl", "wb") as stdout, open(out / "stderr.txt", "wb") as stderr:
             # A session of its own, so a signal reaches Open Max once, from here.
@@ -104,17 +110,19 @@ def run_openmax(openmax, task, repo, out, timeout):
                                      stdout=stdout, stderr=stderr, start_new_session=True)
             if signalled:  # one that arrived while the run was starting
                 child.send_signal(signalled[0])
-            if timer:
+            for timer in timers:
                 timer.start()
             code = child.wait()
     finally:
-        if timer:
+        for timer in timers:
             timer.cancel()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
     if signalled:
         sys.exit(128 + signalled[0])
-    return (128 - code if code < 0 else code), timed_out.is_set()
+    code = 128 - code if code < 0 else code
+    # A run that ended by itself as the timeout fired was not stopped by it.
+    return code, timed_out.is_set() and code >= 128
 
 
 def read_events(path):
@@ -142,6 +150,12 @@ def main():
 
     if not args.check and not args.final_check:
         stop(USAGE, "give at least one --check or --final-check: with none there is nothing to verify")
+    if shutil.which("git") is None:
+        stop(USAGE, "no executable git")
+    # A caller inside a git command, a hook for one, passes on variables that
+    # select its repository over the one `--repo` names. Git lists them.
+    for name in git(".", "rev-parse", "--local-env-vars").split():
+        os.environ.pop(name, None)
     openmax = shutil.which(args.openmax)
     if openmax is None:
         stop(USAGE, f"no executable {args.openmax}")
@@ -196,7 +210,8 @@ def main():
     # The verdict: the checks as this process runs them, on the tree the run
     # left. A run stopped by a signal, or one that never started, gets none.
     ran = code in (0, 1, NOT_VERIFIED)
-    after = run_task_checks.run_checks(args.check + args.final_check, repo) if ran else []
+    after = (run_task_checks.run_checks(args.check, repo, run_task_checks.GATE_SECONDS)
+             + run_task_checks.run_checks(args.final_check, repo)) if ran else []
     checks = []
     for index, command in enumerate(args.check + args.final_check):
         gates = index < len(args.check)

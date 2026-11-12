@@ -24,25 +24,36 @@ GATE_SECONDS = 50
 REASON_CHARS = 480
 TAIL_BYTES = 4096
 
-_running = None
+_running = None  # the check in flight, and whether it leads a session of its own
 
 
 def stop_running_check():
-    """Kill the check in flight with every process it started."""
-    if _running is not None and _running.poll() is None:
+    """Kill the check in flight, with every process it started when it leads
+    a session of its own."""
+    check, own_session = _running or (None, False)
+    if check is not None and check.poll() is None:
         try:
-            os.killpg(_running.pid, signal.SIGKILL)
+            if own_session:
+                os.killpg(check.pid, signal.SIGKILL)
+            else:
+                check.kill()
         except ProcessLookupError:
             pass
 
 
-def run_checks(commands, cwd, seconds=None):
+def run_checks(commands, cwd, seconds=None, own_session=True):
     """Run each command with `sh -c` in `cwd`, and return one record for each.
 
     `exit` is the command's exit code, or None when it had no result within
     `seconds`, the time all the commands share: it was stopped, or the time
     was spent before it could start. `output_tail` is the end of what it
     printed, stdout and stderr together.
+
+    A command leads a session of its own unless `own_session` is false, so
+    that stopping it stops its children. The hook passes false: its checks
+    stay in the hook's process group, which Open Max stops as a whole on a
+    cancel, on a kill and on the hook's timeout, and whose members it stops
+    when the hook has exited.
     """
     global _running
     deadline = None if seconds is None else time.monotonic() + seconds
@@ -52,14 +63,14 @@ def run_checks(commands, cwd, seconds=None):
         code, tail = None, ""
         if deadline is None or started < deadline:
             with tempfile.TemporaryFile() as output:
-                # A session of its own, so stopping the check stops its children.
-                _running = subprocess.Popen(["sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL,
-                                            stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                check = subprocess.Popen(["sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL, stdout=output,
+                                         stderr=subprocess.STDOUT, start_new_session=own_session)
+                _running = check, own_session
                 try:
-                    code = _running.wait(None if deadline is None else deadline - started)
+                    code = check.wait(None if deadline is None else deadline - started)
                 except subprocess.TimeoutExpired:
                     stop_running_check()
-                    _running.wait()
+                    check.wait()
                 size = output.seek(0, os.SEEK_END)
                 output.seek(max(size - TAIL_BYTES, 0))
                 tail = output.read().decode("utf-8", "replace")
@@ -88,8 +99,8 @@ def refusal(records):
 def main():
     payload = json.loads(sys.stdin.readline())
     call = Path(os.environ["RUN_TASK_DIR"])
-    signal.signal(signal.SIGTERM, lambda *_: (stop_running_check(), sys.exit(143)))
-    records = run_checks(json.loads((call / "checks.json").read_text()), os.getcwd(), GATE_SECONDS)
+    records = run_checks(json.loads((call / "checks.json").read_text()), os.getcwd(), GATE_SECONDS,
+                         own_session=False)
     passed = all(record["exit"] == 0 for record in records)
     with open(call / "gate.jsonl", "a") as log:
         log.write(json.dumps({"session_id": payload["session_id"], "continuation": payload["continuation"],
