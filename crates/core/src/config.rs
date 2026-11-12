@@ -198,7 +198,7 @@ pub fn settings_path(data_dir: &Path) -> PathBuf {
 /// `--provider` other than the file's picks another endpoint; then every
 /// flag is for this run only, because a key written for one endpoint would
 /// configure the other (a key for one server sent to another). An override stays the run's through every save the
-/// session makes ([`RunOnly`]). `--max-agent-tokens` and `--max-agent-iterations` bound one run: never written.
+/// session makes ([`RunOnly`]). `--max-agent-tokens` and `--max-agent-iterations` bound one run, even at the file's value: never written.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyFlags {
     pub provider: Option<String>,
@@ -333,8 +333,8 @@ impl KeyFlags {
         );
         place(&mut applied, "reasoning_effort", self.reasoning_effort.filter(|value| *value != file.reasoning_effort), write, Option::is_none,
             &mut file.reasoning_effort, &mut run.reasoning_effort);
-        place(&mut applied, "max_agent_tokens", self.max_agent_tokens.map(Some), false, |_| false, &mut file.max_agent_tokens, &mut run.max_agent_tokens);
-        place(&mut applied, "max_agent_iterations", self.max_agent_iterations, false, |_| false, &mut file.max_agent_iterations, &mut run.max_agent_iterations);
+        if let Some(cap) = self.max_agent_tokens { run.max_agent_tokens = Some(cap); applied.overridden.push("max_agent_tokens"); }
+        if let Some(cap) = self.max_agent_iterations { run.max_agent_iterations = cap; applied.overridden.push("max_agent_iterations"); }
         (run, applied)
     }
 }
@@ -618,6 +618,10 @@ mod tests {
         run.model = "chosen-model".into();
         let (saved, _) = RunOnly::new(file, run.clone(), &applied).unwrap().save(&run);
         assert_eq!((saved.max_agent_tokens, saved.max_agent_iterations, saved.model.as_str()), (None, 300, "chosen-model"));
+        // At the file's own value the flag still sets the run's ceiling.
+        let mut file = Settings { max_agent_iterations: 2, ..Settings::default() };
+        let (_, applied) = KeyFlags { max_agent_iterations: Some(2), ..KeyFlags::default() }.apply(&mut file);
+        assert_eq!(applied.overridden, ["max_agent_iterations"]);
     }
 
     #[test]
