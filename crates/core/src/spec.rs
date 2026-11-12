@@ -398,8 +398,8 @@ Fields:
 - `args` (optional): fixed argv strings.
 - `timeout_secs` (optional): default 10, clamped between 1 and 60, inclusive;
   up to 600 for `turn_end` with `blocking = true`, which runs once per end of a
-  turn rather than before every call: a cancel stops it, a cancelled turn's end
-  gives it 60, and eight refusals bound it to nine runs in one turn.
+  turn rather than before every call: a cancel stops it, an end the model did
+  not ask for gives it 60, and eight refusals bound it to nine runs in one turn.
 - `tool` (optional): exact tool-name filter for `pre_tool_use`/`post_tool_use`.
 - `blocking` (optional): `turn_end` only, default false. True makes the hook
   a completion gate: a nonzero exit refuses the turn's end and the reason is

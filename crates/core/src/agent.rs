@@ -1001,7 +1001,7 @@ async fn run_loop(
                     project_root,
                     &result.finish_reason,
                     crate::hooks::TurnEndAttempt { continuation, blockable },
-                    &cancelled,
+                    Some(&cancelled),
                 )
                 .await;
             // A cancel while a gate ran stopped it: the human ended the turn,
@@ -1528,7 +1528,7 @@ async fn run_loop(
 /// `continuation` honored refusals, and reports the hooks that failed.
 async fn end_turn_hooks(core: &Arc<Core>, session_id: &str, hooks: &Hooks, root: &Path, stop_reason: &str, continuation: usize) {
     let attempt = crate::hooks::TurnEndAttempt { continuation, blockable: false };
-    report_hook_failures(core, session_id, hooks.turn_end(session_id, root, stop_reason, attempt, &Arc::default()).await.failures);
+    report_hook_failures(core, session_id, hooks.turn_end(session_id, root, stop_reason, attempt, None).await.failures);
 }
 
 /// The capability file behind a tool whose exact content no human has

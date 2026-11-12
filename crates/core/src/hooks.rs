@@ -915,9 +915,10 @@ impl Hooks {
     }
 
     /// Run `turn_end` hooks with the turn's stop reason. The end the model
-    /// asked for runs under the turn's cancel token, so a cancel stops a long
-    /// gate; every other end runs under a fresh one, because a cancelled turn
-    /// is still a finished turn worth observing.
+    /// asked for runs under the turn's cancel token (`Some`), so a cancel
+    /// stops a long gate. Every other end runs under a fresh one, because a
+    /// cancelled turn is still a finished turn worth observing, and verifies
+    /// nothing, so a gate there keeps the bound every other hook has.
     ///
     /// Observe only unless a hook's approved bytes asked to block, and unless
     /// the caller says this end attempt is one a refusal can change. The
@@ -930,14 +931,12 @@ impl Hooks {
         cwd: &Path,
         stop_reason: &str,
         attempt: TurnEndAttempt,
-        cancel: &Arc<CancelToken>,
+        cancel: Option<&Arc<CancelToken>>,
     ) -> TurnEndOutcome {
-        let mut outcome = TurnEndOutcome::default();
+        let (mut outcome, fresh) = (TurnEndOutcome::default(), Arc::default());
         for hook in &self.turn_end {
-            // A cancelled turn has no end left to verify, so a gate there gets
-            // the bound every other hook has.
             let bounded = HookSpec { timeout_secs: hook.timeout_secs.min(MAX_TIMEOUT_SECS), ..hook.clone() };
-            let hook = if stop_reason == "cancelled" { &bounded } else { hook };
+            let hook = if cancel.is_some() { hook } else { &bounded };
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
                 "session_id": session_id,
@@ -948,7 +947,7 @@ impl Hooks {
                 "continuations_left":
                     MAX_TURN_END_CONTINUATIONS.saturating_sub(attempt.continuation),
             });
-            match run_hook(hook, payload, cwd, cancel).await {
+            match run_hook(hook, payload, cwd, cancel.unwrap_or(&fresh)).await {
                 HookRun::Allow => {}
                 // A gate that cannot start judged nothing. Its spawn error,
                 // sent back as the user's refusal, asked the model to repair
@@ -2459,7 +2458,7 @@ mod tests {
         write_hook_toml(&hooks_dir, "gate.toml", "event = \"turn_end\"\ncommand = \"./scripts/gate.sh\"\nblocking = true\n");
         let attempt = TurnEndAttempt { continuation: 0, blockable: true };
         let strict = discover_in_dirs(std::slice::from_ref(&hooks_dir));
-        let outcome = strict.turn_end("s", &tmp, "stop", attempt, &Arc::default()).await;
+        let outcome = strict.turn_end("s", &tmp, "stop", attempt, None).await;
         assert!(!outcome.unverified);
         let refusal = outcome.refusal.expect("the gate refuses outside auto");
         assert!(refusal.reason.contains("failed to start hook"), "{}", refusal.reason);
@@ -2467,7 +2466,7 @@ mod tests {
 
         let mut auto = discover_in_dirs(std::slice::from_ref(&hooks_dir));
         auto.auto = true;
-        let outcome = auto.turn_end("s", &tmp, "stop", attempt, &Arc::default()).await;
+        let outcome = auto.turn_end("s", &tmp, "stop", attempt, None).await;
         assert!(outcome.unverified && outcome.refusal.is_none(), "{outcome:?}");
         let named = auto.completion_gates_that_cannot_start(&tmp);
         assert!(named.len() == 1 && named[0].detail.contains("not executable"), "{named:?}");
@@ -3445,7 +3444,7 @@ tool = "bash"
         );
         let hooks = discover_for_test(&tmp);
         // turn_end uses its own fresh token, so a cancelled turn still fires.
-        hooks.turn_end("sess", &tmp, "cancelled", TurnEndAttempt::default(), &Arc::default()).await;
+        hooks.turn_end("sess", &tmp, "cancelled", TurnEndAttempt::default(), None).await;
         let end: Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.join("end.json")).unwrap()).unwrap();
         assert_eq!(end["event"], "turn_end");
