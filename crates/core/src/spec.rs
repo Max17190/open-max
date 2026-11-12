@@ -405,6 +405,8 @@ Fields:
   a completion gate: a nonzero exit refuses the turn's end and the reason is
   sent back as a user message. False observes only; exit status is ignored.
   Rejected on every other event, which either always gates or never does.
+- `max_refusals` (optional): `blocking = true` only: how many refusals of this
+  gate a turn honors, clamped to 1..8, default 8; its next ends it `unverified`.
 
 Unknown keys are rejected with the legal field list. At most 32 hooks load
 per event, sorted by file name; the rest are dropped and `openmax --check`
@@ -432,10 +434,11 @@ with no tool calls, whatever `stop_reason` it carried. `max_iterations`,
 `budget_exhausted`, `cancelled`, `error`, and `truncated` still fire the hook,
 but there is nothing left to honor a refusal with, so it is reported and the
 turn ends. The payload says which case this is (`blockable`), how many
-refusals have already been honored (`continuation`), and how many are left
-(`continuations_left`). After 8 honored refusals the harness overrides the
-hook and ends the turn with `stop_reason` `unverified`; `openmax -p` exits 4 on
-that, and on `max_iterations` and `budget_exhausted`. A refusal whose injected
+refusals have already been honored (`continuation`), and how many this gate
+has left (`continuations_left`). After 8 honored refusals in a turn, or a
+gate's own `max_refusals`, the harness overrides the gate and ends the turn
+with `stop_reason` `unverified`; `openmax -p` exits 4 on that, and on
+`max_iterations` and `budget_exhausted`. A refusal whose injected
 user message cannot be persisted is reported and ends the turn `unverified`
 the same way: a continuation only the running process remembers would diverge
 from every replay of the session. A blocking hook that times out refuses,
@@ -471,7 +474,7 @@ Each run receives one JSON payload on stdin, as one newline-terminated line:
   "continuation", "continuations_left"} where `blockable` says whether a
   nonzero exit will be honored this time, `continuation` counts the refusals
   already honored in this turn (0 on the first end attempt), and
-  `continuations_left` is what remains before the harness overrides the hook.
+  `continuations_left` is what remains before the harness overrides this hook.
   A hook without `blocking` always sees `blockable` false.
 
 In auto, valid hooks run without content approval, including new and repaired

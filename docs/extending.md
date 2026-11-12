@@ -176,7 +176,10 @@ first turn), `compaction` (context was pruned; receives the digest record), and
 `turn_end` (receives the stop reason, fires even on cancel) observe only. A
 `turn_end` hook with `blocking = true` is a completion gate instead: a nonzero
 exit refuses the turn's end and sends its reason back as a user message; up to
-8 refusals are honored, and a further refusal ends the turn `unverified`. An
+8 refusals are honored, and a further refusal ends the turn `unverified`. A
+gate's `max_refusals` (1 to 8, default 8) lowers its own share: once that many
+of its refusals were honored in a turn, its next one ends the turn
+`unverified`, so a check that cannot pass stops costing work sooner. An
 end that every gate passed is recorded as a `turn_verified` event naming them
 ([stdio protocol](stdio-protocol.md)). While
 a hook file fails closed (below), every turn's end is reported and ends
@@ -191,7 +194,7 @@ A completion gate runs once per end of a turn rather than before every call,
 so it may set up to 600, the most one `bash` call may run; a cancel stops it
 like a tool call, an end the model did not ask for (a cancel, a spent budget,
 an error) gives it 60, and with 8 refusals honored it runs at most nine times
-in one turn.
+in one turn (one more than its `max_refusals` when that is lower).
 
 A `post_tool_use` payload carries the tool result the model saw: `output` (its
 first 16 KiB, cut on a character boundary), `output_bytes` (that result's
