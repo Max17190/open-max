@@ -230,9 +230,10 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     // rule asks for a read before every change or a build or test after it:
     // a model reads such a rule as a per-step obligation, re-reading what it
     // already holds and re-running checks after each small edit, and every
-    // one of those rounds resends the conversation. When to read and verify
-    // is left to the model. Both sides count against the frozen prompt
-    // budget in `frozen_prompt_fits_token_budget`.
+    // one of those rounds resends the conversation. When to read and verify,
+    // how many calls share a response, how much of a file to read and how
+    // large a diff to make are left to the model. Both sides count against
+    // the frozen prompt budget in `frozen_prompt_fits_token_budget`.
     let mut prompt = format!(
         "You are Open Max, an expert coding agent working on the project at {root}.\n\
         \n\
@@ -240,8 +241,6 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
         \n\
         Rules:\n\
         - Paths are project-relative.\n\
-        - Batch tool calls per response; read whole files.\n\
-        - Keep the diff minimal, in the existing style.\n\
         - On a tool error, fix the call; never repeat it.\n\
         - Call tools via the API, never as JSON or XML text.\n\
         - Be concise. When done, stop calling tools; summarize briefly without repeating file contents."
@@ -1316,8 +1315,11 @@ mod tests {
     }
 
     /// The path-free base rules and builtin schemas, the extension pointer
-    /// among them in the bash description, must fit in 2,595 bytes (591
-    /// o200k tokens), what they measured when the rules began naming the
+    /// among them in the bash description, must fit in 2,496 bytes (569
+    /// o200k tokens), what they measured when the rules stopped asking for
+    /// batched calls, whole-file reads and a minimal diff in the existing
+    /// style. Before that the cap was 2,595 bytes (591 tokens), what they
+    /// measured when the rules began naming the
     /// four core tools and stopped asking for a read before every change and
     /// a build or test after it. That spends 58 of the 60 bytes freed when
     /// the pointer moved from the system prompt into the bash description,
@@ -1357,7 +1359,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_595;
+        const CAP: usize = 2_496;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
