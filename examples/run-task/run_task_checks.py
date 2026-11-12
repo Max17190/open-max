@@ -10,16 +10,19 @@ end. Exit 1 refuses the end, and stdout goes to the model as a user message.
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 
-# A hook is stopped after 60 seconds at most, so the checks share less than
-# that: one that is still running at the limit is reported by name, where the
-# hook's own timeout would say only that the hook timed out.
-GATE_SECONDS = 50
+# The hook file beside this script grants the gate its time, and the checks
+# share that less a margin: one that is still running at the limit is
+# reported by name, where the hook's own timeout would say only that the hook
+# timed out.
+HOOK_FILE = Path(__file__).with_name("run-task-checks.toml")
+GATE_SECONDS = int(re.search(r"^timeout_secs = (\d+)$", HOOK_FILE.read_text(), re.M).group(1)) - 10
 # Open Max keeps the first 500 characters of a refusal.
 REASON_CHARS = 480
 TAIL_BYTES = 4096

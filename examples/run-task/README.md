@@ -62,10 +62,11 @@ python3 examples/run-task/run_task.py --repo ~/code/my-app \
   deadline of its own.
 - `--openmax` names the binary when `openmax` is not on `PATH`.
 
-A hook is stopped after 60 seconds at most, so the `--check` commands share 50
-seconds each time they run. One that has no result in that time before the
-work starts is refused with exit 2, since a check that slow would refuse every
-end.
+The shipped hook file lets the gate run for 600 seconds (`timeout_secs`, the
+most Open Max gives a completion gate), and the `--check` commands share that
+time less 10 seconds each time they run. One that has no result in that time
+before the work starts is refused with exit 2, since a check that slow would
+refuse every end.
 
 When a check fails at the turn's end, Open Max refuses the end and sends the
 model one message: each failing check, its exit code and the end of its
@@ -120,8 +121,8 @@ The script prints the result on stdout and writes it to `result.json`:
 | `event_log`, `replay` | A copy of the session's event log, and the command that prints it back |
 
 The directory in `out` also holds `stdout.jsonl` and `stderr.txt` (what the
-print run wrote), `checks.json` (the gate's list) and the copy of
-`run_task_checks.py` the hook ran.
+print run wrote), `checks.json` (the gate's list) and the copies of
+`run_task_checks.py` the hook ran and of the hook file it reads its time from.
 
 ## Replay
 

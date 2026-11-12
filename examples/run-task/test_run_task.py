@@ -232,6 +232,10 @@ def a_call_that_cannot_be_held_to_its_checks_does_not_start(root, binary):
         repo, env, out = fixture(root, "usage", binary, url)
         assert "nothing to verify" in call(binary, repo, env, out, code=2)
         assert "inside the repository" in call(binary, repo, env, repo / "out", "--check", CHECK, code=2)
+        # The shipped gate's time is honored as written, past the 60 seconds
+        # any other hook gets, and the checks share it.
+        report = subprocess.run([binary, "--check", "--json"], cwd=repo, env=env, capture_output=True, text=True).stdout
+        assert "clamped" not in report and run_task_checks.GATE_SECONDS > 60, report
     assert requests == []
 
 

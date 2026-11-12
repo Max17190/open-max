@@ -29,6 +29,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 10;
 /// bounds it warns against instead of restating them.
 pub(crate) const MIN_TIMEOUT_SECS: u64 = 1;
 pub(crate) const MAX_TIMEOUT_SECS: u64 = 60;
+
+/// The most a hook's `timeout_secs` may ask for. A blocking `turn_end` gate
+/// runs a caller's checks once per end of a turn, not in front of every call,
+/// so it may take as long as one bash call.
+pub(crate) fn max_timeout_secs(event: HookEvent, blocking: bool) -> u64 {
+    if event == HookEvent::TurnEnd && blocking { crate::tools::BASH_MAX_TIMEOUT_SECS } else { MAX_TIMEOUT_SECS }
+}
 /// Per-event hook cap. Every pre_tool_use hook runs on every tool call, so an
 /// unbounded set turns discovery mistakes into unbounded per-call latency.
 /// Stems sort deterministically; the head runs, --check names the rest.
@@ -223,11 +230,7 @@ fn discover_in_dirs(dirs: &[PathBuf]) -> Hooks {
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
+            let stem = stem_of(&path).unwrap_or("").to_string();
             if stem.is_empty()
                 || by_stem.contains_key(&stem)
                 || invalid_by_stem.contains_key(&stem)
@@ -330,14 +333,7 @@ impl Hooks {
                 // execution fails closed, and there is no repair carve-out:
                 // the fix lives outside the project (openmax
                 // --ledger-repair), not in any file the agent writes.
-                for list in [
-                    &mut self.pre,
-                    &mut self.post,
-                    &mut self.user_prompt,
-                    &mut self.session_start,
-                    &mut self.compaction,
-                    &mut self.turn_end,
-                ] {
+                for list in self.events_mut() {
                     list.clear();
                 }
                 // Loud at turn start, and pointedly not `--approve`: that
@@ -357,14 +353,7 @@ impl Hooks {
         let mut revoked_gates = Vec::new();
         let mut repair_paths = Vec::new();
         let mut notices = Vec::new();
-        for list in [
-            &mut self.pre,
-            &mut self.post,
-            &mut self.user_prompt,
-            &mut self.session_start,
-            &mut self.compaction,
-            &mut self.turn_end,
-        ] {
+        for list in self.events_mut() {
             list.retain_mut(|spec| {
                 let code = crate::ledger::bound_code(&spec.command, &spec.args, project_root);
                 if approvals.contains(&spec.source_sha256) && approvals.covers_code(&code) {
@@ -542,6 +531,17 @@ impl Hooks {
         ]
     }
 
+    fn events_mut(&mut self) -> [&mut Vec<HookSpec>; 6] {
+        [
+            &mut self.pre,
+            &mut self.post,
+            &mut self.user_prompt,
+            &mut self.session_start,
+            &mut self.compaction,
+            &mut self.turn_end,
+        ]
+    }
+
     /// Trim each event to the per-call cap, over the approved set only.
     ///
     /// Every `pre_tool_use` hook runs on every tool call, so the cap is a
@@ -558,14 +558,7 @@ impl Hooks {
     fn apply_cap(&mut self) {
         let mut not_running = Vec::new();
         let mut notices = Vec::new();
-        for list in [
-            &mut self.pre,
-            &mut self.post,
-            &mut self.user_prompt,
-            &mut self.session_start,
-            &mut self.compaction,
-            &mut self.turn_end,
-        ] {
+        for list in self.events_mut() {
             if list.len() <= MAX_HOOKS_PER_EVENT {
                 continue;
             }
@@ -595,12 +588,7 @@ impl Hooks {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pre.is_empty()
-            && self.post.is_empty()
-            && self.user_prompt.is_empty()
-            && self.session_start.is_empty()
-            && self.compaction.is_empty()
-            && self.turn_end.is_empty()
+        self.events().iter().all(|list| list.is_empty())
             && self.invalid.is_empty()
             && self.revoked_gates.is_empty()
             && self.missing.is_empty()
@@ -926,9 +914,11 @@ impl Hooks {
         failures
     }
 
-    /// Run `turn_end` hooks with the turn's stop reason. Deliberately run with
-    /// a fresh cancel token: a cancelled turn is still a finished turn worth
-    /// observing.
+    /// Run `turn_end` hooks with the turn's stop reason. The end the model
+    /// asked for runs under the turn's cancel token (`Some`), so a cancel
+    /// stops a long gate. Every other end runs under a fresh one, because a
+    /// cancelled turn is still a finished turn worth observing, and verifies
+    /// nothing, so a gate there keeps the bound every other hook has.
     ///
     /// Observe only unless a hook's approved bytes asked to block, and unless
     /// the caller says this end attempt is one a refusal can change. The
@@ -941,10 +931,12 @@ impl Hooks {
         cwd: &Path,
         stop_reason: &str,
         attempt: TurnEndAttempt,
+        cancel: Option<&Arc<CancelToken>>,
     ) -> TurnEndOutcome {
-        let cancel = Arc::new(CancelToken::default());
-        let mut outcome = TurnEndOutcome::default();
+        let (mut outcome, fresh) = (TurnEndOutcome::default(), Arc::default());
         for hook in &self.turn_end {
+            let bounded = HookSpec { timeout_secs: hook.timeout_secs.min(MAX_TIMEOUT_SECS), ..hook.clone() };
+            let hook = if cancel.is_some() { hook } else { &bounded };
             let payload = serde_json::json!({
                 "event": hook.event.as_str(),
                 "session_id": session_id,
@@ -955,7 +947,7 @@ impl Hooks {
                 "continuations_left":
                     MAX_TURN_END_CONTINUATIONS.saturating_sub(attempt.continuation),
             });
-            match run_hook(hook, payload, cwd, &cancel).await {
+            match run_hook(hook, payload, cwd, cancel.unwrap_or(&fresh)).await {
                 HookRun::Allow => {}
                 // A gate that cannot start judged nothing. Its spawn error,
                 // sent back as the user's refusal, asked the model to repair
@@ -1475,7 +1467,7 @@ pub(crate) fn parse_hook_source(path: &Path, text: &str) -> Result<HookSpec, Str
         event,
         command,
         args: file.args,
-        timeout_secs: file.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
+        timeout_secs: file.timeout_secs.clamp(MIN_TIMEOUT_SECS, max_timeout_secs(event, file.blocking)),
         tool_filter,
         source_path: path.to_path_buf(),
         blocking: file.blocking,
@@ -2473,7 +2465,7 @@ mod tests {
         write_hook_toml(&hooks_dir, "gate.toml", "event = \"turn_end\"\ncommand = \"./scripts/gate.sh\"\nblocking = true\n");
         let attempt = TurnEndAttempt { continuation: 0, blockable: true };
         let strict = discover_in_dirs(std::slice::from_ref(&hooks_dir));
-        let outcome = strict.turn_end("s", &tmp, "stop", attempt).await;
+        let outcome = strict.turn_end("s", &tmp, "stop", attempt, None).await;
         assert!(!outcome.unverified);
         let refusal = outcome.refusal.expect("the gate refuses outside auto");
         assert!(refusal.reason.contains("failed to start hook"), "{}", refusal.reason);
@@ -2481,7 +2473,7 @@ mod tests {
 
         let mut auto = discover_in_dirs(std::slice::from_ref(&hooks_dir));
         auto.auto = true;
-        let outcome = auto.turn_end("s", &tmp, "stop", attempt).await;
+        let outcome = auto.turn_end("s", &tmp, "stop", attempt, None).await;
         assert!(outcome.unverified && outcome.refusal.is_none(), "{outcome:?}");
         let named = auto.completion_gates_that_cannot_start(&tmp);
         assert!(named.len() == 1 && named[0].detail.contains("not executable"), "{named:?}");
@@ -3459,7 +3451,7 @@ tool = "bash"
         );
         let hooks = discover_for_test(&tmp);
         // turn_end uses its own fresh token, so a cancelled turn still fires.
-        hooks.turn_end("sess", &tmp, "cancelled", TurnEndAttempt::default()).await;
+        hooks.turn_end("sess", &tmp, "cancelled", TurnEndAttempt::default(), None).await;
         let end: Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.join("end.json")).unwrap()).unwrap();
         assert_eq!(end["event"], "turn_end");
