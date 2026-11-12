@@ -911,7 +911,7 @@ mod tests {
         let approve = |name: &str| {
             let manifest = tools.join(format!("{name}.toml"));
             let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
-            shas.extend(crate::ledger::manifest_code(&manifest, &project).into_iter().filter_map(|c| c.sha256));
+            shas.extend(crate::ledger::manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &project).into_iter().filter_map(|c| c.sha256));
             crate::ledger::approve_capability(&data, &project, &manifest, &shas).unwrap();
         };
         for name in ["blessed", "edited", "gone", "kept"] {

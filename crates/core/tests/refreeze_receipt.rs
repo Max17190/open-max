@@ -406,7 +406,7 @@ async fn a_script_only_edit_announces_the_revocation_on_the_writing_call() {
     std::fs::create_dir_all(&data).unwrap();
     let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&manifest_path).unwrap())];
     shas.extend(
-        open_max_core::ledger::manifest_code(&manifest_path, &project)
+        open_max_core::ledger::manifest_code_source(&manifest_path, &std::fs::read_to_string(&manifest_path).unwrap(), &project)
             .into_iter()
             .filter_map(|c| c.sha256),
     );

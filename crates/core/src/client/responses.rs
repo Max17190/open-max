@@ -220,7 +220,7 @@ pub(super) async fn read(
         let mut consumed = 0;
         while let Some(at) = buffer[consumed..].iter().position(|b| *b == b'\n') {
             let end = consumed + at;
-            let line = trim_bytes(&buffer[consumed..end]);
+            let line = buffer[consumed..end].trim_ascii();
             consumed = end + 1;
             if !line.is_empty() {
                 if let Some(bytes) = data_line(line) {

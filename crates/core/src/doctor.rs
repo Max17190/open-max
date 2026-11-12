@@ -199,11 +199,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             // come from one generation of its bytes: a second read for the
             // clamp diagnostic is an interval a rewrite can split, and the
             // report would then describe two files that never existed at once.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::registry::parse_tool_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::registry::parse_tool_source);
             let mut id = None;
             let status = match parsed {
                 Ok(spec) if tools::TOOL_NAMES.contains(&spec.name.as_str()) => {
@@ -386,11 +382,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             // One read per file, like the tool loop: the description the spec
             // clamps and the description the author wrote have to come from
             // one generation of the bytes, or the report compares two files.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::skills::parse_skill_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::skills::parse_skill_source);
             let status = match parsed {
                 Ok(s) => {
                     id = Some(s.name.clone());
@@ -477,11 +469,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             let mut id = None;
             // One read per file, like the tool and skill loops: the clamp
             // diagnostic and the parse must describe one generation of bytes.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::templates::parse_template_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::templates::parse_template_source);
             let status = match parsed {
                 Ok(t) => {
                     id = Some(t.name.clone());
@@ -523,11 +511,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             // it whether or not the file parses.
             let id = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
             // One read, for the same reason as the tool loop above.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::hooks::parse_hook_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::hooks::parse_hook_source);
             let status = match parsed {
                 Ok(h) => {
                     if let Some(filter) = h.tool_filter.as_deref() {
@@ -2300,6 +2284,17 @@ fn is_regular_plural(singular: &str, candidate: &str) -> bool {
     candidate == plural
 }
 
+/// A manifest's text and what `parse` made of it, from one read: an
+/// unreadable file parses as an error naming why.
+fn read_and_parse<T>(path: &Path, parse: fn(&Path, &str) -> Result<T, String>) -> (std::io::Result<String>, Result<T, String>) {
+    let source = std::fs::read_to_string(path);
+    let parsed = match &source {
+        Ok(text) => parse(path, text),
+        Err(e) => Err(format!("unreadable: {e}")),
+    };
+    (source, parsed)
+}
+
 fn files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut paths: Vec<PathBuf> = rd
@@ -2417,7 +2412,7 @@ mod tests {
             let mut shas =
                 vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
             shas.extend(
-                crate::ledger::manifest_code(&manifest, &root)
+                crate::ledger::manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &root)
                     .into_iter()
                     .filter_map(|c| c.sha256),
             );

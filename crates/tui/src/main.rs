@@ -910,6 +910,26 @@ async fn setup_on_shell(
     Ok(result)
 }
 
+/// Run an authentication command on the data directory until it ends or a
+/// quit signal stops it, and the exit code that says which.
+async fn authenticate<F: std::future::Future<Output = Result<(), String>>>(
+    run: impl FnOnce(std::path::PathBuf) -> F,
+) -> std::process::ExitCode {
+    let quit = watch_quit_signals(false);
+    let dir = default_data_dir();
+    let result = tokio::select! {
+        result = run(dir) => Some(result),
+        _ = quit.notified() => None,
+    };
+    open_max_core::chatgpt::finish_refreshes().await;
+    if signalled() { return std::process::ExitCode::from(quit_status() as u8); }
+    match result {
+        Some(Ok(())) => std::process::ExitCode::SUCCESS,
+        Some(Err(error)) => { eprintln!("openmax: {error}"); std::process::ExitCode::from(1) }
+        None => std::process::ExitCode::from(quit_status() as u8),
+    }
+}
+
 /// The run of everything but a session painted first (see `main`).
 async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let request = cli.login.as_ref().map(|target| (setup::Action::Login, target.as_deref(), "--login"))
@@ -919,19 +939,7 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             eprintln!("openmax: {error}");
             return Ok(std::process::ExitCode::from(3));
         }
-        let quit = watch_quit_signals(false);
-        let dir = default_data_dir();
-        let result = tokio::select! {
-            result = Box::pin(setup::run(&dir, action, target, None)) => Some(result),
-            _ = quit.notified() => None,
-        };
-        open_max_core::chatgpt::finish_refreshes().await;
-        if signalled() { return Ok(std::process::ExitCode::from(quit_status() as u8)); }
-        return Ok(match result {
-            Some(Ok(())) => std::process::ExitCode::SUCCESS,
-            Some(Err(error)) => { eprintln!("openmax: {error}"); std::process::ExitCode::from(1) }
-            None => std::process::ExitCode::from(quit_status() as u8),
-        });
+        return Ok(authenticate(|dir| async move { Box::pin(setup::run(&dir, action, target, None)).await }).await);
     }
     if let Some(action) = &cli.chatgpt {
         if matches!(action.as_str(), "login" | "logout") {
@@ -940,19 +948,8 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 return Ok(std::process::ExitCode::from(3));
             }
         }
-        let quit = watch_quit_signals(false);
-        let dir = default_data_dir();
-        let result = tokio::select! {
-            result = chatgpt::run(&dir, action, cli.account.as_deref().unwrap_or("main")) => Some(result),
-            _ = quit.notified() => None,
-        };
-        open_max_core::chatgpt::finish_refreshes().await;
-        if signalled() { return Ok(std::process::ExitCode::from(quit_status() as u8)); }
-        return Ok(match result {
-            Some(Ok(())) => std::process::ExitCode::SUCCESS,
-            Some(Err(e)) => { eprintln!("openmax: {e}"); std::process::ExitCode::from(1) }
-            None => std::process::ExitCode::from(quit_status() as u8),
-        });
+        let account = cli.account.as_deref().unwrap_or("main");
+        return Ok(authenticate(|dir| async move { chatgpt::run(&dir, action, account).await }).await);
     }
     if let Some(surface) = &cli.spec {
         // `usage` is the one dynamic surface: it joins each extension's

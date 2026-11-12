@@ -331,14 +331,23 @@ impl Core {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = std::fs::create_dir_all(&data_dir);
         let settings = crate::config::load(&data_dir)?;
-        let core_data_dir = data_dir.clone();
         // Stamped before the read, so a write landing in between is read again.
         let stamp = crate::sessions::stamp(&crate::trust::trust_path(&data_dir));
         let modes = crate::trust::approval_modes(&data_dir)?;
-        let core = Arc::new(Self {
+        Ok((Self::with(data_dir, settings, ProjectModes { live: modes, stamp }, tx), rx))
+    }
+
+    fn with(
+        data_dir: PathBuf,
+        settings: Settings,
+        modes: ProjectModes,
+        events: mpsc::UnboundedSender<AgentEventEnvelope>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&data_dir)),
             data_dir,
             settings: Mutex::new(settings),
-            project_approval_modes: Mutex::new(ProjectModes { live: modes, stamp }),
+            project_approval_modes: Mutex::new(modes),
             sessions: Default::default(),
             running: Default::default(),
             cancel_flags: Default::default(),
@@ -347,12 +356,10 @@ impl Core {
             sessions_lock: Default::default(),
             session_owners: Default::default(),
             message_restorations: Default::default(),
-            settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
             run_only: Mutex::new(None),
             event_log: Default::default(),
-            events: tx,
-        });
-        Ok((core, rx))
+            events,
+        })
     }
 
     /// A core for read-only history operations: ones that read the stores and
@@ -377,25 +384,7 @@ impl Core {
             Ok(settings) => (settings, None),
             Err(reason) => (crate::config::Settings::default(), Some(reason)),
         };
-        let core_data_dir = data_dir.clone();
-        let core = Arc::new(Self {
-            data_dir,
-            settings: Mutex::new(settings),
-            project_approval_modes: Mutex::new(Default::default()),
-            sessions: Default::default(),
-            running: Default::default(),
-            cancel_flags: Default::default(),
-            steers: Default::default(),
-            approvals: Default::default(),
-            sessions_lock: Default::default(),
-            session_owners: Default::default(),
-            message_restorations: Default::default(),
-            settings_disk_fingerprint: Mutex::new(settings_file_fingerprint(&core_data_dir)),
-            run_only: Mutex::new(None),
-            event_log: Default::default(),
-            events: tx,
-        });
-        (core, rx, unreadable)
+        (Self::with(data_dir, settings, Default::default(), tx), rx, unreadable)
     }
 
     /// Persist settings through the process's own hand: the on-disk

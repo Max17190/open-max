@@ -1384,19 +1384,10 @@ pub fn inline_program_read(command: &str, args: &[String], project_root: &Path) 
     None
 }
 
-/// The project-local code the capability manifest at `path` will execute,
-/// whichever surface it belongs to. Both manifest surfaces name a `command`
-/// plus fixed `args`; skills name none. Production reads go through
-/// `manifest_code_source` with bytes already in hand; this path-taking form
-/// is what the integration tests bind their fixtures with.
-pub fn manifest_code(path: &Path, project_root: &Path) -> Vec<BoundCode> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => manifest_code_source(path, &text, project_root),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// The same answer from bytes a caller already read. `openmax --approve`
+/// The project-local code the capability manifest at `path`, whose bytes the
+/// caller already read as `text`, will execute, whichever surface it belongs
+/// to. Both manifest surfaces name a `command` plus fixed `args`; skills name
+/// none. `openmax --approve`
 /// hashes a manifest and lists the code that hash obliges it to bless; both
 /// must describe one read, or the interval between two reads is where a swap
 /// puts the hash of one file on record next to the code list of another.
@@ -2470,7 +2461,7 @@ mod tests {
         // The hashes exactly as `openmax --approve` computes them: the
         // manifest's bytes, plus the code those bytes name.
         let mut shas = vec![sha256_hex(gate_body.as_bytes())];
-        shas.extend(manifest_code(&manifest, &root).into_iter().filter_map(|c| c.sha256));
+        shas.extend(manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &root).into_iter().filter_map(|c| c.sha256));
         assert_eq!(shas.len(), 2, "the gate script must be part of the act");
 
         // Swapped inside the interval: same path, observer shape.
@@ -2544,7 +2535,7 @@ mod tests {
         let gate_body = "event = \"turn_end\"\nblocking = true\ncommand = \"./verify.sh\"\n";
         std::fs::write(&manifest, gate_body).unwrap();
         let mut shas = vec![sha256_hex(gate_body.as_bytes())];
-        shas.extend(manifest_code(&manifest, &root).into_iter().filter_map(|c| c.sha256));
+        shas.extend(manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &root).into_iter().filter_map(|c| c.sha256));
 
         // Swapped inside the interval: the same hashes, one word short.
         std::fs::write(&manifest, "event = \"turn_end\"\ncommand = \"./verify.sh\"\n").unwrap();
@@ -2588,7 +2579,7 @@ mod tests {
         let approve = |body: &str| {
             std::fs::write(&manifest, body).unwrap();
             let mut shas = vec![sha256_hex(body.as_bytes())];
-            shas.extend(manifest_code(&manifest, &root).into_iter().filter_map(|c| c.sha256));
+            shas.extend(manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &root).into_iter().filter_map(|c| c.sha256));
             approve_capability(&data, &root, &manifest, &shas).unwrap();
         };
         let is_gate = || {

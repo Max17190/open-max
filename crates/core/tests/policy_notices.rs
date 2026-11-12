@@ -787,7 +787,7 @@ async fn editing_an_approved_gates_script_is_named_on_the_writing_call() {
     std::fs::create_dir_all(&data).unwrap();
     let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(&hook).unwrap())];
     shas.extend(
-        open_max_core::ledger::manifest_code(&hook, &project)
+        open_max_core::ledger::manifest_code_source(&hook, &std::fs::read_to_string(&hook).unwrap(), &project)
             .into_iter()
             .filter_map(|c| c.sha256),
     );
