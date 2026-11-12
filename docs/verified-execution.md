@@ -144,10 +144,12 @@ other hook gets at most 60, and 10 by default. A gate that times out refuses.
 The example's hook asks for 600, and its checks share that time less 10
 seconds; a `--check` with no result in that time before the work is refused
 with exit 2. At an end the model did not ask for, a gate gets at most 60
-seconds. A cancel (a stdio `cancel`, or a signal to a print run) stops a gate
-as it stops a tool call, and the turn ends `cancelled`. After a signal Open
-Max waits at most 3 seconds for the turn, then kills a `turn_end` hook still
-running.
+seconds, and a stdio `cancel` does not stop it: it runs until it exits or its
+time is up, and `done` keeps that end's `stop_reason`. A cancel (a stdio
+`cancel`, or a signal to a print run) while a gate judges the model's own end
+stops the gate as it stops a tool call, and the turn ends `cancelled`. After
+a signal, Open Max waits at most 3 seconds for the turn, then kills a
+`turn_end` hook still running.
 
 **`unverified`.** The turn ends with `stop_reason` `unverified` when:
 
@@ -207,8 +209,10 @@ openmax: stopped (max_iterations): reached the limit of 1 tool-call round for on
 `run_task.py` takes both and passes them on, and reports them in its result's
 `ceilings`. It also takes `--timeout <seconds>`: at that time the run gets
 SIGTERM, which cancels the turn, and SIGKILL 10 seconds later if it is still
-there. The script still prints a result, with `stop_reason` `cancelled`, and
-exits 143 or 137. A print run has no deadline of its own.
+there. The script still prints a result and exits 143 or 137. Its `reason`
+names the timeout; `stop_reason` is `cancelled` when Open Max wrote its `done`
+before it exited, and null when it had to be killed first, so recognize a
+timeout by `exit_code` and `reason`. A print run has no deadline of its own.
 
 There is no ceiling in money. Open Max counts tokens and does not know their
 price, so bound the tokens and multiply by your own price.
