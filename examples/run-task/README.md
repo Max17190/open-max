@@ -108,7 +108,6 @@ The script prints the result on stdout and writes it to `result.json`:
   "stop_reason": "stop",
   "session_id": "a92b42d0-63f8-4bb3-bc1d-284ca25822b8",
   "repo": "/home/me/code/my-app",
-  "ceilings": {"max_agent_tokens": null, "max_agent_iterations": null},
   "checks": [
     {
       "command": "cargo test -p parser",
@@ -119,6 +118,7 @@ The script prints the result on stdout and writes it to `result.json`:
       "output_tail": "test result: ok. 41 passed; 0 failed\n"
     }
   ],
+  "ceilings": {"max_agent_tokens": null, "max_agent_iterations": null},
   "refusals": 1,
   "gates_passed": ["run-task-checks"],
   "gate_log": "/tmp/run-task-k2x9/gate.jsonl",
@@ -137,8 +137,8 @@ The script prints the result on stdout and writes it to `result.json`:
 | `exit_code` | The script's exit code, from the table below |
 | `reason` | Why the result is not verified, or null |
 | `stop_reason` | The `stop_reason` of the run's `done` event |
-| `ceilings` | The `--max-agent-tokens` and `--max-agent-iterations` this call passed, or null |
 | `checks` | Each check: whether it `gates` the turn's end, its exit code `before` the work (null for a final check) and `after` it (null when the checks were not run again), and the time and the end of the output of that last run |
+| `ceilings` | The `--max-agent-tokens` and `--max-agent-iterations` this call passed, or null |
 | `refusals` | The ends of the turn the gate refused, counted from the `turn_refused` events |
 | `gates_passed` | The gates Open Max reports passed the end the turn stopped on, from its `turn_verified` event, or empty when no gate passed it. The checks this script runs afterwards still decide `verified` |
 | `gate_log` | One JSON line for each end of a turn the gate judged: the session, the `continuation`, whether a refusal could be honored (`blockable`), and each check's exit code, time and output. A session the agent starts itself inherits the gate and is logged here too |
