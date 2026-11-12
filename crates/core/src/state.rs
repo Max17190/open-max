@@ -454,6 +454,11 @@ impl Core {
         Ok(applied)
     }
 
+    /// Whether the command line set settings key `key` for this run only.
+    pub fn run_only(&self, key: &str) -> bool {
+        self.run_only.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|r| r.keys.contains(&key))
+    }
+
     /// Whether settings.json on disk moved since this process last read or
     /// wrote it. On drift, records the new content (so each distinct change
     /// is reported once) and returns whether the new bytes would parse -
