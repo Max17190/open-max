@@ -990,6 +990,13 @@ impl Hooks {
                 HookRun::Cancelled => break,
             }
         }
+        // A file failing closed is a gate the user wrote down that is not
+        // running, so the end that stands is reported and not verified, and
+        // nothing is refused: the model was asked for nothing.
+        if let Some(reason) = self.fail_closed_reason() {
+            outcome.failures.push(notice("hooks".into(), "turn_end", format!("this end is not verified: {reason}")));
+            outcome.unverified = true;
+        }
         outcome
     }
 }
@@ -1013,9 +1020,9 @@ pub struct TurnEndAttempt {
 pub struct TurnEndOutcome {
     pub failures: Vec<HookFailure>,
     pub refusal: Option<Refusal>,
-    /// A gate that should have judged this end could not start (under auto):
-    /// it is among the failures, it refused nothing, and the end is not
-    /// verified.
+    /// A gate that should have judged this end could not start (under auto),
+    /// or a hook file fails closed: it is among the failures, it refused
+    /// nothing, and the end is not verified.
     pub unverified: bool,
 }
 

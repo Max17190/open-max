@@ -176,7 +176,10 @@ first turn), `compaction` (context was pruned; receives the digest record), and
 `turn_end` (receives the stop reason, fires even on cancel) observe only. A
 `turn_end` hook with `blocking = true` is a completion gate instead: a nonzero
 exit refuses the turn's end and sends its reason back as a user message; up to
-8 refusals are honored, and a further refusal ends the turn `unverified`. Each
+8 refusals are honored, and a further refusal ends the turn `unverified`. While
+a hook file fails closed (below), every turn's end is reported and ends
+`unverified` without a refusal, until a turn repairs it: that turn's end is
+judged by the hooks on disk then. Each
 hook gets one JSON payload on stdin. `user_prompt_submit` also runs on every
 message steered into a running turn, with the payload a prompt gets, so a gate
 with side effects runs once per steer too.
