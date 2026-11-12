@@ -671,6 +671,7 @@ async fn run_loop(
     let gates = hooks.completion_gates_that_cannot_start(project_root);
     let unverified = " cannot start, so no turn's end is verified until it is repaired";
     startup_notices.extend(gates.iter().map(|f| format!("hook {}", hook_clause(f, unverified))));
+    startup_notices.extend(hooks.fail_closed_reason().map(|r| format!("no turn's end is verified until this is repaired: {r}")));
     let novel = novel_policy_notices(core, session_id, startup_notices).await;
     if !novel.is_empty() {
         let text = format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER));
@@ -994,6 +995,11 @@ async fn run_loop(
             // reply is handed to it. Every other exit is a budget the turn has
             // run out of or a human who stopped it, and neither is a hook's to
             // overrule - which is also why the cancel check above comes first.
+            // Hook files load at turn start, so a turn that repaired one
+            // failing closed is judged by the hooks on disk now.
+            if hooks.fail_closed_reason().is_some() {
+                hooks = Hooks::discover_for_mode(project_root, &core.data_dir, policy_mode);
+            }
             let blockable = continuation < crate::hooks::MAX_TURN_END_CONTINUATIONS;
             let outcome = hooks
                 .turn_end(
@@ -1011,79 +1017,62 @@ async fn run_loop(
                 break 'turns;
             }
             report_hook_failures(core, session_id, outcome.failures);
-            if let Some(refusal) = outcome.refusal {
-                if blockable {
-                    // The refusal reaches the model as the user speaking: it
-                    // is work to do, not a tool result, and there is no call
-                    // id to answer. On disk before the next request goes out,
-                    // the discipline a prune already follows (#172). The stop
-                    // reason is deliberately left alone: a refused end is not
-                    // an end, so a loop that runs out here says so.
-                    guard.messages().push(ChatMessage::user(refusal.reason.clone()));
-                    if save_messages(core, session_id, guard.messages(), false).await {
-                        // Disk first, then the wire: the frontend hears about
-                        // the continuation only once the transcript a resume
-                        // would replay already records it, so the live view
-                        // never reports a refusal the disk denies.
-                        core.send_agent(
-                            session_id,
-                            AgentEvent::TurnRefused {
-                                hook: refusal.hook,
-                                reason: refusal.reason,
-                                continuation,
-                                continuations_left: crate::hooks::MAX_TURN_END_CONTINUATIONS
-                                    .saturating_sub(continuation),
-                            },
-                        );
-                        continuation += 1;
-                        continue 'turns;
-                    }
-                    // The refusal cannot be made durable, so it is not
-                    // honored: a continuation only this process remembers is
-                    // the divergence #172 exists to prevent (a resume would
-                    // replay a conversation the continuation never happened
-                    // in). The save path already said why; this says what it
-                    // cost, and the turn ends `unverified` because a gate
-                    // said no and nothing could honor it - the same state
-                    // the continuation cap ends in.
-                    guard.messages().pop();
+            let refused = outcome.refusal.is_some();
+            if let Some(refusal) = outcome.refusal.filter(|_| blockable) {
+                // The refusal reaches the model as the user speaking: it
+                // is work to do, not a tool result, and there is no call
+                // id to answer. On disk before the next request goes out,
+                // the discipline a prune already follows (#172). The stop
+                // reason is deliberately left alone: a refused end is not
+                // an end, so a loop that runs out here says so.
+                guard.messages().push(ChatMessage::user(refusal.reason.clone()));
+                if save_messages(core, session_id, guard.messages(), false).await {
+                    // Disk first, then the wire: the frontend hears about
+                    // the continuation only once the transcript a resume
+                    // would replay already records it, so the live view
+                    // never reports a refusal the disk denies.
                     core.send_agent(
                         session_id,
-                        AgentEvent::HookFailed {
+                        AgentEvent::TurnRefused {
                             hook: refusal.hook,
-                            event: "turn_end".into(),
-                            detail: format!(
-                                "refusal not honored: the transcript could not be persisted, so the continuation was withheld ({})",
-                                refusal.reason
-                            ),
+                            reason: refusal.reason,
+                            continuation,
+                            continuations_left: crate::hooks::MAX_TURN_END_CONTINUATIONS
+                                .saturating_sub(continuation),
                         },
                     );
-                    turn_end_fired = true;
-                    stop_reason = "unverified".into();
-                    break 'turns;
+                    continuation += 1;
+                    continue 'turns;
                 }
-                // Past the cap the harness ends the turn itself and says so: a
-                // policy that cannot be satisfied in this many rounds has
-                // wedged, and the answer it kept refusing was never verified.
-                // The consult above was this end's turn_end run - its payload
-                // already said blockable false and continuations_left 0 - so
-                // the late site stays quiet here too: overriding the verdict
-                // is not a second end.
-                turn_end_fired = true;
-                stop_reason = "unverified".into();
-                break 'turns;
+                // The refusal cannot be made durable, so it is not
+                // honored: a continuation only this process remembers is
+                // the divergence #172 exists to prevent (a resume would
+                // replay a conversation the continuation never happened
+                // in). The save path already said why; this says what it
+                // cost, and the turn ends `unverified` below because a gate
+                // said no and nothing could honor it, naming any file failing closed.
+                guard.messages().pop();
+                core.send_agent(
+                    session_id,
+                    AgentEvent::HookFailed {
+                        hook: refusal.hook,
+                        event: "turn_end".into(),
+                        detail: format!(
+                            "refusal not honored: the transcript could not be persisted, so the continuation was withheld ({}){}",
+                            refusal.reason,
+                            hooks.fail_closed_reason().map(|r| format!("; this end is not verified: {r}")).unwrap_or_default()
+                        ),
+                    },
+                );
             }
-            if outcome.unverified {
-                // A gate that could not start was reported above. It refused
-                // nothing, and the end it could not judge is not verified.
-                turn_end_fired = true;
-                stop_reason = "unverified".into();
-                break 'turns;
-            }
-            stop_reason = result.finish_reason;
-            // The consult IS this end's turn_end run, so the late site stays
-            // quiet: one end attempt, one fire.
+            // A refusal past the cap is the harness ending the turn itself: a
+            // policy that cannot be satisfied in this many rounds has wedged,
+            // and the answer it kept refusing was never verified. A gate that
+            // could not judge this end was reported above and refused nothing;
+            // that end is not verified either. The consult IS this end's
+            // turn_end run, so the late site stays quiet: one end, one fire.
             turn_end_fired = true;
+            stop_reason = if refused || outcome.unverified { "unverified".into() } else { result.finish_reason };
             break 'turns;
         }
 
@@ -6454,6 +6443,12 @@ mod tests {
         )
         .unwrap();
         approve_hook(&core, &project, &toml);
+        // A hook file a human approved that no longer parses: the report of
+        // the end that stands names it too.
+        let broken = hooks_dir.join("broken.toml");
+        std::fs::write(&broken, "event = \"post_tool_use\"\ncommand = \"true\"\n").unwrap();
+        approve_hook(&core, &project, &broken);
+        std::fs::write(&broken, "event = \"post_tool_use\"\ncommand = \"true\"\ntimeout = 5\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
         // A recorded transcript exists (the session is indexed), and then the
         // index is damaged: every save now reports and returns non-durable.
@@ -6480,7 +6475,8 @@ mod tests {
         );
         assert!(
             events.iter().any(|e| matches!(e,
-                AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored"))),
+                AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored")
+                    && detail.contains("this end is not verified") && detail.contains("broken.toml"))),
             "the withheld continuation must be named: {events:?}"
         );
 

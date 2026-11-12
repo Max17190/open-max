@@ -459,3 +459,60 @@ async fn a_completion_gate_that_cannot_start_ends_the_turn_unverified_without_re
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A hook file that no longer parses might have been a completion gate, so
+/// the end it could have judged is not verified: reported once, on the end
+/// that stands, after a working gate's refusal was honored, and refusing
+/// nothing itself. The model hears it at a turn start, once per session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_file_failing_closed_ends_the_turn_unverified_without_refusals() {
+    let (dir, data, project) = auto_project("failing-closed");
+    std::fs::write(project.join(".openmax/hooks/broken.toml"), "event = \"turn_end\"\nblocking = true\ncommand = \"true\"\ntimeout = 5\n").unwrap();
+    write_exec(&project.join("scripts/once.sh"), "#!/bin/sh\n[ -f refused ] && exit 0\ntouch refused\necho 'run the tests'\nexit 1\n");
+    std::fs::write(project.join(".openmax/hooks/once.toml"), "event = \"turn_end\"\nblocking = true\ncommand = \"./scripts/once.sh\"\n").unwrap();
+    let (base_url, bodies) = recording_endpoint(vec![text("4"); 12]).await;
+    write_settings(&data, &base_url);
+    let (core, mut rx) = Core::new(data).unwrap();
+
+    let turn = drive_turn(&core, &mut rx, "failing-closed", &project, "what is 2+2?").await;
+    let next = drive_turn(&core, &mut rx, "failing-closed", &project, "and 3+3?").await;
+
+    assert_eq!(turn.stop, "unverified", "an end a broken hook file might have judged is not verified");
+    assert_eq!(next.stop, "unverified");
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3, "the working gate's one refusal, and nothing spent on the broken file");
+    let failures: Vec<_> = turn.hook_failures.iter().filter(|(event, _)| event == "turn_end").collect();
+    assert_eq!(failures.len(), 1, "one report for the turn, not one per end attempt: {failures:?}");
+    assert!(failures[0].1.contains("not verified") && failures[0].1.contains("broken.toml"), "{}", failures[0].1);
+    let told = |body: &str| body.matches("no turn's end is verified until this is repaired").count();
+    assert_eq!(told(&bodies[0]), 1, "the model is told: {}", bodies[0]);
+    assert_eq!(told(&bodies[2]), 1, "once per session: {}", bodies[2]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A turn that repairs the broken file through the carve-out is judged by
+/// the hooks on disk at its end: the repaired gate runs and passes, and the
+/// end is verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_that_repairs_a_hook_file_failing_closed_ends_verified() {
+    let (dir, data, project) = auto_project("repaired");
+    write_plain(&project.join("scripts/gate.sh"), "#!/bin/sh\ntouch judged\nexit 0\n");
+    let manifest = "event = \"turn_end\"\nblocking = true\ncommand = \"sh\"\nargs = [\"./scripts/gate.sh\"]\n";
+    std::fs::write(project.join(".openmax/hooks/gate.toml"), format!("{manifest}timeout = 5\n")).unwrap();
+    let (base_url, _) = recording_endpoint(vec![
+        call("fix", "write_file", serde_json::json!({ "path": ".openmax/hooks/gate.toml", "content": manifest })),
+        text("repaired"),
+    ])
+    .await;
+    write_settings(&data, &base_url);
+    let (core, mut rx) = Core::new(data).unwrap();
+
+    let turn = drive_turn(&core, &mut rx, "repaired", &project, "fix the gate").await;
+
+    let (ok, output) = turn.call("fix");
+    assert!(ok, "the repair carve-out let the write through: {output}");
+    assert_eq!(turn.stop, "stop", "{:?}", turn.hook_failures);
+    assert!(turn.hook_failures.is_empty(), "{:?}", turn.hook_failures);
+    assert!(project.join("judged").exists(), "the repaired gate judged the end");
+    let _ = std::fs::remove_dir_all(dir);
+}

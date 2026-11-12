@@ -440,7 +440,11 @@ user message cannot be persisted is reported and ends the turn `unverified`
 the same way: a continuation only the running process remembers would diverge
 from every replay of the session. A blocking hook that times out refuses,
 like any other gate, and so does one that cannot start, except in auto
-(below).
+(below). While a hook file fails closed (it no longer parses, an approved
+gate changed or was deleted, a gate cannot run, or the approval store cannot
+be read), each turn's end is reported in `hook_failed` and ends `unverified`
+without a refusal; the model is told at turn start, once per session. A turn
+that repairs the file is judged by the hooks on disk at its end.
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:
 - pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
@@ -1119,7 +1123,7 @@ prune target and nothing changed),
 failed or a hook file on disk is not loaded, and the turn proceeded; or, in
 auto, a `user_prompt_submit` gate could not start and did not check the
 prompt, or a blocking `turn_end` gate could not start and the turn ends
-`unverified`),
+`unverified`; or a hook file fails closed and the turn ends `unverified`),
 `turn_refused` (hook, reason, continuation, continuations_left: a blocking
 `turn_end` hook refused the model's completion and the harness honored it;
 `reason` is already in the transcript as a user message - on disk before this
