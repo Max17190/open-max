@@ -140,7 +140,7 @@ def main():
     parser.add_argument("task", help="what to do, as you would type it into a session")
     parser.add_argument("--repo", default=".", help="the repository's root, trusted in auto mode (default: .)")
     parser.add_argument("--check", action="append", default=[], metavar="COMMAND",
-                        help="a shell command the turn cannot end without passing; repeat for more")
+                        help="a shell command that refuses the turn's end while it fails; repeat for more")
     parser.add_argument("--final-check", action="append", default=[], metavar="COMMAND",
                         help="a shell command run only after the process exits, for checks too slow for the gate")
     parser.add_argument("--out", help="a new or empty directory outside the repository for the call's files")

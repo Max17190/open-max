@@ -1,4 +1,4 @@
-# Run a task that cannot end until your checks pass
+# Run a task held to your own checks
 
 This optional example is one entry point for a program that hands Open Max a
 task: a script, a CI job or another agent. `run_task.py` runs the task in your
@@ -48,8 +48,8 @@ python3 examples/run-task/run_task.py --repo ~/code/my-app \
   "Make parse_date accept ISO week dates."
 ```
 
-- `--check` is a command the turn cannot end without passing. It runs with
-  `sh -c` in the repository's root and passes when it exits 0. Repeat the
+- `--check` is a command that refuses the turn's end while it fails. It runs
+  with `sh -c` in the repository's root and passes when it exits 0. Repeat the
   option for more. The script runs these once before the work, so the result
   shows which of them failed to begin with; the hook runs them at each end of
   the turn; and the script runs them once more after the process has exited.
