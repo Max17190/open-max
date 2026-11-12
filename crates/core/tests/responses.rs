@@ -335,14 +335,21 @@ async fn readonly_and_deny_rules_still_gate_responses_calls() {
     }
 }
 
+/// A reply cut after its text began is sent again twice with the same
+/// request and then ends the turn truncated. The endpoint answers each resend,
+/// so the test waits the two backoffs and not on a closed port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_incomplete_and_interrupted_streams_never_run_partial_calls() {
-    for ending in [
-        event(
-            json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit"}}}),
+    for (ending, sends) in [
+        (
+            event(
+                json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit"}}}),
+            ),
+            1,
         ),
-        event(json!({"type":"response.incomplete","response":{"status":"incomplete"}})),
-        String::new(),
+        (event(json!({"type":"response.incomplete","response":{"status":"incomplete"}})), 1),
+        // One send and the client's two resends of a cut reply.
+        (String::new(), 3),
     ] {
         let scratch = Scratch::new();
         let payload = format!(
@@ -353,7 +360,7 @@ async fn failed_incomplete_and_interrupted_streams_never_run_partial_calls() {
             ),
             ending
         );
-        let (url, requests, job) = server(vec![payload]).await;
+        let (url, requests, job) = server(vec![payload; sends]).await;
         scratch.configure(&url);
         open_max_core::trust::grant_trust(&scratch.data(), &scratch.project(), ApprovalMode::Auto).unwrap();
         let (core, mut rx) = Core::new(scratch.data()).unwrap();
@@ -361,7 +368,19 @@ async fn failed_incomplete_and_interrupted_streams_never_run_partial_calls() {
         assert!(!scratch.project().join("forbidden").exists());
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolStart { .. })));
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        if ending.is_empty() {
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, AgentEvent::Error { message } if message.contains("the reply above is incomplete"))
+                ),
+                "{events:?}"
+            );
+        }
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), sends);
+            assert!(requests.iter().all(|request| *request == requests[0]));
+        }
         job.await.unwrap();
     }
 }
