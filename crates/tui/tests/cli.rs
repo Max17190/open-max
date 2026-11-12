@@ -4830,7 +4830,8 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
     // can be after the tree has written its pids, and then starts the watcher.
     // Once the watcher runs, that thread has nothing left to do before the
     // signals, so the exit's bounded wait for it covers removing the record.
-    let _ = watcher(&base.join("home").join(".openmax").join("run").join(format!("{}.groups", child.id())));
+    let record = base.join("home").join(".openmax").join("run").join(format!("{}.groups", child.id()));
+    let watched = watcher(&record);
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     std::thread::sleep(std::time::Duration::from_millis(100));
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
@@ -4847,6 +4848,7 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
     assert_eq!(lines[2], format!("-{}", lines[1]), "a finished tool round left its group listed: {during:?}");
     assert!(!finished_left, "a run whose tool round finished left its record\n{stderr}");
     let stderr = String::from_utf8_lossy(&killed.stderr);
+    assert!(watched.is_some(), "the run's first tool started no watcher of {}\n{stderr}", record.display());
     assert_eq!(killed.status.code(), Some(143), "{:?}\n{stderr}", killed.status);
     assert!(!killed_left, "a run whose second signal killed its tools left their record\n{stderr}");
 }
