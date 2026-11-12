@@ -1043,7 +1043,7 @@ async fn run_loop(
                 // replay a conversation the continuation never happened
                 // in). The save path already said why; this says what it
                 // cost, and the turn ends `unverified` below because a gate
-                // said no and nothing could honor it.
+                // said no and nothing could honor it, naming any file failing closed.
                 guard.messages().pop();
                 core.send_agent(
                     session_id,
@@ -1051,8 +1051,9 @@ async fn run_loop(
                         hook: refusal.hook,
                         event: "turn_end".into(),
                         detail: format!(
-                            "refusal not honored: the transcript could not be persisted, so the continuation was withheld ({})",
-                            refusal.reason
+                            "refusal not honored: the transcript could not be persisted, so the continuation was withheld ({}){}",
+                            refusal.reason,
+                            hooks.fail_closed_reason().map(|r| format!("; this end is not verified: {r}")).unwrap_or_default()
                         ),
                     },
                 );
@@ -6386,6 +6387,12 @@ mod tests {
         )
         .unwrap();
         approve_hook(&core, &project, &toml);
+        // A hook file a human approved that no longer parses: the report of
+        // the end that stands names it too.
+        let broken = hooks_dir.join("broken.toml");
+        std::fs::write(&broken, "event = \"post_tool_use\"\ncommand = \"true\"\n").unwrap();
+        approve_hook(&core, &project, &broken);
+        std::fs::write(&broken, "event = \"post_tool_use\"\ncommand = \"true\"\ntimeout = 5\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
         // A recorded transcript exists (the session is indexed), and then the
         // index is damaged: every save now reports and returns non-durable.
@@ -6412,7 +6419,8 @@ mod tests {
         );
         assert!(
             events.iter().any(|e| matches!(e,
-                AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored"))),
+                AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored")
+                    && detail.contains("this end is not verified") && detail.contains("broken.toml"))),
             "the withheld continuation must be named: {events:?}"
         );
 
