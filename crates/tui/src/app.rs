@@ -2929,10 +2929,10 @@ impl App {
                 }
             }
             AgentEvent::Retry { attempt, max_attempts, reason } => {
-                // The reasoning shown so far belongs to the attempt that
-                // failed; the fresh attempt starts its own. The reason can
-                // carry a backend body; the note is one line.
-                self.clear_thinking();
+                // What streamed so far, a cut reply's text included, belongs
+                // to the attempt that failed; the fresh attempt starts its
+                // own. The reason can carry a backend body; the note is one line.
+                self.clear_live_tail();
                 self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
                 self.dirty.mark_tail();
             }
@@ -6473,6 +6473,13 @@ mod tests {
         assert_eq!(app.thinking_chars, 0);
         app.on_agent_event(AgentEvent::Thinking { text: "fresh line".into() });
         assert_eq!(app.thinking_tail, "fresh line");
+        // A reply cut after its text began is asked for again from its
+        // start: the cut text leaves the live view, so the fresh reply
+        // streams alone instead of after the text it repeats.
+        app.on_agent_event(AgentEvent::Token { text: "half an ans".into() });
+        app.on_agent_event(AgentEvent::Retry { attempt: 2, max_attempts: 3, reason: "the reply was cut short".into() });
+        app.on_agent_event(AgentEvent::Token { text: "the whole answer".into() });
+        assert_eq!(app.stream_text, "the whole answer");
         fs::remove_dir_all(dir).unwrap();
     }
 

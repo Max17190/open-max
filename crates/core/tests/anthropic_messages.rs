@@ -187,6 +187,26 @@ async fn native_invalid_and_incomplete_streams_never_return_executable_tools() {
     }
 }
 
+/// A native reply cut after its text began is asked for again with the same
+/// body, and what the server counted for the cut reply reaches the caller
+/// before the resend, apart from the finished reply's own usage.
+#[tokio::test]
+async fn native_reply_cut_after_its_text_is_asked_for_again_with_its_usage_reported() {
+    let whole=text_response();
+    let cut=whole[..whole.find("content_block_stop").unwrap()].to_string();
+    let scratch=Scratch::new();let(base,server)=serve(vec![(200,cut),(200,whole)]).await;
+    let client=client(&scratch,&base,None);let mut seen=Vec::new();
+    let result=client.stream_chat(&[ChatMessage::user("task")],&tools(),Arc::new(CancelToken::default()),|delta| match delta {
+        StreamDelta::Usage(usage)=>seen.push(format!("usage {}",usage.prompt_tokens)),
+        StreamDelta::Retry{attempt,max_attempts,reason}=>seen.push(format!("retry {attempt}/{max_attempts} {}",reason.starts_with("the reply was cut short ("))),
+        _=>{}
+    }).await.unwrap();
+    assert_eq!((result.content.as_str(),result.finish_reason.as_str()),("verified","stop"));
+    assert_eq!(seen,["usage 17","retry 2/3 true"]);
+    assert_eq!(result.usage.map(|usage|usage.completion_tokens),Some(7));
+    let records=server.await.unwrap();assert_eq!(records.len(),2);assert_eq!(records[0].body,records[1].body);
+}
+
 #[tokio::test]
 async fn native_retry_keeps_effort_and_body_identical_and_model_errors_stay_errors() {
     let scratch=Scratch::new();let(base,server)=serve(vec![(503,json!({"error":{"type":"overloaded_error","message":"fixture busy"}}).to_string()),(200,text_response()),(400,json!({"error":{"type":"invalid_request_error","message":"unsupported effort for this model"}}).to_string())]).await;

@@ -194,9 +194,9 @@ pub enum AgentEvent {
     /// ended the previous one (a transport failure, a 429 or transient 5xx,
     /// or, before any reply text, a stream that died or went silent, or a
     /// stream or reply the provider failed with a rate limit, an overload,
-    /// or a server fault). Emitted before the wait; a cancel during it ends
-    /// the turn and the attempt never goes out. Thinking streamed for the
-    /// failed attempt is void; no Token preceded it.
+    /// or a server fault, or a reply the network cut after its text began,
+    /// at most twice). Emitted before the wait; a cancel during it ends the
+    /// turn and the attempt never goes out. What streamed for it is void.
     Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
@@ -228,7 +228,7 @@ pub enum AgentEvent {
         /// as structured data, not folded into `detail`, so the frontend
         /// controls its own un-clippable placement. Additive and defaulted:
         /// a stream without the key deserializes unchanged, and the key is
-        /// omitted from the wire whenever it is empty, so `openmax-stdio/9`
+        /// omitted from the wire whenever it is empty, so `openmax-stdio/10`
         /// bytes are byte-identical for every call that grants no env.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<String>,
@@ -256,7 +256,7 @@ pub enum AgentEvent {
         /// shell-quoted). In auto such a tool is callable from the next step
         /// with no card, so this is what the TUI shows when it lands.
         /// In-process only: `serde(skip)` keeps it off the wire, so
-        /// `openmax-stdio/9` bytes are unchanged and a parsed event carries
+        /// `openmax-stdio/10` bytes are unchanged and a parsed event carries
         /// it empty.
         #[serde(skip)]
         runs: Vec<(String, String)>,
@@ -364,7 +364,7 @@ mod tests {
     /// exactly as `--stdio` and `--print --json` emit it: both write
     /// `to_json_line`, which this pins, and crates/tui/tests/cli.rs checks
     /// that one turn comes out of the two in the same bytes. These strings
-    /// are the `openmax-stdio/9` contract: session_id first, then the `type`
+    /// are the `openmax-stdio/10` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant

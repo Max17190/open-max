@@ -817,6 +817,8 @@ async fn run_loop(
             .await;
         flusher.abort();
         batcher.lock().unwrap().flush();
+        // A reply the client asked for again was paid for, however this request ended.
+        for usage in std::mem::take(&mut batcher.lock().unwrap().resent) { spend.charge(core, session_id, usage); }
 
         let result = match result {
             Ok(r) => r,
@@ -927,12 +929,12 @@ async fn run_loop(
             stop_reason = "cancelled".into();
             break 'turns;
         }
-        // The provider stopped writing without ever finishing the answer, so
-        // this is broken output, not a response: there is no way to know
-        // whether more calls were coming or whether this one was still being
-        // revised. No calls are dispatched. The partial text stays in the transcript and
-        // any unrun call ids are stubbed after the loop, so resume replays
-        // cleanly; the turn ends here with an error before its single Done.
+        // The provider stopped writing without ever finishing the answer, and
+        // the client already asked again where that could help, so this is
+        // broken output: whether more calls were coming, or this one was still
+        // being revised, cannot be known. No calls are dispatched. The partial
+        // text stays and unrun call ids are stubbed after the loop, so resume
+        // replays cleanly; the turn ends here with an error before its Done.
         if result.finish_reason == TRUNCATED {
             let mut message =
                 "provider response was interrupted or exceeded client limits; the reply above is incomplete"
@@ -3061,6 +3063,11 @@ mod tests {
     /// A provider that answers its first request with `first` and every later
     /// one with `STOP_SSE`, keeping each request body it was sent.
     async fn capturing_endpoint(first: &str) -> (String, Arc<StdMutex<Vec<String>>>) {
+        capturing_endpoint_times(first, 1).await
+    }
+
+    /// [`capturing_endpoint`] answering the first `times` requests with `first`.
+    async fn capturing_endpoint_times(first: &str, times: usize) -> (String, Arc<StdMutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3094,7 +3101,7 @@ mod tests {
                 }
                 seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
                 n += 1;
-                let sse = if n == 1 { first.as_str() } else { STOP_SSE };
+                let sse = if n <= times { first.as_str() } else { STOP_SSE };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
                 );
@@ -3317,6 +3324,11 @@ mod tests {
     /// One turn per prompt in one session against `capturing_endpoint(first)`:
     /// each turn's stop reason, and every request body the provider was sent.
     async fn capture_turns(first: &'static str, prompts: &[&str]) -> (Vec<String>, Vec<String>) {
+        capture_turns_times(first, 1, prompts).await
+    }
+
+    /// [`capture_turns`] with `first` answering the first `times` requests.
+    async fn capture_turns_times(first: &'static str, times: usize, prompts: &[&str]) -> (Vec<String>, Vec<String>) {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -3326,7 +3338,7 @@ mod tests {
         std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
 
-        let (base_url, bodies) = capturing_endpoint(first).await;
+        let (base_url, bodies) = capturing_endpoint_times(first, times).await;
         {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
@@ -3375,13 +3387,15 @@ mod tests {
     }
 
     /// The same for a call a cut stream left unfinished: it never ran, and the
-    /// next turn sends it back with `{}` beside its stub.
+    /// next turn sends it back with `{}` beside its stub. The reply is cut on
+    /// each of the three times it is asked for.
     #[tokio::test]
     async fn arguments_cut_off_midway_are_never_sent_back() {
-        let (stops, bodies) = capture_turns(CUT_TOOL_SSE, &["what is in a.txt", "and now?"]).await;
+        let (stops, bodies) = capture_turns_times(CUT_TOOL_SSE, 3, &["what is in a.txt", "and now?"]).await;
         assert_eq!(stops, [TRUNCATED, "stop"]);
-        assert_eq!(bodies.len(), 2, "{bodies:?}");
-        assert_eq!(sent_arguments(&bodies[1]), ["{}"], "{}", bodies[1]);
+        assert_eq!(bodies.len(), 4, "{bodies:?}");
+        assert_eq!(bodies[0], bodies[2], "a reply asked for again is the same request");
+        assert_eq!(sent_arguments(&bodies[3]), ["{}"], "{}", bodies[3]);
     }
 
     /// A tool call as Gemini's OpenAI-compatible endpoint streams it: whole in

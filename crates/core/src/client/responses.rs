@@ -209,8 +209,10 @@ pub(super) async fn read(
             chunk = tokio::time::timeout(idle, stream.next()) => chunk,
             _ = cancelled.cancelled() => { result.finish_reason = "cancelled".into(); return (result, None); }
         };
-        let Ok(Some(Ok(chunk))) = next else {
-            return (result, Some(Unfinished::Interrupted("Responses stream ended before response.completed".into())));
+        let chunk = match next {
+            Ok(Some(Ok(chunk))) => chunk,
+            Err(_) => return (result, Some(Unfinished::Silent(silence(idle)))),
+            _ => return (result, Some(Unfinished::Interrupted("Responses stream ended before response.completed".into()))),
         };
         if chunk.len() > MAX_RESPONSE_BYTES - received {
             return (result, None);
