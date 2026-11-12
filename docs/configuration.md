@@ -151,16 +151,16 @@ and the run that writes a key already uses it.
   the turn as truncated.
   For a reasoning model the limit is also a bound on how long it thinks
   before it acts. Setup leaves it at the default for a Chat Completions
-  connection unless the catalog reports a lower output maximum; for a
-  Responses or native Messages connection it still writes the catalog's
-  output maximum when one is reported, and
-  `openmax --check` warns while such a connection runs at the default. To
-  raise it, set `max_tokens` on the model's providers.json entry (or in
-  settings.json), at most about a quarter of the window, since the same
-  number is reserved out of the input budget. A 4096 counts as chosen only
-  on the model's entry: every settings save writes 4096 to settings.json
-  when the limit is unset. `openmax --check --all` states the active
-  model's limit and where it is set.
+  connection unless the catalog reports a lower output maximum, which it
+  saves; for a Responses or native Messages connection it still writes the
+  catalog's output maximum when one is reported, and `openmax --check`
+  warns while such a connection runs at the default. To raise it, set
+  `max_tokens` on the model's providers.json entry (or in settings.json),
+  at most about a quarter of the window, since the same number is reserved
+  out of the input budget. A 4096 counts as chosen only on the model's
+  entry: every settings save writes 4096 to settings.json when the limit is
+  unset. `openmax --check --all` states the active model's limit and where
+  it is set.
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
   model's value in `providers.json`, then a default that follows the
@@ -563,9 +563,9 @@ model. OpenAI setup omits known dedicated embedding, image, speech, realtime,
 and moderation model families; other providers retain their own catalogs.
 When the API does not report its context window, enter the value from
 the model's documentation. For a Chat Completions connection setup writes
-no `max_tokens`, so the model runs at the default reply limit, unless the
-catalog reports an output maximum under 4096, which it saves as the
-model's limit. For a Responses or native Messages connection, when the
+no `max_tokens`, so the model runs at the reply limit settings.json gives
+(4096 by default), unless the catalog reports an output maximum under that
+limit, which it saves as the model's limit. For a Responses or native Messages connection, when the
 catalog reports the model's output maximum (`max_completion_tokens`,
 `max_output_tokens`, `max_tokens`, or `top_provider.max_completion_tokens`),
 setup writes the model entry's `max_tokens`: that maximum, capped at a

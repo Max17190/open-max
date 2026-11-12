@@ -202,7 +202,7 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
 fn setup_saves_the_reply_limit_a_catalog_reports() {
     let saved = |metadata: Value, window: u64| {
         let mut catalog = vec![json!({"id":"other","max_tokens":1})];
-        record_model(&mut catalog, "m", window, &metadata, false);
+        record_model(&mut catalog, "m", window, &metadata, None);
         assert_eq!(catalog[0], json!({"id":"other","max_tokens":1}), "other models are untouched");
         assert_eq!(catalog[1]["context_tokens"], window);
         catalog[1].get("max_tokens").map(|n| n.as_u64().unwrap())
@@ -217,27 +217,30 @@ fn setup_saves_the_reply_limit_a_catalog_reports() {
     assert_eq!(saved(json!({"context_length":131072}), 131072), None, "a silent catalog gets no guess");
     assert_eq!(saved(json!({"max_tokens":0}), 131072), None);
     let mut catalog = vec![json!({"id":"m","context_tokens":1,"max_tokens":2048})];
-    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":65536}), false);
+    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":65536}), None);
     assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":2048})], "a limit the user set is kept");
 }
 
 /// A Chat Completions connection continues a reply cut at its limit, so setup
 /// saves the model's window and writes no reply limit when the catalog reports
-/// an output maximum at or over the default; the default stays in force. A
-/// maximum under the default is what the model accepts, so it is saved. A
-/// `max_tokens` already on the entry, and every other model, is kept as it was.
+/// an output maximum at or over the limit an entry without one inherits (the
+/// settings' `max_tokens`, 4096 by default); that limit stays in force. A
+/// maximum under it is what the model accepts, so it is saved. A `max_tokens`
+/// already on the entry, and every other model, is kept as it was.
 #[test]
 fn setup_saves_the_window_and_keeps_the_reply_limit_it_finds() {
     for most in [32768, 4096] {
         let mut catalog = vec![json!({"id":"other","max_tokens":1})];
-        record_model(&mut catalog, "m", 131072, &json!({"max_completion_tokens":most}), true);
+        record_model(&mut catalog, "m", 131072, &json!({"max_completion_tokens":most}), Some(4096));
         assert_eq!(catalog, vec![json!({"id":"other","max_tokens":1}), json!({"id":"m","context_tokens":131072})]);
     }
-    let mut catalog = Vec::new();
-    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":2048}), true);
-    assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":2048})], "a lower maximum is what the model accepts");
+    for (most, inherited) in [(2048, 4096), (8192, 32768)] {
+        let mut catalog = Vec::new();
+        record_model(&mut catalog, "m", 131072, &json!({"max_tokens":most}), Some(inherited));
+        assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":most})], "a maximum under the inherited {inherited} is what the model accepts");
+    }
     let mut catalog = vec![json!({"id":"m","context_tokens":1,"max_tokens":2048})];
-    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":65536}), true);
+    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":65536}), Some(4096));
     assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":2048})], "a limit the user set is kept");
 }
 
@@ -251,7 +254,7 @@ async fn a_model_setup_saved_sends_the_default_reply_limit() {
     let models = discover(&catalog_base, "fixture-secret", &serde_json::Map::new(), false, false).await.unwrap();
     catalog_task.await.unwrap();
     let mut saved = Vec::new();
-    record_model(&mut saved, "fixture-model", models[0]["context_length"].as_u64().unwrap(), &models[0], true);
+    record_model(&mut saved, "fixture-model", models[0]["context_length"].as_u64().unwrap(), &models[0], Some(4096));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     let dir = crate::test_temp_dir("openmax-setup-reply-limit");

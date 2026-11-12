@@ -290,7 +290,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         }
     };
     api_defaults(&mut entry, &name, previous.is_none())?;
-    let chat = entry.get("wire_api").is_none_or(|w| w == "chat_completions");
+    let inherited = entry.get("wire_api").is_none_or(|w| w == "chat_completions").then(|| open_max_core::config::load(dir).map_or(4096, |s| s.max_tokens) as u64);
     let catalog = entry
         .as_object_mut()
         .unwrap()
@@ -299,7 +299,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     let catalog = catalog
         .as_array_mut()
         .ok_or("provider models must be an array")?;
-    record_model(catalog, &model, window, metadata, chat);
+    record_model(catalog, &model, window, metadata, inherited);
     entry["base_url"] = json!(base);
     entry["api_key"] = json!(if key.starts_with('$') {
         format!("${key}")
@@ -326,12 +326,12 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
 }
 
 /// Saves the model's window and the output maximum a catalog reports as the reply
-/// limit, on Chat Completions only when under the 4096 default; capped at a quarter
-/// of the window (not below the default) as it is also the input reserve. A limit
-/// on the entry is kept; with none reported none is guessed.
-fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value, chat: bool) {
+/// limit; on Chat Completions only one under `inherited`, the limit an entry without
+/// one runs at. It is capped at a quarter of the window (not below the 4096 default)
+/// as it is also the input reserve. An entry's limit is kept; none reported, none guessed.
+fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value, inherited: Option<u64>) {
     let most = ["max_completion_tokens", "max_output_tokens", "max_tokens"].iter().find_map(|k| metadata[*k].as_u64())
-        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0 && (!chat || *n < 4096));
+        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0 && inherited.is_none_or(|limit| *n < limit));
     let i = catalog.iter().position(|m| m["id"] == model).unwrap_or_else(|| { catalog.push(json!({"id":model})); catalog.len() - 1 });
     catalog[i]["context_tokens"] = json!(window);
     if let (Some(most), None) = (most, catalog[i].get("max_tokens")) { catalog[i]["max_tokens"] = json!(most.min((window / 4).max(4096))); }
