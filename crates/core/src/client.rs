@@ -2803,13 +2803,19 @@ pub(crate) mod tests {
     /// child process that another test forks holds a copy of every open
     /// descriptor until it execs, so a dropped listener can still take a
     /// connection, which is reset when that copy closes: a busy machine
-    /// stretches that window enough for a retry to land in it.
+    /// stretches that window enough for a retry to land in it. Each probe
+    /// is bounded: one the open copy never accepts can fill its queue, and a
+    /// connect to a full queue waits instead of failing.
     fn close_until_refused(listener: std::net::TcpListener) {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::net::TcpStream::connect(addr).is_ok() {
-            assert!(std::time::Instant::now() < deadline, "{addr} still takes connections after its listener closed");
+        loop {
+            let probe = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100));
+            if probe.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{addr} still takes connections after its listener closed: {probe:?}");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
