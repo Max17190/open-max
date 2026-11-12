@@ -153,8 +153,10 @@ message, written to disk before this event goes out, so render it: otherwise
 the live view shows the model finishing and starting again with no visible
 cause, while a replay of the same session from disk shows the injected message.
 `continuation` and `continuations_left` are the numbers the hook's payload
-carried for this attempt: refusals honored before this one, and how many the
-harness had left to honor.
+carried for this attempt: refusals honored before this one (from any gate), and
+how many the harness had left to honor for this gate, counting this one: the
+fewer of the turn's 8 less `continuation` and the gate's `max_refusals` less its
+own refusals so far.
 
 `turn_verified` goes out before `done` when the model ended the turn and every
 blocking `turn_end` gate loaded for that end ran and exited 0. A gate that
@@ -240,7 +242,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, or on the last retry), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
-| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), its refusal could not be persisted, or in auto it could not start; or a hook file fails closed at the turn's end; the reply stands unverified |
+| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8, or fewer when the gate sets `max_refusals`), its refusal could not be persisted, or in auto it could not start; or a hook file fails closed at the turn's end; the reply stands unverified |
 | `blocked` | A `user_prompt_submit` hook refused the prompt |
 | `cancelled` | A `cancel` command, a signal, or shutdown stopped the turn |
 | `error` | The turn failed; an `error` line precedes it |

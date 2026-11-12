@@ -615,7 +615,7 @@ async fn run_loop(
     // resume silently runs without the extensions the agent already wrote.
     if let Err(message) = ensure_session_hydrated(core, session_id, project_root).await {
         core.send_agent(session_id, AgentEvent::Error { message });
-        end_turn_hooks(core, session_id, &hooks, project_root, "error", 0).await;
+        end_turn_hooks(core, session_id, &hooks, project_root, "error", &[]).await;
         return "error".into();
     }
 
@@ -701,7 +701,7 @@ async fn run_loop(
                 guard.messages().pop();
             }
             guard.commit().await;
-            end_turn_hooks(core, session_id, &hooks, project_root, "error", 0).await;
+            end_turn_hooks(core, session_id, &hooks, project_root, "error", &[]).await;
             return "error".into();
         }
     };
@@ -726,11 +726,11 @@ async fn run_loop(
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
-    // What every request of this turn has cost so far, and how many turn_end
+    // What every request of this turn has cost so far, and which gates' turn_end
     // refusals the turn has already honored. Both are turn-scoped: a
     // continuation is more of the same turn, so it spends the same budgets.
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
-    let mut continuation: usize = 0;
+    let mut honored: Vec<String> = Vec::new();
     // Set when the model-stopped break already ran the turn_end hooks, so the
     // late call site does not run them a second time for one end.
     let mut turn_end_fired = false;
@@ -1000,13 +1000,12 @@ async fn run_loop(
             if hooks.fail_closed_reason().is_some() {
                 hooks = Hooks::discover_for_mode(project_root, &core.data_dir, policy_mode);
             }
-            let blockable = continuation < crate::hooks::MAX_TURN_END_CONTINUATIONS;
             let outcome = hooks
                 .turn_end(
                     session_id,
                     project_root,
                     &result.finish_reason,
-                    crate::hooks::TurnEndAttempt { continuation, blockable },
+                    crate::hooks::TurnEndAttempt { refused: &honored, blockable: true },
                     Some(&cancelled),
                 )
                 .await;
@@ -1018,7 +1017,7 @@ async fn run_loop(
             }
             report_hook_failures(core, session_id, outcome.failures);
             let refused = outcome.refusal.is_some();
-            if let Some(refusal) = outcome.refusal.filter(|_| blockable) {
+            if let Some(refusal) = outcome.refusal.filter(|r| r.continuations_left > 0) {
                 // The refusal reaches the model as the user speaking: it
                 // is work to do, not a tool result, and there is no call
                 // id to answer. On disk before the next request goes out,
@@ -1034,14 +1033,13 @@ async fn run_loop(
                     core.send_agent(
                         session_id,
                         AgentEvent::TurnRefused {
-                            hook: refusal.hook,
+                            hook: refusal.hook.clone(),
                             reason: refusal.reason,
-                            continuation,
-                            continuations_left: crate::hooks::MAX_TURN_END_CONTINUATIONS
-                                .saturating_sub(continuation),
+                            continuation: honored.len(),
+                            continuations_left: refusal.continuations_left,
                         },
                     );
-                    continuation += 1;
+                    honored.push(refusal.hook);
                     continue 'turns;
                 }
                 // The refusal cannot be made durable, so it is not
@@ -1512,15 +1510,15 @@ async fn run_loop(
     // nothing left to spend on doing what it asks, so it is reported and the
     // turn ends anyway.
     if !turn_end_fired {
-        end_turn_hooks(core, session_id, &hooks, project_root, &stop_reason, continuation).await;
+        end_turn_hooks(core, session_id, &hooks, project_root, &stop_reason, &honored).await;
     }
     stop_reason
 }
 
 /// Runs the `turn_end` hooks for an end no refusal can change, after
-/// `continuation` honored refusals, and reports the hooks that failed.
-async fn end_turn_hooks(core: &Arc<Core>, session_id: &str, hooks: &Hooks, root: &Path, stop_reason: &str, continuation: usize) {
-    let attempt = crate::hooks::TurnEndAttempt { continuation, blockable: false };
+/// the honored refusals in `refused`, and reports the hooks that failed.
+async fn end_turn_hooks(core: &Arc<Core>, session_id: &str, hooks: &Hooks, root: &Path, stop_reason: &str, refused: &[String]) {
+    let attempt = crate::hooks::TurnEndAttempt { refused, blockable: false };
     report_hook_failures(core, session_id, hooks.turn_end(session_id, root, stop_reason, attempt, None).await.failures);
 }
 
@@ -6551,6 +6549,124 @@ mod tests {
         assert!(verified(&events).is_empty(), "an end refused past the bound passed nothing");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One turn against completion gates given as (stem, max_refusals line,
+    /// passes from its nth verdict on, or never). Each gate logs the payload
+    /// of every run. Returns the stop reason, the events, the requests sent,
+    /// and each gate's payloads as (continuation, blockable, continuations_left).
+    async fn turn_with_gates(gates: &[(&str, &str, Option<usize>)]) -> (String, Vec<AgentEvent>, usize, Vec<Vec<(u64, bool, u64)>>) {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        for (stem, bound, passes) in gates {
+            let (script, log) = (project.join(format!("{stem}.sh")), project.join(format!("{stem}.jsonl")));
+            let verdict = match passes {
+                Some(n) => format!("[ $(grep -c . {}) -ge {n} ] && exit 0\n", log.display()),
+                None => String::new(),
+            };
+            write_exec(&script, &format!("#!/bin/sh\ncat >> {0}\n{verdict}echo 'not verified by {stem}'\nexit 1\n", log.display()));
+            let toml = hooks_dir.join(format!("{stem}.toml"));
+            std::fs::write(&toml, format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n{bound}", script.display())).unwrap();
+            approve_hook(&core, &project, &toml);
+        }
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_agent_iterations = 20;
+        }
+
+        start_turn(core.clone(), "sess-bounds".into(), project.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        let payloads = gates
+            .iter()
+            .map(|(stem, _, _)| {
+                std::fs::read_to_string(project.join(format!("{stem}.jsonl")))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                    .map(|p| (p["continuation"].as_u64().unwrap(), p["blockable"].as_bool().unwrap(), p["continuations_left"].as_u64().unwrap()))
+                    .collect()
+            })
+            .collect();
+        let sent = *requests.lock().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        (stop, events, sent, payloads)
+    }
+
+    /// Each honored refusal as (hook, continuation, continuations_left).
+    fn refusals(events: &[AgentEvent]) -> Vec<(&str, usize, usize)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnRefused { hook, continuation, continuations_left, .. } => {
+                    Some((hook.as_str(), *continuation, *continuations_left))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A gate's `max_refusals` is its own bound below the turn's: a gate that
+    /// never passes has that many refusals honored, and its next failing
+    /// verdict ends the turn `unverified` exactly as the turn's bound would,
+    /// reported and not sent to the model. The payload tells it the truth at
+    /// each attempt. One that passes within its bound ends the turn as before.
+    #[tokio::test]
+    async fn a_gate_with_max_refusals_ends_the_turn_after_its_own_bound() {
+        let (stop, events, sent, payloads) = turn_with_gates(&[("never", "max_refusals = 2\n", None)]).await;
+        assert_eq!(stop, "unverified");
+        assert_eq!(sent, 3, "a first attempt plus two honored refusals");
+        assert_eq!(refusals(&events), [("never", 0, 2), ("never", 1, 1)]);
+        assert_eq!(payloads[0], [(0, true, 2), (1, true, 1), (2, false, 0)]);
+        assert!(verified(&events).is_empty(), "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::HookFailed { detail, .. } if detail.contains("not verified by never"))),
+            "the refusal past the bound is reported: {events:?}"
+        );
+
+        let (stop, events, sent, payloads) = turn_with_gates(&[("verify", "max_refusals = 2\n", Some(2))]).await;
+        assert_eq!(stop, "stop");
+        assert_eq!(sent, 2);
+        assert_eq!(refusals(&events), [("verify", 0, 2)]);
+        assert_eq!(payloads[0], [(0, true, 2), (1, true, 1)]);
+        assert_eq!(verified(&events), [["verify"]]);
+    }
+
+    /// With several gates each has its own bound, counted from its own
+    /// refusals, and the turn's bound still holds over all of them. A gate
+    /// whose refusal is not honored ends the turn, so a gate that runs after
+    /// it in the same end is not honored either, and is told so.
+    #[tokio::test]
+    async fn several_gates_each_keep_their_own_refusal_bound() {
+        // `a` refuses once and then passes; `b` may refuse once and never passes.
+        let (stop, events, sent, payloads) =
+            turn_with_gates(&[("a", "max_refusals = 3\n", Some(2)), ("b", "max_refusals = 1\n", None)]).await;
+        assert_eq!(stop, "unverified");
+        assert_eq!(sent, 3);
+        assert_eq!(refusals(&events), [("a", 0, 3), ("b", 1, 1)], "b's bound counts b's refusals, not the turn's");
+        assert_eq!(payloads[0], [(0, true, 3), (1, true, 2), (2, true, 2)]);
+        assert_eq!(payloads[1], [(1, true, 1), (2, false, 0)]);
+        assert!(verified(&events).is_empty(), "{events:?}");
+
+        // `a` spends its one refusal; its second ends the turn, and `b`, which
+        // runs after it in that end, is told its refusal will not be honored.
+        let (stop, events, sent, payloads) =
+            turn_with_gates(&[("a", "max_refusals = 1\n", None), ("b", "", None)]).await;
+        assert_eq!(stop, "unverified");
+        assert_eq!(sent, 2);
+        assert_eq!(refusals(&events), [("a", 0, 1)]);
+        assert_eq!(payloads[0], [(0, true, 1), (1, false, 0)]);
+        assert_eq!(payloads[1], [(1, false, 7)]);
     }
 
     /// A hook that never accepts is a wedged turn, and a wedged turn spends

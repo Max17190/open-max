@@ -86,11 +86,11 @@ def a_turn_whose_checks_never_pass_ends_unverified(root, binary):
         result = call(binary, repo, env, out, "--check", CHECK, code=4)
     assert not result["verified"] and result["exit_code"] == 4, result
     assert result["stop_reason"] == "unverified" and result["reason"] == "the turn ended unverified", result
-    # Eight refusals are honored; the ninth end is judged and reported, and the turn ends.
-    assert result["refusals"] == 8 and len(requests) == 9 and result["gates_passed"] == [], result
+    # The hook file's three refusals are honored; the fourth end is judged and reported, and the turn ends.
+    assert result["refusals"] == 3 and len(requests) == 4 and result["gates_passed"] == [], result
     log = gate_log(out)
-    assert [end["continuation"] for end in log] == list(range(9)), log
-    assert [end["blockable"] for end in log] == [True] * 8 + [False] and not any(end["passed"] for end in log)
+    assert [end["continuation"] for end in log] == list(range(4)), log
+    assert [end["blockable"] for end in log] == [True] * 3 + [False] and not any(end["passed"] for end in log)
     assert result["checks"][0]["after"] == 1 and result["files_changed"] == [], result
 
 
@@ -170,6 +170,9 @@ def a_call_that_cannot_be_held_to_its_checks_does_not_start(root, binary):
         repo, env, out = fixture(root, "observer", binary, url)
         hook = Path(env["HOME"]) / ".openmax" / "hooks" / "run-task-checks.toml"
         hook.write_text(hook.read_text().replace("blocking = true\n", ""))
+        # Without `blocking = true` the shipped bound has no gate to bound, so the file does not load.
+        assert "max_refusals bounds a completion gate" in call(binary, repo, env, out, "--check", CHECK, code=2)
+        hook.write_text(hook.read_text().replace("max_refusals = 3\n", ""))
         assert "is not the hook this example ships" in call(binary, repo, env, out, "--check", CHECK, code=2)
         repo, env, out = fixture(root, "untrusted", binary, url, trust=False)
         call(binary, repo, env, out, "--check", CHECK, code=3)

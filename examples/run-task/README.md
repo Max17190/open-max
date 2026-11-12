@@ -93,7 +93,10 @@ refuse every end.
 When a check fails at the turn's end, Open Max refuses the end and sends the
 model one message: each failing check, its exit code and the end of its
 output, within the 500 characters a refusal keeps. The model works on from
-there. After eight refusals Open Max ends the turn as `unverified`.
+there. The hook file sets `max_refusals = 3`: after three refusals the next
+failing end is not sent back, and Open Max ends the turn as `unverified`, so a
+check the model cannot make pass stops costing work after three tries. Open
+Max's own bound, and the most `max_refusals` may ask for, is eight.
 
 ## The result
 
@@ -207,7 +210,7 @@ python3 examples/run-task/test_run_task.py target/debug/openmax
 
 The test runs the script against a scripted endpoint on loopback: a turn
 whose first end is refused and whose second passes, a turn that spends all
-eight refusals, a turn that empties the gate's list, a final check, a turn
+three refusals, a turn that empties the gate's list, a final check, a turn
 stopped by a ceiling, a timeout
 and a signal, a project in `ask` mode, an endpoint that is down, the calls
 that are refused before any request, and the demo. The demo and the test share
