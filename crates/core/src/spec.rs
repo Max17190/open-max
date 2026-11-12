@@ -895,10 +895,10 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 }
 ```
 
-A reasoning model's reasoning counts toward those 4096: a reply cut before
-any tool call is continued after a note, four times in a row at most; a fifth
-ends the turn (`length`). Set its output maximum, at most a quarter of the
-window.
+A reasoning model's reasoning counts toward those 4096, which bound its
+thinking: a reply cut before any tool call is continued after a note, four
+times in a row at most; a fifth ends the turn (`length`). To raise it, stay
+under a quarter of the window.
 
 ## The supported model-switch recipe
 

@@ -8,8 +8,8 @@
 <h3 align="center">Most powerful & token efficient harness for agents</h3>
 
 <p align="center">
-  A coding agent for your terminal. Its built-in prompt is under a thousand tokens and<br>
-  stays stable across turns so providers can cache it.
+  A coding agent for your terminal. Its built-in prompt is under 700 tokens, and each<br>
+  agent step in a session sends it as the same bytes, so providers can cache it.
 </p>
 
 <p align="center">
@@ -22,7 +22,9 @@
   <img src="docs/assets/demo.svg" width="780" alt="Terminal demo: Open Max fixes a failing test, then writes and runs a tool that searches the docs.">
 </p>
 
-Open Max is one Rust binary: an agent loop, seven tools, a terminal UI that streams every step, and a core that keeps the trust decisions. When it needs a new capability, the agent writes it as a file, such as a [tool](docs/extending.md) or a skill, and can call a tool it wrote on its very next step.
+Open Max is one Rust binary: an agent loop, seven tools, a terminal UI that streams every step, and a core that keeps the trust decisions. When it needs a new capability, the agent writes it as a file, such as a [tool](docs/extending.md) or a skill, and can call a tool it wrote on its very next step. Within 100 ms of a `kill -9`, no process in the process groups of its tools is still running ([how](docs/execution.md)).
+
+**Held to your checks.** [examples/run-task](examples/run-task/README.md) runs one task in your repository and refuses the end of the turn while a command you name fails, sending its output back to the model; after three refusals the turn ends `unverified`. Once Open Max has exited, the script runs your commands again itself and prints one JSON result: each check before and after the work, the patch, and a command that replays every step offline from one file, byte for byte.
 
 ## Install
 
