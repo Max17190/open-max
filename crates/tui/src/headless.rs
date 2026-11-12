@@ -21,6 +21,7 @@ pub struct HeadlessArgs {
     /// place in its worktree.
     pub project: PathBuf,
     pub continue_session: bool,
+    pub session: Option<String>,
     pub json: bool,
     /// Notified on a quit signal (see `watch_quit_signals`).
     pub quit: Arc<Notify>,
@@ -38,8 +39,8 @@ pub async fn run(
 
     // Finding or creating the session waits on the session index lock.
     let setup = {
-        let (core, continue_session) = (core.clone(), args.continue_session);
-        move || open_session(&core, project_key, continue_session)
+        let (core, continue_session, named) = (core.clone(), args.continue_session, args.session.clone());
+        move || open_session(&core, project_key, continue_session, named)
     };
     let mut stop_by = None;
     let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
@@ -65,31 +66,40 @@ pub async fn run(
     code
 }
 
-/// The latest session here, or a new one: Ok(its id), or Err(the exit
-/// status) once the reason is on stderr.
-pub(crate) fn open_session(core: &Core, project_key: String, continue_session: bool) -> Result<String, i32> {
-    if continue_session {
-        match sessions::latest(core, &project_key) {
-            Ok(Some(meta)) => Ok(meta.id),
-            Ok(None) => {
-                eprintln!("openmax: no prior session in this directory to continue");
-                Err(2)
-            }
-            Err(e) => {
-                eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(core, e)));
-                Err(1)
-            }
+/// The session `named`, else the latest session here, or a new one: Ok(its
+/// id), or Err(the exit status) once the reason is on stderr.
+pub(crate) fn open_session(core: &Core, project_key: String, continue_session: bool, named: Option<String>) -> Result<String, i32> {
+    let (opened, failed) = match named {
+        Some(id) => return named_session(core, &project_key, &id),
+        None if continue_session => (sessions::latest(core, &project_key).map(|meta| meta.map(|m| m.id)), ""),
+        None => (sessions::create(core, project_key).map(|meta| Some(meta.id)), "failed to create session: "),
+    };
+    let refusal = match opened {
+        Ok(Some(id)) => return Ok(id),
+        Ok(None) => {
+            eprintln!("openmax: no prior session in this directory to continue");
+            return Err(2);
         }
-    } else {
-        match sessions::create(core, project_key) {
-            Ok(meta) => Ok(meta.id),
-            Err(e) => {
-                let refusal = sessions::refusal_with_repair(core, e);
-                eprintln!("openmax: failed to create session: {}", one_line(&refusal));
-                Err(1)
-            }
-        }
-    }
+        Err(e) => sessions::refusal_with_repair(core, e),
+    };
+    eprintln!("openmax: {failed}{}", one_line(&refusal));
+    Err(1)
+}
+
+/// Session `id` if this project can continue it, else a usage error (exit 2).
+fn named_session(core: &Core, project: &str, id: &str) -> Result<String, i32> {
+    let why = match sessions::list(core, project) {
+        Err(e) => { eprintln!("openmax: {}", one_line(&sessions::refusal_with_repair(core, e))); return Err(1) }
+        Ok(here) if here.iter().any(|m| m.id == id) => match sessions::load_messages(core, id) {
+            Ok(Some(_)) => return Ok(id.to_string()),
+            Ok(None) => "has no saved transcript to resume".to_string(),
+            Err(e) => format!("cannot be resumed: {e}"),
+        },
+        Ok(_) if sessions::meta(core, id).is_some() => "belongs to another project".into(),
+        Ok(_) => "does not exist in this project".into(),
+    };
+    eprintln!("openmax: session {} {}", one_line(id), one_line(&why));
+    Err(2)
 }
 
 async fn run_prompts(
@@ -264,9 +274,15 @@ async fn run_turn_events(
                     let reported = stop_reason == "error" && error_printed;
                     if stop_reason == "max_iterations" {
                         let cap = core.settings.lock().unwrap().max_agent_iterations;
-                        let how = "Run openmax --continue -p \"<follow-up>\" to continue, \
-                                   after raising max_agent_iterations in settings.json if it needs more rounds";
+                        let how = if core.run_only("max_agent_iterations") { "--max-agent-iterations set it for this run. Run openmax --continue -p \"<follow-up>\" to continue" }
+                            else { "Run openmax --continue -p \"<follow-up>\" to continue, after raising max_agent_iterations in settings.json if it needs more rounds" };
                         let _ = writeln!(stderr, "openmax: stopped (max_iterations): {}", iteration_cap_note(cap, how));
+                    } else if stop_reason == "budget_exhausted" {
+                        let by = if core.run_only("max_agent_tokens") { "--max-agent-tokens for this run" } else { "max_agent_tokens in settings.json" };
+                        let _ = writeln!(stderr, "openmax: stopped (budget_exhausted): the next request would not fit in the turn's ceiling of {} tokens, set by {by}. Run openmax --continue -p \"<follow-up>\" to continue, with a higher ceiling if it needs more",
+                            core.settings.lock().unwrap().max_agent_tokens.unwrap_or_default());
+                    } else if stop_reason == "length" {
+                        let _ = writeln!(stderr, "openmax: stopped (length): {}", reply_limit_note(core, "Run openmax --continue -p \"<follow-up>\" to continue, after raising it if replies need more room"));
                     } else if stop_reason != "stop" && stop_reason != "tool_calls" && !reported {
                         let _ = writeln!(stderr, "openmax: stopped ({stop_reason})");
                     }
@@ -348,9 +364,9 @@ async fn run_turn_events(
             AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
                 let _ = writeln!(
                     stderr,
-                    "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {}",
+                    "openmax: turn_end gate '{hook}' refused completion (refusal {} of this turn; this gate may refuse {} more): {}",
                     continuation + 1,
-                    continuation + continuations_left,
+                    continuations_left.saturating_sub(1),
                     one_line(reason),
                 );
             }
@@ -366,6 +382,7 @@ async fn run_turn_events(
             | AgentEvent::Diff { .. }
             | AgentEvent::SteerAccepted { .. }
             | AgentEvent::SteerBlocked { .. }
+            | AgentEvent::TurnVerified { .. }
             | AgentEvent::ApprovalSettled { .. } => {}
         }
     }
@@ -416,6 +433,13 @@ pub(crate) fn iteration_cap_note(cap: usize, how_to_continue: &str) -> String {
     format!("reached the limit of {cap} tool-call {rounds} for one turn. {how_to_continue}")
 }
 
+/// What a person reads when a reply is cut at its output limit: the setting and its value now, where it is set, then `how_to_continue`.
+pub(crate) fn reply_limit_note(core: &Core, how_to_continue: &str) -> String {
+    let now = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir).map_or(String::new(), |e| format!(" (now {})", e.max_tokens));
+    format!("the reply reached its output limit before it finished; reasoning counts toward it. \
+             The limit is max_tokens{now}, on the model's providers.json entry, else in settings.json. {how_to_continue}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +464,7 @@ mod tests {
             prompts: Vec::new(),
             project: dir.clone(),
             continue_session: false,
+            session: None,
             json: true,
             quit: Arc::new(Notify::new()),
         };
@@ -505,6 +530,7 @@ mod tests {
             prompts: Vec::new(),
             project: dir.clone(),
             continue_session: false,
+            session: None,
             json: true,
             quit: Arc::new(Notify::new()),
         };

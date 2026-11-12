@@ -52,7 +52,7 @@ use crate::compaction::{
 use crate::config::{ApprovalMode, ReasoningEffort, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
-    append_and_emit_note, hook_clause, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
+    append_and_emit_note, hook_clause, insert_note, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
     narrate_permissions_reload, novel_policy_notices, repeated_result_note, report_hook_failures, report_schemas_over_budget,
     settings_drift_note, store_note, ChangeWatch, RepeatTracker, NOTICE_JOINER, POLICY_NOTE_PREFIX, REPEAT_NOTE_AT,
 };
@@ -93,6 +93,14 @@ fn cut_off_call_error(max_tokens: usize) -> String {
          (old_string is the last few lines you wrote, enough to be unique; new_string \
          is those lines followed by the next part)."
     )
+}
+
+/// A reply the output cap cut before its first tool call ran nothing and
+/// answered nothing, so the turn goes on this many times in a row, each
+/// after this note; one more such reply ends the turn `length`.
+const MAX_CUT_CONTINUATIONS: usize = 4;
+fn reply_cut_note(max_tokens: usize) -> String {
+    format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]")
 }
 
 /// The one failure persisted without the `Error: ` prefix: the model must
@@ -607,6 +615,7 @@ async fn run_loop(
     // resume silently runs without the extensions the agent already wrote.
     if let Err(message) = ensure_session_hydrated(core, session_id, project_root).await {
         core.send_agent(session_id, AgentEvent::Error { message });
+        end_turn_hooks(core, session_id, &hooks, project_root, "error", &[]).await;
         return "error".into();
     }
 
@@ -662,6 +671,7 @@ async fn run_loop(
     let gates = hooks.completion_gates_that_cannot_start(project_root);
     let unverified = " cannot start, so no turn's end is verified until it is repaired";
     startup_notices.extend(gates.iter().map(|f| format!("hook {}", hook_clause(f, unverified))));
+    startup_notices.extend(hooks.fail_closed_reason().map(|r| format!("no turn's end is verified until this is repaired: {r}")));
     let novel = novel_policy_notices(core, session_id, startup_notices).await;
     if !novel.is_empty() {
         let text = format!("{POLICY_NOTE_PREFIX}{}]", novel.join(NOTICE_JOINER));
@@ -691,19 +701,7 @@ async fn run_loop(
                 guard.messages().pop();
             }
             guard.commit().await;
-            report_hook_failures(
-                core,
-                session_id,
-                hooks
-                    .turn_end(
-                        session_id,
-                        project_root,
-                        "error",
-                        crate::hooks::TurnEndAttempt::default(),
-                    )
-                    .await
-                    .failures,
-            );
+            end_turn_hooks(core, session_id, &hooks, project_root, "error", &[]).await;
             return "error".into();
         }
     };
@@ -728,11 +726,11 @@ async fn run_loop(
     // Every break assigns a real reason; this survives only if the model kept
     // calling tools until the iteration cap.
     let mut stop_reason = String::from("max_iterations");
-    // What every request of this turn has cost so far, and how many turn_end
+    // What every request of this turn has cost so far, and which gates' turn_end
     // refusals the turn has already honored. Both are turn-scoped: a
     // continuation is more of the same turn, so it spends the same budgets.
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
-    let mut continuation: usize = 0;
+    let mut honored: Vec<String> = Vec::new();
     // Set when the model-stopped break already ran the turn_end hooks, so the
     // late call site does not run them a second time for one end.
     let mut turn_end_fired = false;
@@ -752,6 +750,8 @@ async fn run_loop(
     );
     let max_iterations = settings.max_agent_iterations.max(1);
     let mut repeats = RepeatTracker::default();
+    // Cut replies with no call since the last reply the cap did not cut.
+    let mut cuts = 0;
 
     'turns: for iteration in 0..max_iterations {
         // One refresh, split around the steers. The mode in force first, so
@@ -876,8 +876,14 @@ async fn run_loop(
         core.send_agent(session_id, AgentEvent::MessageDone { text: content.clone() });
 
         // Never persist a fully empty assistant message (e.g. a turn cancelled
-        // before the first token): chat templates can reject it on replay.
-        if !content.is_empty() || !tool_calls.is_empty() {
+        // before the first token): chat templates can reject it on replay. A
+        // reply the output cap cut while it was still reasoning keeps that
+        // reasoning, so the continuation resumes the thought instead of
+        // starting it over; the wire skips it wherever the reasoning does
+        // not go back (another endpoint, a path that does not replay it).
+        let cut_thought = result.hit_output_cap(max_tokens)
+            && (result.reasoning_content.is_some() || result.reasoning.is_some() || result.reasoning_details.is_some());
+        if !content.is_empty() || !tool_calls.is_empty() || cut_thought {
             // A call whose arguments are not JSON (a model's slip, or a call a
             // cancel or a cut stream left unfinished) is recorded with `{}`:
             // servers that re-parse the history refuse every later request
@@ -948,10 +954,25 @@ async fn run_loop(
         // model can split the work. The client keeps its raw arguments even
         // when the cut lands before the first byte.
         let capped = result.hit_output_cap(max_tokens);
+        if !capped {
+            cuts = 0;
+        }
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
+            // Cut while still thinking or writing, before any call: not an
+            // answer, so not an end and no turn_end consult. The reply stays
+            // as recorded above, the note goes after it, on disk before the
+            // next request, and the loop goes round. Never on the last
+            // iteration, which has no request left to carry the note.
+            if capped && cuts < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
+                cuts += 1;
+                let at = guard.messages().len();
+                insert_note(core, session_id, guard.messages(), at, reply_cut_note(max_tokens));
+                save_messages(core, session_id, guard.messages(), false).await;
+                continue 'turns;
+            }
             // A steer sent while the model wrote its answer is not answered
             // yet, so this is not the end: take it now and round again for
             // the model to read it. Taken here, through its gate, so a blocked
@@ -976,89 +997,86 @@ async fn run_loop(
             // reply is handed to it. Every other exit is a budget the turn has
             // run out of or a human who stopped it, and neither is a hook's to
             // overrule - which is also why the cancel check above comes first.
-            let blockable = continuation < crate::hooks::MAX_TURN_END_CONTINUATIONS;
+            // Hook files load at turn start, so a turn that repaired one
+            // failing closed is judged by the hooks on disk now.
+            if hooks.fail_closed_reason().is_some() {
+                hooks = Hooks::discover_for_mode(project_root, &core.data_dir, policy_mode);
+            }
             let outcome = hooks
                 .turn_end(
                     session_id,
                     project_root,
                     &result.finish_reason,
-                    crate::hooks::TurnEndAttempt { continuation, blockable },
+                    crate::hooks::TurnEndAttempt { refused: &honored, blockable: true },
+                    Some(&cancelled),
                 )
                 .await;
+            // A cancel while a gate ran stopped it: the human ended the turn,
+            // and the late site tells every hook so.
+            if cancelled.is_cancelled() {
+                stop_reason = "cancelled".into();
+                break 'turns;
+            }
             report_hook_failures(core, session_id, outcome.failures);
-            if let Some(refusal) = outcome.refusal {
-                if blockable {
-                    // The refusal reaches the model as the user speaking: it
-                    // is work to do, not a tool result, and there is no call
-                    // id to answer. On disk before the next request goes out,
-                    // the discipline a prune already follows (#172). The stop
-                    // reason is deliberately left alone: a refused end is not
-                    // an end, so a loop that runs out here says so.
-                    guard.messages().push(ChatMessage::user(refusal.reason.clone()));
-                    if save_messages(core, session_id, guard.messages(), false).await {
-                        // Disk first, then the wire: the frontend hears about
-                        // the continuation only once the transcript a resume
-                        // would replay already records it, so the live view
-                        // never reports a refusal the disk denies.
-                        core.send_agent(
-                            session_id,
-                            AgentEvent::TurnRefused {
-                                hook: refusal.hook,
-                                reason: refusal.reason,
-                                continuation,
-                                continuations_left: crate::hooks::MAX_TURN_END_CONTINUATIONS
-                                    .saturating_sub(continuation),
-                            },
-                        );
-                        continuation += 1;
-                        continue 'turns;
-                    }
-                    // The refusal cannot be made durable, so it is not
-                    // honored: a continuation only this process remembers is
-                    // the divergence #172 exists to prevent (a resume would
-                    // replay a conversation the continuation never happened
-                    // in). The save path already said why; this says what it
-                    // cost, and the turn ends `unverified` because a gate
-                    // said no and nothing could honor it - the same state
-                    // the continuation cap ends in.
-                    guard.messages().pop();
+            let refused = outcome.refusal.is_some();
+            if let Some(refusal) = outcome.refusal.filter(|r| r.continuations_left > 0) {
+                // The refusal reaches the model as the user speaking: it
+                // is work to do, not a tool result, and there is no call
+                // id to answer. On disk before the next request goes out,
+                // the discipline a prune already follows (#172). The stop
+                // reason is deliberately left alone: a refused end is not
+                // an end, so a loop that runs out here says so.
+                guard.messages().push(ChatMessage::user(refusal.reason.clone()));
+                if save_messages(core, session_id, guard.messages(), false).await {
+                    // Disk first, then the wire: the frontend hears about
+                    // the continuation only once the transcript a resume
+                    // would replay already records it, so the live view
+                    // never reports a refusal the disk denies.
                     core.send_agent(
                         session_id,
-                        AgentEvent::HookFailed {
-                            hook: refusal.hook,
-                            event: "turn_end".into(),
-                            detail: format!(
-                                "refusal not honored: the transcript could not be persisted, so the continuation was withheld ({})",
-                                refusal.reason
-                            ),
+                        AgentEvent::TurnRefused {
+                            hook: refusal.hook.clone(),
+                            reason: refusal.reason,
+                            continuation: honored.len(),
+                            continuations_left: refusal.continuations_left,
                         },
                     );
-                    turn_end_fired = true;
-                    stop_reason = "unverified".into();
-                    break 'turns;
+                    honored.push(refusal.hook);
+                    continue 'turns;
                 }
-                // Past the cap the harness ends the turn itself and says so: a
-                // policy that cannot be satisfied in this many rounds has
-                // wedged, and the answer it kept refusing was never verified.
-                // The consult above was this end's turn_end run - its payload
-                // already said blockable false and continuations_left 0 - so
-                // the late site stays quiet here too: overriding the verdict
-                // is not a second end.
-                turn_end_fired = true;
-                stop_reason = "unverified".into();
-                break 'turns;
+                // The refusal cannot be made durable, so it is not
+                // honored: a continuation only this process remembers is
+                // the divergence #172 exists to prevent (a resume would
+                // replay a conversation the continuation never happened
+                // in). The save path already said why; this says what it
+                // cost, and the turn ends `unverified` below because a gate
+                // said no and nothing could honor it, naming any file failing closed.
+                guard.messages().pop();
+                core.send_agent(
+                    session_id,
+                    AgentEvent::HookFailed {
+                        hook: refusal.hook,
+                        event: "turn_end".into(),
+                        detail: format!(
+                            "refusal not honored: the transcript could not be persisted, so the continuation was withheld ({}){}",
+                            refusal.reason,
+                            hooks.fail_closed_reason().map(|r| format!("; this end is not verified: {r}")).unwrap_or_default()
+                        ),
+                    },
+                );
             }
-            if outcome.unverified {
-                // A gate that could not start was reported above. It refused
-                // nothing, and the end it could not judge is not verified.
-                turn_end_fired = true;
-                stop_reason = "unverified".into();
-                break 'turns;
-            }
-            stop_reason = result.finish_reason;
-            // The consult IS this end's turn_end run, so the late site stays
-            // quiet: one end attempt, one fire.
+            // A refusal past the cap is the harness ending the turn itself: a
+            // policy that cannot be satisfied in this many rounds has wedged,
+            // and the answer it kept refusing was never verified. A gate that
+            // could not judge this end was reported above and refused nothing;
+            // that end is not verified either. The consult IS this end's
+            // turn_end run, so the late site stays quiet: one end, one fire.
             turn_end_fired = true;
+            stop_reason = if refused || outcome.unverified { "unverified".into() } else { result.finish_reason };
+            // An end that stands with every gate passing names them, so it reads apart from one no gate judged.
+            if !refused && !outcome.unverified && !outcome.passed.is_empty() {
+                core.send_agent(session_id, AgentEvent::TurnVerified { hooks: outcome.passed });
+            }
             break 'turns;
         }
 
@@ -1494,21 +1512,16 @@ async fn run_loop(
     // nothing left to spend on doing what it asks, so it is reported and the
     // turn ends anyway.
     if !turn_end_fired {
-        report_hook_failures(
-            core,
-            session_id,
-            hooks
-                .turn_end(
-                    session_id,
-                    project_root,
-                    &stop_reason,
-                    crate::hooks::TurnEndAttempt { continuation, blockable: false },
-                )
-                .await
-                .failures,
-        );
+        end_turn_hooks(core, session_id, &hooks, project_root, &stop_reason, &honored).await;
     }
     stop_reason
+}
+
+/// Runs the `turn_end` hooks for an end no refusal can change, after
+/// the honored refusals in `refused`, and reports the hooks that failed.
+async fn end_turn_hooks(core: &Arc<Core>, session_id: &str, hooks: &Hooks, root: &Path, stop_reason: &str, refused: &[String]) {
+    let attempt = crate::hooks::TurnEndAttempt { refused, blockable: false };
+    report_hook_failures(core, session_id, hooks.turn_end(session_id, root, stop_reason, attempt, None).await.failures);
 }
 
 /// The capability file behind a tool whose exact content no human has
@@ -2026,7 +2039,7 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         let mut shas = vec![crate::ledger::sha256_hex(&bytes)];
         shas.extend(
-            crate::ledger::manifest_code(path, project)
+            crate::ledger::manifest_code_source(path, &std::fs::read_to_string(path).unwrap(), project)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );
@@ -2073,7 +2086,7 @@ mod tests {
         // A human approves the pair, as `openmax --approve` does.
         let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
         shas.extend(
-            crate::ledger::manifest_code(&manifest, &project)
+            crate::ledger::manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &project)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );
@@ -3205,6 +3218,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A reply the output cap cut while the model was still reasoning: no
+    /// text, no call, only reasoning.
+    const THOUGHT_CUT_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"half a thought\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// The bug this guards: a reply cut inside its reasoning was not kept, so
+    /// the continuation carried the note and nothing of the thought, and the
+    /// model started the same long thought again. The reasoning is kept and
+    /// goes back to its own endpoint ahead of the note, also after the session
+    /// is reopened from disk; an endpoint it does not go to gets no empty
+    /// assistant message in its place.
+    #[tokio::test]
+    async fn a_reply_cut_while_reasoning_keeps_its_reasoning_for_its_endpoint() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (thinking, thinking_bodies) = capturing_endpoint(THOUGHT_CUT_SSE).await;
+        let (other, other_bodies) = capturing_endpoint(STOP_SSE).await;
+        let thinking_url = thinking.clone();
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = thinking;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_tokens = 1024;
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        let id = &crate::sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id.into(), project.clone(), "go".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let bodies = thinking_bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "the cut reply, then its continuation");
+        let sent: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let sent = sent["messages"].as_array().unwrap();
+        let at = sent.iter().position(|m| m["role"] == "assistant").expect("the cut reply goes back");
+        assert_eq!(sent[at]["reasoning_content"], "half a thought", "{}", bodies[1]);
+        assert!(sent[at].get("content").is_none() && sent[at].get("tool_calls").is_none(), "{}", bodies[1]);
+        assert_eq!(sent[at + 1]["role"], "user");
+        assert!(sent[at + 1]["content"].as_str().unwrap().starts_with("[reply cut: it reached max_tokens (1024)"), "{}", bodies[1]);
+        assert!(!bodies[1].contains("reasoning_origin"));
+
+        let messages = transcript(&core, id).await;
+        let kept = messages.iter().find(|m| m.reasoning_content.as_deref() == Some("half a thought")).expect("kept on disk");
+        assert!(kept.content.is_none() && kept.tool_calls.is_none() && kept.reasoning_origin.is_some());
+
+        // Reopened from disk, the session sends the same messages first, byte for byte.
+        while crate::sessions::detach(&core, id).is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(core);
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens) = (thinking_url.clone(), "stub".into(), Some(16384));
+            (s.max_tokens, s.approval_mode) = (1024, ApprovalMode::Auto);
+        }
+        start_turn(core.clone(), id.into(), project.clone(), "again".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let bodies = thinking_bodies.lock().unwrap().clone();
+        let resumed: Value = serde_json::from_str(&bodies[2]).unwrap();
+        assert_eq!(resumed["messages"].as_array().unwrap()[..sent.len()], sent[..], "{}", bodies[2]);
+
+        // Another endpoint: the reasoning does not go there, so neither does the message.
+        core.settings.lock().unwrap().base_url = other;
+        start_turn(core.clone(), id.into(), project.clone(), "and now?".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+        let other_bodies = other_bodies.lock().unwrap().clone();
+        assert_eq!(other_bodies.len(), 1);
+        let replies = sent_replies(&other_bodies[0]);
+        assert_eq!(replies.len(), 2, "only the two answers go: {}", other_bodies[0]);
+        assert!(replies.iter().all(|reply| reply["content"] == "done"), "{}", other_bodies[0]);
+        assert!(!other_bodies[0].contains("reasoning") && !other_bodies[0].contains("half a thought"), "{}", other_bodies[0]);
+        assert!(other_bodies[0].contains("[reply cut"), "the note still goes: {}", other_bodies[0]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A finished reply whose one call has arguments that stop partway
     /// through the path string.
     const UNTERMINATED_TOOL_SSE: &str = concat!(
@@ -4025,6 +4126,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A turn whose session cannot be loaded after `user_prompt_submit`
+    /// accepted the prompt has started, so it ends with exactly one
+    /// `turn_end` carrying `error`, as every other exit of a started turn does.
+    #[tokio::test]
+    async fn turn_end_hook_fires_once_when_the_session_cannot_be_loaded() {
+        use crate::state::Core;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        // The gate accepts the prompt and damages the transcript on its way
+        // out, so the load that follows the accepted prompt fails.
+        let sessions = core.data_dir.join("sessions");
+        let scripts = [
+            ("gate", "user_prompt_submit", format!("mkdir -p '{0}' && printf 'not json\\n' > '{0}/sess-unloadable.messages.json'", sessions.display())),
+            ("end", "turn_end", format!("cat >> '{}/end.jsonl'; echo >> '{}/end.jsonl'", project.display(), project.display())),
+        ];
+        for (name, event, body) in scripts {
+            let script = project.join(format!("{name}.sh"));
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let manifest = hooks_dir.join(format!("{name}.toml"));
+            std::fs::write(&manifest, format!("event = \"{event}\"\ncommand = \"{}\"\n", script.display())).unwrap();
+            approve_hook(&core, &project, &manifest);
+        }
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        start_turn(core.clone(), "sess-unloadable".into(), project.clone(), "hi".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let (mut error, mut stop) = (None, None);
+        while stop.is_none() && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(env)) => match env.event {
+                    AgentEvent::Error { message } => error = Some(message),
+                    AgentEvent::Done { stop_reason } => stop = Some(stop_reason),
+                    _ => {}
+                },
+                _ => continue,
+            }
+        }
+        assert_eq!(stop.as_deref(), Some("error"));
+        assert!(error.is_some_and(|m| m.contains("is damaged")), "the load failure is reported first");
+        let ends = std::fs::read_to_string(project.join("end.jsonl")).unwrap_or_default();
+        let ends: Vec<Value> = ends.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(ends.len(), 1, "a started turn ends with exactly one turn_end: {ends:?}");
+        assert_eq!(ends[0]["event"], "turn_end");
+        assert_eq!(ends[0]["stop_reason"], "error");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A provider that answers every request with the same scripted stream and
     /// counts what it was asked for. What ends these turns is the loop's own
     /// accounting, which is the thing under test.
@@ -4356,6 +4511,7 @@ mod tests {
                     .unwrap()
             };
             let cut = reply("c2");
+            assert_eq!(user_messages(&messages, "[reply cut"), 0, "{case}: a reply with calls is not continued with a note");
             assert_eq!(cut.contains("max_tokens = 1024") && cut.contains("in parts"), capped, "{case}: {cut}");
             assert_eq!(cut.contains("invalid JSON"), !capped, "{case}: {cut}");
             // The cause belongs to the cut call alone: the model had finished
@@ -4368,6 +4524,165 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// A reply the output cap cut while the model was still writing: its text
+    /// so far, no call, finish_reason `length`.
+    const CUT_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"so far\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    const CUT_NOTE: &str = "[reply cut: it reached max_tokens (1024) before any tool call; continue from where it stopped: think briefly, then act.]";
+
+    /// The bug this guards: a reply the output cap cut before any call ran
+    /// nothing and answered nothing, yet it ended the turn, so a model that
+    /// thinks past max_tokens stopped mid-task. The reply is kept, a note after
+    /// it says what cut it, and the loop goes round, at most four times in a
+    /// row: a fifth cut ends the turn `length` as before, and so does a cut on
+    /// the last iteration. A reply the cap did not cut resets the count. The
+    /// turn_end hook runs once, for the real end.
+    #[tokio::test]
+    async fn a_reply_cut_before_any_call_continues_the_turn_at_most_four_times_in_a_row() {
+        use crate::state::Core;
+        use std::os::unix::fs::PermissionsExt;
+
+        // A case: name, the replies in order (the last repeats), the
+        // iteration cap, the stop reason, the requests, and the notes.
+        type Case = (&'static str, &'static [&'static str], usize, &'static str, usize, usize);
+        let cases: [Case; 4] = [
+            ("cut, then a call", &[CUT_SSE, TOOL_SSE, STOP_SSE], 10, "stop", 3, 1),
+            ("cut five times", &[CUT_SSE], 10, "length", 5, 4),
+            ("a call between cuts resets the count", &[CUT_SSE, CUT_SSE, CUT_SSE, CUT_SSE, TOOL_SSE, CUT_SSE, CUT_SSE, CUT_SSE, CUT_SSE, STOP_SSE], 12, "stop", 10, 8),
+            ("the iteration cap binds", &[CUT_SSE], 2, "length", 2, 1),
+        ];
+        for (case, streams, iterations, want, want_requests, want_notes) in cases {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            let hooks_dir = project.join(".openmax/hooks");
+            std::fs::create_dir_all(&hooks_dir).unwrap();
+            std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+            let script = project.join("end.sh");
+            std::fs::write(&script, format!("#!/bin/sh\ncat >> '{0}/end.jsonl'; echo >> '{0}/end.jsonl'\n", project.display())).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let manifest = hooks_dir.join("end.toml");
+            std::fs::write(&manifest, format!("event = \"turn_end\"\ncommand = \"{}\"\n", script.display())).unwrap();
+            approve_hook(&core, &project, &manifest);
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+            let (base_url, requests) = scripted_endpoint(streams).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                s.base_url = base_url;
+                s.model = "stub".into();
+                s.context_tokens = Some(16384);
+                s.max_tokens = 1024;
+                s.approval_mode = ApprovalMode::Auto;
+                s.max_agent_iterations = iterations;
+            }
+            let id = "sess-reply-cut";
+            start_turn(core.clone(), id.into(), project.clone(), "read a.txt".into()).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (mut wire, mut stop) = (Vec::new(), None);
+            while stop.is_none() && tokio::time::Instant::now() < deadline {
+                if let Ok(Some(env)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    match env.event {
+                        AgentEvent::HarnessNote { call_id, text } if text.starts_with("[reply cut") => wire.push((call_id, text)),
+                        AgentEvent::Done { stop_reason } => stop = Some(stop_reason),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(stop.as_deref(), Some(want), "{case}");
+            assert_eq!(*requests.lock().unwrap(), want_requests, "{case}");
+            assert_eq!(wire, vec![(String::new(), CUT_NOTE.to_string()); want_notes], "{case}: one notice per note, owned by no call");
+            // Each cut reply stays as it was, its note right after it.
+            let messages = transcript(&core, id).await;
+            let cuts: Vec<usize> = (0..messages.len()).filter(|&i| messages[i].content.as_deref() == Some("so far")).collect();
+            assert_eq!(cuts.len(), want_notes + usize::from(want == "length"), "{case}");
+            for &i in &cuts[..want_notes] {
+                assert_eq!(messages[i].role, "assistant", "{case}");
+                assert_eq!((messages[i + 1].role.as_str(), messages[i + 1].content.as_deref()), ("user", Some(CUT_NOTE)), "{case}");
+            }
+            assert_eq!(user_messages(&messages, "[reply cut"), want_notes, "{case}");
+            if case == "cut, then a call" {
+                assert!(messages[cuts[0] + 2].tool_calls.is_some(), "{case}: the call follows the note");
+            }
+            let ends = std::fs::read_to_string(project.join("end.jsonl")).unwrap();
+            let ends: Vec<Value> = ends.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect();
+            assert_eq!(ends.len(), 1, "{case}: one turn_end for one end");
+            assert_eq!(ends[0]["stop_reason"], want, "{case}");
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A cancel that lands after a cut reply's note, while its continuation is
+    /// in flight, ends the turn `cancelled` with the note kept.
+    #[tokio::test]
+    async fn a_cancel_after_a_cut_reply_ends_the_continuation() {
+        use crate::state::Core;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        // The first request gets the cut reply; the second is held unanswered.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(0usize));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                *seen.lock().unwrap() += 1;
+                if *seen.lock().unwrap() > 1 {
+                    held.push(sock);
+                    continue;
+                }
+                let mut buf = [0u8; 65536];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{CUT_SSE}");
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = format!("http://{addr}/v1");
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_tokens = 1024;
+        }
+        let id = "sess-cut-cancel";
+        start_turn(core.clone(), id.into(), project, "go".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut stop = None;
+        while stop.is_none() && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                match env.event {
+                    // The note goes out before the next request; cancel once
+                    // that request has reached the endpoint.
+                    AgentEvent::HarnessNote { text, .. } if text == CUT_NOTE => {
+                        while *requests.lock().unwrap() < 2 && tokio::time::Instant::now() < deadline {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        core.cancel(id);
+                    }
+                    AgentEvent::Done { stop_reason } => stop = Some(stop_reason),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(stop.as_deref(), Some("cancelled"));
+        assert_eq!(*requests.lock().unwrap(), 2, "the continuation went out and nothing after it");
+        let messages = transcript(&core, id).await;
+        assert_eq!(user_messages(&messages, CUT_NOTE), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// One reply carrying `calls` as (id, tool, arguments), in order.
@@ -5981,6 +6296,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A completion gate may run for minutes, so a cancel while it runs stops
+    /// it the way a cancel stops a tool call: the turn ends `cancelled` at
+    /// once, not when the gate finishes, and the hooks then hear the cancel.
+    #[tokio::test]
+    async fn a_cancel_stops_a_long_completion_gate() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("verify.sh");
+        write_exec(
+            &script,
+            &format!(
+                "#!/bin/sh\nif grep -q '\"cancelled\"'; then echo cancelled >> {0}/ends; exit 0; fi\n: > {0}/started\nsleep 30\n",
+                project.display()
+            ),
+        );
+        let toml = hooks_dir.join("verify.toml");
+        std::fs::write(&toml, format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\ntimeout_secs = 600\n", script.display()))
+            .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, _) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+        }
+
+        let id = "sess-long-gate";
+        start_turn(core.clone(), id.into(), project.clone(), "ship it".into()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !project.join("started").exists() {
+            assert!(std::time::Instant::now() < deadline, "the gate never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let cancelled_at = std::time::Instant::now();
+        core.cancel(id);
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "cancelled");
+        assert!(verified(&events).is_empty(), "a gate the cancel stopped passed nothing: {events:?}");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(10), "the cancel waited for the gate: {:?}", cancelled_at.elapsed());
+        assert_eq!(std::fs::read_to_string(project.join("ends")).unwrap(), "cancelled\n", "the hooks hear the cancel once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Every event until Done, so a test can see what a frontend sees.
     async fn drive_turn_events(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>,
@@ -5998,6 +6363,11 @@ mod tests {
             }
         }
         panic!("the turn never emitted Done");
+    }
+
+    /// The gates each `TurnVerified` among `events` named.
+    fn verified(events: &[AgentEvent]) -> Vec<Vec<String>> {
+        events.iter().filter_map(|e| match e { AgentEvent::TurnVerified { hooks } => Some(hooks.clone()), _ => None }).collect()
     }
 
     /// A honored refusal grows the transcript with a user message the client
@@ -6064,6 +6434,12 @@ mod tests {
             )],
             "one honored refusal, named by hook stem, carrying the payload's numbers"
         );
+        // The gate passes the next end after refusing this one: the pass is
+        // reported after the refusal, and the refusal stays in the record.
+        let refused_at = events.iter().position(|e| matches!(e, AgentEvent::TurnRefused { .. })).unwrap();
+        let passed_at = events.iter().position(|e| matches!(e, AgentEvent::TurnVerified { .. }));
+        assert!(passed_at > Some(refused_at), "the pass follows the refusal: {events:?}");
+        assert_eq!(verified(&events), [["verify"]]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6095,6 +6471,12 @@ mod tests {
         )
         .unwrap();
         approve_hook(&core, &project, &toml);
+        // A hook file a human approved that no longer parses: the report of
+        // the end that stands names it too.
+        let broken = hooks_dir.join("broken.toml");
+        std::fs::write(&broken, "event = \"post_tool_use\"\ncommand = \"true\"\n").unwrap();
+        approve_hook(&core, &project, &broken);
+        std::fs::write(&broken, "event = \"post_tool_use\"\ncommand = \"true\"\ntimeout = 5\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
         // A recorded transcript exists (the session is indexed), and then the
         // index is damaged: every save now reports and returns non-durable.
@@ -6119,9 +6501,11 @@ mod tests {
             !events.iter().any(|e| matches!(e, AgentEvent::TurnRefused { .. })),
             "the wire must not claim a continuation the disk denies"
         );
+        assert!(verified(&events).is_empty(), "a refused end is not a passed one: {events:?}");
         assert!(
             events.iter().any(|e| matches!(e,
-                AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored"))),
+                AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored")
+                    && detail.contains("this end is not verified") && detail.contains("broken.toml"))),
             "the withheld continuation must be named: {events:?}"
         );
 
@@ -6176,8 +6560,127 @@ mod tests {
             crate::hooks::MAX_TURN_END_CONTINUATIONS,
             "one event per honored refusal; the override is a failure, not a continuation"
         );
+        assert!(verified(&events).is_empty(), "an end refused past the bound passed nothing");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One turn against completion gates given as (stem, max_refusals line,
+    /// passes from its nth verdict on, or never). Each gate logs the payload
+    /// of every run. Returns the stop reason, the events, the requests sent,
+    /// and each gate's payloads as (continuation, blockable, continuations_left).
+    async fn turn_with_gates(gates: &[(&str, &str, Option<usize>)]) -> (String, Vec<AgentEvent>, usize, Vec<Vec<(u64, bool, u64)>>) {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        for (stem, bound, passes) in gates {
+            let (script, log) = (project.join(format!("{stem}.sh")), project.join(format!("{stem}.jsonl")));
+            let verdict = match passes {
+                Some(n) => format!("[ $(grep -c . {}) -ge {n} ] && exit 0\n", log.display()),
+                None => String::new(),
+            };
+            write_exec(&script, &format!("#!/bin/sh\ncat >> {0}\n{verdict}echo 'not verified by {stem}'\nexit 1\n", log.display()));
+            let toml = hooks_dir.join(format!("{stem}.toml"));
+            std::fs::write(&toml, format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n{bound}", script.display())).unwrap();
+            approve_hook(&core, &project, &toml);
+        }
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, requests) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.max_agent_iterations = 20;
+        }
+
+        start_turn(core.clone(), "sess-bounds".into(), project.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        let payloads = gates
+            .iter()
+            .map(|(stem, _, _)| {
+                std::fs::read_to_string(project.join(format!("{stem}.jsonl")))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                    .map(|p| (p["continuation"].as_u64().unwrap(), p["blockable"].as_bool().unwrap(), p["continuations_left"].as_u64().unwrap()))
+                    .collect()
+            })
+            .collect();
+        let sent = *requests.lock().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        (stop, events, sent, payloads)
+    }
+
+    /// Each honored refusal as (hook, continuation, continuations_left).
+    fn refusals(events: &[AgentEvent]) -> Vec<(&str, usize, usize)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnRefused { hook, continuation, continuations_left, .. } => {
+                    Some((hook.as_str(), *continuation, *continuations_left))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A gate's `max_refusals` is its own bound below the turn's: a gate that
+    /// never passes has that many refusals honored, and its next failing
+    /// verdict ends the turn `unverified` exactly as the turn's bound would,
+    /// reported and not sent to the model. The payload tells it the truth at
+    /// each attempt. One that passes within its bound ends the turn as before.
+    #[tokio::test]
+    async fn a_gate_with_max_refusals_ends_the_turn_after_its_own_bound() {
+        let (stop, events, sent, payloads) = turn_with_gates(&[("never", "max_refusals = 2\n", None)]).await;
+        assert_eq!(stop, "unverified");
+        assert_eq!(sent, 3, "a first attempt plus two honored refusals");
+        assert_eq!(refusals(&events), [("never", 0, 2), ("never", 1, 1)]);
+        assert_eq!(payloads[0], [(0, true, 2), (1, true, 1), (2, false, 0)]);
+        assert!(verified(&events).is_empty(), "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::HookFailed { detail, .. } if detail.contains("not verified by never"))),
+            "the refusal past the bound is reported: {events:?}"
+        );
+
+        let (stop, events, sent, payloads) = turn_with_gates(&[("verify", "max_refusals = 2\n", Some(2))]).await;
+        assert_eq!(stop, "stop");
+        assert_eq!(sent, 2);
+        assert_eq!(refusals(&events), [("verify", 0, 2)]);
+        assert_eq!(payloads[0], [(0, true, 2), (1, true, 1)]);
+        assert_eq!(verified(&events), [["verify"]]);
+    }
+
+    /// With several gates each has its own bound, counted from its own
+    /// refusals, and the turn's bound still holds over all of them. A gate
+    /// whose refusal is not honored ends the turn, so a gate that runs after
+    /// it in the same end is not honored either, and is told so.
+    #[tokio::test]
+    async fn several_gates_each_keep_their_own_refusal_bound() {
+        // `a` refuses once and then passes; `b` may refuse once and never passes.
+        let (stop, events, sent, payloads) =
+            turn_with_gates(&[("a", "max_refusals = 3\n", Some(2)), ("b", "max_refusals = 1\n", None)]).await;
+        assert_eq!(stop, "unverified");
+        assert_eq!(sent, 3);
+        assert_eq!(refusals(&events), [("a", 0, 3), ("b", 1, 1)], "b's bound counts b's refusals, not the turn's");
+        assert_eq!(payloads[0], [(0, true, 3), (1, true, 2), (2, true, 2)]);
+        assert_eq!(payloads[1], [(1, true, 1), (2, false, 0)]);
+        assert!(verified(&events).is_empty(), "{events:?}");
+
+        // `a` spends its one refusal; its second ends the turn, and `b`, which
+        // runs after it in that end, is told its refusal will not be honored.
+        let (stop, events, sent, payloads) =
+            turn_with_gates(&[("a", "max_refusals = 1\n", None), ("b", "", None)]).await;
+        assert_eq!(stop, "unverified");
+        assert_eq!(sent, 2);
+        assert_eq!(refusals(&events), [("a", 0, 1)]);
+        assert_eq!(payloads[0], [(0, true, 1), (1, false, 0)]);
+        assert_eq!(payloads[1], [(1, false, 7)]);
     }
 
     /// A hook that never accepts is a wedged turn, and a wedged turn spends
@@ -6495,9 +6998,10 @@ mod tests {
 
         let id = "sess-once";
         start_turn(core.clone(), id.into(), project, "ship it".into()).unwrap();
-        let (stop, _) = drive_turn(&mut rx).await;
+        let (stop, events) = drive_turn_events(&mut rx).await;
         assert_eq!(stop, "stop");
         assert_eq!(*requests.lock().unwrap(), 1);
+        assert_eq!(verified(&events), [["count"]], "the one gate passed this end");
         let lines: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
@@ -6512,6 +7016,68 @@ mod tests {
             lines[0]["continuations_left"],
             crate::hooks::MAX_TURN_END_CONTINUATIONS
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An end every gate passed names each gate that judged it, and only
+    /// gates: an observe-only `turn_end` hook judged nothing. A project with
+    /// no gate, and an end the model did not ask for (here the iteration
+    /// budget), get no such line, though their hooks ran and exited 0.
+    #[tokio::test]
+    async fn a_passing_end_names_its_gates_and_no_other_end_claims_a_pass() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let (gated, ungated) = (dir.join("gated"), dir.join("ungated"));
+        let script = dir.join("pass.sh");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_exec(&script, &format!("#!/bin/sh
+cat > /dev/null
+echo run >> {}
+", dir.join("runs").display()));
+        let hook = |project: &Path, name: &str, blocking: bool| {
+            let toml = project.join(".openmax/hooks").join(format!("{name}.toml"));
+            std::fs::create_dir_all(toml.parent().unwrap()).unwrap();
+            std::fs::write(&toml, format!("event = \"turn_end\"\nblocking = {blocking}\ncommand = \"{}\"\n", script.display()))
+                .unwrap();
+            approve_hook(&core, project, &toml);
+        };
+        hook(&gated, "lint", true);
+        hook(&gated, "tests", true);
+        hook(&gated, "notify", false);
+        hook(&ungated, "notify", false);
+        for project in [&gated, &ungated] {
+            std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, project).unwrap();
+        }
+        let (stop_url, _) = counting_endpoint(STOP_SSE).await;
+        let (tool_url, _) = counting_endpoint(TOOL_SSE).await;
+        let run = |url: String, iterations: usize| {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_agent_iterations) = (url, "stub".into(), Some(16384), iterations);
+        };
+
+        run(stop_url.clone(), 10);
+        start_turn(core.clone(), "sess-gated".into(), gated.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "stop");
+        assert_eq!(verified(&events), [["lint", "tests"]], "both gates, in the order they ran, and not the observer");
+        assert!(matches!(events.last(), Some(AgentEvent::TurnVerified { .. })), "the pass is the last line before done: {events:?}");
+
+        start_turn(core.clone(), "sess-ungated".into(), ungated.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "stop");
+        assert!(verified(&events).is_empty(), "no gate judged this end: {events:?}");
+
+        run(tool_url, 1);
+        start_turn(core.clone(), "sess-budget".into(), gated.clone(), "keep reading".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "max_iterations");
+        assert!(verified(&events).is_empty(), "an end the model did not ask for is not verified: {events:?}");
+        let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        assert_eq!(runs.lines().count(), 3 + 1 + 3, "every hook ran on every end, the budget's included");
 
         let _ = std::fs::remove_dir_all(dir);
     }

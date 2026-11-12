@@ -1,0 +1,12 @@
+# The completion gate of run_task.py. Install it once:
+#   cp examples/run-task/run-task-checks.toml ~/.openmax/hooks/
+# It judges only a turn that run_task.py started: every other session has no
+# RUN_TASK_DIR, and the hook exits 0 at once.
+event = "turn_end"
+blocking = true
+command = "sh"
+args = ["-c", "[ -z \"$RUN_TASK_DIR\" ] || exec python3 \"$RUN_TASK_DIR/run_task_checks.py\""]
+# The most a completion gate may run; the checks share it less a margin.
+timeout_secs = 600
+# Three refusals, then the turn ends unverified (Open Max's own bound is eight).
+max_refusals = 3

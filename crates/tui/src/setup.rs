@@ -297,11 +297,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     let catalog = catalog
         .as_array_mut()
         .ok_or("provider models must be an array")?;
-    if let Some(old) = catalog.iter_mut().find(|m| m["id"] == model) {
-        old["context_tokens"] = json!(window);
-    } else {
-        catalog.push(json!({"id":model,"context_tokens":window}));
-    }
+    record_model(catalog, &model, window, metadata);
     entry["base_url"] = json!(base);
     entry["api_key"] = json!(if key.starts_with('$') {
         format!("${key}")
@@ -326,6 +322,18 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         open_max_core::doctor::shell_quote(Path::new(&model))
     );
     Ok(())
+}
+
+/// Saves the model's window and, when the catalog reports the model's output
+/// maximum, a reply limit: that maximum, capped at a quarter of the window (but
+/// not below the 4096 default) since the limit is also the input reserve. A
+/// limit already on the entry is kept; with no reported maximum none is guessed.
+fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value) {
+    let most = ["max_completion_tokens", "max_output_tokens", "max_tokens"].iter().find_map(|k| metadata[*k].as_u64())
+        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0);
+    let i = catalog.iter().position(|m| m["id"] == model).unwrap_or_else(|| { catalog.push(json!({"id":model})); catalog.len() - 1 });
+    catalog[i]["context_tokens"] = json!(window);
+    if let (Some(most), None) = (most, catalog[i].get("max_tokens")) { catalog[i]["max_tokens"] = json!(most.min((window / 4).max(4096))); }
 }
 
 fn api_defaults(entry: &mut Value, name: &str, new: bool) -> Result<(), String> {

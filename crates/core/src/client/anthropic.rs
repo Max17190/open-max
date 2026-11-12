@@ -311,7 +311,7 @@ pub(super) async fn read(
         buffer.extend_from_slice(&chunk);
         let complete_end = buffer.iter().rposition(|b| *b == b'\n').map_or(0, |at| at + 1);
         for line in buffer[..complete_end].split_inclusive(|b| *b == b'\n') {
-            let line = trim_bytes(line);
+            let line = line.trim_ascii();
             if !line.is_empty() {
                 if let Some(bytes) = data_line(line) {
                     if !data.is_empty() {

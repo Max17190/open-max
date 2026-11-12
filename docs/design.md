@@ -17,7 +17,7 @@ You own the endpoints, the tools, the skills, and the context.
 - **Recall over everything kept.** `openmax --recall "<query>"` searches this project's past sessions, compaction archives, digests, and memories in one bounded streaming pass: BM25 relevance fused with the same recency law, ranked excerpts, each citing the file with the full record. No index to build or maintain: the stores on disk stay the single source of truth.
 - **Visible work.** Reads, greps, diffs, and shell commands stream as they happen in a fullscreen TUI. Headless print mode for scripts and CI.
 - **Local sessions.** Conversation state lives under `~/.openmax/`. The harness contacts your configured model endpoint and, when you connect ChatGPT, OpenAI's authentication service.
-- **Offline replay.** Each session keeps an event log. Copied to any machine, `openmax --replay <log> --json` prints from it, byte for byte, what `-p --json` printed during the run, with no endpoint, settings, trust or data dir.
+- **Offline replay.** Each session keeps an event log. Copied to any machine, `openmax --replay <log> --json` prints from it, byte for byte, what `-p --json` printed for every turn that finished, with no endpoint, settings, trust or data dir. The log is written when a turn ends (and mid-turn once 64 KiB of events wait), so a run killed mid-turn leaves out what that turn had not written, often all of it; `openmax -c` still continues the session from its saved transcript.
 
 ## Design
 
@@ -33,7 +33,7 @@ The design starts with one question: **What is the smallest capability Open Max 
 | Lifecycle policy and events | Process hooks and permission files |
 | Compaction integration | The built-in model summary plus the `compaction` hook event |
 | Model endpoints | `providers.json`, including local servers, gateways, and private proxies |
-| Shortcuts or a completely different UI | Prompt templates, or a custom frontend speaking `openmax-stdio/8` |
+| Shortcuts or a completely different UI | Prompt templates, or a custom frontend speaking `openmax-stdio/9` |
 
 These are deliberate boundaries, not placeholders for hidden orchestration products. Open Max does not carry an MCP host, nested-agent scheduler, plan mode, background-job product, built-in TODO database, user-keybinding engine, pluggable compactor, or TUI plugin ABI. The agent composes those richer workflows from the same host tools a developer can inspect, edit, test, and remove.
 

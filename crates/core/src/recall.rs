@@ -31,6 +31,7 @@ use std::path::Path;
 
 use crate::sessions;
 use crate::state::Core;
+use crate::text::{ceil_char_boundary, floor_char_boundary};
 use crate::types::estimate_tokens;
 
 /// Ranked results returned by default; `k:<n>` in the query overrides.
@@ -402,7 +403,7 @@ pub(crate) fn salient_window(text: &str, context: &str, width: usize) -> std::op
     }
     let terms: std::collections::HashSet<String> = tokenize(context).into_iter().collect();
     if terms.is_empty() {
-        return 0..end_boundary(text, width);
+        return 0..floor_char_boundary(text, width);
     }
     // One tokenizing pass, keeping only the runs that can score at all. Every
     // candidate window is then a range over this list, so the whole scan is
@@ -416,7 +417,7 @@ pub(crate) fn salient_window(text: &str, context: &str, width: usize) -> std::op
         }
     });
     if hits.is_empty() {
-        return 0..end_boundary(text, width);
+        return 0..floor_char_boundary(text, width);
     }
     // A window never begins mid-line: tool output is line-structured and a
     // window cut inside one reads as garbage.
@@ -455,16 +456,7 @@ pub(crate) fn salient_window(text: &str, context: &str, width: usize) -> std::op
             best_score = distinct;
         }
     }
-    best..end_boundary(text, best + width)
-}
-
-/// Largest char boundary at or below `at`, clamped to the string.
-fn end_boundary(text: &str, at: usize) -> usize {
-    let mut end = at.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
+    best..floor_char_boundary(text, best + width)
 }
 
 /// Strip one plural 's' (never 'ss'/'us'/'is'): "files"~"file",
@@ -555,20 +547,12 @@ fn pages(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
     while start < text.len() {
-        while start < text.len() && !text.is_char_boundary(start) {
-            start += 1;
-        }
-        let mut end = (start + PAGE_CHARS).min(text.len());
-        while end < text.len() && !text.is_char_boundary(end) {
-            end += 1;
-        }
+        start = ceil_char_boundary(text, start);
+        let mut end = ceil_char_boundary(text, start + PAGE_CHARS);
         if end < text.len() {
             // Prefer a whitespace boundary in the last fifth of the page;
             // both slice ends must sit on char boundaries first.
-            let mut window_start = end.saturating_sub(PAGE_CHARS / 5).max(start + 1);
-            while window_start < end && !text.is_char_boundary(window_start) {
-                window_start += 1;
-            }
+            let window_start = ceil_char_boundary(text, end.saturating_sub(PAGE_CHARS / 5).max(start + 1));
             if window_start < end {
                 if let Some(ws) = text[window_start..end].rfind(char::is_whitespace) {
                     end = window_start + ws;
@@ -594,11 +578,7 @@ fn bounded(text: String) -> String {
     if text.len() <= MAX_CHUNK_BYTES {
         return text;
     }
-    let mut cut = MAX_CHUNK_BYTES;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    text[..cut].to_string()
+    text[..floor_char_boundary(&text, MAX_CHUNK_BYTES)].to_string()
 }
 
 /// Read at most `io_budget` bytes of a JSONL file and parse what fits, one
@@ -813,71 +793,38 @@ fn collect_chunks(
                 paths: record.paths,
             });
         }
-        let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
-        let messages_path = std::path::PathBuf::from(sessions::messages_display(core, &meta.id));
-        let (records, tail_cut) =
-            bounded_jsonl::<crate::types::ChatMessage>(&messages_path, io_budget);
-        cut |= tail_cut;
-        for (line, msg) in records {
-            if bytes >= scan_ceiling {
-                cut = true;
-                break;
-            }
-            if msg.role == "system" {
-                continue;
-            }
-            let Some(content) = msg.content else { continue };
-            if content.trim().is_empty() {
-                continue;
-            }
-            let content = bounded(content);
-            bytes += content.len();
-            let source = sessions::messages_display(core, &meta.id);
-            for page in pages(&content) {
-                chunks.push(Chunk {
-                    kind: "message",
-                    role: Some(msg.role.clone()),
-                    session: Some(meta.id.clone()),
-                    title: Some(meta.title.clone()),
-                    age_hours: age,
-                    doc: format!("{source}#{line}"),
-                    source: source.clone(),
-                    line: Some(line),
-                    text: page.to_string(),
-                    paths: Vec::new(),
-                });
-            }
-        }
-        let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
-        let archive_path = std::path::PathBuf::from(sessions::archive_display(core, &meta.id));
-        let (records, tail_cut) =
-            bounded_jsonl::<crate::types::ChatMessage>(&archive_path, io_budget);
-        cut |= tail_cut;
-        for (line, msg) in records {
-            if bytes >= scan_ceiling {
-                cut = true;
-                break;
-            }
-            let Some(content) = msg.content else { continue };
-            if content.trim().is_empty() {
-                continue;
-            }
-            let content = bounded(content);
-            bytes += content.len();
-            let source = sessions::archive_display(core, &meta.id);
-            for page in pages(&content) {
-                chunks.push(Chunk {
-                    kind: "archive",
-                    role: Some(msg.role.clone()),
-                    session: Some(meta.id.clone()),
-                    title: Some(meta.title.clone()),
-                    age_hours: age,
-                    doc: format!("{source}#{line}"),
-                    source: source.clone(),
-                    line: Some(line),
-                    text: page.to_string(),
-                    paths: Vec::new(),
-                });
+        for (kind, source) in [("message", &stores[0]), ("archive", &stores[1])] {
+            let io_budget = scan_ceiling.saturating_sub(bytes).saturating_add(MAX_CHUNK_BYTES);
+            let (records, tail_cut) = bounded_jsonl::<crate::types::ChatMessage>(Path::new(source), io_budget);
+            cut |= tail_cut;
+            for (line, msg) in records {
+                if bytes >= scan_ceiling {
+                    cut = true;
+                    break;
+                }
+                if kind == "message" && msg.role == "system" {
+                    continue;
+                }
+                let Some(content) = msg.content else { continue };
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let content = bounded(content);
+                bytes += content.len();
+                for page in pages(&content) {
+                    chunks.push(Chunk {
+                        kind,
+                        role: Some(msg.role.clone()),
+                        session: Some(meta.id.clone()),
+                        title: Some(meta.title.clone()),
+                        age_hours: age,
+                        doc: format!("{source}#{line}"),
+                        source: source.clone(),
+                        line: Some(line),
+                        text: page.to_string(),
+                        paths: Vec::new(),
+                    });
+                }
             }
         }
         if cut {
@@ -895,14 +842,8 @@ fn collect_chunks(
 fn excerpt_around(text: &str, terms_by_rarity: &[&str], width: usize) -> String {
     let hit = terms_by_rarity.iter().find_map(|t| find_ci(text, t)).unwrap_or(0);
     let start_target = hit.saturating_sub(width / 4);
-    let mut start = start_target.min(text.len());
-    while start > 0 && !text.is_char_boundary(start) {
-        start -= 1;
-    }
-    let mut end = (start + width).min(text.len());
-    while end < text.len() && !text.is_char_boundary(end) {
-        end += 1;
-    }
+    let start = floor_char_boundary(text, start_target);
+    let end = ceil_char_boundary(text, start + width);
     let mut out = String::with_capacity(end - start + 2);
     if start > 0 {
         out.push('…');
@@ -1141,11 +1082,7 @@ pub fn recall(core: &Core, project_root: &Path, raw_query: &str) -> Result<Recal
             // its excerpt shrinks to whatever width the budget leaves.
             let width = (query.budget_tokens * 4).saturating_sub(chunk.source.len() + 192);
             excerpt = excerpt_around(&chunk.text, &terms_by_rarity, width.max(40));
-            let mut cut = excerpt.len().min(width.max(40));
-            while cut > 0 && !excerpt.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            excerpt.truncate(cut);
+            excerpt.truncate(floor_char_boundary(&excerpt, width.max(40)));
             cost = estimate_tokens(excerpt.len() + chunk.source.len() + 48);
         }
         spent += cost;

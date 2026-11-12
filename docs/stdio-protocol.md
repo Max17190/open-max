@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/8`)
+# stdio protocol (`openmax-stdio/9`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,12 +15,13 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
 the same major as a readable id. Any wire change bumps both. `continued` is
-true when `--continue` resumed a prior session; the next line is then one
+true when `--continue` resumed a prior session (the latest in the directory,
+or the one `--session <id>` names); the next line is then one
 `transcript` object so the client can render history without synthetic events:
 
 ```json
@@ -111,16 +112,17 @@ events either, but carry one).
 | `usage` | `prompt_tokens`, `completion_tokens` (the reply's output as the provider bills it, reasoning included: a server that reports reasoning beside its own `completion_tokens` and in its `total_tokens`, as xAI's Chat Completions does, has it added), `cached_tokens` (or null) |
 | `tool_start` | `call_id`, `name`, `args` (object) |
 | `tool_end` | `call_id`, `ok` (bool), `output` |
-| `harness_note` | `call_id`, `text` (a note the harness wrote into the model's transcript: a refreeze receipt; an execution policy, policy, permission, hook, providers, settings, or approval notice; or the repeated identical call note. `--print` without `--json` prints no line for it. `call_id` links it to the tool result it rode; it is empty for a note inserted before the next prompt, such as a turn-start receipt) |
-| `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out after a backoff wait, and `max_attempts` the one the request ends on if it keeps failing the same way, `reason` having ended the previous one with a transport failure, a 429 or transient server error (500, 502, 503, 504, 529), or, before any reply text arrived, a stream that died, went silent, or carried a data line the client cannot read, or a stream or reply the provider failed with a rate limit, an overload, or a server fault. A stream that died or carried a data line the client cannot read after reply text arrived is resent too, at most twice in a row, and its `reason` starts `the reply was cut short`; a stream that went silent after reply text is not, since the idle interval is the client's own limit. The wait is the backoff, or the response's `Retry-After` in seconds when that is longer. A `Retry-After` of more than a minute is not retried: the request fails at once and the error names the server's wait. Neither is a 429 reporting an exhausted quota (`insufficient_quota`). Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` and `token` lines already emitted for that attempt are void and the reply starts over; `message_done` carries only the reply that finished. A request gives up before its budget after three attempts in a row that failed to connect or timed out: while that streak runs, `max_attempts` counts to its third attempt (or to the budget, if that comes first), and it returns to the budget when an attempt ends any other way. After a cut reply it counts to the attempt that spends the two resends a cut gets) |
+| `harness_note` | `call_id`, `text` (a note the harness wrote into the model's transcript: a refreeze receipt; an execution policy, policy, permission, hook, providers, settings, or approval notice; the repeated identical call note; or the note after a reply the output limit cut before any tool call, which continues the turn. `--print` without `--json` prints no line for it. `call_id` links it to the tool result it rode; it is empty for a note inserted before the next prompt, such as a turn-start receipt) |
+| `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out after a backoff wait, and `max_attempts` the one the request ends on if it keeps failing the same way, `reason` having ended the previous one with a transport failure, a 429 or transient server error (500, 502, 503, 504, 529), or, before any reply text arrived, a stream that died, went silent, or carried a data line the client cannot read, or a stream or reply the provider failed with a rate limit, an overload, or a server fault. A stream that died or carried a data line the client cannot read after reply text arrived is resent too, at most twice in a row, and its `reason` starts `the reply was cut short`; a stream that went silent after reply text is not, since the idle interval is the client's own limit. The wait is the backoff, or the response's `Retry-After` in seconds when that is longer. A `Retry-After` of more than a minute is not retried: the request fails at once and the error names the server's wait. Neither is a 429 reporting an exhausted quota (`insufficient_quota`). Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` and `token` lines already emitted for that attempt are void and the reply starts over; `message_done` carries only the reply that finished. A request gives up before its budget after three attempts in a row that failed to connect or timed out: while that streak runs, `max_attempts` counts to its third attempt (or to the budget, if that comes first), and it returns to the budget when an attempt ends any other way) |
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
 | `approval_request` | `approval_id`, `name`, `summary`, `detail`, `reason` (`gate`, or `unapproved_source` which unattended clients must never auto-approve), `source_path`, `source_sha`, and optional `env` (see below) |
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: one line per tool or skill file added, modified, or removed) |
 | `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the frozen tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the prune target and nothing changed) |
-| `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`) |
+| `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`; or a hook file fails closed and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |
+| `turn_verified` | `hooks` (the model's end stands and every blocking `turn_end` gate that judged it passed, named by file stem in the order they ran; see below) |
 | `steer_accepted` | `text` (a `user` line sent while the turn ran entered the transcript as a user message here; see below) |
 | `steer_blocked` | `text`, `reason` (a `user_prompt_submit` gate refused a steer, which entered nothing; see below) |
 | `done` | `stop_reason` |
@@ -151,8 +153,21 @@ message, written to disk before this event goes out, so render it: otherwise
 the live view shows the model finishing and starting again with no visible
 cause, while a replay of the same session from disk shows the injected message.
 `continuation` and `continuations_left` are the numbers the hook's payload
-carried for this attempt: refusals honored before this one, and how many the
-harness had left to honor.
+carried for this attempt: refusals honored before this one (from any gate), and
+how many the harness had left to honor for this gate, counting this one: the
+fewer of the turn's 8 less `continuation` and the gate's `max_refusals` less its
+own refusals so far.
+
+`turn_verified` goes out before `done` when the model ended the turn and every
+blocking `turn_end` gate loaded for that end ran and exited 0. A gate that
+refused earlier ends of the same turn and then passed is named too; its
+refusals are the `turn_refused` lines before it. There is no such line when no
+gate judged the end (none is installed, or only observe-only `turn_end` hooks
+are), when the turn ends `unverified` (a refusal past the bound or one that
+could not be persisted, a gate that could not start, a hook file failing
+closed), or when the end is not one the model asked for (`cancelled`,
+`error`, `truncated`, `max_iterations`, `budget_exhausted`). A frontend can
+therefore tell an end held to checks from one with nothing to hold it to.
 
 A `user` line sent while a turn runs steers it. A `/name args` line is
 expanded as a prompt template first, as a turn's first prompt is, and the
@@ -230,7 +245,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, on the third such cut in a row or the last retry, or by going silent), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
-| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8), its refusal could not be persisted, or in auto it could not start; the reply stands unverified |
+| `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8, or fewer when the gate sets `max_refusals`), its refusal could not be persisted, or in auto it could not start; or a hook file fails closed at the turn's end; the reply stands unverified |
 | `blocked` | A `user_prompt_submit` hook refused the prompt |
 | `cancelled` | A `cancel` command, a signal, or shutdown stopped the turn |
 | `error` | The turn failed; an `error` line precedes it |
@@ -247,8 +262,9 @@ before its `done` (send it again after that `done`), is refused with a
 `protocol_error` alone.
 
 The process exit code is 1 when any turn ended with `stop_reason` `error` or
-the session could not be opened, 2 on a usage or configuration error or when
-`--continue` finds no prior session in the directory, 3 when the project is
+the session could not be opened, 2 on a usage or configuration error, when
+`--continue` finds no prior session in the directory, or when `--session`
+names one this directory cannot continue, 3 when the project is
 not trusted or trust cannot be granted from this process, and 0
 otherwise, including `length`, `max_iterations`, `budget_exhausted`, and
 `unverified`. The client reads `done` and decides for itself. See the
@@ -296,6 +312,7 @@ Any wire change bumps `protocol_version`. What each version changed:
 
 | Version | Change |
 | --- | --- |
+| 9 | `turn_verified` event |
 | 8 | A `user` line sent while a turn runs steers that turn instead of being refused; `steer_accepted` and `steer_blocked` events |
 | 7 | `fork` and `rewind` commands and the `forked` line |
 | 6 | `retry` event |

@@ -1024,6 +1024,47 @@ fn check_exit_codes_follow_findings() {
     assert!(stdout.contains("broken.toml"), "{stdout}");
 }
 
+/// A project is often checked before anyone trusts it (a setup script, a CI
+/// step). No session runs there yet, so its rows are graded in the settings
+/// default, ask when unset, where the hook `--spec hooks` shows is inert until
+/// a human approves it. The report says so once, first, with the command that
+/// trusts the project, and keeps its exit status. A trusted project has no
+/// such line, even in ask, where the same hook is still inert.
+#[test]
+fn check_names_an_untrusted_project_and_the_mode_it_was_graded_in() {
+    let (project, home) = fresh_dirs("check-untrusted");
+    let spec = open_max_core::spec::render("hooks").unwrap();
+    let hook = spec.split("```toml\n").nth(1).and_then(|rest| rest.split("```").next()).unwrap();
+    std::fs::create_dir_all(project.join(".openmax/hooks")).unwrap();
+    std::fs::write(project.join(".openmax/hooks/deny-rm.toml"), hook).unwrap();
+    std::fs::create_dir_all(project.join("scripts")).unwrap();
+    std::fs::write(project.join("scripts/deny-rm.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let check = |args: &[&str]| {
+        let out = cmd(&project, &home).args(args).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let trust = open_max_core::doctor::trust_command(&std::fs::canonicalize(&project).unwrap());
+
+    let (code, report) = check(&["--check"]);
+    assert_eq!(code, Some(1), "the inert hook still fails the check:\n{report}");
+    let first = report.lines().next().unwrap_or_default();
+    assert!(first.starts_with("warn trust "), "{report}");
+    assert!(first.contains("not trusted") && first.contains("graded in ask mode"), "{report}");
+    assert!(first.contains(&format!("`{trust}`")), "{report}");
+    assert_eq!(report.matches("not trusted").count(), 1, "{report}");
+    assert!(report.contains("err  hook        .openmax/hooks/deny-rm.toml  inert"), "{report}");
+    let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((rows[0]["surface"].as_str(), rows[0]["status"].as_str()), (Some("trust"), Some("warn")), "{rows}");
+
+    trust_in_ask(&project, &home);
+    let (code, report) = check(&["--check"]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(!report.contains("not trusted") && report.contains("inert"), "{report}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// An agent runs `--check` after every extension file it writes, and the
 /// report stays in its transcript, re-sent with every later request. So the
 /// default report prints only rows to act on (warn and err, plus a hook's row,
@@ -1034,6 +1075,9 @@ fn check_exit_codes_follow_findings() {
 fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
     let (project, home) = fresh_dirs("check-diet");
     write_settings(&home, "http://127.0.0.1:9/v1");
+    // A healthy setup sets its reply limit; at the default its settings row warns.
+    let settings = home.join(".openmax/settings.json");
+    std::fs::write(&settings, std::fs::read_to_string(&settings).unwrap().replace("}", r#","max_tokens":8192}"#)).unwrap();
     let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto);
     assert_eq!(grant.unwrap().1, Some(ApprovalMode::Auto));
     let tools = project.join(".openmax").join("tools");
@@ -1659,8 +1703,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/8");
-    assert_eq!(hello["protocol_version"], 8);
+    assert_eq!(hello["proto"], "openmax-stdio/9");
+    assert_eq!(hello["protocol_version"], 9);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -1836,6 +1880,68 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("stub says hi"), "stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// A reasoning model can spend a reply's whole `max_tokens` thinking: the
+/// reply comes back with finish reason `length`, no text and no call, and the
+/// turn ends. Print mode used to say only `stopped (length)` and `--check` did
+/// not show the limit at all, so a person at the 4096 default had nothing to
+/// act on. Now the stop line names the setting, its value and where it is set,
+/// and `--check` warns while the active model runs at the default and says
+/// nothing in its default report once the limit is set.
+#[test]
+fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
+    let (project, home) = fresh_dirs("reply-limit");
+    let cut = sse(&[serde_json::json!({"choices":[{"delta":{},"finish_reason":"length"}],
+        "usage":{"prompt_tokens":10,"completion_tokens":4096}})]);
+    // The turn continues after four cut replies; the fifth in a row ends it.
+    let (base_url, requests, _server) = spawn_scripted_server(vec![(cut, true); 5]);
+    write_settings(&home, &base_url);
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "think it through"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert_eq!(requests.lock().unwrap().len(), 5, "{stderr}");
+    assert!(stderr.contains(
+        "openmax: stopped (length): the reply reached its output limit before it finished; reasoning counts toward it. \
+         The limit is max_tokens (now 4096), on the model's providers.json entry, else in settings.json. \
+         Run openmax --continue -p \"<follow-up>\" to continue, after raising it if replies need more room"), "{stderr}");
+    let body: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
+    assert_eq!(body["max_tokens"], 4096, "the stop line names the limit the request was sent with");
+
+    let check = |args: &[&str]| {
+        let out = cmd(&project, &home).args(args).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let (code, report) = check(&["--check"]);
+    assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");
+    let row = report.lines().find(|l| l.contains("max_tokens")).unwrap_or_default();
+    assert!(row.starts_with("warn settings") && row.contains("reply limit max_tokens = 4096, the default: a reply longer than this, \
+        its reasoning included, is cut, and five cuts in a row before any tool call end the turn; set max_tokens on the model's providers.json entry"), "{report}");
+
+    let dir = home.join(".openmax");
+    std::fs::write(dir.join("settings.json"), format!(r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"ask","context_tokens":16384,"max_tokens":8192}}"#)).unwrap();
+    let (code, report) = check(&["--check"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(!report.contains("max_tokens"), "a limit set on purpose is not reported by default:\n{report}");
+    let (_, all) = check(&["--check", "--all"]);
+    assert!(all.contains("reply limit max_tokens = 8192 from settings"), "{all}");
+    std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384,"max_tokens":3000}}]}}}}}}"#)).unwrap();
+    std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"ask"}"#).unwrap();
+    let (_, all) = check(&["--check", "--all"]);
+    assert!(all.contains("reply limit max_tokens = 3000 from the model entry"), "{all}");
+
+    // Every settings save writes 4096 when the limit is unset, so a 4096 in
+    // settings.json still reads as the default; on the model entry it is a choice.
+    std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"ask","max_tokens":4096}"#).unwrap();
+    std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384}}]}}}}}}"#)).unwrap();
+    let (_, report) = check(&["--check"]);
+    assert!(report.contains("max_tokens = 4096, the default") && report.contains("4096 counts as chosen only on the entry"), "{report}");
+    std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384,"max_tokens":4096}}]}}}}}}"#)).unwrap();
+    let (_, report) = check(&["--check"]);
+    assert!(!report.contains("max_tokens"), "a 4096 on the model entry is a choice:\n{report}");
+    let (_, all) = check(&["--check", "--all"]);
+    assert!(all.contains("reply limit max_tokens = 4096 from the model entry"), "{all}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
 /// The first error a local-model user meets is a server not started yet.
@@ -2473,7 +2579,7 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
     assert_eq!(
         framed[0],
         format!(
-            r#"{{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            r#"{{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
             env!("CARGO_PKG_VERSION"),
             hello["project"],
         )
@@ -2639,6 +2745,55 @@ fn rewind_and_fork_branch_a_session_and_the_next_request_carries_only_the_branch
     assert_eq!(entry(&forked)["forked_from"]["root_id"], parent.as_str(), "a fork of a branch continues the parent's conversation");
     assert!(entry(&parent).get("forked_from").is_none(), "a session that is no fork writes no field");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A print run whose end every completion gate passed says so: a
+/// `turn_verified` line naming the gates in the order they ran, after the
+/// refusal one of them made of the end before, and just before `done`. The
+/// session's event log replays the run byte for byte, that line included.
+#[test]
+fn a_passed_end_names_its_gates_and_replays_byte_for_byte() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, home) = fresh_dirs("verified");
+    let base = project.parent().unwrap().to_path_buf();
+    let replies = ["r1", "r1 checked", "r2", "r2 checked"].map(sse_text).to_vec();
+    let (base_url, _server) = spawn_recording_server(replies, base.join("requests.jsonl"));
+    write_settings_with_mode(&home, &base_url, "auto");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let refuse_once = format!("[ -f '{0}' ] && exit 0\n: > '{0}'\necho 'one test fails'\nexit 1", base.join("refused").display());
+    for (name, body, bound) in [("lint", "exit 0".to_string(), ""), ("tests", refuse_once, "max_refusals = 2\n")] {
+        let gate = base.join(format!("{name}.sh"));
+        std::fs::write(&gate, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n{bound}", gate.display());
+        std::fs::write(hooks.join(format!("{name}.toml")), manifest).unwrap();
+    }
+
+    let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "ship it"]).output().unwrap();
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{printed}{}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<serde_json::Value> = printed.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let at = |kind: &str| lines.iter().position(|l| l["type"] == kind).unwrap_or_else(|| panic!("no {kind}: {printed}"));
+    assert_eq!(lines[at("turn_refused")]["hook"], "tests", "{printed}");
+    // The turn's count and the gate's own refusals left, each said as what it is.
+    assert_eq!((&lines[at("turn_refused")]["continuation"], &lines[at("turn_refused")]["continuations_left"]), (&serde_json::json!(0), &serde_json::json!(2)), "{printed}");
+    assert_eq!(lines[at("turn_verified")]["hooks"], serde_json::json!(["lint", "tests"]), "{printed}");
+    assert!(at("turn_refused") < at("turn_verified") && at("turn_verified") + 2 == lines.len(), "{printed}");
+    assert_eq!(lines[lines.len() - 1]["stop_reason"], "stop", "{printed}");
+
+    let id = lines[0]["session_id"].as_str().unwrap();
+    let log = home.join(".openmax").join("sessions").join(format!("{id}.events.jsonl"));
+    let replayed = cmd(&project, &home).arg("--replay").arg(&log).arg("--json").output().unwrap();
+    assert_eq!(replayed.status.code(), Some(0), "{}", String::from_utf8_lossy(&replayed.stderr));
+    assert_eq!(String::from_utf8(replayed.stdout).unwrap(), printed, "the replay prints what the run printed");
+    // Without --json the refusal is a line on stderr, with the turn's count and the gate's own refusals left.
+    std::fs::remove_file(base.join("refused")).unwrap();
+    let text = cmd(&project, &home).args(["-p", "ship it again"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert_eq!(text.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("gate 'tests' refused completion (refusal 1 of this turn; this gate may refuse 1 more)"), "{stderr}");
+    let _ = std::fs::remove_dir_all(base);
 }
 
 /// A completion gate's refusal reaches the model as a user message right
@@ -4237,24 +4392,26 @@ fn an_unknown_flag_is_a_usage_error() {
 }
 
 /// SIGKILL the watcher of the run whose record of its tool groups is
-/// `record`, and say whether there was one: the process whose command line
-/// names it (`openmax --lifeline <record> <start>`), which the record's
-/// first write starts, waited for up to 10 seconds. A run killed after it
+/// `record`, and say whether there was one (`watcher`). A run killed after it
 /// leaves its tools to the next launch, the backstop for a watcher that is
 /// gone too.
 fn kill_watcher(record: &Path) -> bool {
+    watcher(record).map(|watcher| unsafe { libc::kill(watcher, libc::SIGKILL) }).is_some()
+}
+
+/// The pid of the watcher of the run whose record of its tool groups is
+/// `record`: the process whose command line names it (`openmax --lifeline
+/// <record> <start>`), which the record's first write starts, waited for up
+/// to 10 seconds.
+fn watcher(record: &Path) -> Option<i32> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let out = Command::new("ps").args(["-A", "-ww", "-o", "pid=", "-o", "args="]).output().expect("ps runs");
         let (listing, needle) = (String::from_utf8_lossy(&out.stdout), record.to_string_lossy());
         let watcher: Option<i32> =
             listing.lines().filter(|line| line.contains(&*needle)).find_map(|line| line.split_whitespace().next()?.parse().ok());
-        if let Some(watcher) = watcher {
-            unsafe { libc::kill(watcher, libc::SIGKILL) };
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
+        if watcher.is_some() || std::time::Instant::now() >= deadline {
+            return watcher;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -4270,6 +4427,27 @@ struct ToolTree {
     _stdin: Option<std::process::ChildStdin>,
     pids: Vec<i32>,
     base: PathBuf,
+}
+
+/// Set SIGHUP to `disposition` in the child `command` spawns, whatever this
+/// test process inherited. A run honors a SIGHUP it inherited as ignored
+/// (`a_signal_the_run_inherited_as_ignored_stays_ignored`), and a suite
+/// started under `nohup` passes that ignore to every child, so a test that
+/// sends SIGHUP would otherwise test the invoking shell, not the run.
+fn sighup_in_child(command: &mut Command, disposition: libc::sighandler_t) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: sigaction is async-signal-safe, and nothing else runs between
+    // fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = disposition;
+            match libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        })
+    }
 }
 
 /// Start `args` (a print or a stdio run) and return once the bash call's
@@ -4288,7 +4466,7 @@ fn start_tool_tree(tag: &str, args: &[&str], preamble: &str) -> ToolTree {
     ]);
     write_settings_with_mode(&home, &base_url, "auto");
     let stdio = args.contains(&"--stdio");
-    let mut child = cmd(&project, &home)
+    let mut child = sighup_in_child(&mut cmd(&project, &home), libc::SIG_DFL)
         .arg("--trust-project")
         .args(args)
         .stdin(if stdio { Stdio::piped() } else { Stdio::null() })
@@ -4458,6 +4636,7 @@ fn sigint_sighup_and_sigquit_stop_a_sub_agent_and_keep_its_work() {
         write_settings_with_mode(&home, &base_url, "auto");
         open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
         let mut command = cmd(&project, &home);
+        sighup_in_child(&mut command, libc::SIG_DFL);
         command.envs(SUB_AGENT_GIT).args(["--subagent", "start the tree", "--worktree"]);
         if json {
             command.arg("--json");
@@ -4651,6 +4830,12 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
 
     let ToolTree { child, _stdin, pids, base } =
         start_tool_tree("record-killed", &["--json", "-p", "start the tree"], "trap '' TERM; ");
+    // The record's thread writes the group just after its spawn returns, which
+    // can be after the tree has written its pids, and then starts the watcher.
+    // Once the watcher runs, that thread has nothing left to do before the
+    // signals, so the exit's bounded wait for it covers removing the record.
+    let record = base.join("home").join(".openmax").join("run").join(format!("{}.groups", child.id()));
+    let watched = watcher(&record);
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     std::thread::sleep(std::time::Duration::from_millis(100));
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
@@ -4667,6 +4852,7 @@ fn a_run_that_stops_its_tools_leaves_no_record_of_them() {
     assert_eq!(lines[2], format!("-{}", lines[1]), "a finished tool round left its group listed: {during:?}");
     assert!(!finished_left, "a run whose tool round finished left its record\n{stderr}");
     let stderr = String::from_utf8_lossy(&killed.stderr);
+    assert!(watched.is_some(), "the run's first tool started no watcher of {}\n{stderr}", record.display());
     assert_eq!(killed.status.code(), Some(143), "{:?}\n{stderr}", killed.status);
     assert!(!killed_left, "a run whose second signal killed its tools left their record\n{stderr}");
 }
@@ -5439,7 +5625,6 @@ fn a_signal_ends_a_stdio_session_waiting_on_the_trust_store_to_save_an_approval_
 /// A handler for it would cancel the turn the parent meant to keep.
 #[test]
 fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
-    use std::os::unix::process::CommandExt;
     let (project, home) = fresh_dirs("sighup-ignored");
     let pid_file = project.parent().unwrap().join("pids");
     let script = format!("echo $$ >> '{}'; sleep 1", pid_file.display());
@@ -5448,25 +5633,13 @@ fn a_signal_the_run_inherited_as_ignored_stays_ignored() {
         (sse_text("done"), true),
     ]);
     write_settings_with_mode(&home, &base_url, "auto");
-    let mut command = cmd(&project, &home);
-    command
+    let mut child = sighup_in_child(&mut cmd(&project, &home), libc::SIG_IGN)
         .args(["--trust-project", "--json", "-p", "outlive the terminal"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: sigaction is async-signal-safe, and nothing else runs between
-    // fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            let mut ignore: libc::sigaction = std::mem::zeroed();
-            ignore.sa_sigaction = libc::SIG_IGN;
-            match libc::sigaction(libc::SIGHUP, &ignore, std::ptr::null_mut()) {
-                0 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            }
-        });
-    }
-    let mut child = command.spawn().unwrap();
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::fs::read_to_string(&pid_file).unwrap_or_default().trim().is_empty() {
         if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {

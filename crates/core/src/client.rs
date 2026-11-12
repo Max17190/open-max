@@ -161,10 +161,22 @@ fn chat_replay(message: &ChatMessage, origin: &str, prefer_details: bool) -> (bo
     (replay, plain)
 }
 
+/// An assistant message that would go out with no text, no call and no
+/// reasoning: a reply cut while reasoning, sent to an endpoint its reasoning
+/// does not go to. Chat templates can reject an empty assistant turn, so it
+/// is not sent at all.
+pub(crate) fn blank_on_wire(message: &ChatMessage, replay: bool) -> bool {
+    message.role == "assistant"
+        && message.content.as_deref().is_none_or(str::is_empty)
+        && message.tool_calls.as_deref().is_none_or(<[_]>::is_empty)
+        && !(replay && (message.reasoning_content.is_some() || message.reasoning.is_some() || message.reasoning_details.is_some()))
+}
+
 impl Serialize for WireMessages<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let last = self.messages.len().saturating_sub(1);
-        serializer.collect_seq(self.messages.iter().enumerate().map(|(at, m)| {
+        let sent = |m: &&ChatMessage| !blank_on_wire(m, m.reasoning_origin.as_deref() == Some(self.origin));
+        let last = self.messages.iter().filter(sent).count().saturating_sub(1);
+        serializer.collect_seq(self.messages.iter().filter(sent).enumerate().map(|(at, m)| {
             let (replay, plain) = chat_replay(m, self.origin, self.prefer_reasoning_details);
             let mark = self.marks && (at == last || m.role == "system");
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
@@ -1068,7 +1080,7 @@ async fn read_sse(
             scanned = 0;
             let rest = buf.split_off(pos + 1);
             let consumed = std::mem::replace(&mut buf, rest);
-            let line = trim_bytes(&consumed[..pos]);
+            let line = consumed[..pos].trim_ascii();
             if line.is_empty() || line.first() == Some(&b':') {
                 continue;
             }
@@ -1354,23 +1366,13 @@ pub(crate) fn strip_leading_think(content: &str) -> Option<String> {
     None
 }
 
-fn trim_bytes(mut s: &[u8]) -> &[u8] {
-    while s.first().is_some_and(|b| b.is_ascii_whitespace()) {
-        s = &s[1..];
-    }
-    while s.last().is_some_and(|b| b.is_ascii_whitespace()) {
-        s = &s[..s.len() - 1];
-    }
-    s
-}
-
 /// The payload of one SSE line, or None for a line that carries none: an
 /// empty `data:` line, or another field (`event:`, `id:`, `retry:`), which
 /// is passed over as the format asks. A line with no field name that opens
 /// like JSON is taken as data too, for servers that send it bare.
 fn data_line(line: &[u8]) -> Option<&[u8]> {
     match line.strip_prefix(b"data:") {
-        Some(data) => Some(trim_bytes(data)).filter(|data| !data.is_empty()),
+        Some(data) => Some(data.trim_ascii()).filter(|data| !data.is_empty()),
         None => matches!(line.first(), Some(b'{' | b'[')).then_some(line),
     }
 }
@@ -1641,11 +1643,7 @@ pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        let mut end = max;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &s[..end])
+        format!("{}…", &s[..crate::text::floor_char_boundary(s, max)])
     }
 }
 
@@ -1863,8 +1861,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn trim_bytes_strips_whitespace() {
-        assert_eq!(trim_bytes(b"  hello \r"), b"hello");
+    fn sse_lines_are_trimmed_of_ascii_whitespace() {
+        assert_eq!(b"  hello \r".trim_ascii(), b"hello");
     }
 
     #[test]
@@ -1940,7 +1938,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_sse_line_extracts_content() {
         let line = br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
-        let data = data_line(trim_bytes(line)).unwrap();
+        let data = data_line(line.trim_ascii()).unwrap();
         let chunk: StreamChunk = serde_json::from_slice(data).unwrap();
         let delta = chunk.choices.unwrap().remove(0).delta.unwrap();
         assert_eq!(delta.content.as_deref(), Some("hi"));
@@ -2742,7 +2740,9 @@ pub(crate) mod tests {
     /// into a hang.
     #[tokio::test]
     async fn an_address_that_never_answers_gives_up_before_the_budget() {
-        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        close_until_refused(listener);
         let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
         let reason = format!("cannot connect to {addr} (connection refused)");
         assert_eq!(deltas, [2, 3].map(|n| format!("{n}/{UNREACHED_ATTEMPTS}:{reason}")));
@@ -2763,7 +2763,7 @@ pub(crate) mod tests {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             // Gone before it answers, so every later attempt is refused.
-            drop(listener);
+            close_until_refused(listener);
             let mut reader = std::io::BufReader::new(stream);
             let mut length = 0;
             loop {
@@ -2789,6 +2789,27 @@ pub(crate) mod tests {
             ]
         );
         assert!(err.starts_with(&format!("{refused}: nothing is listening there")), "{err}");
+    }
+
+    /// Close `listener` and return once its port refuses connections. A
+    /// child process that another test forks holds a copy of every open
+    /// descriptor until it execs, so a dropped listener can still take a
+    /// connection, which is reset when that copy closes: a busy machine
+    /// stretches that window enough for a retry to land in it. Each probe
+    /// is bounded: one the open copy never accepts can fill its queue, and a
+    /// connect to a full queue waits instead of failing.
+    fn close_until_refused(listener: std::net::TcpListener) {
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let probe = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100));
+            if probe.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{addr} still takes connections after its listener closed: {probe:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// The error a request to `url` ends with and its retry announcements,

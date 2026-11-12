@@ -2957,15 +2957,17 @@ impl App {
                 // transcript. The note carries what the block cannot: whose
                 // verdict this was and how close the harness is to overriding.
                 self.note(&format!(
-                    "turn_end gate '{hook}' refused completion (refusal {} of {}); its reason continues the turn:",
+                    "turn_end gate '{hook}' refused completion (refusal {} of this turn; this gate may refuse {} more); its reason continues the turn:",
                     continuation + 1,
-                    continuation + continuations_left,
+                    continuations_left.saturating_sub(1),
                 ));
                 self.insert_user_block(&reason);
                 // An open find popup indexes blocks; the injected one must
                 // enter its matches now, exactly as a finished message does.
                 self.refilter_scroll_search_live();
             }
+            // A record for callers (the event log, `--json`, stdio), not a line on every turn's end.
+            AgentEvent::TurnVerified { .. } => {}
             AgentEvent::SteerAccepted { text } => {
                 // The steer leaves the queue strip for its place in the
                 // transcript, the one a resumed session replays it at.
@@ -2998,7 +3000,8 @@ impl App {
                 match stop_reason.as_str() {
                     "stop" | "tool_calls" => self.push_turn_stats(),
                     "cancelled" => self.note("cancelled"),
-                    "length" => self.note("stopped: hit the response token limit"),
+                    "length" => self.note(&format!("stopped: {}", crate::headless::reply_limit_note(&self.core, "Send a follow-up to continue. \
+                        A raised limit applies from the next turn in providers.json, and once openmax is restarted with --continue in settings.json"))),
                     "max_iterations" => {
                         let cap = self.core.settings.lock().unwrap().max_agent_iterations;
                         let how = "Send a follow-up to continue. A higher max_agent_iterations in settings.json \
@@ -6753,6 +6756,33 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A reply the output limit cut while the model was still reasoning is
+    /// kept as an assistant message with reasoning and no text. Reopened, the
+    /// session draws exactly what it draws without that message: no empty
+    /// reply block and no blank line for it.
+    #[test]
+    fn replay_draws_nothing_for_a_reasoning_only_reply() {
+        use open_max_core::types::ChatMessage;
+        let mut thought = ChatMessage::assistant(None, None);
+        thought.reasoning_content = Some("half a thought".into());
+        thought.reasoning_origin = Some("origin".into());
+        let note = ChatMessage::user("[reply cut: continue]");
+        let drawn = |messages: Vec<ChatMessage>| {
+            let (mut app, dir) = app_fixture();
+            let meta = open_max_core::sessions::create(&app.core, app.project.display().to_string()).unwrap();
+            open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut 0, false);
+            app.replay(&meta.id);
+            // The first row names the fixture's own project directory.
+            let text = buffer_text(&render_app(&mut app, 100, 30)).split_once('\n').unwrap().1.to_string();
+            fs::remove_dir_all(dir).unwrap();
+            text
+        };
+        let answer = ChatMessage::assistant(Some("done".into()), None);
+        let with = drawn(vec![ChatMessage::user("go"), thought, note.clone(), answer.clone()]);
+        assert_eq!(with, drawn(vec![ChatMessage::user("go"), note, answer]));
+        assert!(with.contains("done") && !with.contains("half a thought"), "{with}");
+    }
+
     /// Opening a marathon session from the /resume picker: the width is
     /// already set from prior paints, replay pushes every persisted message
     /// through the incremental append path, then one frame paints. Not a
@@ -7166,6 +7196,29 @@ mod tests {
             text.contains(
                 "stopped: reached the limit of 7 tool-call rounds for one turn. Send a follow-up to continue. \
                  A higher max_agent_iterations in settings.json applies once openmax is restarted with --continue"
+            ),
+            "{text}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A reply cut at its output limit (a reasoning model can spend the whole
+    /// limit thinking) says which setting cut it, the value in force, where it
+    /// is set, and how to go on; it used to say only "hit the response token limit".
+    #[tokio::test]
+    async fn a_reply_cut_at_its_limit_names_max_tokens_and_how_to_continue() {
+        let (mut app, dir) = app_fixture();
+        {
+            let mut s = app.core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = ("http://127.0.0.1:9/v1".into(), "m".into(), Some(65536), 6000);
+        }
+        app.running = true;
+        app.on_agent_event(AgentEvent::Done { stop_reason: "length".into() });
+        let text = app.transcript.export_text();
+        assert!(
+            text.contains(
+                "stopped: the reply reached its output limit before it finished; reasoning counts toward it. \
+                 The limit is max_tokens (now 6000), on the model's providers.json entry, else in settings.json. Send a follow-up to continue."
             ),
             "{text}"
         );
