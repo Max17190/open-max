@@ -163,6 +163,11 @@ the prompts after it.
 | 3 | The project is not trusted, or trust cannot be granted from this process |
 | 4 | A turn stopped short (`length` when five replies in a row reached their `max_tokens` before any tool call, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start repeats until the hook is repaired |
 
+[examples/run-task](../examples/run-task/README.md) is a caller built on these
+codes: it hands a print run one task and its own checks, a `turn_end` gate
+refuses the turn's end while a check fails, and it returns one JSON result
+with the checks, the changes and the replay command.
+
 Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches
 openmax and not them. SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 to a
 print or stdio run cancels the running turn, which stops each tool's process
