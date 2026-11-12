@@ -143,12 +143,15 @@ and the run that writes a key already uses it.
   before any tool call does not end the turn: it stays in the transcript
   (its reasoning too, which goes back only to the endpoint that wrote it),
   a note after it tells the model the limit and to continue briefly, and
-  the turn goes on. After four such continuations in a row, a fifth cut
-  reply ends the turn with `length` (so does a cut on the turn's last
-  iteration), and the terminal UI and print mode say which `max_tokens`
-  cut it and where it is set. Send a follow-up to continue. On a Responses
-  connection a reply that reaches the limit is reported incomplete and ends
-  the turn as truncated.
+  the turn goes on. A server can refuse a request that carries a reply
+  holding reasoning and nothing else (HTTP 400 or 422): that reasoning then
+  stops going back, in this session and after a resume, and the request is
+  sent once more without it. After four such continuations in a row, a
+  fifth cut reply ends the turn with `length` (so does a cut on the turn's
+  last iteration), and the terminal UI and print mode say which
+  `max_tokens` cut it and where it is set. Send a follow-up to continue.
+  On a Responses connection a reply that reaches the limit is reported
+  incomplete and ends the turn as truncated.
   For a reasoning model the limit is also a bound on how long it thinks
   before it acts. Setup leaves it at the default for a Chat Completions
   connection unless the catalog reports a lower output maximum, which it
