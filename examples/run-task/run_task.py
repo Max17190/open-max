@@ -254,6 +254,7 @@ def main():
         "checks": checks,
         "ceilings": ceilings,
         "refusals": sum(1 for event in events if event.get("type") == "turn_refused" and event.get("hook") == HOOK),
+        "gates_passed": next((event.get("hooks") for event in reversed(events) if event.get("type") == "turn_verified"), []),
         "gate_log": str(out / "gate.jsonl") if (out / "gate.jsonl").is_file() else None,
         "changes": str(out / "changes.patch"),
         "files_changed": changed,

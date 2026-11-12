@@ -120,6 +120,7 @@ The script prints the result on stdout and writes it to `result.json`:
     }
   ],
   "refusals": 1,
+  "gates_passed": ["run-task-checks"],
   "gate_log": "/tmp/run-task-k2x9/gate.jsonl",
   "changes": "/tmp/run-task-k2x9/changes.patch",
   "files_changed": ["crates/parser/src/date.rs"],
@@ -139,6 +140,7 @@ The script prints the result on stdout and writes it to `result.json`:
 | `ceilings` | The `--max-agent-tokens` and `--max-agent-iterations` this call passed, or null |
 | `checks` | Each check: whether it `gates` the turn's end, its exit code `before` the work (null for a final check) and `after` it (null when the checks were not run again), and the time and the end of the output of that last run |
 | `refusals` | The ends of the turn the gate refused, counted from the `turn_refused` events |
+| `gates_passed` | The gates Open Max reports passed the end the turn stopped on, from its `turn_verified` event, or empty when no gate passed it. The checks this script runs afterwards still decide `verified` |
 | `gate_log` | One JSON line for each end of a turn the gate judged: the session, the `continuation`, whether a refusal could be honored (`blockable`), and each check's exit code, time and output. A session the agent starts itself inherits the gate and is logged here too |
 | `changes`, `files_changed` | The work tree after the run against the work tree before it, as a patch and as paths. Untracked files are included and ignored ones are not |
 | `usage` | The replies the model sent, and the sums of the run's `usage` events |

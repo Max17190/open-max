@@ -1073,6 +1073,10 @@ async fn run_loop(
             // turn_end run, so the late site stays quiet: one end, one fire.
             turn_end_fired = true;
             stop_reason = if refused || outcome.unverified { "unverified".into() } else { result.finish_reason };
+            // An end that stands with every gate passing names them, so it reads apart from one no gate judged.
+            if !refused && !outcome.unverified && !outcome.passed.is_empty() {
+                core.send_agent(session_id, AgentEvent::TurnVerified { hooks: outcome.passed });
+            }
             break 'turns;
         }
 
@@ -6322,8 +6326,9 @@ mod tests {
         }
         let cancelled_at = std::time::Instant::now();
         core.cancel(id);
-        let (stop, _) = drive_turn(&mut rx).await;
+        let (stop, events) = drive_turn_events(&mut rx).await;
         assert_eq!(stop, "cancelled");
+        assert!(verified(&events).is_empty(), "a gate the cancel stopped passed nothing: {events:?}");
         assert!(cancelled_at.elapsed() < Duration::from_secs(10), "the cancel waited for the gate: {:?}", cancelled_at.elapsed());
         assert_eq!(std::fs::read_to_string(project.join("ends")).unwrap(), "cancelled\n", "the hooks hear the cancel once");
         let _ = std::fs::remove_dir_all(dir);
@@ -6346,6 +6351,11 @@ mod tests {
             }
         }
         panic!("the turn never emitted Done");
+    }
+
+    /// The gates each `TurnVerified` among `events` named.
+    fn verified(events: &[AgentEvent]) -> Vec<Vec<String>> {
+        events.iter().filter_map(|e| match e { AgentEvent::TurnVerified { hooks } => Some(hooks.clone()), _ => None }).collect()
     }
 
     /// A honored refusal grows the transcript with a user message the client
@@ -6412,6 +6422,12 @@ mod tests {
             )],
             "one honored refusal, named by hook stem, carrying the payload's numbers"
         );
+        // The gate passes the next end after refusing this one: the pass is
+        // reported after the refusal, and the refusal stays in the record.
+        let refused_at = events.iter().position(|e| matches!(e, AgentEvent::TurnRefused { .. })).unwrap();
+        let passed_at = events.iter().position(|e| matches!(e, AgentEvent::TurnVerified { .. }));
+        assert!(passed_at > Some(refused_at), "the pass follows the refusal: {events:?}");
+        assert_eq!(verified(&events), [["verify"]]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6473,6 +6489,7 @@ mod tests {
             !events.iter().any(|e| matches!(e, AgentEvent::TurnRefused { .. })),
             "the wire must not claim a continuation the disk denies"
         );
+        assert!(verified(&events).is_empty(), "a refused end is not a passed one: {events:?}");
         assert!(
             events.iter().any(|e| matches!(e,
                 AgentEvent::HookFailed { detail, .. } if detail.contains("refusal not honored")
@@ -6531,6 +6548,7 @@ mod tests {
             crate::hooks::MAX_TURN_END_CONTINUATIONS,
             "one event per honored refusal; the override is a failure, not a continuation"
         );
+        assert!(verified(&events).is_empty(), "an end refused past the bound passed nothing");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6850,9 +6868,10 @@ mod tests {
 
         let id = "sess-once";
         start_turn(core.clone(), id.into(), project, "ship it".into()).unwrap();
-        let (stop, _) = drive_turn(&mut rx).await;
+        let (stop, events) = drive_turn_events(&mut rx).await;
         assert_eq!(stop, "stop");
         assert_eq!(*requests.lock().unwrap(), 1);
+        assert_eq!(verified(&events), [["count"]], "the one gate passed this end");
         let lines: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
@@ -6867,6 +6886,68 @@ mod tests {
             lines[0]["continuations_left"],
             crate::hooks::MAX_TURN_END_CONTINUATIONS
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An end every gate passed names each gate that judged it, and only
+    /// gates: an observe-only `turn_end` hook judged nothing. A project with
+    /// no gate, and an end the model did not ask for (here the iteration
+    /// budget), get no such line, though their hooks ran and exited 0.
+    #[tokio::test]
+    async fn a_passing_end_names_its_gates_and_no_other_end_claims_a_pass() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let (gated, ungated) = (dir.join("gated"), dir.join("ungated"));
+        let script = dir.join("pass.sh");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_exec(&script, &format!("#!/bin/sh
+cat > /dev/null
+echo run >> {}
+", dir.join("runs").display()));
+        let hook = |project: &Path, name: &str, blocking: bool| {
+            let toml = project.join(".openmax/hooks").join(format!("{name}.toml"));
+            std::fs::create_dir_all(toml.parent().unwrap()).unwrap();
+            std::fs::write(&toml, format!("event = \"turn_end\"\nblocking = {blocking}\ncommand = \"{}\"\n", script.display()))
+                .unwrap();
+            approve_hook(&core, project, &toml);
+        };
+        hook(&gated, "lint", true);
+        hook(&gated, "tests", true);
+        hook(&gated, "notify", false);
+        hook(&ungated, "notify", false);
+        for project in [&gated, &ungated] {
+            std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, project).unwrap();
+        }
+        let (stop_url, _) = counting_endpoint(STOP_SSE).await;
+        let (tool_url, _) = counting_endpoint(TOOL_SSE).await;
+        let run = |url: String, iterations: usize| {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_agent_iterations) = (url, "stub".into(), Some(16384), iterations);
+        };
+
+        run(stop_url.clone(), 10);
+        start_turn(core.clone(), "sess-gated".into(), gated.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "stop");
+        assert_eq!(verified(&events), [["lint", "tests"]], "both gates, in the order they ran, and not the observer");
+        assert!(matches!(events.last(), Some(AgentEvent::TurnVerified { .. })), "the pass is the last line before done: {events:?}");
+
+        start_turn(core.clone(), "sess-ungated".into(), ungated.clone(), "ship it".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "stop");
+        assert!(verified(&events).is_empty(), "no gate judged this end: {events:?}");
+
+        run(tool_url, 1);
+        start_turn(core.clone(), "sess-budget".into(), gated.clone(), "keep reading".into()).unwrap();
+        let (stop, events) = drive_turn_events(&mut rx).await;
+        assert_eq!(stop, "max_iterations");
+        assert!(verified(&events).is_empty(), "an end the model did not ask for is not verified: {events:?}");
+        let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        assert_eq!(runs.lines().count(), 3 + 1 + 3, "every hook ran on every end, the budget's included");
 
         let _ = std::fs::remove_dir_all(dir);
     }

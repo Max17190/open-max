@@ -2966,6 +2966,8 @@ impl App {
                 // enter its matches now, exactly as a finished message does.
                 self.refilter_scroll_search_live();
             }
+            // A record for callers (the event log, `--json`, stdio), not a line on every turn's end.
+            AgentEvent::TurnVerified { .. } => {}
             AgentEvent::SteerAccepted { text } => {
                 // The steer leaves the queue strip for its place in the
                 // transcript, the one a resumed session replays it at.
