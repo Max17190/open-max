@@ -362,9 +362,9 @@ async fn run_turn_events(
             AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
                 let _ = writeln!(
                     stderr,
-                    "openmax: turn_end gate '{hook}' refused completion (refusal {} of {}): {}",
+                    "openmax: turn_end gate '{hook}' refused completion (refusal {} of this turn; this gate may refuse {} more): {}",
                     continuation + 1,
-                    continuation + continuations_left,
+                    continuations_left.saturating_sub(1),
                     one_line(reason),
                 );
             }

@@ -194,7 +194,8 @@ A completion gate runs once per end of a turn rather than before every call,
 so it may set up to 600, the most one `bash` call may run; a cancel stops it
 like a tool call, an end the model did not ask for (a cancel, a spent budget,
 an error) gives it 60, and with 8 refusals honored it runs at most nine times
-in one turn (one more than its `max_refusals` when that is lower).
+in one turn. A gate that keeps refusing runs at most one more time than its
+`max_refusals`; a passing gate may run again whenever another gate refuses.
 
 A `post_tool_use` payload carries the tool result the model saw: `output` (its
 first 16 KiB, cut on a character boundary), `output_bytes` (that result's

@@ -2756,17 +2756,17 @@ fn a_passed_end_names_its_gates_and_replays_byte_for_byte() {
     use std::os::unix::fs::PermissionsExt;
     let (project, home) = fresh_dirs("verified");
     let base = project.parent().unwrap().to_path_buf();
-    let replies = ["r1", "r1 checked"].map(sse_text).to_vec();
+    let replies = ["r1", "r1 checked", "r2", "r2 checked"].map(sse_text).to_vec();
     let (base_url, _server) = spawn_recording_server(replies, base.join("requests.jsonl"));
     write_settings_with_mode(&home, &base_url, "auto");
     let hooks = project.join(".openmax").join("hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     let refuse_once = format!("[ -f '{0}' ] && exit 0\n: > '{0}'\necho 'one test fails'\nexit 1", base.join("refused").display());
-    for (name, body) in [("lint", "exit 0".to_string()), ("tests", refuse_once)] {
+    for (name, body, bound) in [("lint", "exit 0".to_string(), ""), ("tests", refuse_once, "max_refusals = 2\n")] {
         let gate = base.join(format!("{name}.sh"));
         std::fs::write(&gate, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let manifest = format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n", gate.display());
+        let manifest = format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n{bound}", gate.display());
         std::fs::write(hooks.join(format!("{name}.toml")), manifest).unwrap();
     }
 
@@ -2776,6 +2776,8 @@ fn a_passed_end_names_its_gates_and_replays_byte_for_byte() {
     let lines: Vec<serde_json::Value> = printed.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let at = |kind: &str| lines.iter().position(|l| l["type"] == kind).unwrap_or_else(|| panic!("no {kind}: {printed}"));
     assert_eq!(lines[at("turn_refused")]["hook"], "tests", "{printed}");
+    // The turn's count and the gate's own refusals left, each said as what it is.
+    assert_eq!((&lines[at("turn_refused")]["continuation"], &lines[at("turn_refused")]["continuations_left"]), (&serde_json::json!(0), &serde_json::json!(2)), "{printed}");
     assert_eq!(lines[at("turn_verified")]["hooks"], serde_json::json!(["lint", "tests"]), "{printed}");
     assert!(at("turn_refused") < at("turn_verified") && at("turn_verified") + 2 == lines.len(), "{printed}");
     assert_eq!(lines[lines.len() - 1]["stop_reason"], "stop", "{printed}");
@@ -2785,6 +2787,12 @@ fn a_passed_end_names_its_gates_and_replays_byte_for_byte() {
     let replayed = cmd(&project, &home).arg("--replay").arg(&log).arg("--json").output().unwrap();
     assert_eq!(replayed.status.code(), Some(0), "{}", String::from_utf8_lossy(&replayed.stderr));
     assert_eq!(String::from_utf8(replayed.stdout).unwrap(), printed, "the replay prints what the run printed");
+    // Without --json the refusal is a line on stderr, with the turn's count and the gate's own refusals left.
+    std::fs::remove_file(base.join("refused")).unwrap();
+    let text = cmd(&project, &home).args(["-p", "ship it again"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert_eq!(text.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("gate 'tests' refused completion (refusal 1 of this turn; this gate may refuse 1 more)"), "{stderr}");
     let _ = std::fs::remove_dir_all(base);
 }
 
