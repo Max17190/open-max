@@ -869,7 +869,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                 status: match crate::providers::resolve(&settings, data_dir) {
                     Ok(endpoint) => {
                         let entry = endpoint.provider.as_ref().and_then(|p| crate::providers::load_providers(data_dir).remove(p)).and_then(|p| p.models.into_iter().find(|m| m.id == endpoint.model)?.max_tokens);
-                        let from = if entry.is_some() { "the model entry" } else if settings.max_tokens != crate::config::Settings::default().max_tokens { "settings" } else if endpoint.chatgpt.is_some() { "the default, a local reserve on this route" } else { "" };
+                        let from = if entry.is_some() { "the model entry" } else if settings.max_tokens != crate::config::Settings::default().max_tokens { "settings" } else if endpoint.chatgpt.is_some() { "the default, a local reserve on this route" } else if endpoint.wire_api == crate::providers::WireApi::ChatCompletions { "the default" } else { "" };
                         let row = format!("model {} via {}, {}-token window, reply limit max_tokens = {}", endpoint.model, endpoint.provider.as_deref().unwrap_or("base_url"), endpoint.context_tokens, endpoint.max_tokens);
                         if !from.is_empty() { Status::Ok(format!("{row} from {from}; read at launch, not hot (openmax --spec settings)")) }
                         else { Status::Warn(format!("{row}, the default: a reply longer than this, its reasoning included, is cut, and five cuts in a row before any tool call end the turn; set max_tokens on the model's providers.json entry (or in settings.json) to its documented output maximum (4096 counts as chosen only on the entry, since every settings save writes 4096 when it is unset); read at launch, not hot (openmax --spec settings)")) }
@@ -4495,9 +4495,9 @@ mod tests {
         .unwrap();
         let findings = check_at(&root, &data);
         let s = findings.iter().find(|f| f.kind == "settings").unwrap();
-        // It resolves, at the default reply limit, which is worth acting on.
-        assert!(matches!(s.status, Status::Warn(_)), "{:?}", s.status);
-        assert!(s.status.summary().contains("max_tokens = 4096, the default"), "{}", s.status.summary());
+        // It resolves; the default reply limit is stated, not warned about.
+        assert!(matches!(s.status, Status::Ok(_)), "{:?}", s.status);
+        assert!(s.status.summary().contains("max_tokens = 4096 from the default"), "{}", s.status.summary());
         std::fs::write(
             data.join("settings.json"),
             r#"{"base_url":"http://x/v1","model":"m","approval_mode":"auto","context_tokens":32768,"max_tokens":8192}"#,

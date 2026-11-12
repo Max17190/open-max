@@ -289,6 +289,8 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
                 .ok_or("context window must be a positive number of tokens")? as u64
         }
     };
+    api_defaults(&mut entry, &name, previous.is_none())?;
+    let inherited = entry.get("wire_api").is_none_or(|w| w == "chat_completions").then(|| open_max_core::config::load(dir).map_or(4096, |s| s.max_tokens) as u64);
     let catalog = entry
         .as_object_mut()
         .unwrap()
@@ -297,7 +299,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     let catalog = catalog
         .as_array_mut()
         .ok_or("provider models must be an array")?;
-    record_model(catalog, &model, window, metadata);
+    record_model(catalog, &model, window, metadata, inherited);
     entry["base_url"] = json!(base);
     entry["api_key"] = json!(if key.starts_with('$') {
         format!("${key}")
@@ -305,7 +307,6 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         key
     });
     entry.as_object_mut().unwrap().remove("api_key_env");
-    api_defaults(&mut entry, &name, previous.is_none())?;
     providers::edit_catalog(dir, |entries| {
         unchanged(entries.get(&name), previous.as_ref())?;
         entries.insert(name.clone(), entry);
@@ -324,13 +325,13 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     Ok(())
 }
 
-/// Saves the model's window and, when the catalog reports the model's output
-/// maximum, a reply limit: that maximum, capped at a quarter of the window (but
-/// not below the 4096 default) since the limit is also the input reserve. A
-/// limit already on the entry is kept; with no reported maximum none is guessed.
-fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value) {
+/// Saves the model's window and the output maximum a catalog reports as the reply
+/// limit; on Chat Completions only one under `inherited`, the limit an entry without
+/// one runs at. It is capped at a quarter of the window (not below the 4096 default)
+/// as it is also the input reserve. An entry's limit is kept; none reported, none guessed.
+fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value, inherited: Option<u64>) {
     let most = ["max_completion_tokens", "max_output_tokens", "max_tokens"].iter().find_map(|k| metadata[*k].as_u64())
-        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0);
+        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0 && inherited.is_none_or(|limit| *n < limit));
     let i = catalog.iter().position(|m| m["id"] == model).unwrap_or_else(|| { catalog.push(json!({"id":model})); catalog.len() - 1 });
     catalog[i]["context_tokens"] = json!(window);
     if let (Some(most), None) = (most, catalog[i].get("max_tokens")) { catalog[i]["max_tokens"] = json!(most.min((window / 4).max(4096))); }
