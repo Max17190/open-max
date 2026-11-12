@@ -550,7 +550,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                             text,
                             "hook",
                             crate::hooks::MIN_TIMEOUT_SECS,
-                            crate::hooks::MAX_TIMEOUT_SECS,
+                            crate::hooks::max_timeout_secs(h.event, h.blocking),
                         )
                     }) {
                         // A gate that times out blocks, so the clamp decides
@@ -559,6 +559,8 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                         // on the same terms.
                         if h.gates() {
                             reason.push_str("; a gate that times out blocks");
+                        } else if h.event == crate::hooks::HookEvent::TurnEnd {
+                            reason.push_str(&format!("; with `blocking = true`, a completion gate may set up to {}", crate::tools::BASH_MAX_TIMEOUT_SECS));
                         }
                         hook_clamps.push((hooks_found.len(), reason));
                     }
@@ -4133,6 +4135,16 @@ mod tests {
             root.join(".openmax/hooks/watch.toml"),
             "event = \"turn_end\"\ncommand = \"/bin/echo\"\ntimeout_secs = 5\n",
         );
+        // A completion gate runs once per end, so it may ask for a bash call's
+        // ceiling; an observer of the same event may not, and is told what would.
+        write(
+            root.join(".openmax/hooks/suite.toml"),
+            "event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n",
+        );
+        write(
+            root.join(".openmax/hooks/late.toml"),
+            "event = \"turn_end\"\ncommand = \"/bin/echo\"\ntimeout_secs = 61\n",
+        );
 
         let findings = local_at(&root, &data);
         let clamped = |needle: &str| {
@@ -4158,8 +4170,16 @@ mod tests {
             }
             other => panic!("a gate's clamped timeout must be reported: {other:?}"),
         }
+        match clamped("late.toml").map(|f| &f.status) {
+            Some(Status::Warn(reason)) => {
+                assert!(reason.contains("1..60") && reason.contains("clamped to 60 seconds"), "{reason}");
+                assert!(reason.contains("with `blocking = true`, a completion gate may set up to 600"), "{reason}");
+            }
+            other => panic!("an observer asking for 61 must be told what would allow it: {other:?}"),
+        }
         // A value the loader honours is not worth a line.
         assert!(clamped("watch.toml").is_none(), "{findings:?}");
+        assert!(clamped("suite.toml").is_none(), "{findings:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4175,7 +4195,7 @@ mod tests {
         let data = root.join("data");
         let gate = root.join(".openmax/hooks/verify.toml");
         let gate_body =
-            "event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n";
+            "event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\ntimeout_secs = 601\n";
         write(gate.clone(), gate_body);
         write(
             root.join(".openmax/hooks/watch.toml"),

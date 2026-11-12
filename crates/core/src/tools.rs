@@ -2127,7 +2127,7 @@ pub(crate) const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// a command that then times out is told so: when the result named only the
 /// ceiling, nothing said the request had been cut, and a retry asked for the
 /// same deadline and was held again.
-const BASH_MAX_TIMEOUT_SECS: u64 = 600;
+pub(crate) const BASH_MAX_TIMEOUT_SECS: u64 = 600;
 
 /// The deadline a bash call runs under, and the request it was held down
 /// from when there was one.

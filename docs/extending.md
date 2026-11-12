@@ -181,6 +181,12 @@ hook gets one JSON payload on stdin. `user_prompt_submit` also runs on every
 message steered into a running turn, with the payload a prompt gets, so a gate
 with side effects runs once per steer too.
 
+A hook is stopped after its `timeout_secs`: 10 seconds unless set, at most 60.
+A completion gate runs once per end of a turn rather than before every call,
+so it may set up to 600, the most one `bash` call may run; a cancel stops it
+like a tool call, a cancelled turn's end gives it 60, and with 8 refusals
+honored it runs at most nine times in one turn.
+
 A `post_tool_use` payload carries the tool result the model saw: `output` (its
 first 16 KiB, cut on a character boundary), `output_bytes` (that result's
 size), and `output_truncated` (whether the payload dropped part of it). That is

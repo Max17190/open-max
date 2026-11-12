@@ -6,4 +6,5 @@ event = "turn_end"
 blocking = true
 command = "sh"
 args = ["-c", "[ -z \"$RUN_TASK_DIR\" ] || exec python3 \"$RUN_TASK_DIR/run_task_checks.py\""]
-timeout_secs = 60
+# The most a completion gate may run; the checks share it less a margin.
+timeout_secs = 600

@@ -176,7 +176,8 @@ def main():
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, stop_on_signal)
     (out / "checks.json").write_text(json.dumps(args.check))
-    shutil.copyfile(HERE / "run_task_checks.py", out / "run_task_checks.py")
+    for name in ("run_task_checks.py", f"{HOOK}.toml"):  # the checks read their time from the hook file
+        shutil.copyfile(HERE / name, out / name)
     # Before the start tree is taken, so files the checks leave behind are in
     # both trees and stay out of the changes.
     before = run_task_checks.run_checks(args.check, repo, run_task_checks.GATE_SECONDS)

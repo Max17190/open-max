@@ -1001,8 +1001,15 @@ async fn run_loop(
                     project_root,
                     &result.finish_reason,
                     crate::hooks::TurnEndAttempt { continuation, blockable },
+                    &cancelled,
                 )
                 .await;
+            // A cancel while a gate ran stopped it: the human ended the turn,
+            // and the late site tells every hook so.
+            if cancelled.is_cancelled() {
+                stop_reason = "cancelled".into();
+                break 'turns;
+            }
             report_hook_failures(core, session_id, outcome.failures);
             if let Some(refusal) = outcome.refusal {
                 if blockable {
@@ -1521,7 +1528,7 @@ async fn run_loop(
 /// `continuation` honored refusals, and reports the hooks that failed.
 async fn end_turn_hooks(core: &Arc<Core>, session_id: &str, hooks: &Hooks, root: &Path, stop_reason: &str, continuation: usize) {
     let attempt = crate::hooks::TurnEndAttempt { continuation, blockable: false };
-    report_hook_failures(core, session_id, hooks.turn_end(session_id, root, stop_reason, attempt).await.failures);
+    report_hook_failures(core, session_id, hooks.turn_end(session_id, root, stop_reason, attempt, &Arc::default()).await.failures);
 }
 
 /// The capability file behind a tool whose exact content no human has
@@ -6281,6 +6288,55 @@ mod tests {
             "the reason must reach the model as work to do: {messages:?}"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A completion gate may run for minutes, so a cancel while it runs stops
+    /// it the way a cancel stops a tool call: the turn ends `cancelled` at
+    /// once, not when the gate finishes, and the hooks then hear the cancel.
+    #[tokio::test]
+    async fn a_cancel_stops_a_long_completion_gate() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        let hooks_dir = project.join(".openmax/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script = project.join("verify.sh");
+        write_exec(
+            &script,
+            &format!(
+                "#!/bin/sh\nif grep -q '\"cancelled\"'; then echo cancelled >> {0}/ends; exit 0; fi\n: > {0}/started\nsleep 30\n",
+                project.display()
+            ),
+        );
+        let toml = hooks_dir.join("verify.toml");
+        std::fs::write(&toml, format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\ntimeout_secs = 600\n", script.display()))
+            .unwrap();
+        approve_hook(&core, &project, &toml);
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, _) = counting_endpoint(STOP_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+        }
+
+        let id = "sess-long-gate";
+        start_turn(core.clone(), id.into(), project.clone(), "ship it".into()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !project.join("started").exists() {
+            assert!(std::time::Instant::now() < deadline, "the gate never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let cancelled_at = std::time::Instant::now();
+        core.cancel(id);
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "cancelled");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(10), "the cancel waited for the gate: {:?}", cancelled_at.elapsed());
+        assert_eq!(std::fs::read_to_string(project.join("ends")).unwrap(), "cancelled\n", "the hooks hear the cancel once");
         let _ = std::fs::remove_dir_all(dir);
     }
 
