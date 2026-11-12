@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/9`)
+# stdio protocol (`openmax-stdio/10`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/10","protocol_version":10,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -312,6 +312,7 @@ Any wire change bumps `protocol_version`. What each version changed:
 
 | Version | Change |
 | --- | --- |
+| 10 | A `retry` can follow `token` lines of the attempt it voids: a reply the network cut after its text began is asked for again, at most twice in a row |
 | 9 | `turn_verified` event |
 | 8 | A `user` line sent while a turn runs steers that turn instead of being refused; `steer_accepted` and `steer_blocked` events |
 | 7 | `fork` and `rewind` commands and the `forked` line |

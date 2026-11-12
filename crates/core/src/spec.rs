@@ -1031,14 +1031,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/9)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/10)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/10","protocol_version":10,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
