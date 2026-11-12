@@ -1075,9 +1075,6 @@ fn check_names_an_untrusted_project_and_the_mode_it_was_graded_in() {
 fn check_prints_rows_to_act_on_and_counts_the_files_that_loaded() {
     let (project, home) = fresh_dirs("check-diet");
     write_settings(&home, "http://127.0.0.1:9/v1");
-    // A healthy setup sets its reply limit; at the default its settings row warns.
-    let settings = home.join(".openmax/settings.json");
-    std::fs::write(&settings, std::fs::read_to_string(&settings).unwrap().replace("}", r#","max_tokens":8192}"#)).unwrap();
     let grant = open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto);
     assert_eq!(grant.unwrap().1, Some(ApprovalMode::Auto));
     let tools = project.join(".openmax").join("tools");
@@ -1883,14 +1880,13 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
 }
 
 /// A reasoning model can spend a reply's whole `max_tokens` thinking: the
-/// reply comes back with finish reason `length`, no text and no call, and the
-/// turn ends. Print mode used to say only `stopped (length)` and `--check` did
-/// not show the limit at all, so a person at the 4096 default had nothing to
-/// act on. Now the stop line names the setting, its value and where it is set,
-/// and `--check` warns while the active model runs at the default and says
-/// nothing in its default report once the limit is set.
+/// reply comes back with finish reason `length`, no text and no call. When
+/// such cuts end the turn, the stop line names the setting, its value and
+/// where it is set. `--check --all` states the active model's limit and where
+/// it came from; the default limit is not a warning, so the default report
+/// leaves it out.
 #[test]
-fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
+fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() {
     let (project, home) = fresh_dirs("reply-limit");
     let cut = sse(&[serde_json::json!({"choices":[{"delta":{},"finish_reason":"length"}],
         "usage":{"prompt_tokens":10,"completion_tokens":4096}})]);
@@ -1913,10 +1909,10 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
         (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
     };
     let (code, report) = check(&["--check"]);
-    assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");
-    let row = report.lines().find(|l| l.contains("max_tokens")).unwrap_or_default();
-    assert!(row.starts_with("warn settings") && row.contains("reply limit max_tokens = 4096, the default: a reply longer than this, \
-        its reasoning included, is cut, and five cuts in a row before any tool call end the turn; set max_tokens on the model's providers.json entry"), "{report}");
+    assert_eq!(code, Some(0), "{report}");
+    assert!(!report.contains("max_tokens"), "the default limit is not a warning:\n{report}");
+    let (_, all) = check(&["--check", "--all"]);
+    assert!(all.lines().any(|l| l.starts_with("ok   settings") && l.contains("reply limit max_tokens = 4096 from the default;")), "{all}");
 
     let dir = home.join(".openmax");
     std::fs::write(dir.join("settings.json"), format!(r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"ask","context_tokens":16384,"max_tokens":8192}}"#)).unwrap();
@@ -1931,11 +1927,13 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_warns_at_the_default() {
     assert!(all.contains("reply limit max_tokens = 3000 from the model entry"), "{all}");
 
     // Every settings save writes 4096 when the limit is unset, so a 4096 in
-    // settings.json still reads as the default; on the model entry it is a choice.
+    // settings.json reads as the default; on the model entry it is a choice.
     std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"ask","max_tokens":4096}"#).unwrap();
     std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384}}]}}}}}}"#)).unwrap();
     let (_, report) = check(&["--check"]);
-    assert!(report.contains("max_tokens = 4096, the default") && report.contains("4096 counts as chosen only on the entry"), "{report}");
+    assert!(!report.contains("max_tokens"), "{report}");
+    let (_, all) = check(&["--check", "--all"]);
+    assert!(all.contains("reply limit max_tokens = 4096 from the default;"), "{all}");
     std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384,"max_tokens":4096}}]}}}}}}"#)).unwrap();
     let (_, report) = check(&["--check"]);
     assert!(!report.contains("max_tokens"), "a 4096 on the model entry is a choice:\n{report}");
