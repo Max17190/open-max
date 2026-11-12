@@ -366,6 +366,7 @@ async fn run_turn_events(
             | AgentEvent::Diff { .. }
             | AgentEvent::SteerAccepted { .. }
             | AgentEvent::SteerBlocked { .. }
+            | AgentEvent::TurnVerified { .. }
             | AgentEvent::ApprovalSettled { .. } => {}
         }
     }

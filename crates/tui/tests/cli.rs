@@ -1703,8 +1703,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/8");
-    assert_eq!(hello["protocol_version"], 8);
+    assert_eq!(hello["proto"], "openmax-stdio/9");
+    assert_eq!(hello["protocol_version"], 9);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -2579,7 +2579,7 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
     assert_eq!(
         framed[0],
         format!(
-            r#"{{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            r#"{{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
             env!("CARGO_PKG_VERSION"),
             hello["project"],
         )
@@ -2745,6 +2745,47 @@ fn rewind_and_fork_branch_a_session_and_the_next_request_carries_only_the_branch
     assert_eq!(entry(&forked)["forked_from"]["root_id"], parent.as_str(), "a fork of a branch continues the parent's conversation");
     assert!(entry(&parent).get("forked_from").is_none(), "a session that is no fork writes no field");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A print run whose end every completion gate passed says so: a
+/// `turn_verified` line naming the gates in the order they ran, after the
+/// refusal one of them made of the end before, and just before `done`. The
+/// session's event log replays the run byte for byte, that line included.
+#[test]
+fn a_passed_end_names_its_gates_and_replays_byte_for_byte() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, home) = fresh_dirs("verified");
+    let base = project.parent().unwrap().to_path_buf();
+    let replies = ["r1", "r1 checked"].map(sse_text).to_vec();
+    let (base_url, _server) = spawn_recording_server(replies, base.join("requests.jsonl"));
+    write_settings_with_mode(&home, &base_url, "auto");
+    let hooks = project.join(".openmax").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let refuse_once = format!("[ -f '{0}' ] && exit 0\n: > '{0}'\necho 'one test fails'\nexit 1", base.join("refused").display());
+    for (name, body) in [("lint", "exit 0".to_string()), ("tests", refuse_once)] {
+        let gate = base.join(format!("{name}.sh"));
+        std::fs::write(&gate, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = format!("event = \"turn_end\"\nblocking = true\ncommand = \"{}\"\n", gate.display());
+        std::fs::write(hooks.join(format!("{name}.toml")), manifest).unwrap();
+    }
+
+    let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "ship it"]).output().unwrap();
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{printed}{}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<serde_json::Value> = printed.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let at = |kind: &str| lines.iter().position(|l| l["type"] == kind).unwrap_or_else(|| panic!("no {kind}: {printed}"));
+    assert_eq!(lines[at("turn_refused")]["hook"], "tests", "{printed}");
+    assert_eq!(lines[at("turn_verified")]["hooks"], serde_json::json!(["lint", "tests"]), "{printed}");
+    assert!(at("turn_refused") < at("turn_verified") && at("turn_verified") + 2 == lines.len(), "{printed}");
+    assert_eq!(lines[lines.len() - 1]["stop_reason"], "stop", "{printed}");
+
+    let id = lines[0]["session_id"].as_str().unwrap();
+    let log = home.join(".openmax").join("sessions").join(format!("{id}.events.jsonl"));
+    let replayed = cmd(&project, &home).arg("--replay").arg(&log).arg("--json").output().unwrap();
+    assert_eq!(replayed.status.code(), Some(0), "{}", String::from_utf8_lossy(&replayed.stderr));
+    assert_eq!(String::from_utf8(replayed.stdout).unwrap(), printed, "the replay prints what the run printed");
+    let _ = std::fs::remove_dir_all(base);
 }
 
 /// A completion gate's refusal reaches the model as a user message right

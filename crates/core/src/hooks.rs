@@ -921,6 +921,7 @@ impl Hooks {
                     MAX_TURN_END_CONTINUATIONS.saturating_sub(attempt.continuation),
             });
             match run_hook(hook, payload, cwd, cancel.unwrap_or(&fresh)).await {
+                HookRun::Allow if hook.gates() => outcome.passed.push(hook_stem(hook)),
                 HookRun::Allow => {}
                 // A gate that cannot start judged nothing. Its spawn error,
                 // sent back as the user's refusal, asked the model to repair
@@ -989,6 +990,8 @@ pub struct TurnEndOutcome {
     /// or a hook file fails closed: it is among the failures, it refused
     /// nothing, and the end is not verified.
     pub unverified: bool,
+    /// The gates that let this end stand, by file stem, in the order they ran.
+    pub passed: Vec<String>,
 }
 
 /// A gating hook's refusal: which hook said no, by file stem - the name every
