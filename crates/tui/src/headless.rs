@@ -269,7 +269,7 @@ async fn run_turn_events(
                         let _ = writeln!(stderr, "openmax: stopped (max_iterations): {}", iteration_cap_note(cap, how));
                     } else if stop_reason == "budget_exhausted" {
                         let by = if core.run_only("max_agent_tokens") { "--max-agent-tokens for this run" } else { "max_agent_tokens in settings.json" };
-                        let _ = writeln!(stderr, "openmax: stopped (budget_exhausted): the turn reached its ceiling of {} tokens, set by {by}. Run openmax --continue -p \"<follow-up>\" to continue",
+                        let _ = writeln!(stderr, "openmax: stopped (budget_exhausted): the next request would not fit in the turn's ceiling of {} tokens, set by {by}. Run openmax --continue -p \"<follow-up>\" to continue, with a higher ceiling if it needs more",
                             core.settings.lock().unwrap().max_agent_tokens.unwrap_or_default());
                     } else if stop_reason == "length" {
                         let _ = writeln!(stderr, "openmax: stopped (length): {}", reply_limit_note(core, "Run openmax --continue -p \"<follow-up>\" to continue, after raising it if replies need more room"));

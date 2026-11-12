@@ -87,8 +87,10 @@ one `-p`, `--stdio` or `--subagent` run as the settings keys
 bound the run it starts without editing settings.json. They are never written
 to settings.json, even where it leaves the key unset, and an in-session save
 keeps the file's value. A turn that reaches one ends as it does at the
-setting, `budget_exhausted` or `max_iterations` with exit code 4, and in text
-mode the stop line names the flag. A value that is not a positive whole number
+setting, with `done` carrying `budget_exhausted` or `max_iterations`: a print
+or `--subagent` run then exits 4 and in text mode its stop line names the
+flag, while a `--stdio` run exits as [stdio](stdio-protocol.md) says, so its
+client reads the `stop_reason`. A value that is not a positive whole number
 is a usage error (exit 2), and so is either flag on an interactive session.
 There is no ceiling in money: Open Max counts tokens and does not know their
 price.

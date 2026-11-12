@@ -2287,8 +2287,8 @@ fn ceiling_flags_stop_one_run_and_leave_settings_unchanged() {
             "openmax: stopped (max_iterations): reached the limit of 1 tool-call round for one turn. \
              --max-agent-iterations set it for this run. Run openmax --continue -p \"<follow-up>\" to continue".to_string()),
         ("--max-agent-tokens", WINDOW.to_string(), "budget_exhausted",
-            format!("openmax: stopped (budget_exhausted): the turn reached its ceiling of {WINDOW} tokens, \
-                     set by --max-agent-tokens for this run. Run openmax --continue -p \"<follow-up>\" to continue")),
+            format!("openmax: stopped (budget_exhausted): the next request would not fit in the turn's ceiling of {WINDOW} tokens, \
+                     set by --max-agent-tokens for this run. Run openmax --continue -p \"<follow-up>\" to continue, with a higher ceiling if it needs more")),
     ];
     for (flag, value, stop_reason, said) in cases {
         for json in [true, false] {
