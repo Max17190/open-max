@@ -161,7 +161,7 @@ the prompts after it.
 | 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
 | 2 | A usage or configuration error before any turn, or `--continue` found no prior session here |
 | 3 | The project is not trusted, or trust cannot be granted from this process |
-| 4 | A turn stopped short (`length` when five replies in a row reached their `max_tokens` before any tool call, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start repeats until the hook is repaired |
+| 4 | A turn stopped short (`length` when five replies in a row reached their `max_tokens` before any tool call, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
 
 Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches
 openmax and not them. SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 to a
