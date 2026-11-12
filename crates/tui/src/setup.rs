@@ -289,6 +289,8 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
                 .ok_or("context window must be a positive number of tokens")? as u64
         }
     };
+    api_defaults(&mut entry, &name, previous.is_none())?;
+    let chat = entry.get("wire_api").is_none_or(|w| w == "chat_completions");
     let catalog = entry
         .as_object_mut()
         .unwrap()
@@ -297,7 +299,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     let catalog = catalog
         .as_array_mut()
         .ok_or("provider models must be an array")?;
-    record_model(catalog, &model, window);
+    record_model(catalog, &model, window, metadata, chat);
     entry["base_url"] = json!(base);
     entry["api_key"] = json!(if key.starts_with('$') {
         format!("${key}")
@@ -305,7 +307,6 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         key
     });
     entry.as_object_mut().unwrap().remove("api_key_env");
-    api_defaults(&mut entry, &name, previous.is_none())?;
     providers::edit_catalog(dir, |entries| {
         unchanged(entries.get(&name), previous.as_ref())?;
         entries.insert(name.clone(), entry);
@@ -324,13 +325,16 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     Ok(())
 }
 
-/// Saves the model's window. A reply limit is never written: the default stays
-/// in force, and a `max_tokens` already on the entry is kept.
-fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64) {
-    match catalog.iter_mut().find(|m| m["id"] == model) {
-        Some(old) => old["context_tokens"] = json!(window),
-        None => catalog.push(json!({"id":model,"context_tokens":window})),
-    }
+/// Saves the model's window and, only for a connection whose wire is not Chat
+/// Completions, the output maximum a catalog reports as the reply limit, capped
+/// at a quarter of the window (not below the 4096 default) as it is also the
+/// input reserve. A limit on the entry is kept; with none reported none is guessed.
+fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value, chat: bool) {
+    let most = ["max_completion_tokens", "max_output_tokens", "max_tokens"].iter().find_map(|k| metadata[*k].as_u64())
+        .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0 && !chat);
+    let i = catalog.iter().position(|m| m["id"] == model).unwrap_or_else(|| { catalog.push(json!({"id":model})); catalog.len() - 1 });
+    catalog[i]["context_tokens"] = json!(window);
+    if let (Some(most), None) = (most, catalog[i].get("max_tokens")) { catalog[i]["max_tokens"] = json!(most.min((window / 4).max(4096))); }
 }
 
 fn api_defaults(entry: &mut Value, name: &str, new: bool) -> Result<(), String> {

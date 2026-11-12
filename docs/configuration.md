@@ -146,12 +146,19 @@ and the run that writes a key already uses it.
   the turn goes on. After four such continuations in a row, a fifth cut
   reply ends the turn with `length` (so does a cut on the turn's last
   iteration), and the terminal UI and print mode say which `max_tokens`
-  cut it and where it is set. Send a follow-up to continue.
+  cut it and where it is set. Send a follow-up to continue. On a Responses
+  connection a reply that reaches the limit is reported incomplete and ends
+  the turn as truncated.
   For a reasoning model the limit is also a bound on how long it thinks
-  before it acts, and setup leaves it at the default. To raise it, set
-  `max_tokens` on the model's providers.json entry (or in settings.json),
-  at most about a quarter of the window, since the same number is reserved
-  out of the input budget. `openmax --check --all` states the active
+  before it acts. Setup leaves it at the default for a Chat Completions
+  connection; for a Responses or native Messages connection it still
+  writes the catalog's output maximum when one is reported, and
+  `openmax --check` warns while such a connection runs at the default. To
+  raise it, set `max_tokens` on the model's providers.json entry (or in
+  settings.json), at most about a quarter of the window, since the same
+  number is reserved out of the input budget. A 4096 counts as chosen only
+  on the model's entry: every settings save writes 4096 to settings.json
+  when the limit is unset. `openmax --check --all` states the active
   model's limit and where it is set.
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
@@ -554,10 +561,18 @@ API setup loads the endpoint's model catalog and lets you choose an exact
 model. OpenAI setup omits known dedicated embedding, image, speech, realtime,
 and moderation model families; other providers retain their own catalogs.
 When the API does not report its context window, enter the value from
-the model's documentation. Setup writes no `max_tokens`, so the model runs
-at the default reply limit, and keeps a `max_tokens` the entry already has.
-An endpoint without a model-list route can be
-configured with an exact model ID; setup reports that access was not verified.
+the model's documentation. For a Chat Completions connection setup writes
+no `max_tokens`, so the model runs at the default reply limit. For a
+Responses or native Messages connection, when the catalog reports the
+model's output maximum (`max_completion_tokens`, `max_output_tokens`,
+`max_tokens`, or `top_provider.max_completion_tokens`), setup writes the
+model entry's `max_tokens`: that maximum, capped at a quarter of the window
+(the cap is never under the 4096 default, so a model whose own maximum is
+lower gets that maximum). A catalog that reports no maximum gets no guess,
+and `openmax --check` then warns that the model runs at the default. Setup
+never replaces a `max_tokens` the entry already has. An endpoint without a
+model-list route can be configured with an exact model ID; setup reports
+that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.
 Run login again to add another. Choose the connection with `/model` afterward,
 or use the printed `openmax --provider ... --model ...` command. Login does not

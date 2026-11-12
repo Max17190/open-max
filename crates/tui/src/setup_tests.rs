@@ -193,22 +193,51 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
     }
 }
 
-/// Setup saves a model's window and writes no reply limit, so the default
-/// stays in force; a `max_tokens` already on the entry, and every other model,
-/// is kept as it was.
+/// On a connection whose wire is not Chat Completions, setup saves the output
+/// maximum a catalog reports, under each name a catalog uses for it, capped at
+/// a quarter of the window because the limit is also reserved out of the input
+/// budget, never under the default; it guesses nothing when the catalog is
+/// silent and keeps a limit already set.
 #[test]
-fn setup_saves_the_window_and_keeps_the_reply_limit_it_finds() {
-    let mut catalog = vec![json!({"id":"other","max_tokens":1})];
-    record_model(&mut catalog, "m", 131072);
-    assert_eq!(catalog, vec![json!({"id":"other","max_tokens":1}), json!({"id":"m","context_tokens":131072})]);
+fn setup_saves_the_reply_limit_a_catalog_reports() {
+    let saved = |metadata: Value, window: u64| {
+        let mut catalog = vec![json!({"id":"other","max_tokens":1})];
+        record_model(&mut catalog, "m", window, &metadata, false);
+        assert_eq!(catalog[0], json!({"id":"other","max_tokens":1}), "other models are untouched");
+        assert_eq!(catalog[1]["context_tokens"], window);
+        catalog[1].get("max_tokens").map(|n| n.as_u64().unwrap())
+    };
+    for metadata in [json!({"max_completion_tokens":32768}), json!({"max_output_tokens":32768}),
+        json!({"max_tokens":32768}), json!({"top_provider":{"max_completion_tokens":32768}})] {
+        assert_eq!(saved(metadata.clone(), 1_048_576), Some(32768), "the model's maximum is under a quarter of the window: {metadata}");
+        assert_eq!(saved(metadata.clone(), 65536), Some(16384), "a quarter of the window is under the maximum: {metadata}");
+        assert_eq!(saved(metadata.clone(), 8192), Some(4096), "never under the default: {metadata}");
+    }
+    assert_eq!(saved(json!({"max_tokens":2048}), 131072), Some(2048), "a model's own lower maximum is what it accepts");
+    assert_eq!(saved(json!({"context_length":131072}), 131072), None, "a silent catalog gets no guess");
+    assert_eq!(saved(json!({"max_tokens":0}), 131072), None);
     let mut catalog = vec![json!({"id":"m","context_tokens":1,"max_tokens":2048})];
-    record_model(&mut catalog, "m", 131072);
+    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":65536}), false);
     assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":2048})], "a limit the user set is kept");
 }
 
-/// A model saved by setup from a catalog that reports a large output maximum
-/// still runs at the default reply limit: the entry resolves to it and a
-/// request carries it as `max_tokens`.
+/// A Chat Completions connection continues a reply cut at its limit, so setup
+/// saves the model's window and writes no reply limit even when the catalog
+/// reports an output maximum; the default stays in force, and a `max_tokens`
+/// already on the entry, and every other model, is kept as it was.
+#[test]
+fn setup_saves_the_window_and_keeps_the_reply_limit_it_finds() {
+    let mut catalog = vec![json!({"id":"other","max_tokens":1})];
+    record_model(&mut catalog, "m", 131072, &json!({"max_completion_tokens":32768}), true);
+    assert_eq!(catalog, vec![json!({"id":"other","max_tokens":1}), json!({"id":"m","context_tokens":131072})]);
+    let mut catalog = vec![json!({"id":"m","context_tokens":1,"max_tokens":2048})];
+    record_model(&mut catalog, "m", 131072, &json!({"max_tokens":65536}), true);
+    assert_eq!(catalog, vec![json!({"id":"m","context_tokens":131072,"max_tokens":2048})], "a limit the user set is kept");
+}
+
+/// A Chat Completions model saved by setup from a catalog that reports a large
+/// output maximum still runs at the default reply limit: the entry resolves to
+/// it and a request carries it as `max_tokens`.
 #[tokio::test]
 async fn a_model_setup_saved_sends_the_default_reply_limit() {
     let (catalog_base, catalog_task) = server(200, "", json!({"data":[{"id":"fixture-model",
@@ -216,7 +245,7 @@ async fn a_model_setup_saved_sends_the_default_reply_limit() {
     let models = discover(&catalog_base, "fixture-secret", &serde_json::Map::new(), false, false).await.unwrap();
     catalog_task.await.unwrap();
     let mut saved = Vec::new();
-    record_model(&mut saved, "fixture-model", models[0]["context_length"].as_u64().unwrap());
+    record_model(&mut saved, "fixture-model", models[0]["context_length"].as_u64().unwrap(), &models[0], true);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     let dir = crate::test_temp_dir("openmax-setup-reply-limit");
