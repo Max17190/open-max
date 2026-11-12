@@ -406,7 +406,7 @@ fn exclude(parent: &Path) {
     use std::io::{Read, Write};
     // Held while the file is read and written, so runs that start together
     // add the line once.
-    let Some(mut file) = lock(parent) else { return };
+    let Some(mut file) = lock(parent, Step::Settled) else { return };
     let mut text = String::new();
     if file.read_to_string(&mut text).is_err() {
         return;
@@ -419,9 +419,10 @@ fn exclude(parent: &Path) {
 }
 
 /// The repository's exclude file, open and locked once no other run holds it,
-/// or None: it cannot be had, or a stop came while another run held it.
-fn lock(parent: &Path) -> Option<std::fs::File> {
-    let path = run_git(parent, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], Step::Settled).ok()?;
+/// or None: it cannot be had, or a stop came while another run held it (or,
+/// for a `step` of the launch, before).
+fn lock(parent: &Path, step: Step) -> Option<std::fs::File> {
+    let path = run_git(parent, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], step).ok()?;
     let path = path_from_bytes(path.strip_suffix(b"\n").unwrap_or(&path));
     let _ = path.parent().map(std::fs::create_dir_all);
     let file = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&path).ok()?;
@@ -507,12 +508,12 @@ const STOPPED: &str = "a signal stopped it";
 fn run_git<S: AsRef<OsStr>>(dir: &Path, args: &[S], step: Step) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let grace = if step == Step::Settled { crate::STOP_SETTLE } else { Duration::ZERO };
+    // Git fails on a worktree whose entry another `git worktree add` is still
+    // writing, so a run's worktree commands wait for other runs' to end.
+    let _turn = args.first().filter(|arg| arg.as_ref() == OsStr::new("worktree")).and_then(|_| lock(dir, step));
     if grace.is_zero() && crate::signalled() {
         return Err(STOPPED.into());
     }
-    // Git fails on a worktree whose entry another `git worktree add` is still
-    // writing, so a run's worktree commands wait for other runs' to end.
-    let _turn = args.first().filter(|arg| arg.as_ref() == OsStr::new("worktree")).and_then(|_| lock(dir));
     let mut command = Command::new("git");
     command.arg("-C").arg(dir);
     if step != Step::Checkout {
