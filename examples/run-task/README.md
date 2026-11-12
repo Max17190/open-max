@@ -11,6 +11,23 @@ It adds nothing to Open Max. It is a print run (`openmax -p --json`), a
 `turn_end` hook with `blocking = true` (`openmax --spec hooks`) and the
 session's event log (`openmax --replay`), put together.
 
+## See it in one minute
+
+With the `openmax` binary, Python 3.9 or later and Git, and no model account:
+
+```sh
+python3 examples/run-task/demo.py    # --openmax <path> when openmax is not on PATH
+```
+
+The model's replies are scripted by a small server on 127.0.0.1. Everything
+else is real. The demo makes a throwaway repository whose check fails, runs
+`run_task.py` on it, and prints, in order: the check failing before the work,
+the turn's end being refused and the message the model was sent, the fix, the
+JSON result, and the replay command printing the run's output again byte for
+byte with the server stopped. It works in a private temporary home, where it
+grants trust to the throwaway repository as a person does at setup, so it
+never reads or writes your `~/.openmax`, and it removes that home at the end.
+
 ## Set up once
 
 Use Python 3.9 or later as `python3` on `PATH`, and Git, on Linux or macOS.
@@ -181,5 +198,6 @@ python3 examples/run-task/test_run_task.py target/debug/openmax
 The test runs the script against a scripted endpoint on loopback: a turn
 whose first end is refused and whose second passes, a turn that spends all
 eight refusals, a turn that empties the gate's list, a final check, a timeout
-and a signal, a project in `ask` mode, an endpoint that is down, and the calls
-that are refused before any request.
+and a signal, a project in `ask` mode, an endpoint that is down, the calls
+that are refused before any request, and the demo. The demo and the test share
+the scripted endpoint in `scripted_endpoint.py`.
