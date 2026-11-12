@@ -26,6 +26,7 @@ sys.dont_write_bytecode = True  # no __pycache__ beside the example
 from scripted_endpoint import CHECK, DONE, FIX, TASK, endpoint, fixture  # noqa: E402
 
 FIXED = {"text": "Fixed."}
+RUN_SECONDS = 60
 
 
 def heading(text):
@@ -71,12 +72,15 @@ def main():
             print(f"exit {before.returncode}")
 
             heading("2. run_task.py runs the task, held to the check")
+            # run_task.py stops its own openmax at the timeout, SIGKILL 10
+            # seconds after SIGTERM, so a stalled run is stopped before the
+            # demo removes the directory it works in.
+            options = ["--check", CHECK, "--timeout", str(RUN_SECONDS), TASK]
             command = [sys.executable, str(HERE / "run_task.py"), "--repo", str(repo), "--out", str(out),
-                       "--openmax", binary, "--check", CHECK, TASK]
-            print("$ " + shlex.join(["python3", "examples/run-task/run_task.py", "--repo", "<repo>",
-                                     "--check", CHECK, TASK]))
+                       "--openmax", binary, *options]
+            print("$ " + shlex.join(["python3", "examples/run-task/run_task.py", "--repo", "<repo>", *options]))
             call = subprocess.run(command, cwd=repo, env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                                  text=True, timeout=120)
+                                  text=True)
         # The scripted server has stopped: nothing below can reach a model.
 
         # Each reply with no tool call ends the turn, and the gate judges that
