@@ -2748,7 +2748,9 @@ pub(crate) mod tests {
     /// into a hang.
     #[tokio::test]
     async fn an_address_that_never_answers_gives_up_before_the_budget() {
-        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        close_until_refused(listener);
         let (err, deltas) = unreached_request(format!("http://{addr}/v1")).await;
         let reason = format!("cannot connect to {addr} (connection refused)");
         assert_eq!(deltas, [2, 3].map(|n| format!("{n}/{UNREACHED_ATTEMPTS}:{reason}")));
@@ -2769,7 +2771,7 @@ pub(crate) mod tests {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             // Gone before it answers, so every later attempt is refused.
-            drop(listener);
+            close_until_refused(listener);
             let mut reader = std::io::BufReader::new(stream);
             let mut length = 0;
             loop {
@@ -2795,6 +2797,21 @@ pub(crate) mod tests {
             ]
         );
         assert!(err.starts_with(&format!("{refused}: nothing is listening there")), "{err}");
+    }
+
+    /// Close `listener` and return once its port refuses connections. A
+    /// child process that another test forks holds a copy of every open
+    /// descriptor until it execs, so a dropped listener can still take a
+    /// connection, which is reset when that copy closes: a busy machine
+    /// stretches that window enough for a retry to land in it.
+    fn close_until_refused(listener: std::net::TcpListener) {
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::net::TcpStream::connect(addr).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "{addr} still takes connections after its listener closed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// The error a request to `url` ends with and its retry announcements,
