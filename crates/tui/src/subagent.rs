@@ -100,6 +100,7 @@ pub async fn run(
             prompts: vec![task.clone()],
             project: worktree.project.clone(),
             continue_session: false,
+            session: None,
             json,
             quit: quit.clone(),
         };
@@ -176,7 +177,7 @@ impl Worktree {
     fn create(project: &Path, task: &str) -> Result<Self, (i32, String)> {
         let parent = std::fs::canonicalize(project)
             .map_err(|e| (1, format!("cannot resolve {}: {e}", project.display())))?;
-        let prefix = git_output(&parent, &["rev-parse", "--show-prefix"]).map_err(|e| {
+        let prefix = run_git(&parent, &["rev-parse", "--show-prefix"], Step::Settled).map_err(|e| {
             (2, format!("--subagent --worktree runs its child in a git worktree, and {} is not in a git repository: {e}", parent.display()))
         })?;
         // This directory's path in the repository, byte for byte as git
@@ -186,7 +187,7 @@ impl Worktree {
         let base = git(&parent, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).map_err(|_| {
             (2, "--subagent --worktree starts its child from HEAD, and this repository has no commit yet".to_string())
         })?;
-        if launch_git(&parent, &["status", "--porcelain"]).is_ok_and(|status| !status.is_empty()) {
+        if run_git(&parent, &["status", "--porcelain"], Step::Launch).is_ok_and(|status| !status.is_empty()) {
             eprintln!(
                 "openmax: the sub-agent starts from HEAD ({}); uncommitted changes in this tree are not in its worktree",
                 &base[..base.len().min(12)]
@@ -337,7 +338,7 @@ impl Worktree {
     /// only by its id, unless a remote-tracking branch there holds it, as it
     /// does a commit the child fetched.
     fn unsaved(&self, tip: &str) -> Result<Vec<String>, String> {
-        let status = git_output(&self.root, &["status", "--porcelain", "-z", "--ignore-submodules=none"])?;
+        let status = run_git(&self.root, &["status", "--porcelain", "-z", "--ignore-submodules=none"], Step::Settled)?;
         // Each record ends in NUL: two status letters, a space, then the path
         // bytes, which are kept exactly as git wrote them, so a name that is
         // not UTF-8 still names the directory the child worked in. A rename
@@ -353,7 +354,7 @@ impl Worktree {
             }
         }
         let changes = ["diff-tree", "-r", "-z", "--ignore-submodules=none", self.base.as_str(), tip];
-        let changes = git_output(&self.root, &changes)?;
+        let changes = run_git(&self.root, &changes, Step::Settled)?;
         // `:<mode> <mode> <id> <id> <status>`, then the path, each ending in
         // NUL; a repository's commit has mode 160000.
         let mut fields = changes.split(|byte| *byte == 0);
@@ -403,18 +404,11 @@ impl Worktree {
 /// worktrees visible to the project's status, glob and grep, nothing worse.
 fn exclude(parent: &Path) {
     use std::io::{Read, Write};
-    let Ok(path) = git_output(parent, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"]) else {
-        return;
-    };
-    let path = path_from_bytes(path.strip_suffix(b"\n").unwrap_or(&path));
-    let _ = path.parent().map(std::fs::create_dir_all);
-    let Ok(mut file) = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&path) else {
-        return;
-    };
     // Held while the file is read and written, so runs that start together
     // add the line once.
+    let Some(mut file) = lock(parent, Step::Settled) else { return };
     let mut text = String::new();
-    if file.lock().is_err() || file.read_to_string(&mut text).is_err() {
+    if file.read_to_string(&mut text).is_err() {
         return;
     }
     if text.lines().any(|line| line.trim() == EXCLUDE) {
@@ -422,6 +416,23 @@ fn exclude(parent: &Path) {
     }
     let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
     let _ = file.write_all(format!("{separator}# openmax sub-agent worktrees\n{EXCLUDE}\n").as_bytes());
+}
+
+/// The repository's exclude file, open and locked once no other run holds it,
+/// or None: it cannot be had, or a stop came while another run held it (or,
+/// for a `step` of the launch, before).
+fn lock(parent: &Path, step: Step) -> Option<std::fs::File> {
+    let path = run_git(parent, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], step).ok()?;
+    let path = path_from_bytes(path.strip_suffix(b"\n").unwrap_or(&path));
+    let _ = path.parent().map(std::fs::create_dir_all);
+    let file = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&path).ok()?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if !crate::signalled() => std::thread::sleep(STOP_CHECK),
+            Err(_) => return None,
+        }
+    }
 }
 
 /// The worktree's directory and its branch's last part: the task's first
@@ -474,16 +485,6 @@ fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String, String> {
     run_git(dir, args, Step::Settled).map(|stdout| String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
-/// `run_git`'s stdout as git wrote it.
-fn git_output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>, String> {
-    run_git(dir, args, Step::Settled)
-}
-
-/// As `git`, for a command of the launch, which a stop does not wait for.
-fn launch_git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String, String> {
-    run_git(dir, args, Step::Launch).map(|stdout| String::from_utf8_lossy(&stdout).trim().to_string())
-}
-
 /// How often a git command looks for a stop.
 const STOP_CHECK: Duration = Duration::from_millis(20);
 
@@ -507,6 +508,9 @@ const STOPPED: &str = "a signal stopped it";
 fn run_git<S: AsRef<OsStr>>(dir: &Path, args: &[S], step: Step) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let grace = if step == Step::Settled { crate::STOP_SETTLE } else { Duration::ZERO };
+    // Git fails on a worktree whose entry another `git worktree add` is still
+    // writing, so a run's worktree commands wait for other runs' to end.
+    let _turn = args.first().filter(|arg| arg.as_ref() == OsStr::new("worktree")).and_then(|_| lock(dir, step));
     if grace.is_zero() && crate::signalled() {
         return Err(STOPPED.into());
     }

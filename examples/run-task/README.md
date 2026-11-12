@@ -1,5 +1,9 @@
 # Run a task held to your own checks
 
+[Hold a run to your own checks](../../docs/verified-execution.md) is the
+one page for a caller: how a turn's end is judged, how to bound, continue and
+replay a run, and what the result does and does not show.
+
 This optional example is one entry point for a program that hands Open Max a
 task: a script, a CI job or another agent. `run_task.py` runs the task in your
 repository, with the model your installation is configured for, and refuses
@@ -10,6 +14,23 @@ command that replays every step offline.
 It adds nothing to Open Max. It is a print run (`openmax -p --json`), a
 `turn_end` hook with `blocking = true` (`openmax --spec hooks`) and the
 session's event log (`openmax --replay`), put together.
+
+## See it in one minute
+
+With the `openmax` binary, Python 3.9 or later and Git, and no model account:
+
+```sh
+python3 examples/run-task/demo.py    # --openmax <path> when openmax is not on PATH
+```
+
+The model's replies are scripted by a small server on 127.0.0.1. Everything
+else is real. The demo makes a throwaway repository whose check fails, runs
+`run_task.py` on it, and prints, in order: the check failing before the work,
+the turn's end being refused and the message the model was sent, the fix, the
+JSON result, and the replay command printing the run's output again byte for
+byte with the server stopped. It works in a private temporary home, where it
+grants trust to the throwaway repository as a person does at setup, so it
+never reads or writes your `~/.openmax`, and it removes that home at the end.
 
 ## Set up once
 
@@ -60,6 +81,11 @@ python3 examples/run-task/run_task.py --repo ~/code/my-app \
   call's files. Without it the script makes one and names it in the result.
 - `--timeout` stops the run after that many seconds. A print run has no
   deadline of its own.
+- `--max-agent-tokens` and `--max-agent-iterations` bound the turn for this
+  call only: the script passes each to Open Max as its flag of the same name,
+  and a turn that reaches one ends `budget_exhausted` or `max_iterations`
+  (exit 4). Neither is written to your settings. There is no ceiling in
+  money, since Open Max counts tokens and does not know their price.
 - `--openmax` names the binary when `openmax` is not on `PATH`.
 
 The shipped hook file lets the gate run for 600 seconds (`timeout_secs`, the
@@ -71,7 +97,10 @@ refuse every end.
 When a check fails at the turn's end, Open Max refuses the end and sends the
 model one message: each failing check, its exit code and the end of its
 output, within the 500 characters a refusal keeps. The model works on from
-there. After eight refusals Open Max ends the turn as `unverified`.
+there. The hook file sets `max_refusals = 3`: after three refusals the next
+failing end is not sent back, and Open Max ends the turn as `unverified`, so a
+check the model cannot make pass stops costing work after three tries. Open
+Max's own bound, and the most `max_refusals` may ask for, is eight.
 
 ## The result
 
@@ -96,7 +125,9 @@ The script prints the result on stdout and writes it to `result.json`:
       "output_tail": "test result: ok. 41 passed; 0 failed\n"
     }
   ],
+  "ceilings": {"max_agent_tokens": null, "max_agent_iterations": null},
   "refusals": 1,
+  "gates_passed": ["run-task-checks"],
   "gate_log": "/tmp/run-task-k2x9/gate.jsonl",
   "changes": "/tmp/run-task-k2x9/changes.patch",
   "files_changed": ["crates/parser/src/date.rs"],
@@ -114,7 +145,9 @@ The script prints the result on stdout and writes it to `result.json`:
 | `reason` | Why the result is not verified, or null |
 | `stop_reason` | The `stop_reason` of the run's `done` event |
 | `checks` | Each check: whether it `gates` the turn's end, its exit code `before` the work (null for a final check) and `after` it (null when the checks were not run again), and the time and the end of the output of that last run |
+| `ceilings` | The `--max-agent-tokens` and `--max-agent-iterations` this call passed, or null |
 | `refusals` | The ends of the turn the gate refused, counted from the `turn_refused` events |
+| `gates_passed` | The gates Open Max reports passed the end the turn stopped on, from its `turn_verified` event, or empty when no gate passed it. The checks this script runs afterwards still decide `verified` |
 | `gate_log` | One JSON line for each end of a turn the gate judged: the session, the `continuation`, whether a refusal could be honored (`blockable`), and each check's exit code, time and output. A session the agent starts itself inherits the gate and is logged here too |
 | `changes`, `files_changed` | The work tree after the run against the work tree before it, as a patch and as paths. Untracked files are included and ignored ones are not |
 | `usage` | The replies the model sent, and the sums of the run's `usage` events |
@@ -168,8 +201,9 @@ check reads, a test among them, so read `changes.patch` or check it with a
 `--final-check` of your own.
 
 The run keeps the limits of your installation: `max_agent_iterations` and
-`max_agent_tokens` in `~/.openmax/settings.json` bound a turn, and neither can
-be set for one call. Run one call at a time in a work tree.
+`max_agent_tokens` in `~/.openmax/settings.json` bound a turn, unless the
+call's `--max-agent-iterations` or `--max-agent-tokens` sets one for that run.
+Run one call at a time in a work tree.
 
 ## Test
 
@@ -180,6 +214,8 @@ python3 examples/run-task/test_run_task.py target/debug/openmax
 
 The test runs the script against a scripted endpoint on loopback: a turn
 whose first end is refused and whose second passes, a turn that spends all
-eight refusals, a turn that empties the gate's list, a final check, a timeout
-and a signal, a project in `ask` mode, an endpoint that is down, and the calls
-that are refused before any request.
+three refusals, a turn that empties the gate's list, a final check, a turn
+stopped by a ceiling, a timeout
+and a signal, a project in `ask` mode, an endpoint that is down, the calls
+that are refused before any request, and the demo. The demo and the test share
+the scripted endpoint in `scripted_endpoint.py`.

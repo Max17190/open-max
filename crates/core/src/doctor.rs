@@ -199,11 +199,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             // come from one generation of its bytes: a second read for the
             // clamp diagnostic is an interval a rewrite can split, and the
             // report would then describe two files that never existed at once.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::registry::parse_tool_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::registry::parse_tool_source);
             let mut id = None;
             let status = match parsed {
                 Ok(spec) if tools::TOOL_NAMES.contains(&spec.name.as_str()) => {
@@ -213,8 +209,9 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                     id = Some(spec.name.clone());
                     tool_meta.push((spec.name.clone(), path.clone()));
                     if let Some(reason) = source.as_deref().ok().and_then(|text| {
-                        clamped_timeout_reason(
+                        clamped_reason(
                             text,
+                            ("timeout_secs", " seconds"),
                             "tool",
                             crate::registry::MIN_TIMEOUT_SECS,
                             crate::registry::MAX_TIMEOUT_SECS,
@@ -386,11 +383,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             // One read per file, like the tool loop: the description the spec
             // clamps and the description the author wrote have to come from
             // one generation of the bytes, or the report compares two files.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::skills::parse_skill_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::skills::parse_skill_source);
             let status = match parsed {
                 Ok(s) => {
                     id = Some(s.name.clone());
@@ -477,11 +470,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             let mut id = None;
             // One read per file, like the tool and skill loops: the clamp
             // diagnostic and the parse must describe one generation of bytes.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::templates::parse_template_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::templates::parse_template_source);
             let status = match parsed {
                 Ok(t) => {
                     id = Some(t.name.clone());
@@ -523,11 +512,7 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
             // it whether or not the file parses.
             let id = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
             // One read, for the same reason as the tool loop above.
-            let source = std::fs::read_to_string(&path);
-            let parsed = match &source {
-                Ok(text) => crate::hooks::parse_hook_source(&path, text),
-                Err(e) => Err(format!("unreadable: {e}")),
-            };
+            let (source, parsed) = read_and_parse(&path, crate::hooks::parse_hook_source);
             let status = match parsed {
                 Ok(h) => {
                     if let Some(filter) = h.tool_filter.as_deref() {
@@ -546,8 +531,9 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                         }
                     }
                     if let Some(mut reason) = source.as_deref().ok().and_then(|text| {
-                        clamped_timeout_reason(
+                        clamped_reason(
                             text,
+                            ("timeout_secs", " seconds"),
                             "hook",
                             crate::hooks::MIN_TIMEOUT_SECS,
                             crate::hooks::max_timeout_secs(h.event, h.blocking),
@@ -562,6 +548,10 @@ fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Fin
                         } else if h.event == crate::hooks::HookEvent::TurnEnd {
                             reason.push_str(&format!("; with `blocking = true`, a completion gate may set up to {}", crate::tools::BASH_MAX_TIMEOUT_SECS));
                         }
+                        hook_clamps.push((hooks_found.len(), reason));
+                    }
+                    let most = crate::hooks::MAX_TURN_END_CONTINUATIONS as u64;
+                    if let Some(reason) = source.as_deref().ok().and_then(|text| clamped_reason(text, ("max_refusals", ""), "gate's max_refusals", 1, most)) {
                         hook_clamps.push((hooks_found.len(), reason));
                     }
                     hook_events.push(Some(h.event.as_str()));
@@ -1788,25 +1778,25 @@ fn clamp_findings(
         .collect()
 }
 
-/// Why the `timeout_secs` this file asks for is not the one it gets, if it is
+/// Why the `key` value this file asks for is not the one it gets, if it is
 /// not. Both loaders clamp out-of-range values and say nothing, which for a
 /// gate is a policy change rather than a detail: a gate that times out blocks,
 /// so an author who wrote 600 is enforcing a 60-second budget. Takes the bytes
 /// the caller already parsed, never a path: the parsed spec carries only the
 /// clamped number, and reading the file again to recover the written one would
 /// let a rewrite between the two reads produce a report of two generations.
-fn clamped_timeout_reason(text: &str, what: &str, min: u64, max: u64) -> Option<String> {
+fn clamped_reason(text: &str, (key, unit): (&str, &str), what: &str, min: u64, max: u64) -> Option<String> {
     let written = toml::from_str::<toml::Value>(text)
         .ok()?
         .as_table()?
-        .get("timeout_secs")?
+        .get(key)?
         .as_integer()?;
     // A value outside i64, or below zero, never parses into the spec at all,
     // so anything reaching here is a number the loader accepted and clamped.
     let effective = written.clamp(min as i64, max as i64);
     (written != effective).then(|| {
         format!(
-            "timeout_secs = {written} is outside the documented {min}..{max} range, so this {what} is clamped to {effective} seconds, not {written}"
+            "{key} = {written} is outside the documented {min}..{max} range, so this {what} is clamped to {effective}{unit}, not {written}"
         )
     })
 }
@@ -2300,6 +2290,17 @@ fn is_regular_plural(singular: &str, candidate: &str) -> bool {
     candidate == plural
 }
 
+/// A manifest's text and what `parse` made of it, from one read: an
+/// unreadable file parses as an error naming why.
+fn read_and_parse<T>(path: &Path, parse: fn(&Path, &str) -> Result<T, String>) -> (std::io::Result<String>, Result<T, String>) {
+    let source = std::fs::read_to_string(path);
+    let parsed = match &source {
+        Ok(text) => parse(path, text),
+        Err(e) => Err(format!("unreadable: {e}")),
+    };
+    (source, parsed)
+}
+
 fn files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut paths: Vec<PathBuf> = rd
@@ -2417,7 +2418,7 @@ mod tests {
             let mut shas =
                 vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
             shas.extend(
-                crate::ledger::manifest_code(&manifest, &root)
+                crate::ledger::manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &root)
                     .into_iter()
                     .filter_map(|c| c.sha256),
             );
@@ -4183,6 +4184,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A gate's `max_refusals` outside 1..8 is clamped, which decides when the
+    /// gate stops being honored, so `--check` reports it with the range the
+    /// way it reports a clamped timeout. On a hook that is not a completion
+    /// gate the field is rejected, as `blocking` is off `turn_end`.
+    #[test]
+    fn a_max_refusals_outside_its_range_is_reported_and_off_a_gate_rejected() {
+        let root = temp_project();
+        let data = root.join("data");
+        let gate = |n: &str| format!("event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\nmax_refusals = {n}\n");
+        write(root.join(".openmax/hooks/none.toml"), &gate("0"));
+        write(root.join(".openmax/hooks/nine.toml"), &gate("9"));
+        write(root.join(".openmax/hooks/three.toml"), &gate("3"));
+        write(root.join(".openmax/hooks/watch.toml"), "event = \"turn_end\"\ncommand = \"/bin/echo\"\nmax_refusals = 3\n");
+        write(root.join(".openmax/hooks/pre.toml"), "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\nmax_refusals = 3\n");
+
+        let findings = local_at(&root, &data);
+        let about = |stem: &str| {
+            findings
+                .iter()
+                .filter(|f| f.path.ends_with(format!(".openmax/hooks/{stem}.toml")) && f.status.summary().contains("max_refusals"))
+                .map(|f| &f.status)
+                .collect::<Vec<_>>()
+        };
+        match about("none")[..] {
+            [Status::Warn(reason)] => assert!(
+                reason.contains("max_refusals = 0 is outside the documented 1..8 range") && reason.contains("clamped to 1, not 0"),
+                "{reason}"
+            ),
+            ref other => panic!("a gate's max_refusals of 0 must be reported: {other:?}"),
+        }
+        match about("nine")[..] {
+            [Status::Warn(reason)] => assert!(reason.contains("1..8") && reason.contains("clamped to 8, not 9"), "{reason}"),
+            ref other => panic!("a gate's max_refusals of 9 must be reported: {other:?}"),
+        }
+        assert!(about("three").is_empty(), "{findings:?}");
+        for stem in ["watch", "pre"] {
+            match about(stem)[..] {
+                [Status::Err(reason)] => assert!(reason.contains("needs event = \"turn_end\" and blocking = true"), "{reason}"),
+                ref other => panic!("max_refusals off a completion gate must be rejected: {other:?}"),
+            }
+        }
+        // What the loader runs: the clamped values, and the default.
+        let parsed = |body: &str| crate::hooks::parse_hook_source(Path::new("g.toml"), body).map(|h| h.max_refusals);
+        assert_eq!(parsed(&gate("0")), Ok(1));
+        assert_eq!(parsed(&gate("9")), Ok(crate::hooks::MAX_TURN_END_CONTINUATIONS));
+        assert_eq!(parsed(&gate("3")), Ok(3));
+        assert_eq!(parsed("event = \"turn_end\"\nblocking = true\ncommand = \"/bin/echo\"\n"), Ok(crate::hooks::MAX_TURN_END_CONTINUATIONS));
+        assert!(parsed(&gate("-1")).is_err(), "a negative bound is not a number of refusals");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// `--check` classifies hooks so a human can see which files can refuse
     /// something. A `turn_end` hook with `blocking = true` can, so every place
     /// the report tells a gate from an observer has to ask the hook and not
@@ -4356,8 +4408,9 @@ mod tests {
         // What the caller parsed a moment earlier.
         let parsed = "event = \"pre_tool_use\"\ncommand = \"/bin/echo\"\ntimeout_secs = 600\n";
 
-        let reason = clamped_timeout_reason(
+        let reason = clamped_reason(
             parsed,
+            ("timeout_secs", " seconds"),
             "hook",
             crate::hooks::MIN_TIMEOUT_SECS,
             crate::hooks::MAX_TIMEOUT_SECS,
@@ -4368,8 +4421,9 @@ mod tests {
         // And the generation on disk, judged on its own bytes, says nothing.
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(
-            clamped_timeout_reason(
+            clamped_reason(
                 &on_disk,
+                ("timeout_secs", " seconds"),
                 "hook",
                 crate::hooks::MIN_TIMEOUT_SECS,
                 crate::hooks::MAX_TIMEOUT_SECS,

@@ -4,7 +4,7 @@
 //! speak line-delimited JSON (an editor plugin, an orchestrator, another
 //! openmax) can drive a complete interactive session, approvals included.
 //!
-//! Protocol (`openmax-stdio/8`), one JSON object per line. The normative
+//! Protocol (`openmax-stdio/9`), one JSON object per line. The normative
 //! reference (every field of every line) is `docs/stdio-protocol.md`, kept in
 //! step with `openmax --spec stdio`; `crates/core/src/types.rs` golden tests
 //! pin the event wire.
@@ -20,7 +20,7 @@
 //!   {"cmd":"quit"}                                   finish the turn, then exit
 //!
 //! stdout lines:
-//!   {"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"...","project":"...","continued":false}
+//!   {"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"...","version":"...","project":"...","continued":false}
 //!   AgentEvent envelopes exactly as `--print --json` emits them
 //!   {"type":"protocol_error","message":"..."}        bad input; session unharmed
 //!   {"type":"forked","session_id":"...","parent_id":"...","message_index":3}
@@ -50,11 +50,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
 use std::time::Instant;
 
-pub const PROTO: &str = "openmax-stdio/8";
+pub const PROTO: &str = "openmax-stdio/9";
 /// Machine-comparable protocol major. A client negotiates on this integer;
 /// `PROTO` embeds the same number as a human-readable id (checked in tests).
 /// Bump on any wire change (event field, command shape, framing line).
-pub const PROTO_VERSION: u32 = 8;
+pub const PROTO_VERSION: u32 = 9;
 
 // Unknown `cmd` values are protocol errors; extra fields on a known command
 // are ignored (lenient by design, so clients can annotate lines freely).
@@ -78,6 +78,7 @@ enum Command {
 
 pub struct StdioArgs {
     pub continue_session: bool,
+    pub session: Option<String>,
     /// Notified on a quit signal (see `watch_quit_signals`).
     pub quit: Arc<Notify>,
 }
@@ -92,8 +93,8 @@ pub async fn run(
 
     // Every step of the setup can wait on the session index lock.
     let setup = {
-        let (core, project_key, continue_session) = (core.clone(), project_key.clone(), args.continue_session);
-        move || open_session(&core, &project_key, continue_session)
+        let (core, project_key, continue_session, named) = (core.clone(), project_key.clone(), args.continue_session, args.session.clone());
+        move || open_session(&core, &project_key, continue_session, named)
     };
     let mut stop_by = None;
     let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
@@ -130,8 +131,9 @@ fn open_session(
     core: &Core,
     project_key: &str,
     continue_session: bool,
+    named: Option<String>,
 ) -> Result<(String, Vec<open_max_core::types::ChatMessage>), i32> {
-    let session_id = crate::headless::open_session(core, project_key.to_string(), continue_session)?;
+    let session_id = crate::headless::open_session(core, project_key.to_string(), continue_session, named)?;
     if let Err(e) = sessions::attach(core, &session_id) {
         eprintln!("openmax: {e}");
         return Err(1);
@@ -680,7 +682,7 @@ fn transcript<'a>(
     StdioLine::Transcript { session_id, messages: out, truncated }
 }
 
-/// Validate one JSONL line against the `openmax-stdio/8` contract using the
+/// Validate one JSONL line against the `openmax-stdio/9` contract using the
 /// authoritative types (`Command` for stdin, `AgentEvent` for stdout events),
 /// so there is no second schema to drift. Returns a short label on success
 /// (`cmd user`, `event token`, `hello`) or a human reason on failure.

@@ -33,6 +33,8 @@ options:
                          login, logout, status, or models for ChatGPT plan use
       --account <label>  saved ChatGPT account (default: main)
   -c, --continue         resume the latest session in this directory
+      --session <id>     with -p or --stdio, continue that session of this
+                         directory instead of the latest (implies --continue)
       --base-url <url>   the model server's API root (settings key base_url)
   -m, --model <id>       the model id it expects (settings key model)
       --api-key <key>    its key, a literal or '$ENV_VAR' naming a set variable
@@ -49,6 +51,9 @@ options:
                          says which
       --effort <level>   reasoning effort: default, none, minimal, low, medium,
                          high, xhigh or max; support depends on the model
+      --max-agent-tokens <n>, --max-agent-iterations <n>
+                         with -p, --stdio or --subagent, bound each turn of this
+                         run like the settings keys of the same name; never saved
       --provider <name>  use a named provider from ~/.openmax/providers.json
                          for this run; --base-url and --api-key are refused
                          beside it
@@ -156,6 +161,8 @@ struct CliArgs {
     chatgpt: Option<String>,
     account: Option<String>,
     continue_session: bool,
+    /// `--session`: the session `--continue` resumes instead of the latest.
+    session: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<Option<open_max_core::config::ReasoningEffort>>,
     provider: Option<String>,
@@ -164,6 +171,8 @@ struct CliArgs {
     base_url: Option<String>,
     api_key: Option<String>,
     context_tokens: Option<usize>,
+    max_agent_tokens: Option<usize>,
+    max_agent_iterations: Option<usize>,
     print: bool,
     json: bool,
     stdio: bool,
@@ -219,12 +228,15 @@ where
         chatgpt: None,
         account: None,
         continue_session: false,
+        session: None,
         model: None,
         reasoning_effort: None,
         provider: None,
         base_url: None,
         api_key: None,
         context_tokens: None,
+        max_agent_tokens: None,
+        max_agent_iterations: None,
         print: false,
         json: false,
         stdio: false,
@@ -273,6 +285,7 @@ where
             Long("chatgpt") => set_once(&mut out.chatgpt, "--chatgpt", &mut parser)?,
             Long("account") => set_once(&mut out.account, "--account", &mut parser)?,
             Short('c') | Long("continue") => out.continue_session = true,
+            Long("session") => { set_once(&mut out.session, "--session", &mut parser)?; out.continue_session = true }
             Short('m') | Long("model") => out.model = Some(parser.value()?.string()?),
             Long("effort") => {
                 let value = parser.value()?.string()?;
@@ -282,6 +295,8 @@ where
             Long("base-url") => out.base_url = Some(parser.value()?.string()?),
             Long("api-key") => out.api_key = Some(parser.value()?.string()?),
             Long("context-tokens") => out.context_tokens = Some(parser.value()?.parse()?),
+            Long("max-agent-tokens") => out.max_agent_tokens = Some(parser.value()?.parse()?),
+            Long("max-agent-iterations") => out.max_agent_iterations = Some(parser.value()?.parse()?),
             Short('p') | Long("print") => {
                 if out.print {
                     // Subsequent -p closes the previous prompt; empty is an error.
@@ -450,12 +465,15 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         chatgpt,
         account,
         continue_session,
+        session,
         model,
         reasoning_effort,
         provider,
         base_url,
         api_key,
         context_tokens,
+        max_agent_tokens,
+        max_agent_iterations,
         print,
         json,
         stdio,
@@ -511,16 +529,19 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // A sub-agent's child is a session too, but a new one in a new worktree.
     const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 14] = [
+    let options: [(bool, &str, &[Option<&str>]); 17] = [
         (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
+        (session.is_some(), "--session", &[Some("--stdio"), Some("--print")]),
         (model.is_some(), "--model", RUNS),
         (reasoning_effort.is_some(), "--effort", RUNS),
         (provider.is_some(), "--provider", RUNS),
         (base_url.is_some(), "--base-url", RUNS),
         (api_key.is_some(), "--api-key", RUNS),
         (context_tokens.is_some(), "--context-tokens", RUNS),
+        (max_agent_tokens.is_some(), "--max-agent-tokens", &RUNS[1..]), // runs a program starts
+        (max_agent_iterations.is_some(), "--max-agent-iterations", &RUNS[1..]),
         (*json, "--json", &[Some("--print"), Some("--subagent"), Some("--check"), Some("--recall"), Some("--replay"), Some("--mcp-list")]),
         (*run_examples, "--run-examples", &[Some("--check")]),
         (*all, "--all", &[Some("--check")]),
@@ -625,6 +646,8 @@ fn key_flags(cli: &CliArgs) -> open_max_core::config::KeyFlags {
         model: trimmed(&cli.model),
         context_tokens: cli.context_tokens,
         reasoning_effort: cli.reasoning_effort,
+        max_agent_tokens: cli.max_agent_tokens,
+        max_agent_iterations: cli.max_agent_iterations,
     }
 }
 
@@ -910,6 +933,26 @@ async fn setup_on_shell(
     Ok(result)
 }
 
+/// Run an authentication command on the data directory until it ends or a
+/// quit signal stops it, and the exit code that says which.
+async fn authenticate<F: std::future::Future<Output = Result<(), String>>>(
+    run: impl FnOnce(std::path::PathBuf) -> F,
+) -> std::process::ExitCode {
+    let quit = watch_quit_signals(false);
+    let dir = default_data_dir();
+    let result = tokio::select! {
+        result = run(dir) => Some(result),
+        _ = quit.notified() => None,
+    };
+    open_max_core::chatgpt::finish_refreshes().await;
+    if signalled() { return std::process::ExitCode::from(quit_status() as u8); }
+    match result {
+        Some(Ok(())) => std::process::ExitCode::SUCCESS,
+        Some(Err(error)) => { eprintln!("openmax: {error}"); std::process::ExitCode::from(1) }
+        None => std::process::ExitCode::from(quit_status() as u8),
+    }
+}
+
 /// The run of everything but a session painted first (see `main`).
 async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let request = cli.login.as_ref().map(|target| (setup::Action::Login, target.as_deref(), "--login"))
@@ -919,19 +962,7 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             eprintln!("openmax: {error}");
             return Ok(std::process::ExitCode::from(3));
         }
-        let quit = watch_quit_signals(false);
-        let dir = default_data_dir();
-        let result = tokio::select! {
-            result = Box::pin(setup::run(&dir, action, target, None)) => Some(result),
-            _ = quit.notified() => None,
-        };
-        open_max_core::chatgpt::finish_refreshes().await;
-        if signalled() { return Ok(std::process::ExitCode::from(quit_status() as u8)); }
-        return Ok(match result {
-            Some(Ok(())) => std::process::ExitCode::SUCCESS,
-            Some(Err(error)) => { eprintln!("openmax: {error}"); std::process::ExitCode::from(1) }
-            None => std::process::ExitCode::from(quit_status() as u8),
-        });
+        return Ok(authenticate(|dir| async move { Box::pin(setup::run(&dir, action, target, None)).await }).await);
     }
     if let Some(action) = &cli.chatgpt {
         if matches!(action.as_str(), "login" | "logout") {
@@ -940,19 +971,8 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 return Ok(std::process::ExitCode::from(3));
             }
         }
-        let quit = watch_quit_signals(false);
-        let dir = default_data_dir();
-        let result = tokio::select! {
-            result = chatgpt::run(&dir, action, cli.account.as_deref().unwrap_or("main")) => Some(result),
-            _ = quit.notified() => None,
-        };
-        open_max_core::chatgpt::finish_refreshes().await;
-        if signalled() { return Ok(std::process::ExitCode::from(quit_status() as u8)); }
-        return Ok(match result {
-            Some(Ok(())) => std::process::ExitCode::SUCCESS,
-            Some(Err(e)) => { eprintln!("openmax: {e}"); std::process::ExitCode::from(1) }
-            None => std::process::ExitCode::from(quit_status() as u8),
-        });
+        let account = cli.account.as_deref().unwrap_or("main");
+        return Ok(authenticate(|dir| async move { chatgpt::run(&dir, action, account).await }).await);
     }
     if let Some(surface) = &cli.spec {
         // `usage` is the one dynamic surface: it joins each extension's
@@ -1455,13 +1475,14 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
 
     if cli.stdio || cli.print {
         let code = if cli.stdio {
-            let args = stdio::StdioArgs { continue_session: cli.continue_session, quit: quit.clone() };
+            let args = stdio::StdioArgs { continue_session: cli.continue_session, session: cli.session, quit: quit.clone() };
             stdio::run(core, core_rx, args).await
         } else {
             let args = headless::HeadlessArgs {
                 prompts: cli.prompts,
                 project: project.clone(),
                 continue_session: cli.continue_session,
+                session: cli.session,
                 json: cli.json,
                 quit: quit.clone(),
             };
@@ -3728,6 +3749,8 @@ mod tests {
                 model: Some("m".into()),
                 context_tokens: Some(8),
                 reasoning_effort: None,
+                max_agent_tokens: None,
+                max_agent_iterations: None,
             }
         );
         let cli = parse_args_from(["--provider", " p "]).unwrap();

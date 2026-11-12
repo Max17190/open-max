@@ -48,7 +48,7 @@ Open Max asks before it works in a new project. Its shell commands, tools and ho
 
 ## Docs
 
-[Install](docs/install.md) · [Getting started](docs/getting-started.md) · [Configuration](docs/configuration.md) · [Usage](docs/usage.md) · [Extending](docs/extending.md) · [Design](docs/design.md) · [Native execution and privacy](docs/execution.md) · [stdio protocol](docs/stdio-protocol.md) · [Development](docs/development.md)
+[Install](docs/install.md) · [Getting started](docs/getting-started.md) · [Configuration](docs/configuration.md) · [Usage](docs/usage.md) · [Extending](docs/extending.md) · [Design](docs/design.md) · [Native execution and privacy](docs/execution.md) · [Hold a run to your own checks](docs/verified-execution.md) · [stdio protocol](docs/stdio-protocol.md) · [Development](docs/development.md)
 
 ## License
 

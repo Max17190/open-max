@@ -2957,15 +2957,17 @@ impl App {
                 // transcript. The note carries what the block cannot: whose
                 // verdict this was and how close the harness is to overriding.
                 self.note(&format!(
-                    "turn_end gate '{hook}' refused completion (refusal {} of {}); its reason continues the turn:",
+                    "turn_end gate '{hook}' refused completion (refusal {} of this turn; this gate may refuse {} more); its reason continues the turn:",
                     continuation + 1,
-                    continuation + continuations_left,
+                    continuations_left.saturating_sub(1),
                 ));
                 self.insert_user_block(&reason);
                 // An open find popup indexes blocks; the injected one must
                 // enter its matches now, exactly as a finished message does.
                 self.refilter_scroll_search_live();
             }
+            // A record for callers (the event log, `--json`, stdio), not a line on every turn's end.
+            AgentEvent::TurnVerified { .. } => {}
             AgentEvent::SteerAccepted { text } => {
                 // The steer leaves the queue strip for its place in the
                 // transcript, the one a resumed session replays it at.

@@ -238,6 +238,9 @@ and the run that writes a key already uses it.
   A turn that reaches it stops and says so; a follow-up message (or
   `openmax --continue -p "<follow-up>"`) carries on from there. Settings are
   read at start, so a raised cap applies from the next `openmax` run.
+  `--max-agent-iterations` and `--max-agent-tokens` set either cap for one
+  `-p`, `--stdio` or `--subagent` run without writing it here (see
+  [usage](usage.md#command-line)).
 
 The input budget for the transcript and frozen tool schemas is
 `context_tokens - (max_tokens + 1024)`, leaving room for the reply and 1024

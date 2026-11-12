@@ -30,6 +30,7 @@ setting.
 openmax --base-url http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b --context-tokens 32768
 openmax --continue                    # resume latest session here
 openmax -c
+openmax --session <id> -p "carry on"   # continue that session of this directory
 openmax --provider ollama --model qwen2.5-coder:7b
 openmax -p "summarize the top level layout of this repo"
 openmax -p --json "list public modules in crates/core"
@@ -81,6 +82,20 @@ the file's is not sent the file's `api_key`. With
 writes the endpoint and answers a first task. The full rule, `--provider`
 included, is in [configuration](configuration.md#settings-from-the-command-line).
 
+`--max-agent-tokens <n>` and `--max-agent-iterations <n>` bound each turn of
+one `-p`, `--stdio` or `--subagent` run as the settings keys
+`max_agent_tokens` and `max_agent_iterations` do, so a script or CI job can
+bound the run it starts without editing settings.json. They are never written
+to settings.json, even where it leaves the key unset, and an in-session save
+keeps the file's value. A turn that reaches one ends as it does at the
+setting, with `done` carrying `budget_exhausted` or `max_iterations`: a print
+or `--subagent` run then exits 4 and in text mode its stop line names the
+flag, while a `--stdio` run exits as [stdio](stdio-protocol.md) says, so its
+client reads the `stop_reason`. A value that is not a positive whole number
+is a usage error (exit 2), and so is either flag on an interactive session.
+There is no ceiling in money: Open Max counts tokens and does not know their
+price.
+
 `openmax --mcp-list` and `openmax --mcp-call` are a one-shot MCP stdio
 client, used by the proxy tool an MCP server is adopted through; see
 [extending](extending.md#mcp-servers) and `openmax --spec mcp`.
@@ -116,6 +131,14 @@ running and removes that openmax's record of them (see the signals below). Auto 
 without content approval; ask uses the documented approval and sandbox rules.
 It honors permission rules, `pre_tool_use` hooks, and `approval_mode` exactly
 as a turn does. See [extending](extending.md#proof-of-life).
+
+`--session <id>` continues that session instead of the latest one, with `-p`
+or `--stdio`, and implies `--continue`; it is a separate option because
+`--continue` takes no value, so a word after it stays prompt text. The id is
+the `session_id` every event line carries. An id that no session of this
+directory has, one of another project's sessions, and one whose transcript is
+missing or does not load are each refused with exit 2 and a line that says
+which. Trust, approvals and permissions are those of `--continue`.
 
 A print prompt that starts with `-` parses as options, not text. Put it
 last, after `--`, which ends the options: `openmax -p -- '- list the files'`.
@@ -159,7 +182,7 @@ the prompts after it.
 | --- | --- |
 | 0 | Every turn finished |
 | 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
-| 2 | A usage or configuration error before any turn, or `--continue` found no prior session here |
+| 2 | A usage or configuration error before any turn, `--continue` found no prior session here, or `--session` named one this directory cannot continue |
 | 3 | The project is not trusted, or trust cannot be granted from this process |
 | 4 | A turn stopped short (`length` when five replies in a row reached their `max_tokens` before any tool call, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
 
@@ -167,6 +190,7 @@ the prompts after it.
 codes: it hands a print run one task and its own checks, a `turn_end` gate
 refuses the turn's end while a check fails, and it returns one JSON result
 with the checks, the changes and the replay command.
+[Hold a run to your own checks](verified-execution.md) walks a caller through it.
 
 Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches
 openmax and not them. SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 to a

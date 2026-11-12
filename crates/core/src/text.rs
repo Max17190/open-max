@@ -41,6 +41,25 @@ pub fn one_line(s: &str) -> String {
         .collect()
 }
 
+/// The largest char boundary of `s` at or below `at`, clamped to its length:
+/// where a byte budget can cut a string without splitting a character.
+pub(crate) fn floor_char_boundary(s: &str, at: usize) -> usize {
+    let mut end = at.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// The smallest char boundary of `s` at or above `at`, clamped to its length.
+pub(crate) fn ceil_char_boundary(s: &str, at: usize) -> usize {
+    let mut start = at.min(s.len());
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

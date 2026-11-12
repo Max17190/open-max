@@ -405,6 +405,8 @@ Fields:
   a completion gate: a nonzero exit refuses the turn's end and the reason is
   sent back as a user message. False observes only; exit status is ignored.
   Rejected on every other event, which either always gates or never does.
+- `max_refusals` (optional): `blocking = true` only: how many refusals of this
+  gate a turn honors, clamped to 1..8, default 8; its next ends it `unverified`.
 
 Unknown keys are rejected with the legal field list. At most 32 hooks load
 per event, sorted by file name; the rest are dropped and `openmax --check`
@@ -432,10 +434,11 @@ with no tool calls, whatever `stop_reason` it carried. `max_iterations`,
 `budget_exhausted`, `cancelled`, `error`, and `truncated` still fire the hook,
 but there is nothing left to honor a refusal with, so it is reported and the
 turn ends. The payload says which case this is (`blockable`), how many
-refusals have already been honored (`continuation`), and how many are left
-(`continuations_left`). After 8 honored refusals the harness overrides the
-hook and ends the turn with `stop_reason` `unverified`; `openmax -p` exits 4 on
-that, and on `max_iterations` and `budget_exhausted`. A refusal whose injected
+refusals have already been honored (`continuation`), and how many this gate
+has left (`continuations_left`). After 8 honored refusals in a turn, or a
+gate's own `max_refusals`, the harness overrides the gate and ends the turn
+with `stop_reason` `unverified`; `openmax -p` exits 4 on that, and on
+`max_iterations` and `budget_exhausted`. A refusal whose injected
 user message cannot be persisted is reported and ends the turn `unverified`
 the same way: a continuation only the running process remembers would diverge
 from every replay of the session. A blocking hook that times out refuses,
@@ -444,7 +447,8 @@ like any other gate, and so does one that cannot start, except in auto
 gate changed or was deleted, a gate cannot run, or the approval store cannot
 be read), each turn's end is reported in `hook_failed` and ends `unverified`
 without a refusal; the model is told at turn start, once per session. A turn
-that repairs the file is judged by the hooks on disk at its end.
+that repairs the file is judged by the hooks on disk at its end. An end every
+gate passed is recorded as `turn_verified`, naming them (`--spec stdio`).
 
 Each run receives one JSON payload on stdin, as one newline-terminated line:
 - pre_tool_use: {"event", "session_id", "tool", "args", "cwd", "tool_ok"}
@@ -470,7 +474,7 @@ Each run receives one JSON payload on stdin, as one newline-terminated line:
   "continuation", "continuations_left"} where `blockable` says whether a
   nonzero exit will be honored this time, `continuation` counts the refusals
   already honored in this turn (0 on the first end attempt), and
-  `continuations_left` is what remains before the harness overrides the hook.
+  `continuations_left` is what remains before the harness overrides this hook.
   A hook without `blocking` always sees `blockable` false.
 
 In auto, valid hooks run without content approval, including new and repaired
@@ -830,7 +834,8 @@ whose endpoint is not the one this file selects (a `--provider` other than
 save keeps this file's `model` and `reasoning_effort`, since they belong to that
 endpoint. `--api-key` beside a selected provider is refused.
 `--effort` sets `reasoning_effort` under the same write/override rules;
-`--effort default` leaves the request field unset.
+`--effort default` leaves the request field unset. `--max-agent-tokens` and
+`--max-agent-iterations` bound one unattended run and are never written here.
 
 Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 `context_tokens` fails at resolve, i.e. every turn refuses with the reason):
@@ -1026,14 +1031,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/8)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/9)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -1084,7 +1089,8 @@ Unknown `cmd` values yield {"type":"protocol_error","message":"..."} and the
 session continues; extra fields on a known command are ignored; blank lines
 are skipped.
 
-`openmax --stdio --continue` reattaches to the directory's latest session.
+`openmax --stdio --continue` reattaches to the directory's latest session,
+or with `--session <id>` to that session of the directory.
 After `hello` it emits one
 {"type":"transcript","session_id":"...","messages":[{"role":"user"|"assistant","content":"..."},...],"truncated":bool}
 line so the client can render what came before: user and assistant text only,
@@ -1131,6 +1137,9 @@ event goes out - and the turn continues, so render it, or the live view shows
 the model finishing and then starting again with no visible cause while a
 replay of the same session from disk shows the injected message; the two
 counters are the numbers the hook's payload carried for this attempt),
+`turn_verified` (hooks: the model's end stands and every blocking `turn_end`
+gate that judged it passed, named in the order they ran, before `done`;
+no line when no gate judged the end or it ends any other way),
 `steer_accepted` (text: a `user` line sent while the turn ran entered the
 transcript as a user message here, after the output above it and before the
 next request, which carries it; `text` is the line's text after template
@@ -1626,7 +1635,7 @@ mod tests {
         let hook = root.join(".openmax/hooks/deny-rm.toml");
         let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap())];
         shas.extend(
-            crate::ledger::manifest_code(&hook, &root)
+            crate::ledger::manifest_code_source(&hook, &std::fs::read_to_string(&hook).unwrap(), &root)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );
@@ -1644,7 +1653,7 @@ mod tests {
         let tool = root.join(".openmax/tools/todo_scan.toml");
         let mut tool_shas = vec![crate::ledger::sha256_hex(&std::fs::read(&tool).unwrap())];
         tool_shas.extend(
-            crate::ledger::manifest_code(&tool, &root)
+            crate::ledger::manifest_code_source(&tool, &std::fs::read_to_string(&tool).unwrap(), &root)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );
@@ -1909,6 +1918,7 @@ mod tests {
                 continuation: 0,
                 continuations_left: 0,
             },
+            AgentEvent::TurnVerified { hooks: Vec::new() },
             AgentEvent::SteerAccepted { text: String::new() },
             AgentEvent::SteerBlocked { text: String::new(), reason: String::new() },
             AgentEvent::Done { stop_reason: String::new() },
