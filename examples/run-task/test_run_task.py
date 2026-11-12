@@ -57,6 +57,7 @@ def a_refused_end_goes_back_to_the_model_and_the_next_one_passes(root, binary):
         result = call(binary, repo, elsewhere, out, "--check", CHECK)
     assert result["verified"] and result["exit_code"] == 0 and result["reason"] is None, result
     assert result["stop_reason"] == "stop" and result["refusals"] == 1 and len(requests) == 3, result
+    assert result["gates_passed"] == ["run-task-checks"], result
     check, = result["checks"]
     assert (check["command"], check["gates"], check["before"], check["after"]) == (CHECK, True, 1, 0), check
     # The refusal reached the model as the next user message, with the check's output.
@@ -86,7 +87,7 @@ def a_turn_whose_checks_never_pass_ends_unverified(root, binary):
     assert not result["verified"] and result["exit_code"] == 4, result
     assert result["stop_reason"] == "unverified" and result["reason"] == "the turn ended unverified", result
     # Eight refusals are honored; the ninth end is judged and reported, and the turn ends.
-    assert result["refusals"] == 8 and len(requests) == 9, result
+    assert result["refusals"] == 8 and len(requests) == 9 and result["gates_passed"] == [], result
     log = gate_log(out)
     assert [end["continuation"] for end in log] == list(range(9)), log
     assert [end["blockable"] for end in log] == [True] * 8 + [False] and not any(end["passed"] for end in log)
@@ -101,6 +102,8 @@ def the_verdict_is_this_script_s_own_run_of_the_checks(root, binary):
         repo, env, out = fixture(root, "defeated", binary, url)
         result = call(binary, repo, env, out, "--check", CHECK, code=4)
     assert result["stop_reason"] == "stop" and result["refusals"] == 1 and len(requests) == 3, result
+    # The gate passed the end it was left to judge; the script's own run decides.
+    assert result["gates_passed"] == ["run-task-checks"], result
     assert not result["verified"] and result["reason"].startswith("1 of 1 checks failed after the run"), result
 
 
@@ -114,6 +117,21 @@ def a_final_check_decides_the_verdict_without_gating_the_end(root, binary):
     assert (final["gates"], final["before"], final["after"]) == (False, None, 1), final
 
 
+def a_ceiling_ends_the_turn_as_open_max_s_flag_does(root, binary):
+    """The ceilings reach Open Max as its own flags, for this run only."""
+    with endpoint([FIX, DONE]) as (url, requests):
+        repo, env, out = fixture(root, "ceiling", binary, url)
+        settings = Path(env["HOME"]) / ".openmax" / "settings.json"
+        before = settings.read_bytes()
+        result = call(binary, repo, env, out, "--check", CHECK, "--max-agent-iterations", "1", code=4)
+        assert "positive number" in call(binary, repo, env, out, "--check", CHECK, "--max-agent-tokens", "0", code=2)
+    assert result["stop_reason"] == "max_iterations" and result["reason"] == "the turn ended max_iterations", result
+    assert result["ceilings"] == {"max_agent_tokens": None, "max_agent_iterations": 1} and len(requests) == 1, result
+    # The one round the ceiling allowed made the fix, so the checks pass afterwards.
+    assert result["checks"][0]["after"] == 0 and result["files_changed"] == ["greet.sh"], result
+    assert settings.read_bytes() == before
+
+
 def a_timeout_or_a_signal_stops_the_run(root, binary):
     sleep = {"tool": "bash", "args": {"command": "sleep 60"}}
     with endpoint([sleep]) as (url, requests):
@@ -122,6 +140,7 @@ def a_timeout_or_a_signal_stops_the_run(root, binary):
         result = call(binary, repo, env, out, "--check", CHECK, "--timeout", "2", code=143)
         assert time.monotonic() - started < 30
         assert result["stop_reason"] == "cancelled" and result["reason"] == "stopped at the --timeout of 2 seconds"
+        assert result["gates_passed"] == [], result
         assert result["checks"][0]["before"] == 1 and result["checks"][0]["after"] is None, result
 
     # A signal while the gate runs a check. Open Max lets a turn_end hook run
@@ -229,6 +248,7 @@ if __name__ == "__main__":
         a_turn_whose_checks_never_pass_ends_unverified(root, binary)
         the_verdict_is_this_script_s_own_run_of_the_checks(root, binary)
         a_final_check_decides_the_verdict_without_gating_the_end(root, binary)
+        a_ceiling_ends_the_turn_as_open_max_s_flag_does(root, binary)
         a_timeout_or_a_signal_stops_the_run(root, binary)
         a_call_that_cannot_be_held_to_its_checks_does_not_start(root, binary)
         a_project_in_ask_mode_says_why_nothing_was_written(root, binary)

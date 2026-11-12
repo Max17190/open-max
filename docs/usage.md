@@ -82,6 +82,20 @@ the file's is not sent the file's `api_key`. With
 writes the endpoint and answers a first task. The full rule, `--provider`
 included, is in [configuration](configuration.md#settings-from-the-command-line).
 
+`--max-agent-tokens <n>` and `--max-agent-iterations <n>` bound each turn of
+one `-p`, `--stdio` or `--subagent` run as the settings keys
+`max_agent_tokens` and `max_agent_iterations` do, so a script or CI job can
+bound the run it starts without editing settings.json. They are never written
+to settings.json, even where it leaves the key unset, and an in-session save
+keeps the file's value. A turn that reaches one ends as it does at the
+setting, with `done` carrying `budget_exhausted` or `max_iterations`: a print
+or `--subagent` run then exits 4 and in text mode its stop line names the
+flag, while a `--stdio` run exits as [stdio](stdio-protocol.md) says, so its
+client reads the `stop_reason`. A value that is not a positive whole number
+is a usage error (exit 2), and so is either flag on an interactive session.
+There is no ceiling in money: Open Max counts tokens and does not know their
+price.
+
 `openmax --mcp-list` and `openmax --mcp-call` are a one-shot MCP stdio
 client, used by the proxy tool an MCP server is adopted through; see
 [extending](extending.md#mcp-servers) and `openmax --spec mcp`.

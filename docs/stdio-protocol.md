@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/8`)
+# stdio protocol (`openmax-stdio/9`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/8","protocol_version":8,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/9","protocol_version":9,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -122,6 +122,7 @@ events either, but carry one).
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the prune target and nothing changed) |
 | `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`; or a hook file fails closed and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |
+| `turn_verified` | `hooks` (the model's end stands and every blocking `turn_end` gate that judged it passed, named by file stem in the order they ran; see below) |
 | `steer_accepted` | `text` (a `user` line sent while the turn ran entered the transcript as a user message here; see below) |
 | `steer_blocked` | `text`, `reason` (a `user_prompt_submit` gate refused a steer, which entered nothing; see below) |
 | `done` | `stop_reason` |
@@ -154,6 +155,17 @@ cause, while a replay of the same session from disk shows the injected message.
 `continuation` and `continuations_left` are the numbers the hook's payload
 carried for this attempt: refusals honored before this one, and how many the
 harness had left to honor.
+
+`turn_verified` goes out before `done` when the model ended the turn and every
+blocking `turn_end` gate loaded for that end ran and exited 0. A gate that
+refused earlier ends of the same turn and then passed is named too; its
+refusals are the `turn_refused` lines before it. There is no such line when no
+gate judged the end (none is installed, or only observe-only `turn_end` hooks
+are), when the turn ends `unverified` (a refusal past the bound or one that
+could not be persisted, a gate that could not start, a hook file failing
+closed), or when the end is not one the model asked for (`cancelled`,
+`error`, `truncated`, `max_iterations`, `budget_exhausted`). A frontend can
+therefore tell an end held to checks from one with nothing to hold it to.
 
 A `user` line sent while a turn runs steers it. A `/name args` line is
 expanded as a prompt template first, as a turn's first prompt is, and the
@@ -295,6 +307,7 @@ Any wire change bumps `protocol_version`. What each version changed:
 
 | Version | Change |
 | --- | --- |
+| 9 | `turn_verified` event |
 | 8 | A `user` line sent while a turn runs steers that turn instead of being refused; `steer_accepted` and `steer_blocked` events |
 | 7 | `fork` and `rewind` commands and the `forked` line |
 | 6 | `retry` event |

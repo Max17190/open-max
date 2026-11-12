@@ -228,7 +228,7 @@ pub enum AgentEvent {
         /// as structured data, not folded into `detail`, so the frontend
         /// controls its own un-clippable placement. Additive and defaulted:
         /// a stream without the key deserializes unchanged, and the key is
-        /// omitted from the wire whenever it is empty, so `openmax-stdio/8`
+        /// omitted from the wire whenever it is empty, so `openmax-stdio/9`
         /// bytes are byte-identical for every call that grants no env.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<String>,
@@ -256,7 +256,7 @@ pub enum AgentEvent {
         /// shell-quoted). In auto such a tool is callable from the next step
         /// with no card, so this is what the TUI shows when it lands.
         /// In-process only: `serde(skip)` keeps it off the wire, so
-        /// `openmax-stdio/8` bytes are unchanged and a parsed event carries
+        /// `openmax-stdio/9` bytes are unchanged and a parsed event carries
         /// it empty.
         #[serde(skip)]
         runs: Vec<(String, String)>,
@@ -293,6 +293,11 @@ pub enum AgentEvent {
     /// payload carried for this attempt: refusals honored before this one,
     /// and how many the harness had left to honor.
     TurnRefused { hook: String, reason: String, continuation: usize, continuations_left: usize },
+    /// The model's end stands and every blocking `turn_end` gate loaded for
+    /// it judged it and passed: `hooks` names them by file stem. Absent when
+    /// no gate judged the end or when it is not verified, so a frontend can
+    /// tell an end held to checks from one in a project without any.
+    TurnVerified { hooks: Vec<String> },
     /// A message sent while the turn ran (`Core::steer`) entered the
     /// transcript as a user message at an iteration boundary, after the
     /// output above it and before the next request. `text` is exactly what
@@ -359,7 +364,7 @@ mod tests {
     /// exactly as `--stdio` and `--print --json` emit it: both write
     /// `to_json_line`, which this pins, and crates/tui/tests/cli.rs checks
     /// that one turn comes out of the two in the same bytes. These strings
-    /// are the `openmax-stdio/8` contract: session_id first, then the `type`
+    /// are the `openmax-stdio/9` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
@@ -510,6 +515,10 @@ mod tests {
             r#"{"session_id":"s1","type":"turn_refused","hook":"verify","reason":"tests failing","continuation":0,"continuations_left":8}"#
         );
         assert_eq!(
+            env(AgentEvent::TurnVerified { hooks: vec!["lint".into(), "tests".into()] }),
+            r#"{"session_id":"s1","type":"turn_verified","hooks":["lint","tests"]}"#
+        );
+        assert_eq!(
             env(AgentEvent::SteerAccepted { text: "use the v2 API".into() }),
             r#"{"session_id":"s1","type":"steer_accepted","text":"use the v2 API"}"#
         );
@@ -591,6 +600,7 @@ mod tests {
                 AgentEvent::SchemasOverBudget { .. } => {}
                 AgentEvent::HookFailed { .. } => {}
                 AgentEvent::TurnRefused { .. } => {}
+                AgentEvent::TurnVerified { .. } => {}
                 AgentEvent::SteerAccepted { .. } => {}
                 AgentEvent::SteerBlocked { .. } => {}
                 AgentEvent::Done { .. } => {}
