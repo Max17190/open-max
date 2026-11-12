@@ -1412,7 +1412,7 @@ fn write_hundred_extensions(data: &std::path::Path, project: &std::path::Path) {
     // the project-local code it runs.
     for path in &approved {
         let mut shas = vec![open_max_core::ledger::sha256_hex(&std::fs::read(path).unwrap())];
-        shas.extend(open_max_core::ledger::manifest_code(path, project).into_iter().filter_map(|c| c.sha256));
+        shas.extend(open_max_core::ledger::manifest_code_source(path, &std::fs::read_to_string(path).unwrap(), project).into_iter().filter_map(|c| c.sha256));
         open_max_core::ledger::approve_capability(data, project, path, &shas).unwrap();
     }
 }

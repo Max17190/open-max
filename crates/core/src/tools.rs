@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use similar::{ChangeTag, DiffTag, TextDiff};
 
 use crate::client::truncate;
+use crate::text::{ceil_char_boundary, floor_char_boundary};
 
 const MAX_RESULTS: usize = 200;
 /// Grep lines run up to ~300 chars: 200 results could inject ~60KB (≈15k
@@ -1157,17 +1158,10 @@ fn next_line(reader: &mut impl std::io::BufRead, kept: &mut Vec<u8>, keep: usize
     }
 }
 
-fn floor_char(s: &str, mut idx: usize) -> usize {
-    while !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
 /// A clipped line must say so; its displayed prefix cannot be copied as a full line.
 fn numbered_line(n: usize, line: &str, len: usize) -> String {
     if len > MAX_LINE_CHARS {
-        let end = floor_char(line, MAX_LINE_CHARS);
+        let end = floor_char_boundary(line, MAX_LINE_CHARS);
         format!("{n} {}… [line clipped; {} more bytes]\n", &line[..end], len - end)
     } else {
         format!("{n} {line}\n")
@@ -1262,7 +1256,7 @@ fn write_file(root: &Path, args: &Value) -> ToolOutcome {
 /// all of a clipped line the model can have copied.
 fn hint_text(line: &str) -> &str {
     let line = line.trim();
-    &line[..floor_char(line, line.len().min(MAX_LINE_CHARS))]
+    &line[..floor_char_boundary(line, MAX_LINE_CHARS)]
 }
 
 fn line_similarity(a: &str, b: &str) -> f64 {
@@ -1892,11 +1886,7 @@ fn kept_tail(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
     }
-    let mut start = text.len() - max_bytes;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    from_a_line_start(&text[start..])
+    from_a_line_start(&text[ceil_char_boundary(text, text.len() - max_bytes)..])
 }
 
 /// The head of `text` within `max_bytes`, ending at a line boundary when one
@@ -1905,11 +1895,7 @@ fn kept_head(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
     }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    to_a_line_end(&text[..end])
+    to_a_line_end(&text[..floor_char_boundary(text, max_bytes)])
 }
 
 /// `text` after its first line break, when one is close by.

@@ -830,20 +830,7 @@ fn provider_key(key: Option<&str>, env: &[String]) -> Option<String> {
 /// The key configured for settings.base_url: settings.api_key, else
 /// `OPENMAX_API_KEY`.
 fn settings_key(key: Option<&str>) -> Option<String> {
-    if let Some(k) = key {
-        if let Some(v) = expand_secret(k) {
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    if let Ok(v) = std::env::var("OPENMAX_API_KEY") {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    None
+    provider_key(key, &["OPENMAX_API_KEY".into()])
 }
 
 /// Whether two base URLs name the same server: scheme, host, and port

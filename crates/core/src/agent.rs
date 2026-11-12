@@ -2035,7 +2035,7 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         let mut shas = vec![crate::ledger::sha256_hex(&bytes)];
         shas.extend(
-            crate::ledger::manifest_code(path, project)
+            crate::ledger::manifest_code_source(path, &std::fs::read_to_string(path).unwrap(), project)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );
@@ -2082,7 +2082,7 @@ mod tests {
         // A human approves the pair, as `openmax --approve` does.
         let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&manifest).unwrap())];
         shas.extend(
-            crate::ledger::manifest_code(&manifest, &project)
+            crate::ledger::manifest_code_source(&manifest, &std::fs::read_to_string(&manifest).unwrap(), &project)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );

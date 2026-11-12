@@ -796,21 +796,10 @@ impl Hooks {
         outcome: &crate::tools::ToolOutcome,
         cancel: &Arc<CancelToken>,
     ) -> Vec<HookFailure> {
-        let mut failures = Vec::new();
-        for hook in &self.post {
-            if !hook.matches(tool) {
-                continue;
-            }
-            let payload = tool_payload(hook, session_id, tool, args, cwd, Some(outcome));
-            match run_hook(hook, payload, cwd, cancel).await {
-                HookRun::Allow => {}
-                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
-                    failures.push(failure(hook, reason))
-                }
-                HookRun::Cancelled => break,
-            }
-        }
-        failures
+        observe(&self.post, cwd, cancel, |hook| {
+            hook.matches(tool).then(|| tool_payload(hook, session_id, tool, args, cwd, Some(outcome)))
+        })
+        .await
     }
 
     /// Run all `user_prompt_submit` hooks against the text the user typed,
@@ -868,22 +857,14 @@ impl Hooks {
         cwd: &Path,
         cancel: &Arc<CancelToken>,
     ) -> Vec<HookFailure> {
-        let mut failures = Vec::new();
-        for hook in &self.session_start {
-            let payload = serde_json::json!({
+        observe(&self.session_start, cwd, cancel, |hook| {
+            Some(serde_json::json!({
                 "event": hook.event.as_str(),
                 "session_id": session_id,
                 "cwd": cwd.display().to_string(),
-            });
-            match run_hook(hook, payload, cwd, cancel).await {
-                HookRun::Allow => {}
-                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
-                    failures.push(failure(hook, reason))
-                }
-                HookRun::Cancelled => break,
-            }
-        }
-        failures
+            }))
+        })
+        .await
     }
 
     /// Run `compaction` hooks after context was pruned, with the same digest
@@ -895,23 +876,15 @@ impl Hooks {
         record: &Value,
         cancel: &Arc<CancelToken>,
     ) -> Vec<HookFailure> {
-        let mut failures = Vec::new();
-        for hook in &self.compaction {
-            let payload = serde_json::json!({
+        observe(&self.compaction, cwd, cancel, |hook| {
+            Some(serde_json::json!({
                 "event": hook.event.as_str(),
                 "session_id": session_id,
                 "cwd": cwd.display().to_string(),
                 "record": record,
-            });
-            match run_hook(hook, payload, cwd, cancel).await {
-                HookRun::Allow => {}
-                HookRun::Block(reason) | HookRun::Unstarted(reason) => {
-                    failures.push(failure(hook, reason))
-                }
-                HookRun::Cancelled => break,
-            }
-        }
-        failures
+            }))
+        })
+        .await
     }
 
     /// Run `turn_end` hooks with the turn's stop reason. The end the model
@@ -1121,6 +1094,27 @@ fn describe(entries: &[(PathBuf, String)]) -> String {
         .join("; ")
 }
 
+/// Run observe-only `hooks` in order, each with its own payload, passing over
+/// one with none. A failure never blocks: it is returned, and a cancel ends
+/// the run.
+async fn observe(
+    hooks: &[HookSpec],
+    cwd: &Path,
+    cancel: &Arc<CancelToken>,
+    payload: impl Fn(&HookSpec) -> Option<Value>,
+) -> Vec<HookFailure> {
+    let mut failures = Vec::new();
+    for hook in hooks {
+        let Some(payload) = payload(hook) else { continue };
+        match run_hook(hook, payload, cwd, cancel).await {
+            HookRun::Allow => {}
+            HookRun::Block(reason) | HookRun::Unstarted(reason) => failures.push(failure(hook, reason)),
+            HookRun::Cancelled => break,
+        }
+    }
+    failures
+}
+
 /// The stdin payload for tool-scoped events, shared by pre and post. `result`
 /// is the outcome a `post_tool_use` hook is reporting on, and is None before
 /// the call runs.
@@ -1171,14 +1165,7 @@ fn tool_payload(
 /// what the model reasoned about. It is therefore what a hook is shown, and
 /// what `output_bytes` measures.
 fn head_bytes(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    &s[..crate::text::floor_char_boundary(s, max)]
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2570,7 +2557,7 @@ mod tests {
         let Ok(bytes) = std::fs::read(path) else { return };
         let mut shas = vec![crate::ledger::sha256_hex(&bytes)];
         shas.extend(
-            crate::ledger::manifest_code(path, project)
+            crate::ledger::manifest_code_source(path, &std::fs::read_to_string(path).unwrap(), project)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );

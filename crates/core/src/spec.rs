@@ -1626,7 +1626,7 @@ mod tests {
         let hook = root.join(".openmax/hooks/deny-rm.toml");
         let mut shas = vec![crate::ledger::sha256_hex(&std::fs::read(&hook).unwrap())];
         shas.extend(
-            crate::ledger::manifest_code(&hook, &root)
+            crate::ledger::manifest_code_source(&hook, &std::fs::read_to_string(&hook).unwrap(), &root)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );
@@ -1644,7 +1644,7 @@ mod tests {
         let tool = root.join(".openmax/tools/todo_scan.toml");
         let mut tool_shas = vec![crate::ledger::sha256_hex(&std::fs::read(&tool).unwrap())];
         tool_shas.extend(
-            crate::ledger::manifest_code(&tool, &root)
+            crate::ledger::manifest_code_source(&tool, &std::fs::read_to_string(&tool).unwrap(), &root)
                 .into_iter()
                 .filter_map(|c| c.sha256),
         );

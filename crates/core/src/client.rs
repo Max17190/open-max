@@ -1069,7 +1069,7 @@ async fn read_sse(
             scanned = 0;
             let rest = buf.split_off(pos + 1);
             let consumed = std::mem::replace(&mut buf, rest);
-            let line = trim_bytes(&consumed[..pos]);
+            let line = consumed[..pos].trim_ascii();
             if line.is_empty() || line.first() == Some(&b':') {
                 continue;
             }
@@ -1363,23 +1363,13 @@ pub(crate) fn strip_leading_think(content: &str) -> Option<String> {
     None
 }
 
-fn trim_bytes(mut s: &[u8]) -> &[u8] {
-    while s.first().is_some_and(|b| b.is_ascii_whitespace()) {
-        s = &s[1..];
-    }
-    while s.last().is_some_and(|b| b.is_ascii_whitespace()) {
-        s = &s[..s.len() - 1];
-    }
-    s
-}
-
 /// The payload of one SSE line, or None for a line that carries none: an
 /// empty `data:` line, or another field (`event:`, `id:`, `retry:`), which
 /// is passed over as the format asks. A line with no field name that opens
 /// like JSON is taken as data too, for servers that send it bare.
 fn data_line(line: &[u8]) -> Option<&[u8]> {
     match line.strip_prefix(b"data:") {
-        Some(data) => Some(trim_bytes(data)).filter(|data| !data.is_empty()),
+        Some(data) => Some(data.trim_ascii()).filter(|data| !data.is_empty()),
         None => matches!(line.first(), Some(b'{' | b'[')).then_some(line),
     }
 }
@@ -1650,11 +1640,7 @@ pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        let mut end = max;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &s[..end])
+        format!("{}…", &s[..crate::text::floor_char_boundary(s, max)])
     }
 }
 
@@ -1890,8 +1876,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn trim_bytes_strips_whitespace() {
-        assert_eq!(trim_bytes(b"  hello \r"), b"hello");
+    fn sse_lines_are_trimmed_of_ascii_whitespace() {
+        assert_eq!(b"  hello \r".trim_ascii(), b"hello");
     }
 
     #[test]
@@ -1967,7 +1953,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_sse_line_extracts_content() {
         let line = br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
-        let data = data_line(trim_bytes(line)).unwrap();
+        let data = data_line(line.trim_ascii()).unwrap();
         let chunk: StreamChunk = serde_json::from_slice(data).unwrap();
         let delta = chunk.choices.unwrap().remove(0).delta.unwrap();
         assert_eq!(delta.content.as_deref(), Some("hi"));

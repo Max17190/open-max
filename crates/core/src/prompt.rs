@@ -692,10 +692,7 @@ fn capped_agents_md(text: &str) -> String {
     if text.len() <= MAX_AGENTS_MD_BYTES {
         return text.to_string();
     }
-    let mut cut = MAX_AGENTS_MD_BYTES;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = crate::text::floor_char_boundary(text, MAX_AGENTS_MD_BYTES);
     format!("{}\n…[AGENTS.md truncated; read_file it for the rest]", &text[..cut])
 }
 
