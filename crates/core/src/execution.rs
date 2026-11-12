@@ -3566,14 +3566,21 @@ mod tests {
         assert!(output.background_terminated, "a stopped background child was not reported");
     }
 
-    /// A program whose helper exits a few milliseconds after it, as a test
-    /// runner's worker pool does once its pipe to them closes, left nothing
-    /// running: the helper is not signalled and nothing is reported. The
-    /// helper is the test's own child, reaped as it exits, so a host whose
-    /// init does not reap orphans cannot keep it in the group as a zombie.
-    /// Its teardown is 5 ms of work rather than a timer, which a QoS clamp on
-    /// macOS would stretch past the window, and the program exits only once
-    /// the helper says it is ready, so a slow start is not counted in it.
+    /// A program whose helper exits just after it, as a test runner's worker
+    /// pool does once its pipe to them closes, left nothing running: the
+    /// helper is not signalled and nothing is reported. The helper is the
+    /// test's own child, reaped as it exits, so a host whose init does not
+    /// reap orphans cannot keep it in the group as a zombie.
+    ///
+    /// The window opens once the helper says it has seen its pipe close, so
+    /// what is on the window's clock is its teardown, 1 ms of work rather
+    /// than a timer a QoS clamp on macOS would stretch, and its exit. Opened
+    /// as the pipe closed, the window also held the helper's wake-up, which
+    /// waits on the scheduler: with every test binary running at once, or
+    /// the cores busy with other work, the helper was still waiting for a
+    /// core when the window ended, and was stopped and reported. The program
+    /// exits only once the helper says it is ready, so a slow start is not
+    /// counted either.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_helper_that_exits_just_after_its_program_is_not_reported() {
@@ -3584,18 +3591,19 @@ mod tests {
         let mut program = program.spawn().unwrap();
         let group = program.id();
         let teardown =
-            "use Time::HiRes qw(time); $| = 1; print qq(ready\\n); <STDIN>; my $end = time + 0.005; 1 while time < $end";
+            "use Time::HiRes qw(time); $| = 1; print qq(r); <STDIN>; print qq(d); my $end = time + 0.001; 1 while time < $end";
         let mut helper = Command::new("perl");
         helper.args(["-e", teardown]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
         helper.kill_on_drop(true).as_std_mut().process_group(i32::try_from(group.unwrap()).unwrap());
         let mut helper = helper.spawn().unwrap();
         let pipe = helper.stdin.take();
-        let mut ready = [0; 1];
-        let said = helper.stdout.take().unwrap().read(&mut ready).await.unwrap();
-        assert_eq!(said, 1, "the helper never started");
+        let mut said = helper.stdout.take().unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(said.read(&mut byte).await.unwrap(), 1, "the helper never started");
         program.start_kill().unwrap();
         program.wait().await.unwrap();
         drop(pipe);
+        assert_eq!(said.read(&mut byte).await.unwrap(), 1, "the helper never saw its pipe close");
         let (reported, exited) = tokio::join!(stop_what_was_left_running(group), helper.wait());
         assert_eq!(exited.unwrap().code(), Some(0), "the helper was stopped instead of exiting on its own");
         assert!(!reported, "a helper on its way out was reported as left running");
