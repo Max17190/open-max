@@ -190,6 +190,7 @@ the prompts after it.
 codes: it hands a print run one task and its own checks, a `turn_end` gate
 refuses the turn's end while a check fails, and it returns one JSON result
 with the checks, the changes and the replay command.
+[Hold a run to your own checks](verified-execution.md) walks a caller through it.
 
 Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches
 openmax and not them. SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 to a
