@@ -1,5 +1,9 @@
 # Run a task held to your own checks
 
+[Hold a run to your own checks](../../docs/verified-execution.md) is the
+one page for a caller: how a turn's end is judged, how to bound, continue and
+replay a run, and what the result does and does not show.
+
 This optional example is one entry point for a program that hands Open Max a
 task: a script, a CI job or another agent. `run_task.py` runs the task in your
 repository, with the model your installation is configured for, and refuses
