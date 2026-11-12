@@ -33,6 +33,8 @@ options:
                          login, logout, status, or models for ChatGPT plan use
       --account <label>  saved ChatGPT account (default: main)
   -c, --continue         resume the latest session in this directory
+      --session <id>     with -p or --stdio, continue that session of this
+                         directory instead of the latest (implies --continue)
       --base-url <url>   the model server's API root (settings key base_url)
   -m, --model <id>       the model id it expects (settings key model)
       --api-key <key>    its key, a literal or '$ENV_VAR' naming a set variable
@@ -156,6 +158,8 @@ struct CliArgs {
     chatgpt: Option<String>,
     account: Option<String>,
     continue_session: bool,
+    /// `--session`: the session `--continue` resumes instead of the latest.
+    session: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<Option<open_max_core::config::ReasoningEffort>>,
     provider: Option<String>,
@@ -219,6 +223,7 @@ where
         chatgpt: None,
         account: None,
         continue_session: false,
+        session: None,
         model: None,
         reasoning_effort: None,
         provider: None,
@@ -273,6 +278,7 @@ where
             Long("chatgpt") => set_once(&mut out.chatgpt, "--chatgpt", &mut parser)?,
             Long("account") => set_once(&mut out.account, "--account", &mut parser)?,
             Short('c') | Long("continue") => out.continue_session = true,
+            Long("session") => { set_once(&mut out.session, "--session", &mut parser)?; out.continue_session = true }
             Short('m') | Long("model") => out.model = Some(parser.value()?.string()?),
             Long("effort") => {
                 let value = parser.value()?.string()?;
@@ -450,6 +456,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         chatgpt,
         account,
         continue_session,
+        session,
         model,
         reasoning_effort,
         provider,
@@ -511,10 +518,11 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // A sub-agent's child is a session too, but a new one in a new worktree.
     const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 14] = [
+    let options: [(bool, &str, &[Option<&str>]); 15] = [
         (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
+        (session.is_some(), "--session", &[Some("--stdio"), Some("--print")]),
         (model.is_some(), "--model", RUNS),
         (reasoning_effort.is_some(), "--effort", RUNS),
         (provider.is_some(), "--provider", RUNS),
@@ -1452,13 +1460,14 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
 
     if cli.stdio || cli.print {
         let code = if cli.stdio {
-            let args = stdio::StdioArgs { continue_session: cli.continue_session, quit: quit.clone() };
+            let args = stdio::StdioArgs { continue_session: cli.continue_session, session: cli.session, quit: quit.clone() };
             stdio::run(core, core_rx, args).await
         } else {
             let args = headless::HeadlessArgs {
                 prompts: cli.prompts,
                 project: project.clone(),
                 continue_session: cli.continue_session,
+                session: cli.session,
                 json: cli.json,
                 quit: quit.clone(),
             };

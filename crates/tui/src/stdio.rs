@@ -78,6 +78,7 @@ enum Command {
 
 pub struct StdioArgs {
     pub continue_session: bool,
+    pub session: Option<String>,
     /// Notified on a quit signal (see `watch_quit_signals`).
     pub quit: Arc<Notify>,
 }
@@ -92,8 +93,8 @@ pub async fn run(
 
     // Every step of the setup can wait on the session index lock.
     let setup = {
-        let (core, project_key, continue_session) = (core.clone(), project_key.clone(), args.continue_session);
-        move || open_session(&core, &project_key, continue_session)
+        let (core, project_key, continue_session, named) = (core.clone(), project_key.clone(), args.continue_session, args.session.clone());
+        move || open_session(&core, &project_key, continue_session, named)
     };
     let mut stop_by = None;
     let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
@@ -130,8 +131,9 @@ fn open_session(
     core: &Core,
     project_key: &str,
     continue_session: bool,
+    named: Option<String>,
 ) -> Result<(String, Vec<open_max_core::types::ChatMessage>), i32> {
-    let session_id = crate::headless::open_session(core, project_key.to_string(), continue_session)?;
+    let session_id = crate::headless::open_session(core, project_key.to_string(), continue_session, named)?;
     if let Err(e) = sessions::attach(core, &session_id) {
         eprintln!("openmax: {e}");
         return Err(1);
