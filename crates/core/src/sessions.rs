@@ -573,46 +573,6 @@ fn archive_path(core: &Core, id: &str) -> PathBuf {
     sessions_dir(core).join(format!("{id}.archive.jsonl"))
 }
 
-const ARCHIVE_RECOVERY_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Read only complete records in a bounded suffix of this session's archive.
-/// The digest and call ID identify the exact original even if IDs repeat.
-pub(crate) fn archived_tool_outputs<'a>(
-    core: &Core, id: &str, wanted: &HashSet<crate::types::ArchivedToolKey<'a>>,
-) -> HashMap<crate::types::ArchivedToolKey<'a>, String> {
-    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-    let mut found = HashMap::new();
-    if wanted.is_empty() { return found; }
-    let mut by_digest: HashMap<&str, Vec<_>> = HashMap::new();
-    for key in wanted {
-        by_digest.entry(key.0).or_default().push(*key);
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let Ok(mut file) = options.open(archive_path(core, id)) else { return found; };
-    let Ok(meta) = file.metadata() else { return found; };
-    if !meta.is_file() { return found; }
-    let start = meta.len().saturating_sub(ARCHIVE_RECOVERY_BYTES);
-    if file.seek(SeekFrom::Start(start.saturating_sub(1))).is_err() { return found; }
-    // Read one byte before the cut so a record that starts there still fits.
-    let mut reader = BufReader::new(file.take(ARCHIVE_RECOVERY_BYTES + u64::from(start > 0)));
-    let mut line = Vec::new();
-    if start > 0 && reader.read_until(b'\n', &mut line).is_err() { return found; }
-    while found.len() < wanted.len() {
-        line.clear();
-        if reader.read_until(b'\n', &mut line).is_err() || !line.ends_with(b"\n") { break; }
-        let Ok(row) = serde_json::from_slice::<ChatMessage>(&line) else { continue; };
-        let Some((digest, call_id)) = row.archived_tool_key() else { continue; };
-        let Some(&key) = by_digest.get(digest).and_then(|keys| keys.iter().find(|key| key.1 == call_id)) else { continue; };
-        if let Some(content) = row.content.filter(|content| crate::ledger::sha256_hex(content.as_bytes()) == key.0) {
-            found.insert(key, content);
-        }
-    }
-    found
-}
-
 /// Absolute path of a session's compaction archive: the address the digest
 /// note hands the agent so dropped context stays reachable (bash: grep/tail).
 pub fn archive_display(core: &Core, id: &str) -> String {
@@ -2772,49 +2732,6 @@ mod tests {
         assert_eq!(loaded[3].content.as_deref(), Some("second prune"));
         assert!(archive_display(&core, id).ends_with(&format!("{id}.archive.jsonl")));
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn archive_recovery_reads_only_complete_matching_records_in_its_tail() {
-        let dir = std::env::temp_dir().join(format!("openmax-archive-tail-{}", uuid::Uuid::new_v4()));
-        let (core, _) = Core::new(dir.clone()).unwrap();
-        let id = create(&core, dir.display().to_string()).unwrap().id;
-        let tagged = |content: &str| ChatMessage {
-            archived_tool_output: Some(crate::ledger::sha256_hex(content.as_bytes())),
-            ..ChatMessage::tool("call", content)
-        };
-        let missing_id = ChatMessage { tool_call_id: None, ..tagged("valid output") };
-        let wrong_id = tagged("another call's result");
-        let wrong_role = tagged("incorrect role");
-        let corrupt = tagged("changed content");
-        let malformed = tagged("malformed line");
-        let partial = tagged("partial first line");
-        let torn = tagged("missing final newline");
-        let wanted = [&missing_id, &wrong_id, &wrong_role, &corrupt, &malformed, &partial, &torn]
-            .into_iter().map(|msg| msg.archived_tool_key().unwrap()).collect();
-        assert!(archived_tool_outputs(&core, &id, &wanted).is_empty());
-
-        let json = |msg: &ChatMessage| serde_json::to_string(msg).unwrap();
-        let tail = format!(
-            "{}\n{}\n{}\n{}\n{} garbage\n{}",
-            json(&missing_id),
-            json(&ChatMessage { tool_call_id: Some("other".into()), ..wrong_id.clone() }),
-            json(&ChatMessage { role: "assistant".into(), ..wrong_role.clone() }),
-            json(&ChatMessage { content: Some("tampered".into()), ..corrupt.clone() }),
-            json(&malformed), json(&torn),
-        );
-        let first = format!("{}\n", json(&partial));
-        let padding = ARCHIVE_RECOVERY_BYTES as usize - first.len() - tail.len();
-        // Start the scan within this row. The suffix would parse as JSON
-        // after its leading spaces if the reader treated the cut as a boundary.
-        let mut bytes = b"partial prefix ".to_vec();
-        bytes.resize(bytes.len() + padding, b' ');
-        bytes.extend(first.bytes());
-        bytes.extend(tail.bytes());
-        std::fs::write(archive_path(&core, &id), bytes).unwrap();
-        let recovered = archived_tool_outputs(&core, &id, &wanted);
-        assert_eq!(recovered, HashMap::from([(missing_id.archived_tool_key().unwrap(), "valid output".into())]));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
