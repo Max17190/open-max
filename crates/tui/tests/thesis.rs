@@ -130,7 +130,9 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// multiplier, which the script explains, in a step with a timeout, and
 /// fails the pull request over that budget. It is a job of its own, so no
 /// step of the test job runs on one of its runners only, and it restores the
-/// test job's cache, saving none. macos-latest does not meet its budget, so
+/// test job's cache, saving none. Neither it nor the report gives cargo
+/// another profile than Cargo.toml's, so each times the build `cargo test`
+/// makes. macos-latest does not meet its budget, so
 /// the Reports workflow runs the script there every night instead, five
 /// times after one build with that runner's multiplier, and reports what it
 /// prints, failing only when the five runs did not finish. This test holds
@@ -190,6 +192,18 @@ fn the_suite_fails_over_its_time_budget() {
     assert!(at(&report, "run: cargo test --workspace --locked --no-run").is_some(), "the report builds under its timeout");
     for line in ["shared-key: test", "save-if: false"] {
         assert!(at(&report, line).is_some(), "the suite time report does not restore the test job's cache without saving one: {line}");
+    }
+    // The gate and the report time the build `cargo test` makes from
+    // Cargo.toml: neither job gives cargo another profile, by a variable, a
+    // flag or a config file, as the test job does to build unoptimized.
+    for (name, lines) in [("gate", &job), ("report", &report)] {
+        let overrides: Vec<&str> = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.starts_with('#'))
+            .filter(|line| *line == "env:" || ["CARGO_", "RUSTFLAGS", "GITHUB_ENV", "--config", "config.toml"].iter().any(|key| line.contains(key)))
+            .collect();
+        assert!(overrides.is_empty(), "the suite time {name} can build another profile than Cargo.toml's: {overrides:?}");
     }
     let run = at(&report, "- name: Report the suite time").expect("the Reports workflow has no suite time report");
     assert!(
@@ -2214,8 +2228,8 @@ fn core_share_reports_the_share_of_commits_that_change_the_core() {
 /// would serve only that pull request's later runs, which main's copy serves
 /// as well unless the pull request changes Cargo.lock, since rust-cache keeps
 /// no workspace crate, and it would take the repository's cache space. A job
-/// that repeats the build of a ci.yml job saves none, and restores that
-/// job's cache by naming it as its shared key.
+/// that builds a ci.yml job's dependencies again saves none, and restores
+/// that job's cache by naming it as its shared key.
 #[test]
 fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
     let events = triggers("ci.yml");
@@ -2309,7 +2323,10 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
 /// job on the other, which would hide its failures. A lock inside one test
 /// binary keeps nothing apart across the processes nextest starts, so the
 /// harness-time tests, which thesis_rounds holds apart with a lock for their
-/// CPU-bound timing, reserve every test thread instead. The doc tests, which
+/// CPU-bound timing, reserve every test thread instead. The job builds the
+/// workspace's own crates unoptimized, the build each debug bound was set on,
+/// by two settings in cargo's home config that override Cargo.toml's test
+/// profile, written before any step builds. The doc tests, which
 /// nextest does not run, run in a step of their own. docs/development.md states this.
 #[test]
 fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
@@ -2321,6 +2338,13 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
     let run = at("step that runs nextest", &|line| line == format!("run: {NEXTEST_RUN}"));
     at("step that runs the doc tests", &|line| line == format!("run: {DOC_TESTS}"));
     assert!(install < run, "the tests run before nextest is installed");
+    let unoptimized = at("step that builds the workspace's crates unoptimized", &|line| {
+        line.starts_with("printf ")
+            && ["[profile.test.package.open-max-core]\\nopt-level = 0", "[profile.test.package.openmax]\\nopt-level = 0", "/config.toml"]
+                .iter()
+                .all(|part| line.contains(part))
+    });
+    assert!(unoptimized < run, "the tests are built before the workspace's crates are set unoptimized");
     let keys = step_keys(&job, install);
     let version = keys.iter().find_map(|key| key.strip_prefix("NEXTEST_VERSION: ")).expect("nextest's version is not pinned");
     assert!(
@@ -2958,6 +2982,12 @@ fn a_full_mutation_run_fails_under_its_floor() {
         "a shard tests its mutants before every test of the workspace has passed on the unmutated tree in its cgroup"
     );
     assert!(holds(&shards, "max-parallel: 4"), "background mutation sweeps do not reserve runner capacity");
+    assert!(
+        shards.iter().any(|l| l.trim().starts_with("printf ")
+            && l.contains("[profile.test.package.open-max-core]\\nopt-level = 0")
+            && l.contains("[profile.test.package.openmax]\\nopt-level = 0")),
+        "a shard builds the workspace's crates as the test job does not, so its mutants are judged by another build's tests"
+    );
     assert!(holds(&judge, "if: ${{ !cancelled() }}"), "the judgement is skipped when a shard fails");
     assert!(holds(&judge, "needs: [plan, mutants]"), "the judgement does not wait for the shards");
     // The download puts a lone shard's artifact in shards/ itself, and each of

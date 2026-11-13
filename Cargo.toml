@@ -124,14 +124,15 @@ opt-level = "s"
 [profile.dist]
 inherits = "release"
 
-# `cargo test` builds the dev profile. The terminal rendering and JSON crates
-# below are optimized (level 1): run all at once the suite is CPU-bound, and
-# this takes the TUI's unit tests, its slowest binary, from 4.9 to 3.4
-# CPU-seconds and the whole suite from 21.2 to 19.3, for 2 seconds more on a
-# clean test build (30 to 32 at 3 jobs). The other dependencies and the
-# workspace's own crates stay unoptimized, so an edit rebuilds as before.
-# Optimizing every dependency saved no more and doubled that clean build,
-# since it optimizes the proc macros too, `syn` first.
+# `cargo test` builds the test profile, which inherits this one. The terminal
+# rendering and JSON crates below are optimized (level 1): run all at once the
+# suite is CPU-bound, and this takes the TUI's unit tests, its slowest binary,
+# from 4.9 to 3.4 CPU-seconds and the whole suite from 21.2 to 19.3, for 2
+# seconds more on a clean test build (30 to 32 at 3 jobs). The other
+# dependencies stay unoptimized: optimizing every dependency saved no more and
+# doubled that clean build, since it optimizes the proc macros too, `syn`
+# first. The workspace's own crates stay unoptimized outside test builds
+# (below), so `cargo build` and `cargo run` rebuild after an edit as before.
 [profile.dev.package]
 ratatui-core.opt-level = 1
 ratatui-widgets.opt-level = 1
@@ -148,3 +149,18 @@ serde_core.opt-level = 1
 ryu.opt-level = 1
 itoa.opt-level = 1
 memchr.opt-level = 1
+
+# Test builds optimize the workspace's own crates too (level 2): the suite is
+# CPU-bound on ubuntu-latest, where CI holds it to 15 seconds
+# (scripts/check-suite-time.sh). Run beside each other there, it took 12.34
+# seconds with them unoptimized and 8.49 with them optimized on the slowest of
+# 2 runners, and 10.87 and 8.53 on the fastest. The build pays for it: on such
+# a runner the tests build in 203 to 223 seconds instead of 35 to 37, and
+# after a one-line edit in 28 to 35 instead of 14 to 15 (open-max-core) or 2.3
+# to 2.6 instead of 2.8 to 3.0 (openmax). Debug assertions and overflow checks
+# stay on. CI's test job and the mutation sweep build them unoptimized
+# (.github/workflows), and docs/development.md says how to on one's own
+# machine.
+[profile.test.package]
+open-max-core.opt-level = 2
+openmax.opt-level = 2

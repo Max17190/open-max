@@ -12,9 +12,9 @@ name: Reports
 # Release build start, holding the macOS runners a pull request's run waits
 # for. Each job puts its numbers in its summary and fails only when it could
 # not measure, so a failed run here is a measurement that broke, not a target
-# missed. Each job repeats the build of a ci.yml job, so it restores the cache
-# that job saves on main and saves none of its own: the repository's cache
-# space holds no second copy. crates/tui/tests/thesis.rs holds this wiring.
+# missed. Each job builds the dependencies of a ci.yml job again, so it
+# restores the cache that job saves on main and saves none of its own: the
+# repository's cache space holds no second copy. crates/tui/tests/thesis.rs holds this wiring.
 on:
   schedule:
     - cron: "17 7 * * *"

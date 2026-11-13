@@ -65,6 +65,19 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Test builds optimize the workspace's own crates (Cargo.toml's test
+      # profile), which the Suite time job times and pays for: built that way
+      # the tests take 203 to 223 seconds to build on ubuntu-latest instead of
+      # 35 to 37, and 425 instead of 63 on macos-latest. This job holds no time
+      # budget and runs each test in a process of its own, so it builds them
+      # unoptimized, as it did before: cargo reads the two settings from the
+      # config in its home directory, over Cargo.toml's.
+      # crates/tui/tests/thesis.rs holds this.
+      - name: Build the workspace's crates unoptimized
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '\n[profile.test.package.open-max-core]\nopt-level = 0\n\n[profile.test.package.openmax]\nopt-level = 0\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+
       # cargo-nextest's release binary for the runner, checked against the
       # sha256 its release publishes before it runs, as the Mutants workflow
       # checks cargo-mutants. A bump replaces the version and both hashes.
@@ -118,9 +131,11 @@ jobs:
   # test job runs on one of its runners only. macos-latest, 3 shared cores,
   # ran the suite in 12.5 to 33.7 seconds over 32 runs, over its 20-second
   # budget in 19, so the Reports workflow measures it there every night
-  # instead. The job repeats the test job's build, so it restores the cache
-  # that job saves on main and saves none of its own: the repository's cache
-  # space holds no second copy. crates/tui/tests/thesis.rs holds this wiring.
+  # instead. The job builds the test job's dependencies again, and the
+  # workspace's own crates as Cargo.toml's test profile gives them, so it
+  # restores the cache that job saves on main and saves none of its own: the
+  # repository's cache space holds no second copy. crates/tui/tests/thesis.rs
+  # holds this wiring.
   suite-time:
     name: Suite time
     runs-on: ubuntu-latest
