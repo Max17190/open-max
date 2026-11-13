@@ -1,0 +1,241 @@
+name: Suite CPU by test
+
+# Temporary: measures where the test suite spends CPU on the hosted runner
+# that CI's Suite time job draws, per test binary and per test, to choose
+# what to cut. Runs on pushes to its own branch only; never merged.
+on:
+  push:
+    branches: [test/suite-cpu-by-test]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      - name: Tools
+        timeout-minutes: 6
+        run: |
+          set +e
+          sudo apt-get update -qq > /dev/null 2>&1
+          sudo apt-get install -y time strace > /dev/null 2>&1
+          sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 ||
+            sudo apt-get install -y linux-tools-azure > /dev/null 2>&1
+          /usr/bin/time --version 2>&1 | head -n 1
+          strace -V 2>&1 | head -n 1
+          perf --version || echo "no perf"
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          exit 0
+
+      - name: Host
+        timeout-minutes: 1
+        run: |
+          mkdir -p prof
+          {
+            lscpu
+            echo
+            echo "nproc: $(nproc)"
+            echo "kernel: $(uname -r)"
+            echo "perf: $(perf --version 2>&1 || echo none)"
+          } | tee prof/host.txt
+
+      - name: Build the tests
+        timeout-minutes: 30
+        run: |
+          start=$(date +%s.%N)
+          cargo test --workspace --locked --no-run
+          end=$(date +%s.%N)
+          awk -v a="$start" -v b="$end" 'BEGIN { printf "build the tests: %.1f s\n", b - a }' | tee -a prof/host.txt
+
+      # The executables and package directories, as scripts/check-suite-time.sh
+      # takes them, and what that listing costs, since the suite runs below
+      # count it in their CPU-seconds.
+      - name: List the test binaries
+        timeout-minutes: 5
+        run: |
+          /usr/bin/time -f '%U %S %e' -o prof/listing-time.txt \
+            cargo test --workspace --locked --no-run --message-format=json 2> /dev/null > prof/cargo-artifacts.json
+          perl -MJSON::PP -ne '
+            my $m = decode_json($_);
+            next unless $m->{reason} eq "compiler-artifact" && defined $m->{executable} && $m->{profile}{test};
+            (my $dir = $m->{manifest_path}) =~ s{/Cargo\.toml$}{};
+            print join("\t", $dir, "$m->{target}{name} ($m->{target}{kind}[0])", $m->{executable}), "\n";
+          ' prof/cargo-artifacts.json > prof/binaries.tsv
+          rm prof/cargo-artifacts.json
+          cat prof/binaries.tsv
+          echo "cargo's listing (user system elapsed): $(tail -n 1 prof/listing-time.txt)"
+
+      - name: The whole suite as CI runs it, five times
+        timeout-minutes: 15
+        run: |
+          set +e
+          busy() { awk '/^cpu /{ print $2+$3+$4+$7+$8 }' /proc/stat; }
+          hz=$(getconf CLK_TCK)
+          : > prof/suite.txt
+          for run in 1 2 3 4 5; do
+            b=$(busy); t0=$(date +%s.%N)
+            timeout -k 10 150 scripts/check-suite-time.sh 3 < /dev/null > "prof/suite-$run.log" 2>&1
+            status=$?
+            a=$(busy); t1=$(date +%s.%N)
+            {
+              echo "== run $run"
+              cat "prof/suite-$run.log"
+              awk -v s="$status" -v a="$a" -v b="$b" -v hz="$hz" -v t0="$t0" -v t1="$t1" \
+                'BEGIN { printf "exit %d; machine CPU %.2f s over %.2f s of wall time\n", s, (a - b) / hz, t1 - t0 }'
+              echo
+            } | tee -a prof/suite.txt
+          done
+
+      - name: Each test binary alone, three times
+        timeout-minutes: 20
+        run: |
+          set +e
+          printf 'round\tbinary\tuser\tsystem\telapsed\texit\n' > prof/per-binary-raw.tsv
+          for round in 1 2 3; do
+            while IFS=$'\t' read -r dir name exe; do
+              (
+                cd "$dir" &&
+                  /usr/bin/time -f '%U %S %e' -o "$RUNNER_TEMP/t" timeout -k 5 120 "$exe" --test-threads 32 < /dev/null > "$RUNNER_TEMP/log" 2>&1
+              )
+              status=$?
+              read -r u s e < <(tail -n 1 "$RUNNER_TEMP/t")
+              printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$round" "$name" "$u" "$s" "$e" "$status" >> prof/per-binary-raw.tsv
+            done < prof/binaries.tsv
+          done
+          column -t -s $'\t' prof/per-binary-raw.tsv
+
+      - name: Every test alone, one after another
+        timeout-minutes: 40
+        run: |
+          set +e
+          mkdir -p prof/failed
+          printf 'binary\ttest\tuser\tsystem\telapsed\texit\tran\n' > prof/per-test-raw.tsv
+          : > prof/per-test-counts.txt
+          while IFS=$'\t' read -r dir name exe; do
+            (cd "$dir" && "$exe" --list < /dev/null 2> /dev/null) | sed -n 's/: test$//p' | LC_ALL=C sort > "$RUNNER_TEMP/all"
+            (cd "$dir" && "$exe" --list --ignored < /dev/null 2> /dev/null) | sed -n 's/: test$//p' | LC_ALL=C sort > "$RUNNER_TEMP/ignored"
+            LC_ALL=C comm -23 "$RUNNER_TEMP/all" "$RUNNER_TEMP/ignored" > "$RUNNER_TEMP/run"
+            echo "$name: $(wc -l < "$RUNNER_TEMP/run") tests run, $(wc -l < "$RUNNER_TEMP/ignored") ignored" | tee -a prof/per-test-counts.txt
+            while read -r test; do
+              (
+                cd "$dir" &&
+                  /usr/bin/time -f '%U %S %e' -o "$RUNNER_TEMP/t" timeout -k 5 60 "$exe" --exact "$test" --test-threads 1 < /dev/null > "$RUNNER_TEMP/log" 2>&1
+              )
+              status=$?
+              read -r u s e < <(tail -n 1 "$RUNNER_TEMP/t")
+              ran=$(sed -n 's/^running \([0-9]*\) tests\{0,1\}$/\1/p' "$RUNNER_TEMP/log" | head -n 1)
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$test" "$u" "$s" "$e" "$status" "${ran:-?}" >> prof/per-test-raw.tsv
+              if [ "$status" != 0 ]; then
+                safe=$(printf '%s--%s' "$name" "$test" | tr -c 'A-Za-z0-9_.-' '_')
+                cp "$RUNNER_TEMP/log" "prof/failed/$safe.log"
+                echo "failed ($status): $name $test"
+              fi
+            done < "$RUNNER_TEMP/run"
+          done < prof/binaries.tsv
+          echo "tests timed: $(($(wc -l < prof/per-test-raw.tsv) - 1))"
+
+      - name: The whole suite under perf, every CPU
+        timeout-minutes: 10
+        run: |
+          set +e
+          if ! perf --version > /dev/null 2>&1; then echo "no perf on this runner" | tee prof/perf-missing.txt; exit 0; fi
+          perf record -a -g -F 499 -o prof/suite.data -- timeout -k 10 150 scripts/check-suite-time.sh 3 < /dev/null > prof/suite-perf.log 2>&1
+          tail -n 3 prof/suite-perf.log
+          r() { perf report -i prof/suite.data --no-children "$@" --stdio 2> /dev/null | grep -E '^ +[0-9]' | sed -n '1,45p'; }
+          r --sort comm -g none > prof/perf-by-command.txt
+          r --sort dso -g none > prof/perf-by-dso.txt
+          r --sort dso,sym -g none > prof/perf-by-dso-symbol.txt
+          r --sort sym -g none --dsos '[kernel.kallsyms]' > prof/perf-kernel-symbols.txt
+          for f in by-command by-dso by-dso-symbol kernel-symbols; do echo "== $f"; cat "prof/perf-$f.txt"; done
+          echo "== kernel share of all samples: $(grep -F '[kernel.kallsyms]' prof/perf-by-dso.txt | awk '{ print $1 }')" | tee prof/perf-kernel-share.txt
+          exe=target/debug/openmax
+          echo "== the debug openmax binary: $(stat -c %s "$exe") bytes" | tee prof/openmax-version-stat.txt
+          perf stat -r 50 -e task-clock,page-faults "$exe" --version 2>&1 > /dev/null | grep -E 'task-clock|page-faults|elapsed' | tee -a prof/openmax-version-stat.txt
+          exit 0
+
+      # Which tests start target/debug/openmax: the cargo-bin lookups in the
+      # integration tests, then each test of the binaries that hold one,
+      # alone under strace (not timed), counting its execs of that binary.
+      - name: Tests that start the openmax binary
+        timeout-minutes: 15
+        run: |
+          set +e
+          grep -rnE 'CARGO_BIN_EXE|openmax_bin\(\)' crates/*/tests | tee prof/bin-lookups.txt
+          echo "cargo-bin lookups: $(wc -l < prof/bin-lookups.txt)"
+          printf 'binary\ttest\topenmax_execs\n' > prof/openmax-execs.tsv
+          files=$(grep -rlE 'CARGO_BIN_EXE_openmax' crates/*/tests | xargs -n 1 basename | sed 's/\.rs$//')
+          while IFS=$'\t' read -r dir name exe; do
+            target=${name% (test)}
+            printf '%s\n' $files | grep -qxF "$target" || continue
+            (cd "$dir" && "$exe" --list < /dev/null 2> /dev/null) | sed -n 's/: test$//p' > "$RUNNER_TEMP/all"
+            while read -r test; do
+              (cd "$dir" && timeout -k 5 60 strace -f -qq -e trace=execve -o "$RUNNER_TEMP/trace" "$exe" --exact "$test" --test-threads 1 < /dev/null > /dev/null 2>&1)
+              printf '%s\t%s\t%s\n' "$name" "$test" "$(grep -cE 'execve\("[^"]*/target/debug/openmax"' "$RUNNER_TEMP/trace")" >> prof/openmax-execs.tsv
+            done < "$RUNNER_TEMP/all"
+          done < prof/binaries.tsv
+          awk -F '\t' 'NR > 1 { n[$1] += ($3 > 0); e[$1] += $3; t[$1]++ } END { for (b in t) printf "%s: %d of %d tests start openmax, %d starts\n", b, n[b], t[b], e[b] }' prof/openmax-execs.tsv | tee prof/openmax-execs-summary.txt
+          exit 0
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        run: |
+          set +e
+          cat prof/host.txt | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|nproc|build the tests'
+          echo
+          grep -E '^== run|took|^exit' prof/suite.txt
+          echo
+          echo "== per binary, median of three (user system elapsed)"
+          python3 - << 'EOF'
+          import csv, statistics
+          def num(v):
+              try:
+                  return float(v)
+              except (TypeError, ValueError):
+                  return 0.0
+          rows = list(csv.DictReader(open("prof/per-binary-raw.tsv"), delimiter="\t"))
+          by = {}
+          for r in rows:
+              by.setdefault(r["binary"], []).append(r)
+          out = []
+          for b, rs in by.items():
+              med = lambda k: statistics.median(num(x[k]) for x in rs)
+              out.append((med("user") + med("system"), b, med("user"), med("system"), med("elapsed"), ",".join(x["exit"] for x in rs)))
+          for cpu, b, u, s, e, ex in sorted(out, reverse=True):
+              print(f"{cpu:8.2f} {u:8.2f} {s:8.2f} {e:8.2f}  {b}  exits {ex}")
+          print(f"total median CPU {sum(o[0] for o in out):.2f}")
+          tests = list(csv.DictReader(open("prof/per-test-raw.tsv"), delimiter="\t"))
+          for t in tests:
+              t["cpu"] = num(t["user"]) + num(t["system"])
+          tests.sort(key=lambda t: -t["cpu"])
+          print(f"\n== top 60 of {len(tests)} tests alone by CPU (total {sum(t['cpu'] for t in tests):.2f} s, user system elapsed exit)")
+          for t in tests[:60]:
+              print(f"{t['cpu']:7.2f} {t['user']:>6} {t['system']:>6} {t['elapsed']:>6} {t['exit']:>4}  {t['binary']}  {t['test']}")
+          EOF
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: suite-cpu-by-test-${{ github.run_attempt }}
+          path: |
+            prof
+            !prof/suite.data
