@@ -1,7 +1,8 @@
-name: Suite time by dev profile
+name: Suite time by test profile
 
-# Temporary: times the suite time check under five dev profiles of main on
-# one runner, each checkout with its own build. Never merged.
+# Temporary: times the suite time check with the workspace's own crates at
+# three optimization levels in the test profile, each checkout with its own
+# build, on one runner. Never merged.
 on:
   push:
     branches: [test/suite-time-build-variants]
@@ -11,12 +12,12 @@ defaults:
     shell: bash
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
 
 jobs:
-  variants:
+  linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -38,98 +39,90 @@ jobs:
         run: |
           mkdir -p out
           : > out/summary.txt
-          { nproc; grep -m1 'model name' /proc/cpuinfo; df -h / /mnt || true; du -sh target || true; rustc -V; } | tee out/host.txt
+          { nproc; grep -m1 'model name' /proc/cpuinfo; df -h / || true; du -sh target || true; rustc -V; cargo -V; } | tee out/host.txt
           root="$RUNNER_TEMP/v"
           mkdir -p "$root"
-          echo "root=$root" | tee -a out/host.txt
           echo "VROOT=$root" >> "$GITHUB_ENV"
           base=$(git rev-parse origin/main)
           echo "base=$base" | tee -a out/host.txt
-          add() { perl -0pi -e "s/^(\\[profile\\.dev\\.package\\]\\n)/\$1$1/m" "$2"; }
-          for v in A B C D E; do
+          for v in A C G; do
             git worktree add -q --detach "$root/$v" "$base"
             m="$root/$v/Cargo.toml"
             case $v in
-              B) add 'openmax.opt-level = 1\n' "$m" ;;
-              C) add 'open-max-core.opt-level = 1\nopenmax.opt-level = 1\n' "$m" ;;
-              D) perl -pi -e 's/^([A-Za-z0-9_-]+)\.opt-level = 1$/$1.opt-level = 3/' "$m"
-                 add 'open-max-core.opt-level = 1\nopenmax.opt-level = 1\n' "$m" ;;
-              E) perl -pi -e 's/^([A-Za-z0-9_-]+)\.opt-level = 1$/$1.opt-level = 3/' "$m"
-                 add 'open-max-core.opt-level = 2\nopenmax.opt-level = 2\n' "$m" ;;
+              C) printf '\n[profile.test.package]\nopen-max-core.opt-level = 1\nopenmax.opt-level = 1\n' >> "$m" ;;
+              G) printf '\n[profile.test.package]\nopen-max-core.opt-level = 2\nopenmax.opt-level = 2\n' >> "$m" ;;
             esac
             echo "== $v"; sed -n '/^\[profile\.dev\.package\]/,$p' "$m"
           done | tee out/profiles.txt
 
       - name: Build each checkout
-        timeout-minutes: 27
+        timeout-minutes: 25
         run: |
           now() { date +%s.%N; }
           : > out/built.txt
-          need=15
-          for v in A C D E B; do
+          for v in A C G; do
             avail=$(df --output=avail -BG "$VROOT" | tail -1 | tr -dc 0-9)
-            if [ "$avail" -lt "$need" ]; then echo "DROPPED $v avail=${avail}G need=${need}G" | tee -a out/summary.txt; continue; fi
+            echo "$v: ${avail}G free before the copy" | tee -a out/host.txt
             cp -a target "$VROOT/$v/target"
             cd "$VROOT/$v"
-            t0=$(now); cargo test --workspace --locked --no-run > "$GITHUB_WORKSPACE/out/build-$v-a.log" 2>&1 && ca=0 || ca=$?; t1=$(now)
-            cargo clean -p open-max-core -p openmax >> "$GITHUB_WORKSPACE/out/build-$v-b.log" 2>&1 || true
-            t2=$(now); cargo test --workspace --locked --no-run >> "$GITHUB_WORKSPACE/out/build-$v-b.log" 2>&1 && cb=0 || cb=$?; t3=$(now)
+            cargo test --workspace --locked --no-run > "$GITHUB_WORKSPACE/out/build-$v-a.log" 2>&1 && ca=0 || ca=$?
+            cargo clean -p open-max-core -p openmax > "$GITHUB_WORKSPACE/out/build-$v-b.log" 2>&1 || true
+            t0=$(now); cargo test --workspace --locked --no-run >> "$GITHUB_WORKSPACE/out/build-$v-b.log" 2>&1 && cb=0 || cb=$?; t1=$(now)
             cd "$GITHUB_WORKSPACE"
-            echo "BUILD $v norun=$(echo "$t1 - $t0" | bc | cut -c1-6) exit_a=$ca build=$(echo "$t3 - $t2" | bc | cut -c1-6) exit_b=$cb" | tee -a out/summary.txt
+            compiled=$(grep -oE 'Compiling [^ ]+' "out/build-$v-b.log" | awk '{ print $2 }' | sort -u | tr '\n' ',')
+            echo "BUILD $v build=$(echo "$t1 - $t0" | bc | cut -c1-7) exit_a=$ca exit_b=$cb compiled=$compiled" | tee -a out/summary.txt
             [ "$ca" = 0 ] && [ "$cb" = 0 ] && echo "$v" >> out/built.txt
-            if [ "$v" = A ]; then
-              size=$(du -s -BG "$VROOT/A/target" | cut -f1 | tr -dc 0-9)
-              need=$((size * 13 / 10 + 3))
-              echo "A target ${size}G; each later checkout needs ${need}G free" | tee -a out/summary.txt
-            fi
-            df -h "$VROOT" | tail -1
           done
+          df -h "$VROOT" | tail -1 | tee -a out/host.txt
 
-      - name: Suite time, three rounds
-        timeout-minutes: 14
+      - name: Suite time, five rounds
+        timeout-minutes: 20
         run: |
           busy() { awk '/^cpu /{ print $2+$3+$4+$7+$8 }' /proc/stat; }
-          for r in 1 2 3; do
-            for v in A B C D E; do
+          r=0
+          for order in "G C A" "A G C" "C A G" "G C A" "A G C"; do
+            r=$((r + 1))
+            for v in $order; do
               grep -qx "$v" out/built.txt || continue
               log="out/suite-$v-$r.log"
               b=$(busy)
               (cd "$VROOT/$v" && env -u GITHUB_ACTIONS scripts/check-suite-time.sh 3) > "$log" 2>&1 && code=0 || code=$?
               a=$(busy)
-              took=$(grep -oE 'the test suite took [0-9.]+s' "$log" | grep -oE '[0-9.]+s' | tr -d s || echo none)
+              took=$(grep -oE 'the test suite took [0-9.]+s' "$log" | grep -oE '[0-9.]+s' | tr -d s || true)
+              alone=$(grep -E 'failed beside the other binaries and passed alone:$' "$log" | sed 's/ failed beside.*//' | tr ' ' '_' | tr '\n' ';' || true)
               retried=$(grep -c 'failed beside the other binaries and passed alone' "$log" || true)
-              failed=$(grep -E 'failed:$' "$log" | grep -v 'passed alone' | tr '\n' ' ' || true)
-              names=$(grep -oE "^thread '[^']+'|^test [^ ]+ \.\.\. FAILED" "$log" | sort -u | tr '\n' ' ' || true)
-              echo "SUITE $v $r exit=$code took=${took:-none} cpu=$(echo "($a - $b) / $(getconf CLK_TCK)" | bc -l | cut -c1-6) retried=$retried failed=[$failed] $names" | tee -a out/summary.txt
+              failed=$(grep -E ' failed:$' "$log" | grep -v 'passed alone' | sed 's/ failed:$//' | tr ' ' '_' | tr '\n' ';' || true)
+              names=$(grep -oE '^---- [^ ]+' "$log" | awk '{ print $2 }' | sort -u | tr '\n' ';' || true)
+              echo "SUITE $v $r exit=$code took=${took:-none} cpu=$(echo "($a - $b) / $(getconf CLK_TCK)" | bc -l | cut -c1-6) retried=$retried alone=[$alone] failed=[$failed] tests=[$names]" | tee -a out/summary.txt
             done
           done
 
       - name: Rebuild after a one-line edit
-        timeout-minutes: 18
+        timeout-minutes: 25
         env:
           CARGO_INCREMENTAL: "1"
         run: |
           now() { date +%s.%N; }
-          for v in A C D E B; do
+          for v in A C G; do
             grep -qx "$v" out/built.txt || continue
-            avail=$(df --output=avail -BG "$VROOT" | tail -1 | tr -dc 0-9)
-            if [ "$avail" -lt 4 ]; then echo "EDIT $v skipped avail=${avail}G" | tee -a out/summary.txt; continue; fi
             cd "$VROOT/$v"
             cargo test --workspace --locked --no-run > "$GITHUB_WORKSPACE/out/edit-$v.log" 2>&1 || true
             echo 'pub fn edit_rebuild_probe() -> usize { 1 }' >> crates/core/src/text.rs
             t0=$(now); cargo test --workspace --locked --no-run >> "$GITHUB_WORKSPACE/out/edit-$v.log" 2>&1 && c=0 || c=$?; t1=$(now)
-            git checkout -q crates/core/src/text.rs
+            printf '#[allow(dead_code)]\nfn edit_rebuild_probe() -> usize { 1 }\n' >> crates/tui/src/theme.rs
+            t2=$(now); cargo test --workspace --locked --no-run >> "$GITHUB_WORKSPACE/out/edit-$v.log" 2>&1 && e=0 || e=$?; t3=$(now)
+            git checkout -q crates/core/src/text.rs crates/tui/src/theme.rs
             cd "$GITHUB_WORKSPACE"
-            echo "EDIT $v edit=$(echo "$t1 - $t0" | bc | cut -c1-6) exit=$c" | tee -a out/summary.txt
+            echo "EDIT $v ce=$(echo "$t1 - $t0" | bc | cut -c1-7) exit_c=$c te=$(echo "$t3 - $t2" | bc | cut -c1-7) exit_t=$e" | tee -a out/summary.txt
           done
 
       - name: The mutation floor test alone, main's fixture and the smaller one
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: |
           [ -x /usr/bin/time ] || { sudo apt-get update -q && sudo apt-get install -y -q time; }
           cd "$VROOT/A"
           exe() { cargo test -p openmax --test thesis --locked --no-run --message-format=json 2> /dev/null |
-            perl -MJSON::PP -ne '$m = decode_json($_); print $m->{executable} if $m->{reason} eq "compiler-artifact" && $m->{executable}'; }
+            perl -MJSON::PP -ne '$m = decode_json($_); print $m->{executable} if $m->{reason} eq "compiler-artifact" && $m->{target}{name} eq "thesis" && $m->{manifest_path} =~ m{crates/tui/Cargo\.toml$} && $m->{executable}'; }
           cp "$(exe)" "$RUNNER_TEMP/thesis-main"
           git apply "$GITHUB_WORKSPACE/suite-time-cut2.patch"
           cp "$(exe)" "$RUNNER_TEMP/thesis-cut2"
@@ -137,43 +130,86 @@ jobs:
           cd crates/tui
           for i in 1 2 3 4 5 6 7; do
             for f in main cut2; do
-              env -u GITHUB_ACTIONS /usr/bin/time -f "%e %U %S" -o "$RUNNER_TEMP/t" "$RUNNER_TEMP/thesis-$f" --exact a_full_mutation_run_fails_under_its_floor --test-threads 1 > "$GITHUB_WORKSPACE/out/cut2-$f-$i.log" 2>&1 && code=0 || code=$?
-              read -r e u s < "$RUNNER_TEMP/t"
+              env -u GITHUB_ACTIONS /usr/bin/time -f '%U %S %e' -o "$RUNNER_TEMP/t" "$RUNNER_TEMP/thesis-$f" --exact a_full_mutation_run_fails_under_its_floor --test-threads 1 > "$GITHUB_WORKSPACE/out/cut2-$f-$i.log" 2>&1 && code=0 || code=$?
+              read -r u s e < "$RUNNER_TEMP/t"
               echo "CUT2 $f $i exit=$code wall=$e cpu=$(echo "$u + $s" | bc)" | tee -a "$GITHUB_WORKSPACE/out/summary.txt"
             done
           done
 
+      - name: The test job's opt-out, in G
+        timeout-minutes: 10
+        run: |
+          now() { date +%s.%N; }
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '\n[profile.test.package.open-max-core]\nopt-level = 0\n\n[profile.test.package.openmax]\nopt-level = 0\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          cat "${CARGO_HOME:-$HOME/.cargo}/config.toml" | tee out/optout-config.txt
+          cd "$VROOT/G"
+          cargo clean -p open-max-core -p openmax > "$GITHUB_WORKSPACE/out/optout.log" 2>&1 || true
+          t0=$(now); cargo test --workspace --locked --no-run >> "$GITHUB_WORKSPACE/out/optout.log" 2>&1 && c=0 || c=$?; t1=$(now)
+          cd "$GITHUB_WORKSPACE"
+          compiled=$(grep -oE 'Compiling [^ ]+' out/optout.log | awk '{ print $2 }' | sort -u | tr '\n' ',')
+          echo "OPTOUT G optout=$(echo "$t1 - $t0" | bc | cut -c1-7) exit=$c compiled=$compiled" | tee -a out/summary.txt
+
       - name: Table
         if: ${{ !cancelled() }}
         timeout-minutes: 2
-        run: |
-          python3 - out/summary.txt << 'EOF' | tee out/table.txt
-          import re, statistics, sys
-          rows = open(sys.argv[1]).read().splitlines()
-          build, edit, suite, cut2 = {}, {}, {}, {}
-          for line in rows:
-              f = line.split()
-              if not f: continue
-              kv = dict(x.split('=', 1) for x in f if '=' in x)
-              if f[0] == 'BUILD': build[f[1]] = kv
-              elif f[0] == 'EDIT' and 'edit' in kv: edit[f[1]] = kv['edit']
-              elif f[0] == 'SUITE':
-                  suite.setdefault(f[1], []).append(kv)
-              elif f[0] == 'CUT2': cut2.setdefault(f[1], []).append(kv)
-          med = {v: statistics.median(float(k['took']) for k in runs if k['took'] != 'none') for v, runs in suite.items() if any(k['took'] != 'none' for k in runs)}
-          print('variant  norun  build  edit   run1   run2   run3   median  r(V)  exits  retried')
-          for v in 'ABCDE':
-              if v not in build: print(v, 'dropped'); continue
-              runs = suite.get(v, [])
-              t = [k['took'] for k in runs] + ['-'] * (3 - len(runs))
-              r = med[v] / med['A'] if v in med and 'A' in med else float('nan')
-              print(f"{v:7} {build[v]['norun']:>6} {build[v]['build']:>6} {edit.get(v, '-'):>6} {t[0]:>6} {t[1]:>6} {t[2]:>6} {med.get(v, float('nan')):7.2f} {r:5.3f}  {','.join(k['exit'] for k in runs)}  {','.join(k['retried'] for k in runs)}")
-          for f, runs in cut2.items():
-              print('cut2', f, 'cpu median', statistics.median(float(k['cpu']) for k in runs), 'wall median', statistics.median(float(k['wall']) for k in runs), 'exits', ','.join(k['exit'] for k in runs))
-          EOF
+        run: python3 table.py out/summary.txt | tee out/table.txt
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: suite-time-variants
+          name: suite-time-linux
+          path: out
+
+  macos:
+    if: ${{ !contains(github.event.head_commit.message, 'linux only') }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      - name: Build under each profile
+        timeout-minutes: 35
+        run: |
+          now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
+          mkdir -p out
+          : > out/summary.txt
+          { sysctl -n hw.ncpu; sysctl -n machdep.cpu.brand_string; rustc -V; } | tee out/host.txt
+          git checkout -q --detach origin/main
+          git log -1 --format=%H | tee -a out/host.txt
+          cargo test --workspace --locked --no-run > out/prewarm.log 2>&1 || true
+          for v in A C G optout; do
+            git checkout -q Cargo.toml
+            case $v in
+              C) printf '\n[profile.test.package]\nopen-max-core.opt-level = 1\nopenmax.opt-level = 1\n' >> Cargo.toml ;;
+              G|optout) printf '\n[profile.test.package]\nopen-max-core.opt-level = 2\nopenmax.opt-level = 2\n' >> Cargo.toml ;;
+            esac
+            if [ "$v" = optout ]; then
+              mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+              printf '\n[profile.test.package.open-max-core]\nopt-level = 0\n\n[profile.test.package.openmax]\nopt-level = 0\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+            fi
+            cargo clean -p open-max-core -p openmax > "out/build-$v.log" 2>&1 || true
+            t0=$(now); cargo test --workspace --locked --no-run >> "out/build-$v.log" 2>&1 && c=0 || c=$?; t1=$(now)
+            compiled=$(grep -oE 'Compiling [^ ]+' "out/build-$v.log" | awk '{ print $2 }' | sort -u | tr '\n' ',')
+            echo "MBUILD $v build=$(echo "$t1 - $t0" | bc) exit=$c compiled=$compiled" | tee -a out/summary.txt
+          done
+          git checkout -q Cargo.toml
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: suite-time-macos
           path: out
