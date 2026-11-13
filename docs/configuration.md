@@ -136,8 +136,10 @@ and the run that writes a key already uses it.
 - `max_tokens` (default 4096): the completion reserve, clamped so it never
   eats the window (at most `context_tokens - 2048`), and sent as the reply's
   length limit. When the server reports the cut (finish_reason `length`, or
-  a usage count at the limit), a tool call cut off at that limit does not
-  run; the model is told why and to send large content in parts. A
+  a usage count at the limit), the last tool call of that reply, the one
+  the limit cut, never runs, even when the server closed its arguments so
+  they parse, and the model is told why and asked to send it again in
+  parts; the calls before it run as usual. A
   reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
   before any tool call does not end the turn: it stays in the transcript

@@ -1095,9 +1095,15 @@ async fn run_loop(
         // memory written with the file tools refreshes the note below.
         let memory_seen = turn_usage.lock().unwrap_or_else(|e| e.into_inner()).memory.len();
 
+        // Only the last call can be the one the cap cut: the model had
+        // finished every call before it when it moved on, so an earlier one
+        // that fails to parse made its own slip, and the parse error is what
+        // fixes it. The last one never runs, even when its arguments parse:
+        // a server can close a cut call's JSON, and it would run truncated.
+        let is_cut = |call: &crate::types::ToolCall| capped && tool_calls.last().is_some_and(|last| std::ptr::eq(call, last));
         let batch_mode = core.approval_mode_canonical(&canonical_root);
         let segments = partition_concurrent_runs(&tool_calls, |call| {
-            batchable_call(
+            !is_cut(call) && batchable_call(
                 call,
                 &registry,
                 &permissions,
@@ -1159,25 +1165,19 @@ async fn run_loop(
                     end_call(core, session_id, &call.id, &tools::ToolOutcome::err(msg), guard.messages());
                     continue;
                 }
-                let args: Value = match serde_json::from_str(&call.function.arguments) {
+                let parsed = if is_cut(call) { Err(None) } else { serde_json::from_str::<Value>(&call.function.arguments).map_err(Some) };
+                let args: Value = match parsed {
                     Ok(v) => v,
                     Err(e) => {
-                        // The transcript holds this call with `{}`, so the
+                        // The transcript can hold this call with `{}`, so the
                         // reply is the model's only view of what it sent.
                         let mut sent = take_note_bytes(&call.function.arguments, 120);
                         if sent.len() < call.function.arguments.len() {
                             sent.push_str("...");
                         }
-                        // Only the last call can be the one the cap cut: the
-                        // model had finished every call before it when it
-                        // moved on, so an earlier one that fails to parse
-                        // made its own slip, and the parse error is what
-                        // fixes it.
-                        let cut = capped && tool_calls.last().is_some_and(|last| std::ptr::eq(call, last));
-                        let cause = if cut {
-                            cut_off_call_error(max_tokens)
-                        } else {
-                            format!("invalid JSON in tool arguments: {e}. The call did not run.")
+                        let cause = match e {
+                            None => cut_off_call_error(max_tokens),
+                            Some(e) => format!("invalid JSON in tool arguments: {e}. The call did not run."),
                         };
                         let msg = format!("{cause} Arguments sent: {sent}");
                         core.send_agent(session_id, AgentEvent::ToolStart { call_id: call.id.clone(), name: name.into(), args: Value::Null });
@@ -4719,6 +4719,90 @@ mod tests {
                 let earlier = reply(id);
                 assert!(earlier.contains(earned) && !earlier.contains("max_tokens"), "{case}: {id}: {earlier}");
             }
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The bug this guards: a server can close the JSON of the call the cap
+    /// cut, so its arguments parse. A write_file cut before its path ran and
+    /// failed with "missing required argument: path", which reads as a slip,
+    /// and the model sent the same oversized call again; a bash call cut
+    /// inside a here-document ran and wrote a truncated file. The last call
+    /// of a capped reply never runs, whether or not it parses, and is asked
+    /// for again in parts; the calls before it run, a read batch included.
+    /// The same calls in a reply the cap did not stop all run.
+    #[tokio::test]
+    async fn the_last_call_of_a_capped_reply_never_runs_even_when_it_parses() {
+        use crate::state::Core;
+
+        // A call: id, tool, arguments, and a word of the reply it earns when it runs.
+        type Call = (&'static str, &'static str, &'static str, &'static str);
+        const DONE: Call = ("c1", "write_file", r#"{"path":"done.txt","content":"whole\n"}"#, "done.txt (+1 −0)");
+        const PEEK: Call = ("c1", "read_file", r#"{"path":"note.txt"}"#, "noted");
+        const CLOSED: Call = ("c2", "write_file", r#"{"content":"Big\nlorem ips"}"#, "missing required argument: path");
+        const WHOLE: Call = ("c2", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#, "big.txt (+1 −0)");
+        const PEEK_AGAIN: Call = ("c2", "read_file", r#"{"path":"note.txt"}"#, "noted");
+        // A case: name, the calls, finish_reason, the completion count when
+        // the server sends one, and whether the reply reached the cap.
+        type Case = (&'static str, &'static [Call], &'static str, Option<u64>, bool);
+        let cases: [Case; 7] = [
+            ("a closed cut call alone", &[CLOSED], "length", None, true),
+            ("a closed cut call after a finished write", &[DONE, CLOSED], "length", None, true),
+            ("a complete last call at the cap", &[DONE, WHOLE], "tool_calls", Some(1024), true),
+            ("a read batch at the cap", &[PEEK, PEEK_AGAIN], "length", None, true),
+            ("a closed call in an uncapped reply", &[DONE, CLOSED], "tool_calls", None, false),
+            ("a complete call in an uncapped reply", &[DONE, WHOLE], "tool_calls", Some(1500), false),
+            ("a read batch in an uncapped reply", &[PEEK, PEEK_AGAIN], "tool_calls", None, false),
+        ];
+        for (case, calls, finish, completion_tokens, capped) in cases {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("note.txt"), "noted\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+            let raw: Vec<(&str, &str, &str)> = calls.iter().map(|&(id, tool, args, _)| (id, tool, args)).collect();
+            let sse = raw_calls_sse(&raw, finish, completion_tokens);
+            let (base_url, requests) = scripted_endpoint(&[&sse, STOP_SSE]).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                s.base_url = base_url;
+                s.model = "stub".into();
+                s.context_tokens = Some(16384);
+                s.max_tokens = 1024;
+                s.approval_mode = ApprovalMode::Auto;
+                s.max_agent_iterations = 5;
+            }
+
+            let id = "sess-closed-cut";
+            start_turn(core.clone(), id.into(), project.clone(), "write big.txt".into()).unwrap();
+            let (stop, _) = drive_turn(&mut rx).await;
+            assert_eq!(stop, "stop", "{case}");
+            assert_eq!(*requests.lock().unwrap(), 2, "{case}: one request after the calls, then done");
+            let messages = transcript(&core, id).await;
+            let reply = |id: &str| {
+                messages
+                    .iter()
+                    .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(id))
+                    .and_then(|m| m.content.clone())
+                    .unwrap()
+            };
+            let (first, last) = calls.split_at(calls.len() - 1);
+            for &(id, _, _, earned) in first {
+                let earlier = reply(id);
+                assert!(earlier.contains(earned) && !earlier.contains("max_tokens"), "{case}: {id}: {earlier}");
+            }
+            let (_, _, args, earned) = last[0];
+            let cut = reply("c2");
+            if capped {
+                assert_eq!(cut, format!("Error: {} Arguments sent: {args}", cut_off_call_error(1024)), "{case}");
+            } else {
+                assert!(cut.contains(earned) && !cut.contains("max_tokens"), "{case}: {cut}");
+            }
+            assert_eq!(project.join("big.txt").exists(), !capped && last[0] == WHOLE, "{case}: only an uncapped write runs");
+            assert_eq!(project.join("done.txt").exists(), first.contains(&DONE), "{case}: a finished write before the last runs");
 
             let _ = std::fs::remove_dir_all(dir);
         }
