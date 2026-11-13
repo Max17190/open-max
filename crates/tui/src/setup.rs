@@ -328,7 +328,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
 /// Saves the model's window and the output maximum a catalog reports as the reply
 /// limit; on Chat Completions only one under `inherited`, the limit an entry without
 /// one runs at. It is capped at a quarter of the window (not below the 4096 default)
-/// as it is also the input reserve. An entry's limit is kept; none reported, none guessed.
+/// so no request asks for a longer reply. An entry's limit is kept; none reported, none guessed.
 fn record_model(catalog: &mut Vec<Value>, model: &str, window: u64, metadata: &Value, inherited: Option<u64>) {
     let most = ["max_completion_tokens", "max_output_tokens", "max_tokens"].iter().find_map(|k| metadata[*k].as_u64())
         .or_else(|| metadata["top_provider"]["max_completion_tokens"].as_u64()).filter(|n| *n > 0 && inherited.is_none_or(|limit| *n < limit));

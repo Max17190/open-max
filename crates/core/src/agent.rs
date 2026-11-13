@@ -751,6 +751,7 @@ async fn run_loop(
     let mut repeats = RepeatTracker::default();
     // Cut replies with no call since the last reply the cap did not cut.
     let mut cuts = 0;
+    let mut at_reserve = false;
 
     'turns: for iteration in 0..max_iterations {
         // One refresh, split around the steers. The mode in force first, so
@@ -767,8 +768,7 @@ async fn run_loop(
         // as real as the transcript: the overhead every request carries
         // besides the history, the note stored in it included.
         let schema_tokens = request_overhead(&schemas_wire);
-        // The window less the reply reserve, in estimator units at the spend factor;
-        // the soft trigger may use a lower ratio and is capped by this budget.
+        // The window less the reply reserve, in estimator units; it caps the soft trigger.
         let factor = token_factor(prompt_ratio);
         let window_budget = context_tokens.saturating_sub(endpoint.reply_reserve + 1024);
         let budget = to_estimate(window_budget, factor);
@@ -805,7 +805,7 @@ async fn run_loop(
         }
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
-        let limit = endpoint.reply_limit(used_real);
+        let limit = if std::mem::take(&mut at_reserve) { endpoint.reply_reserve } else { endpoint.reply_limit(used_real) };
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
@@ -836,6 +836,8 @@ async fn run_loop(
         let result = match result {
             Ok(r) => r,
             Err(mut message) => {
+                // The room left was misjudged: the same request goes once more at the reserve.
+                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; continue 'turns; }
                 // A server can refuse a request that carries a reply of reasoning alone. Such
                 // replies lose their stamp, so no wire sends them, and the request goes again.
                 let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
@@ -9137,12 +9139,21 @@ echo run >> {}
     /// own estimate and refuses for length a request whose prompt and reply
     /// limit pass `window`, keeping each request body.
     async fn window_refusing_endpoint(window: u64) -> (String, Arc<StdMutex<Vec<String>>>) {
+        prompt_counting_endpoint(window, |estimate, _| estimate as u64 + 1_536).await
+    }
+
+    /// A provider that counts a prompt the loop estimates at `estimate` as
+    /// `count(estimate, first)` tokens, `first` being the estimate of the
+    /// first request it saw, and refuses for length a request whose prompt
+    /// and reply limit pass `window`, keeping each request body.
+    async fn prompt_counting_endpoint(window: u64, count: impl Fn(usize, usize) -> u64 + Send + 'static) -> (String, Arc<StdMutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
         let seen = bodies.clone();
+        let mut first = None;
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let mut head = Vec::new();
@@ -9163,7 +9174,8 @@ echo run >> {}
                 let estimate = estimate_tokens(body["tools"].to_string().len())
                     + messages.iter().map(|m| estimate_tokens(m["content"].as_str().map_or(0, str::len)) + 8).sum::<usize>();
                 seen.lock().unwrap().push(String::from_utf8_lossy(&payload).into_owned());
-                let resp = if estimate as u64 + 1_536 + body["max_tokens"].as_u64().unwrap() > window {
+                let first = *first.get_or_insert(estimate);
+                let resp = if count(estimate, first) + body["max_tokens"].as_u64().unwrap() > window {
                     let refusal = r#"{"error":{"message":"This model's maximum context length is exceeded by the prompt and the completion.","type":"invalid_request_error"}}"#;
                     format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{refusal}", refusal.len())
                 } else {
@@ -9220,6 +9232,96 @@ echo run >> {}
         assert!(second > first + 1024, "{first} -> {second}");
         assert_eq!(limits(&bodies)[1], 65_536 - 1024 - second as u64);
         assert!(sessions::last_compaction(&core, &id).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A session of exchanges past `history` estimated tokens on a
+    /// 128,000-token window with the reply limit 65,536, so a 16,000-token
+    /// reserve, served by a `prompt_counting_endpoint` that counts with `count`.
+    #[allow(clippy::type_complexity)]
+    async fn counted_session(
+        history: usize,
+        count: impl Fn(usize, usize) -> u64 + Send + 'static,
+    ) -> (Arc<Core>, tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>, String, PathBuf, Arc<StdMutex<Vec<String>>>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= history {
+                data.messages.push(ChatMessage::user("q ".repeat(2_000)));
+                data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
+            }
+            let mut persisted = 0usize;
+            sessions::save_messages(&core, &id, &data.messages, &mut persisted, true);
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+        }
+        let (base_url, bodies) = prompt_counting_endpoint(128_000, count).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(128_000), 65_536);
+        }
+        (core, rx, id, project, bodies, dir)
+    }
+
+    /// The reply limits the turn's requests carried, in order; a compaction
+    /// summary, which carries no tools, is left out.
+    fn turn_limits(bodies: &Arc<StdMutex<Vec<String>>>) -> Vec<u64> {
+        let sent = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()).collect::<Vec<_>>();
+        sent.iter().filter(|b| b["tools"].is_array()).map(|b| b["max_tokens"].as_u64().unwrap()).collect()
+    }
+
+    /// A provider that counts the prompt at 1.3 times the estimate refuses a
+    /// request that asks for the room the estimate leaves. That refusal
+    /// proves only about 1,024 tokens more than the estimate, so a next
+    /// request sized the same way would be refused again, turn after turn.
+    /// The same request goes once more at the reserve and is answered in the
+    /// same turn, without compaction.
+    #[tokio::test]
+    async fn a_refusal_at_the_room_left_sends_the_request_again_at_the_reserve() {
+        let (core, mut rx, id, project, bodies, dir) = counted_session(68_000, |estimate, _| estimate as u64 * 13 / 10).await;
+        start_turn(core.clone(), id.clone(), project, "go".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop", "the request sent again at the reserve is answered");
+        let first = budgets[0];
+        assert!((68_000..72_000).contains(&first), "{first}");
+        assert_eq!(turn_limits(&bodies), [128_000 - 1024 - first as u64, 16_000], "two requests in all");
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+        assert!(sessions::last_compaction(&core, &id).is_none());
+        let reply = core.sessions.lock().await[&id].messages.last().and_then(|m| m.content.clone());
+        assert_eq!(reply.as_deref(), Some("done"), "the reply is the turn's answer");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// When the request sent again at the reserve is refused too, the prompt
+    /// is more than the window less the reserve, so the calibration rises to
+    /// at least that floor and the turn ends as before. The next turn
+    /// compacts and its request is answered at the first try: no refusal
+    /// carries into a further turn. The provider counts every prompt at one
+    /// ratio, the one that puts the first prompt plus the reserve 700 tokens
+    /// past the window.
+    #[tokio::test]
+    async fn a_refusal_at_the_reserve_calibrates_to_it_and_the_next_turn_compacts_and_fits() {
+        let count = |estimate: usize, first: usize| (estimate as f64 * 112_700.0 / first as f64) as u64;
+        let (core, mut rx, id, project, bodies, dir) = counted_session(88_000, count).await;
+        start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "error", "refused at the room left and at the reserve");
+        let first = budgets[0];
+        assert_eq!(turn_limits(&bodies), [128_000 - 1024 - first as u64, 16_000]);
+        let ratio = core.sessions.lock().await[&id].prompt_ratio.as_ref().map(|r| r.1).unwrap();
+        assert!(ratio >= (128_000 - 16_000) as f64 / first as f64, "{ratio} for {first}");
+
+        start_turn(core.clone(), id.clone(), project, "second".into()).unwrap();
+        let (stop, _) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop", "the compacted request is answered");
+        assert!(sessions::last_compaction(&core, &id).is_some(), "the calibrated budget compacts");
+        let limits = turn_limits(&bodies);
+        assert_eq!(limits.len(), 3, "one request after the two refused: {limits:?}");
+        assert!(limits[2] > 16_000, "it asks for the room its prompt leaves: {limits:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

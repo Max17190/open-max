@@ -846,7 +846,7 @@ pub(crate) fn refusal_ratio(message: &str, estimated: usize, fits: usize, factor
 /// use; one it misses keeps today's behavior. An error status keeps only the
 /// body's message, not its code, so a message that names no window still
 /// needs a phrase of its own.
-fn refused_for_length(message: &str) -> bool {
+pub(crate) fn refused_for_length(message: &str) -> bool {
     const PHRASES: [&str; 10] = [
         "context length",
         "context_length",

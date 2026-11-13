@@ -401,7 +401,6 @@ pub struct ChatClient {
     pub model: String,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// The room held back for a reply (`ActiveEndpoint::reply_reserve`).
     pub reply_reserve: usize,
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,

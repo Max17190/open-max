@@ -161,8 +161,7 @@ pub struct ActiveEndpoint {
     pub key_hint: Option<String>,
 }
 
-/// The reply limit (`max_tokens`, leaving 2048 tokens of the window) and the reserve the input
-/// budget holds back for a reply: the limit, but no more than the larger of 4096 and a window's eighth.
+/// The reply limit (leaving 2048 tokens of window) and the input budget's reserve: it, at most max(4096, window/8).
 pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) {
     let limit = max_tokens.max(1).min(context.saturating_sub(2048).max(1));
     (limit, limit.min((context / 8).max(4096)))

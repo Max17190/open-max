@@ -277,7 +277,9 @@ input budget are two numbers: set to a model's longest reply, `max_tokens`
 no longer holds that much input back, and a model whose longest reply is as
 large as its window keeps seven eighths of it for input instead of about a
 thousand tokens. A reply that reaches the limit its request carried is cut
-as at any limit, and a refusal for length calibrates against that limit.
+as at any limit. A request that asked for more than the reserve and is
+refused for length goes once more in the same turn at the reserve, and each
+refusal for length calibrates against the limit its request carried.
 Open Max estimates the input at about four bytes per token and scales the
 estimate up when the server reports more prompt tokens than estimated or
 refuses a request for length that the estimate said fit.
