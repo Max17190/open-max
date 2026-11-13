@@ -3191,6 +3191,45 @@ mod tests {
         }
     }
 
+    /// A probe of a project under /tmp sees its own working directory. The
+    /// sandbox mounts a private, empty /tmp over the host's, so without a
+    /// bind of its own the project is gone inside it and a relative command
+    /// such as `./tool.sh` does not exist. The working directory is bound
+    /// read-only after that /tmp and before the scratch (so a scratch inside
+    /// the project stays writable), and the probe starts in it. Checked on
+    /// the argument list, so it holds on a host that cannot start the
+    /// sandbox too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_under_tmp_sees_its_working_directory() {
+        let (project, scratch) = ("/tmp/omx-project", "/tmp/omx-project/.scratch");
+        let mut request = sandboxed_request(Path::new(scratch), "./tool.sh");
+        request.cwd = PathBuf::from(project);
+        let policy = request.sandbox.clone().unwrap();
+        let args = match apply_sandbox(&request.program, &request.args, &policy) {
+            Ok((_, args)) => args,
+            Err(ProcessError::SandboxUnavailable(reason)) => {
+                eprintln!("sandbox backend unavailable here ({reason}); fail-closed path verified");
+                return;
+            }
+            Err(other) => panic!("wrapping the probe failed unexpectedly: {other}"),
+        };
+        let args: Vec<&str> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+        let at = |run: &[&str]| args.windows(run.len()).position(|window| window == run);
+        let tmp = at(&["--tmpfs", "/tmp"]).expect("a private /tmp");
+        let writable = at(&["--bind", scratch, scratch]).expect("a writable scratch");
+        let bound = at(&["--ro-bind", project, project]);
+        assert!(
+            bound.is_some_and(|at| tmp < at && at < writable),
+            "the working directory is bound read-only after the private /tmp and before the scratch: {args:?}"
+        );
+        let program = args.iter().position(|arg| *arg == "--").expect("the end of the options");
+        assert!(
+            at(&["--chdir", project]).is_some_and(|at| at < program),
+            "the probe starts in its working directory: {args:?}"
+        );
+    }
+
     /// The probe's write authority ends at its scratch: an escape attempt
     /// fails and leaves nothing behind, while a scratch write succeeds.
     #[tokio::test]
