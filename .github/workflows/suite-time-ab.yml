@@ -1,0 +1,132 @@
+name: Suite time A/B
+
+# Temporary: compares the suite time check on main and on this branch's
+# head on one runner, interleaved, each tree with its own build. Never
+# merged.
+on:
+  push:
+    branches: [test/suite-time-test-profile-ab]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      - name: Build both trees
+        timeout-minutes: 20
+        run: |
+          echo "CARGO_TERM_COLOR=never" >> "$GITHUB_ENV"
+          export CARGO_TERM_COLOR=never
+          mkdir -p ab
+          : > ab/summary.txt
+          now() { date +%s.%N; }
+          { nproc; grep -m1 'model name' /proc/cpuinfo; rustc -V; } | tee ab/host.txt
+          head=$(git rev-parse HEAD^)
+          main=$(git rev-parse origin/main)
+          echo "main=$main head=$head" | tee -a ab/host.txt
+          git worktree add -q --detach "$RUNNER_TEMP/A" "$main"
+          git worktree add -q --detach "$RUNNER_TEMP/P" "$head"
+          for v in A P; do
+            cp -a target "$RUNNER_TEMP/$v/target"
+            cd "$RUNNER_TEMP/$v"
+            cargo test --workspace --locked --no-run > "$GITHUB_WORKSPACE/ab/build-$v.log" 2>&1
+            cargo clean -p open-max-core -p openmax >> "$GITHUB_WORKSPACE/ab/build-$v.log" 2>&1
+            t0=$(now); cargo test --workspace --locked --no-run >> "$GITHUB_WORKSPACE/ab/build-$v.log" 2>&1; t1=$(now)
+            cd "$GITHUB_WORKSPACE"
+            compiled=$(grep -oE 'Compiling [^ ]+' "ab/build-$v.log" | awk '{ print $2 }' | sort -u | tr '\n' ',')
+            echo "BUILD $v build=$(echo "$t1 - $t0" | bc | cut -c1-7) compiled=$compiled" | tee -a ab/summary.txt
+          done
+          sed -n '/^\[profile\.test\.package\]/,$p' "$RUNNER_TEMP/P/Cargo.toml"
+          ls "${CARGO_HOME:-$HOME/.cargo}/config.toml" 2> /dev/null && cat "${CARGO_HOME:-$HOME/.cargo}/config.toml" || echo "no cargo home config"
+
+      - name: Main and head, interleaved
+        timeout-minutes: 30
+        run: |
+          busy() { awk '/^cpu /{ print $2+$3+$4+$7+$8 }' /proc/stat; }
+          for i in $(seq 12); do
+            if [ $((i % 2)) = 1 ]; then order="P A"; else order="A P"; fi
+            for v in $order; do
+              log="ab/suite-$v-$i.log"
+              b=$(busy)
+              (cd "$RUNNER_TEMP/$v" && env -u GITHUB_ACTIONS scripts/check-suite-time.sh 3) > "$log" 2>&1 && code=0 || code=$?
+              a=$(busy)
+              took=$(grep -oE 'the test suite took [0-9.]+s' "$log" | grep -oE '[0-9.]+s' | tr -d s || true)
+              alone=$(grep -E 'failed beside the other binaries and passed alone:$' "$log" | sed 's/ failed beside.*//' | tr ' ' '_' | tr '\n' ';' || true)
+              retried=$(grep -c 'failed beside the other binaries and passed alone' "$log" || true)
+              failed=$(grep -E ' failed:$' "$log" | grep -v 'passed alone' | sed 's/ failed:$//' | tr ' ' '_' | tr '\n' ';' || true)
+              names=$(grep -oE '^---- [^ ]+' "$log" | awk '{ print $2 }' | sort -u | tr '\n' ';' || true)
+              echo "SUITE $v $i exit=$code took=${took:-none} cpu=$(echo "($a - $b) / $(getconf CLK_TCK)" | bc -l | cut -c1-6) retried=$retried alone=[$alone] failed=[$failed] tests=[$names]" | tee -a ab/summary.txt
+            done
+          done
+
+      - name: Rebuild after a one-line edit in the core
+        timeout-minutes: 15
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: |
+          now() { date +%s.%N; }
+          for v in A P; do
+            cd "$RUNNER_TEMP/$v"
+            cargo test --workspace --locked --no-run > "$GITHUB_WORKSPACE/ab/edit-$v.log" 2>&1 || true
+            echo 'pub fn edit_rebuild_probe() -> usize { 1 }' >> crates/core/src/text.rs
+            t0=$(now); cargo test --workspace --locked --no-run >> "$GITHUB_WORKSPACE/ab/edit-$v.log" 2>&1 && c=0 || c=$?; t1=$(now)
+            git checkout -q crates/core/src/text.rs
+            cd "$GITHUB_WORKSPACE"
+            echo "EDIT $v ce=$(echo "$t1 - $t0" | bc | cut -c1-7) exit=$c" | tee -a ab/summary.txt
+          done
+
+      - name: Table
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        run: |
+          python3 - ab/summary.txt << 'PY' | tee ab/table.txt
+          import statistics, sys
+          suite, build, edit = {}, {}, {}
+          for line in open(sys.argv[1]).read().splitlines():
+              f = line.split()
+              if not f: continue
+              kv = dict(x.split('=', 1) for x in f if '=' in x)
+              if f[0] == 'SUITE': suite.setdefault(f[1], []).append(kv)
+              elif f[0] == 'BUILD': build[f[1]] = kv
+              elif f[0] == 'EDIT': edit[f[1]] = kv
+          med = {}
+          for v in 'AP':
+              runs = suite.get(v, [])
+              t = [float(k['took']) for k in runs if k['took'] != 'none']
+              med[v] = statistics.median(t) if t else float('nan')
+              print(f"{v}: median {med[v]:.2f} slowest {max(t) if t else float('nan'):.2f} cpu median {statistics.median(float(k['cpu']) for k in runs) if runs else 0:.2f} "
+                    f"exits {','.join(k['exit'] for k in runs)} passed-alone runs {sum(int(k['retried']) > 0 for k in runs)} binaries {sum(int(k['retried']) for k in runs)} "
+                    f"build {build.get(v, {}).get('build')} ce {edit.get(v, {}).get('ce')}")
+              print('   times', ' '.join(k['took'] for k in runs))
+              for k in runs:
+                  if k['alone'] != '[]' or k['failed'] != '[]': print('  ', k['alone'], k['failed'], k['tests'])
+          print(f"ratio P/A {med['P'] / med['A']:.3f}")
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: suite-time-ab-${{ github.run_attempt }}
+          path: ab
