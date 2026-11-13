@@ -11,7 +11,7 @@ defaults:
     shell: bash
 
 env:
-  CARGO_TERM_COLOR: never
+  CARGO_TERM_COLOR: always
 
 jobs:
   variants:
@@ -37,7 +37,8 @@ jobs:
         timeout-minutes: 5
         run: |
           mkdir -p out
-          { nproc; grep -m1 'model name' /proc/cpuinfo; df -h / /mnt || true; du -sh target; rustc -V; } | tee out/host.txt
+          : > out/summary.txt
+          { nproc; grep -m1 'model name' /proc/cpuinfo; df -h / /mnt || true; du -sh target || true; rustc -V; } | tee out/host.txt
           root="$RUNNER_TEMP/v"
           if [ -d /mnt ] && sudo mkdir -p /mnt/v && sudo chown "$(id -u):$(id -g)" /mnt/v; then
             avail=$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)
