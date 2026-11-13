@@ -9192,7 +9192,7 @@ echo run >> {}
     /// length when the provider counts the prompt higher than the estimate.
     /// The refusal proves the prompt was more than the window less the limit
     /// that request carried, so the calibration rises by that much, and the
-    /// next request asks for less and fits.
+    /// same request goes once more in the same turn at the reserve and fits.
     #[tokio::test]
     async fn a_refusal_at_the_room_left_raises_the_calibration_until_the_resend_fits() {
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -9213,25 +9213,18 @@ echo run >> {}
             let mut s = core.settings.lock().unwrap();
             (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(65_536), 65_536);
         }
-        let limits = |bodies: &Arc<StdMutex<Vec<String>>>| -> Vec<u64> {
-            bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect()
-        };
 
-        start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
+        start_turn(core.clone(), id.clone(), project, "first".into()).unwrap();
         let (stop, budgets) = budgets_until_done(&mut rx).await;
-        assert_eq!(stop, "error", "the provider refused the request for length");
-        let [first] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
-        assert_eq!(limits(&bodies), [65_536 - 1024 - first as u64]);
+        assert_eq!(stop, "stop", "the request sent again at the reserve fits");
+        let first = budgets[0];
+        assert_eq!(turn_limits(&bodies), [65_536 - 1024 - first as u64, 8_192], "the room left, then the reserve");
+        assert_eq!(bodies.lock().unwrap().len(), 2, "two requests in all");
         let ratio = core.sessions.lock().await[&id].prompt_ratio.as_ref().map(|r| r.1);
         assert_eq!(ratio, Some((first + 1024) as f64 / first as f64), "the window less the limit sent is a floor");
-
-        start_turn(core.clone(), id.clone(), project, "second".into()).unwrap();
-        let (stop, budgets) = budgets_until_done(&mut rx).await;
-        assert_eq!(stop, "stop", "the calibrated request asks for less and fits");
-        let [second] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
-        assert!(second > first + 1024, "{first} -> {second}");
-        assert_eq!(limits(&bodies)[1], 65_536 - 1024 - second as u64);
         assert!(sessions::last_compaction(&core, &id).is_none());
+        let reply = core.sessions.lock().await[&id].messages.last().and_then(|m| m.content.clone());
+        assert_eq!(reply.as_deref(), Some("done"), "the turn ends with the reply");
         let _ = std::fs::remove_dir_all(dir);
     }
 
