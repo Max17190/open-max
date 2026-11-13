@@ -11,10 +11,10 @@ Found a bug or want a change? Open an issue or send a pull request. To report a 
 Every pull request runs the CI workflow, and these jobs have to pass. [Development](docs/development.md) states each budget and floor.
 
 - **Test**, on ubuntu-latest and macos-latest: every test under cargo-nextest, the doc tests, the examples' tests, and `scripts/check-test-count.sh` against the test count floor.
-- **Suite time**: `scripts/check-suite-time.sh` on ubuntu-latest, against the suite's time budget.
-- **Clippy**: `cargo clippy --workspace --all-targets --locked -- -D warnings`, with no warnings.
+- **Suite time**: `scripts/check-suite-time.sh 3` on ubuntu-latest, against three times the suite's time budget.
+- **Clippy**: `cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings`, with no warnings.
 - **Thesis**, on ubuntu-latest and macos-latest: the thesis tests in a release build, each holding a bound, such as the frozen prefix's byte cap and the core source's line ratchet.
-- **Release plan**: `dist plan`, so a release config it cannot plan fails the pull request.
+- **Release plan**: `dist plan --output-format=json`, so a release config it cannot plan fails the pull request.
 
 The **Core share** job reports the share of recent commits that change `crates/core/`.
 
