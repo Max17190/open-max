@@ -273,7 +273,7 @@ struct WireToolCall<'a> {
 /// the server's KV cache without re-walking a `Value` tree. The client's
 /// `origin` decides whose reasoning goes out, and its `cache_marks` whether
 /// the messages carry cache markers.
-fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], tools_wire: &str) -> Result<Vec<u8>, String> {
+fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], limit: usize, tools_wire: &str) -> Result<Vec<u8>, String> {
     let include_tools = !tools_wire.is_empty() && tools_wire != "[]";
     // Borrow the frozen wire as RawValue: validation only, no Value rebuild.
     // Serialize writes these exact bytes into the body.
@@ -288,8 +288,8 @@ fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], to
         },
         temperature: client.temperature,
         reasoning_effort: client.reasoning_effort,
-        max_tokens: (!completion).then_some(client.max_tokens),
-        max_completion_tokens: completion.then_some(client.max_tokens),
+        max_tokens: (!completion).then_some(limit),
+        max_completion_tokens: completion.then_some(limit),
         stream: true,
         stream_options: client.send_stream_options.then_some(StreamOptions { include_usage: true }),
         tools,
@@ -358,17 +358,16 @@ pub struct CompletionResult {
 }
 
 impl CompletionResult {
-    pub(crate) fn hit_output_cap(&self, max_tokens: usize) -> bool {
+    pub(crate) fn hit_output_cap(&self, limit: usize) -> bool {
         // Some servers report tool_calls even when the arguments hit the cap.
-        self.finish_reason == "length"
-            || self.usage.is_some_and(|u| u.completion_tokens == max_tokens as u64)
+        self.finish_reason == "length" || self.usage.is_some_and(|u| u.completion_tokens == limit as u64)
     }
 
-    fn normalize_empty_tool_arguments(mut self, max_tokens: usize) -> Self {
+    fn normalize_empty_tool_arguments(mut self, limit: usize) -> Self {
         // A completed no-argument call may omit the empty object. Leave the
         // last call's blank arguments alone at the cap: it may have been cut
         // before its first argument byte, so dispatch must reject it.
-        let complete = self.tool_calls.len().saturating_sub(usize::from(self.hit_output_cap(max_tokens)));
+        let complete = self.tool_calls.len().saturating_sub(usize::from(self.hit_output_cap(limit)));
         for call in self.tool_calls.iter_mut().take(complete) {
             if call.function.arguments.trim().is_empty() {
                 call.function.arguments = "{}".into();
@@ -402,7 +401,8 @@ pub struct ChatClient {
     pub model: String,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub max_tokens: usize,
+    /// The room held back for a reply (`ActiveEndpoint::reply_reserve`).
+    pub reply_reserve: usize,
     pub headers: Vec<(String, String)>,
     pub use_max_completion_tokens: bool,
     pub send_stream_options: bool,
@@ -519,7 +519,7 @@ struct ToolCallFnDelta {
 }
 
 impl ChatClient {
-    pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: Option<f32>, max_tokens: usize) -> Self {
+    pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: Option<f32>, reply_reserve: usize) -> Self {
         // One client (and connection pool) for the process lifetime: ChatClient
         // is rebuilt every turn, and rebuilding the pool with it would redo the
         // TCP/TLS handshake per turn on remote endpoints.
@@ -546,7 +546,7 @@ impl ChatClient {
             model,
             temperature,
             reasoning_effort: None,
-            max_tokens,
+            reply_reserve,
             headers: Vec::new(),
             use_max_completion_tokens: false,
             send_stream_options: true,
@@ -570,7 +570,7 @@ impl ChatClient {
             use_max_completion_tokens: ep.compat.use_max_completion_tokens,
             send_stream_options: ep.compat.send_stream_options,
             prefer_reasoning_details: ep.compat.prefer_reasoning_details,
-            ..Self::new(ep.base_url.clone(), ep.api_key.clone(), ep.model.clone(), ep.temperature, ep.max_tokens)
+            ..Self::new(ep.base_url.clone(), ep.api_key.clone(), ep.model.clone(), ep.temperature, ep.reply_reserve)
         }
     }
 
@@ -710,7 +710,7 @@ impl ChatClient {
 
     /// Stream a chat completion, invoking `on_delta` for each token. Returns the
     /// fully accumulated message. If the server replies with plain JSON instead
-    /// of an SSE stream, the response is parsed in one shot.
+    /// of an SSE stream, the response is parsed in one shot. It asks for a reply of at most `limit`.
     ///
     /// `tools_wire` is the registry's frozen schema array JSON (`tool_schemas_wire`).
     /// Pass the same slice every iteration of a turn so the tools field stays
@@ -718,6 +718,7 @@ impl ChatClient {
     pub async fn stream_chat(
         &self,
         messages: &[ChatMessage],
+        limit: usize,
         tools_wire: &str,
         cancelled: Arc<crate::state::CancelToken>,
         mut on_delta: impl FnMut(StreamDelta),
@@ -743,10 +744,10 @@ impl ChatClient {
         // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
         let body = if self.wire_api == crate::providers::WireApi::Anthropic {
-            anthropic::serialize(self, messages, tools_wire)?
+            anthropic::serialize(self, messages, limit, tools_wire)?
         } else if self.wire_api == crate::providers::WireApi::Responses {
-            responses::serialize(self, messages, tools_wire)?
-        } else { serialize_chat_request_body(self, messages, tools_wire)? };
+            responses::serialize(self, messages, limit, tools_wire)?
+        } else { serialize_chat_request_body(self, messages, limit, tools_wire)? };
         // Native Messages takes an effort change as history under its beta.
         let beta = (self.wire_api == crate::providers::WireApi::Anthropic && !self.effort_plan(messages).1.is_empty()).then_some(("anthropic-beta", crate::providers::EFFORT_BETA));
 
@@ -894,7 +895,7 @@ impl ChatClient {
                     return Err(naming_wait(failure.message, beyond_cap));
                 }
                 return parse_complete_response(&v, &mut on_delta)
-                    .map(|reply| reply.normalize_empty_tool_arguments(self.max_tokens));
+                    .map(|reply| reply.normalize_empty_tool_arguments(limit));
             }
 
             let (reply, unfinished) = match self.wire_api {
@@ -927,7 +928,7 @@ impl ChatClient {
                 // Never a truncated reply: the server said this one failed,
                 // and a tool call it carried must not run.
                 Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
-                _ => return Ok(reply.normalize_empty_tool_arguments(self.max_tokens)),
+                _ => return Ok(reply.normalize_empty_tool_arguments(limit)),
             };
             if let Some(usage) = reply.usage { on_delta(StreamDelta::Usage(usage)); }
             if !resend_after(attempt, last, &reason, wait, &cancelled, &mut on_delta).await {
@@ -1886,7 +1887,7 @@ pub(crate) mod tests {
             None,
         );
         let err = ChatClient::new(refuse(), None, "m".into(), Some(0.2), 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
             .await
             .err()
             .expect("a 400 is an error");
@@ -1904,7 +1905,7 @@ pub(crate) mod tests {
             None,
         );
         let err = ChatClient::new(refuse(), None, "m".into(), Some(0.2), 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
             .await
             .err()
             .expect("a 422 is an error");
@@ -2009,7 +2010,7 @@ pub(crate) mod tests {
         let client = ChatClient::new(spawn_sse_once(sse), None, "m".into(), None, 64);
         client
             .stream_chat(
-                &[ChatMessage::user("hi")],
+                &[ChatMessage::user("hi")], client.reply_reserve,
                 "[]",
                 Arc::new(crate::state::CancelToken::default()),
                 |_| {},
@@ -2027,7 +2028,7 @@ pub(crate) mod tests {
             let task_cancel = cancelled.clone();
             let mut task = tokio::spawn(async move {
                 ChatClient::new(url, None, "m".into(), None, 64)
-                    .stream_chat(&[ChatMessage::user("hi")], "[]", task_cancel, |_| {}).await
+                    .stream_chat(&[ChatMessage::user("hi")], 64, "[]", task_cancel, |_| {}).await
             });
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             cancelled.cancel();
@@ -2365,7 +2366,7 @@ pub(crate) mod tests {
             None,
         );
         let result = ChatClient::new(url, None, "m".into(), None, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
         assert_eq!(result.content, "ok");
         assert_eq!(result.reasoning_content.as_deref(), Some("thought"));
         assert_eq!(result.reasoning, None);
@@ -2396,7 +2397,7 @@ pub(crate) mod tests {
             );
             let mut texts = Vec::new();
             let result = ChatClient::new(url, None, "m".into(), None, 64)
-                .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |delta| {
+                .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |delta| {
                     if let StreamDelta::Content(text) = delta {
                         texts.push(text);
                     }
@@ -2639,7 +2640,7 @@ pub(crate) mod tests {
         let mut client = ChatClient::new(url, None, "m".into(), None, 64);
         client.idle_timeout = idle;
         let result = client
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+            .stream_chat(&[ChatMessage::user("hi")], client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
                 deltas.push(match d {
                     StreamDelta::Content(t) => format!("content:{t}"),
                     StreamDelta::Reasoning(t) => format!("reasoning:{t}"),
@@ -2819,7 +2820,7 @@ pub(crate) mod tests {
         let mut deltas = Vec::new();
         let client = ChatClient::new(url, None, "m".into(), None, 64);
         let messages = [ChatMessage::user("hi")];
-        let request = client.stream_chat(&messages, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+        let request = client.stream_chat(&messages, client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
             if let StreamDelta::Retry { attempt, max_attempts, reason } = d {
                 deltas.push(format!("{attempt}/{max_attempts}:{reason}"));
             }
@@ -3130,7 +3131,7 @@ pub(crate) mod tests {
         let (url, served) = spawn_sse_sequence(vec![refusal, FINISHED.into()]);
         let cancelled = Arc::new(crate::state::CancelToken::default());
         let reply = ChatClient::new(url, None, "m".into(), None, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", cancelled.clone(), |delta| {
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", cancelled.clone(), |delta| {
                 if matches!(delta, StreamDelta::Retry { .. }) {
                     cancelled.cancel();
                 }
@@ -3263,7 +3264,7 @@ pub(crate) mod tests {
         let (url, served) = spawn_sse_sequence(vec![refusal, FINISHED.into()]);
         let mut retries = 0;
         let result = ChatClient::new(url, None, "m".into(), None, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
                 if let StreamDelta::Retry { .. } = d {
                     retries += 1;
                 }
@@ -3624,7 +3625,7 @@ pub(crate) mod tests {
             let client = ChatClient::from_endpoint(endpoint);
             async move {
                 client
-                    .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+                    .stream_chat(&[ChatMessage::user("hi")], client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
                     .await
             }
         };
@@ -3668,7 +3669,7 @@ pub(crate) mod tests {
         std::fs::write(crate::providers::providers_path(&dir), catalog.to_string()).unwrap();
         let settings = crate::config::Settings { provider: Some("picky".into()), model: "m".into(), ..Default::default() };
         let client = ChatClient::from_endpoint(&crate::providers::resolve(&settings, &dir).unwrap());
-        let reply = client.stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
+        let reply = client.stream_chat(&[ChatMessage::user("hi")], client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
         assert_eq!(reply.unwrap().content, "all of it");
         let request = requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
@@ -3699,7 +3700,7 @@ pub(crate) mod tests {
             client.headers = headers;
             let mut retries = 0;
             let err = client
-                .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| retries += 1)
+                .stream_chat(&[ChatMessage::user("hi")], client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |_| retries += 1)
                 .await
                 .err()
                 .expect("a key over plain http to another machine is refused");
@@ -3711,7 +3712,7 @@ pub(crate) mod tests {
 
         let (url, heads) = spawn_recording_once(finished_response());
         let result = ChatClient::new(url, Some("sk-local".into()), "m".into(), None, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
             .await
             .expect("loopback http carries a key");
         assert_eq!(result.content, "all of it");
@@ -3791,7 +3792,7 @@ pub(crate) mod tests {
         client.headers = vec![("X-API-Key".into(), "sk-test".into())];
         let mut deltas = 0;
         let err = client
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| deltas += 1)
+            .stream_chat(&[ChatMessage::user("hi")], client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |_| deltas += 1)
             .await
             .err()
             .expect("a redirect to another server fails the request");
@@ -3802,7 +3803,7 @@ pub(crate) mod tests {
         // Within the same server, a moved path is followed.
         let (url, served) = spawn_sse_sequence(vec![moved("/v2/chat/completions"), FINISHED.into()]);
         let result = ChatClient::new(url, None, "m".into(), None, 64)
-            .stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {})
             .await
             .expect("a redirect within the server is followed");
         assert_eq!(result.content, "all of it");
@@ -3899,7 +3900,7 @@ pub(crate) mod tests {
         }])
         .to_string();
         // Default compat: max_tokens + stream_options (local OpenAI-compatible).
-        let bytes = serialize_chat_request_body(&chat_client("test-model", Some(0.2), 1024, false, true), &messages, &tools_wire).unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("test-model", Some(0.2), 1024, false, true), &messages, 1024, &tools_wire).unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(v["model"], "test-model");
@@ -3947,7 +3948,7 @@ pub(crate) mod tests {
         );
         assert_eq!(wire(&messages, "o"), old_shape);
         assert_eq!(serde_json::to_string(&messages).unwrap(), old_shape);
-        let bytes = serialize_chat_request_body(&chat_client("m", None, 64, false, false), &messages, "").unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("m", None, 64, false, false), &messages, 64, "").unwrap();
         let body = String::from_utf8(bytes).unwrap();
         assert!(body.contains(&format!(r#""messages":{old_shape}"#)), "{body}");
 
@@ -4230,9 +4231,9 @@ pub(crate) mod tests {
         for wire_api in [crate::providers::WireApi::ChatCompletions, crate::providers::WireApi::Responses, crate::providers::WireApi::Anthropic] {
             let client = ChatClient { wire_api, ..ChatClient::new("http://127.0.0.1:8080/v1".into(), None, "m".into(), None, 64) };
             let body = match wire_api {
-                crate::providers::WireApi::ChatCompletions => serialize_chat_request_body(&client, &messages, "[]"),
-                crate::providers::WireApi::Responses => responses::serialize(&client, &messages, "[]"),
-                crate::providers::WireApi::Anthropic => anthropic::serialize(&client, &messages, "[]"),
+                crate::providers::WireApi::ChatCompletions => serialize_chat_request_body(&client, &messages, client.reply_reserve, "[]"),
+                crate::providers::WireApi::Responses => responses::serialize(&client, &messages, client.reply_reserve, "[]"),
+                crate::providers::WireApi::Anthropic => anthropic::serialize(&client, &messages, client.reply_reserve, "[]"),
             };
             let body: Value = serde_json::from_slice(&body.unwrap()).unwrap();
             let entries = body.get("messages").or(body.get("input")).and_then(Value::as_array).unwrap();
@@ -4309,7 +4310,7 @@ pub(crate) mod tests {
 
     /// The whole request body `client` would send for `messages`.
     fn request_body(client: &ChatClient, messages: &[ChatMessage]) -> String {
-        let bytes = serialize_chat_request_body(client, messages, "").unwrap();
+        let bytes = serialize_chat_request_body(client, messages, client.reply_reserve, "").unwrap();
         String::from_utf8(bytes).unwrap()
     }
 
@@ -4365,11 +4366,11 @@ pub(crate) mod tests {
         expected[0]["content"] = marked("p");
         expected[3]["cache_control"] = json!({ "type": "ephemeral" });
         assert_eq!(sent(&round), expected);
-        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "anthropic/claude-sonnet-5.5"), &round, "").unwrap();
+        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "anthropic/claude-sonnet-5.5"), &round, 4096, "").unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["messages"], sent(&round), "the route's requests carry them");
         assert_eq!(body.to_string().matches("cache_control").count(), 2, "{body}");
-        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "openai/gpt-5.6"), &round, "").unwrap();
+        let body = serialize_chat_request_body(&serving("https://openrouter.ai/api/v1", "openai/gpt-5.6"), &round, 4096, "").unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["messages"], plain, "another model's do not");
 
         let mut expected = serde_json::to_value(&round[..2]).unwrap();
@@ -4390,7 +4391,7 @@ pub(crate) mod tests {
         let messages = vec![ChatMessage::user("hi")];
         for tools_wire in ["", "[]"] {
             let bytes =
-                serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, tools_wire)
+                serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, 64, tools_wire)
                     .unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(
@@ -4414,10 +4415,10 @@ pub(crate) mod tests {
         let marked = ChatMessage { archived_tool_output: Some("archive-reference".into()), ..original.clone() };
         let (original, marked) = (&[original], &[marked]);
         assert_eq!(original[0].estimated_tokens(), marked[0].estimated_tokens());
-        assert_eq!(serialize_chat_request_body(&client, original, "[]").unwrap(),
-                   serialize_chat_request_body(&client, marked, "[]").unwrap());
-        assert_eq!(responses::serialize(&client, original, "[]").unwrap(),
-                   responses::serialize(&client, marked, "[]").unwrap());
+        assert_eq!(serialize_chat_request_body(&client, original, client.reply_reserve, "[]").unwrap(),
+                   serialize_chat_request_body(&client, marked, client.reply_reserve, "[]").unwrap());
+        assert_eq!(responses::serialize(&client, original, client.reply_reserve, "[]").unwrap(),
+                   responses::serialize(&client, marked, client.reply_reserve, "[]").unwrap());
     }
 
     #[test]
@@ -4428,9 +4429,9 @@ pub(crate) mod tests {
             "function": { "name": "bash", "parameters": { "type": "object" } }
         }])
         .to_string();
-        let a = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, &tools_wire)
+        let a = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, 256, &tools_wire)
             .unwrap();
-        let b = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, &tools_wire)
+        let b = serialize_chat_request_body(&chat_client("m", Some(0.5), 256, false, true), &messages, 256, &tools_wire)
             .unwrap();
         assert_eq!(a, b);
     }
@@ -4440,10 +4441,10 @@ pub(crate) mod tests {
     #[test]
     fn serialize_omits_temperature_unless_configured() {
         let messages = vec![ChatMessage::user("hi")];
-        let unset = serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, "").unwrap();
+        let unset = serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, 64, "").unwrap();
         let v: Value = serde_json::from_slice(&unset).unwrap();
         assert!(v.get("temperature").is_none(), "{v}");
-        let set = serialize_chat_request_body(&chat_client("m", Some(0.7), 64, false, true), &messages, "").unwrap();
+        let set = serialize_chat_request_body(&chat_client("m", Some(0.7), 64, false, true), &messages, 64, "").unwrap();
         let v: Value = serde_json::from_slice(&set).unwrap();
         assert!((v["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-5, "{v}");
     }
@@ -4452,7 +4453,7 @@ pub(crate) mod tests {
     fn serialize_respects_max_completion_tokens_and_omits_stream_options() {
         let messages = vec![ChatMessage::user("compat")];
         // max_completion_tokens, no stream_options, no tools.
-        let bytes = serialize_chat_request_body(&chat_client("gpt-style", Some(0.1), 512, true, false), &messages, "").unwrap();
+        let bytes = serialize_chat_request_body(&chat_client("gpt-style", Some(0.1), 512, true, false), &messages, 512, "").unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["max_completion_tokens"], 512);
         assert!(v.get("max_tokens").is_none());
@@ -4471,7 +4472,7 @@ pub(crate) mod tests {
         let messages = vec![ChatMessage::user("hi")];
         let wire = registry.tool_schemas_wire();
         let bytes =
-            serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, wire).unwrap();
+            serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, 64, wire).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(
             body.contains(wire),
@@ -4574,7 +4575,7 @@ pub(crate) mod tests {
         for (model, routed) in [("grok-4.7", true), ("m", false)] {
             let (url, requests) = spawn_recording_once(finished_response());
             let client = ChatClient::new(url, None, model.into(), None, 64).for_conversation("root");
-            let reply = client.stream_chat(&[ChatMessage::user("hi")], "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
+            let reply = client.stream_chat(&[ChatMessage::user("hi")], client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
             assert_eq!(reply.unwrap().content, "all of it");
             let request = requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
             let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();

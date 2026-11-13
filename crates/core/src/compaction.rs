@@ -60,7 +60,7 @@ pub(crate) const MAX_DIGEST_SNIPPET_BYTES: usize = 120;
 
 /// What one prune may spend on summarizer input, in bytes. The summary
 /// request's prompt side has `budget + 1024` tokens of room (`budget` already
-/// reserves max_tokens + 1024 out of the window), so 4 x budget bytes ~= budget tokens
+/// holds the reply reserve + 1024 out of the window), so 4 x budget bytes ~= budget tokens
 /// leaves the reserve for the system line and envelope. Floored so small
 /// windows keep useful fidelity, capped so giant windows do not pay giant
 /// summary requests.
@@ -351,7 +351,7 @@ async fn summarize_compaction(
     let estimated = messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
     if !spend.admits(estimated) { return None; }
     let mut resent = Vec::new();
-    let outcome = tokio::time::timeout(SUMMARY_TIMEOUT, client.stream_chat(&messages, "[]", cancelled.clone(), |delta| {
+    let outcome = tokio::time::timeout(SUMMARY_TIMEOUT, client.stream_chat(&messages, client.reply_reserve, "[]", cancelled.clone(), |delta| {
         if let crate::client::StreamDelta::Usage(usage) = delta { resent.push(usage); }
     })).await;
     // A summary the client asked for again was paid for, however this one ended.
@@ -359,8 +359,8 @@ async fn summarize_compaction(
     let result = match outcome {
         Ok(Ok(result)) => result,
         _ => {
-            // Without a completed response, reserve the configured output cap.
-            spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(client.max_tokens));
+            // Without a completed response, charge the reply reserve it asked for.
+            spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(client.reply_reserve));
             return None;
         }
     };

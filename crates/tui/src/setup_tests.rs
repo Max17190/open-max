@@ -282,7 +282,7 @@ async fn a_model_setup_saved_sends_the_default_reply_limit() {
     });
     let client = open_max_core::client::ChatClient::from_endpoint(&endpoint);
     let messages = [open_max_core::types::ChatMessage::user("fixture task")];
-    client.stream_chat(&messages, "[]", Default::default(), |_| {}).await.unwrap();
+    client.stream_chat(&messages, client.reply_reserve, "[]", Default::default(), |_| {}).await.unwrap();
     let body: Value = serde_json::from_str(&request.await.unwrap()).unwrap();
     assert_eq!(body["max_tokens"], 4096);
     let _ = std::fs::remove_dir_all(dir);

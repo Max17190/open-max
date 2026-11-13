@@ -448,7 +448,7 @@ async fn run_compact(
     // In estimator units, like the turn loop's; the receipt converts back.
     let factor = token_factor(prompt_ratio);
     let budget = to_estimate(
-        endpoint.context_tokens.saturating_sub(endpoint.max_tokens + 1024),
+        endpoint.context_tokens.saturating_sub(endpoint.reply_reserve + 1024),
         factor,
     );
     // A one-shot command can prune even when the protected tail will not fit
@@ -738,7 +738,6 @@ async fn run_loop(
     // the agent (via openmax --spec usage) can prune its own toolbox.
     let turn_usage = std::sync::Mutex::new(TurnUsage::default());
     let context_tokens = endpoint.context_tokens;
-    let max_tokens = endpoint.max_tokens;
     // Seeded from the session, not reset per turn: the next turn must budget
     // with what the earlier requests on this route taught, a request the
     // provider refused for length included (see `refusal_ratio`).
@@ -768,11 +767,10 @@ async fn run_loop(
         // as real as the transcript: the overhead every request carries
         // besides the history, the note stored in it included.
         let schema_tokens = request_overhead(&schemas_wire);
-        // Convert the provider's window to estimator units with the
-        // conservative factor used for spend admission. The soft trigger
-        // can use a lower ratio and is capped by that window budget.
+        // The window less the reply reserve, in estimator units at the spend factor;
+        // the soft trigger may use a lower ratio and is capped by this budget.
         let factor = token_factor(prompt_ratio);
-        let window_budget = context_tokens.saturating_sub(max_tokens + 1024);
+        let window_budget = context_tokens.saturating_sub(endpoint.reply_reserve + 1024);
         let budget = to_estimate(window_budget, factor);
         if schemas_outgrow_budget(budget, schema_tokens) {
             let schema_real = to_real(schema_tokens, factor);
@@ -807,11 +805,12 @@ async fn run_loop(
         }
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
+        let limit = endpoint.reply_limit(used_real);
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
         let result = client
-            .stream_chat(guard.messages(), &schemas_wire, cancelled.clone(), move |delta| {
+            .stream_chat(guard.messages(), limit, &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -826,7 +825,7 @@ async fn run_loop(
         // or an earlier ratio that tightens the window: it cannot relax it.
         let next_ratio = match &result {
             Ok(result) => updated_prompt_ratio(prompt_ratio, result, used),
-            Err(message) => refusal_ratio(message, used, context_tokens.saturating_sub(max_tokens), factor).or(prompt_ratio.filter(|&ratio| ratio >= 1.0)),
+            Err(message) => refusal_ratio(message, used, context_tokens.saturating_sub(limit), factor).or(prompt_ratio.filter(|&ratio| ratio >= 1.0)),
         };
         if next_ratio != prompt_ratio {
             prompt_ratio = next_ratio;
@@ -886,7 +885,7 @@ async fn run_loop(
         // reasoning, so the continuation resumes the thought instead of
         // starting it over; the wire skips it wherever the reasoning does
         // not go back (another endpoint, a path that does not replay it).
-        let cut_thought = result.hit_output_cap(max_tokens)
+        let cut_thought = result.hit_output_cap(limit)
             && (result.reasoning_content.is_some() || result.reasoning.is_some() || result.reasoning_details.is_some());
         if !content.is_empty() || !tool_calls.is_empty() || cut_thought {
             // A call whose arguments are not JSON (a model's slip, or a call a
@@ -952,7 +951,7 @@ async fn run_loop(
         // the one it was still writing, is refused with the cause, so the
         // model can split the work. The client keeps its raw arguments even
         // when the cut lands before the first byte.
-        let capped = result.hit_output_cap(max_tokens);
+        let capped = result.hit_output_cap(limit);
         if !capped {
             cuts = 0;
         }
@@ -968,7 +967,7 @@ async fn run_loop(
             if capped && cuts < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
                 cuts += 1;
                 let at = guard.messages().len();
-                insert_note(core, session_id, guard.messages(), at, reply_cut_note(max_tokens));
+                insert_note(core, session_id, guard.messages(), at, reply_cut_note(limit));
                 save_messages(core, session_id, guard.messages(), false).await;
                 continue 'turns;
             }
@@ -1176,7 +1175,7 @@ async fn run_loop(
                             sent.push_str("...");
                         }
                         let cause = match e {
-                            None => cut_off_call_error(max_tokens),
+                            None => cut_off_call_error(limit),
                             Some(e) => format!("invalid JSON in tool arguments: {e}. The call did not run."),
                         };
                         let msg = format!("{cause} Arguments sent: {sent}");
@@ -8969,5 +8968,258 @@ echo run >> {}
             !core.cancel_flags.lock().unwrap().contains_key(&session_id),
             "a dead turn must drop its cancel token"
         );
+    }
+
+    /// The request bodies of a three-request session (two reads, then the
+    /// answer) at the default reply limit on a `window`-token window. The
+    /// system prompt and the tool schemas, which other files write, stand as
+    /// placeholders; every other byte is as sent.
+    async fn default_limit_bodies(window: usize) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, bodies) = capturing_endpoint_times(TOOL_SSE, 2).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(window), 4_096);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        start_turn(core.clone(), "sess-limit".into(), project, "read a.txt".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let _ = std::fs::remove_dir_all(dir);
+        let bodies = bodies.lock().unwrap().clone();
+        bodies
+            .into_iter()
+            .map(|body| {
+                let sent: Value = serde_json::from_str(&body).unwrap();
+                let system = serde_json::to_string(&sent["messages"][0]["content"]).unwrap();
+                let tools = serde_json::to_string(&sent["tools"]).unwrap();
+                assert!(body.contains(&system) && body.contains(&tools), "{body}");
+                body.replacen(&system, "\"<system prompt>\"", 1).replacen(&tools, "\"<tool schemas>\"", 1)
+            })
+            .collect()
+    }
+
+    /// A reply limit no larger than the reserve's cap, the default 4096
+    /// among them, sends what it always sent: the reserve is the limit, and
+    /// every request of a three-request session on a 1,048,576-token and a
+    /// 32,768-token window carries the bytes it carried before the limit
+    /// followed the room left in the window.
+    #[tokio::test]
+    async fn the_default_reply_limit_sends_the_bytes_it_always_sent() {
+        let sent: std::collections::BTreeMap<String, Vec<String>> =
+            serde_json::from_str(include_str!("../tests/fixtures/default-reply-limit-bodies.json")).unwrap();
+        for window in [1_048_576usize, 32_768] {
+            assert_eq!(crate::providers::reply_limits(window, 4_096), (4_096, 4_096));
+            assert_eq!(default_limit_bodies(window).await, sent[&window.to_string()], "window {window}");
+        }
+    }
+
+    /// The endpoint a `window`-token window with the reply limit `max_tokens` resolves to.
+    fn endpoint_on(window: usize, max_tokens: usize) -> crate::providers::ActiveEndpoint {
+        let settings = Settings { base_url: "http://127.0.0.1:9/v1".into(), model: "m".into(), context_tokens: Some(window), max_tokens, ..Default::default() };
+        crate::providers::resolve(&settings, &std::env::temp_dir().join(format!("openmax-none-{}", uuid::Uuid::new_v4()))).unwrap()
+    }
+
+    /// One turn of a session seeded with more than `history` estimated tokens,
+    /// on a `window`-token window with the reply limit `max_tokens` and the
+    /// compaction trigger left to the input budget, against a provider that
+    /// answers. Returns the request's size as the budget event reported it,
+    /// the reply limit its body carried, and whether the turn compacted.
+    async fn one_request_on(window: usize, max_tokens: usize, history: usize) -> (usize, u64, bool) {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= history {
+                data.messages.push(ChatMessage::user("q ".repeat(2_000)));
+                data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
+            }
+            let mut persisted = 0usize;
+            sessions::save_messages(&core, &id, &data.messages, &mut persisted, true);
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+        }
+        let (base_url, bodies) = capturing_endpoint_times(STOP_SSE, 0).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(window), max_tokens);
+            s.compaction_tokens = Some(window);
+        }
+        start_turn(core.clone(), id.clone(), project, "go".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop");
+        let [used] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        let body: Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        let compacted = sessions::last_compaction(&core, &id).is_some();
+        let _ = std::fs::remove_dir_all(dir);
+        (used, body["max_tokens"].as_u64().unwrap(), compacted)
+    }
+
+    /// The reply limit had two jobs, the limit each request carries and the
+    /// room held back from the input budget. Set to a longest reply as large
+    /// as the window, it left an input budget of about a thousand tokens, and
+    /// a session of any size compacted or failed. The reserve is now an
+    /// eighth of the window, and each request asks for the room its prompt
+    /// leaves.
+    #[tokio::test]
+    async fn a_reply_limit_as_large_as_the_window_keeps_the_input_budget() {
+        let ep = endpoint_on(262_144, 262_144);
+        assert_eq!((ep.reply_reserve, ep.context_tokens - (ep.reply_reserve + 1024)), (32_768, 228_352));
+        assert_eq!((ep.reply_limit(200_000), ep.reply_limit(10_000)), (61_120, 251_120));
+        let (used, limit, compacted) = one_request_on(262_144, 262_144, 10_000).await;
+        assert!(used > 10_000 && !compacted, "a 10,000-token history fits the input budget: {used}");
+        assert_eq!(limit, (262_144 - 1024 - used) as u64, "the request asks for the room its prompt leaves");
+    }
+
+    /// On a window large enough that the longest reply leaves room, the
+    /// reserve is still an eighth of it: a history over what the window less
+    /// the whole limit would leave fits without compaction, and its request
+    /// asks for less than the limit, which a short prompt gets in full.
+    #[tokio::test]
+    async fn a_raised_reply_limit_holds_back_an_eighth_of_a_large_window() {
+        let ep = endpoint_on(1_048_576, 393_216);
+        assert_eq!(ep.reply_reserve, 131_072);
+        assert_eq!((ep.reply_limit(500_000), ep.reply_limit(800_000)), (393_216, 247_552));
+        let (used, limit, compacted) = one_request_on(1_048_576, 393_216, 700_000).await;
+        assert!(used > 1_048_576 - (393_216 + 1024) && !compacted, "{used}");
+        assert_eq!(limit, ep.reply_limit(used) as u64);
+        assert!(limit < 393_216, "{limit}");
+    }
+
+    /// A reply that the server ends with finish reason `length` at a limit
+    /// lowered to the room its prompt left is cut as at the configured
+    /// limit: a reply with no call gets the continuation note, a call still
+    /// being written is refused, and both name the limit that request sent.
+    #[tokio::test]
+    async fn a_reply_cut_at_a_lowered_limit_names_the_limit_it_was_sent() {
+        const LENGTH_CALL_SSE: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        for (first, needle) in [(CUT_SSE, "[reply cut: it reached max_tokens ({})"), (LENGTH_CALL_SSE, "Not run: your reply reached the output limit (max_tokens = {})")] {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, bodies) = capturing_endpoint(first).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(65_536), 65_536);
+                s.approval_mode = ApprovalMode::Auto;
+            }
+            // A prompt over 1,024 tokens, so the room it leaves is under the configured limit.
+            start_turn(core.clone(), "sess-cut".into(), project, "go ".repeat(2_000)).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop");
+            let bodies = bodies.lock().unwrap().clone();
+            assert_eq!(bodies.len(), 2, "the cut reply, then the one after it");
+            let sent: Value = serde_json::from_str(&bodies[0]).unwrap();
+            let limit = sent["max_tokens"].as_u64().unwrap();
+            assert!(limit > 8_192 && limit < 63_488, "lowered from the configured limit, over the reserve: {limit}");
+            let told = needle.replace("{}", &limit.to_string());
+            let next: Value = serde_json::from_str(&bodies[1]).unwrap();
+            let told_at = next["messages"].as_array().unwrap().iter().filter(|m| m["content"].as_str().is_some_and(|c| c.contains(&told))).count();
+            assert_eq!(told_at, 1, "{told}: {}", bodies[1]);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A provider that counts every prompt at 1,536 tokens over the loop's
+    /// own estimate and refuses for length a request whose prompt and reply
+    /// limit pass `window`, keeping each request body.
+    async fn window_refusing_endpoint(window: u64) -> (String, Arc<StdMutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && matches!(sock.read(&mut byte).await, Ok(1)) {
+                    head.push(byte[0]);
+                }
+                let length = String::from_utf8_lossy(&head).lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                });
+                let mut payload = vec![0u8; length.unwrap_or(0)];
+                if sock.read_exact(&mut payload).await.is_err() {
+                    continue;
+                }
+                let body: Value = serde_json::from_slice(&payload).unwrap();
+                let messages = body["messages"].as_array().unwrap();
+                let estimate = estimate_tokens(body["tools"].to_string().len())
+                    + messages.iter().map(|m| estimate_tokens(m["content"].as_str().map_or(0, str::len)) + 8).sum::<usize>();
+                seen.lock().unwrap().push(String::from_utf8_lossy(&payload).into_owned());
+                let resp = if estimate as u64 + 1_536 + body["max_tokens"].as_u64().unwrap() > window {
+                    let refusal = r#"{"error":{"message":"This model's maximum context length is exceeded by the prompt and the completion.","type":"invalid_request_error"}}"#;
+                    format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{refusal}", refusal.len())
+                } else {
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{STOP_SSE}")
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), bodies)
+    }
+
+    /// A request that asks for the room its prompt leaves is refused for
+    /// length when the provider counts the prompt higher than the estimate.
+    /// The refusal proves the prompt was more than the window less the limit
+    /// that request carried, so the calibration rises by that much, and the
+    /// next request asks for less and fits.
+    #[tokio::test]
+    async fn a_refusal_at_the_room_left_raises_the_calibration_until_the_resend_fits() {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            let mut data = build_session_data(&core, &id, &project).unwrap();
+            data.messages.push(ChatMessage::user("q ".repeat(20_000)));
+            let mut persisted = 0usize;
+            sessions::save_messages(&core, &id, &data.messages, &mut persisted, true);
+            sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+        }
+        let (base_url, bodies) = window_refusing_endpoint(65_536).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(65_536), 65_536);
+        }
+        let limits = |bodies: &Arc<StdMutex<Vec<String>>>| -> Vec<u64> {
+            bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect()
+        };
+
+        start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "error", "the provider refused the request for length");
+        let [first] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        assert_eq!(limits(&bodies), [65_536 - 1024 - first as u64]);
+        let ratio = core.sessions.lock().await[&id].prompt_ratio.as_ref().map(|r| r.1);
+        assert_eq!(ratio, Some((first + 1024) as f64 / first as f64), "the window less the limit sent is a floor");
+
+        start_turn(core.clone(), id.clone(), project, "second".into()).unwrap();
+        let (stop, budgets) = budgets_until_done(&mut rx).await;
+        assert_eq!(stop, "stop", "the calibrated request asks for less and fits");
+        let [second] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
+        assert!(second > first + 1024, "{first} -> {second}");
+        assert_eq!(limits(&bodies)[1], 65_536 - 1024 - second as u64);
+        assert!(sessions::last_compaction(&core, &id).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
