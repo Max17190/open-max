@@ -3,11 +3,7 @@ use super::*;
 use serde_json::json;
 use ring::digest::{Context, SHA256};
 
-pub(super) fn serialize(
-    client: &ChatClient,
-    messages: &[ChatMessage],
-    tools: &str,
-) -> Result<Vec<u8>, String> {
+pub(super) fn serialize(client: &ChatClient, messages: &[ChatMessage], limit: usize, tools: &str) -> Result<Vec<u8>, String> {
     let (origin, (effort, changes)) = (client.origin(), client.effort_plan(messages));
     let schemas: Vec<Value> = serde_json::from_str(tools).map_err(|_| "invalid frozen tools")?;
     let mut functions = Vec::new();
@@ -93,7 +89,7 @@ pub(super) fn serialize(
         block["cache_control"] = json!({"type":"ephemeral"});
     }
     let mut body =
-        json!({"model":client.model,"max_tokens":client.max_tokens,"stream":true,"messages":input});
+        json!({"model":client.model,"max_tokens":limit,"stream":true,"messages":input});
     if !system.is_empty() {
         body["system"] = json!(system);
         body["system"][system.len() - 1]["cache_control"] = json!({"type":"ephemeral"});

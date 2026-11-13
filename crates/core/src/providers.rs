@@ -146,6 +146,7 @@ pub struct ActiveEndpoint {
     pub model: String,
     pub context_tokens: usize,
     pub max_tokens: usize,
+    pub reply_reserve: usize,
     /// Compaction ceiling in real tokens, before the window cap and calibration.
     pub compaction_tokens: usize,
     pub temperature: Option<f32>,
@@ -158,6 +159,17 @@ pub struct ActiveEndpoint {
     /// sent and how to give the provider its own, for the error a 401 from
     /// it reports.
     pub key_hint: Option<String>,
+}
+
+/// The reply limit (leaving 2048 tokens of window) and the input budget's reserve: it, at most max(4096, window/8).
+pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) {
+    let limit = max_tokens.max(1).min(context.saturating_sub(2048).max(1));
+    (limit, limit.min((context / 8).max(4096)))
+}
+
+impl ActiveEndpoint {
+    /// The limit a request with a `prompt`-token prompt carries: the room it leaves, within the reserve and max_tokens.
+    pub(crate) fn reply_limit(&self, prompt: usize) -> usize { self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_reserve, self.max_tokens) }
 }
 
 pub fn providers_path(data_dir: &Path) -> PathBuf {
@@ -652,13 +664,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             .or(settings.context_tokens)
             .ok_or(ResolveError::MissingContextTokens)?
             .max(1);
-        let mut max_tokens = model_entry
-            .and_then(|m| m.max_tokens)
-            .unwrap_or(settings.max_tokens)
-            .max(1);
-        // Keep room for system + task history; never let max_tokens eat the window.
-        let max_allowed = context_tokens.saturating_sub(2048).max(1);
-        max_tokens = max_tokens.min(max_allowed);
+        let (max_tokens, reply_reserve) = reply_limits(context_tokens, model_entry.and_then(|m| m.max_tokens).unwrap_or(settings.max_tokens));
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
         // Sent anywhere else, it hands one server's credential to another.
@@ -685,6 +691,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             model: model.to_string(),
             context_tokens,
             max_tokens,
+            reply_reserve,
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
                 .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -715,8 +722,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         .context_tokens
         .ok_or(ResolveError::MissingContextTokens)?
         .max(1);
-    let max_allowed = context_tokens.saturating_sub(2048).max(1);
-    let max_tokens = settings.max_tokens.max(1).min(max_allowed);
+    let (max_tokens, reply_reserve) = reply_limits(context_tokens, settings.max_tokens);
     Ok(ActiveEndpoint {
         wire_api: WireApi::ChatCompletions,
         chatgpt: None,
@@ -727,6 +733,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         model: model.to_string(),
         context_tokens,
         max_tokens,
+        reply_reserve,
         compaction_tokens: settings
             .compaction_tokens
             .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -1499,6 +1506,38 @@ mod tests {
         };
         let err = resolve(&settings, &dir).unwrap_err();
         assert!(matches!(err, ResolveError::MissingEndpoint));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The reserve held back from the input budget is the reply limit up to
+    /// the larger of 4096 and an eighth of the window, on a model entry and in
+    /// flat settings alike; a small window still leaves 2048 tokens of input
+    /// whatever the limit. docs/configuration.md states both formulas.
+    #[test]
+    fn the_reply_reserve_is_at_most_an_eighth_of_the_window() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":4096,"max_tokens":100000}]}}}"#);
+        let entry = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
+        assert_eq!((entry.max_tokens, entry.reply_reserve), (2048, 2048));
+        let flat = |context_tokens: usize, max_tokens: usize| {
+            let s = Settings { base_url: "http://t/v1".into(), model: "m".into(), context_tokens: Some(context_tokens), max_tokens, ..Default::default() };
+            let ep = resolve(&s, &dir.join("none")).unwrap();
+            (ep.max_tokens, ep.reply_reserve)
+        };
+        assert_eq!(flat(4096, 100_000), (2048, 2048));
+        assert_eq!(flat(262_144, 262_144), (260_096, 32_768));
+        assert_eq!(flat(1_048_576, 393_216), (393_216, 131_072));
+        assert_eq!(flat(1_048_576, 4096), (4096, 4096));
+        assert_eq!(flat(32_768, 4096), (4096, 4096));
+        assert_eq!(flat(32_768, 8000), (8000, 4096));
+        let docs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/configuration.md")).unwrap();
+        for formula in [
+            "reply_reserve = min(max_tokens, max(4096, context_tokens / 8))",
+            "limit = clamp(context_tokens - 1024 - prompt, reply_reserve, max_tokens)",
+            "`context_tokens - (reply_reserve + 1024)`",
+        ] {
+            assert!(docs.contains(formula), "docs/configuration.md does not state {formula}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
