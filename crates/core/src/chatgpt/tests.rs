@@ -822,7 +822,7 @@ async fn catalog_and_provider_resolution_keep_credentials_and_defaults_separate(
         }
         let cancelled = Arc::new(crate::state::CancelToken::default());
         cancelled.cancel();
-        let error = client.stream_chat(&[], "[]", cancelled, |_| {}).await.err().unwrap();
+        let error = client.stream_chat(&[], client.reply_reserve, "[]", cancelled, |_| {}).await.err().unwrap();
         assert!(error.contains("fixed OpenAI endpoint"), "{guard}: {error}");
     }
     settings.provider = Some("local".into());

@@ -6037,10 +6037,13 @@ fn compaction_uses_the_selected_ceiling_within_the_model_window() {
     let window_default = |window: usize| (window / 4).max(150_000);
     // Cases with a model select it from the named catalog via --model.
     // The others use a flat endpoint.
-    for (window, reserve, model, global, trigger) in [
+    // A raised reply limit holds back at most an eighth of the window (4096
+    // at least): 16,000 of 128,000, so the input budget caps the trigger at
+    // 128,000 - (16,000 + 1,024).
+    for (window, max_tokens, model, global, trigger) in [
         (500_000, 4_096, None, None, window_default(500_000)),
         (1_000_000, 4_096, Some("stub-model"), None, window_default(1_000_000)),
-        (128_000, 65_536, None, None, 61_440),
+        (128_000, 65_536, None, None, 110_976),
         (500_000, 4_096, Some("short-history"), None, 100_000),
         (500_000, 4_096, Some("long-history"), None, 200_000),
         (500_000, 4_096, Some("short-history"), Some(180_000), 180_000),
@@ -6052,7 +6055,7 @@ fn compaction_uses_the_selected_ceiling_within_the_model_window() {
         let data = home.join(".openmax");
         std::fs::create_dir_all(&data).unwrap();
         let settings_path = data.join("settings.json");
-        let mut settings = json!({"base_url": base_url, "model": "stub-model", "max_tokens": reserve});
+        let mut settings = json!({"base_url": base_url, "model": "stub-model", "max_tokens": max_tokens});
         if let Some(global) = global {
             settings["compaction_tokens"] = json!(global);
         } else if window == 1_000_000 {
@@ -6108,10 +6111,13 @@ fn compaction_uses_the_selected_ceiling_within_the_model_window() {
             assert_eq!(requests.len() - before, 1 + usize::from(pruned), "{case}, padding {padding}");
             let sent: Value = serde_json::from_str(requests.last().unwrap()).unwrap();
             assert_eq!(sent["model"], model, "{case}");
-            assert_eq!(sent["max_tokens"], reserve, "{case}");
             let budget = events.iter().find(|e| e["type"] == "budget").unwrap();
             assert_eq!(budget["context_tokens"], window, "{case}");
-            budget["used_tokens"].as_u64().unwrap() as usize
+            let used = budget["used_tokens"].as_u64().unwrap() as usize;
+            // The request asks for the room its prompt leaves, within the reserve and max_tokens.
+            let reserve = max_tokens.min((window / 8).max(4_096));
+            assert_eq!(sent["max_tokens"], (window - 1_024 - used).clamp(reserve, max_tokens), "{case}");
+            used
         };
 
         // Measure the unpadded input through the CLI so the assertions stay

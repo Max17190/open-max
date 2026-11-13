@@ -133,13 +133,16 @@ and the run that writes a key already uses it.
   small model's requests fail for length), so a turn refuses with a message
   naming this field until it is set. Set it to what the server actually
   serves for the model. `openmax --check` warns while it is missing.
-- `max_tokens` (default 4096): the completion reserve, clamped so it never
-  eats the window (at most `context_tokens - 2048`), and sent as the reply's
-  length limit. When the server reports the cut (finish_reason `length`, or
-  a usage count at the limit), the last tool call of that reply, the one
-  the limit cut, never runs, even when the server closed its arguments so
-  they parse, and the model is told why and asked to send it again in
-  parts; the calls before it run as usual. A
+- `max_tokens` (default 4096): the reply's length limit, clamped so it never
+  eats the window (at most `context_tokens - 2048`). A request asks for the
+  room its prompt leaves, never less than the reply reserve and never more
+  than this limit (see the input budget below), so a limit up to the larger
+  of 4096 and an eighth of the window, the default among them, goes out on
+  every request as it is. When the server reports the cut (finish_reason
+  `length`, or a usage count at the limit), the last tool call of that
+  reply, the one the limit cut, never runs, even when the server closed its
+  arguments so they parse, and the model is told why and asked to send it
+  again in parts; the calls before it run as usual. A
   reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
   before any tool call does not end the turn: it stays in the transcript
@@ -151,7 +154,8 @@ and the run that writes a key already uses it.
   sent once more without it. After four such continuations in a row, a
   fifth cut reply ends the turn with `length` (so does a cut on the turn's
   last iteration), and the terminal UI and print mode say which
-  `max_tokens` cut it and where it is set. Send a follow-up to continue.
+  `max_tokens` cut it and where it is set (the cut note and the refused
+  call name the limit that request carried). Send a follow-up to continue.
   On a Responses connection a reply that reaches the limit is reported
   incomplete and ends the turn as truncated.
   For a reasoning model the limit is also a bound on how long it thinks
@@ -161,11 +165,12 @@ and the run that writes a key already uses it.
   catalog's output maximum when one is reported, and `openmax --check`
   warns while such a connection runs at the default. To raise it, set
   `max_tokens` on the model's providers.json entry (or in settings.json),
-  at most about a quarter of the window, since the same number is reserved
-  out of the input budget. A 4096 counts as chosen only on the model's
-  entry: every settings save writes 4096 to settings.json when the limit is
-  unset. `openmax --check --all` states the active model's limit and where
-  it is set.
+  up to the model's longest reply: the input budget holds back at most the
+  larger of 4096 and an eighth of the window for it, and a request asks for
+  more only when its prompt leaves the room. A 4096 counts as chosen only on
+  the model's entry: every settings save writes 4096 to settings.json when
+  the limit is unset. `openmax --check --all` states the active model's
+  limit and where it is set.
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
   model's value in `providers.json`, then a default that follows the
@@ -257,10 +262,27 @@ and the run that writes a key already uses it.
   [usage](usage.md#command-line)).
 
 The input budget for the transcript and frozen tool schemas is
-`context_tokens - (max_tokens + 1024)`, leaving room for the reply and 1024
-tokens of headroom. Open Max estimates the input at about four bytes per
-token and scales the estimate up when the server reports more prompt tokens
-than estimated or refuses a request for length that the estimate said fit.
+`context_tokens - (reply_reserve + 1024)`, leaving room for the reply and 1024
+tokens of headroom, where
+
+    reply_reserve = min(max_tokens, max(4096, context_tokens / 8))
+
+with `max_tokens` after its clamp above. Each request carries the reply limit
+
+    limit = clamp(context_tokens - 1024 - prompt, reply_reserve, max_tokens)
+
+where `prompt` is the calibrated estimate of that request in the server's
+tokens. So the limit each request carries and the room held back from the
+input budget are two numbers: set to a model's longest reply, `max_tokens`
+no longer holds that much input back, and a model whose longest reply is as
+large as its window keeps seven eighths of it for input instead of about a
+thousand tokens. A reply that reaches the limit its request carried is cut
+as at any limit. A request that asked for more than the reserve and is
+refused for length goes once more in the same turn at the reserve, and each
+refusal for length calibrates against the limit its request carried.
+Open Max estimates the input at about four bytes per token and scales the
+estimate up when the server reports more prompt tokens than estimated or
+refuses a request for length that the estimate said fit.
 Calibration stays in memory, so a resumed session starts on the plain
 estimate.
 

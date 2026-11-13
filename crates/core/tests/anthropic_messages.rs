@@ -73,7 +73,7 @@ fn client(dir: &Scratch, base: &str, effort: Option<ReasoningEffort>) -> ChatCli
     ChatClient::from_endpoint(&providers::resolve(&settings,&dir.0).unwrap())
 }
 async fn run(client: &ChatClient, messages: &[ChatMessage]) -> Result<open_max_core::client::CompletionResult,String> {
-    tokio::time::timeout(Duration::from_secs(5),client.stream_chat(messages,&tools(),Arc::new(CancelToken::default()), |_|{})).await.expect("native completion deadline")
+    tokio::time::timeout(Duration::from_secs(5),client.stream_chat(messages, client.reply_reserve,&tools(),Arc::new(CancelToken::default()), |_|{})).await.expect("native completion deadline")
 }
 
 #[tokio::test]
@@ -83,7 +83,7 @@ async fn native_effort_auth_and_default_omission_preserve_request_content() {
     let (base,server)=serve(levels.iter().map(|_|(200,text_response())).collect()).await;
     for effort in levels {
         let client=client(&scratch,&base,effort).for_conversation("native-session"); let mut shown=String::new();
-        let result=client.stream_chat(&[ChatMessage::system("instructions"),ChatMessage::user("task")],&tools(),Arc::new(CancelToken::default()),|delta| if let StreamDelta::Content(text)=delta {shown.push_str(&text)}).await.unwrap();
+        let result=client.stream_chat(&[ChatMessage::system("instructions"),ChatMessage::user("task")], client.reply_reserve,&tools(),Arc::new(CancelToken::default()),|delta| if let StreamDelta::Content(text)=delta {shown.push_str(&text)}).await.unwrap();
         assert_eq!(result.content,"verified"); assert_eq!(shown,"verified"); assert_eq!(result.finish_reason,"stop"); assert!(result.tool_calls.is_empty());
         let usage=result.usage.unwrap();assert_eq!((usage.prompt_tokens,usage.completion_tokens,usage.cached_tokens),(17,7,Some(4)));
     }
@@ -149,7 +149,7 @@ async fn native_tool_round_trip_preserves_signed_blocks_only_for_the_same_origin
     let mut client=client(&scratch,&base,Some(ReasoningEffort::High));
     let mut messages=vec![ChatMessage::system("instructions"),ChatMessage::user("inspect")];
     let mut thinking=Vec::new();
-    let first=client.stream_chat(&messages,&tools(),Arc::new(CancelToken::default()),|delta| {
+    let first=client.stream_chat(&messages, client.reply_reserve,&tools(),Arc::new(CancelToken::default()),|delta| {
         if let StreamDelta::Reasoning(text)=delta {thinking.push(text);}
     }).await.unwrap();
     assert_eq!(thinking,["inspect first"]);
@@ -179,7 +179,7 @@ async fn native_invalid_and_incomplete_streams_never_return_executable_tools() {
     for response in [truncated,malformed,bad_stop,error,duplicate,missing_signature,bad_name,unknown,duplicate_id] {
         let scratch=Scratch::new(); let(base,server)=serve(vec![(200,response)]).await;
         let client=client(&scratch,&base,None);let cancel=Arc::new(CancelToken::default());
-        let result=tokio::time::timeout(Duration::from_secs(5),client.stream_chat(&[ChatMessage::user("inspect")],&tools(),cancel.clone(),|delta| {
+        let result=tokio::time::timeout(Duration::from_secs(5),client.stream_chat(&[ChatMessage::user("inspect")], client.reply_reserve,&tools(),cancel.clone(),|delta| {
             if matches!(delta,StreamDelta::Retry{..}) {cancel.cancel();}
         })).await.expect("invalid stream deadline");
         match result {Err(_)=>{},Ok(result)=>{assert!(result.tool_calls.is_empty());assert_ne!(result.finish_reason,"tool_calls");}}
@@ -196,7 +196,7 @@ async fn native_reply_cut_after_its_text_is_asked_for_again_with_its_usage_repor
     let cut=whole[..whole.find("content_block_stop").unwrap()].to_string();
     let scratch=Scratch::new();let(base,server)=serve(vec![(200,cut),(200,whole)]).await;
     let client=client(&scratch,&base,None);let mut seen=Vec::new();
-    let result=client.stream_chat(&[ChatMessage::user("task")],&tools(),Arc::new(CancelToken::default()),|delta| match delta {
+    let result=client.stream_chat(&[ChatMessage::user("task")], client.reply_reserve,&tools(),Arc::new(CancelToken::default()),|delta| match delta {
         StreamDelta::Usage(usage)=>seen.push(format!("usage {}",usage.prompt_tokens)),
         StreamDelta::Retry{attempt,max_attempts,reason}=>seen.push(format!("retry {attempt}/{max_attempts} {}",reason.starts_with("the reply was cut short ("))),
         _=>{}
@@ -237,19 +237,19 @@ async fn native_json_fallback_and_cancellation_keep_the_same_tool_contract() {
     let(base,server)=serve_chunks(vec![(200,complete.clone()),(200,tool_response()),(200,complete)],usize::MAX).await;
     let client=client(&scratch,&base,None);
     let mut shown=String::new();
-    let first=client.stream_chat(&[ChatMessage::user("task")],&tools(),Arc::new(CancelToken::default()),|delta| {
+    let first=client.stream_chat(&[ChatMessage::user("task")], client.reply_reserve,&tools(),Arc::new(CancelToken::default()),|delta| {
         if let StreamDelta::Content(text)=delta {shown.push_str(&text);}
     }).await.unwrap();
     assert_eq!(shown,"read next");
     assert_eq!(first.content,"read next");assert_eq!(first.finish_reason,"tool_calls");assert_eq!(first.tool_calls[0].id,"json-call");
     assert!(first.reasoning_details.unwrap().get().contains("fixture-opaque"));
     let cancel=Arc::new(CancelToken::default());
-    let second=client.stream_chat(&[ChatMessage::user("task")],&tools(),cancel.clone(),|delta| {
+    let second=client.stream_chat(&[ChatMessage::user("task")], client.reply_reserve,&tools(),cancel.clone(),|delta| {
         if matches!(delta,StreamDelta::Reasoning(_)) {cancel.cancel();}
     }).await.unwrap();
     assert_eq!(second.finish_reason,"cancelled");assert!(second.tool_calls.is_empty());
     let cancel=Arc::new(CancelToken::default());
-    let third=client.stream_chat(&[ChatMessage::user("task")],&tools(),cancel.clone(),|delta| {
+    let third=client.stream_chat(&[ChatMessage::user("task")], client.reply_reserve,&tools(),cancel.clone(),|delta| {
         if matches!(delta,StreamDelta::Content(_)) {cancel.cancel();}
     }).await.unwrap();
     assert_eq!(third.finish_reason,"cancelled");assert!(third.tool_calls.is_empty());assert!(third.reasoning_details.is_none());assert_eq!(third.content,"read next");
@@ -294,9 +294,9 @@ async fn native_history_groups_tool_results_and_marks_the_newest_block() {
     let call=|id:&str| ToolCall {id:id.into(),kind:"function".into(),function:ToolCallFunction{name:"inspect".into(),arguments:"{}".into()},extra_content:None};
     let history=[ChatMessage::system(""),ChatMessage::system("instructions"),ChatMessage::user("first"),ChatMessage::user("second"),
         ChatMessage::assistant(Some("checking".into()),Some(vec![call("one"),call("two")])),ChatMessage::tool("one","result one"),ChatMessage::tool("two","result two")];
-    native.stream_chat(&history,"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
-    native.stream_chat(&history[..5],"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
-    native.stream_chat(&history[..2],"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
+    native.stream_chat(&history, native.reply_reserve,"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
+    native.stream_chat(&history[..5], native.reply_reserve,"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
+    native.stream_chat(&history[..2], native.reply_reserve,"[]",Arc::new(CancelToken::default()), |_|{}).await.unwrap();
     let records=server.await.unwrap();let body:Value=serde_json::from_slice(&records[0].body).unwrap();
     assert!(body.get("tools").is_none());assert!(body.get("tool_choice").is_none());
     assert_eq!(body["system"],json!([{"type":"text","text":"instructions","cache_control":{"type":"ephemeral"}}]));
@@ -323,7 +323,7 @@ async fn native_requests_mark_the_shared_prefix_and_the_tail_the_next_request_re
     let native=client(&scratch,&base,None);
     let mut history=vec![ChatMessage::system("instructions"),ChatMessage::user("inspect")];
     for step in 0..3 {
-        let reply=native.stream_chat(&history,&tools(),Arc::new(CancelToken::default()),|_|{}).await.unwrap();
+        let reply=native.stream_chat(&history, native.reply_reserve,&tools(),Arc::new(CancelToken::default()),|_|{}).await.unwrap();
         let mut assistant=ChatMessage::assistant(Some(reply.content),Some(reply.tool_calls));
         assistant.reasoning_details=reply.reasoning_details;assistant.reasoning_origin=Some(native.origin());
         history.push(assistant);history.push(ChatMessage::tool("call-fixture",format!("result {step}")));
@@ -375,7 +375,7 @@ async fn native_stream_faults_are_reported_and_retryable_api_errors_restart() {
     let recovered=text_response().replace("\"text\":\"\"","\"text\":\"start:\"").replace("\"usage\":{","\"usage\":\ndata: {");
     let scratch=Scratch::new();let(base,server)=serve(vec![(200,error),(200,recovered)]).await;
     let native=client(&scratch,&base,None);let mut retries=0;let mut content=Vec::new();
-    let result=native.stream_chat(&[ChatMessage::user("task")],&tools(),Arc::new(CancelToken::default()),|delta| match delta {
+    let result=native.stream_chat(&[ChatMessage::user("task")], native.reply_reserve,&tools(),Arc::new(CancelToken::default()),|delta| match delta {
         StreamDelta::Retry{..}=>retries+=1,StreamDelta::Content(text)=>content.push(text),_=>{},
     }).await.unwrap();
     assert_eq!(retries,1);assert_eq!(result.content,"start:verified");assert_eq!(content,["start:","verified"]);let requests=server.await.unwrap();assert_eq!(requests[0].body,requests[1].body);
@@ -436,11 +436,11 @@ async fn native_signed_thinking_requires_unchanged_prefix_and_assistant_payload(
     let mut history=opening.clone();history.push(assistant.clone());history.push(ChatMessage::tool("call-fixture","result"));
     let resumed:Vec<ChatMessage>=serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
     run(&native,&resumed).await.unwrap();
-    native.reasoning_effort=Some(ReasoningEffort::Low);native.max_tokens=96;native.temperature=None;
+    native.reasoning_effort=Some(ReasoningEffort::Low);native.reply_reserve=96;native.temperature=None;
     run(&native,&history).await.unwrap();
     let mut changed=history.clone();changed[0]=ChatMessage::system("changed instructions");run(&native,&changed).await.unwrap();
     let mut changed_tools:Value=serde_json::from_str(&tools()).unwrap();changed_tools[0]["function"]["description"]=json!("changed description");
-    native.stream_chat(&history,&changed_tools.to_string(),Arc::new(CancelToken::default()), |_|{}).await.unwrap();
+    native.stream_chat(&history, native.reply_reserve,&changed_tools.to_string(),Arc::new(CancelToken::default()), |_|{}).await.unwrap();
     let mut changed=history.clone();changed[1]=ChatMessage::user("edited earlier task");run(&native,&changed).await.unwrap();
     let mut compacted=history.clone();compacted.drain(1..3);compacted.insert(1,ChatMessage::user("[context note: earlier exchange summarized]"));
     run(&native,&compacted).await.unwrap();

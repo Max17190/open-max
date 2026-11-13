@@ -152,7 +152,7 @@ async fn explicit_effort_uses_each_protocol_without_changing_other_request_field
             let client = client(&scratch.0, &base, wire, effort);
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
-                client.stream_chat(&messages, &tools(), Arc::new(CancelToken::default()), |_| {}),
+                client.stream_chat(&messages, client.reply_reserve, &tools(), Arc::new(CancelToken::default()), |_| {}),
             )
             .await
             .unwrap()
@@ -227,7 +227,7 @@ async fn retry_preserves_the_exact_request_body_and_explicit_effort() {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             client.stream_chat(
-                &[ChatMessage::user("fixture task")],
+                &[ChatMessage::user("fixture task")], client.reply_reserve,
                 &tools(),
                 Arc::new(CancelToken::default()),
                 |delta| {
@@ -269,7 +269,7 @@ async fn incompatible_endpoint_refuses_explicit_effort_before_request_serializat
     // Invalid tools also fail before transport if the endpoint preflight regresses.
     let error = client
         .stream_chat(
-            &[ChatMessage::user("fixture task")],
+            &[ChatMessage::user("fixture task")], client.reply_reserve,
             "not-json",
             Arc::new(CancelToken::default()),
             |_| {},
@@ -290,7 +290,7 @@ async fn custom_endpoint_rejections_keep_the_backend_error_without_changing_effo
         let error = tokio::time::timeout(
             Duration::from_secs(3),
             client.stream_chat(
-                &[ChatMessage::user("fixture task")],
+                &[ChatMessage::user("fixture task")], client.reply_reserve,
                 "[]",
                 Arc::new(CancelToken::default()),
                 |_| {},
