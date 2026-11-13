@@ -1,0 +1,68 @@
+diff --git a/crates/tui/tests/thesis.rs b/crates/tui/tests/thesis.rs
+index 4971a99..a102d8f 100644
+--- a/crates/tui/tests/thesis.rs
++++ b/crates/tui/tests/thesis.rs
+@@ -2804,17 +2804,18 @@ fn gate_time_reports_the_p50_p90_and_p99_of_green_pull_request_runs() {
+ /// cfg(test), compiles; counts a listed timeout, and a listed mutant whose
+ /// build or tests a signal ended, as caught, an unlisted one and a listed
+ /// miss as missed, and names each mutant a signal ended with its phase and
+-/// signal; passes a score exactly at the floor and fails one a mutant under
+-/// it; says how many of the missed would meet the target; gives each file's
+-/// score, worst first and ties by name, with the catches it needs for 90%;
+-/// offers to raise the floor to a score less the margin, and only when that
+-/// is above the floor; in diff mode fails on exactly the unlisted misses,
+-/// timeouts and signals, marking each on its line with its message escaped
+-/// as a workflow command needs; and refuses a shard that did not finish, one
+-/// whose unmutated tests failed, shards that overlap, built different targets
+-/// or hold fewer mutants than the plan listed, a mutant that was only checked,
+-/// a Failure no signal ended, an outcome cargo-mutants does not write even in
+-/// code the run did not build, and an allowlist entry with no reason.
++/// signal; passes a score exactly at the floor and fails one a hundredth of a
++/// point under it; says how many of the missed would meet the target; gives
++/// each file's score, worst first and ties by name, with the catches it needs
++/// for 90%; offers to raise the floor to a score less the margin, and only
++/// when that is above the floor; in diff mode fails on exactly the unlisted
++/// misses, timeouts and signals, marking each on its line with its message
++/// escaped as a workflow command needs; and refuses a shard that did not
++/// finish, one whose unmutated tests failed, shards that overlap, built
++/// different targets or hold fewer mutants than the plan listed, a mutant
++/// that was only checked, a Failure no signal ended, an outcome cargo-mutants
++/// does not write even in code the run did not build, and an allowlist entry
++/// with no reason.
+ #[test]
+ fn a_full_mutation_run_fails_under_its_floor() {
+     let gate = std::fs::read_to_string(repo().join("scripts/check-mutants.sh")).unwrap();
+@@ -3111,10 +3112,11 @@ fn a_full_mutation_run_fails_under_its_floor() {
+         })
+         .collect();
+     let files = shard("files", linux, &per_file, true, "Success");
+-    // Scores of exactly the floor and a mutant under it, each over the fewest
+-    // mutants that score it exactly (hundredths of a point over 10,000, in
+-    // lowest terms), of exactly the floor plus the margin as the report
+-    // truncates it, over the fewest mutants that score that, and of 100%.
++    // Scores of exactly the floor and a hundredth of a point under it, each
++    // over the fewest mutants that score it exactly (hundredths of a point
++    // over 10,000, in lowest terms), of exactly the floor plus the margin as
++    // the report truncates it, over the fewest mutants that score that, and
++    // of 100%.
+     fn gcd(a: u64, b: u64) -> u64 {
+         if b == 0 { a } else { gcd(b, a % b) }
+     }
+@@ -3132,7 +3134,7 @@ fn a_full_mutation_run_fails_under_its_floor() {
+     };
+     let at_floor = exactly(floor_bp);
+     let passing = boundary("passing", at_floor);
+-    let failing = (at_floor.0 > 0).then(|| boundary("failing", (at_floor.0 - 1, at_floor.1)));
++    let failing = (floor_bp > 0).then(|| boundary("failing", exactly(floor_bp - 1)));
+     let margin_over = (floor_bp + margin_bp <= 10_000).then(|| boundary("margin-over", truncated(floor_bp + margin_bp)));
+     let perfect = boundary("perfect", (1, 1));
+     let missed = tree.join("missed.txt");
+@@ -3259,7 +3261,7 @@ fn a_full_mutation_run_fails_under_its_floor() {
+         assert!(at_report.contains(&to_go), "the report does not say how far the target is, {to_go:?}: {at_report}");
+     }
+     if let Some((under, under_report)) = under {
+-        assert_eq!(under, Some(1), "a score a mutant under the floor of {floor}% passes: {under_report}");
++        assert_eq!(under, Some(1), "a score a hundredth of a point under the floor of {floor}% passes: {under_report}");
+         assert!(under_report.contains(&format!("the score is under its floor of {floor}%")), "{under_report}");
+     }
+     // The floor may rise to a run's score less the margin, and only above itself.
