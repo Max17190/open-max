@@ -496,8 +496,9 @@ fn protected_tail_start(messages: &[ChatMessage], head: usize) -> usize {
 
 /// The total (schemas plus transcript) one cut aims for: the schemas, the
 /// pinned head, and the newest exchanges with the note in their place, at
-/// most a quarter of `budget` and at most `KEEP_RECENT_TOKENS`. A quarter
-/// leaves a gap so the turns after a cut append instead of cutting again.
+/// most a quarter of `budget` and at most `KEEP_RECENT_TOKENS`, and never
+/// past `budget`, which a cut must reach however the schemas and the opening
+/// crowd it. A quarter leaves a gap so the turns after a cut append.
 pub(crate) fn cut_target(
     budget: usize,
     schema_tokens: usize,
@@ -505,7 +506,13 @@ pub(crate) fn cut_target(
     estimate: &dyn Fn(&ChatMessage) -> usize,
 ) -> usize {
     let head = pinned_head(messages).min(messages.len());
-    schema_tokens + messages[..head].iter().map(estimate).sum::<usize>() + (budget / 4).min(KEEP_RECENT_TOKENS)
+    (schema_tokens + messages[..head].iter().map(estimate).sum::<usize>() + (budget / 4).min(KEEP_RECENT_TOKENS)).min(budget)
+}
+
+/// The prompt a cut puts back after its note for the turn in progress: the
+/// newest one it removed (only prompts carry an effort stamp), if none is kept.
+fn restored_prompt<'a>(kept: &[ChatMessage], dropped: &'a [ChatMessage]) -> Option<&'a ChatMessage> {
+    if kept.iter().any(|m| m.effort.is_some()) { None } else { dropped.iter().rev().find(|m| m.effort.is_some()) }
 }
 
 /// True when the frozen schemas fill the window on their own. The schema cost
@@ -564,10 +571,11 @@ const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_900;
 /// notes request each time.
 ///
 /// Irreducible means exactly what a maximal prune leaves: the drop loop's
-/// length floor ends at the pinned head, the digest note, and the newest
-/// three messages, including any tool exchange that crosses that boundary.
-/// Those are what the target must contain. Counting more would fall back
-/// while a configured prune could succeed, silently disabling the setting.
+/// length floor ends at the pinned head, the digest note, the turn's prompt
+/// it puts back, and the newest three messages, including any tool exchange
+/// that crosses that boundary. Those are what the target must contain.
+/// Counting more would fall back while a configured prune could succeed,
+/// silently disabling the setting.
 ///
 /// `ceiling` is in real tokens. The budget, schema cost, and trigger use
 /// estimator units so the window can cap the trigger independently.
@@ -590,6 +598,7 @@ pub(crate) fn compaction_trigger(
         + messages[..head]
             .iter()
             .chain(&messages[tail..])
+            .chain(restored_prompt(&messages[tail..], &messages[head..tail]))
             .map(estimate)
             .sum::<usize>();
     if cut_target(trigger, schema_tokens, messages, estimate) < irreducible {
@@ -762,26 +771,26 @@ fn prune_transcript(
     let mut digest = CompactionDigest::default();
     // The slot after the head may hold an earlier cut's note.
     let has_note = messages.get(head).is_some_and(is_digest_message);
-    let remove_and_record =
-        |messages: &mut Vec<ChatMessage>, digest: &mut CompactionDigest, slot| {
-            let removed = messages.remove(slot);
-            digest.record_message(&removed);
-            removed
-        };
+    // Drops the message at `slot` (a call with its results) into the digest
+    // and returns the tokens freed. The turn's prompt frees none: it goes back
+    // after the note (below), so what the cut keeps meets the target with it.
+    let drop_exchange = |messages: &mut Vec<ChatMessage>, digest: &mut CompactionDigest, slot: usize| {
+        let calls = messages[slot].role == "assistant" && messages[slot].tool_calls.is_some();
+        let results = if calls { messages[slot + 1..].iter().take_while(|m| m.role == "tool").count() } else { 0 };
+        let removed: Vec<ChatMessage> = messages.drain(slot..=slot + results).collect();
+        removed.iter().map(|m| {
+            digest.record_message(m);
+            let restored = m.effort.is_some() && !messages[slot..].iter().any(|later| later.effort.is_some());
+            if restored { 0 } else { estimate(m) }
+        }).sum::<usize>()
+    };
     // Drop whole exchanges starting after the pinned head. Keep tool
     // replies consistent with the assistant message that requested them.
     // Leave an existing digest alone if it is the only thing before the
     // protected tail. Otherwise this cut would only summarize itself.
     let can_drop = messages.len() > head + protected + usize::from(has_note);
     while can_drop && total > target && messages.len() > (head + 4).max(head + protected) {
-        let removed = remove_and_record(messages, &mut digest, head);
-        total = total.saturating_sub(estimate(&removed));
-        if removed.role == "assistant" && removed.tool_calls.is_some() {
-            while messages.len() > head && messages[head].role == "tool" {
-                let tool = remove_and_record(messages, &mut digest, head);
-                total = total.saturating_sub(estimate(&tool));
-            }
-        }
+        total = total.saturating_sub(drop_exchange(messages, &mut digest, head));
     }
     if digest.message_count == 0 {
         return None;
@@ -798,27 +807,18 @@ fn prune_transcript(
     // another cut. Record dropped messages into the same digest and
     // refresh the note each time, so it stays a faithful summary of
     // everything removed and the target check counts it as it is.
-    total = schema_tokens + messages.iter().map(estimate).sum::<usize>();
+    let restored = restored_prompt(&messages[head + 1..], &digest.dropped);
+    total = schema_tokens + messages.iter().chain(restored).map(estimate).sum::<usize>();
     while total + growth > target && messages.len() > (head + 4).max(head + 1 + protected) {
-        let removed = remove_and_record(messages, &mut digest, head + 1);
-        total = total.saturating_sub(estimate(&removed));
-        if removed.role == "assistant" && removed.tool_calls.is_some() {
-            while messages.len() > head + 1 && messages[head + 1].role == "tool" {
-                let tool = remove_and_record(messages, &mut digest, head + 1);
-                total = total.saturating_sub(estimate(&tool));
-            }
-        }
+        total = total.saturating_sub(drop_exchange(messages, &mut digest, head + 1));
         let stale = estimate(&messages[head]);
         messages[head] = ChatMessage::user(digest.format(None, None));
         total = total - stale + estimate(&messages[head]);
     }
-    // The turn in progress keeps its prompt: when the cut removed it (the
-    // only messages stamped with an effort are prompts), it goes back
-    // verbatim, stamp included, right after the note.
-    if !messages[head + 1..].iter().any(|m| m.effort.is_some()) {
-        if let Some(prompt) = digest.dropped.iter().rev().find(|m| m.effort.is_some()) {
-            messages.insert(head + 1, prompt.clone());
-        }
+    // The turn in progress keeps its prompt: when the cut removed it, it goes
+    // back verbatim, stamp included, right after the note.
+    if let Some(prompt) = restored_prompt(&messages[head + 1..], &digest.dropped) {
+        messages.insert(head + 1, prompt.clone());
     }
     Some(digest)
 }
@@ -1300,8 +1300,8 @@ pub(crate) mod tests {
     #[test]
     fn budget_still_prunes_when_schemas_crowd_but_fit_the_window() {
         let budget = 10_000;
-        // 72% of the window: past the 70% mark, short of the window itself.
-        let schema_tokens = 7_200;
+        // 80% of the window: past the 70% mark, short of the window itself.
+        let schema_tokens = 8_000;
         assert!(schemas_outgrow_budget(budget, schema_tokens), "degraded, so it must advise");
         assert!(!schemas_exceed_budget(budget, schema_tokens), "but not hopeless");
 
@@ -1316,13 +1316,15 @@ pub(crate) mod tests {
             messages.push(msg("tool", 200));
         }
 
-        // The schemas, the opening and a quarter of the window.
-        assert_eq!(cut_target(budget, schema_tokens, &messages, &ChatMessage::estimated_tokens), 7_200 + 216 + 2_500);
+        let target = cut_target(budget, schema_tokens, &messages, &ChatMessage::estimated_tokens);
         let digest = enforce_budget(&mut messages, budget, schema_tokens, 0, &ChatMessage::estimated_tokens);
         assert!(digest.is_some(), "a cut that would work must not be skipped");
         let total: usize =
             schema_tokens + messages.iter().map(|m| m.estimated_tokens()).sum::<usize>();
         assert!(total <= budget, "the request must now fit: {total} of {budget}");
+        // The schemas, the opening and a quarter of the window would pass the
+        // window, so the cut aims at the window itself.
+        assert_eq!(target, budget);
         assert!(messages.len() > 6, "history is pruned, not shredded to the floor");
 
         // And the reduced target still leaves a gap, so the next turns append
@@ -1422,9 +1424,9 @@ pub(crate) mod tests {
             "a reachable target must keep the setting in force"
         );
 
-        // A note-first opening pins the request behind the note as well, and
-        // the target holds the whole pinned head beside what the cut keeps,
-        // so a long request alone never makes the setting unreachable.
+        // A note-first opening pins the request behind the note as well, so
+        // a request the target cannot contain makes the setting unreachable
+        // however much prunable history follows it: no cut ends under it.
         let note = ChatMessage::user(execution_policy_note(ApprovalMode::Ask));
         let mut note_first = vec![msg("system", 400), note, msg("user", 80_000)];
         for _ in 0..6 {
@@ -1432,8 +1434,8 @@ pub(crate) mod tests {
         }
         assert_eq!(
             compaction_trigger(budget, schema_tokens, 20_000, None, &note_first, &ChatMessage::estimated_tokens),
-            20_000,
-            "the target must count the whole pinned head"
+            budget,
+            "the floor must count the whole pinned head"
         );
     }
 
@@ -1867,6 +1869,25 @@ pub(crate) mod tests {
         assert_eq!(wire(&messages[head + 1]), wire(&turn));
         assert_eq!(messages.iter().filter(|m| m.content == turn.content).count(), 1);
         assert_eq!(messages.iter().filter(|m| is_digest_message(m)).count(), 1);
+    }
+
+    /// The prompt the cut puts back is counted before the cut chooses what
+    /// else to keep: with a turn's prompt of 33,000 tokens in a window of
+    /// 40,000, the request after a cut the window forces still fits it, and a
+    /// setting the prompt alone outgrows falls back to the window.
+    #[tokio::test]
+    async fn a_large_prompt_put_back_after_a_cut_still_fits_the_window() {
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        let mut messages = session(4, 2_000);
+        let turn = prompt(&"p".repeat(132_000));
+        messages.push(turn.clone());
+        messages.extend((4..30).flat_map(|i| exchange(i, 2_000)));
+        assert!(tokens(&messages) > 40_000, "the window forces the cut");
+        let trigger = compaction_trigger(40_000, 0, 20_000, None, &messages, &ChatMessage::estimated_tokens);
+        assert_eq!(trigger, 40_000, "no cut reaches a target of 20,000 with the prompt in it");
+        assert!(fixture.cut(&mut messages, trigger, 40_000, &mut RequestSpend::new(None)).await > 0);
+        assert!(tokens(&messages) <= 40_000, "the request after the cut is {} tokens", tokens(&messages));
+        assert_eq!(wire(&messages[pinned_head(&messages) + 1]), wire(&turn), "the prompt follows the note");
     }
 
     /// A session of one prompt keeps it in the opening, so the cut adds

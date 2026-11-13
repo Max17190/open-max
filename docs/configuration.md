@@ -305,8 +305,10 @@ schemas alone fill the trigger.
 
 A compaction is one cut. It keeps, byte for byte, the system prompt, the
 opening of the conversation through your original request, the prompt of the
-turn in progress, and the newest exchanges, up to a quarter of the trigger
-and at most 20,000 tokens with the note in their place. It removes everything
+turn in progress, and the newest exchanges. It aims to fit the note, that
+prompt and the newest exchanges in a quarter of the trigger, at most 20,000
+tokens, and never aims past the input budget, even where the frozen schemas
+and the opening crowd it. It removes everything
 between, and never shortens a kept message, so between cuts the history stays
 byte-stable and the server can reuse its prompt cache. Before the cut, the
 session's own model writes the notes it will continue from: one extra
