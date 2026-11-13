@@ -1613,7 +1613,7 @@ async fn run_hook(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -2551,7 +2551,7 @@ mod tests {
     /// and the code it runs, exactly as `openmax --approve` does), plus a
     /// throwaway data dir: these tests exercise parse and gate semantics, not
     /// the approval boundary (which has its own tests).
-    fn discover_for_test(project: &Path) -> Hooks {
+    pub(crate) fn discover_for_test(project: &Path) -> Hooks {
         let data = project.join("test-approvals-data");
         approve_all_hooks(project, &data);
         Hooks::discover(project, &data)

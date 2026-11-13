@@ -45,7 +45,7 @@ use tokio::sync::oneshot;
 use crate::batch::{batchable_call, execute_readonly_batch, parallel_tool_limit, partition_concurrent_runs, ReadonlyBatchCtx};
 use crate::client::{ChatClient, TRUNCATED};
 use crate::compaction::{
-    achievable_target, compact_messages, compaction_trigger, over_budget_error_context, refusal_ratio,
+    compact_messages, compaction_trigger, cut_target, over_budget_error_context, refusal_ratio,
     request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
     to_estimate, to_real, token_factor, updated_prompt_ratio, CompactionCtx, RequestSpend,
 };
@@ -444,7 +444,8 @@ async fn run_compact(
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
     // The same overhead the turn loop budgets with: the tool schemas.
-    let schema_tokens = request_overhead(&registry.schemas_wire_arc());
+    let schemas_wire = registry.schemas_wire_arc();
+    let schema_tokens = request_overhead(&schemas_wire);
     // In estimator units, like the turn loop's; the receipt converts back.
     let factor = token_factor(prompt_ratio);
     let budget = to_estimate(
@@ -466,7 +467,7 @@ async fn run_compact(
                 .into(),
         );
     }
-    if tokens_before <= achievable_target(trigger, schema_tokens) {
+    if tokens_before <= cut_target(trigger, schema_tokens, guard.messages(), &estimate) {
         // Nothing above the target: say so through the same receipt rather
         // than pruning history that already fits.
         guard.commit().await;
@@ -478,9 +479,9 @@ async fn run_compact(
         });
     }
     let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled };
+    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
-    let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, schema_tokens, true, &mut spend).await {
+    let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, true, &mut spend).await {
         Ok(count) => count,
         Err(reason) => {
             guard.commit().await;
@@ -758,6 +759,8 @@ async fn run_loop(
     // Cut replies with no call since the last reply the cap did not cut.
     let mut cuts = 0;
     let mut at_reserve = false;
+    // Set once a request goes out over the soft trigger: a cut without notes waits for the window.
+    let mut soft_spent = false;
 
     'turns: for iteration in 0..max_iterations {
         // One refresh, split around the steers. The mode in force first, so
@@ -783,19 +786,20 @@ async fn run_loop(
             report_schemas_over_budget(core, session_id, guard.messages(), schema_real, window_budget)
                 .await;
         }
-        let trigger = compaction_trigger(
+        let trigger = if soft_spent { budget } else { compaction_trigger(
             budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(), &estimate,
-        );
+        ) };
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled,
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire,
         };
-        if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, schema_tokens, false, &mut spend).await {
+        if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await {
             core.send_agent(session_id, AgentEvent::Error { message });
             stop_reason = "error".into();
             break 'turns;
         }
         let used = schema_tokens
             + guard.messages().iter().map(&estimate).sum::<usize>();
+        soft_spent |= used > trigger;
         let used_real = to_real(used, factor);
         // The ceiling refuses the request it cannot afford, not just the one
         // after it: what the turn has spent plus the request-side size of the
@@ -1775,10 +1779,7 @@ mod tests {
     use super::*;
     use crate::batch::{collect_bounded, MODE_LEFT_AUTO_BEFORE_START};
     use crate::client::StreamDelta;
-    use crate::compaction::tests::msg;
-    use crate::compaction::{
-        is_digest_message, CompactionDigest, DIGEST_PREFIX, DROPPED_TEXT_CAP_FLOOR, MAX_DIGEST_SNIPPET_BYTES,
-    };
+    use crate::compaction::{is_digest_message, DIGEST_PREFIX, MAX_DIGEST_SNIPPET_BYTES};
     use crate::notes::{
         canonical_notice, execution_policy_note, outside_approval_note, policy_notice_hash, rehydrate_policy_notices,
         REPEAT_NOTE_MARK,
@@ -6218,52 +6219,75 @@ mod tests {
         }
     }
 
+    /// The provider's count of a request with no reply after it.
+    fn reported_usage(tokens: usize) -> String {
+        STOP_SSE.replace(
+            "data: [DONE]\n\n",
+            &format!("data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{tokens},\"completion_tokens\":1}}}}\n\ndata: [DONE]\n\n"),
+        )
+    }
+
     #[tokio::test]
     async fn provider_usage_calibrates_the_soft_ceiling_for_current_context() {
-        let mut session = SoftCompactionSession::new(300_000, None, None).await;
-        let (stop, budgets) = session.turn("new context ".repeat(7_000)).await;
+        // The provider counts the second request a little under the estimate,
+        // so its ceiling, 150,000 real tokens, is a little over 150,000
+        // estimated ones.
+        let second = reported_usage(149_000);
+        let mut session = SoftCompactionSession::new(300_000, None, Some(&second)).await;
+        let (stop, budgets) = session.turn("new context ".repeat(4_000)).await;
         assert_eq!(stop, "stop");
         let [used] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
-        assert!((155_000..165_000).contains(&used), "the added context fits: {used}");
+        assert!((150_000..160_000).contains(&used), "the added context fits: {used}");
         assert_eq!(session.request_count(), 2);
 
         // The last provider count still fits. The current transcript crosses
         // the calibrated ceiling before another normal request goes out.
-        let ratio = 108_000.0 / used as f64;
-        let (stop, budgets) = session.turn("more context ".repeat(25_000)).await;
+        let ratio = 149_000.0 / used as f64;
+        let trigger = (150_000.0 / ratio) as usize;
+        assert!(trigger < used + 4_000, "the next prompt crosses it: {trigger}");
+        let (stop, budgets) = session.turn("more context ".repeat(1_250)).await;
         assert_eq!(stop, "stop");
         let [used] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
-        let target = (150_000.0 / ratio) as usize * 70 / 100;
-        assert!((target - 3_000..=target).contains(&used), "pruned to {used}, target {target}");
-        assert_eq!(session.request_count(), 4, "the third turn makes one summary and one completion");
+        let target = {
+            let map = session.core.sessions.lock().await;
+            let data = &map[&session.id];
+            cut_target(trigger, request_overhead(&data.registry.schemas_wire_arc()), &data.messages, &ChatMessage::estimated_tokens)
+        };
+        assert!((target - 5_000..=target).contains(&used), "cut to {used}, target {target}");
+        assert_eq!(session.request_count(), 4, "the third turn makes one notes request and one completion");
         let _ = std::fs::remove_dir_all(session.dir);
     }
 
     #[tokio::test]
     async fn forced_compaction_keeps_calibration_until_usage_is_missing() {
         let mut session = SoftCompactionSession::new(300_000, None, None).await;
-        let (stop, budgets) = session.turn("new context ".repeat(7_000)).await;
+        let (stop, budgets) = session.turn("new context ".repeat(4_000)).await;
         assert_eq!(stop, "stop");
         let [used] = budgets[..] else { panic!("one request, one budget event: {budgets:?}") };
         let ratio = 108_000.0 / used as f64;
-        let target = (150_000.0 / ratio) as usize * 70 / 100;
+        let trigger = (150_000.0 / ratio) as usize;
+        let target = {
+            let map = session.core.sessions.lock().await;
+            let data = &map[&session.id];
+            cut_target(trigger, request_overhead(&data.registry.schemas_wire_arc()), &data.messages, &ChatMessage::estimated_tokens)
+        };
         let receipt = run_compact(
             &session.core, &session.id, &session.project, &Arc::new(CancelToken::default()),
         ).await.unwrap();
         assert!(receipt.compacted_messages > 0);
-        assert!((150_001..=target).contains(&receipt.tokens_after));
-        assert_eq!(session.ratio().await, Some(ratio));
+        assert!(receipt.tokens_after <= target, "{} of {target}", receipt.tokens_after);
+        assert_eq!(session.ratio().await, Some(ratio), "the notes request teaches no ratio");
 
         let (stop, budgets) = session.turn("continue".into()).await;
         assert_eq!(stop, "stop");
-        assert!(budgets[0] > 150_000, "the calibrated target does not immediately prune again");
+        assert!(budgets[0] < 150_000, "the cut leaves the turn under its trigger");
         assert_eq!(session.request_count(), 4);
         assert_eq!(session.ratio().await, None, "the completion reported no usage");
 
         let (stop, budgets) = session.turn("continue again".into()).await;
         assert_eq!(stop, "stop");
         assert!(budgets[0] <= 105_000, "missing usage restores the plain target");
-        assert_eq!(session.request_count(), 6);
+        assert_eq!(session.request_count(), 5, "the turn after the cut needs no other");
         let _ = std::fs::remove_dir_all(session.dir);
     }
 
@@ -6271,9 +6295,9 @@ mod tests {
     async fn a_failed_request_discards_low_compaction_calibration() {
         let error = "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"rejected\"}}\n\n";
         let mut session = SoftCompactionSession::new(300_000, None, Some(error)).await;
-        let (stop, budgets) = session.turn("new context ".repeat(7_000)).await;
+        let (stop, budgets) = session.turn("new context ".repeat(4_000)).await;
         assert_eq!(stop, "error");
-        assert!(budgets[0] > 155_000, "the failed request used the prior calibration");
+        assert!(budgets[0] > 150_000, "the failed request used the prior calibration");
         assert_eq!(session.request_count(), 2);
         assert_eq!(session.ratio().await, None, "the failure supplied no usable usage");
 
@@ -6350,13 +6374,16 @@ mod tests {
         (format!("http://{addr}/v1"), requests)
     }
 
-    /// A session whose transcript is over 30k estimated tokens (a request of
-    /// ~125 KB), on a 65_536 window with a 1_024 reply reserve and a
+    /// A session whose transcript is over `fill` estimated tokens (30k is a
+    /// request of ~125 KB) and opens with a request of `opening` bytes, on a
+    /// 65_536 window with a 1_024 reply reserve and a
     /// `length_refusing_endpoint(limit)`. The send budget is
     /// 65_536 - (1_024 + 1_024) = 63_488, so the plain estimate sends the
     /// whole transcript; 64_512 tokens fit beside the reserve.
     async fn long_session_on_a_window(
         limit: usize,
+        fill: usize,
+        opening: usize,
     ) -> (
         std::path::PathBuf,
         Arc<crate::state::Core>,
@@ -6375,7 +6402,9 @@ mod tests {
         let id = sessions::create(&core, project.display().to_string()).unwrap().id;
         {
             let mut data = build_session_data(&core, &id, &project).unwrap();
-            while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 30_000 {
+            data.messages.push(ChatMessage::user("q ".repeat(opening / 2)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
+            while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= fill {
                 data.messages.push(ChatMessage::user("q ".repeat(2_000)));
                 data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
             }
@@ -6406,7 +6435,7 @@ mod tests {
     async fn a_refusal_for_length_calibrates_the_next_requests_budget() {
         // The provider refuses anything over 100 KB, which a prune to 70% of
         // the calibrated budget gets under.
-        let (dir, core, mut rx, project, id, requests) = long_session_on_a_window(100_000).await;
+        let (dir, core, mut rx, project, id, requests) = long_session_on_a_window(100_000, 30_000, 4_000).await;
 
         start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
         let (stop, budgets) = budgets_until_done(&mut rx).await;
@@ -6436,16 +6465,17 @@ mod tests {
     }
 
     /// A refusal proves only that the request did not fit, not by how much.
-    /// When the provider counts it at more than about 1.5 times what fits,
-    /// the first prune is not enough and that turn is refused too. Its
-    /// refusal is still news, a floor about 1.5 times higher than the one the
-    /// budget assumed, so the turn after it prunes again and is answered.
+    /// When the provider counts it at several times what fits, the first cut
+    /// is not enough and that turn is refused too. Its refusal is still news,
+    /// a floor about three times higher than the one the budget assumed, so
+    /// the turn after it cuts again and is answered.
     #[tokio::test]
     async fn a_refusal_after_a_prune_raises_the_floor_until_a_turn_fits() {
-        // The provider refuses anything over 76 KB: the seeded request is
-        // about 1.6 times that, a prune to 70% of the first floor's budget is
-        // still about 1.1 times it, and the next prune gets under it.
-        let (dir, core, mut rx, project, id, _requests) = long_session_on_a_window(76_000).await;
+        // The provider refuses anything over 50 KB: the seeded request is
+        // about 4.5 times that, a cut to a quarter of the first floor's
+        // budget beside a long opening is still about 1.4 times it, and the
+        // next cut gets under it.
+        let (dir, core, mut rx, project, id, _requests) = long_session_on_a_window(50_000, 56_000, 16_000).await;
 
         start_turn(core.clone(), id.clone(), project.clone(), "first".into()).unwrap();
         let (stop, budgets) = budgets_until_done(&mut rx).await;
@@ -6469,7 +6499,7 @@ mod tests {
         };
         assert_eq!(second, (pruned as f64 * floor).round() as usize);
         assert_eq!(raised, 64_512.0 / pruned as f64, "the second refusal proves a higher floor");
-        assert!(raised > floor * 1.4, "{floor} -> {raised}");
+        assert!(raised > floor * 2.5, "{floor} -> {raised}");
 
         start_turn(core.clone(), id.clone(), project.clone(), "third".into()).unwrap();
         let (stop, budgets) = budgets_until_done(&mut rx).await;
@@ -8623,6 +8653,85 @@ echo run >> {}
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A turn whose endpoint never writes notes asks for them once. Without
+    /// notes the soft trigger cuts nothing, and the turn then waits for the
+    /// window, so a missing note costs one request per turn, not one per
+    /// iteration.
+    #[tokio::test]
+    async fn a_turn_without_notes_asks_for_them_once() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        // Every reply is a call with no text, the notes request's included.
+        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(400_000);
+            s.max_tokens = 1_024;
+            s.compaction_tokens = Some(20_000);
+            s.max_agent_iterations = 6;
+        }
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let mut data = build_session_data(&core, &id, &project).unwrap();
+        while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 22_000 {
+            data.messages.push(ChatMessage::user("q ".repeat(400)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        core.sessions.lock().await.insert(id.clone(), data);
+
+        start_turn(core.clone(), id.clone(), project, "keep reading".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
+        assert_eq!(*requests.lock().unwrap(), 6 + 1, "six turn requests and one notes request");
+        assert!(!transcript(&core, &id).await.iter().any(is_digest_message), "no cut without notes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `/compact` makes the cut the budget path makes, to the same target,
+    /// with or without notes, and its receipt reports what is left.
+    #[tokio::test]
+    async fn a_forced_compact_cuts_to_the_cut_target() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-compact-{}", uuid::Uuid::new_v4()));
+        let (core, _rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        {
+            // A refused connection: no notes, and the cut is made anyway.
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = "http://127.0.0.1:9".into();
+            s.model = "m".into();
+            s.context_tokens = Some(12_288);
+            s.max_tokens = 1_024;
+        }
+        let mut data = build_session_data(&core, &id, &project).unwrap();
+        while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 8_500 {
+            data.messages.push(ChatMessage::user("q ".repeat(400)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
+        // The window's budget, 12,288 less the reply and its headroom.
+        let target = cut_target(10_240, schema_tokens, &data.messages, &ChatMessage::estimated_tokens);
+        core.sessions.lock().await.insert(id.clone(), data);
+
+        let receipt = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
+        assert!(receipt.compacted_messages > 0);
+        let left = schema_tokens + transcript(&core, &id).await.iter().map(ChatMessage::estimated_tokens).sum::<usize>();
+        assert_eq!(receipt.tokens_after, left, "the receipt reports the transcript the cut left");
+        assert!(left <= target, "the cut ends at its target: {left} of {target}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A request longer than any digest snippet, so only the message itself
     /// can satisfy a verbatim match after a prune.
     fn original_request() -> String {
@@ -8801,9 +8910,11 @@ echo run >> {}
         let request = original_request();
         let mut saved = String::new();
         let (on_disk, boundaries, address) = compact_saved_opening(|address| {
-            let mut shortened = CompactionDigest::new(DROPPED_TEXT_CAP_FLOOR);
-            shortened.truncated.push(msg("tool", 4000));
-            saved = shortened.format_truncation_only(Some(address));
+            // The wording that release saved, which no code writes any more.
+            saved = format!(
+                "[context note: 1 older tool outputs were shortened in place; each ends with \"…[older tool output \
+                 truncated]\". Full text: {address} (bash: grep or tail it). Re-issue the call if you need the rest."
+            );
             vec![ChatMessage::user(note.clone()), ChatMessage::user(saved.clone()), ChatMessage::user(request.clone())]
         })
         .await;
@@ -9317,11 +9428,14 @@ echo run >> {}
         (core, rx, id, project, bodies, dir)
     }
 
-    /// The reply limits the turn's requests carried, in order; a compaction
-    /// summary, which carries no tools, is left out.
+    /// The reply limits the turn's requests carried, in order; a request for
+    /// compaction notes, which ends with the notes ask, is left out.
     fn turn_limits(bodies: &Arc<StdMutex<Vec<String>>>) -> Vec<u64> {
         let sent = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()).collect::<Vec<_>>();
-        sent.iter().filter(|b| b["tools"].is_array()).map(|b| b["max_tokens"].as_u64().unwrap()).collect()
+        sent.iter()
+            .filter(|b| b["messages"].as_array().and_then(|m| m.last()).map(|m| &m["content"]) != Some(&crate::compaction::NOTES_ASK.into()))
+            .map(|b| b["max_tokens"].as_u64().unwrap())
+            .collect()
     }
 
     /// A provider that counts the prompt at 1.3 times the estimate refuses a
