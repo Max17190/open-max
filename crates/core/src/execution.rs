@@ -586,16 +586,15 @@ where
     }
 }
 
-/// Rewrite `(program, args)` to run under this host's sandbox backend, or
-/// say why no containment is possible. Pure argv surgery: the supervisor's
-/// lifecycle, capture, and process-group handling see one program like any
-/// other (the wrapper is the group leader, so cancel and timeout kill the
-/// whole tree unchanged).
+/// Rewrite the request's argv to run under this host's sandbox backend, or
+/// say why no containment is possible. Pure argv surgery: lifecycle, capture
+/// and process groups see one program like any other (the wrapper leads the
+/// group, so cancel and timeout kill the whole tree unchanged).
 fn apply_sandbox(
-    program: &OsString,
-    args: &[OsString],
+    request: &ProcessRequest,
     policy: &SandboxPolicy,
 ) -> Result<(OsString, Vec<OsString>), ProcessError> {
+    let (program, args) = (&request.program, &request.args);
     #[cfg(target_os = "macos")]
     {
         let exec = Path::new("/usr/bin/sandbox-exec");
@@ -642,10 +641,9 @@ fn apply_sandbox(
                 "bubblewrap (bwrap) is not installed".into(),
             ));
         };
-        // Read-only root, scratch bound writable, all namespaces unshared
-        // (which cuts the network). If user namespaces are disabled the run
-        // fails at spawn with bwrap's own diagnostic - a loud refusal, not a
-        // silent unsandboxed run.
+        // Read-only root, private /tmp, then the working directory bound back
+        // read-only (a project under /tmp would vanish) and the scratch writable
+        // last. All namespaces unshared (no network); without them bwrap fails loudly.
         let mut wrapped: Vec<OsString> = vec![
             "--die-with-parent".into(),
             "--unshare-all".into(),
@@ -658,9 +656,14 @@ fn apply_sandbox(
             "/proc".into(),
             "--tmpfs".into(),
             "/tmp".into(),
+            "--ro-bind".into(),
+            request.cwd.as_os_str().to_os_string(),
+            request.cwd.as_os_str().to_os_string(),
             "--bind".into(),
             policy.rw_scratch.as_os_str().to_os_string(),
             policy.rw_scratch.as_os_str().to_os_string(),
+            "--chdir".into(),
+            request.cwd.as_os_str().to_os_string(),
             "--".into(),
             program.clone(),
         ];
@@ -810,7 +813,7 @@ pub(crate) async fn run_process(
 ) -> Result<ProcessOutput, ProcessError> {
     let (program, args) = match &request.sandbox {
         None => (request.program.clone(), request.args.clone()),
-        Some(policy) => apply_sandbox(&request.program, &request.args, policy)?,
+        Some(policy) => apply_sandbox(&request, policy)?,
     };
     let mut command = Command::new(&program);
     command
@@ -3189,6 +3192,45 @@ mod tests {
             }
             Err(other) => panic!("sandboxed spawn failed unexpectedly: {other}"),
         }
+    }
+
+    /// A probe of a project under /tmp sees its own working directory. The
+    /// sandbox mounts a private, empty /tmp over the host's, so without a
+    /// bind of its own the project is gone inside it and a relative command
+    /// such as `./tool.sh` does not exist. The working directory is bound
+    /// read-only after that /tmp and before the scratch (so a scratch inside
+    /// the project stays writable), and the probe starts in it. Checked on
+    /// the argument list, so it holds on a host that cannot start the
+    /// sandbox too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_under_tmp_sees_its_working_directory() {
+        let (project, scratch) = ("/tmp/omx-project", "/tmp/omx-project/.scratch");
+        let mut request = sandboxed_request(Path::new(scratch), "./tool.sh");
+        request.cwd = PathBuf::from(project);
+        let policy = request.sandbox.clone().unwrap();
+        let args = match apply_sandbox(&request, &policy) {
+            Ok((_, args)) => args,
+            Err(ProcessError::SandboxUnavailable(reason)) => {
+                eprintln!("sandbox backend unavailable here ({reason}); fail-closed path verified");
+                return;
+            }
+            Err(other) => panic!("wrapping the probe failed unexpectedly: {other}"),
+        };
+        let args: Vec<&str> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+        let at = |run: &[&str]| args.windows(run.len()).position(|window| window == run);
+        let tmp = at(&["--tmpfs", "/tmp"]).expect("a private /tmp");
+        let writable = at(&["--bind", scratch, scratch]).expect("a writable scratch");
+        let bound = at(&["--ro-bind", project, project]);
+        assert!(
+            bound.is_some_and(|at| tmp < at && at < writable),
+            "the working directory is bound read-only after the private /tmp and before the scratch: {args:?}"
+        );
+        let program = args.iter().position(|arg| *arg == "--").expect("the end of the options");
+        assert!(
+            at(&["--chdir", project]).is_some_and(|at| at < program),
+            "the probe starts in its working directory: {args:?}"
+        );
     }
 
     /// The probe's write authority ends at its scratch: an escape attempt
