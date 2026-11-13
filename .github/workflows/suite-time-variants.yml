@@ -40,10 +40,6 @@ jobs:
           : > out/summary.txt
           { nproc; grep -m1 'model name' /proc/cpuinfo; df -h / /mnt || true; du -sh target || true; rustc -V; } | tee out/host.txt
           root="$RUNNER_TEMP/v"
-          if [ -d /mnt ] && sudo mkdir -p /mnt/v && sudo chown "$(id -u):$(id -g)" /mnt/v; then
-            avail=$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)
-            if [ "$avail" -ge 50 ]; then root=/mnt/v; fi
-          fi
           mkdir -p "$root"
           echo "root=$root" | tee -a out/host.txt
           echo "VROOT=$root" >> "$GITHUB_ENV"
@@ -65,7 +61,7 @@ jobs:
           done | tee out/profiles.txt
 
       - name: Build each checkout
-        timeout-minutes: 28
+        timeout-minutes: 27
         run: |
           now() { date +%s.%N; }
           : > out/built.txt
@@ -109,7 +105,7 @@ jobs:
           done
 
       - name: Rebuild after a one-line edit
-        timeout-minutes: 14
+        timeout-minutes: 18
         env:
           CARGO_INCREMENTAL: "1"
         run: |
