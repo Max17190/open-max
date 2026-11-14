@@ -519,6 +519,35 @@ mod tests {
         }
     }
 
+    /// A turn that changed the effort keeps its prompt after a cut, so the
+    /// notes request carries the history before it, which every earlier
+    /// request sent at the effort it opened with. The notes request names that
+    /// effort at its top as they did and the change just ahead of its ask, so
+    /// everything ahead of the ask is what an earlier request sent.
+    #[test]
+    fn the_notes_request_keeps_the_effort_earlier_requests_named_at_the_top() {
+        use crate::config::ReasoningEffort::{High, Low};
+        let mut client = ChatClient::new("https://api.openai.com/v1".into(), None, "gpt-6.1-sol".into(), None, 64);
+        client.wire_api = crate::providers::WireApi::Responses;
+        client.reasoning_effort = Some(Low);
+        let mut history = vec![ChatMessage::system("rules")];
+        for turn in 0..3 {
+            history.push(ChatMessage { effort: Some(client.effort_stamp()), ..ChatMessage::user(format!("task {turn}")) });
+            history.push(ChatMessage::assistant(Some(format!("done {turn}")), None));
+        }
+        let earlier: Value = serde_json::from_slice(&serialize(&client, &history, client.reply_reserve, "[]").unwrap()).unwrap();
+        client.reasoning_effort = Some(High);
+        // The cut keeps the newest turn's prompt and removes all but the opening.
+        let (head, dropped) = (&history[..3], &history[3..]);
+        let notes = crate::compaction::notes_messages(&client, head, dropped);
+        let sent: Value = serde_json::from_slice(&serialize(&client, &notes, client.reply_reserve, "[]").unwrap()).unwrap();
+        assert_eq!(sent["reasoning"], earlier["reasoning"], "the top names the effort the conversation opened with");
+        let (input, before) = (sent["input"].as_array().unwrap(), earlier["input"].as_array().unwrap());
+        assert_eq!(input[..before.len()], before[..], "every item ahead of the ask is one an earlier request sent");
+        assert_eq!(input[before.len()], json!({"type":"configuration_update","reasoning":{"effort":"high"}}));
+        assert_eq!(input.len(), before.len() + 2, "the change, then the ask");
+    }
+
     /// A GPT-6 conversation keeps the effort it opened with at the top of
     /// every request and sends each later choice as a `configuration_update`
     /// just ahead of the prompt it was made for, so a change appends to what

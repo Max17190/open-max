@@ -49,7 +49,7 @@ use crate::compaction::{
     request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
     to_estimate, to_real, token_factor, updated_prompt_ratio, CompactionCtx, RequestSpend,
 };
-use crate::config::{ApprovalMode, ReasoningEffort, Settings};
+use crate::config::{ApprovalMode, Settings};
 use crate::hooks::{Hooks, PreToolResult};
 use crate::notes::{
     append_and_emit_note, hook_clause, insert_note, insert_startup_note, narrate_approval_policy, narrate_outside_approvals,
@@ -479,7 +479,7 @@ async fn run_compact(
         });
     }
     let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire };
+    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
     let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, true, &mut spend).await {
         Ok(count) => count,
@@ -708,7 +708,7 @@ async fn run_loop(
     };
     let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
     // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
-    if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(format!("{} {}", client.reasoning_effort.map_or("default", ReasoningEffort::as_str), client.origin())); }
+    if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(client.effort_stamp()); }
     // Frozen wire form: every request of the session injects the same tool
     // schema bytes without re-serializing the Value array. A refreeze swaps
     // the registry and keeps these (a tool file written since rides the
@@ -784,7 +784,7 @@ async fn run_loop(
             budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(), &estimate,
         ) };
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire,
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor,
         };
         if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await {
             core.send_agent(session_id, AgentEvent::Error { message });
