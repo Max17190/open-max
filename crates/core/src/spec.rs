@@ -878,6 +878,9 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `compaction_tokens`: optional global ceiling for compaction. Unset uses the
   active model's ceiling, else 150,000 tokens or a quarter of the window when
   larger; the window budget always caps it.
+- `compaction_keep_tokens`: optional most a cut keeps of the newest
+  exchanges, note included. Unset keeps 20,000; floored at 4,000; at most a
+  quarter of the trigger.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction notes. Unaffordable notes leave the history uncut unless the
   window forces a prune.
