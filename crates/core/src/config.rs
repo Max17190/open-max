@@ -152,7 +152,12 @@ pub struct Settings {
     /// 75, 90 and 100 percent of it. Guidance only: it never ends a turn or
     /// changes a limit. Unset or 0 adds no note.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_budget: Option<usize>,
+    pub request_budget: Option<usize>,    /// Built-in tools left out of the tools array for this process, read at
+    /// launch (for example `["edit_file", "write_file"]`, which leaves file
+    /// changes to bash). The prompt names only the tools on offer and a call
+    /// to an omitted one is refused as unknown. Empty offers all seven.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub omit_tools: Vec<String>,
 }
 
 /// A change across several files with its tests routinely takes more than
@@ -185,6 +190,7 @@ impl Default for Settings {
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
             request_budget: None,
+            omit_tools: Vec::new(),
         }
     }
 }

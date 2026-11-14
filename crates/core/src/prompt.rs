@@ -234,10 +234,23 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     // how many calls share a response, how much of a file to read and how
     // large a diff to make are left to the model. Both sides count against
     // the frozen prompt budget in `frozen_prompt_fits_token_budget`.
+    // One clause per core tool on offer: a tool `omit_tools` leaves out of
+    // the array is not named, so nothing points the model at it.
+    let tools = [
+        ("bash", "bash runs shell commands (ls, rg, git, tests; chain steps)"),
+        ("read_file", "read_file reads files"),
+        ("edit_file", "edit_file replaces exact text"),
+        ("write_file", "write_file creates files"),
+    ]
+    .into_iter()
+    .filter(|(name, _)| crate::tools::is_offered(name))
+    .map(|(_, clause)| clause)
+    .collect::<Vec<_>>()
+    .join("; ");
     let mut prompt = format!(
         "You are Open Max, an expert coding agent working on the project at {root}.\n\
         \n\
-        Tools: bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files.\n\
+        Tools: {tools}.\n\
         \n\
         Rules:\n\
         - Paths are project-relative.\n\

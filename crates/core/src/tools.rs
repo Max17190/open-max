@@ -178,6 +178,40 @@ pub fn is_mutating(name: &str) -> bool {
 pub const TOOL_NAMES: &[&str] =
     &["list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash"];
 
+/// Built-in tools this process leaves out of the tools array, from the
+/// `omit_tools` setting read at launch. Empty (the default) offers all seven,
+/// and the array is then byte-identical to `tool_schemas()`. An omitted tool
+/// is absent from the registry, so a call to it gets the unknown-tool reply,
+/// and the prompt names only the tools on offer.
+static OMITTED_BUILTINS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Set the built-ins this process omits. Every name must be a built-in.
+pub fn set_omitted_builtins(names: &[String]) -> Result<(), String> {
+    if let Some(bad) = names.iter().find(|n| !TOOL_NAMES.contains(&n.as_str())) {
+        return Err(format!(
+            "omit_tools: {bad} is not a built-in tool; the built-ins are {}",
+            TOOL_NAMES.join(", ")
+        ));
+    }
+    *OMITTED_BUILTINS.write().unwrap_or_else(|e| e.into_inner()) = names.to_vec();
+    Ok(())
+}
+
+/// Whether the built-in `name` is on offer in this process.
+pub fn is_offered(name: &str) -> bool {
+    !OMITTED_BUILTINS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|n| n == name)
+}
+
+/// The built-in entries of the tools array: `tool_schemas()` without the
+/// omitted ones.
+pub fn offered_schemas() -> Value {
+    let mut schemas = tool_schemas().clone();
+    if let Some(entries) = schemas.as_array_mut() {
+        entries.retain(|e| is_offered(e["function"]["name"].as_str().unwrap_or_default()));
+    }
+    schemas
+}
+
 /// One-line human summary of a call, shown in approval prompts and tool cards.
 pub fn summarize_call(name: &str, args: &Value) -> String {
     match name {

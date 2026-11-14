@@ -331,6 +331,7 @@ impl Core {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = std::fs::create_dir_all(&data_dir);
         let settings = crate::config::load(&data_dir)?;
+        crate::tools::set_omitted_builtins(&settings.omit_tools)?;
         // Stamped before the read, so a write landing in between is read again.
         let stamp = crate::sessions::stamp(&crate::trust::trust_path(&data_dir));
         let modes = crate::trust::approval_modes(&data_dir)?;

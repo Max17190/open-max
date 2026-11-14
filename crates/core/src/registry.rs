@@ -935,7 +935,7 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
 
 /// The built-in schemas followed by `entries`: a tools array as sent.
 fn with_builtins(entries: impl IntoIterator<Item = Value>) -> Value {
-    let mut schemas = tools::tool_schemas().clone();
+    let mut schemas = tools::offered_schemas();
     if let Some(arr) = schemas.as_array_mut() {
         arr.extend(entries);
     }
@@ -962,7 +962,7 @@ pub(crate) fn entry_name(entry: &Value) -> &str {
 /// Built-in tool specs derived from the canonical `tools::tool_schemas()`
 /// literals, so name/description/parameters have a single source of truth.
 fn builtin_specs() -> Vec<ToolSpec> {
-    let schemas = tools::tool_schemas();
+    let schemas = tools::offered_schemas();
     schemas
         .as_array()
         .expect("builtin schemas are an array")
