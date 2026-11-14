@@ -3133,6 +3133,58 @@ mod tests {
         body["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant").cloned().collect()
     }
 
+    /// The provider caches the tokens it generated, so the next request reads
+    /// a reply from cache only when it goes back as it was generated. A reply
+    /// that streamed whitespace before its call goes back without it (the
+    /// provider's prefix cache stopped there), while the session file keeps
+    /// the text the server sent.
+    #[tokio::test]
+    async fn a_tool_loop_replays_a_reply_without_the_whitespace_before_its_call() {
+        use crate::state::Core;
+
+        const SSE: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"read a.txt first\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\\n\\n\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+
+        let (base_url, bodies) = capturing_endpoint(SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(16384);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+
+        let id = "sess-replay-whitespace";
+        start_turn(core.clone(), id.into(), project.clone(), "what is in a.txt".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        assert_eq!(stop, "stop");
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one tool step, then the answer");
+        let replies = sent_replies(&bodies[1]);
+        assert_eq!(replies.len(), 1, "{}", bodies[1]);
+        assert!(replies[0].get("content").is_none(), "{}", bodies[1]);
+        assert_eq!(replies[0]["tool_calls"][0]["function"]["arguments"], "{\"path\": \"a.txt\"}", "arguments go back as streamed");
+        assert_eq!(replies[0]["reasoning_content"], "read a.txt first");
+
+        let messages = transcript(&core, id).await;
+        let call = messages.iter().find(|m| m.tool_calls.is_some()).unwrap();
+        assert_eq!(call.content.as_deref(), Some("\n\n"), "the session file keeps the text as it came");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The bug this guards: DeepSeek's thinking mode answered the second
     /// request of every tool loop with a 400, because the reasoning its first
     /// reply streamed was shown and thrown away. The assistant message that
