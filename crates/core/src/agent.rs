@@ -760,7 +760,7 @@ async fn run_loop(
     // Cut replies with no call since the last reply the cap did not cut.
     let mut cuts = 0;
     let mut at_reserve = false;
-    // Set once a request goes out over the soft trigger: a cut without notes waits for the window.
+    // Set once a request goes out over the soft trigger: a cut without notes waits for the window; a cut clears it.
     let mut soft_spent = false;
 
     'turns: for iteration in 0..max_iterations {
@@ -794,7 +794,8 @@ async fn run_loop(
         let ctx = CompactionCtx {
             core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep,
         };
-        if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await {
+        let compacted = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await;
+        if let Err(message) = compacted.map(|dropped| soft_spent &= dropped == 0) {
             core.send_agent(session_id, AgentEvent::Error { message });
             stop_reason = "error".into();
             break 'turns;
@@ -8657,8 +8658,8 @@ echo run >> {}
 
     /// A turn whose endpoint never writes notes asks for them once. Without
     /// notes the soft trigger cuts nothing, and the turn then waits for the
-    /// window, so a missing note costs one request per turn, not one per
-    /// iteration.
+    /// window, so a missing note costs one request until a cut lands, not
+    /// one per iteration.
     #[tokio::test]
     async fn a_turn_without_notes_asks_for_them_once() {
         use crate::state::Core;
@@ -8693,6 +8694,53 @@ echo run >> {}
         assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
         assert_eq!(*requests.lock().unwrap(), 6 + 1, "six turn requests and one notes request");
         assert!(!transcript(&core, &id).await.iter().any(is_digest_message), "no cut without notes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A cut the window forces returns the turn to its configured trigger: a
+    /// turn whose notes request once came back empty asks again once its
+    /// history crosses the trigger after that cut, rather than growing to the
+    /// window between every later cut.
+    #[tokio::test]
+    async fn a_cut_that_lands_restores_the_configured_trigger() {
+        use crate::state::Core;
+        const ITERATIONS: usize = 40;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // Each read adds about 2,000 estimated tokens.
+        let lines: String = (0..130).map(|i| format!("{i:05} {}\n", "x".repeat(60))).collect();
+        std::fs::write(project.join("a.txt"), lines).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        // Every reply is a call with no text, the notes request's included.
+        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.context_tokens = Some(100_000);
+            s.max_tokens = 1_024;
+            s.compaction_tokens = Some(40_000);
+            s.max_agent_iterations = ITERATIONS;
+        }
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        let mut data = build_session_data(&core, &id, &project).unwrap();
+        while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 42_000 {
+            data.messages.push(ChatMessage::user("q ".repeat(400)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        core.sessions.lock().await.insert(id.clone(), data);
+
+        start_turn(core.clone(), id.clone(), project, "keep reading".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
+        assert!(transcript(&core, &id).await.iter().any(is_digest_message), "the window forced a cut");
+        // The first soft cut gets no notes, the window forces a cut (its own
+        // notes request), and the history then crosses the configured
+        // trigger again: one more notes request, not none.
+        assert_eq!(*requests.lock().unwrap() - ITERATIONS, 3, "three notes requests");
         let _ = std::fs::remove_dir_all(dir);
     }
 

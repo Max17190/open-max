@@ -227,8 +227,9 @@ async fn summarize_compaction(
 ) -> Option<String> {
     let CompactionCtx { core, session_id, client, cancelled, schemas, factor, .. } = *ctx;
     let messages = notes_messages(client, head, &digest.dropped);
-    // In real tokens by the session's learned factor, as every request is admitted.
-    let estimated = to_real(messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() + request_overhead(schemas), factor);
+    // In real tokens by the session's learned factor, as every request is
+    // admitted, and by the route's estimator, which counts only what it sends.
+    let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
     if !spend.admits(estimated) { return None; }
     let mut resent = Vec::new();
     let outcome = tokio::time::timeout(SUMMARY_TIMEOUT, client.stream_chat(&messages, client.reply_reserve, schemas, cancelled.clone(), |delta| {
@@ -2108,6 +2109,26 @@ pub(crate) mod tests {
         assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original, "the history is whole");
         assert!(!fixture.committed(), "nothing of a cut was committed");
         assert_eq!(spend.tokens, 0, "the refused request is never sent, so nothing is charged");
+    }
+
+    /// The notes request is admitted by the route's estimator, as the turn
+    /// loop admits every request: reasoning the route does not send is not
+    /// charged against the spend ceiling.
+    #[tokio::test]
+    async fn the_spend_ceiling_admits_notes_by_what_the_route_sends() {
+        let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        for message in messages.iter_mut().filter(|message| message.role == "assistant") {
+            message.reasoning_content = Some("t".repeat(4_000));
+        }
+        assert!(sessions::save_messages(&fixture.core, &fixture.id, &messages, &mut 0, true));
+        let sent = |message: &ChatMessage| message.estimated_tokens_with_replay(false, false);
+        let (routed, full) = (messages.iter().map(sent).sum::<usize>(), tokens(&messages));
+        let mut spend = RequestSpend::new(Some(routed + (full - routed) / 4));
+        let ctx = CompactionCtx { estimate: &sent, ..fixture.ctx() };
+        assert!(compact_messages(&ctx, &mut messages, 20_000, 1_000_000, 0, false, &mut spend).await.unwrap() > 0);
+        assert!(requests.try_recv().is_ok() && spend.tokens > 0, "the notes request went and was charged");
     }
 
     /// When the window forces the cut it is made without notes, and leaves
