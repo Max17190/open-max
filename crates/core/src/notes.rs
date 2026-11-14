@@ -517,6 +517,28 @@ pub(crate) fn repeated_result_note(n: usize) -> String {
          a short plain-text summary now.]"
     )
 }
+
+/// The opening of every request budget note (`Settings::request_budget`).
+pub(crate) const BUDGET_NOTE_MARK: &str = "[harness: request budget:";
+
+/// The percentages of the request budget whose crossing earns a note.
+const BUDGET_MARKS: [usize; 4] = [50, 75, 90, 100];
+
+/// The note that states the turn's soft request budget before its prompt.
+pub(crate) fn request_budget_start_note(budget: usize) -> String {
+    format!("{BUDGET_NOTE_MARK} this task has a soft budget of {budget} model requests. It is guidance, not a limit: plan to finish and verify the task within it.]")
+}
+
+/// The note owed once `used` of `budget` requests are spent, when they reach
+/// a mark past `noted`, the highest one already said, which it then records.
+/// Marks passed together earn one note, for the highest.
+pub(crate) fn request_budget_note(budget: usize, used: usize, noted: &mut usize) -> Option<String> {
+    let mark = BUDGET_MARKS.into_iter().rev().find(|&mark| used.saturating_mul(100) >= mark.saturating_mul(budget)).filter(|&mark| mark > *noted)?;
+    *noted = mark;
+    let (percent, left) = (used.saturating_mul(100) / budget.max(1), budget.saturating_sub(used));
+    Some(format!("{BUDGET_NOTE_MARK} {used} of {budget} requests used ({percent}%), {left} left. Prioritize finishing and verifying the task.]"))
+}
+
 /// What a mutating call's permissions reload found, said on that call's
 /// result: that it left permissions.toml malformed (`fail_closed_now`, the
 /// parse reason, with the repair `permissions`, as reloaded, still allows),
@@ -762,6 +784,23 @@ fn approval_state(
 mod tests {
     use super::*;
     use crate::prompt::{NOTE_HEADER, NOTE_SEPARATOR};
+
+    /// A note at each of 50, 75, 90 and 100 percent, once each, and none
+    /// before the first or after the last; marks passed in one step earn one
+    /// note, for the highest.
+    #[test]
+    fn request_budget_notes_fall_on_their_marks_once() {
+        let mut noted = 0;
+        let said: Vec<(usize, String)> =
+            (1..=25).filter_map(|used| request_budget_note(20, used, &mut noted).map(|note| (used, note))).collect();
+        assert_eq!(said.iter().map(|(used, _)| *used).collect::<Vec<_>>(), [10, 15, 18, 20]);
+        assert_eq!(said[0].1, format!("{BUDGET_NOTE_MARK} 10 of 20 requests used (50%), 10 left. Prioritize finishing and verifying the task.]"));
+        assert_eq!(said[3].1, format!("{BUDGET_NOTE_MARK} 20 of 20 requests used (100%), 0 left. Prioritize finishing and verifying the task.]"));
+        let mut noted = 0;
+        let small: Vec<String> = (1..=5).filter_map(|used| request_budget_note(2, used, &mut noted)).collect();
+        assert_eq!(small.len(), 2, "50% at 1, then 75, 90 and 100 together at 2: {small:?}");
+        assert!(small[1].contains("2 of 2 requests used (100%)"), "{small:?}");
+    }
 
     fn call() -> ToolCall {
         ToolCall {

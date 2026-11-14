@@ -748,6 +748,12 @@ async fn run_loop(
         &ratio_origin,
     );
     let max_iterations = settings.max_agent_iterations.max(1);
+    // The soft request budget: said before the prompt, then at its marks on a tool result. It ends nothing.
+    let request_budget = settings.request_budget.filter(|&budget| budget > 0);
+    if let Some(budget) = request_budget {
+        insert_startup_note(core, session_id, guard.messages(), crate::notes::request_budget_start_note(budget));
+    }
+    let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
     // Cut replies with no call since the last reply the cap did not cut.
     let mut cuts = 0;
@@ -1439,6 +1445,9 @@ async fn run_loop(
         let streak = repeats.observe(&tool_calls, guard.messages());
         if streak >= REPEAT_NOTE_AT {
             append_and_emit_note(core, session_id, guard.messages(), &repeated_result_note(streak));
+        }
+        if let Some(text) = request_budget.and_then(|budget| crate::notes::request_budget_note(budget, iteration + 1, &mut budget_noted)) {
+            append_and_emit_note(core, session_id, guard.messages(), &text);
         }
 
         // The mid-turn half of the self-modification loop: an extension file
@@ -4603,6 +4612,54 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A soft request budget rides notes in the history, never the frozen
+    /// prefix: one before the prompt, then one at each of its marks on the
+    /// tool result the next request carries, each stored once and never
+    /// moved. Every request sends the system prompt and tools a turn without
+    /// it sends, byte for byte, and without it no request carries a note.
+    #[tokio::test]
+    async fn a_request_budget_rides_notes_and_leaves_the_prefix_alone() {
+        use crate::notes::BUDGET_NOTE_MARK;
+        use crate::state::Core;
+
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut runs: Vec<Vec<Value>> = Vec::new();
+        for (n, budget) in [None, Some(4)].into_iter().enumerate() {
+            let (core, mut rx) = Core::new(root.join(format!("data-{n}"))).unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, bodies) = capturing_endpoint_times(POLL_SSE, 4).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(16384));
+                (s.approval_mode, s.request_budget) = (ApprovalMode::Auto, budget);
+            }
+            start_turn(core.clone(), format!("sess-budget-{n}"), project.clone(), "poll until done".into()).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop", "the budget never ends the turn");
+            runs.push(bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect());
+        }
+        let (off, on) = (&runs[0], &runs[1]);
+        assert_eq!((off.len(), on.len()), (5, 5), "four tool rounds and the answer, with or without a budget");
+        for body in off.iter().chain(on) {
+            assert_eq!(body["messages"][0], off[0]["messages"][0], "the system prompt never moves");
+            assert_eq!(body["tools"], off[0]["tools"], "the tools never move");
+        }
+        let marks = |body: &Value| body["messages"].to_string().matches(BUDGET_NOTE_MARK).count();
+        assert!(off.iter().all(|body| marks(body) == 0), "no budget, no note");
+        assert_eq!(on.iter().map(marks).collect::<Vec<_>>(), [1, 1, 2, 3, 4], "the start, then 50%, 75% and 100% (90% with it)");
+        for pair in on.windows(2) {
+            let (before, after) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
+            assert_eq!(before[..], after[..before.len()], "a note is stored once and never moved");
+        }
+        let start = on[0]["messages"].as_array().unwrap();
+        let at = start.iter().position(|m| m["content"].as_str().is_some_and(|text| text.starts_with(BUDGET_NOTE_MARK)));
+        assert!(at.is_some_and(|at| at < start.len() - 1 && start[at]["role"] == "user"), "the budget precedes the prompt: {start:?}");
+        assert!(on[4]["messages"].to_string().contains("4 of 4 requests used (100%), 0 left"), "{}", on[4]);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// One finished reply of calls given as (id, tool, raw arguments), ending
