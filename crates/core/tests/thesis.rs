@@ -201,7 +201,10 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
     const TARGET_TOKENS: usize = 700;
     const PATH_ALLOWANCE_TOKENS: usize = 10;
     const BYTES_PER_TOKEN_TENTHS: usize = 44;
-    let cap = if responses { 3046 } else { (TARGET_TOKENS - PATH_ALLOWANCE_TOKENS) * BYTES_PER_TOKEN_TENTHS / 10 };
+    // One experimental prompt rule adds 115 bytes to every request; the cap
+    // moves by exactly that.
+    const VARIANT_RULE_BYTES: usize = 115;
+    let cap = VARIANT_RULE_BYTES + if responses { 3046 } else { (TARGET_TOKENS - PATH_ALLOWANCE_TOKENS) * BYTES_PER_TOKEN_TENTHS / 10 };
     println!(
         "MEASURE {gate} {bytes} path-free bytes = {system_path_free} messages[0] without the {}-byte project path + {} \
          tools + {} execution policy note; cap {cap} bytes, the {TARGET_TOKENS}-token target's calibration",

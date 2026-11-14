@@ -243,6 +243,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
         - Paths are project-relative.\n\
         - On a tool error, fix the call; never repeat it.\n\
         - Call tools via the API, never as JSON or XML text.\n\
+        - Run the narrowest relevant tests when a change is complete, not after each edit; run them once before finishing.\n\
         - Be concise. When done, stop calling tools; summarize briefly without repeating file contents."
     );
     breakdown.components.push(("base rules".into(), prompt.len()));
@@ -1364,7 +1365,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_596;
+        const CAP: usize = 2_711;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
