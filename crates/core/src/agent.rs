@@ -1742,7 +1742,7 @@ async fn request_approval(
 fn approval_detail(args: &Value) -> String {
     if let Some(obj) = args.as_object() {
         let mut parts = Vec::new();
-        for key in ["path", "command", "old_string", "new_string", "content", "pattern", "glob"] {
+        for key in ["path", "command", "old_string", "new_string", "edits", "content", "pattern", "glob"] {
             if let Some(v) = obj.get(key) {
                 let s = match v {
                     Value::String(s) => s.clone(),

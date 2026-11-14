@@ -6277,3 +6277,75 @@ fn a_refusal_for_length_lets_the_next_turn_compact_and_be_answered() {
     assert!(!answered.1 && answered.0 + 4_096 <= 16_384, "{phase:?}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// One edit_file call carries several replacements through the whole loop:
+/// the file changes once, the model's next request holds the changed lines
+/// so it need not read them back, and a list with one bad replacement, or
+/// one a deny rule covers, writes nothing.
+#[test]
+fn one_edit_call_carries_several_replacements_end_to_end() {
+    let (project, home) = fresh_dirs("multi-edit");
+    let original = "[server]\nport = 80\nhost = \"a\"\n\n[client]\nretries = 1\n";
+    std::fs::write(project.join("app.toml"), original).unwrap();
+    std::fs::write(project.join("locked.toml"), original).unwrap();
+    std::fs::create_dir_all(project.join(".openmax")).unwrap();
+    std::fs::write(
+        project.join(".openmax/permissions.toml"),
+        "[[rules]]\neffect = \"deny\"\ntool = \"edit_file\"\narg_regex = \"^locked\\\\.toml$\"\n",
+    )
+    .unwrap();
+    let edits = serde_json::json!([
+        {"old_string": "port = 80", "new_string": "port = 8080"},
+        {"old_string": "retries = 1", "new_string": "retries = 3\ntimeout = 5"},
+    ]);
+    let bad = serde_json::json!([
+        {"old_string": "port = 8080", "new_string": "port = 9"},
+        {"old_string": "missing", "new_string": "x"},
+    ]);
+    let script = vec![
+        (sse_tool_call("edit_file", serde_json::json!({"path": "app.toml", "edits": edits})), true),
+        (sse_tool_call("edit_file", serde_json::json!({"path": "app.toml", "edits": bad})), true),
+        (sse_tool_call("edit_file", serde_json::json!({"path": "locked.toml", "edits": edits})), true),
+        (sse_text("done"), true),
+    ];
+    let (base_url, requests, _server) = spawn_scripted_server(script);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "tune the config"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+
+    let edited = "[server]\nport = 8080\nhost = \"a\"\n\n[client]\nretries = 3\ntimeout = 5\n";
+    assert_eq!(std::fs::read_to_string(project.join("app.toml")).unwrap(), edited);
+    assert_eq!(std::fs::read_to_string(project.join("locked.toml")).unwrap(), original);
+    let ends: Vec<(bool, String)> = stdout
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("every stdout line is JSON"))
+        .filter(|l| l["type"] == "tool_end")
+        .map(|l| (l["ok"] == true, l["output"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    assert_eq!(ends.len(), 3, "{stdout}");
+    assert!(ends[0].0 && ends[0].1.starts_with("edited app.toml (+3 −2)\n"), "{:?}", ends[0]);
+    assert!(!ends[1].0 && ends[1].1.starts_with("edit 2 of 2: old_string not found"), "{:?}", ends[1]);
+    assert!(!ends[2].0 && ends[2].1.contains("permission rule denied"), "the deny rule covers every replacement of the call: {:?}", ends[2]);
+
+    // The tool result the model reads next shows the edit in place.
+    let second: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[1]).unwrap();
+    let result = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    for line in ["2 port = 8080", "6 retries = 3", "7 timeout = 5"] {
+        assert!(result.contains(line), "the model sees {line:?} without a read: {result}");
+    }
+}
