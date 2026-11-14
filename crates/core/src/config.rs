@@ -122,6 +122,11 @@ pub struct Settings {
     /// and falls back to that budget when an automatic prune cannot reach its target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_tokens: Option<usize>,
+    /// The most an automatic cut keeps of the newest exchanges, its note
+    /// included, in tokens. Unset keeps 20,000. Floored at 4,000, and a cut
+    /// still keeps at most a quarter of its trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_keep_tokens: Option<usize>,
     /// Ceiling on the tokens one turn may spend across the agent requests it
     /// makes, counted as a provider bills them: prompt plus completion, with
     /// cached prompt tokens at full value, because what this bounds is the
@@ -175,6 +180,7 @@ impl Default for Settings {
             reasoning_effort: None,
             max_output_bytes: None,
             compaction_tokens: None,
+            compaction_keep_tokens: None,
             max_agent_tokens: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
@@ -501,6 +507,16 @@ mod tests {
         let configured: Settings =
             serde_json::from_str(r#"{"compaction_tokens":150000}"#).unwrap();
         assert_eq!(configured.compaction_tokens, Some(150_000));
+    }
+
+    #[test]
+    fn compaction_keep_tokens_parses_and_defaults_to_none() {
+        let defaulted: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.compaction_keep_tokens, None);
+        assert!(serde_json::to_value(&defaulted).unwrap().get("compaction_keep_tokens").is_none());
+        let configured: Settings = serde_json::from_str(r#"{"compaction_keep_tokens":5000}"#).unwrap();
+        assert_eq!(configured.compaction_keep_tokens, Some(5_000));
+        assert!(serde_json::from_str::<Settings>(r#"{"compaction_keep_tokens":-1}"#).is_err());
     }
 
     /// Absent from every settings.json that exists today, so the default has
