@@ -86,22 +86,10 @@ enum ApprovalOutcome {
 /// how edit_file appends, because its old_string has to be unique and the
 /// last line alone of a large file is often a brace or blank.
 fn cut_off_call_error(max_tokens: usize) -> String {
-    // Without the typed edit tools (`omit_tools`) the same advice goes
-    // through the shell, so the note never names a tool the array lacks.
-    if !tools::is_offered("write_file") || !tools::is_offered("edit_file") {
-        return format!(
-            "Not run: your reply reached the output limit (max_tokens = {max_tokens}) while \
-             writing this call, so its arguments were cut off. Send large content in parts: \
-             for a file, write the first part with a bash heredoc (cat > file), then append \
-             the rest with another (cat >> file)."
-        );
-    }
     format!(
         "Not run: your reply reached the output limit (max_tokens = {max_tokens}) while \
-         writing this call, so its arguments were cut off. Send large content in parts: \
-         for a file, write_file the first part, then append the rest with edit_file \
-         (old_string is the last few lines you wrote, enough to be unique; new_string \
-         is those lines followed by the next part)."
+         writing this call, so its arguments were cut off. Send large content in parts: {}",
+        tools::parts_advice()
     )
 }
 

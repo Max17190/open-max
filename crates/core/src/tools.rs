@@ -202,6 +202,19 @@ pub fn is_offered(name: &str) -> bool {
     !OMITTED_BUILTINS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|n| n == name)
 }
 
+/// How the cut-off call reply says to send a large file in parts, naming
+/// only tools on offer: without the typed edit tools it goes through bash.
+pub(crate) fn parts_advice() -> &'static str {
+    if is_offered("write_file") && is_offered("edit_file") {
+        "for a file, write_file the first part, then append the rest with edit_file \
+         (old_string is the last few lines you wrote, enough to be unique; new_string \
+         is those lines followed by the next part)."
+    } else {
+        "for a file, write the first part with a bash heredoc (cat > file), then append \
+         the rest with another (cat >> file)."
+    }
+}
+
 /// The built-in entries of the tools array: `tool_schemas()` without the
 /// omitted ones.
 pub fn offered_schemas() -> Value {
