@@ -377,88 +377,6 @@ fn emit_run(
     run.clear();
 }
 
-/// The `width`-byte window of `text` that mentions the most distinct terms
-/// from `context`, aligned to line starts. Returns a byte range.
-///
-/// This is the working-set principle applied to eviction: when only part of
-/// a page can stay resident, keep the part the current working set refers to.
-/// Budget enforcement kept the first bytes of an old tool output, which is a
-/// positional guess - the head of a file read is its imports, the head of a
-/// grep is whichever match sorted first, and neither is what the conversation
-/// is about.
-///
-/// Distinct-term COUNT, deliberately, not the idf-weighted sum used for
-/// ranking. Measured on 132 real truncations, idf weighting scored 0.158
-/// against a plain count's 0.180 (paired, 95% CI [-0.032, -0.013]): rarity
-/// inside one tool output selects for hashes, offsets and line numbers, which
-/// are exactly the tokens nothing refers to again. Breadth of overlap with
-/// the live conversation is the better signal, and it needs no corpus
-/// statistics at all.
-///
-/// Bounded by construction: candidate starts are line starts, strided so no
-/// single output can cost more than `MAX_WINDOW_PROBES` scored windows.
-pub(crate) fn salient_window(text: &str, context: &str, width: usize) -> std::ops::Range<usize> {
-    if text.len() <= width {
-        return 0..text.len();
-    }
-    let terms: std::collections::HashSet<String> = tokenize(context).into_iter().collect();
-    if terms.is_empty() {
-        return 0..floor_char_boundary(text, width);
-    }
-    // One tokenizing pass, keeping only the runs that can score at all. Every
-    // candidate window is then a range over this list, so the whole scan is
-    // two monotone pointers rather than a re-tokenization per candidate: the
-    // windows overlap almost entirely, and tokenizing the same bytes once per
-    // line start is quadratic work for a linear answer.
-    let mut hits: Vec<(usize, usize, String)> = Vec::new();
-    tokenize_runs(text, |start, end, token| {
-        if terms.contains(&token) {
-            hits.push((start, end, token));
-        }
-    });
-    if hits.is_empty() {
-        return 0..floor_char_boundary(text, width);
-    }
-    // A window never begins mid-line: tool output is line-structured and a
-    // window cut inside one reads as garbage.
-    let starts = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
-        .filter(|s| *s < text.len());
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    let mut distinct = 0usize;
-    let (mut lo, mut hi) = (0usize, 0usize);
-    let (mut best, mut best_score) = (0usize, 0usize);
-    for start in starts {
-        let end = start + width;
-        // A run scores only where it fits whole; a name cut in half is not
-        // the name, and counting it would reward windows that clip it.
-        while hi < hits.len() && hits[hi].1 <= end {
-            let entry = counts.entry(hits[hi].2.as_str()).or_insert(0);
-            *entry += 1;
-            if *entry == 1 {
-                distinct += 1;
-            }
-            hi += 1;
-        }
-        while lo < hi && hits[lo].0 < start {
-            if let Some(entry) = counts.get_mut(hits[lo].2.as_str()) {
-                *entry -= 1;
-                if *entry == 0 {
-                    distinct -= 1;
-                }
-            }
-            lo += 1;
-        }
-        // Ties go to the earlier window: with nothing to separate them, the
-        // head is the one a reader can orient in.
-        if distinct > best_score {
-            best = start;
-            best_score = distinct;
-        }
-    }
-    best..floor_char_boundary(text, best + width)
-}
-
 /// Strip one plural 's' (never 'ss'/'us'/'is'): "files"~"file",
 /// "sessions"~"session", while "class", "status", "analysis" stay whole.
 fn fold_plural(token: &str) -> &str {
@@ -1875,28 +1793,6 @@ mod tests {
         // Unicode: multibyte content pages without panicking on boundaries.
         let cjk = "修复错误 ".repeat(600);
         assert!(pages(&cjk).len() > 1);
-    }
-
-    /// Term matching: exact, plural fold, and >=5-char full-prefix
-    /// containment - and the guards that keep it from admitting noise.
-    #[test]
-    fn salient_window_finds_the_region_the_context_is_about() {
-        let noise = "unrelated filler line with nothing anyone asked about\n".repeat(40);
-        let text = format!("{noise}retry_budget = 2 and upstream_timeout = 45s\n{noise}");
-        let window = salient_window(&text, "what are retry_budget and upstream_timeout", 120);
-        assert!(
-            text[window.clone()].contains("retry_budget = 2"),
-            "the window must land on the region the context names, got: {}",
-            &text[window.clone()]
-        );
-        // Line-aligned, so the slice never begins mid-line.
-        assert!(window.start == 0 || text.as_bytes()[window.start - 1] == b'\n');
-
-        // With nothing to go on, the head is the honest default.
-        assert_eq!(salient_window(&text, "", 120).start, 0);
-        assert_eq!(salient_window(&text, "terms that appear nowhere here", 120).start, 0);
-        // Short inputs are returned whole rather than windowed.
-        assert_eq!(salient_window("tiny", "tiny", 120), 0..4);
     }
 
     #[test]

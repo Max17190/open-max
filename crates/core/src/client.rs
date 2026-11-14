@@ -694,6 +694,12 @@ impl ChatClient {
     /// that made it). Trailing slashes are dropped as `endpoint` drops them,
     /// since the request goes to the same URL. A hash, so a session file never
     /// holds the URL, the key, or a header value.
+    /// The stamp a turn's prompt carries for `effort_plan`: the effort this
+    /// client runs at (`default` or a level) and its route.
+    pub(crate) fn effort_stamp(&self) -> String {
+        format!("{} {}", self.reasoning_effort.map_or("default", ReasoningEffort::as_str), self.origin())
+    }
+
     pub fn origin(&self) -> String {
         let mut key = format!("{}\n{}\n{}", self.base_url.trim_end_matches('/'), self.model, self.api_key.as_deref().unwrap_or(""));
         if self.wire_api == crate::providers::WireApi::Responses { key.push_str("\nresponses"); }

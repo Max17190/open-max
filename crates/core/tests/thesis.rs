@@ -453,12 +453,11 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// Method: one session against a scripted endpoint, in a project trusted in
 /// `ask`, with a 16,384-token window and a 1,024-token reply. Turn one writes
 /// a tool manifest, a refreeze that stores the note once, on the write's
-/// result, which every later request but the compaction's summary carries,
-/// and a steer sent while that write waits for approval joins the next
-/// request; it reads the README, lists the
-/// project and answers. Turn two reads fourteen small files and one of 300
-/// lines, which takes the transcript past the window's budget, so the harness
-/// compacts, with its summary request, and the turn answers. Turn three runs
+/// result, which every later request carries, and a steer sent while that
+/// write waits for approval joins the next request; it reads the README,
+/// lists the project and answers. Turn two reads fourteen small files and one
+/// of 300 lines, which takes the transcript past the window's budget, so the
+/// harness asks for notes and cuts, and the turn answers. Turn three runs
 /// in a new `Core`, as a resume in a new process does, at a reasoning effort
 /// the user chose since: four reads and an answer. The Responses and native
 /// Messages sessions run a model that takes an effort change inside the
@@ -475,14 +474,14 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// one fixed name, as the frozen prefix gate leaves the project path out, so
 /// each count is the same on any machine.
 ///
-/// The gate names the two requests the compaction makes: its summary request,
-/// which opens with instructions of its own and no tools, the only request
-/// after the first to start cold, sharing its frozen prefix (its tools and
-/// system prompt) whole with no earlier request, and the request after it,
-/// whose history the prune rewrote, so that it repeats only the frozen prefix
-/// and the opening the prune keeps. Every other request repeats every byte
-/// the request before it sent, and every request after the first but the
-/// summary shares its whole frozen prefix with an earlier one; on native
+/// The gate names the two requests the compaction makes: its notes request,
+/// which carries the turn's tools and system prompt, repeats every byte the
+/// request before it sent up to the cut and then asks for the notes, and the
+/// request after it, whose history the cut rewrote, so that it repeats only
+/// the frozen prefix and the opening the cut keeps, and carries the notes
+/// right after the original request. Every other request repeats every byte
+/// the request before it sent, and no request after the first starts cold:
+/// each shares its whole frozen prefix with an earlier one; on native
 /// Messages each request from the rewritten one on replays the thinking of
 /// every reply since. The share holds the 75% target and a ratchet, the
 /// share measured when the ratchet was set less half a point, rounded down to
@@ -496,7 +495,10 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// both providers render ahead of the history, request 22 repeated none of
 /// request 21 on Responses and only its tools and system prompt on native
 /// Messages: 81.57% and 84.33%; sent with the prompt it was chosen for,
-/// 86.69% and 87.15%.
+/// 86.69% and 87.15%. With the notes asked for in the conversation and a cut
+/// that keeps a quarter of the trigger, 88.49% (155,255 of 175,450), 88.49%
+/// (156,443 of 176,797) and 88.60% (151,575 of 171,071), where the ratchets
+/// are set now.
 ///
 /// Where a provider's cache ends its entries at message or block boundaries
 /// rather than at any byte, the Responses and native Messages twins also
@@ -508,7 +510,8 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// block. An entry holds at least 1,024 tokens. The ratchet holds the billed
 /// share: every request but the two the compaction makes reads back the
 /// entry the request before it wrote, when that one was long enough to write
-/// one, and the share holds the 75% target and its ratchet, set as above;
+/// one (the notes request reads back the whole of it), and the share holds
+/// the 75% target and its ratchet, set as above;
 /// docs/development.md states it. With the note at the end of the last message, the
 /// Responses share was 0.00%; measured when its ratchet was set, 84.74%
 /// (166,870 of 196,910 prompt tokens). With no block marked, the native
@@ -516,9 +519,11 @@ async fn every_request_in_a_session_carries_the_same_prefix_bytes() {
 /// (69,363 of 83,762). Once the note was stored where it changes, the two
 /// read back 85.91% and 86.26%; across the effort change sent at the top of
 /// each request, 80.79% and 83.05%, and sent as history, 85.91% and 86.26%.
+/// With the notes asked for in the conversation, 87.66% (154,983 of 176,797)
+/// and 87.76% (150,139 of 171,071), where the ratchets are set now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 85.0, None).await;
+    cacheable_share_case("a_session_prompt_is_75_percent_cacheable", WireApi::ChatCompletions, 87.9, None).await;
 }
 
 /// The same session over the Responses API, whose `input` carries the
@@ -526,21 +531,21 @@ async fn a_session_prompt_is_75_percent_cacheable() {
 /// in the order sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_responses_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case("a_responses_session_prompt_is_75_percent_cacheable", WireApi::Responses, 85.0, Some(84.2)).await;
+    cacheable_share_case("a_responses_session_prompt_is_75_percent_cacheable", WireApi::Responses, 87.9, Some(87.1)).await;
 }
 
 /// The same session over native Messages, whose prompt cache covers `tools`,
 /// then `system`, then `messages`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_messages_session_prompt_is_75_percent_cacheable() {
-    cacheable_share_case("a_messages_session_prompt_is_75_percent_cacheable", WireApi::Anthropic, 83.8, Some(82.3)).await;
+    cacheable_share_case("a_messages_session_prompt_is_75_percent_cacheable", WireApi::Anthropic, 88.1, Some(87.2)).await;
 }
 
 /// One scripted reply of the cacheable-prefix gate's session.
 enum Reply {
     /// A call of one tool with these arguments.
     Call(&'static str, serde_json::Value),
-    /// The turn's answer, or the compaction's summary.
+    /// The turn's answer, or the compaction's notes.
     Answer(&'static str),
 }
 
@@ -822,12 +827,13 @@ fn the_cache_rules_read_back_an_entry_only_through_the_same_bytes_within_their_l
 async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ratchet: Option<f64>) {
     use serde_json::json;
     const TARGET_PERCENT: f64 = 75.0;
-    // The index of the compaction's summary request, the 20th; the one after
-    // it is the first whose history the prune rewrote.
-    const SUMMARY: usize = 19;
+    // The index of the compaction's notes request, the 20th; the one after
+    // it is the first whose history the cut rewrote.
+    const NOTES: usize = 19;
     const ORIGINAL_REQUEST: &str = "add a word count tool";
     const FOLLOW_UP: &str = "read the README too";
-    const SUMMARY_REPLY: &str = "User instructions: read the README too. Done: added the tool and read README.md.";
+    const NOTES_REPLY: &str = "State: added the tool and read README.md. Facts: the user said read the README too.";
+    const NOTES_ASK: &str = "[context note: everything above this message except the original request is about to be removed";
     let name = match wire {
         WireApi::ChatCompletions => "Chat Completions",
         WireApi::Responses => "Responses",
@@ -837,14 +843,13 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     let (data, project) = (dir.join("data"), dir.join("project"));
     std::fs::create_dir_all(&project).unwrap();
     let project = project.canonicalize().unwrap();
-    // Each small file's read stays under the 600 bytes past which a prune
-    // shortens an old tool output in place, so the compaction drops whole
-    // exchanges and summarizes them; the large read is the newest message
-    // then, which a prune keeps whole. On every protocol the request before
-    // the large read is more than 1,300 estimated tokens under the window's
-    // 14,336-token budget and the read's round adds about 3,900, and after
-    // the prune the session ends more than 1,300 under it: a prompt a few
-    // kilobytes longer compacts at the same request, once.
+    // The compaction cuts whole exchanges and keeps the newest ones byte for
+    // byte; the large read is the newest message then, which the cut keeps.
+    // On every protocol the request before the large read is more than 1,300
+    // estimated tokens under the window's 14,336-token budget and the read's
+    // round adds about 3,900, and after the cut the session ends more than
+    // 1,300 under it: a prompt a few kilobytes longer compacts at the same
+    // request, once.
     for i in 0..14 {
         let body: String = (0..12).map(|l| format!("pub fn item_{i}_{l}() -> u32 {{ {l} }}\n")).collect();
         std::fs::write(project.join(format!("f{i}.rs")), body).unwrap();
@@ -863,7 +868,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     ];
     replies.extend((0..14).map(|i| read(format!("f{i}.rs"))));
     replies.push(read("large.rs".into()));
-    replies.push(Reply::Answer(SUMMARY_REPLY));
+    replies.push(Reply::Answer(NOTES_REPLY));
     replies.push(Reply::Answer("read them all"));
     replies.extend((0..4).map(|i| read(format!("f{i}.rs"))));
     replies.push(Reply::Answer("resumed"));
@@ -940,7 +945,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     let cacheable: Vec<usize> =
         (0..prompts.len()).map(|i| (0..i).map(|j| prompts[i].shared(&prompts[j])).max().unwrap_or(0)).collect();
     let billed: Vec<usize> = (0..prompts.len()).map(|i| prompts[i].billed(&prompts[..i])).collect();
-    let rewritten = SUMMARY + 1;
+    let rewritten = NOTES + 1;
     let per_request = || {
         prompts
             .iter()
@@ -964,49 +969,49 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     };
     // The fixture: the steer sent while the tool write waited for approval
     // first rides the request after it; the write stored the note once, on
-    // its result, which every later request carries but the summary's; the
-    // summary request sends no tools, and the request after it is the first
-    // turn request with the compaction's digest note (its persisted opening,
-    // `[context note:`).
+    // its result, which every later request carries; the notes request ends
+    // with the ask, and the request after it is the first turn request with
+    // the compaction's digest note (its persisted opening, `[context note:`).
     assert!(!bodies[0].contains(FOLLOW_UP) && bodies[1].contains(FOLLOW_UP), "the steer joins request 2");
     let notes: Vec<usize> = prompts.iter().map(|prompt| prompt.notes).collect();
-    let once: Vec<usize> = (0..prompts.len()).map(|i| usize::from(i > 0 && i != SUMMARY)).collect();
-    assert_eq!(notes, once, "the note, stored once, rides every request after the tool write but the summary's");
-    assert!(
-        !bodies[SUMMARY].contains("\"tools\":"),
-        "request {} is not the compaction's summary request: the fixture's compaction moved",
-        SUMMARY + 1
-    );
+    let once: Vec<usize> = (0..prompts.len()).map(|i| usize::from(i > 0)).collect();
+    assert_eq!(notes, once, "the note, stored once, rides every request after the tool write");
+    let asks: Vec<usize> = (0..bodies.len()).filter(|&i| bodies[i].contains(NOTES_ASK)).map(|i| i + 1).collect();
+    assert_eq!(asks, [NOTES + 1], "request {} is not the compaction's notes request: the fixture's compaction moved", NOTES + 1);
     let digests: Vec<usize> =
-        (0..bodies.len()).filter(|&i| i != SUMMARY && bodies[i].contains("[context note:")).map(|i| i + 1).collect();
+        (0..bodies.len()).filter(|&i| i != NOTES && bodies[i].contains("[context note:")).map(|i| i + 1).collect();
     assert_eq!(digests.first(), Some(&(rewritten + 1)), "the compaction's digest note first rides request {}", rewritten + 1);
+    // The notes request carries the turn's tools and system prompt as the
+    // request before it did, and every byte ahead of the separator that
+    // opens the ask's own message or block is one an earlier request sent.
+    let (asked, before) = (&prompts[NOTES], &prompts[NOTES - 1]);
+    assert_eq!(asked.text[..asked.frozen], before.text[..before.frozen], "the notes request carries the turn's tools");
+    let ask = asked.text.find(NOTES_ASK).unwrap();
+    let ask_message = asked.text[..ask].rfind("},{").unwrap() + 1;
+    assert!(
+        cacheable[NOTES] >= ask_message,
+        "the notes request repeats {} of the {ask_message} bytes ahead of its ask:\n{}",
+        cacheable[NOTES],
+        per_request()
+    );
     if wire == WireApi::ChatCompletions {
-        let summary: serde_json::Value = serde_json::from_str(&bodies[SUMMARY]).unwrap();
-        let instructions = summary["messages"][0]["content"].as_str().unwrap();
-        let excerpt = summary["messages"][1]["content"].as_str().unwrap();
-        assert!(instructions.contains("Retained user instructions are outside this excerpt."));
-        assert!(instructions.contains("Do not infer missing goals or revise retained instructions."));
-        assert!(instructions.contains("explicit requests and constraints in the excerpt"));
-        assert!(instructions.contains("Omit this part if none appear."));
-        assert!(!excerpt.contains(ORIGINAL_REQUEST), "the pinned request stays out of the excerpt");
-        assert!(excerpt.contains(&format!("user: {FOLLOW_UP}")), "the excerpt includes the dropped follow-up");
-
         let next: serde_json::Value = serde_json::from_str(&bodies[rewritten]).unwrap();
         let messages = next["messages"].as_array().unwrap();
         let original = messages.iter().position(|msg| msg["role"] == "user" && msg["content"] == ORIGINAL_REQUEST).unwrap();
-        assert!(messages[original + 1]["content"].as_str().unwrap().contains(SUMMARY_REPLY));
+        let note = messages[original + 1]["content"].as_str().unwrap();
+        assert!(note.starts_with("[context note:") && note.contains(NOTES_REPLY), "{note}");
     }
 
     // Every request repeats what the request before it sent ahead of its
     // note, but the two the compaction makes.
     let rewrote: Vec<usize> = (1..prompts.len())
-        .filter(|&i| i != SUMMARY && i != rewritten && prompts[i].shared(&prompts[i - 1]) < prompts[i - 1].stable())
+        .filter(|&i| i != NOTES && i != rewritten && prompts[i].shared(&prompts[i - 1]) < prompts[i - 1].stable())
         .map(|i| i + 1)
         .collect();
     assert!(rewrote.is_empty(), "requests {rewrote:?} rewrote what the request before them sent:\n{}", per_request());
     assert!(
-        prompts[rewritten].shared(&prompts[SUMMARY - 1]) < prompts[SUMMARY - 1].stable(),
-        "request {} repeats the history the request before the compaction sent, so the prune rewrote none:\n{}",
+        prompts[rewritten].shared(&prompts[NOTES - 1]) < prompts[NOTES - 1].stable(),
+        "request {} repeats the history the request before the compaction sent, so the cut rewrote none:\n{}",
         rewritten + 1,
         per_request()
     );
@@ -1018,7 +1023,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         assert_eq!(replayed, (0..replayed.len()).collect::<Vec<_>>(), "thinking replayed from request {}", rewritten + 1);
     }
     let cold: Vec<usize> = (1..prompts.len()).filter(|&i| cacheable[i] < prompts[i].frozen).map(|i| i + 1).collect();
-    assert_eq!(cold, [SUMMARY + 1], "only the compaction's summary starts cold after the first request:\n{}", per_request());
+    assert!(cold.is_empty(), "requests {cold:?} start cold after the first request:\n{}", per_request());
 
     let sizes: Vec<usize> = prompts.iter().map(Prompt::len).collect();
     let tokens = |bytes: &[usize]| bytes.iter().map(|&b| estimate_tokens(b)).sum::<usize>();
@@ -1026,7 +1031,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     let share = 100.0 * served as f64 / sent as f64;
     println!(
         "MEASURE {gate} {share:.2}% ({name}) = {served} of {sent} prompt tokens ({} of {} bytes) over {} requests; \
-         cold after the first: {cold:?} (the compaction's summary); ratchet {ratchet:.1}%, target {TARGET_PERCENT}%",
+         cold after the first: {cold:?}; ratchet {ratchet:.1}%, target {TARGET_PERCENT}%",
         cacheable.iter().sum::<usize>(),
         sizes.iter().sum::<usize>(),
         prompts.len(),
@@ -1052,7 +1057,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         // back the entry the request before it, when long enough to cache,
         // wrote through its history.
         let unread: Vec<usize> = (1..prompts.len())
-            .filter(|&i| i != SUMMARY && i != rewritten && estimate_tokens(prompts[i - 1].len()) >= MIN_CACHED_TOKENS)
+            .filter(|&i| i != NOTES && i != rewritten && estimate_tokens(prompts[i - 1].len()) >= MIN_CACHED_TOKENS)
             .filter(|&i| prompts[i - 1].writes.iter().max().is_none_or(|&w| billed[i] < w))
             .map(|i| i + 1)
             .collect();

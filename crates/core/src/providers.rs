@@ -16,11 +16,12 @@ const DEFAULT_COMPACTION_TOKENS: usize = 150_000;
 
 /// The soft compaction ceiling when neither settings nor the selected model
 /// entry sets one: 150,000 tokens, or a quarter of the context window when
-/// that is larger. A fixed 150,000 sized for small windows prunes a
-/// 1,048,576-token window at a seventh of its size, and each prune changes
-/// the prefix, so the next request re-bills the remaining context uncached
-/// and the model re-reads the tool results the prune shortened. Windows up
-/// to 600,000 tokens keep 150,000; the input budget still caps the trigger.
+/// that is larger. A fixed 150,000 sized for small windows cuts a
+/// 1,048,576-token window at a seventh of its size, and each cut changes the
+/// prefix, so the next request re-bills what the cut kept uncached and the
+/// model re-reads what the cut removed. Windows up to 600,000 tokens keep
+/// 150,000; the input budget still caps the trigger. A lower ceiling for a
+/// model is its entry's `compaction_tokens`.
 fn default_compaction_tokens(context_tokens: usize) -> usize {
     DEFAULT_COMPACTION_TOKENS.max(context_tokens / 4)
 }
