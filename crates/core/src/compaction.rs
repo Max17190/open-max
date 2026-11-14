@@ -579,7 +579,9 @@ const COMPACTION_KEEP_FLOOR: usize = 4_000;
 /// The most a cut keeps of the newest exchanges, in estimator units: the
 /// `compaction_keep_tokens` setting, floored in its real tokens and then
 /// converted like the trigger, or `KEEP_RECENT_TOKENS` when it is unset. A
-/// cut still keeps at most a quarter of its trigger (`cut_target`).
+/// cut still keeps at most a quarter of its trigger (`cut_target`). At a high
+/// learned ratio the converted value can fall below the note's allowance; the
+/// cut then ends at the drop floor, and `compaction_trigger` still fires it.
 pub(crate) fn requested_keep(requested: Option<usize>, ratio: Option<f64>) -> usize {
     requested.map_or(KEEP_RECENT_TOKENS, |keep| to_estimate(keep.max(COMPACTION_KEEP_FLOOR), setting_factor(ratio)))
 }
@@ -1967,6 +1969,22 @@ pub(crate) mod tests {
         let (budget, newest) = (190_000, 3 * 2_250);
         assert!(cut_target(60_000, 5_000, 0, &messages, estimate) < newest + DIGEST_NOTE_ALLOWANCE_TOKENS, "fixture: the tail outgrows the small target");
         assert_eq!(compaction_trigger(budget, 0, 60_000, 5_000, None, &messages, estimate), 60_000);
+        // At the largest learned ratio the converted keep (1,250) is below the
+        // note's own allowance; where the default tail fits, the cut still
+        // fires at the converted trigger.
+        let ratio = Some(MAX_TOKEN_FACTOR);
+        let keep = requested_keep(Some(5_000), ratio);
+        assert!(keep < DIGEST_NOTE_ALLOWANCE_TOKENS, "fixture: {keep}");
+        let mut lean = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..60 {
+            lean.push(msg("user", 1_600));
+            lean.push(msg("assistant", 1_600));
+        }
+        let trigger = requested_trigger(60_000, ratio, budget);
+        assert_eq!(compaction_trigger(budget, 0, 60_000, KEEP_RECENT_TOKENS, ratio, &lean, estimate), trigger, "fixture: the default cuts");
+        assert_eq!(compaction_trigger(budget, 0, 60_000, keep, ratio, &lean, estimate), trigger);
+        enforce_budget(&mut lean, trigger, keep, 0, 0, estimate).expect("a cut");
+        assert!(tokens(&lean) <= 200 + 4 * 400 + DIGEST_NOTE_ALLOWANCE_TOKENS, "{}", tokens(&lean));
         let mut kept_small = messages.clone();
         enforce_budget(&mut kept_small, 60_000, 5_000, 0, 0, estimate).expect("a cut");
         let mut kept_default = messages.clone();
