@@ -147,6 +147,12 @@ pub struct Settings {
     /// Runtime code clamps configured values to 1..=32.
     #[serde(default = "default_max_parallel_tools")]
     pub max_parallel_tools: usize,
+    /// A soft budget of model requests per turn, told to the model in notes
+    /// in the history: at the turn's start, then as its requests reach 50,
+    /// 75, 90 and 100 percent of it. Guidance only: it never ends a turn or
+    /// changes a limit. Unset or 0 adds no note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_budget: Option<usize>,
 }
 
 /// A change across several files with its tests routinely takes more than
@@ -178,6 +184,7 @@ impl Default for Settings {
             max_agent_tokens: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
+            request_budget: None,
         }
     }
 }
@@ -526,6 +533,17 @@ mod tests {
         let json = serde_json::to_string(&configured).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.max_agent_tokens, Some(120_000));
+    }
+
+    /// The request budget is off unless set, and unset it stays out of a
+    /// saved file, so settings written by a build without it are unchanged.
+    #[test]
+    fn request_budget_is_off_by_default_and_unwritten() {
+        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().request_budget, None);
+        assert!(!serde_json::to_string(&Settings::default()).unwrap().contains("request_budget"));
+        let configured: Settings = serde_json::from_str(r#"{"request_budget":40}"#).unwrap();
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(back.request_budget, Some(40));
     }
 
     /// The TUI saves the whole struct, so an unset temperature has to stay

@@ -36,6 +36,15 @@ whether or not a human approved their content; outside `auto`, an unapproved
 one is never batched: it takes the serial path, which asks for approval or,
 in `readonly`, refuses the call.
 
+`request_budget` is an optional soft budget of model requests per turn, off
+when unset or 0. When set, the model reads a note before the prompt stating
+the budget, and a one-line note on a tool result as the turn's requests reach
+50, 75, 90 and 100 percent of it, with the requests used and left. Each
+request the turn's loop sends counts once; a retry of one request and a
+compaction summary do not. It is guidance only: it never ends a turn and
+changes no limit, and its notes ride the history, so the system prompt and
+tools are the same bytes with or without it.
+
 A missing settings file means defaults, and the default `base_url` and `model`
 are empty: endpoint resolution fails until `base_url`, `model` and
 `context_tokens` are set, here or through a named provider, and one error

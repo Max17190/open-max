@@ -712,11 +712,12 @@ fn repo_lines() -> Result<&'static str, String> {
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
-    // Compaction makes one cut and asks for notes in the conversation, and
-    // an edit_file call carries several replacements and returns an excerpt
+    // Compaction makes one cut and asks for notes in the conversation; an
+    // edit_file call carries several replacements and returns an excerpt
     // of the changed lines, so an edit takes one round, not one per
-    // replacement plus a read-back.
-    const BASELINE: usize = 44_003;
+    // replacement plus a read-back; and the opt-in soft request budget
+    // adds its notes.
+    const BASELINE: usize = 44_043;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
