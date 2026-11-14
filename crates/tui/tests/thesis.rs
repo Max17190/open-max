@@ -714,8 +714,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const TARGET: usize = 37_000;
     // Several replacements per edit_file call, and an excerpt of the
     // changed lines in its result, so an edit takes one round, not one per
-    // replacement plus a read-back.
-    const BASELINE: usize = 44_286;
+    // replacement plus a read-back. The opt-in soft request budget and its
+    // notes.
+    const BASELINE: usize = 44_326;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
