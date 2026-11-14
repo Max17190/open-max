@@ -1315,8 +1315,13 @@ mod tests {
     }
 
     /// The path-free base rules and builtin schemas, the extension pointer
-    /// among them in the bash description, must fit in 2,496 bytes (569
-    /// o200k tokens), what they measured when the rules stopped asking for
+    /// among them in the bash description, must fit in 2,596 bytes (596
+    /// o200k tokens), what they measured when edit_file began taking a list
+    /// of replacements per call (100 bytes, 27 tokens: `edits` with its item
+    /// schema in place of the top-level pair). A call that carries one
+    /// replacement paid a full request for each, so the bytes buy back
+    /// rounds. Before that the cap was 2,496
+    /// bytes (569 tokens), what they measured when the rules stopped asking for
     /// batched calls, whole-file reads and a minimal diff in the existing
     /// style. Before that the cap was 2,595 bytes (591 tokens), what they
     /// measured when the rules began naming the
@@ -1359,7 +1364,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_496;
+        const CAP: usize = 2_596;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
