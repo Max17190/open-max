@@ -101,8 +101,9 @@ struct StreamOptions {
 }
 
 /// The transcript as one endpoint receives it, borrowed so a request never
-/// copies it. Each message goes out as it serializes on disk, except that
-/// reasoning, `reasoning_details`, and each tool call's `extra_content` go
+/// copies it. Each message goes out as it serializes on disk, except that a
+/// reply that called tools loses the whitespace ending its text (`wire_text`),
+/// and that reasoning, `reasoning_details`, and each tool call's `extra_content` go
 /// only to the endpoint that produced them (`origin` matches the message's
 /// `reasoning_origin`), and the stamp itself never goes. Compatible routes
 /// receive unchanged structured blocks without a duplicate plaintext field.
@@ -182,7 +183,7 @@ impl Serialize for WireMessages<'_> {
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             WireMessage {
                 role: &m.role,
-                content: m.content.as_deref().map(|text| WireContent { text, mark: text_mark }),
+                content: wire_text(m).map(|text| WireContent { text, mark: text_mark }),
                 tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| plain),
@@ -192,6 +193,22 @@ impl Serialize for WireMessages<'_> {
             }
         }))
     }
+}
+
+/// A message's text as it goes out. A reply that called tools goes back
+/// without the whitespace that ended its text, and without its text when
+/// that whitespace was all of it. The server streams the separator before
+/// the calls as text; sent back, it no longer matched what the model
+/// generated (measured on DeepSeek V4.1 Flash), so the provider's prefix
+/// cache stopped at the end of the reply's reasoning and the reply's text and
+/// calls cost the uncached price on the next request. The session file keeps
+/// the text as it came.
+fn wire_text(message: &ChatMessage) -> Option<&str> {
+    let text = message.content.as_deref()?;
+    if message.role != "assistant" || message.tool_calls.as_deref().is_none_or(<[_]>::is_empty) {
+        return Some(text);
+    }
+    Some(text.trim_end()).filter(|text| !text.is_empty())
 }
 
 /// One message on the wire. Fields, order, and skip rules follow
@@ -3969,6 +3986,35 @@ pub(crate) mod tests {
         assert!(old.reasoning_details.is_none());
         let old: ToolCall = serde_json::from_str(r#"{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}"#).unwrap();
         assert!(old.extra_content.is_none());
+    }
+
+    /// A reply that called tools goes back without the whitespace that ended
+    /// its text, and without its text when nothing else was in it, so the
+    /// replay matches what the model generated. Text without calls, and
+    /// every other role, keep their bytes.
+    #[test]
+    fn a_reply_with_calls_goes_back_without_its_trailing_whitespace() {
+        let call = r#""tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]"#;
+        let messages = vec![
+            ChatMessage::user("hi\n\n"),
+            ChatMessage::assistant(Some("\n\n".into()), Some(vec![bash_call()])),
+            ChatMessage::tool("c1", "out\n"),
+            ChatMessage::assistant(Some("Reading it.\n\n".into()), Some(vec![bash_call()])),
+            ChatMessage::tool("c1", "out\n"),
+            ChatMessage::assistant(Some("done\n\n".into()), None),
+        ];
+        let expected = format!(concat!(
+            r#"[{{"role":"user","content":"hi\n\n"}},"#,
+            r#"{{"role":"assistant",{call}}},"#,
+            r#"{{"role":"tool","content":"out\n","tool_call_id":"c1"}},"#,
+            r#"{{"role":"assistant","content":"Reading it.",{call}}},"#,
+            r#"{{"role":"tool","content":"out\n","tool_call_id":"c1"}},"#,
+            r#"{{"role":"assistant","content":"done\n\n"}}]"#,
+        ), call = call);
+        assert_eq!(wire(&messages, "o"), expected);
+        // The session file keeps the text as the server sent it.
+        let saved = serde_json::to_string(&messages[1]).unwrap();
+        assert!(saved.contains(r#""content":"\n\n""#), "{saved}");
     }
 
     /// Gemini streams each call whole, without an `index`, and puts its

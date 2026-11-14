@@ -855,6 +855,22 @@ fn without_route(line: &str) -> String {
     }
 }
 
+/// A stored line as the chat wire sends it: a reply that called tools goes
+/// without the whitespace ending its text, and without its text when that
+/// was all of it.
+fn as_sent(line: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+    let (Some(text), true) = (value["content"].as_str(), value["role"] == "assistant" && value["tool_calls"].is_array()) else {
+        return line.to_string();
+    };
+    let stored = format!("\"content\":{},", serde_json::to_string(text).unwrap());
+    let sent = match text.trim_end() {
+        "" => String::new(),
+        trimmed => format!("\"content\":{},", serde_json::to_string(trimmed).unwrap()),
+    };
+    line.replacen(&stored, &sent, 1)
+}
+
 fn user_line(prompt: &str) -> String {
     format!("{{\"role\":\"user\",\"content\":{}}}", serde_json::to_string(prompt).unwrap())
 }
@@ -866,7 +882,7 @@ fn check_resume(first: &Run, resumed: &Run) {
     let log = resumed.log();
     assert_eq!(resumed.sid, first.sid, "{log}");
     let kept = complete_prefix(&resumed.before);
-    let lines: Vec<String> = std::str::from_utf8(kept).unwrap().lines().map(without_origin).collect();
+    let lines: Vec<String> = std::str::from_utf8(kept).unwrap().lines().map(without_origin).map(|line| as_sent(&line)).collect();
     let expected = format!("[{},{}]", lines.join(","), user_line(&resumed.prompt));
     let body = fields(&resumed.requests[0]);
     assert_eq!(body["messages"].get(), expected, "the resume sends the transcript as stored: {log}");
