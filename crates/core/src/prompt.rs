@@ -237,7 +237,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     let mut prompt = format!(
         "You are Open Max, an expert coding agent working on the project at {root}.\n\
         \n\
-        Tools: bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files.\n\
+        Tools: bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text, several per call; write_file creates files.\n\
         \n\
         Rules:\n\
         - Paths are project-relative.\n\
@@ -1315,8 +1315,13 @@ mod tests {
     }
 
     /// The path-free base rules and builtin schemas, the extension pointer
-    /// among them in the bash description, must fit in 2,496 bytes (569
-    /// o200k tokens), what they measured when the rules stopped asking for
+    /// among them in the bash description, must fit in 2,575 bytes (592
+    /// o200k tokens), what they measured when edit_file began taking several
+    /// replacements per call (79 bytes, 23 tokens: the `edits` property, its
+    /// clause in the description, and the prompt's "several per call"). A
+    /// call that carries one replacement per round paid a full request for
+    /// each, so the bytes buy back rounds. Before that the cap was 2,496
+    /// bytes (569 tokens), what they measured when the rules stopped asking for
     /// batched calls, whole-file reads and a minimal diff in the existing
     /// style. Before that the cap was 2,595 bytes (591 tokens), what they
     /// measured when the rules began naming the
@@ -1359,7 +1364,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_496;
+        const CAP: usize = 2_575;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
