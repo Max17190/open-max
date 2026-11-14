@@ -256,16 +256,17 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace old_string (exact; unique unless replace_all) with new_string.",
+                "description": "Replace old_string (exact; unique unless replace_all) with new_string, or each item of edits, all or none.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
                         "old_string": { "type": "string" },
                         "new_string": { "type": "string" },
-                        "replace_all": { "type": "boolean" }
+                        "replace_all": { "type": "boolean" },
+                        "edits": { "type": "array", "items": { "type": "object" } }
                     },
-                    "required": ["path", "old_string", "new_string"]
+                    "required": ["path"]
                 }
             }
         },
@@ -1397,25 +1398,66 @@ fn to_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
+/// The replacements an `edit_file` call carries, as (old, new, replace_all),
+/// in order: the top-level pair, then each item of `edits`, which may come
+/// as a JSON string. An empty top-level pair beside `edits` is ignored.
+fn replacements(args: &Value) -> Result<Vec<(String, String, bool)>, String> {
+    let not_a_list = || "edits must be a list of {old_string, new_string, replace_all}".to_string();
+    let edits = match &args["edits"] {
+        Value::Null => Vec::new(),
+        Value::Array(items) => items.clone(),
+        Value::String(text) => serde_json::from_str(text).map_err(|_| not_a_list())?,
+        _ => return Err(not_a_list()),
+    };
+    let pair = |v: &Value| Some((v["old_string"].as_str()?.to_string(), v["new_string"].as_str()?.to_string()));
+    let all = |v: &Value| arg(v, "replace_all", Value::as_bool).unwrap_or(false);
+    let mut list = Vec::new();
+    match pair(args) {
+        Some((old, new)) if !edits.is_empty() && old.is_empty() && new.is_empty() => {}
+        Some((old, new)) => list.push((old, new, all(args))),
+        None if edits.is_empty() || !args["old_string"].is_null() || !args["new_string"].is_null() => {
+            return Err("missing required arguments: old_string and new_string".into())
+        }
+        None => {}
+    }
+    for (i, item) in edits.iter().enumerate() {
+        let (old, new) = pair(item).ok_or_else(|| format!("edits[{i}] needs old_string and new_string"))?;
+        list.push((old, new, all(item)));
+    }
+    Ok(list)
+}
+
+/// Replace exact text in one file. Each replacement of a call is matched
+/// against the file as it was before the call and none may overlap another;
+/// the file is written only when all match, so a failure changes nothing and
+/// names the one that failed. The result shows the changed lines in place,
+/// so the edit needs no read-back.
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
-    let (Some(old_string), Some(new_string)) = (args["old_string"].as_str(), args["new_string"].as_str()) else {
-        return ToolOutcome::err("missing required arguments: old_string and new_string");
+    let mut list = match replacements(args) {
+        Ok(list) => list,
+        Err(e) => return ToolOutcome::err(e),
     };
-    // An empty old_string matches between every pair of characters, so the
-    // ambiguity error would steer the model to replace_all, which splices
-    // new_string between every character of the file.
-    if old_string.is_empty() {
-        return ToolOutcome::err(
-            "old_string is empty; give the exact text to replace, or use write_file to create or replace a whole file",
-        );
+    // A lone replacement's errors read as they did before a call could carry
+    // several; in a list each names its place.
+    let total = list.len();
+    let label = |i: usize| if total == 1 { String::new() } else { format!("edit {} of {total}: ", i + 1) };
+    for (i, (old_string, new_string, _)) in list.iter().enumerate() {
+        // An empty old_string matches between every pair of characters, so
+        // the ambiguity error would steer the model to replace_all, which
+        // splices new_string between every character of the file.
+        if old_string.is_empty() {
+            return ToolOutcome::err(format!(
+                "{}old_string is empty; give the exact text to replace, or use write_file to create or replace a whole file",
+                label(i)
+            ));
+        }
+        if old_string == new_string {
+            return ToolOutcome::err(format!("{}old_string and new_string are identical", label(i)));
+        }
     }
-    if old_string == new_string {
-        return ToolOutcome::err("old_string and new_string are identical");
-    }
-    let replace_all = arg(args, "replace_all", Value::as_bool).unwrap_or(false);
     let path = match resolve(root, rel) {
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(e),
@@ -1433,51 +1475,121 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     // to assume, so it stays exact.
     let crlf = old.matches("\r\n").count();
     let lf = old.matches('\n').count();
-    let (old_string, new_string) = if crlf > 0 && crlf == lf {
-        (to_crlf(old_string), to_crlf(new_string))
-    } else {
-        (old_string.to_string(), new_string.to_string())
-    };
-    // Strings that differ only in line endings are the same edit once read
-    // as CRLF; writing it would report a change that never reached the file.
-    if old_string == new_string {
-        return ToolOutcome::err(format!(
-            "old_string and new_string differ only in line endings; {rel} uses CRLF throughout and edit_file keeps it, so use write_file to change line endings"
-        ));
+    if crlf > 0 && crlf == lf {
+        for (old_string, new_string, _) in &mut list {
+            (*old_string, *new_string) = (to_crlf(old_string), to_crlf(new_string));
+        }
     }
 
-    let new = if old.contains(&old_string) {
-        let count = old.matches(&old_string).count();
+    // Every match as (start, end, replacement), in the file as read.
+    let mut spans = Vec::new();
+    for (i, (old_string, new_string, replace_all)) in list.iter().enumerate() {
+        // Strings that differ only in line endings are the same edit once
+        // read as CRLF; writing it would report a change that never reached
+        // the file.
+        if old_string == new_string {
+            return ToolOutcome::err(format!(
+                "{}old_string and new_string differ only in line endings; {rel} uses CRLF throughout and edit_file keeps it, so use write_file to change line endings",
+                label(i)
+            ));
+        }
+        let count = old.matches(old_string.as_str()).count();
         if count > 1 && !replace_all {
             return ToolOutcome::err(format!(
-                "old_string matches {count} times; provide a longer unique string or set replace_all to true"
+                "{}old_string matches {count} times; provide a longer unique string or set replace_all to true",
+                label(i)
             ));
         }
-        if replace_all {
-            old.replace(&old_string, &new_string)
-        } else {
-            old.replacen(&old_string, &new_string, 1)
-        }
-    } else {
-        let mixed_endings = crlf > 0 && crlf < lf && old_string.contains('\n');
-        if !mixed_endings {
-            if let Some(hint) = anchored_edit_hint(&old, &old_string) {
-                return ToolOutcome::err(hint);
+        if count == 0 {
+            let mixed_endings = crlf > 0 && crlf < lf && old_string.contains('\n');
+            let anchored = if mixed_endings { None } else { anchored_edit_hint(&old, old_string) };
+            let mut hint = anchored.unwrap_or_else(|| closest_line_hint(&old, old_string));
+            if mixed_endings {
+                hint.push_str(&format!(
+                    " Note: {rel} mixes CRLF and LF line endings, which read_file does not show, so a multi-line old_string must match each line ending exactly; edit one line at a time or rewrite the file with write_file."
+                ));
             }
+            if total > 1 {
+                hint.push_str(" Each edit matches the file as it was before this call; nothing was written.");
+            }
+            return ToolOutcome::err(format!("{}{hint}", label(i)));
         }
-        let mut hint = closest_line_hint(&old, &old_string);
-        if mixed_endings {
-            hint.push_str(&format!(
-                " Note: {rel} mixes CRLF and LF line endings, which read_file does not show, so a multi-line old_string must match each line ending exactly; edit one line at a time or rewrite the file with write_file."
-            ));
-        }
-        return ToolOutcome::err(hint);
-    };
+        spans.extend(old.match_indices(old_string.as_str()).map(|(at, _)| (at, at + old_string.len(), i)));
+    }
+    spans.sort_unstable();
+    if let Some(w) = spans.windows(2).find(|w| w[1].0 < w[0].1) {
+        let (a, b) = (w[0].2.min(w[1].2) + 1, w[0].2.max(w[1].2) + 1);
+        let what = if a == b { format!("matches of edit {a}") } else { format!("edits {a} and {b}") };
+        return ToolOutcome::err(format!("{what} overlap in {rel}; merge them into one edit. Nothing was written."));
+    }
+
+    // Splice every replacement in one pass, noting where each landed.
+    let (mut new, mut changed, mut at) = (String::with_capacity(old.len()), Vec::new(), 0);
+    for &(start, end, i) in &spans {
+        new.push_str(&old[at..start]);
+        changed.push((new.len(), new.len() + list[i].1.len()));
+        new.push_str(&list[i].1);
+        at = end;
+    }
+    new.push_str(&old[at..]);
 
     if let Err(e) = write_regular(&path, rel, new.as_bytes()) {
         return ToolOutcome::err(e);
     }
-    changed_file("edited", root, &path, &old, &new)
+    let mut outcome = changed_file("edited", root, &path, &old, &new);
+    outcome.output.push_str(&edit_excerpt(&new, &changed));
+    outcome
+}
+
+/// Most bytes an edit's excerpt adds to its result.
+const EXCERPT_BYTES: usize = 2_000;
+
+/// The lines of `new` that the byte ranges in `changed` touch, with two lines
+/// of context, numbered as read_file numbers them, so a model sees its edit
+/// in place without a read-back. A run of more than six changed lines shows
+/// its first and last three, since the model wrote them; the whole is cut at
+/// `EXCERPT_BYTES` and says so.
+fn edit_excerpt(new: &str, changed: &[(usize, usize)]) -> String {
+    let starts: Vec<usize> =
+        std::iter::once(0).chain(new.match_indices('\n').map(|(i, _)| i + 1)).filter(|&s| s < new.len()).collect();
+    let Some(last_line) = starts.len().checked_sub(1) else {
+        return String::new();
+    };
+    let line_of = |offset: usize| starts.partition_point(|&s| s <= offset.min(new.len() - 1)) - 1;
+    // Each line range to show, merged where ranges meet.
+    let mut shown: Vec<(usize, usize)> = Vec::new();
+    let mut show = |lo: usize, hi: usize| match shown.last_mut() {
+        Some(prev) if lo <= prev.1 + 1 => prev.1 = prev.1.max(hi),
+        _ => shown.push((lo, hi)),
+    };
+    for &(start, end) in changed {
+        let (first, last) = (line_of(start), line_of(end.max(start + 1) - 1));
+        let (lo, hi) = (first.saturating_sub(2), (last + 2).min(last_line));
+        if last - first >= 6 {
+            show(lo, first + 2);
+            show(last - 2, hi);
+        } else {
+            show(lo, hi);
+        }
+    }
+    let mut out = String::from("\n");
+    for (k, &(lo, hi)) in shown.iter().enumerate() {
+        if k > 0 {
+            let gap = lo - shown[k - 1].1 - 1;
+            out.push_str(&format!("[{gap} line{} not shown]\n", if gap == 1 { "" } else { "s" }));
+        }
+        for n in lo..=hi {
+            let text = &new[starts[n]..starts.get(n + 1).copied().unwrap_or(new.len())];
+            let text = text.strip_suffix('\n').map_or(text, |t| t.strip_suffix('\r').unwrap_or(t));
+            let text = numbered_line(n + 1, text, text.len());
+            if out.len() + text.len() > EXCERPT_BYTES {
+                out.push_str(&format!("[excerpt cut at {EXCERPT_BYTES} bytes; read_file shows the rest]\n"));
+                return out;
+            }
+            out.push_str(&text);
+        }
+    }
+    out
 }
 
 /// The walk glob and grep share, from `walk_root` in the project whose
@@ -2784,6 +2896,149 @@ mod tests {
         let out = edit_file(&root, &json!({"path": "mixed.txt", "old_string": "two\nthree", "new_string": "2\n3"}));
         assert!(out.ok, "{}", out.output);
         assert_eq!(std::fs::read_to_string(root.join("mixed.txt")).unwrap(), "one\r\n2\n3\r\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Several replacements in one call land together, each matched against
+    /// the file as it was, and the result shows them in place with their
+    /// line numbers so the model need not read the file back.
+    #[test]
+    fn one_edit_call_applies_several_replacements_and_shows_them() {
+        let root = temp_project();
+        let original = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n    two();\n}\n\nfn c() {}\n";
+        std::fs::write(root.join("lib.rs"), original).unwrap();
+        let out = edit_file(&root, &json!({"path": "lib.rs", "edits": [
+            {"old_string": "fn c() {}", "new_string": "fn c() {\n    three();\n}"},
+            {"old_string": "    one();", "new_string": "    uno();"},
+            {"old_string": "two()", "new_string": "dos()", "replace_all": true},
+        ]}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(root.join("lib.rs")).unwrap(),
+            "fn a() {\n    uno();\n}\n\nfn b() {\n    dos();\n    dos();\n}\n\nfn c() {\n    three();\n}\n"
+        );
+        let mut lines = out.output.lines();
+        assert_eq!(lines.next(), Some("edited lib.rs (+6 −4)"), "{}", out.output);
+        let excerpt: Vec<&str> = lines.collect();
+        for shown in ["2     uno();", "6     dos();", "7     dos();", "10 fn c() {", "11     three();", "12 }"] {
+            assert!(excerpt.contains(&shown), "the excerpt shows {shown:?}:\n{}", out.output);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A list is all or nothing: one replacement that cannot apply leaves
+    /// the file as it was, and the error names which one and why.
+    #[test]
+    fn a_failed_replacement_in_a_list_writes_nothing_and_names_itself() {
+        let root = temp_project();
+        let original = "alpha\nbeta\ngamma\nbeta\n";
+        std::fs::write(root.join("list.txt"), original).unwrap();
+        for (edits, expected) in [
+            (json!([{"old_string": "alpha", "new_string": "A"}, {"old_string": "delta", "new_string": "D"}]),
+             "edit 2 of 2: old_string not found"),
+            (json!([{"old_string": "alpha", "new_string": "A"}, {"old_string": "beta", "new_string": "B"}]),
+             "edit 2 of 2: old_string matches 2 times"),
+            (json!([{"old_string": "gamma", "new_string": "G"}, {"old_string": "", "new_string": "x"}]),
+             "edit 2 of 2: old_string is empty"),
+            (json!([{"old_string": "alpha", "new_string": "alpha"}]), "old_string and new_string are identical"),
+            (json!([{"old_string": "alpha"}]), "edits[0] needs old_string and new_string"),
+            (json!("not a list"), "edits must be a list"),
+        ] {
+            let out = edit_file(&root, &json!({"path": "list.txt", "edits": edits}));
+            assert!(!out.ok && out.output.starts_with(expected), "{expected:?}: {}", out.output);
+            assert_eq!(std::fs::read_to_string(root.join("list.txt")).unwrap(), original);
+        }
+        // An edit that depends on another's output does not see it, and is
+        // told so.
+        let out = edit_file(&root, &json!({"path": "list.txt", "edits": [
+            {"old_string": "alpha", "new_string": "omega"}, {"old_string": "omega", "new_string": "z"}]}));
+        assert!(!out.ok && out.output.contains("as it was before this call"), "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("list.txt")).unwrap(), original);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Replacements that overlap have no single meaning, so the call is
+    /// refused before anything is written, including the same text named
+    /// twice; two that only touch are fine.
+    #[test]
+    fn overlapping_replacements_are_refused() {
+        let root = temp_project();
+        let original = "one two three\n";
+        std::fs::write(root.join("o.txt"), original).unwrap();
+        for (edits, expected) in [
+            (json!([{"old_string": "one two", "new_string": "1 2"}, {"old_string": "two three", "new_string": "2 3"}]),
+             "edits 1 and 2 overlap in o.txt"),
+            (json!([{"old_string": "three", "new_string": "3"}, {"old_string": "three", "new_string": "III"}]),
+             "edits 1 and 2 overlap in o.txt"),
+            (json!([{"old_string": "e", "new_string": "E", "replace_all": true}, {"old_string": "hree", "new_string": "HREE"}]),
+             "edits 1 and 2 overlap in o.txt"),
+        ] {
+            let out = edit_file(&root, &json!({"path": "o.txt", "edits": edits}));
+            assert!(!out.ok && out.output.starts_with(expected), "{expected:?}: {}", out.output);
+            assert_eq!(std::fs::read_to_string(root.join("o.txt")).unwrap(), original);
+        }
+        let out = edit_file(&root, &json!({"path": "o.txt", "edits": [
+            {"old_string": "one ", "new_string": "1_"}, {"old_string": "two", "new_string": "2"}]}));
+        assert!(out.ok, "adjacent replacements apply: {}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("o.txt")).unwrap(), "1_2 three\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The excerpt is bounded however much an edit changes: a long run of
+    /// new lines shows its ends, and a replace_all across a large file stops
+    /// at the byte cap and says where it stopped.
+    #[test]
+    fn the_edit_excerpt_is_capped_and_says_so() {
+        let root = temp_project();
+        let body: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("run.txt"), "head\nmarker\ntail\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "run.txt", "old_string": "marker\n", "new_string": body}));
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("1 head\n2 line 1\n3 line 2\n4 line 3\n[6 lines not shown]\n11 line 10\n"), "{}", out.output);
+        assert!(out.output.ends_with("13 line 12\n14 tail\n"), "{}", out.output);
+
+        // Each change sits far enough from the next to be a hunk of its own.
+        let wide = format!("{}\n", "x".repeat(300));
+        std::fs::write(root.join("wide.txt"), format!("{wide}keep\nkeep\nkeep\nkeep\nkeep\n").repeat(40)).unwrap();
+        let out = edit_file(&root, &json!({"path": "wide.txt", "old_string": "x\n", "new_string": "y\n", "replace_all": true}));
+        assert!(out.ok, "{}", out.output);
+        let excerpt = out.output.split_once('\n').unwrap().1;
+        assert!(excerpt.ends_with("[excerpt cut at 2000 bytes; read_file shows the rest]\n"), "{excerpt}");
+        assert!(excerpt.len() <= EXCERPT_BYTES + 80, "a {}-byte excerpt", excerpt.len());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The single form reads and writes as it always has: its summary line
+    /// and its errors are unchanged, and the excerpt follows the summary. A
+    /// list may follow the top-level pair, and an empty pair beside a list
+    /// is ignored, as is a list sent as a JSON string.
+    #[test]
+    fn the_single_form_is_unchanged_and_combines_with_a_list() {
+        let root = temp_project();
+        std::fs::write(root.join("s.txt"), "a\nb\nc\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "s.txt", "old_string": "b", "new_string": "B"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output, "edited s.txt (+1 −1)\n1 a\n2 B\n3 c\n");
+        let out = edit_file(&root, &json!({"path": "s.txt", "old_string": "zzz", "new_string": "y"}));
+        assert!(out.output.starts_with("old_string not found."), "{}", out.output);
+        let out = edit_file(&root, &json!({"path": "s.txt"}));
+        assert_eq!(out.output, "missing required arguments: old_string and new_string");
+
+        let out = edit_file(&root, &json!({"path": "s.txt", "old_string": "a", "new_string": "A",
+            "edits": [{"old_string": "c", "new_string": "C"}]}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("s.txt")).unwrap(), "A\nB\nC\n");
+        let out = edit_file(&root, &json!({"path": "s.txt", "old_string": "", "new_string": "",
+            "edits": "[{\"old_string\": \"B\", \"new_string\": \"b\"}]"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("s.txt")).unwrap(), "A\nb\nC\n");
+
+        // A list on a CRLF file keeps CRLF, and the excerpt shows no \r.
+        std::fs::write(root.join("w.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "w.txt", "edits": [
+            {"old_string": "a", "new_string": "A"}, {"old_string": "c", "new_string": "C\nD"}]}));
+        assert!(out.ok && out.output.ends_with("\n1 A\n2 b\n3 C\n4 D\n"), "{:?}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("w.txt")).unwrap(), "A\r\nb\r\nC\r\nD\r\n");
         let _ = std::fs::remove_dir_all(root);
     }
 
