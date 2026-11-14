@@ -184,10 +184,10 @@ and the run that writes a key already uses it.
   Max uses the explicit value in `settings.json` first, then the selected
   model's value in `providers.json`, then a default that follows the
   model's context window: 150,000 tokens, or a quarter of the window when
-  that is larger (262,144 for a 1,048,576-token window). Fewer prunes on a
-  large window mean fewer re-reads of shortened tool results and fewer
-  requests that re-send the whole context uncached; the price is a larger
-  context on every request while no prune fires. To keep more or less
+  that is larger (262,144 for a 1,048,576-token window). Fewer cuts on a
+  large window mean fewer re-reads of removed context and fewer requests
+  that re-send the whole context uncached; the price is a larger context on
+  every request while no cut fires. To keep more or less
   history on a model, set the cap in that model's entry and leave the
   global setting unset.
 - `temperature` (default unset): sent only when set, so otherwise the
@@ -297,7 +297,7 @@ estimate.
 
 Open Max estimates the current input against the selected `compaction_tokens`
 value, with a 20,000-token floor on that value. It calibrates this soft trigger
-and its 70% prune target with the prompt count from the same route. A lower
+with the prompt count from the same route. A lower
 reported count can allow more history within the conservative input budget.
 This is a best-effort estimate because providers may count prompt tokens
 differently. A normal turn request that fails or returns no usable prompt
@@ -307,22 +307,33 @@ The input budget always bounds the trigger. With the defaults before
 calibration, a 128,000-token window triggers at 122,880 tokens, a
 500,000-token window triggers at 150,000 tokens, and a 1,048,576-token
 window triggers at 262,144 tokens. If the frozen schemas or the
-messages a prune must keep make the target unreachable, automatic compaction
-falls back to the input budget. The `/compact` command aims for 70% of the
-calibrated trigger and uses the input budget if the frozen schemas alone
-fill the trigger.
+messages a cut must keep make the target unreachable, automatic compaction
+falls back to the input budget. The `/compact` command makes the same cut
+against the calibrated trigger and uses the input budget if the frozen
+schemas alone fill the trigger.
 
-Between prunes the history stays byte-stable so the server can reuse its
-prompt cache. A prune truncates old tool outputs first, then drops the oldest
-exchanges. Everything dropped is appended verbatim to
-`~/.openmax/sessions/<id>.archive.jsonl`, and the context note that replaces
-the dropped span names that path, so compaction stays reversible: the model
-summary (or its heuristic fallback) is the bounded view, the archive is the
-lossless record. If a later compaction drops a shortened tool result, its
-summary uses the original when it can verify that record in the last 8 MiB of
-the session's archive. When that record is unavailable, or the shortened
-result predates archive references, the summary uses the retained excerpt.
-The `compaction` hook observes each prune.
+A compaction is one cut. It keeps, byte for byte, the system prompt, the
+opening of the conversation through your original request, the prompt of the
+turn in progress, and the newest exchanges. It aims to fit the note, that
+prompt and the newest exchanges in a quarter of the trigger, at most 20,000
+tokens, and never aims past the input budget, even where the frozen schemas
+and the opening crowd it. It removes everything
+between, and never shortens a kept message, so between cuts the history stays
+byte-stable and the server can reuse its prompt cache. Before the cut, the
+session's own model writes the notes it will continue from: one extra
+request whose prompt is the conversation up to the cut, as earlier requests
+already sent it, with the same tools, plus one ask. The notes, up to 4,000
+bytes, take the removed span's place in one context note. A call in that
+reply never runs, and nothing else of the exchange is kept. When no notes
+come back (an error, an empty reply, a timeout, or a request
+`max_agent_tokens` refuses), automatic compaction makes no cut until the
+window forces one, and does not ask again in that turn before then. A cut the
+window forces, or a `/compact`, is made without notes when none come back,
+and its note lists the tools used, the files touched and the earlier goals
+instead. Everything a cut removes is appended verbatim to
+`~/.openmax/sessions/<id>.archive.jsonl`, and the context note names that
+path, so compaction stays reversible: the notes are the bounded view, the
+archive is the lossless record. The `compaction` hook observes each cut.
 
 ## Approvals
 
