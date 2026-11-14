@@ -197,6 +197,18 @@ const MAX_SUMMARY_BYTES: usize = 4_000;
 /// The ask that ends the notes request, after the transcript up to the cut.
 pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request is about to be removed from the conversation to keep requests small. Write the notes you will continue from. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), at most 400 words, in four labeled parts. State: what is finished and verified, what is half done, and the next step. Files: every path changed or still needed, with the names and places in it that matter. Facts: commands that work in this project, each failure seen with its cause, and every instruction the user gave after the original request, in the user's words; copy identifiers, paths and error text exactly. Open: what is unresolved or unverified. If a context note appears above, carry forward what still holds.]";
 
+/// The notes request's messages: `head`, every message the cut removes, and
+/// the ask. The ask is stamped with the effort in force, as a turn's prompt
+/// is, so where a turn changed the effort and its prompt stays after the cut,
+/// the change rides just ahead of the ask and the effort every earlier request
+/// named at its top stays there: what they sent stays a cached prefix.
+pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut messages = head.to_vec();
+    messages.extend(dropped.iter().cloned());
+    messages.push(ChatMessage { effort: Some(client.effort_stamp()), ..ChatMessage::user(NOTES_ASK) });
+    messages
+}
+
 /// The notes the session's own model writes before a cut. The request is the
 /// transcript up to the cut (`head`, then every message the cut removes, in
 /// order) and `NOTES_ASK`, with the turn's tools: a prompt the session
@@ -213,11 +225,10 @@ async fn summarize_compaction(
     digest: &CompactionDigest,
     spend: &mut RequestSpend,
 ) -> Option<String> {
-    let CompactionCtx { core, session_id, client, cancelled, schemas, .. } = *ctx;
-    let mut messages = head.to_vec();
-    messages.extend(digest.dropped.iter().cloned());
-    messages.push(ChatMessage::user(NOTES_ASK));
-    let estimated = messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() + request_overhead(schemas);
+    let CompactionCtx { core, session_id, client, cancelled, schemas, factor, .. } = *ctx;
+    let messages = notes_messages(client, head, &digest.dropped);
+    // In real tokens by the session's learned factor, as every request is admitted.
+    let estimated = to_real(messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() + request_overhead(schemas), factor);
     if !spend.admits(estimated) { return None; }
     let mut resent = Vec::new();
     let outcome = tokio::time::timeout(SUMMARY_TIMEOUT, client.stream_chat(&messages, client.reply_reserve, schemas, cancelled.clone(), |delta| {
@@ -317,6 +328,9 @@ pub(crate) struct CompactionCtx<'a> {
     pub(crate) cancelled: &'a Arc<CancelToken>,
     /// The turn's tool schemas, as every request of the turn sends them.
     pub(crate) schemas: &'a str,
+    /// The session's learned real tokens per estimated token (`token_factor`),
+    /// which the notes request is admitted and charged by, as every request is.
+    pub(crate) factor: f64,
 }
 
 /// Ask for the notes and settle the candidate's digest note: the archive
@@ -878,6 +892,7 @@ pub(crate) mod tests {
             hooks: &Hooks::default(),
             cancelled: &Arc::new(CancelToken::default()),
             schemas: SCHEMAS,
+            factor: 1.0,
         };
         assert!(sessions::save_messages(&core, &session_id, &messages, &mut 0, true));
         let mut spend = RequestSpend::new(None);
@@ -1006,7 +1021,7 @@ pub(crate) mod tests {
         let client = ChatClient::from_endpoint(&endpoint);
         let hooks = Hooks::discover(&project, &core.data_dir);
         let cancelled = Arc::new(CancelToken::default());
-        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &project, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS };
+        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &project, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS, factor: 1.0 };
         let budget = 16_000;
         // At the window, so the cut is made without notes.
         compact_messages(&ctx, &mut messages, budget, budget, 0, false, &mut RequestSpend::new(None)).await.unwrap();
@@ -1049,7 +1064,7 @@ pub(crate) mod tests {
             ));
             let client = ChatClient::new(url, None, "fixture".into(), None, 512);
             let (hooks, cancelled) = (Hooks::default(), Arc::new(CancelToken::default()));
-            let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS };
+            let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS, factor: 1.0 };
             // Small messages, so the cut stops just under its target.
             let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("Find the build result.")];
             messages.extend((0..300).map(|_| msg("assistant", 400)));
@@ -1737,6 +1752,7 @@ pub(crate) mod tests {
                 hooks: &self.hooks,
                 cancelled: &self.cancelled,
                 schemas: SCHEMAS,
+                factor: 1.0,
             }
         }
 
@@ -1976,6 +1992,34 @@ pub(crate) mod tests {
         assert_no_cut_without_notes(&url, &mut spend).await;
         assert!(requests.recv_timeout(Duration::from_millis(300)).is_err(), "the refused request is never sent");
         assert_eq!(spend.tokens, 0);
+    }
+
+    /// The notes request is admitted in real tokens by the session's learned
+    /// factor, as every request is: a ceiling with room for its estimate but
+    /// not for twice it refuses the request when the provider counts double.
+    #[tokio::test]
+    async fn the_spend_ceiling_admits_notes_by_the_learned_factor() {
+        let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        let mut spend = RequestSpend::new(None);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut spend).await > 0);
+        let sent = body(&requests)["messages"].as_array().unwrap().len();
+        assert!(sent > 2 && spend.tokens > 0, "the notes request went and was charged");
+        // What that request was admitted at, less the reply it was charged for.
+        let estimated = spend.tokens - estimate_tokens("State: halfway.".len());
+
+        let (url, _requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        let original: Vec<String> = messages.iter().map(wire).collect();
+        assert!(sessions::save_messages(&fixture.core, &fixture.id, &messages, &mut 0, true));
+        let mut spend = RequestSpend::new(Some(estimated * 3 / 2));
+        let ctx = CompactionCtx { factor: 2.0, ..fixture.ctx() };
+        assert_eq!(compact_messages(&ctx, &mut messages, 20_000, 100_000, 0, false, &mut spend).await.unwrap(), 0);
+        assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original, "the history is whole");
+        assert!(!fixture.committed(), "nothing of a cut was committed");
+        assert_eq!(spend.tokens, 0, "the refused request is never sent, so nothing is charged");
     }
 
     /// When the window forces the cut it is made without notes, and leaves
