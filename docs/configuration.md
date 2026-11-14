@@ -196,6 +196,16 @@ and the run that writes a key already uses it.
   `compaction_tokens`, and a cut still keeps at most a quarter of its trigger.
   A smaller value makes the requests after a cut cheaper and leaves the model
   less of its recent work to continue from.
+- `reasoning_carry_chars` (default unset) bounds the reasoning each earlier
+  reply carries back on later requests to its last N characters, behind the
+  fixed line `[earlier reasoning omitted]`. The bound is fixed on a reply when
+  it is stored, so the bytes it is sent with never change and the prompt cache
+  holds; the session file keeps the full reasoning. It applies to
+  `reasoning`, `reasoning_content` and unsigned `reasoning.text` blocks of
+  `reasoning_details` alike. A reply whose reasoning carries a signature or an
+  opaque block, and a reply cut at the reply limit before any call (its
+  continuation resumes from that reasoning), go back whole. Unset sends every
+  reply's reasoning whole, as before.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's

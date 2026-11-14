@@ -180,14 +180,15 @@ impl Serialize for WireMessages<'_> {
             let (replay, plain) = chat_replay(m, self.origin, self.prefer_reasoning_details);
             let mark = self.marks && (at == last || m.role == "system");
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
+            let (reasoning_content, reasoning, reasoning_details) = m.carried_reasoning();
             WireMessage {
                 role: &m.role,
                 content: m.content.as_deref().map(|text| WireContent { text, mark: text_mark }),
                 tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
-                reasoning_content: m.reasoning_content.as_deref().filter(|_| plain),
-                reasoning: m.reasoning.as_deref().filter(|_| plain),
-                reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
+                reasoning_content: reasoning_content.filter(|_| plain),
+                reasoning: reasoning.filter(|_| plain),
+                reasoning_details: reasoning_details.filter(|_| replay),
                 cache_control: (mark && !text_mark).then(|| serde_json::json!({"type": "ephemeral"})),
             }
         }))
@@ -207,11 +208,11 @@ struct WireMessage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<&'a str>,
+    reasoning_content: Option<std::borrow::Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<&'a str>,
+    reasoning: Option<std::borrow::Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_details: Option<&'a RawValue>,
+    reasoning_details: Option<std::borrow::Cow<'a, RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<Value>,
 }

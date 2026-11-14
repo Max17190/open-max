@@ -127,6 +127,12 @@ pub struct Settings {
     /// still keeps at most a quarter of its trigger.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_keep_tokens: Option<usize>,
+    /// The most characters of an assistant reply's reasoning that later
+    /// requests carry back, its tail behind a fixed marker. Fixed on the
+    /// reply when it is stored, so its bytes never change afterwards. Unset
+    /// carries every reply's reasoning whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_carry_chars: Option<usize>,
     /// Ceiling on the tokens one turn may spend across the agent requests it
     /// makes, counted as a provider bills them: prompt plus completion, with
     /// cached prompt tokens at full value, because what this bounds is the
@@ -181,6 +187,7 @@ impl Default for Settings {
             max_output_bytes: None,
             compaction_tokens: None,
             compaction_keep_tokens: None,
+            reasoning_carry_chars: None,
             max_agent_tokens: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),

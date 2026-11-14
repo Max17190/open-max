@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCallFunction {
@@ -94,7 +96,60 @@ pub struct ChatMessage {
     /// it is never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_tool_output: Option<String>,
+    /// On a reply stored while `reasoning_carry_chars` was set and its
+    /// reasoning was longer: the most characters of that reasoning later
+    /// requests carry (`carried_reasoning`). Fixed when the reply is stored,
+    /// so the bytes it goes out with never change, across resume and
+    /// compaction alike; the full reasoning stays here. Never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_carry: Option<usize>,
 }
+
+/// What a bounded reply's reasoning carries in front of its tail.
+pub const REASONING_OMITTED: &str = "[earlier reasoning omitted]\n";
+
+/// The last `limit` characters of `text` behind [`REASONING_OMITTED`], or
+/// `text` itself when it has no more than that.
+pub(crate) fn reasoning_tail(text: &str, limit: usize) -> Cow<'_, str> {
+    let start = match limit.checked_sub(1) {
+        None => text.len(),
+        Some(back) => text.char_indices().nth_back(back).map_or(0, |(at, _)| at),
+    };
+    if start == 0 { Cow::Borrowed(text) } else { Cow::Owned(format!("{REASONING_OMITTED}{}", &text[start..])) }
+}
+
+/// `reasoning_details` whose every block is an unsigned `reasoning.text`,
+/// parsed; `None` for anything else (encrypted, summary or signed blocks),
+/// which goes back whole because a signature covers its text.
+fn unsigned_text_blocks(raw: &RawValue) -> Option<Vec<Map<String, Value>>> {
+    let blocks: Vec<Map<String, Value>> = serde_json::from_str(raw.get()).ok()?;
+    blocks.iter().all(|b| {
+        b.get("type").and_then(Value::as_str) == Some("reasoning.text")
+            && b.get("text").is_some_and(Value::is_string)
+            && b.get("signature").is_none_or(|s| s.is_null() || s.as_str() == Some(""))
+    }).then_some(blocks)
+}
+
+/// `reasoning_details` cut like [`reasoning_tail`] cuts the text its blocks
+/// join to: earlier blocks dropped, the first kept one starting with the
+/// marker. `None` when it is kept whole.
+fn details_tail(raw: &RawValue, limit: usize) -> Option<Box<RawValue>> {
+    let mut blocks = unsigned_text_blocks(raw)?;
+    let mut left = limit;
+    let at = blocks.iter().rposition(|b| {
+        let chars = b["text"].as_str().map_or(0, |t| t.chars().count());
+        let cut = chars > left;
+        if !cut { left -= chars; }
+        cut
+    })?;
+    let text = reasoning_tail(blocks[at]["text"].as_str().unwrap_or_default(), left).into_owned();
+    blocks[at].insert("text".into(), Value::String(text));
+    serde_json::value::to_raw_value(&blocks[at..]).ok()
+}
+
+/// A reply's reasoning as later requests carry it: (`reasoning_content`,
+/// `reasoning`, `reasoning_details`), each cut to `reasoning_carry` when set.
+pub(crate) type CarriedReasoning<'a> = (Option<Cow<'a, str>>, Option<Cow<'a, str>>, Option<Cow<'a, RawValue>>);
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
@@ -113,7 +168,32 @@ impl ChatMessage {
     /// Every constructor starts without reasoning: only the agent loop
     /// attaches it, from a reply, together with its origin.
     fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
-        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None }
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None, reasoning_carry: None }
+    }
+
+    /// The bound to store on a new reply when `reasoning_carry_chars` is
+    /// `limit`: set only when some reasoning is longer and all of it can be
+    /// cut, and never on a reply cut at the reply limit before any call,
+    /// whose continuation resumes from its reasoning.
+    pub(crate) fn reasoning_carry_for(&self, limit: Option<usize>, cut_without_call: bool) -> Option<usize> {
+        let limit = limit.filter(|_| !cut_without_call)?;
+        let details = match self.reasoning_details.as_deref() {
+            Some(raw) => Some(unsigned_text_blocks(raw)?.iter().map(|b| b["text"].as_str().map_or(0, |t| t.chars().count())).sum()),
+            None => None,
+        };
+        let plain = [&self.reasoning_content, &self.reasoning].into_iter().flatten().map(|t| t.chars().count());
+        plain.chain(details).any(|chars| chars > limit).then_some(limit)
+    }
+
+    /// This message's reasoning as a later request carries it.
+    pub(crate) fn carried_reasoning(&self) -> CarriedReasoning<'_> {
+        fn cut(text: Option<&str>, carry: Option<usize>) -> Option<Cow<'_, str>> {
+            text.map(|t| carry.map_or(Cow::Borrowed(t), |n| reasoning_tail(t, n)))
+        }
+        let details = self.reasoning_details.as_deref().map(|raw| {
+            self.reasoning_carry.and_then(|n| details_tail(raw, n)).map_or(Cow::Borrowed(raw), Cow::Owned)
+        });
+        (cut(self.reasoning_content.as_deref(), self.reasoning_carry), cut(self.reasoning.as_deref(), self.reasoning_carry), details)
     }
 
     /// Rough size estimate of the stored message, including reasoning.
@@ -123,13 +203,12 @@ impl ChatMessage {
 
     pub(crate) fn estimated_tokens_with_replay(&self, replay: bool, plain: bool) -> usize {
         let mut chars = self.content.as_deref().map(str::len).unwrap_or(0);
+        let (content, reasoning, details) = self.carried_reasoning();
         if plain {
-            for reasoning in [&self.reasoning_content, &self.reasoning].into_iter().flatten() {
-                chars += reasoning.len();
-            }
+            chars += [content, reasoning].into_iter().flatten().map(|t| t.len()).sum::<usize>();
         }
         if replay {
-            chars += self.reasoning_details.as_deref().map_or(0, |d| d.get().len());
+            chars += details.map_or(0, |d| d.get().len());
         }
         if let Some(calls) = &self.tool_calls {
             for c in calls {
@@ -642,5 +721,29 @@ mod tests {
         let line = r#"{"session_id":"s1","type":"token","text":"hi"}"#;
         let ev: AgentEvent = serde_json::from_str(line).unwrap();
         assert!(matches!(ev, AgentEvent::Token { text } if text == "hi"));
+    }
+
+    /// Text split over several `reasoning_details` blocks is cut where the
+    /// joined text is, so it matches the plaintext field; a signed block or an
+    /// opaque one keeps the whole reply's reasoning as it was.
+    #[test]
+    fn a_bound_cuts_joined_text_blocks_and_never_signed_ones() {
+        let details = |raw: &str| Some(RawValue::from_string(raw.into()).unwrap());
+        let mut reply = ChatMessage::assistant(Some("ok".into()), None);
+        reply.reasoning = Some("abcdefghij".into());
+        reply.reasoning_details = details(r#"[{"type":"reasoning.text","text":"abcdef","signature":null},{"type":"reasoning.text","text":"ghij"}]"#);
+        reply.reasoning_carry = reply.reasoning_carry_for(Some(6), false);
+        assert_eq!(reply.reasoning_carry, Some(6));
+        let (_, plain, blocks) = reply.carried_reasoning();
+        let marked = format!("{REASONING_OMITTED}ef");
+        assert_eq!(plain.as_deref(), Some(format!("{marked}ghij").as_str()));
+        let blocks: Value = serde_json::from_str(blocks.unwrap().get()).unwrap();
+        assert_eq!(blocks, serde_json::json!([{"type":"reasoning.text","text":marked,"signature":null},{"type":"reasoning.text","text":"ghij"}]));
+        assert_eq!(reply.reasoning_carry_for(Some(10), false), None, "it fits");
+        assert_eq!(reply.reasoning_carry_for(Some(6), true), None, "cut before any call");
+        for kept in [r#"[{"type":"reasoning.text","text":"abcdefghij","signature":"sig"}]"#, r#"[{"type":"reasoning.encrypted","data":"x"}]"#] {
+            reply.reasoning_details = details(kept);
+            assert_eq!(reply.reasoning_carry_for(Some(6), false), None, "{kept}");
+        }
     }
 }

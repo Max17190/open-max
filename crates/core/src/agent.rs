@@ -928,6 +928,9 @@ async fn run_loop(
             reply.reasoning_content = result.reasoning_content.clone();
             reply.reasoning = result.reasoning.clone();
             reply.reasoning_details = result.reasoning_details.clone();
+            // Bounded here, once: the bytes it goes out with never change.
+            let cut_without_call = result.hit_output_cap(limit) && tool_calls.is_empty();
+            reply.reasoning_carry = reply.reasoning_carry_for(settings.reasoning_carry_chars, cut_without_call);
             let signed_calls = tool_calls.iter().any(|c| c.extra_content.is_some());
             if reply.reasoning_content.is_some() || reply.reasoning.is_some() || reply.reasoning_details.is_some() || signed_calls {
                 reply.reasoning_origin = Some(client.origin());
@@ -3083,13 +3086,19 @@ mod tests {
 
     /// [`capturing_endpoint`] answering the first `times` requests with `first`.
     async fn capturing_endpoint_times(first: &str, times: usize) -> (String, Arc<StdMutex<Vec<String>>>) {
+        capturing_script(&vec![first; times]).await
+    }
+
+    /// [`capturing_endpoint`] answering the nth request with the nth stream,
+    /// and every one after them with `STOP_SSE`.
+    async fn capturing_script(streams: &[&str]) -> (String, Arc<StdMutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
         let seen = bodies.clone();
-        let first = first.to_owned();
+        let streams: Vec<String> = streams.iter().map(|s| s.to_string()).collect();
         tokio::spawn(async move {
             let mut n = 0usize;
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -3116,7 +3125,7 @@ mod tests {
                 }
                 seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
                 n += 1;
-                let sse = if n <= times { first.as_str() } else { STOP_SSE };
+                let sse = streams.get(n - 1).map_or(STOP_SSE, String::as_str);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
                 );
@@ -3177,6 +3186,109 @@ mod tests {
         assert_eq!(last.content.as_deref(), Some("done"));
         assert!(last.reasoning_content.is_none() && last.reasoning.is_none() && last.reasoning_origin.is_none());
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A tool-call reply whose reasoning streams as `reasoning` and as one
+    /// unsigned `reasoning_details` text block, as OpenRouter sends it.
+    fn reasoning_call_sse(reasoning: &str, id: &str) -> String {
+        let delta = serde_json::json!({"reasoning": reasoning, "reasoning_details": [{"type": "reasoning.text", "text": reasoning, "index": 0}],
+            "tool_calls": [{"index": 0, "id": id, "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}]});
+        format!("data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n", serde_json::json!({"choices": [{"delta": delta, "finish_reason": null}]}))
+    }
+
+    /// One turn of a long-reasoning call, a short-reasoning call, and the
+    /// answer, under `reasoning_carry_chars`: each request body, and the
+    /// transcript.
+    async fn carry_turn(carry: Option<usize>, long: &str) -> (Vec<String>, Vec<ChatMessage>) {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (long, short) = (reasoning_call_sse(long, "c1"), reasoning_call_sse("short", "c2"));
+        let (base_url, bodies) = capturing_script(&[&long, &short]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.approval_mode) = (base_url, "stub".into(), Some(16384), ApprovalMode::Auto);
+            s.reasoning_carry_chars = carry;
+        }
+        start_turn(core.clone(), "sess-carry".into(), project.clone(), "go".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "two calls, then the answer");
+        let messages = transcript(&core, "sess-carry").await;
+        let _ = std::fs::remove_dir_all(dir);
+        (bodies, messages)
+    }
+
+    /// `reasoning_carry_chars` cuts a long reasoning to its tail once, when
+    /// the reply is stored: every later request carries the same bytes for
+    /// it in each wire form, a short one goes back whole, and the transcript
+    /// keeps everything.
+    #[tokio::test]
+    async fn a_bounded_carry_sends_the_same_tail_on_every_later_request() {
+        let long = format!("{}the conclusion: édit a.txt", "x".repeat(500));
+        let (bodies, messages) = carry_turn(Some(20), &long).await;
+        let tail = format!("{}{}", crate::types::REASONING_OMITTED, &long[long.len() - 21..]);
+        assert_eq!(tail.chars().count(), crate::types::REASONING_OMITTED.len() + 20);
+        let (first, second) = (sent_replies(&bodies[1]), sent_replies(&bodies[2]));
+        assert_eq!(first[0]["reasoning"], tail, "{}", bodies[1]);
+        assert_eq!(first[0]["reasoning_details"], serde_json::json!([{"type": "reasoning.text", "text": tail, "index": 0}]));
+        assert_eq!(second[0], first[0], "the stored reply goes out unchanged");
+        let bytes = serde_json::to_string(&first[0]["reasoning_details"]).unwrap();
+        assert!(bodies[1].contains(&bytes) && bodies[2].contains(&bytes));
+        assert_eq!(second[1]["reasoning"], "short");
+        assert_eq!(second[1]["reasoning_details"][0]["text"], "short");
+
+        let reply = |id: &str| messages.iter().find(|m| m.tool_calls.as_ref().is_some_and(|c| c[0].id == id)).unwrap();
+        assert_eq!(reply("c1").reasoning.as_deref(), Some(long.as_str()), "the transcript keeps it whole");
+        assert_eq!((reply("c1").reasoning_carry, reply("c2").reasoning_carry), (Some(20), None));
+        assert!(!bodies.iter().any(|b| b.contains("reasoning_carry")));
+        let estimate = reply("c1").estimated_tokens();
+        assert!(estimate < crate::types::estimate_tokens(long.len()), "the estimate counts what is sent: {estimate}");
+    }
+
+    /// Without the setting nothing is bounded or recorded.
+    #[tokio::test]
+    async fn an_unset_carry_sends_reasoning_whole() {
+        let long = "y".repeat(500);
+        let (bodies, messages) = carry_turn(None, &long).await;
+        assert_eq!(sent_replies(&bodies[2])[0]["reasoning"], long.as_str());
+        assert_eq!(sent_replies(&bodies[2])[0]["reasoning_details"][0]["text"], long.as_str());
+        assert!(messages.iter().all(|m| m.reasoning_carry.is_none()));
+        assert!(!bodies.iter().any(|b| b.contains(crate::types::REASONING_OMITTED.trim_end())));
+    }
+
+    /// A reply cut at the reply limit before any call is exempt: its
+    /// continuation resumes from that reasoning, so it goes back whole.
+    #[tokio::test]
+    async fn a_bounded_carry_exempts_a_reply_cut_before_any_call() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let long = "z".repeat(500);
+        let cut = format!("data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices": [{"delta": {"reasoning_content": long}, "finish_reason": null}]}));
+        let (base_url, bodies) = capturing_endpoint(&cut).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(16384), 1024);
+            (s.approval_mode, s.reasoning_carry_chars) = (ApprovalMode::Auto, Some(20));
+        }
+        start_turn(core.clone(), "sess-cut".into(), project.clone(), "go".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "the cut reply, then its continuation");
+        assert_eq!(sent_replies(&bodies[1])[0]["reasoning_content"], long.as_str(), "{}", bodies[1]);
+        assert!(transcript(&core, "sess-cut").await.iter().all(|m| m.reasoning_carry.is_none()));
         let _ = std::fs::remove_dir_all(dir);
     }
 

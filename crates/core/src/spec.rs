@@ -881,6 +881,10 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `compaction_keep_tokens`: optional most a cut keeps of the newest
   exchanges, note included. Unset keeps 20,000; floored at 4,000; at most a
   quarter of the trigger.
+- `reasoning_carry_chars`: optional most characters of each stored reply's
+  reasoning later requests carry, its tail behind a fixed marker. Fixed when
+  the reply is stored; signed or opaque reasoning and replies cut before any
+  call go back whole. Unset carries all of it.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction notes. Unaffordable notes leave the history uncut unless the
   window forces a prune.
