@@ -181,6 +181,12 @@ and the run that writes a key already uses it.
   every request while no cut fires. To keep more or less
   history on a model, set the cap in that model's entry and leave the
   global setting unset.
+- `compaction_keep_tokens` (default unset) sets the most an automatic cut or
+  `/compact` keeps of the newest exchanges, its context note included. Unset
+  keeps 20,000 tokens. The value is floored at 4,000 and calibrated like
+  `compaction_tokens`, and a cut still keeps at most a quarter of its trigger.
+  A smaller value makes the requests after a cut cheaper and leaves the model
+  less of its recent work to continue from.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's
@@ -307,8 +313,8 @@ A compaction is one cut. It keeps, byte for byte, the system prompt, the
 opening of the conversation through your original request, the prompt of the
 turn in progress, and the newest exchanges. It aims to fit the note, that
 prompt and the newest exchanges in a quarter of the trigger, at most 20,000
-tokens, and never aims past the input budget, even where the frozen schemas
-and the opening crowd it. It removes everything
+tokens or `compaction_keep_tokens`, and never aims past the input budget,
+even where the frozen schemas and the opening crowd it. It removes everything
 between, and never shortens a kept message, so between cuts the history stays
 byte-stable and the server can reuse its prompt cache. Before the cut, the
 session's own model writes the notes it will continue from: one extra

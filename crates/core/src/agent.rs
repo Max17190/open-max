@@ -46,7 +46,7 @@ use crate::batch::{batchable_call, execute_readonly_batch, parallel_tool_limit, 
 use crate::client::{ChatClient, TRUNCATED};
 use crate::compaction::{
     compact_messages, compaction_trigger, cut_target, over_budget_error_context, refusal_ratio,
-    request_overhead, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
+    request_overhead, requested_keep, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
     to_estimate, to_real, token_factor, updated_prompt_ratio, CompactionCtx, RequestSpend,
 };
 use crate::config::{ApprovalMode, Settings};
@@ -456,6 +456,7 @@ async fn run_compact(
     // its target. Fall back only when schemas leave no room at the trigger.
     let trigger = requested_trigger(endpoint.compaction_tokens, prompt_ratio, budget);
     let trigger = if schemas_exceed_budget(trigger, schema_tokens) { budget } else { trigger };
+    let keep = requested_keep(settings.compaction_keep_tokens, prompt_ratio);
     let tokens_before =
         schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>();
     if schemas_exceed_budget(trigger, schema_tokens) {
@@ -467,7 +468,7 @@ async fn run_compact(
                 .into(),
         );
     }
-    if tokens_before <= cut_target(trigger, schema_tokens, guard.messages(), &estimate) {
+    if tokens_before <= cut_target(trigger, keep, schema_tokens, guard.messages(), &estimate) {
         // Nothing above the target: say so through the same receipt rather
         // than pruning history that already fits.
         guard.commit().await;
@@ -479,7 +480,7 @@ async fn run_compact(
         });
     }
     let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor };
+    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor, keep };
     let mut spend = RequestSpend::new(settings.max_agent_tokens);
     let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, true, &mut spend).await {
         Ok(count) => count,
@@ -780,11 +781,12 @@ async fn run_loop(
             report_schemas_over_budget(core, session_id, guard.messages(), schema_real, window_budget)
                 .await;
         }
+        let keep = requested_keep(settings.compaction_keep_tokens, prompt_ratio);
         let trigger = if soft_spent { budget } else { compaction_trigger(
-            budget, schema_tokens, endpoint.compaction_tokens, prompt_ratio, guard.messages(), &estimate,
+            budget, schema_tokens, endpoint.compaction_tokens, keep, prompt_ratio, guard.messages(), &estimate,
         ) };
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor,
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep,
         };
         if let Err(message) = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await {
             core.send_agent(session_id, AgentEvent::Error { message });
@@ -1770,7 +1772,7 @@ mod tests {
     use super::*;
     use crate::batch::{collect_bounded, MODE_LEFT_AUTO_BEFORE_START};
     use crate::client::StreamDelta;
-    use crate::compaction::{is_digest_message, DIGEST_PREFIX, MAX_DIGEST_SNIPPET_BYTES};
+    use crate::compaction::{is_digest_message, DIGEST_PREFIX, KEEP_RECENT_TOKENS, MAX_DIGEST_SNIPPET_BYTES};
     use crate::notes::{
         canonical_notice, execution_policy_note, outside_approval_note, policy_notice_hash, rehydrate_policy_notices,
         REPEAT_NOTE_MARK,
@@ -6194,7 +6196,7 @@ mod tests {
         let target = {
             let map = session.core.sessions.lock().await;
             let data = &map[&session.id];
-            cut_target(trigger, request_overhead(&data.registry.schemas_wire_arc()), &data.messages, &ChatMessage::estimated_tokens)
+            cut_target(trigger, KEEP_RECENT_TOKENS, request_overhead(&data.registry.schemas_wire_arc()), &data.messages, &ChatMessage::estimated_tokens)
         };
         assert!((target - 5_000..=target).contains(&used), "cut to {used}, target {target}");
         assert_eq!(session.request_count(), 4, "the third turn makes one notes request and one completion");
@@ -6212,7 +6214,7 @@ mod tests {
         let target = {
             let map = session.core.sessions.lock().await;
             let data = &map[&session.id];
-            cut_target(trigger, request_overhead(&data.registry.schemas_wire_arc()), &data.messages, &ChatMessage::estimated_tokens)
+            cut_target(trigger, KEEP_RECENT_TOKENS, request_overhead(&data.registry.schemas_wire_arc()), &data.messages, &ChatMessage::estimated_tokens)
         };
         let receipt = run_compact(
             &session.core, &session.id, &session.project, &Arc::new(CancelToken::default()),
@@ -8479,7 +8481,7 @@ echo run >> {}
             let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
-                compaction_trigger(budget, schema_tokens, 20_000, None, &data.messages, &ChatMessage::estimated_tokens),
+                compaction_trigger(budget, schema_tokens, 20_000, KEEP_RECENT_TOKENS, None, &data.messages, &ChatMessage::estimated_tokens),
                 budget,
                 "fixture must sit in the fallback band"
             );
@@ -8664,7 +8666,7 @@ echo run >> {}
         assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
         let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
         // The window's budget, 12,288 less the reply and its headroom.
-        let target = cut_target(10_240, schema_tokens, &data.messages, &ChatMessage::estimated_tokens);
+        let target = cut_target(10_240, KEEP_RECENT_TOKENS, schema_tokens, &data.messages, &ChatMessage::estimated_tokens);
         core.sessions.lock().await.insert(id.clone(), data);
 
         let receipt = run_compact(&core, &id, &project, &Arc::new(CancelToken::default())).await.unwrap();
@@ -8673,6 +8675,51 @@ echo run >> {}
         assert_eq!(receipt.tokens_after, left, "the receipt reports the transcript the cut left");
         assert!(left <= target, "the cut ends at its target: {left} of {target}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `compaction_keep_tokens` sets how much of the newest history a cut in
+    /// the turn loop keeps. The same session cut at a 60,000-token trigger
+    /// keeps a quarter of it (15,000) unset and 5,000 set, and the request
+    /// after the cut carries no more than the head, the schemas and that.
+    #[tokio::test]
+    async fn the_keep_setting_sets_what_a_cut_in_the_turn_loop_keeps() {
+        async fn after_the_cut(keep: Option<usize>) -> (usize, usize) {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+            let fixed = {
+                let mut data = build_session_data(&core, &id, &project).unwrap();
+                while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() <= 70_000 {
+                    data.messages.push(ChatMessage::user("q ".repeat(2_000)));
+                    data.messages.push(ChatMessage::assistant(Some("a ".repeat(2_000)), None));
+                }
+                let mut persisted = 0usize;
+                sessions::save_messages(&core, &id, &data.messages, &mut persisted, true);
+                sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+                request_overhead(&data.registry.schemas_wire_arc()) + data.messages[..2].iter().map(ChatMessage::estimated_tokens).sum::<usize>()
+            };
+            // Every reply is text, so the notes request writes notes and the cut lands.
+            let (base_url, _bodies) = capturing_endpoint_times(STOP_SSE, 0).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(400_000));
+                (s.compaction_tokens, s.compaction_keep_tokens) = (Some(60_000), keep);
+            }
+            start_turn(core.clone(), id.clone(), project, "go".into()).unwrap();
+            let (stop, budgets) = budgets_until_done(&mut rx).await;
+            assert_eq!(stop, "stop");
+            assert!(sessions::last_compaction(&core, &id).is_some(), "the cut landed");
+            let _ = std::fs::remove_dir_all(dir);
+            let [used] = budgets[..] else { panic!("one turn request after the cut: {budgets:?}") };
+            (used, fixed)
+        }
+        let (unset, fixed) = after_the_cut(None).await;
+        assert!(unset > fixed + 10_000 && unset <= fixed + 15_000, "unset keeps a quarter of the trigger: {unset} over {fixed}");
+        let (set, fixed) = after_the_cut(Some(5_000)).await;
+        assert!(set <= fixed + 5_000, "the setting caps what the cut keeps: {set} over {fixed}");
     }
 
     /// A request longer than any digest snippet, so only the message itself
