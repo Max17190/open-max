@@ -138,7 +138,7 @@ pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &t
 }
 
 /// What a call the user cancelled answers, on the wire and to the model.
-const USER_CANCELLED: &str = "The user cancelled this turn.";
+pub(crate) const USER_CANCELLED: &str = "The user cancelled this turn.";
 
 /// End a started call the user cancelled. Its reply carries no "Error:"
 /// prefix: nothing failed, and the turn stops here.
@@ -707,7 +707,10 @@ async fn run_loop(
             return "error".into();
         }
     };
-    let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    let mut client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    // Once an edit has succeeded, the session runs at its after-edit effort, if one is set.
+    let after_edit = settings.effort_after_first_edit;
+    if after_edit.is_some() && core.sessions.lock().await.get(session_id).is_some_and(|d| d.edited) { client.reasoning_effort = after_edit; }
     // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
     if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(client.effort_stamp()); }
     // Frozen wire form: every request of the session injects the same tool
@@ -1409,6 +1412,10 @@ async fn run_loop(
                 end_call(core, session_id, &call.id, &outcome, guard.messages());
                 if executed {
                     count_usage(&turn_usage, &registry, project_root, name, &args, outcome.ok);
+                }
+                if executed && outcome.ok && crate::transcript::is_edit(name) && after_edit.is_some() && client.reasoning_effort != after_edit {
+                    client.reasoning_effort = after_edit;
+                    if let Some(data) = core.sessions.lock().await.get_mut(session_id) { data.edited = true; }
                 }
                 if executed && registry.is_mutating(name) {
                     // Any executed mutating call may have changed extension
@@ -3083,13 +3090,19 @@ mod tests {
 
     /// [`capturing_endpoint`] answering the first `times` requests with `first`.
     async fn capturing_endpoint_times(first: &str, times: usize) -> (String, Arc<StdMutex<Vec<String>>>) {
+        capturing_script(&vec![first; times]).await
+    }
+
+    /// [`capturing_endpoint`] answering the nth request with the nth stream,
+    /// and every request after the script with `STOP_SSE`.
+    async fn capturing_script(streams: &[&str]) -> (String, Arc<StdMutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
         let seen = bodies.clone();
-        let first = first.to_owned();
+        let streams: Vec<String> = streams.iter().map(|s| s.to_string()).collect();
         tokio::spawn(async move {
             let mut n = 0usize;
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -3116,7 +3129,7 @@ mod tests {
                 }
                 seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
                 n += 1;
-                let sse = if n <= times { first.as_str() } else { STOP_SSE };
+                let sse = streams.get(n - 1).map_or(STOP_SSE, String::as_str);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
                 );
@@ -3178,6 +3191,77 @@ mod tests {
         assert!(last.reasoning_content.is_none() && last.reasoning.is_none() && last.reasoning_origin.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One streamed call to `name` with `args` under `id`.
+    fn call_sse(id: &str, name: &str, args: Value) -> String {
+        let call = serde_json::json!({"index":0,"id":id,"function":{"name":name,"arguments":args.to_string()}});
+        format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":null}]}),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
+    }
+
+    /// `effort_after_first_edit` moves every request after the session's
+    /// first successful edit to its level, a resumed session included, and
+    /// with it unset every request carries the configured effort.
+    #[tokio::test]
+    async fn effort_drops_after_the_first_successful_edit() {
+        use crate::config::ReasoningEffort::{High, Low};
+        use crate::state::Core;
+
+        let efforts = |bodies: &Arc<StdMutex<Vec<String>>>| -> Vec<String> {
+            bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["reasoning_effort"].as_str().unwrap_or("unset").to_owned()).collect()
+        };
+        let script = [
+            call_sse("c1", "read_file", serde_json::json!({"path":"a.txt"})),
+            call_sse("c2", "edit_file", serde_json::json!({"path":"a.txt","old_string":"missing","new_string":"x"})),
+            call_sse("c3", "write_file", serde_json::json!({"path":"b.txt","content":"beta\n"})),
+            call_sse("c4", "read_file", serde_json::json!({"path":"b.txt"})),
+        ];
+        let script: Vec<&str> = script.iter().map(String::as_str).collect();
+        for after in [Some(Low), None] {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+            let (base_url, bodies) = capturing_script(&script).await;
+            let configure = |core: &Arc<Core>| {
+                crate::trust::trust_project(&core.data_dir, &project).unwrap();
+                let mut s = core.settings.lock().unwrap();
+                s.base_url = base_url.clone();
+                s.model = "stub".into();
+                s.context_tokens = Some(16384);
+                s.approval_mode = ApprovalMode::Auto;
+                s.reasoning_effort = Some(High);
+                s.effort_after_first_edit = after;
+            };
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            configure(&core);
+            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+            let id = id.as_str();
+            for prompt in ["edit it", "again"] {
+                start_turn(core.clone(), id.into(), project.clone(), prompt.into()).unwrap();
+                assert_eq!(drive_turn(&mut rx).await.0, "stop");
+            }
+            assert!(crate::transcript::edit_succeeded(&sessions::load_messages(&core, id).unwrap().unwrap()), "the saved transcript records the write");
+            drop(core);
+            // A new process resumes the session from disk.
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            configure(&core);
+            start_turn(core.clone(), id.into(), project.clone(), "resumed".into()).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop");
+
+            let sent = efforts(&bodies);
+            assert_eq!(sent.len(), 7, "five requests in the first turn, one in each later turn");
+            if after.is_some() {
+                // A failed edit (c2) keeps the effort; the request after the write (c3) is the first at low.
+                assert_eq!(sent, ["high", "high", "high", "low", "low", "low", "low"], "{sent:?}");
+                assert_eq!(std::fs::read_to_string(project.join("b.txt")).unwrap(), "beta\n");
+            } else {
+                assert!(sent.iter().all(|e| e == "high"), "unset, nothing changes: {sent:?}");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// A `/model` switch moves the session to an endpoint that never produced

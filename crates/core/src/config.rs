@@ -153,6 +153,11 @@ pub struct Settings {
     /// changes a limit. Unset or 0 adds no note.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_budget: Option<usize>,
+    /// The reasoning effort later requests use once a `write_file` or
+    /// `edit_file` call in the session has succeeded. Unset keeps
+    /// `reasoning_effort` for the whole session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_after_first_edit: Option<ReasoningEffort>,
 }
 
 /// A change across several files with its tests routinely takes more than
@@ -185,6 +190,7 @@ impl Default for Settings {
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
             request_budget: None,
+            effort_after_first_edit: None,
         }
     }
 }

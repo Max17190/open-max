@@ -89,6 +89,11 @@ pub struct SessionData {
     /// response or refusal for length. See
     /// `compaction::token_factor`.
     pub prompt_ratio: Option<(String, f64)>,
+    /// Whether a `write_file` or `edit_file` call has succeeded in this
+    /// session, which moves later requests to `effort_after_first_edit`.
+    /// Set once and never cleared; a resume reads it back from the
+    /// transcript (`agent::edit_succeeded`).
+    pub edited: bool,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous

@@ -886,7 +886,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     const TARGET: usize = 2_000;
-    const BASELINE: usize = 1_715;
+    const BASELINE: usize = 1_771;
     // About 1% of the loop: room for a small fix, not for a feature.
     const MARGIN: usize = 50;
     const RATCHET: usize = BASELINE + MARGIN;

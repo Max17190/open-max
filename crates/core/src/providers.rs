@@ -648,6 +648,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             return Err(ResolveError::MissingEndpoint);
         }
         validate_reasoning_effort(base_url, p.wire_api, settings.model.trim(), settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
+        validate_reasoning_effort(base_url, p.wire_api, settings.model.trim(), settings.effort_after_first_edit).map_err(ResolveError::ReasoningEffort)?;
         let model = settings.model.trim();
         if model.is_empty() {
             // A catalog that sizes its models only lacks the choice; when
@@ -708,6 +709,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     // means no request: there is no default server to guess at.
     let base_url = settings.base_url.trim();
     validate_reasoning_effort(base_url, WireApi::ChatCompletions, settings.model.trim(), settings.reasoning_effort).map_err(ResolveError::ReasoningEffort)?;
+    validate_reasoning_effort(base_url, WireApi::ChatCompletions, settings.model.trim(), settings.effort_after_first_edit).map_err(ResolveError::ReasoningEffort)?;
     let model = settings.model.trim();
     let missing = [base_url.is_empty(), model.is_empty(), settings.context_tokens.is_none()];
     if missing.iter().filter(|m| **m).count() > 1 {

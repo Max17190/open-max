@@ -117,7 +117,6 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
         // the compaction archive if a prune has since dropped that exchange,
         // and does not repeat it.
         let mut data = SessionData {
-            messages,
             registry,
             trailing_note: note.map(Arc::from),
             prompt_breakdown,
@@ -129,6 +128,8 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             reported_approval_mode,
             seen_ledger_events: seen_approval_events(core, project_root),
             prompt_ratio: None,
+            edited: edit_succeeded(&messages),
+            messages,
         };
         land_deferred_resume_edits(core, session_id, &mut data, saved);
         data
@@ -162,8 +163,25 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             reported_approval_mode: None,
             seen_ledger_events: seen_approval_events(core, project_root),
             prompt_ratio: None,
+            edited: false,
         }
     })
+}
+
+/// The calls whose success moves a session to `effort_after_first_edit`.
+/// Bash is left out: it reads and runs tests as often as it writes.
+pub(crate) fn is_edit(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file")
+}
+
+/// Whether a transcript holds a `write_file` or `edit_file` call whose reply
+/// is not an error, so a resumed session keeps the effort it switched to.
+pub(crate) fn edit_succeeded(messages: &[ChatMessage]) -> bool {
+    let edits: HashSet<&str> = messages.iter().flat_map(|m| m.tool_calls.iter().flatten())
+        .filter(|call| is_edit(&call.function.name)).map(|call| call.id.as_str()).collect();
+    messages.iter().any(|m| m.role == "tool" && m.tool_call_id.as_deref().is_some_and(|id| edits.contains(id))
+        && m.content.as_deref().is_some_and(|c| !c.starts_with("Error: ")
+            && ![crate::agent::USER_CANCELLED, crate::agent::APPROVAL_TIMEOUT_MESSAGE, INTERRUPTED_TOOL_CALL].contains(&c)))
 }
 
 /// Load a session into the in-memory map if this process has not seen it yet.
