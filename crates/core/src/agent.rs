@@ -774,6 +774,19 @@ async fn run_loop(
         reload_approval_policy(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions);
         accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await;
         narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
+        // A budget mark the last request reached without running a call (a
+        // cut reply, a steer, a refused end, a retried request) had no tool
+        // result to carry its note, so the note goes last now, on disk before
+        // this request. After a round of calls the mark was already said.
+        if let Some(text) = request_budget.filter(|_| iteration > 0).and_then(|budget| crate::notes::request_budget_note(budget, iteration, &mut budget_noted)) {
+            if guard.messages().last().is_some_and(|m| m.role == "tool") {
+                append_and_emit_note(core, session_id, guard.messages(), &text);
+            } else {
+                let at = guard.messages().len();
+                insert_note(core, session_id, guard.messages(), at, text);
+            }
+            save_messages(core, session_id, guard.messages(), false).await;
+        }
         // The tool schemas are re-sent whole on every request, so they are
         // as real as the transcript: the overhead every request carries
         // besides the history, the note stored in it included.
@@ -4664,6 +4677,54 @@ mod tests {
         assert!(on[4]["messages"].to_string().contains("4 of 4 requests used (100%), 0 left"), "{}", on[4]);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The bug this guards: a mark due on a request whose reply the output cap
+    /// cut before any call had no tool result to ride, so its note never went
+    /// out, and the next round of calls said only the mark after it. The note
+    /// now follows the cut note, before the next request, at its own count.
+    #[tokio::test]
+    async fn a_budget_mark_due_on_a_cut_reply_is_still_said() {
+        use crate::notes::BUDGET_NOTE_MARK;
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        // Request 2 of 4, the 50% mark, is the cut one.
+        let (base_url, requests) = scripted_endpoint(&[TOOL_SSE, CUT_SSE, TOOL_SSE, TOOL_SSE, STOP_SSE]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(16384), 1024);
+            (s.approval_mode, s.request_budget) = (ApprovalMode::Auto, Some(4));
+        }
+        let id = "sess-budget-cut";
+        start_turn(core.clone(), id.into(), project.clone(), "read a.txt".into()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (mut notes, mut stop) = (Vec::new(), None);
+        while stop.is_none() && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(env)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                match env.event {
+                    AgentEvent::HarnessNote { text, .. } if text.starts_with(BUDGET_NOTE_MARK) => notes.push(text),
+                    AgentEvent::Done { stop_reason } => stop = Some(stop_reason),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(stop.as_deref(), Some("stop"));
+        assert_eq!(*requests.lock().unwrap(), 5);
+        let used: Vec<&str> = notes[1..].iter().map(|n| n.split(" requests used").next().unwrap().rsplit(": ").next().unwrap()).collect();
+        assert_eq!(used, ["2 of 4", "3 of 4", "4 of 4"], "every mark, each at its own request: {notes:?}");
+        let messages = transcript(&core, id).await;
+        let cut = messages.iter().position(|m| m.content.as_deref() == Some(CUT_NOTE)).expect("the cut note");
+        assert_eq!(messages[cut + 1].role, "user");
+        assert!(messages[cut + 1].content.as_deref().is_some_and(|c| c.contains("2 of 4 requests used (50%)")), "{:?}", messages[cut + 1]);
+        assert!(messages[cut + 2].tool_calls.is_some(), "the next reply reads the note");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// One finished reply of calls given as (id, tool, raw arguments), ending
