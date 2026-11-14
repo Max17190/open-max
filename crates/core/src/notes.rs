@@ -539,6 +539,32 @@ pub(crate) fn request_budget_note(budget: usize, used: usize, noted: &mut usize)
     Some(format!("{BUDGET_NOTE_MARK} {used} of {budget} requests used ({percent}%), {left} left. Prioritize finishing and verifying the task.]"))
 }
 
+/// The budget mark owed before request `used + 1`: one the last request
+/// reached with no call run (a reply cut before any call, a steer, a refused
+/// end, a retried request), so no tool result carried its note. It goes on
+/// the last tool result when the history ends with one, else as a note after
+/// the last message, on disk before the request. After a round of calls the
+/// mark was already said, so this says nothing.
+pub(crate) async fn say_owed_budget_mark(
+    core: &Arc<Core>,
+    session_id: &str,
+    messages: &mut Vec<ChatMessage>,
+    budget: Option<usize>,
+    used: usize,
+    noted: &mut usize,
+) {
+    let Some(text) = budget.filter(|_| used > 0).and_then(|budget| request_budget_note(budget, used, noted)) else { return };
+    // A tool result last was saved before the request that failed, so a
+    // note added to it needs a rewrite to reach the disk.
+    let rewrite = messages.last().is_some_and(|m| m.role == "tool");
+    if rewrite {
+        append_and_emit_note(core, session_id, messages, &text);
+    } else {
+        insert_note(core, session_id, messages, messages.len(), text);
+    }
+    crate::transcript::save_messages(core, session_id, messages, rewrite).await;
+}
+
 /// What a mutating call's permissions reload found, said on that call's
 /// result: that it left permissions.toml malformed (`fail_closed_now`, the
 /// parse reason, with the repair `permissions`, as reloaded, still allows),
