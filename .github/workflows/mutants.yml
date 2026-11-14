@@ -120,6 +120,14 @@ jobs:
           echo "$CARGO_MUTANTS_SHA256  $RUNNER_TEMP/cargo-mutants.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/cargo-mutants.tar.gz" -C ~/.cargo/bin cargo-mutants
 
+      # The build the test job tests, the workspace's own crates unoptimized
+      # (ci.yml's test job says why): a sweep takes what it took, and a mutant
+      # is judged by the tests as that job runs them.
+      - name: Build the workspace's crates unoptimized
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '\n[profile.test.package.open-max-core]\nopt-level = 0\n\n[profile.test.package.openmax]\nopt-level = 0\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+
       # Builds in the checkout (--in-place), so the cached dependencies are
       # reused. cargo-mutants 27.1.0 tests the unmutated tree first (its
       # baseline), but with only the packages its mutants are in, while each
