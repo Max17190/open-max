@@ -228,7 +228,7 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
         .find(|tool| tool["function"]["name"] == "write_file")
         .expect("write_file is a built-in tool");
     let write_file = write_file["function"]["description"].as_str().unwrap_or_default();
-    assert!(write_file.contains("prefer edit_file"), "write_file must point changes at edit_file: {write_file}");
+    assert!(!write_file.contains("prefer edit_file"), "write_file leaves the choice of edit form to the model: {write_file}");
     assert!(
         system.contains("without repeating file contents"),
         "the closing summary must not echo files back:\n{system}"

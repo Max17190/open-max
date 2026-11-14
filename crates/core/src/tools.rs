@@ -241,7 +241,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or rewrite a file; prefer edit_file for changes.",
+                "description": "Create or rewrite a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
