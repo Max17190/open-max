@@ -774,19 +774,8 @@ async fn run_loop(
         reload_approval_policy(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions);
         accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await;
         narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
-        // A budget mark the last request reached without running a call (a
-        // cut reply, a steer, a refused end, a retried request) had no tool
-        // result to carry its note, so the note goes last now, on disk before
-        // this request. After a round of calls the mark was already said.
-        if let Some(text) = request_budget.filter(|_| iteration > 0).and_then(|budget| crate::notes::request_budget_note(budget, iteration, &mut budget_noted)) {
-            if guard.messages().last().is_some_and(|m| m.role == "tool") {
-                append_and_emit_note(core, session_id, guard.messages(), &text);
-            } else {
-                let at = guard.messages().len();
-                insert_note(core, session_id, guard.messages(), at, text);
-            }
-            save_messages(core, session_id, guard.messages(), false).await;
-        }
+        // A mark the last request reached without a round of calls to carry its note is said now.
+        crate::notes::say_owed_budget_mark(core, session_id, guard.messages(), request_budget, iteration, &mut budget_noted).await;
         // The tool schemas are re-sent whole on every request, so they are
         // as real as the transcript: the overhead every request carries
         // besides the history, the note stored in it included.
