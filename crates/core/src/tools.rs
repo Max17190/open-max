@@ -256,17 +256,25 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace old_string (exact; unique unless replace_all) with new_string, or each item of edits, all or none.",
+                "description": "Replace old_string (exact; unique unless replace_all) with new_string, all or none.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "old_string": { "type": "string" },
-                        "new_string": { "type": "string" },
-                        "replace_all": { "type": "boolean" },
-                        "edits": { "type": "array", "items": { "type": "object" } }
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_string": { "type": "string" },
+                                    "new_string": { "type": "string" },
+                                    "replace_all": { "type": "boolean" }
+                                },
+                                "required": ["old_string", "new_string"]
+                            }
+                        }
                     },
-                    "required": ["path"]
+                    "required": ["path", "edits"]
                 }
             }
         },
@@ -1514,7 +1522,11 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
             }
             return ToolOutcome::err(format!("{}{hint}", label(i)));
         }
-        spans.extend(old.match_indices(old_string.as_str()).map(|(at, _)| (at, at + old_string.len(), i)));
+        // A lone replacement streams its matches below; only a list needs
+        // them all at once, to find overlaps.
+        if total > 1 {
+            spans.extend(old.match_indices(old_string.as_str()).map(|(at, _)| (at, at + old_string.len(), i)));
+        }
     }
     spans.sort_unstable();
     if let Some(w) = spans.windows(2).find(|w| w[1].0 < w[0].1) {
@@ -1524,11 +1536,26 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     }
 
     // Splice every replacement in one pass, noting where each landed.
-    let (mut new, mut changed, mut at) = (String::with_capacity(old.len()), Vec::new(), 0);
-    for &(start, end, i) in &spans {
+    // The excerpt needs a record per changed line it can show, not per
+    // match: changes on one line share a record, and records stop once
+    // more lines than the excerpt's cap could hold have one.
+    let (first, all) = (&list[0].0, list[0].2);
+    let lone = old.match_indices(first.as_str()).take(if all { usize::MAX } else { 1 });
+    let matches: Box<dyn Iterator<Item = (usize, usize, usize)>> = match total {
+        1 => Box::new(lone.map(|(at, _)| (at, at + first.len(), 0))),
+        _ => Box::new(spans.into_iter()),
+    };
+    let (mut new, mut changed, mut at) = (String::with_capacity(old.len()), Vec::<(usize, usize)>::new(), 0);
+    for (start, end, i) in matches {
         new.push_str(&old[at..start]);
-        changed.push((new.len(), new.len() + list[i].1.len()));
+        let landed = new.len();
         new.push_str(&list[i].1);
+        let full = changed.len() > EXCERPT_BYTES / 2;
+        match changed.last_mut() {
+            _ if full => {}
+            Some(last) if !new[last.1..landed].contains('\n') => last.1 = new.len(),
+            _ => changed.push((landed, new.len())),
+        }
         at = end;
     }
     new.push_str(&old[at..]);
@@ -2998,6 +3025,11 @@ mod tests {
         assert!(out.output.ends_with("13 line 12\n14 tail\n"), "{}", out.output);
 
         // Each change sits far enough from the next to be a hunk of its own.
+        // Matches on one line share one record of the excerpt.
+        std::fs::write(root.join("same.txt"), "aaaa\nb\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "same.txt", "old_string": "a", "new_string": "x", "replace_all": true}));
+        assert_eq!(out.output, "edited same.txt (+1 −1)\n1 xxxx\n2 b\n");
+
         let wide = format!("{}\n", "x".repeat(300));
         std::fs::write(root.join("wide.txt"), format!("{wide}keep\nkeep\nkeep\nkeep\nkeep\n").repeat(40)).unwrap();
         let out = edit_file(&root, &json!({"path": "wide.txt", "old_string": "x\n", "new_string": "y\n", "replace_all": true}));
