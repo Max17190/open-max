@@ -603,7 +603,12 @@ const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_900;
 /// the transcript grows toward the window), and a setting whose target the
 /// irreducible transcript outgrows; a prune would end at the floor still
 /// over the target and re-fire on every iteration, paying an archive and a
-/// notes request each time.
+/// notes request each time. That check measures the target at the larger of
+/// `keep` and `KEEP_RECENT_TOKENS`: a smaller `keep` asks for a smaller cut,
+/// and a cut that ends at the floor above it still leaves the gap the default
+/// target leaves, so it does not re-fire. Measured against `keep` itself, a
+/// small setting fell back whenever the newest tool output was large, and
+/// the session ran to the window uncut.
 ///
 /// Irreducible means exactly what a maximal prune leaves: the drop loop's
 /// length floor ends at the pinned head, the digest note, the turn's prompt
@@ -637,7 +642,7 @@ pub(crate) fn compaction_trigger(
             .chain(restored_prompt(&messages[tail..], &messages[head..tail]))
             .map(estimate)
             .sum::<usize>();
-    if cut_target(trigger, keep, schema_tokens, messages, estimate) < irreducible {
+    if cut_target(trigger, keep.max(KEEP_RECENT_TOKENS), schema_tokens, messages, estimate) < irreducible {
         budget
     } else {
         trigger
@@ -1946,6 +1951,29 @@ pub(crate) mod tests {
         let head: usize = messages[..pinned_head(&messages)].iter().map(ChatMessage::estimated_tokens).sum();
         assert_eq!(cut_target(60_000, 5_000, 0, &messages, &ChatMessage::estimated_tokens), head + 5_000);
         assert_eq!(cut_target(60_000, 40_000, 0, &messages, &ChatMessage::estimated_tokens), head + 15_000);
+    }
+
+    /// A small keep whose target the protected tail outgrows still cuts, to
+    /// the floor, where the default target holds that tail: falling back to
+    /// the window there left a session uncut until the window forced it.
+    #[test]
+    fn a_small_keep_cuts_to_the_floor_where_the_newest_exchanges_outgrow_it() {
+        let mut messages = vec![msg("system", 400), msg("user", 400)];
+        for _ in 0..30 {
+            messages.push(msg("user", 9_000));
+            messages.push(msg("assistant", 9_000));
+        }
+        let estimate = &ChatMessage::estimated_tokens;
+        let (budget, newest) = (190_000, 3 * 2_250);
+        assert!(cut_target(60_000, 5_000, 0, &messages, estimate) < newest + DIGEST_NOTE_ALLOWANCE_TOKENS, "fixture: the tail outgrows the small target");
+        assert_eq!(compaction_trigger(budget, 0, 60_000, 5_000, None, &messages, estimate), 60_000);
+        let mut kept_small = messages.clone();
+        enforce_budget(&mut kept_small, 60_000, 5_000, 0, 0, estimate).expect("a cut");
+        let mut kept_default = messages.clone();
+        enforce_budget(&mut kept_default, 60_000, KEEP_RECENT_TOKENS, 0, 0, estimate).expect("a cut");
+        let (small, default) = (tokens(&kept_small), tokens(&kept_default));
+        // The drop loop's floor keeps four messages past the head.
+        assert!(small <= 200 + 4 * 2_250 + DIGEST_NOTE_ALLOWANCE_TOKENS && small < default, "{small} against {default}");
     }
 
     /// A session of one prompt keeps it in the opening, so the cut adds
