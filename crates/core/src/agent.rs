@@ -4439,9 +4439,10 @@ mod tests {
                     *seen += 1;
                     &bodies[(*seen - 1).min(bodies.len() - 1)]
                 };
-                let resp = format!(
+                // A whole response passes as is; a stream is served as 200.
+                let resp = if body.starts_with("HTTP/1.1 ") { body.clone() } else { format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
-                );
+                ) };
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
             }
@@ -4712,6 +4713,39 @@ mod tests {
         assert_eq!(messages[cut + 1].role, "user");
         assert!(messages[cut + 1].content.as_deref().is_some_and(|c| c.contains("2 of 4 requests used (50%)")), "{:?}", messages[cut + 1]);
         assert!(messages[cut + 2].tool_calls.is_some(), "the next reply reads the note");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A mark reached by a request the provider refused for length is owed
+    /// on the tool result the resend carries, which an earlier save already
+    /// wrote, so the note is on disk only when that save is a rewrite.
+    #[tokio::test]
+    async fn a_budget_mark_owed_after_a_refused_request_reaches_the_disk() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let refusal = r#"{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}"#;
+        let refused = format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{refusal}", refusal.len());
+        // Request 2 of 2, the 100% mark, is refused and sent again.
+        let (base_url, requests) = scripted_endpoint(&[TOOL_SSE, &refused, STOP_SSE]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(65_536), 65_536);
+            (s.approval_mode, s.request_budget) = (ApprovalMode::Auto, Some(2));
+        }
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id.clone(), project.clone(), "read a.txt".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        assert_eq!(*requests.lock().unwrap(), 3);
+        let saved = sessions::load_messages(&core, &id).unwrap().expect("the saved transcript");
+        let tool = saved.iter().rfind(|m| m.role == "tool").and_then(|m| m.content.as_deref()).unwrap_or_default();
+        assert!(tool.contains("1 of 2 requests used (50%)") && tool.contains("2 of 2 requests used (100%)"), "{tool}");
 
         let _ = std::fs::remove_dir_all(dir);
     }

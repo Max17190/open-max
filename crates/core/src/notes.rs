@@ -554,12 +554,15 @@ pub(crate) async fn say_owed_budget_mark(
     noted: &mut usize,
 ) {
     let Some(text) = budget.filter(|_| used > 0).and_then(|budget| request_budget_note(budget, used, noted)) else { return };
-    if messages.last().is_some_and(|m| m.role == "tool") {
+    // A tool result last was saved before the request that failed, so a
+    // note added to it needs a rewrite to reach the disk.
+    let rewrite = messages.last().is_some_and(|m| m.role == "tool");
+    if rewrite {
         append_and_emit_note(core, session_id, messages, &text);
     } else {
         insert_note(core, session_id, messages, messages.len(), text);
     }
-    crate::transcript::save_messages(core, session_id, messages, false).await;
+    crate::transcript::save_messages(core, session_id, messages, rewrite).await;
 }
 
 /// What a mutating call's permissions reload found, said on that call's
