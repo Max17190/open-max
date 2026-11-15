@@ -903,7 +903,9 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 
 A reasoning model's reasoning counts toward those 4096, which bound its
 thinking: a reply cut before any tool call is continued after a note, four
-times in a row at most; a fifth ends the turn (`length`). It may be raised
+times in a row at most; a fifth ends the turn (`length`). When its usage
+shows output that did not arrive (a call the provider dropped at the
+limit), the note asks for the content in parts instead. It may be raised
 to the model's longest reply: each request asks for the room left.
 
 ## The supported model-switch recipe

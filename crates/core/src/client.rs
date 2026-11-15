@@ -406,6 +406,8 @@ pub struct Usage {
     pub completion_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: Option<u64>,
+    /// The reasoning inside `output_tokens`, when the server reports it.
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Streaming client for Chat Completions, Responses, and native Messages APIs,
@@ -474,6 +476,8 @@ struct StreamChunk {
 /// whole number typed as a float is the count. Reasoning is billed output:
 /// xAI's Chat Completions counts it beside `completion_tokens`, in
 /// `total_tokens` alone, so it is added where the total shows it there.
+/// The reasoning count itself, under `completion_tokens_details` or
+/// `output_tokens_details`, is kept as `reasoning_tokens`.
 fn parse_usage(usage: &Value) -> Option<Usage> {
     if !usage.is_object() {
         return None;
@@ -489,6 +493,7 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
         output_tokens: completion_tokens.saturating_add(beside.unwrap_or(0)),
         cached_tokens: ["/prompt_tokens_details/cached_tokens", "/prompt_cache_hit_tokens", "/input_tokens_details/cached_tokens", input[2]]
             .iter().find_map(|k| count(k)),
+        reasoning_tokens: count("/completion_tokens_details/reasoning_tokens").or_else(|| count("/output_tokens_details/reasoning_tokens")),
     })
 }
 
@@ -4578,7 +4583,9 @@ pub(crate) mod tests {
         ] {
             let u = parse_usage(&usage).expect("a usage object is usage");
             assert_eq!((u.completion_tokens, u.output_tokens), counts, "{usage}");
+            assert!(u.reasoning_tokens.is_some_and(|r| r == 35 || r == 2), "the count is kept as reported: {usage}");
         }
+        assert_eq!(parse_usage(&json!({"prompt_tokens":1,"completion_tokens":2})).unwrap().reasoning_tokens, None);
     }
 
     /// The vendor table is pinned: a provider joins it only with its host,
