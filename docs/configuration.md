@@ -175,7 +175,16 @@ and the run that writes a key already uses it.
   On a Responses connection a reply that reaches the limit is reported
   incomplete and ends the turn as truncated.
   For a reasoning model the limit is also a bound on how long it thinks
-  before it acts. Setup leaves it at the default for a Chat Completions
+  before it acts. Some gateways make it a thinking budget: they end the
+  thinking at a fixed count below the limit, keep the rest for the answer,
+  and report a normal finish, so the model acts mid-thought and no cut is
+  seen. When two replies in a session stop thinking at the same count
+  (within one token), at least half the limit they were sent with and
+  more than 8 tokens short of it, and neither was cut, the session sends
+  32,768 (or `max_tokens`, when larger) on that route from then on, within
+  the window as above. A server that refuses that limit as too much output
+  (HTTP 400 or 422 naming the output limit) gets the configured limit back
+  for the rest of the session, and the request goes once more. Setup leaves it at the default for a Chat Completions
   connection unless the catalog reports a lower output maximum, which it
   saves; for a Responses or native Messages connection it still writes the
   catalog's output maximum when one is reported, and `openmax --check`
