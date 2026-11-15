@@ -820,10 +820,14 @@ pub(crate) const SPLIT_ADVICE: &str = "Send large content in parts: for a file, 
 /// call again, which the limit cuts the same way. So:
 ///
 /// - Usage reports the reasoning count, and the output beyond that reasoning
-///   (or beyond the reasoning text that arrived, when that is longer) and
-///   beyond the text that arrived is more than an eighth of the limit (256
-///   tokens at least): something was written that did not arrive, most likely
-///   one call larger than the limit. The note says so and gives the split advice.
+///   (or beyond the reasoning text that arrived at four bytes a token, when
+///   that is more) and beyond the text that arrived is more than an eighth
+///   of the limit (256 tokens at least): something was written that did not
+///   arrive, most likely one call larger than the limit. The note says so and
+///   gives the split advice. The text that arrived counts at two bytes a
+///   token, denser than code or any script runs, so text that did arrive is
+///   never taken for output that did not. The reported reasoning count is
+///   exact; its text only stands in where it implies more.
 /// - No reasoning count, and nothing at all arrived: the note says it was
 ///   either thinking that is not shown or a call larger than the limit.
 /// - Otherwise, the note every such cut got before, byte for byte.
@@ -833,7 +837,7 @@ pub(crate) fn reply_cut_note(max_tokens: usize, reply: &crate::client::Completio
         .or_else(|| reply.reasoning_details.as_deref().map(|d| d.get().len())).unwrap_or(0);
     let unseen = match reply.usage.and_then(|u| Some((u.output_tokens, u.reasoning_tokens?))) {
         Some((output, reasoning)) => {
-            let arrived = reasoning.max(estimate_tokens(thought) as u64).saturating_add(estimate_tokens(reply.content.len()) as u64);
+            let arrived = reasoning.max(estimate_tokens(thought) as u64).saturating_add(2 * estimate_tokens(reply.content.len()) as u64);
             (output.saturating_sub(arrived) > (max_tokens as u64 / 8).max(256)).then_some(true)
         }
         None => (reply.content.is_empty() && thought == 0).then_some(false),
@@ -877,6 +881,10 @@ mod tests {
             ("text that arrived", reply(&"x".repeat(16_000), None, usage(4_096, Some(0))), "before"),
             // A few unaccounted tokens are not a lost call.
             ("within the margin", reply(&"x".repeat(15_000), None, usage(4_096, Some(0))), "before"),
+            // Dense text that did arrive: 4,096 tokens at three bytes a token.
+            ("dense text that arrived", reply(&"x".repeat(12_288), None, usage(4_096, Some(0))), "before"),
+            // Some text, then a call that never arrived.
+            ("short text, then a lost call", reply(&"x".repeat(2_000), None, usage(4_096, Some(0))), "lost"),
             // No count, nothing arrived: thinking not shown, or a lost call.
             ("nothing arrived, no count", reply("", None, usage(4_096, None)), "unshown"),
             ("nothing arrived, no usage", reply("", None, None), "unshown"),

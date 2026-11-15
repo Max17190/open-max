@@ -486,15 +486,14 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
     let input = ["/input_tokens", "/cache_creation_input_tokens", "/cache_read_input_tokens"];
     let prompt_tokens = count("/prompt_tokens").unwrap_or_else(|| input.iter().filter_map(|k| count(k)).fold(0, u64::saturating_add));
     let completion_tokens = count("/completion_tokens").or_else(|| count("/output_tokens")).unwrap_or(0);
-    let reasoning_tokens = count("/completion_tokens_details/reasoning_tokens").or_else(|| count("/output_tokens_details/reasoning_tokens"));
-    let beside = reasoning_tokens.filter(|r| count("/total_tokens") == Some(prompt_tokens.saturating_add(completion_tokens).saturating_add(*r)));
+    let beside = count("/completion_tokens_details/reasoning_tokens").filter(|r| count("/total_tokens") == Some(prompt_tokens.saturating_add(completion_tokens).saturating_add(*r)));
     Some(Usage {
         prompt_tokens,
         completion_tokens,
         output_tokens: completion_tokens.saturating_add(beside.unwrap_or(0)),
         cached_tokens: ["/prompt_tokens_details/cached_tokens", "/prompt_cache_hit_tokens", "/input_tokens_details/cached_tokens", input[2]]
             .iter().find_map(|k| count(k)),
-        reasoning_tokens,
+        reasoning_tokens: count("/completion_tokens_details/reasoning_tokens").or_else(|| count("/output_tokens_details/reasoning_tokens")),
     })
 }
 
