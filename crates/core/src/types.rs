@@ -94,6 +94,11 @@ pub struct ChatMessage {
     /// it is never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_tool_output: Option<String>,
+    /// Set when the reply was stored under `strip_stored_reasoning`: its
+    /// reasoning stays here and never goes back on a later request. Decided
+    /// once, so the reply's bytes on the wire never change. Never sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_withheld: bool,
 }
 
 impl ChatMessage {
@@ -113,7 +118,29 @@ impl ChatMessage {
     /// Every constructor starts without reasoning: only the agent loop
     /// attaches it, from a reply, together with its origin.
     fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
-        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None }
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None, reasoning_withheld: false }
+    }
+
+    /// Whether `strip_stored_reasoning` may leave this complete reply's
+    /// reasoning out of later requests: it has some, all of it plaintext (no
+    /// `reasoning_details`, or only unsigned `reasoning.text` blocks), and no
+    /// call carries a signature, so nothing a provider verifies goes missing.
+    /// The loop asks only of a complete reply: a cut, interrupted or cancelled
+    /// one keeps its reasoning, because the next request continues that thought.
+    pub(crate) fn reasoning_is_plaintext(&self) -> bool {
+        let any = self.reasoning_content.is_some() || self.reasoning.is_some() || self.reasoning_details.is_some();
+        if !any || self.tool_calls.iter().flatten().any(|c| c.extra_content.is_some()) {
+            return false;
+        }
+        self.reasoning_details.as_deref().is_none_or(|raw| {
+            serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(raw.get()).is_ok_and(|blocks| {
+                blocks.iter().all(|b| {
+                    b.get("type").and_then(serde_json::Value::as_str) == Some("reasoning.text")
+                        && b.get("text").is_some_and(serde_json::Value::is_string)
+                        && b.get("signature").is_none_or(|s| s.is_null() || s.as_str() == Some(""))
+                })
+            })
+        })
     }
 
     /// Rough size estimate of the stored message, including reasoning.
@@ -128,7 +155,7 @@ impl ChatMessage {
                 chars += reasoning.len();
             }
         }
-        if replay {
+        if replay && !self.reasoning_withheld {
             chars += self.reasoning_details.as_deref().map_or(0, |d| d.get().len());
         }
         if let Some(calls) = &self.tool_calls {

@@ -922,6 +922,7 @@ async fn run_loop(
             if reply.reasoning_content.is_some() || reply.reasoning.is_some() || reply.reasoning_details.is_some() || signed_calls {
                 reply.reasoning_origin = Some(client.origin());
             }
+            reply.reasoning_withheld = settings.strip_stored_reasoning && !capped && ![TRUNCATED, "cancelled"].contains(&result.finish_reason.as_str()) && reply.reasoning_is_plaintext();
             guard.messages().push(reply);
             // Any prune was rewritten to disk before the request went out, so
             // this save only appends the new assistant message. A failed
@@ -3084,13 +3085,19 @@ mod tests {
 
     /// [`capturing_endpoint`] answering the first `times` requests with `first`.
     async fn capturing_endpoint_times(first: &str, times: usize) -> (String, Arc<StdMutex<Vec<String>>>) {
+        capturing_script(&vec![first; times]).await
+    }
+
+    /// [`capturing_endpoint`] answering the nth request with the nth stream,
+    /// and every one after them with `STOP_SSE`.
+    async fn capturing_script(streams: &[&str]) -> (String, Arc<StdMutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
         let seen = bodies.clone();
-        let first = first.to_owned();
+        let streams: Vec<String> = streams.iter().map(|s| s.to_string()).collect();
         tokio::spawn(async move {
             let mut n = 0usize;
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -3117,7 +3124,7 @@ mod tests {
                 }
                 seen.lock().unwrap().push(String::from_utf8_lossy(&payload).to_string());
                 n += 1;
-                let sse = if n <= times { first.as_str() } else { STOP_SSE };
+                let sse = streams.get(n - 1).map_or(STOP_SSE, String::as_str);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
                 );
@@ -3231,6 +3238,116 @@ mod tests {
         assert!(last.reasoning_content.is_none() && last.reasoning.is_none() && last.reasoning_origin.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A tool-call reply whose reasoning streams as `reasoning` and as one
+    /// `reasoning_details` text block, as OpenRouter sends it; `signature`
+    /// goes on the block when given.
+    fn reasoning_call_sse(reasoning: &str, signature: Option<&str>, id: &str) -> String {
+        let mut block = serde_json::json!({"type": "reasoning.text", "text": reasoning, "index": 0});
+        if let Some(sig) = signature { block["signature"] = sig.into(); }
+        let delta = serde_json::json!({"reasoning": reasoning, "reasoning_details": [block],
+            "tool_calls": [{"index": 0, "id": id, "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}]});
+        format!("data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n", serde_json::json!({"choices": [{"delta": delta, "finish_reason": null}]}))
+    }
+
+    /// One turn of a plaintext-reasoning call, a signed-reasoning call, and
+    /// the answer, with `strip_stored_reasoning` as given: each request body,
+    /// and the transcript.
+    async fn strip_turn(strip: bool) -> (Vec<String>, Vec<ChatMessage>) {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let plain = reasoning_call_sse("read a.txt first", None, "c1");
+        let signed = reasoning_call_sse("read it again", Some("sig"), "c2");
+        let (base_url, bodies) = capturing_script(&[&plain, &signed]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.approval_mode) = (base_url, "stub".into(), Some(16384), ApprovalMode::Auto);
+            s.strip_stored_reasoning = strip;
+        }
+        start_turn(core.clone(), "sess-strip".into(), project.clone(), "go".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        // The temporary directory is the only other difference between runs.
+        let bodies: Vec<String> = bodies.lock().unwrap().iter().map(|b| b.replace(&dir.display().to_string(), "<dir>")).collect();
+        assert_eq!(bodies.len(), 3, "two calls, then the answer");
+        let messages = transcript(&core, "sess-strip").await;
+        let _ = std::fs::remove_dir_all(dir);
+        (bodies, messages)
+    }
+
+    /// `strip_stored_reasoning` sends a complete reply back without its
+    /// plaintext reasoning, in every wire form, the same bytes on every later
+    /// request, and otherwise exactly as without the setting; a reply whose
+    /// reasoning is signed goes back whole, and the session file keeps all of
+    /// it.
+    #[tokio::test]
+    async fn stripping_stored_reasoning_sends_a_call_reply_without_it_and_nothing_else_changes() {
+        let (on, messages) = strip_turn(true).await;
+        let (off, _) = strip_turn(false).await;
+        let (first, second) = (sent_replies(&on[1]), sent_replies(&on[2]));
+        assert_eq!(first[0], serde_json::json!({"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}]}), "{}", on[1]);
+        let bytes = r#"{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}"#;
+        assert!(on[1].contains(bytes) && on[2].contains(bytes), "the stripped reply goes out with the same bytes: {}", on[2]);
+        assert_eq!(second[1]["reasoning"], "read it again", "signed reasoning goes back whole");
+        assert_eq!(second[1]["reasoning_details"][0]["signature"], "sig");
+        assert_eq!(sent_replies(&off[2])[0]["reasoning"], "read a.txt first", "without the setting it goes back");
+
+        // Apart from the stripped fields, every request is the one main sends.
+        for (on, off) in on.iter().zip(&off) {
+            let mut off: Value = serde_json::from_str(off).unwrap();
+            for m in off["messages"].as_array_mut().unwrap() {
+                if m["tool_calls"][0]["id"] == "c1" {
+                    let m = m.as_object_mut().unwrap();
+                    m.remove("reasoning");
+                    m.remove("reasoning_details");
+                }
+            }
+            assert_eq!(serde_json::from_str::<Value>(on).unwrap(), off);
+        }
+
+        let reply = |id: &str| messages.iter().find(|m| m.tool_calls.as_ref().is_some_and(|c| c[0].id == id)).unwrap();
+        assert_eq!(reply("c1").reasoning.as_deref(), Some("read a.txt first"), "the session file keeps it");
+        assert!(reply("c1").reasoning_details.is_some() && reply("c1").reasoning_origin.is_some());
+        assert!(reply("c1").reasoning_withheld && !reply("c2").reasoning_withheld);
+        assert!(on.iter().all(|b| !b.contains("reasoning_withheld")), "the flag is never sent");
+    }
+
+    /// Under `strip_stored_reasoning` a reply the reply limit cut keeps its
+    /// reasoning, with or without a call: the next request continues that
+    /// thought. The flag stays off it in the session file.
+    #[tokio::test]
+    async fn stripping_stored_reasoning_keeps_a_cut_reply_whole() {
+        use crate::state::Core;
+
+        let cut_call = reasoning_call_sse("half a plan", None, "c1").replace("\"tool_calls\"}", "\"length\"}");
+        for (first, key, want) in [(THOUGHT_CUT_SSE, "reasoning_content", "half a thought"), (cut_call.as_str(), "reasoning", "half a plan")] {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, bodies) = capturing_endpoint(first).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(16384), 1024);
+                (s.approval_mode, s.strip_stored_reasoning) = (ApprovalMode::Auto, true);
+            }
+            start_turn(core.clone(), "sess-strip-cut".into(), project.clone(), "go".into()).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop");
+            let bodies = bodies.lock().unwrap().clone();
+            assert_eq!(bodies.len(), 2, "the cut reply, then its continuation");
+            assert_eq!(sent_replies(&bodies[1])[0][key], want, "{}", bodies[1]);
+            assert!(transcript(&core, "sess-strip-cut").await.iter().all(|m| !m.reasoning_withheld));
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// A `/model` switch moves the session to an endpoint that never produced

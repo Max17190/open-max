@@ -231,6 +231,16 @@ and the run that writes a key already uses it.
   `compaction_tokens`, and a cut still keeps at most a quarter of its trigger.
   A smaller value makes the requests after a cut cheaper and leaves the model
   less of its recent work to continue from.
+- `strip_stored_reasoning` (default false): when true, each complete reply
+  is stored with its reasoning withheld from later requests, so the reasoning
+  is never sent again; the session file keeps it. The choice is made once,
+  when the reply is stored, so the reply's bytes on the wire never change. It
+  applies to `reasoning`, `reasoning_content` and unsigned `reasoning.text`
+  blocks of `reasoning_details`. A reply the reply limit cut keeps its
+  reasoning (the next request continues that thought), and so does a reply
+  whose reasoning carries a signature or an opaque block, or whose calls carry
+  a signature. Providers may document that reasoning inside a tool loop
+  should be returned; test a model with it before relying on it.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's

@@ -883,6 +883,9 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `compaction_keep_tokens`: optional most a cut keeps of the newest
   exchanges, note included. Unset keeps 20,000; floored at 4,000; at most a
   quarter of the trigger.
+- `strip_stored_reasoning`: optional boolean. When true, a complete reply is
+  stored with its plaintext reasoning withheld from later requests; a reply
+  cut at the reply limit and signed reasoning go back whole. Default false.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction notes. Unaffordable notes leave the history uncut unless the
   window forces a prune.

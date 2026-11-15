@@ -127,6 +127,12 @@ pub struct Settings {
     /// still keeps at most a quarter of its trigger.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_keep_tokens: Option<usize>,
+    /// Store each complete reply with its plaintext reasoning withheld from
+    /// later requests, so it is never sent back; the session file keeps it.
+    /// A reply cut at the reply limit, and signed reasoning, go back whole.
+    /// Off sends every reply's reasoning back, as the provider produced it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub strip_stored_reasoning: bool,
     /// Ceiling on the tokens one turn may spend across the agent requests it
     /// makes, counted as a provider bills them: prompt plus completion, with
     /// cached prompt tokens at full value, because what this bounds is the
@@ -181,6 +187,7 @@ impl Default for Settings {
             max_output_bytes: None,
             compaction_tokens: None,
             compaction_keep_tokens: None,
+            strip_stored_reasoning: false,
             max_agent_tokens: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),

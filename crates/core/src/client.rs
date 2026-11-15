@@ -158,7 +158,7 @@ fn details_repeat_plaintext(message: &ChatMessage) -> bool {
 
 fn chat_replay(message: &ChatMessage, origin: &str, prefer_details: bool) -> (bool, bool) {
     let replay = message.reasoning_origin.as_deref() == Some(origin);
-    let plain = replay && !(prefer_details && details_repeat_plaintext(message));
+    let plain = replay && !message.reasoning_withheld && !(prefer_details && details_repeat_plaintext(message));
     (replay, plain)
 }
 
@@ -170,7 +170,7 @@ pub(crate) fn blank_on_wire(message: &ChatMessage, replay: bool) -> bool {
     message.role == "assistant"
         && message.content.as_deref().is_none_or(str::is_empty)
         && message.tool_calls.as_deref().is_none_or(<[_]>::is_empty)
-        && !(replay && (message.reasoning_content.is_some() || message.reasoning.is_some() || message.reasoning_details.is_some()))
+        && !(replay && !message.reasoning_withheld && (message.reasoning_content.is_some() || message.reasoning.is_some() || message.reasoning_details.is_some()))
 }
 
 impl Serialize for WireMessages<'_> {
@@ -188,7 +188,7 @@ impl Serialize for WireMessages<'_> {
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| plain),
                 reasoning: m.reasoning.as_deref().filter(|_| plain),
-                reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
+                reasoning_details: m.reasoning_details.as_deref().filter(|_| replay && !m.reasoning_withheld),
                 cache_control: (mark && !text_mark).then(|| serde_json::json!({"type": "ephemeral"})),
             }
         }))
