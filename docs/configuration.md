@@ -446,11 +446,14 @@ compaction cap. Without one, the cap is four fifths of that model's
 Two cases call for setting these yourself:
 
 - Some providers bill the whole request at a higher rate once its input
-  passes a published size. A `compaction_tokens` just under that size keeps
-  the model below it. For example, on a 1,000,000-token model whose price
+  passes a published size. A `compaction_tokens` under that size makes most
+  requests stay below it. For example, on a 1,000,000-token model whose price
   steps up past 200,000 input tokens, the default cuts at 800,000, so most
   long requests would pay the higher rate; `"compaction_tokens": 190000` in
-  that model's entry keeps every request under the step.
+  that model's entry cuts before most requests reach the step. It is not a
+  price limit: the round that crosses the trigger and the cut's own notes
+  request can still pass the step, and a cut that cannot reach its target
+  waits for the input budget.
 - When a provider accepts less input than the model's advertised window,
   set `context_tokens` to that maximum input, not the advertised window. For
   example, a model advertised at 1,000,000 tokens served with at most
