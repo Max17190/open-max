@@ -876,8 +876,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
   Unset, it follows the model's window, from 16 KiB to 48 KiB.
 - `compaction_tokens`: optional global ceiling for compaction. Unset uses the
-  active model's ceiling, else 150,000 tokens or a quarter of the window when
-  larger; the window budget always caps it.
+  active model's ceiling, else four fifths of the window; the window budget
+  always caps it.
 - `compaction_keep_tokens`: optional most a cut keeps of the newest
   exchanges, note included. Unset keeps 20,000; floored at 4,000; at most a
   quarter of the trigger.

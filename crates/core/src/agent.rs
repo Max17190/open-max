@@ -6332,6 +6332,8 @@ mod tests {
                 settings.base_url = base_url;
                 settings.model = "fixture".into();
                 settings.context_tokens = Some(window);
+                // Pinned, so these tests follow calibration, not the default ceiling.
+                settings.compaction_tokens = Some(150_000);
                 settings.max_tokens = 1_024;
                 settings.max_agent_tokens = spend_cap;
             }
@@ -6557,6 +6559,8 @@ mod tests {
             s.base_url = base_url;
             s.model = "stub".into();
             s.context_tokens = Some(65_536);
+            // At the window, so the input budget is the trigger, as these tests assume.
+            s.compaction_tokens = Some(65_536);
             s.max_tokens = 1_024;
         }
         (dir, core, rx, project, id, requests)
