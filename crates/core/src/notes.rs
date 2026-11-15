@@ -833,14 +833,15 @@ pub(crate) const SPLIT_ADVICE: &str = "Send large content in parts: for a file, 
 /// - Otherwise, the note every such cut got before, byte for byte.
 pub(crate) fn reply_cut_note(max_tokens: usize, reply: &crate::client::CompletionResult) -> String {
     use crate::types::estimate_tokens;
-    let thought = [reply.reasoning_content.as_deref(), reply.reasoning.as_deref()].into_iter().flatten().map(str::len).max()
-        .or_else(|| reply.reasoning_details.as_deref().map(|d| d.get().len())).unwrap_or(0);
+    // Readable reasoning only: `reasoning_details` can hold encrypted data and
+    // signatures, whose bytes say nothing of the tokens behind them.
+    let thought = [reply.reasoning_content.as_deref(), reply.reasoning.as_deref()].into_iter().flatten().map(str::len).max().unwrap_or(0);
     let unseen = match reply.usage.and_then(|u| Some((u.output_tokens, u.reasoning_tokens?))) {
         Some((output, reasoning)) => {
             let arrived = reasoning.max(estimate_tokens(thought) as u64).saturating_add(2 * estimate_tokens(reply.content.len()) as u64);
             (output.saturating_sub(arrived) > (max_tokens as u64 / 8).max(256)).then_some(true)
         }
-        None => (reply.content.is_empty() && thought == 0).then_some(false),
+        None => (reply.content.is_empty() && thought == 0 && reply.reasoning_details.is_none()).then_some(false),
     };
     match unseen {
         Some(true) => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran, and written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
@@ -862,6 +863,7 @@ mod tests {
         use crate::client::{CompletionResult, Usage};
         let before = "[reply cut: it reached max_tokens (4096) before any tool call; continue from where it stopped: think briefly, then act.]";
         let usage = |output: u64, reasoning: Option<u64>| Some(Usage { output_tokens: output, reasoning_tokens: reasoning, ..Default::default() });
+        let encrypted = || Some(serde_json::value::RawValue::from_string(format!(r#"[{{"type":"reasoning.encrypted","data":"{}"}}]"#, "e".repeat(40_000))).unwrap());
         let reply = |content: &str, thought: Option<&str>, usage| CompletionResult {
             content: content.into(), reasoning: thought.map(Into::into), finish_reason: "length".into(), usage, ..Default::default()
         };
@@ -885,6 +887,12 @@ mod tests {
             ("dense text that arrived", reply(&"x".repeat(12_288), None, usage(4_096, Some(0))), "before"),
             // Some text, then a call that never arrived.
             ("short text, then a lost call", reply(&"x".repeat(2_000), None, usage(4_096, Some(0))), "lost"),
+            // Encrypted reasoning, its count small: its bytes do not hide the lost call.
+            ("encrypted reasoning, then a lost call", CompletionResult { reasoning_details: encrypted(), ..reply("", None, usage(4_096, Some(20))) }, "lost"),
+            // Encrypted reasoning counted in full: as before.
+            ("encrypted counted reasoning", CompletionResult { reasoning_details: encrypted(), ..reply("", None, usage(4_096, Some(4_096))) }, "before"),
+            // Encrypted reasoning arrived with no count: something arrived, as before.
+            ("encrypted reasoning, no count", CompletionResult { reasoning_details: encrypted(), ..reply("", None, usage(4_096, None)) }, "before"),
             // No count, nothing arrived: thinking not shown, or a lost call.
             ("nothing arrived, no count", reply("", None, usage(4_096, None)), "unshown"),
             ("nothing arrived, no usage", reply("", None, None), "unshown"),
