@@ -167,16 +167,11 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
 }
 
 impl ActiveEndpoint {
-    /// The limit a request with a `prompt`-token prompt carries: the room it leaves, within the reserve and max_tokens.
+    /// The limit a request with a `prompt`-token prompt carries: the room it leaves, within the reserve and `max` (max_tokens, or a limit `ceiling` lifted, held under the window less 2048).
+    pub(crate) fn reply_limit_within(&self, prompt: usize, max: usize) -> usize { self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_reserve, max.min(self.context_tokens.saturating_sub(2048)).max(self.reply_reserve)) }
+
     #[cfg(test)]
     pub(crate) fn reply_limit(&self, prompt: usize) -> usize { self.reply_limit_within(prompt, self.max_tokens) }
-
-    /// The same within `max` instead of max_tokens (a limit lifted for the
-    /// session, see `ceiling`), and never past the window less 2048.
-    pub(crate) fn reply_limit_within(&self, prompt: usize, max: usize) -> usize {
-        let max = max.min(self.context_tokens.saturating_sub(2048)).max(self.reply_reserve);
-        self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_reserve, max)
-    }
 }
 
 pub fn providers_path(data_dir: &Path) -> PathBuf {
