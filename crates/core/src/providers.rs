@@ -168,6 +168,7 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
 
 impl ActiveEndpoint {
     /// The limit a request with a `prompt`-token prompt carries: the room it leaves, within the reserve and max_tokens.
+    #[cfg(test)]
     pub(crate) fn reply_limit(&self, prompt: usize) -> usize { self.reply_limit_within(prompt, self.max_tokens) }
 
     /// The same within `max` instead of max_tokens (a limit lifted for the
