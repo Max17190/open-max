@@ -744,6 +744,12 @@ async fn run_loop(
         core.sessions.lock().await.get(session_id).and_then(|d| d.prompt_ratio.as_ref()),
         &ratio_origin,
     );
+    // Seeded from the session like the ratio: a route seen budgeting
+    // thinking against the reply limit keeps its lifted limit on later turns.
+    let mut ceiling = crate::ceiling::route_ceiling(
+        core.sessions.lock().await.get(session_id).and_then(|d| d.thought_ceiling.as_ref()),
+        &origin,
+    );
     let max_iterations = settings.max_agent_iterations.max(1);
     // The soft request budget: said before the prompt, then at its marks on a tool result. It ends nothing.
     let request_budget = settings.request_budget.filter(|&budget| budget > 0);
@@ -815,7 +821,11 @@ async fn run_loop(
         }
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
-        let limit = if std::mem::take(&mut at_reserve) { endpoint.reply_reserve } else { endpoint.reply_limit(used_real) };
+        let limit = if std::mem::take(&mut at_reserve) {
+            endpoint.reply_reserve
+        } else {
+            endpoint.reply_limit_within(used_real, ceiling.lifted().unwrap_or(endpoint.max_tokens))
+        };
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
@@ -848,6 +858,15 @@ async fn run_loop(
             Err(mut message) => {
                 // The room left was misjudged: the same request goes once more at the reserve.
                 if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; continue 'turns; }
+                // A route that takes less output than the lifted limit: the
+                // configured limit again, for good, and the request once more.
+                if limit > endpoint.max_tokens && crate::ceiling::refused_for_output(&message) && iteration + 1 < max_iterations {
+                    ceiling.refuse();
+                    if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
+                        data.thought_ceiling = Some((origin.clone(), ceiling.clone()));
+                    }
+                    continue 'turns;
+                }
                 // A server can refuse a request that carries a reply of reasoning alone. Such
                 // replies lose their stamp, so no wire sends them, and the request goes again.
                 let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
@@ -966,6 +985,16 @@ async fn run_loop(
         let capped = result.hit_output_cap(limit);
         if !capped {
             cuts = 0;
+        }
+        // A thought stopped short of the limit at the count an earlier one
+        // stopped at: the route budgets thinking against the limit, which is
+        // lifted for the rest of the session (see `ceiling`).
+        let read = ceiling.clone();
+        ceiling.observe(limit, endpoint.max_tokens, result.usage.and_then(|u| u.reasoning_tokens), capped);
+        if ceiling != read {
+            if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
+                data.thought_ceiling = Some((origin.clone(), ceiling.clone()));
+            }
         }
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
@@ -9570,6 +9599,53 @@ echo run >> {}
             assert_eq!(told_at, 1, "{told}: {}", bodies[1]);
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// The reply limits a turn sends against a provider that answers its
+    /// first `times` requests with `reply`, then says it is done.
+    async fn limits_sent(reply: &str, times: usize) -> Vec<u64> {
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, bodies) = capturing_endpoint_times(reply, times).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(200_000), 4_096);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        start_turn(core.clone(), "sess-ceiling".into(), project, "go".into()).unwrap();
+        drive_turn(&mut rx).await;
+        let limits = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
+        let _ = std::fs::remove_dir_all(dir);
+        limits
+    }
+
+    /// A route that ends thinking at a fixed count below the limit and
+    /// reports a normal finish gets the lifted limit from the request after
+    /// the second such reply; a route that cuts hard at the limit keeps the
+    /// configured one however often it cuts.
+    #[tokio::test]
+    async fn a_route_that_budgets_thinking_gets_a_lifted_limit() {
+        const BUDGETED: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"so the count for m\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":3100,\"completion_tokens_details\":{\"reasoning_tokens\":3072},\"total_tokens\":3200}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        const HARD_CUT: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"half a thought\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4096,\"completion_tokens_details\":{\"reasoning_tokens\":4096},\"total_tokens\":4196}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let lifted = crate::ceiling::LIFTED_REPLY_LIMIT as u64;
+        assert_eq!(limits_sent(BUDGETED, 3).await, [4_096, 4_096, lifted, lifted]);
+        let cut = limits_sent(HARD_CUT, 4).await;
+        assert_eq!(cut, [4_096; 5], "four cuts continued, then done");
     }
 
     /// A provider that counts every prompt at 1,536 tokens over the loop's

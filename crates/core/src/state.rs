@@ -89,6 +89,11 @@ pub struct SessionData {
     /// response or refusal for length. See
     /// `compaction::token_factor`.
     pub prompt_ratio: Option<(String, f64)>,
+    /// What the session's replies showed of a route that budgets thinking
+    /// against the reply limit, and whether the limit is lifted for it.
+    /// Keyed by the route that taught it; in memory only, like the prompt
+    /// ratio. See `ceiling::ThoughtCeiling`.
+    pub thought_ceiling: Option<(String, crate::ceiling::ThoughtCeiling)>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous

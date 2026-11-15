@@ -129,6 +129,7 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             reported_approval_mode,
             seen_ledger_events: seen_approval_events(core, project_root),
             prompt_ratio: None,
+            thought_ceiling: None,
         };
         land_deferred_resume_edits(core, session_id, &mut data, saved);
         data
@@ -162,6 +163,7 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             reported_approval_mode: None,
             seen_ledger_events: seen_approval_events(core, project_root),
             prompt_ratio: None,
+            thought_ceiling: None,
         }
     })
 }
