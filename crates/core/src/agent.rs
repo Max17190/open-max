@@ -88,20 +88,15 @@ enum ApprovalOutcome {
 fn cut_off_call_error(max_tokens: usize) -> String {
     format!(
         "Not run: your reply reached the output limit (max_tokens = {max_tokens}) while \
-         writing this call, so its arguments were cut off. Send large content in parts: \
-         for a file, write_file the first part, then append the rest with edit_file \
-         (old_string is the last few lines you wrote, enough to be unique; new_string \
-         is those lines followed by the next part)."
+         writing this call, so its arguments were cut off. {}",
+        crate::notes::SPLIT_ADVICE
     )
 }
 
 /// A reply the output cap cut before its first tool call ran nothing and
 /// answered nothing, so the turn goes on this many times in a row, each
-/// after this note; one more such reply ends the turn `length`.
+/// after a note (`notes::reply_cut_note`); one more such reply ends the turn `length`.
 const MAX_CUT_CONTINUATIONS: usize = 4;
-fn reply_cut_note(max_tokens: usize) -> String {
-    format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]")
-}
 
 /// The one failure persisted without the `Error: ` prefix: the model must
 /// read the timeout as an instruction to stop, not as tool noise. Everything
@@ -984,7 +979,7 @@ async fn run_loop(
             if capped && cuts < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
                 cuts += 1;
                 let at = guard.messages().len();
-                insert_note(core, session_id, guard.messages(), at, reply_cut_note(limit));
+                insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(limit, &result));
                 save_messages(core, session_id, guard.messages(), false).await;
                 continue 'turns;
             }
@@ -5014,6 +5009,45 @@ mod tests {
         "data: [DONE]\n\n",
     );
     const CUT_NOTE: &str = "[reply cut: it reached max_tokens (1024) before any tool call; continue from where it stopped: think briefly, then act.]";
+
+    /// The bug this guards: a provider that sends a tool call only when it is
+    /// complete dropped a call the reply limit cut, so the reply arrived empty
+    /// although it spent the limit, and the note told the model to continue
+    /// from a point it could not see; it wrote the same call again four times
+    /// and the turn ended `length`. The usage shows the output did not arrive,
+    /// so the note says so and how to split the content, and the next request
+    /// carries that note.
+    #[tokio::test]
+    async fn a_cut_whose_output_never_arrived_says_so_and_how_to_split() {
+        use crate::state::Core;
+
+        const LOST: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1023,\"completion_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":1124}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, bodies) = capturing_endpoint(LOST).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(16384), 1024);
+            s.approval_mode = ApprovalMode::Auto;
+        }
+        start_turn(core.clone(), "sess-lost-call".into(), project.clone(), "write the tests".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "the empty cut reply, then the request after its note");
+        let note = format!("[reply cut: it reached max_tokens (1024) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran, and written again whole it will be cut the same way. {}]", crate::notes::SPLIT_ADVICE);
+        let sent: Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(sent["messages"].as_array().unwrap().last().unwrap()["content"], note.as_str(), "{}", bodies[1]);
+        let messages = transcript(&core, "sess-lost-call").await;
+        assert_eq!(user_messages(&messages, "[reply cut"), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// The bug this guards: a reply the output cap cut before any call ran
     /// nothing and answered nothing, yet it ended the turn, so a model that

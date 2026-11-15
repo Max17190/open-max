@@ -157,7 +157,14 @@ and the run that writes a key already uses it.
   before any tool call does not end the turn: it stays in the transcript
   (its reasoning too, which goes back only to the endpoint that wrote it),
   a note after it tells the model the limit and to continue briefly, and
-  the turn goes on. A server can refuse a request that carries a reply
+  the turn goes on. A provider that sends a tool call only when it is
+  complete drops a call the limit cuts, so such a reply can arrive empty
+  although it spent the limit. When the reply's usage counts output that
+  neither its reasoning nor what arrived accounts for, the note says the
+  reply was cut while writing something that did not arrive, most likely a
+  call larger than the limit, and asks for the content in parts instead;
+  when nothing arrived and no reasoning count is reported, it says it was
+  either thinking that is not shown or such a call. A server can refuse a request that carries a reply
   holding reasoning and nothing else (HTTP 400 or 422): that reasoning then
   stops going back, in this session and after a resume, and the request is
   sent once more without it. After four such continuations in a row, a

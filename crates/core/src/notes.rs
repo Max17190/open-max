@@ -806,10 +806,93 @@ fn approval_state(
         .collect()
 }
 
+
+/// How to get content larger than the reply limit across, as the refusal of a
+/// call the limit cut off (`agent::cut_off_call_error`) and the note after a
+/// call that never arrived both give it.
+pub(crate) const SPLIT_ADVICE: &str = "Send large content in parts: for a file, write_file the first part, then append the rest with edit_file (old_string is the last few lines you wrote, enough to be unique; new_string is those lines followed by the next part).";
+
+/// The note after a reply the output limit cut before any tool call, chosen
+/// by what its usage accounts for. A provider that sends a tool call only
+/// when it is complete drops a call the limit cuts, so the reply can arrive
+/// with nothing in it although it spent the whole limit. Told to continue
+/// from where it stopped, the model cannot see that point and writes the same
+/// call again, which the limit cuts the same way. So:
+///
+/// - Usage reports the reasoning count, and the output beyond that reasoning
+///   (or beyond the reasoning text that arrived, when that is longer) and
+///   beyond the text that arrived is more than an eighth of the limit (256
+///   tokens at least): something was written that did not arrive, most likely
+///   one call larger than the limit. The note says so and gives the split advice.
+/// - No reasoning count, and nothing at all arrived: the note says it was
+///   either thinking that is not shown or a call larger than the limit.
+/// - Otherwise, the note every such cut got before, byte for byte.
+pub(crate) fn reply_cut_note(max_tokens: usize, reply: &crate::client::CompletionResult) -> String {
+    use crate::types::estimate_tokens;
+    let thought = [reply.reasoning_content.as_deref(), reply.reasoning.as_deref()].into_iter().flatten().map(str::len).max()
+        .or_else(|| reply.reasoning_details.as_deref().map(|d| d.get().len())).unwrap_or(0);
+    let unseen = match reply.usage.and_then(|u| Some((u.output_tokens, u.reasoning_tokens?))) {
+        Some((output, reasoning)) => {
+            let arrived = reasoning.max(estimate_tokens(thought) as u64).saturating_add(estimate_tokens(reply.content.len()) as u64);
+            (output.saturating_sub(arrived) > (max_tokens as u64 / 8).max(256)).then_some(true)
+        }
+        None => (reply.content.is_empty() && thought == 0).then_some(false),
+    };
+    match unseen {
+        Some(true) => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran, and written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
+        Some(false) => format!("[reply cut: it reached max_tokens ({max_tokens}) and nothing of the reply arrived here: either thinking that is not shown, or a tool call larger than the limit, which did not run. If it was a call, written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
+        None => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prompt::{NOTE_HEADER, NOTE_SEPARATOR};
+
+    /// The note after a reply cut before any call follows what its usage
+    /// accounts for, and is the note every cut got before whenever what
+    /// arrived accounts for the output.
+    #[test]
+    fn a_cut_note_says_when_the_output_did_not_arrive() {
+        use crate::client::{CompletionResult, Usage};
+        let before = "[reply cut: it reached max_tokens (4096) before any tool call; continue from where it stopped: think briefly, then act.]";
+        let usage = |output: u64, reasoning: Option<u64>| Some(Usage { output_tokens: output, reasoning_tokens: reasoning, ..Default::default() });
+        let reply = |content: &str, thought: Option<&str>, usage| CompletionResult {
+            content: content.into(), reasoning: thought.map(Into::into), finish_reason: "length".into(), usage, ..Default::default()
+        };
+        let long_thought = "t".repeat(16_000);
+        let cases = [
+            // A call dropped whole: the limit spent, one reasoning token, nothing arrived.
+            ("a call that never arrived", reply("", None, usage(4_096, Some(1))), "lost"),
+            // Text, then a call that never arrived: 1,223 output beyond 2,873 reasoning, 117 bytes shown.
+            ("text, then a lost call", reply(&"x".repeat(117), Some(&"t".repeat(12_192)), usage(4_096, Some(2_873))), "lost"),
+            // Reasoning that streamed and was counted.
+            ("streamed reasoning", reply("", Some(&long_thought), usage(4_096, Some(4_096))), "before"),
+            // Reasoning counted but not shown.
+            ("hidden counted reasoning", reply("", None, usage(4_096, Some(4_090))), "before"),
+            // Reasoning that streamed while the count says less.
+            ("reasoning longer than its count", reply("", Some(&long_thought), usage(4_096, Some(10))), "before"),
+            // Text that arrived accounts for the output.
+            ("text that arrived", reply(&"x".repeat(16_000), None, usage(4_096, Some(0))), "before"),
+            // A few unaccounted tokens are not a lost call.
+            ("within the margin", reply(&"x".repeat(15_000), None, usage(4_096, Some(0))), "before"),
+            // No count, nothing arrived: thinking not shown, or a lost call.
+            ("nothing arrived, no count", reply("", None, usage(4_096, None)), "unshown"),
+            ("nothing arrived, no usage", reply("", None, None), "unshown"),
+            // No count, something arrived: as before.
+            ("text, no count", reply("so far", None, None), "before"),
+            ("reasoning, no count", reply("", Some("half a thought"), usage(4_096, None)), "before"),
+        ];
+        for (case, reply, want) in cases {
+            let note = reply_cut_note(4_096, &reply);
+            let got = if note == before { "before" } else if note.contains("did not arrive here") { "lost" } else if note.contains("nothing of the reply arrived") { "unshown" } else { "other" };
+            assert_eq!(got, want, "{case}: {note}");
+            if want != "before" {
+                assert!(note.starts_with("[reply cut: it reached max_tokens (4096)") && note.ends_with(&format!("{SPLIT_ADVICE}]")), "{case}: {note}");
+            }
+        }
+    }
 
     /// A note at each of 50, 75, 90 and 100 percent, once each, and none
     /// before the first or after the last; marks passed in one step earn one
