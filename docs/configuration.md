@@ -182,12 +182,15 @@ and the run that writes a key already uses it.
   limit and where it is set.
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
-  model's value in `providers.json`, then a default that follows the
-  model's context window: 150,000 tokens, or a quarter of the window when
-  that is larger (262,144 for a 1,048,576-token window). Fewer cuts on a
-  large window mean fewer re-reads of removed context and fewer requests
-  that re-send the whole context uncached; the price is a larger context on
-  every request while no cut fires. To keep more or less
+  model's value in `providers.json`, then a default of four fifths of the
+  model's context window (104,857 for a 131,072-token window, 838,860 for a
+  1,048,576-token window). A cut is lossy and changes the prompt prefix, so
+  the requests after it re-send what it kept uncached and the model re-reads
+  what it removed, and you chose the window, so the default cuts only when
+  most of it is in use. The fifth left over holds the reply, the next round's
+  tool results, the cut's own notes request and the drift of the token
+  estimate between calibrations. The price is a larger context on every
+  request while no cut fires. To keep more or less
   history on a model, set the cap in that model's entry and leave the
   global setting unset.
 - `compaction_keep_tokens` (default unset) sets the most an automatic cut or
@@ -310,9 +313,10 @@ differently. A normal turn request that fails or returns no usable prompt
 count discards a lower calibration.
 
 The input budget always bounds the trigger. With the defaults before
-calibration, a 128,000-token window triggers at 122,880 tokens, a
-500,000-token window triggers at 150,000 tokens, and a 1,048,576-token
-window triggers at 262,144 tokens. If the frozen schemas or the
+calibration, a 128,000-token window triggers at 102,400 tokens, a
+500,000-token window triggers at 400,000 tokens, and a 1,048,576-token
+window triggers at 838,860 tokens. On a window too small to leave four
+fifths for history, the input budget is the trigger. If the frozen schemas or the
 messages a cut must keep make the target unreachable, automatic compaction
 falls back to the input budget. The `/compact` command makes the same cut
 against the calibrated trigger and uses the input budget if the frozen
@@ -436,8 +440,22 @@ requests.
 ```
 
 Add `"compaction_tokens": 220000` to a model object to set that model's
-compaction cap. Without one, the cap follows that model's `context_tokens`:
-150,000 tokens, or a quarter of the window when larger. See [context window and compaction](#context-window-and-compaction).
+compaction cap. Without one, the cap is four fifths of that model's
+`context_tokens`. See [context window and compaction](#context-window-and-compaction).
+
+Two cases call for setting these yourself:
+
+- Some providers bill the whole request at a higher rate once its input
+  passes a published size. A `compaction_tokens` just under that size keeps
+  the model below it. For example, on a 1,000,000-token model whose price
+  steps up past 200,000 input tokens, the default cuts at 800,000, so most
+  long requests would pay the higher rate; `"compaction_tokens": 190000` in
+  that model's entry keeps every request under the step.
+- When a provider accepts less input than the model's advertised window,
+  set `context_tokens` to that maximum input, not the advertised window. For
+  example, a model advertised at 1,000,000 tokens served with at most
+  400,000 tokens of input takes `"context_tokens": 400000`, and the default
+  trigger follows it to 320,000.
 
 Set `"provider"` in settings, use the provider CLI option, or use `/provider <name>`
 when you only want to change the endpoint. Bare `/provider` opens the searchable

@@ -12,18 +12,16 @@ use crate::config::Settings;
 mod setup;
 pub use setup::{edit_catalog, read_catalog};
 
-const DEFAULT_COMPACTION_TOKENS: usize = 150_000;
-
 /// The soft compaction ceiling when neither settings nor the selected model
-/// entry sets one: 150,000 tokens, or a quarter of the context window when
-/// that is larger. A fixed 150,000 sized for small windows cuts a
-/// 1,048,576-token window at a seventh of its size, and each cut changes the
-/// prefix, so the next request re-bills what the cut kept uncached and the
-/// model re-reads what the cut removed. Windows up to 600,000 tokens keep
-/// 150,000; the input budget still caps the trigger. A lower ceiling for a
-/// model is its entry's `compaction_tokens`.
+/// entry sets one: four fifths of the context window, for every window. A
+/// cut is lossy and changes the prompt prefix, and the user chose the window,
+/// so the default cuts only when most of it is in use. The fifth left over
+/// holds the reply, the next round's tool results, the cut's own notes
+/// request, and the drift of the token estimate between calibrations. The
+/// input budget still caps the trigger; a lower ceiling for a model is its
+/// entry's `compaction_tokens`.
 fn default_compaction_tokens(context_tokens: usize) -> usize {
-    DEFAULT_COMPACTION_TOKENS.max(context_tokens / 4)
+    context_tokens.saturating_mul(4) / 5
 }
 
 /// Wire quirks for picky OpenAI-compatible servers.
@@ -1137,16 +1135,18 @@ mod tests {
     }
 
     /// With `compaction_tokens` unset in settings and in the model entry, the
-    /// soft ceiling follows the window: 150,000 tokens up to a 600,000-token
-    /// window, a quarter of the window above it. An explicit setting wins over
-    /// the model entry's value, and both win over the window default.
+    /// soft ceiling is four fifths of the window, whatever its size. An
+    /// explicit setting wins over the model entry's value, and both win over
+    /// the window default. The input budget still caps the trigger.
     #[test]
     fn the_default_compaction_ceiling_follows_the_context_window() {
-        let expected = |window: usize| (window / 4).max(DEFAULT_COMPACTION_TOKENS);
+        let expected = |window: usize| window * 4 / 5;
         let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
         write_providers(
             &dir,
             r#"{"providers":{"p":{"base_url":"http://127.0.0.1:9/v1","models":[
+                {"id":"w131k","context_tokens":131072},
+                {"id":"w1000k","context_tokens":1000000},
                 {"id":"w200k","context_tokens":200000},
                 {"id":"w400k","context_tokens":400000},
                 {"id":"w600k","context_tokens":600000},
@@ -1169,11 +1169,24 @@ mod tests {
         let ceiling = |model: &str, setting: Option<usize>, window: Option<usize>| {
             resolve_with(model, setting, window).unwrap().compaction_tokens
         };
-        for (model, window) in [("w200k", 200_000), ("w400k", 400_000), ("w600k", 600_000), ("w1m", 1_048_576)] {
+        for (model, window) in [("w131k", 131_072), ("w200k", 200_000), ("w400k", 400_000), ("w600k", 600_000), ("w1000k", 1_000_000), ("w1m", 1_048_576)] {
             assert_eq!(ceiling(model, None, None), expected(window), "{model}");
         }
-        assert_eq!(expected(600_000), DEFAULT_COMPACTION_TOKENS, "windows up to 600,000 keep the old default");
-        assert_eq!(ceiling("w1m", None, None), 262_144);
+        assert_eq!(ceiling("w131k", None, None), 104_857);
+        assert_eq!(ceiling("w200k", None, None), 160_000);
+        assert_eq!(ceiling("w1000k", None, None), 800_000);
+        assert_eq!(ceiling("w1m", None, None), 838_860);
+        // The trigger is the ceiling capped by the input budget (the window
+        // less the reply reserve and 1,024): under it on these windows,
+        // binding on a tiny one.
+        let trigger = |window: usize| {
+            let s = Settings { base_url: "http://127.0.0.1:9/v1".into(), model: "m".into(), context_tokens: Some(window), ..Default::default() };
+            let ep = resolve(&s, &dir).unwrap();
+            crate::compaction::requested_trigger(ep.compaction_tokens, None, window - ep.reply_reserve - 1024)
+        };
+        assert_eq!(trigger(131_072), 104_857, "the budget, 125,952, does not bind");
+        assert_eq!(trigger(1_048_576), 838_860, "the budget, 1,043,456, does not bind");
+        assert_eq!(trigger(16_384), 16_384 - 4_096 - 1_024, "the budget binds on a tiny window");
         // An entry without a window takes the settings window, and the
         // ceiling follows that; with no window anywhere nothing resolves.
         assert_eq!(ceiling("unsized", None, Some(1_048_576)), expected(1_048_576));
@@ -1196,7 +1209,7 @@ mod tests {
             };
             resolve(&s, &dir).unwrap().compaction_tokens
         };
-        for window in [200_000, 400_000, 600_000, 1_048_576] {
+        for window in [131_072, 200_000, 400_000, 600_000, 1_000_000, 1_048_576] {
             assert_eq!(flat(None, window), expected(window), "flat {window}");
         }
         assert_eq!(flat(Some(120_000), 1_048_576), 120_000);
