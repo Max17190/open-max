@@ -836,8 +836,8 @@ async fn run_loop(
         let result = match result {
             Ok(r) => r,
             Err(mut message) => {
-                // The room left was misjudged: the same request goes once more at the reserve.
-                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some(); continue 'turns; }
+                // The room left was misjudged: the same request goes once more at the reserve, with no more room or raises.
+                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some() || raise > 0; raise = 0; continue 'turns; }
                 // A server that refuses the room a cut reply was promised, or a raised limit, gets the request again at the usual limit.
                 if (roomy.is_some() || raise > 0) && limit > endpoint.reply_limit(used_real) && (message.starts_with("backend returned 400") || message.starts_with("backend returned 422")) && iteration + 1 < max_iterations { no_room = true; raise = 0; continue 'turns; }
                 // A server can refuse a request that carries a reply of reasoning alone. Such
@@ -972,7 +972,7 @@ async fn run_loop(
             // next request, and the loop goes round. Never on the last
             // iteration, which has no request left to carry the note. A second cut in a row doubles the limit, so the
             // limit alone never ends a turn while it can grow.
-            let next = used_real + limit;
+            let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
             cuts += usize::from(capped);
             let raised = capped && cuts > 1 && !no_room && endpoint.raised_limit(next, raise + 1) > endpoint.raised_limit(next, raise);
             if raised { raise += 1 } else if capped && cuts > 1 { stalled += 1 }
