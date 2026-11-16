@@ -261,6 +261,11 @@ pub enum AgentEvent {
     /// event. `compacted_messages` of 0 means the transcript was already at
     /// or under the prune target and nothing changed.
     Compacted { tokens_before: usize, tokens_after: usize, compacted_messages: usize },
+    /// A cut the trigger asked for and the window does not force was not
+    /// made, because the notes it needs did not arrive; `reason` says why.
+    /// The history stays whole and the turn goes on, so it is advisory: the
+    /// window forces the cut, with the deterministic digest, if it fills.
+    CompactionSkipped { reason: String },
     /// The frozen tool schemas take most of what the
     /// window has to spend, so the transcript is squeezed into what little
     /// they leave: compaction runs early and hard, and once `schema_tokens`
@@ -358,7 +363,7 @@ mod tests {
     /// exactly as `--stdio` and `--print --json` emit it: both write
     /// `to_json_line`, which this pins, and crates/tui/tests/cli.rs checks
     /// that one turn comes out of the two in the same bytes. These strings
-    /// are the `openmax-stdio/10` contract: session_id first, then the `type`
+    /// are the `openmax-stdio/11` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
@@ -487,6 +492,10 @@ mod tests {
             r#"{"session_id":"s1","type":"schemas_over_budget","schema_tokens":6800,"budget_tokens":2150}"#
         );
         assert_eq!(
+            env(AgentEvent::CompactionSkipped { reason: "the notes reply had no text (finish_reason stop)".into() }),
+            r#"{"session_id":"s1","type":"compaction_skipped","reason":"the notes reply had no text (finish_reason stop)"}"#
+        );
+        assert_eq!(
             env(AgentEvent::Retry { attempt: 2, max_attempts: 8, reason: "request failed: connection reset".into() }),
             r#"{"session_id":"s1","type":"retry","attempt":2,"max_attempts":8,"reason":"request failed: connection reset"}"#
         );
@@ -591,6 +600,7 @@ mod tests {
                 AgentEvent::ApprovalSettled { .. } => {}
                 AgentEvent::Refrozen { .. } => {}
                 AgentEvent::Compacted { .. } => {}
+                AgentEvent::CompactionSkipped { .. } => {}
                 AgentEvent::SchemasOverBudget { .. } => {}
                 AgentEvent::HookFailed { .. } => {}
                 AgentEvent::TurnRefused { .. } => {}

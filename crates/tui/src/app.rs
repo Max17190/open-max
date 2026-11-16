@@ -2936,6 +2936,9 @@ impl App {
                 self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
                 self.dirty.mark_tail();
             }
+            AgentEvent::CompactionSkipped { reason } => {
+                self.note(&format!("context cut skipped: {}", open_max_core::text::one_line(&reason)));
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Says what it costs and what to do, not how compaction reacts:
                 // that depends on whether any room is left at all.
