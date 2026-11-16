@@ -168,9 +168,8 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
-/// The room a reply cut inside a tool call or its text is asked for once more with. The default limit bounds how
-/// long a reasoning model thinks before it acts, not how much a call may carry, so only it gets room: four times
-/// itself. A limit someone chose, on the model's entry or in settings, is a ceiling and stays one.
+/// The room a reply cut inside a tool call or its text is asked for once more with: four times the default limit,
+/// which bounds thinking, not what a call may carry. A limit someone chose, on the model or in settings, is a ceiling.
 fn reply_room(context: usize, settings: &Settings) -> usize {
     let default = Settings::default().max_tokens;
     let limit = reply_limits(context, settings.max_tokens).0;

@@ -813,18 +813,12 @@ fn approval_state(
 pub(crate) const SPLIT_ADVICE: &str = "Send large content in parts: for a file, write_file the first part, then append the rest with edit_file (old_string is the last few lines you wrote, enough to be unique; new_string is those lines followed by the next part).";
 
 /// The reply for a call the output cap cut off partway through its
-/// arguments. A bare parse error ("EOF while parsing") reads as a typo to
-/// fix, and the model sends the same oversized call again, which the cap
-/// cuts at the same place. The advice is an example, since any tool can be
-/// the one cut (a bash heredoc as easily as a write_file), and it spells out
-/// how edit_file appends, because its old_string has to be unique and the
-/// last line alone of a large file is often a brace or blank. With `room`,
-/// the limit the next request alone carries, the call is asked for whole.
+/// arguments. A bare parse error reads as a typo to fix, and the model sends
+/// the same oversized call again. The advice spells out how edit_file
+/// appends, because its old_string has to be unique. With `room`, the limit
+/// the next request alone carries, the call is asked for whole.
 pub(crate) fn cut_off_call_error(max_tokens: usize, room: Option<usize>) -> String {
-    let advice = match room {
-        Some(room) => format!("Your next reply alone may be up to {room} tokens: send this call again now, whole."),
-        None => SPLIT_ADVICE.into(),
-    };
+    let advice = room.map_or(SPLIT_ADVICE.into(), |room| format!("Your next reply alone may be up to {room} tokens: send this call again now, whole."));
     format!("Not run: your reply reached the output limit (max_tokens = {max_tokens}) while writing this call, so its arguments were cut off. {advice}")
 }
 
@@ -844,8 +838,7 @@ pub(crate) fn cut_off_call_error(max_tokens: usize, room: Option<usize>) -> Stri
 ///   thinking that is not shown or a call larger than the limit.
 /// - `Text`: what arrived accounts for the output, and the text in it is
 ///   more than that same margin: the reply was cut writing its answer.
-/// - `Thought`: what arrived accounts for the output and is thinking, with
-///   at most a few words of text.
+/// - `Thought`: what arrived accounts for the output and is thinking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CutKind { Thought, Text, Lost, Unseen }
 
