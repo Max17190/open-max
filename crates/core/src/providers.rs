@@ -171,10 +171,10 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
 /// The room a reply cut inside a tool call or its text is asked for once more with. The default limit bounds how
 /// long a reasoning model thinks before it acts, not how much a call may carry, so only it gets room: four times
 /// itself. A limit someone chose, on the model's entry or in settings, is a ceiling and stays one.
-fn reply_room(context: usize, settings: &Settings, chosen: bool) -> usize {
+fn reply_room(context: usize, settings: &Settings) -> usize {
     let default = Settings::default().max_tokens;
     let limit = reply_limits(context, settings.max_tokens).0;
-    if chosen || settings.max_tokens != default { limit } else { reply_limits(context, default * 4).0 }
+    if settings.max_tokens != default { limit } else { reply_limits(context, default * 4).0 }
 }
 
 impl ActiveEndpoint {
@@ -704,7 +704,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             context_tokens,
             max_tokens,
             reply_reserve,
-            reply_room: reply_room(context_tokens, settings, model_entry.is_some_and(|m| m.max_tokens.is_some())).max(max_tokens),
+            reply_room: if model_entry.is_some_and(|m| m.max_tokens.is_some()) { max_tokens } else { reply_room(context_tokens, settings) },
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
                 .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -747,7 +747,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         context_tokens,
         max_tokens,
         reply_reserve,
-        reply_room: reply_room(context_tokens, settings, false),
+        reply_room: reply_room(context_tokens, settings),
         compaction_tokens: settings
             .compaction_tokens
             .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -1145,6 +1145,7 @@ mod tests {
         assert_eq!(ep.api_key.as_deref(), Some("sk-test"));
         assert_eq!(ep.context_tokens, 64000);
         assert_eq!(ep.max_tokens, 2048);
+        assert_eq!((ep.reply_room, ep.reply_room(0)), (2048, 2048), "a limit the model's entry sets is a ceiling for the request after a cut too");
         assert!(ep.headers.iter().any(|(k, v)| k == "X-Title" && v == "Open Max"));
         let _ = std::fs::remove_dir_all(dir);
     }
