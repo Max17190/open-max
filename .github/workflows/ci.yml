@@ -70,13 +70,17 @@ jobs:
       # the tests take 203 to 223 seconds to build on ubuntu-latest instead of
       # 35 to 37, and 425 instead of 63 on macos-latest. This job holds no time
       # budget and runs each test in a process of its own, so it builds them
-      # unoptimized, as it did before: cargo reads the two settings from the
-      # config in its home directory, over Cargo.toml's.
+      # unoptimized, as it did before: cargo reads the settings from the
+      # config in its home directory, over Cargo.toml's. The two crates keep
+      # only line tables for debug info, which still names the file and line
+      # of each backtrace frame, so linking the 24 test binaries writes less:
+      # the build took 88 seconds of macos-latest's test job with full debug
+      # info. The dependencies keep theirs, so main's cache still serves them.
       # crates/tui/tests/thesis.rs holds this.
       - name: Build the workspace's crates unoptimized
         run: |
           mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
-          printf '\n[profile.test.package.open-max-core]\nopt-level = 0\n\n[profile.test.package.openmax]\nopt-level = 0\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          printf '\n[profile.test.package.open-max-core]\nopt-level = 0\ndebug = "line-tables-only"\n\n[profile.test.package.openmax]\nopt-level = 0\ndebug = "line-tables-only"\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
 
       # cargo-nextest's release binary for the runner, checked against the
       # sha256 its release publishes before it runs, as the Mutants workflow
