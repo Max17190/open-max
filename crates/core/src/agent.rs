@@ -837,7 +837,7 @@ async fn run_loop(
             Ok(r) => r,
             Err(mut message) => {
                 // The room left was misjudged: the same request goes once more at the reserve.
-                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; continue 'turns; }
+                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some(); continue 'turns; }
                 // A server that refuses the room a cut reply was promised gets the request again at the usual limit.
                 if roomy.is_some() && limit > endpoint.reply_limit(used_real) && (message.starts_with("backend returned 400") || message.starts_with("backend returned 422")) && iteration + 1 < max_iterations { no_room = true; continue 'turns; }
                 // A server can refuse a request that carries a reply of reasoning alone. Such
