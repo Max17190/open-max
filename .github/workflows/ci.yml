@@ -113,14 +113,50 @@ jobs:
       - name: Check test count
         run: scripts/check-test-count.sh
 
-      - name: Test repository memory example
-        run: |
-          cargo build --locked -p openmax
-          python3 examples/repo-memory/test_repo_memory.py target/debug/openmax
+  # The examples' own scripts drive a debug build of the binary end to end.
+  # They took 2.5 minutes after the tests on macos-latest, the longest part
+  # of the gate's slowest job, so they run in a job of their own beside the
+  # tests, on the same runners, and the two scripts run at once: each keeps
+  # its state in a temporary HOME of its own. Each script's output is shown
+  # when both have ended, and a failure of either fails the job. The job
+  # builds the test job's dependencies again, so it restores the cache that
+  # job saves on main and saves none of its own.
+  examples:
+    name: Examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      # The binary the step above built, driven by the example's own script.
-      - name: Test run task example
-        run: python3 examples/run-task/test_run_task.py target/debug/openmax
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+          save-if: false
+
+      - name: Build the binary
+        run: cargo build --locked -p openmax
+
+      - name: Test the examples
+        timeout-minutes: 10
+        run: |
+          python3 examples/repo-memory/test_repo_memory.py target/debug/openmax > "$RUNNER_TEMP/repo-memory.log" 2>&1 &
+          memory=$!
+          python3 examples/run-task/test_run_task.py target/debug/openmax > "$RUNNER_TEMP/run-task.log" 2>&1 &
+          task=$!
+          wait "$memory" || { echo "::error::the repository memory example failed"; failed=1; }
+          wait "$task" || { echo "::error::the run task example failed"; failed=1; }
+          echo "--- repository memory example"; cat "$RUNNER_TEMP/repo-memory.log"
+          echo "--- run task example"; cat "$RUNNER_TEMP/run-task.log"
+          exit ${failed:-0}
 
   # The zero-warning baseline is only real if something checks it. It was set
   # deliberately, then drifted back to three warnings because nothing did. A

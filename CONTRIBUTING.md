@@ -10,7 +10,8 @@ Found a bug or want a change? Open an issue or send a pull request. To report a 
 
 Every pull request runs the CI workflow, and these jobs have to pass. [Development](docs/development.md) states each budget and floor.
 
-- **Test**, on ubuntu-latest and macos-latest: every test under cargo-nextest, the doc tests, the examples' tests, and `scripts/check-test-count.sh` against the test count floor.
+- **Test**, on ubuntu-latest and macos-latest: every test under cargo-nextest, the doc tests, and `scripts/check-test-count.sh` against the test count floor.
+- **Examples**, on ubuntu-latest and macos-latest: the repository memory and run task examples' scripts against a debug build of the binary.
 - **Clippy**: `cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings`, with no warnings.
 - **Thesis**, on ubuntu-latest and macos-latest: the thesis tests in a release build, each holding a bound, such as the frozen prefix's byte cap and the core source's line ratchet.
 - **Release plan**: `dist plan --output-format=json`, so a release config it cannot plan fails the pull request.

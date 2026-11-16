@@ -2212,7 +2212,8 @@ fn core_share_reports_the_share_of_commits_that_change_the_core() {
 /// none needs another, so the gate takes as long as its slowest job, and
 /// Clippy, which builds with a compiler of its own, pinned to a release, is a
 /// job of its own instead of steps after the tests. The jobs are the tests,
-/// Clippy, the thesis gates, the core share and dist's plan of the release;
+/// the examples, Clippy, the thesis gates, the core share and dist's plan of
+/// the release;
 /// the six release builds are not among them (crates/tui/tests/release.rs
 /// holds their workflow and the plan). CI runs on every push to main, every
 /// pull request, every merge group of a merge queue and every night. A push
@@ -2251,7 +2252,7 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
         .skip(1)
         .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':').filter(|key| !key.starts_with([' ', '#'])))
         .collect();
-    assert_eq!(jobs, ["test", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
+    assert_eq!(jobs, ["test", "examples", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
     for job in &jobs {
         let waits: Vec<String> = ci_job(job).into_iter().filter(|line| line.trim().starts_with("needs:")).collect();
         assert!(waits.is_empty(), "the {job} job waits for another, so the gate takes the two one after the other: {waits:?}");
