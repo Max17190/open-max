@@ -164,6 +164,40 @@ async fn native_tool_round_trip_preserves_signed_blocks_only_for_the_same_origin
     let switched=String::from_utf8(records[2].body.clone()).unwrap();assert!(!switched.contains("fixture-signature"));assert!(!switched.contains("inspect first"));assert!(switched.contains("call-fixture"));
 }
 
+/// A compatible server that does not sign thinking: its thinking block has no
+/// signature field, and it starts the call before it stops the text, as a
+/// gateway translating another model's stream sends them (shape recorded
+/// 2026-11-16). The reply is read whole, and its unsigned thinking returns
+/// with the call to that server and model only.
+fn unsigned_interleaved_response() -> String {
+    start() + &event(json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}))
+        + &event(json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"inspect first"}}))
+        + &event(json!({"type":"content_block_stop","index":0}))
+        + &event(json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}))
+        + &event(json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Reading it."}}))
+        + &event(json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-fixture","name":"inspect","input":{}}}))
+        + &event(json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"note.txt\"}"}}))
+        + &event(json!({"type":"content_block_stop","index":1}))
+        + &event(json!({"type":"content_block_stop","index":2})) + &end("tool_use")
+}
+
+#[tokio::test]
+async fn native_unsigned_thinking_and_overlapping_blocks_return_the_call_and_resend_to_the_same_origin() {
+    let scratch=Scratch::new();let(base,server)=serve(vec![(200,unsigned_interleaved_response()),(200,text_response()),(200,text_response())]).await;
+    let mut client=client(&scratch,&base,Some(ReasoningEffort::High));
+    let mut messages=vec![ChatMessage::system("instructions"),ChatMessage::user("inspect")];
+    let first=run(&client,&messages).await.unwrap();
+    assert_eq!((first.finish_reason.as_str(),first.content.as_str(),first.tool_calls.len()),("tool_calls","Reading it.",1));
+    assert_eq!(serde_json::from_str::<Value>(&first.tool_calls[0].function.arguments).unwrap(),json!({"path":"note.txt"}));
+    let mut assistant=ChatMessage::assistant(Some(first.content),Some(first.tool_calls));assistant.reasoning_details=first.reasoning_details;assistant.reasoning_origin=Some(client.origin());
+    messages.push(assistant);messages.push(ChatMessage::tool("call-fixture","file contents"));
+    run(&client,&messages).await.unwrap();client.model="different-model".into();run(&client,&messages).await.unwrap();
+    let records=server.await.unwrap();let second:Value=serde_json::from_slice(&records[1].body).unwrap();
+    assert_eq!(second["messages"][1]["content"],json!([{"type":"thinking","thinking":"inspect first"},{"type":"text","text":"Reading it."},
+        {"type":"tool_use","id":"call-fixture","name":"inspect","input":{"path":"note.txt"}}]));
+    let switched=String::from_utf8(records[2].body.clone()).unwrap();assert!(!switched.contains("inspect first"));assert!(switched.contains("call-fixture"));
+}
+
 #[tokio::test]
 async fn native_invalid_and_incomplete_streams_never_return_executable_tools() {
     let valid=tool_response();
@@ -383,13 +417,14 @@ async fn native_stream_faults_are_reported_and_retryable_api_errors_restart() {
     let valid=text_response();
     let begin=|index:usize,id:&str| event(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":"inspect","input":{}}}));
     let close=|index:usize| event(json!({"type":"content_block_stop","index":index}));
-    let interleaved=start()+&begin(0,"first")+&begin(1,"second")+&close(0)+&close(1)+&end("tool_use");
+    // Blocks may overlap (the unsigned-thinking test reads one), but never start out of index order.
+    let out_of_order=start()+&begin(1,"second")+&begin(0,"first")+&close(0)+&close(1)+&end("tool_use");
     let wrong_index=start()+&begin(9,"first")+&close(0)+&end("tool_use");
     let after_finish=start()+&begin(0,"first")+&close(0)+&event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
         +&begin(1,"second")+&close(1)+&event(json!({"type":"message_stop"}));
     let early_finish=start()+&begin(0,"first")+&event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
         +&close(0)+&event(json!({"type":"message_stop"}));
-    let invalid=[interleaved,wrong_index,after_finish,early_finish,valid.replace("\"input_tokens\":10","\"input_tokens\":1\ndata: 0"),valid.replacen(&start(),"",1),valid.replacen(&start(),&(start()+&start()),1),
+    let invalid=[out_of_order,wrong_index,after_finish,early_finish,valid.replace("\"input_tokens\":10","\"input_tokens\":1\ndata: 0"),valid.replacen(&start(),"",1),valid.replacen(&start(),&(start()+&start()),1),
         valid.replace("\"role\":\"assistant\"","\"role\":\"user\""),valid.replace("\"content\":[]","\"content\":[{\"type\":\"text\",\"text\":\"unexpected\"}]"),
         valid.replace(&event(json!({"type":"content_block_stop","index":0})),""),valid.replace("\"stop_reason\":\"end_turn\"","\"stop_reason\":\"pause_turn\""),
         json_message(vec![json!({"type":"tool_use","id":"","name":"inspect","input":{}})],"tool_use"),
