@@ -1935,8 +1935,8 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     assert!(!report.contains("max_tokens"), "{report}");
     let (_, all) = check(&["--check", "--all"]);
     assert!(all.contains("reply limit max_tokens = 4096 from the default;"), "{all}");
-    // A Responses connection ends the turn on a cut reply, so there the
-    // default still warns.
+    // A Responses connection keeps nothing of reasoning the limit cut, so
+    // there the default still warns.
     std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","wire_api":"responses","models":[{{"id":"stub-model","context_tokens":16384}}]}}}}}}"#)).unwrap();
     let (code, report) = check(&["--check"]);
     assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");

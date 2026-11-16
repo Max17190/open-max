@@ -808,45 +808,76 @@ fn approval_state(
 
 
 /// How to get content larger than the reply limit across, as the refusal of a
-/// call the limit cut off (`agent::cut_off_call_error`) and the note after a
+/// call the limit cut off (`cut_off_call_error`) and the note after a
 /// call that never arrived both give it.
 pub(crate) const SPLIT_ADVICE: &str = "Send large content in parts: for a file, write_file the first part, then append the rest with edit_file (old_string is the last few lines you wrote, enough to be unique; new_string is those lines followed by the next part).";
 
-/// The note after a reply the output limit cut before any tool call, chosen
-/// by what its usage accounts for. A provider that sends a tool call only
-/// when it is complete drops a call the limit cuts, so the reply can arrive
-/// with nothing in it although it spent the whole limit. Told to continue
-/// from where it stopped, the model cannot see that point and writes the same
-/// call again, which the limit cuts the same way. So:
+/// The reply for a call the output cap cut off partway through its
+/// arguments. A bare parse error reads as a typo to fix, and the model sends
+/// the same oversized call again. The advice spells out how edit_file
+/// appends, because its old_string has to be unique. With `room`, the limit
+/// the next request alone carries, the call is asked for whole.
+pub(crate) fn cut_off_call_error(max_tokens: usize, room: Option<usize>) -> String {
+    let advice = room.map_or(SPLIT_ADVICE.into(), |room| format!("Your next reply alone may be up to {room} tokens: send this call again now, whole."));
+    format!("Not run: your reply reached the output limit (max_tokens = {max_tokens}) while writing this call, so its arguments were cut off. {advice}")
+}
+
+/// What a reply the output limit cut before any tool call was writing, by
+/// what its usage accounts for. A provider that sends a tool call only when
+/// it is complete drops a call the limit cuts, so the reply can arrive with
+/// nothing in it although it spent the whole limit.
 ///
-/// - Usage reports the reasoning count, and the output beyond that reasoning
-///   (or beyond the reasoning text that arrived at four bytes a token, when
-///   that is more) and beyond the text that arrived is more than an eighth
-///   of the limit (256 tokens at least): something was written that did not
-///   arrive, most likely one call larger than the limit. The note says so and
-///   gives the split advice. The text that arrived counts at two bytes a
-///   token, denser than code or any script runs, so text that did arrive is
-///   never taken for output that did not. The reported reasoning count is
-///   exact; its text only stands in where it implies more.
-/// - No reasoning count, and nothing at all arrived: the note says it was
-///   either thinking that is not shown or a call larger than the limit.
-/// - Otherwise, the note every such cut got before, byte for byte.
-pub(crate) fn reply_cut_note(max_tokens: usize, reply: &crate::client::CompletionResult) -> String {
+/// - `Lost`: usage reports the reasoning count, and the output beyond that
+///   reasoning (or beyond the reasoning text that arrived at four bytes a
+///   token, when that is more) and beyond the text that arrived is more than
+///   an eighth of the limit (256 tokens at least): something was written
+///   that did not arrive, most likely one call larger than the limit. Text
+///   that arrived counts at two bytes a token, so dense text is never read
+///   as lost.
+/// - `Unseen`: no reasoning count, and nothing at all arrived: either
+///   thinking that is not shown or a call larger than the limit.
+/// - `Text`: what arrived accounts for the output, and the text in it is
+///   more than that same margin: the reply was cut writing its answer.
+/// - `Thought`: what arrived accounts for the output and is thinking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutKind { Thought, Text, Lost, Unseen }
+
+pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResult) -> CutKind {
     use crate::types::estimate_tokens;
     // Readable reasoning only: `reasoning_details` can hold encrypted data and
     // signatures, whose bytes say nothing of the tokens behind them.
     let thought = [reply.reasoning_content.as_deref(), reply.reasoning.as_deref()].into_iter().flatten().map(str::len).max().unwrap_or(0);
+    let margin = (max_tokens as u64 / 8).max(256);
     let unseen = match reply.usage.and_then(|u| Some((u.output_tokens, u.reasoning_tokens?))) {
         Some((output, reasoning)) => {
             let arrived = reasoning.max(estimate_tokens(thought) as u64).saturating_add(2 * estimate_tokens(reply.content.len()) as u64);
-            (output.saturating_sub(arrived) > (max_tokens as u64 / 8).max(256)).then_some(true)
+            (output.saturating_sub(arrived) > margin).then_some(CutKind::Lost)
         }
-        None => (reply.content.is_empty() && thought == 0 && reply.reasoning_details.is_none()).then_some(false),
+        None => (reply.content.is_empty() && thought == 0 && reply.reasoning_details.is_none()).then_some(CutKind::Unseen),
     };
-    match unseen {
-        Some(true) => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran, and written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
-        Some(false) => format!("[reply cut: it reached max_tokens ({max_tokens}) and nothing of the reply arrived here: either thinking that is not shown, or a tool call larger than the limit, which did not run. If it was a call, written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
-        None => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
+    unseen.unwrap_or(if estimate_tokens(reply.content.len()) as u64 > margin { CutKind::Text } else { CutKind::Thought })
+}
+
+/// The note after a reply the output limit cut before any tool call. The
+/// limit bounds how long the model thinks before it acts, so a cut thought
+/// is told to act. A cut inside a call or text needed room, not brevity:
+/// with `room`, the limit the next request alone carries, the note says so
+/// and asks for the content whole. Without it (that request was cut too, or
+/// the limit leaves no more room) the note asks for the content in parts,
+/// and cut text gets the note a cut thought does, byte for byte.
+pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usize>) -> String {
+    let next = |ask: &str| room.map(|room| format!("The next reply alone may be up to {room} tokens: {ask}"));
+    match kind {
+        CutKind::Lost => match next("send that call again now, whole.") {
+            Some(next) => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. {next}]"),
+            None => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran, and written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
+        },
+        CutKind::Unseen => match next("if it was a call, send it again now, whole.") {
+            Some(next) => format!("[reply cut: it reached max_tokens ({max_tokens}) and nothing of the reply arrived here: either thinking that is not shown, or a tool call larger than the limit, which did not run. {next}]"),
+            None => format!("[reply cut: it reached max_tokens ({max_tokens}) and nothing of the reply arrived here: either thinking that is not shown, or a tool call larger than the limit, which did not run. If it was a call, written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
+        },
+        CutKind::Text => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing text. {}]", next("continue the text from exactly where it stopped, without repeating any of it.").unwrap_or_else(|| "Continue the text from exactly where it stopped, without repeating any of it.".into())),
+        CutKind::Thought => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
     }
 }
 
@@ -880,11 +911,11 @@ mod tests {
             // Reasoning that streamed while the count says less.
             ("reasoning longer than its count", reply("", Some(&long_thought), usage(4_096, Some(10))), "before"),
             // Text that arrived accounts for the output.
-            ("text that arrived", reply(&"x".repeat(16_000), None, usage(4_096, Some(0))), "before"),
+            ("text that arrived", reply(&"x".repeat(16_000), None, usage(4_096, Some(0))), "text"),
             // A few unaccounted tokens are not a lost call.
-            ("within the margin", reply(&"x".repeat(15_000), None, usage(4_096, Some(0))), "before"),
+            ("within the margin", reply(&"x".repeat(15_000), None, usage(4_096, Some(0))), "text"),
             // Dense text that did arrive: 4,096 tokens at three bytes a token.
-            ("dense text that arrived", reply(&"x".repeat(12_288), None, usage(4_096, Some(0))), "before"),
+            ("dense text that arrived", reply(&"x".repeat(12_288), None, usage(4_096, Some(0))), "text"),
             // Some text, then a call that never arrived.
             ("short text, then a lost call", reply(&"x".repeat(2_000), None, usage(4_096, Some(0))), "lost"),
             // Encrypted reasoning, its count small: its bytes do not hide the lost call.
@@ -901,12 +932,23 @@ mod tests {
             ("reasoning, no count", reply("", Some("half a thought"), usage(4_096, None)), "before"),
         ];
         for (case, reply, want) in cases {
-            let note = reply_cut_note(4_096, &reply);
-            let got = if note == before { "before" } else if note.contains("did not arrive here") { "lost" } else if note.contains("nothing of the reply arrived") { "unshown" } else { "other" };
+            // With no room to offer, a cut thought and a lost call get the notes they got before, and cut text is
+            // asked to go on from where it stopped.
+            let kind = cut_kind(4_096, &reply);
+            let note = reply_cut_note(4_096, kind, None);
+            let got = if note == before { "before" } else if note == "[reply cut: it reached max_tokens (4096) while writing text. Continue the text from exactly where it stopped, without repeating any of it.]" { "text" } else if note.contains("did not arrive here") { "lost" } else if note.contains("nothing of the reply arrived") { "unshown" } else { "other" };
             assert_eq!(got, want, "{case}: {note}");
-            if want != "before" {
+            if want != "before" && want != "text" {
                 assert!(note.starts_with("[reply cut: it reached max_tokens (4096)") && note.ends_with(&format!("{SPLIT_ADVICE}]")), "{case}: {note}");
             }
+            // With room, a cut thought is still told to act, and anything else is asked for whole, not in parts.
+            let roomy = reply_cut_note(4_096, kind, Some(16_384));
+            match kind {
+                CutKind::Thought => assert_eq!(roomy, before, "{case}"),
+                CutKind::Text => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) while writing text. The next reply alone may be up to 16384 tokens: continue the text from exactly where it stopped, without repeating any of it.]", "{case}"),
+                CutKind::Lost | CutKind::Unseen => assert!(roomy.contains("The next reply alone may be up to 16384 tokens") && roomy.ends_with("again now, whole.]") && !roomy.contains("in parts"), "{case}: {roomy}"),
+            }
+            assert_eq!(kind == CutKind::Text, want == "text", "{case}");
         }
     }
 

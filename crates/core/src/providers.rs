@@ -146,6 +146,8 @@ pub struct ActiveEndpoint {
     pub context_tokens: usize,
     pub max_tokens: usize,
     pub reply_reserve: usize,
+    /// The limit of the one request after a reply the limit cut inside a tool call or its text (see `reply_room`).
+    pub reply_room: usize,
     /// Compaction ceiling in real tokens, before the window cap and calibration.
     pub compaction_tokens: usize,
     pub temperature: Option<f32>,
@@ -166,9 +168,19 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
+/// The room a reply cut inside a tool call or its text is asked for once more with: four times the default limit,
+/// which bounds thinking, not what a call may carry. A limit someone chose, on the model or in settings, is a ceiling.
+fn reply_room(context: usize, settings: &Settings) -> usize {
+    let default = Settings::default().max_tokens;
+    let limit = reply_limits(context, settings.max_tokens).0;
+    if settings.max_tokens != default { limit } else { reply_limits(context, default * 4).0 }
+}
+
 impl ActiveEndpoint {
     /// The limit a request with a `prompt`-token prompt carries: the room it leaves, within the reserve and max_tokens.
     pub(crate) fn reply_limit(&self, prompt: usize) -> usize { self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_reserve, self.max_tokens) }
+    /// The limit of the one request after a reply the limit cut inside a tool call or its text: the room, within what a `prompt`-token prompt leaves.
+    pub(crate) fn reply_room(&self, prompt: usize) -> usize { self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_limit(prompt), self.reply_room.max(self.max_tokens)) }
 }
 
 pub fn providers_path(data_dir: &Path) -> PathBuf {
@@ -691,6 +703,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             context_tokens,
             max_tokens,
             reply_reserve,
+            reply_room: if model_entry.is_some_and(|m| m.max_tokens.is_some()) { max_tokens } else { reply_room(context_tokens, settings) },
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
                 .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -733,6 +746,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         context_tokens,
         max_tokens,
         reply_reserve,
+        reply_room: reply_room(context_tokens, settings),
         compaction_tokens: settings
             .compaction_tokens
             .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -1130,6 +1144,7 @@ mod tests {
         assert_eq!(ep.api_key.as_deref(), Some("sk-test"));
         assert_eq!(ep.context_tokens, 64000);
         assert_eq!(ep.max_tokens, 2048);
+        assert_eq!((ep.reply_room, ep.reply_room(0)), (2048, 2048), "a limit the model's entry sets is a ceiling for the request after a cut too");
         assert!(ep.headers.iter().any(|(k, v)| k == "X-Title" && v == "Open Max"));
         let _ = std::fs::remove_dir_all(dir);
     }

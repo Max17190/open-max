@@ -78,48 +78,41 @@ async fn a_messages_reply_cut_while_thinking_goes_back_as_its_thinking_alone() {
     assert_eq!(switched.iter().filter(|m| m["role"] == "assistant").count(), 1, "only the answer: {text}");
 }
 
-/// Responses: a reply the limit cut arrives as an incomplete response, which
-/// is an interrupted reply, not a cut one: the turn ends there as before, with
-/// no note and nothing of the reply in the transcript. A completed reply that
-/// carries only reasoning and spent the whole limit is a cut: its reasoning
-/// item goes back alone, then the note, and no assistant message item; after
-/// a switch, neither the item nor an empty message goes.
+/// Responses: a reply the limit cut while reasoning arrives either as an
+/// incomplete response (`max_output_tokens`) or as a completed one that
+/// carries only reasoning and spent the whole limit. Either way it is a cut:
+/// its reasoning item goes back alone, then the note, and no assistant
+/// message item; after a switch, neither the item nor an empty message goes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_responses_reply_cut_while_reasoning_goes_back_as_its_reasoning_item_alone() {
     let reasoning = json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque-state"});
     let completed = |output: Value, used: u64| json!({"type":"response.completed","response":{"status":"completed",
         "output":output,"usage":{"input_tokens":10,"output_tokens":used}}});
     let answer = |text: &str| json!([{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}]);
-
     let incomplete = json!({"type":"response.incomplete","response":{"status":"incomplete",
-        "incomplete_details":{"reason":"max_output_tokens"},"output":[reasoning]}});
-    let (url, bodies) = common::recording_responses(vec![incomplete, completed(answer("done"), 5)]).await;
-    let scratch = Scratch::new(&url, "responses");
-    let (_, first_error) = two_turns(&scratch).await;
-    assert!(first_error.is_some_and(|e| e.contains("incomplete")), "an incomplete response ends the turn as an error");
-    let bodies: Vec<String> = bodies.lock().unwrap().clone();
-    assert_eq!(bodies.len(), 2, "no continuation");
-    assert!(!bodies[1].contains("[reply cut") && !bodies[1].contains("opaque-state"), "{}", bodies[1]);
+        "incomplete_details":{"reason":"max_output_tokens"},"output":[reasoning],"usage":{"input_tokens":10,"output_tokens":1024}}});
 
-    let (url, bodies) = common::recording_responses(vec![
-        completed(json!([reasoning]), 1024),
-        completed(answer("done"), 5),
-        completed(answer("done again"), 5),
-    ])
-    .await;
-    let scratch = Scratch::new(&url, "responses");
-    let (errors, _) = two_turns(&scratch).await;
-    assert_eq!(errors, "[]");
-    let bodies: Vec<Value> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap()).collect();
-    assert_eq!(bodies.len(), 3);
-    let input = bodies[1]["input"].as_array().unwrap();
-    let at = input.iter().position(|item| item == &reasoning).expect("the reasoning goes back");
-    assert_eq!((&input[at + 1]["role"], &input[at + 1]["content"]), (&json!("user"), &json!(NOTE)), "{}", bodies[1]);
-    for body in &bodies[1..] {
-        let input = body["input"].as_array().unwrap();
-        let empty = |item: &&Value| item["role"] == "assistant" && item["content"].as_str().is_none_or(str::is_empty);
-        assert!(!input.iter().any(|item| empty(&item)), "an empty assistant item: {body}");
+    for cut in [incomplete, completed(json!([reasoning]), 1024)] {
+        let (url, bodies) = common::recording_responses(vec![
+            cut,
+            completed(answer("done"), 5),
+            completed(answer("done again"), 5),
+        ])
+        .await;
+        let scratch = Scratch::new(&url, "responses");
+        let (errors, _) = two_turns(&scratch).await;
+        assert_eq!(errors, "[]");
+        let bodies: Vec<Value> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap()).collect();
+        assert_eq!(bodies.len(), 3);
+        let input = bodies[1]["input"].as_array().unwrap();
+        let at = input.iter().position(|item| item == &reasoning).expect("the reasoning goes back");
+        assert_eq!((&input[at + 1]["role"], &input[at + 1]["content"]), (&json!("user"), &json!(NOTE)), "{}", bodies[1]);
+        for body in &bodies[1..] {
+            let input = body["input"].as_array().unwrap();
+            let empty = |item: &&Value| item["role"] == "assistant" && item["content"].as_str().is_none_or(str::is_empty);
+            assert!(!input.iter().any(|item| empty(&item)), "an empty assistant item: {body}");
+        }
+        let text = bodies[2].to_string();
+        assert!(!text.contains("opaque-state") && text.contains(NOTE), "{text}");
     }
-    let text = bodies[2].to_string();
-    assert!(!text.contains("opaque-state") && text.contains(NOTE), "{text}");
 }
