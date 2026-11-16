@@ -2202,14 +2202,16 @@ pub(crate) mod tests {
     /// line, so a part they reach is never cut mid-sentence.
     #[tokio::test]
     async fn long_notes_end_at_their_last_whole_line() {
-        let line = format!("{}\n", "w".repeat(99));
-        let (url, _requests) = crate::client::tests::spawn_recording_once(reply(&line.repeat(50), false));
+        // 97-byte lines: the cap falls 23 bytes into the 42nd.
+        let line = format!("{}\n", "w".repeat(96));
+        let (url, _requests) = crate::client::tests::spawn_recording_once(reply(&line.repeat(60), false));
         let fixture = Fixture::new(&url);
         let mut messages = session(60, 2_000);
         assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
         let note = messages[pinned_head(&messages)].content.clone().unwrap();
-        let kept = line.repeat(39) + &"w".repeat(99);
+        let kept = line.repeat(40) + &"w".repeat(96);
         assert!(note.contains(&format!("Summary: {kept}… ")), "{note}");
+        assert!(!note.contains(&format!("{kept}\nw")), "the part of the line past the cap is dropped: {note}");
     }
 
     fn stream(chunks: &[Value]) -> String {
