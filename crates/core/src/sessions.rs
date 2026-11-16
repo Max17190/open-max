@@ -442,6 +442,11 @@ pub struct CompactionRecord {
     pub tools: Vec<String>,
     pub paths: Vec<String>,
     pub user_snippets: Vec<String>,
+    /// The prompts of later turns the cuts removed, word for word, oldest
+    /// first, within the digest's cap; carried into every later cut's note.
+    /// Absent from records written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<String>,
     pub digest: String,
 }
 
@@ -1911,7 +1916,7 @@ mod tests {
         let original = vec![ChatMessage::system("rules"), ChatMessage::user("first"), ChatMessage::user("second")];
         assert!(save_messages(&core, &id, &original, &mut 0, true));
         record_resume_point(&core, &id, 3);
-        let record = CompactionRecord { ts: 1, message_count: 2, tools: vec![], paths: vec![], user_snippets: vec![], digest: "digest".into() };
+        let record = CompactionRecord { ts: 1, message_count: 2, tools: vec![], paths: vec![], user_snippets: vec![], prompts: Vec::new(), digest: "digest".into() };
         let candidate = vec![original[0].clone(), ChatMessage::user("digest")];
         FAIL_COMPACTION_INDEX_WRITE.with(|fail| fail.set(true));
         assert!(commit_compaction(&core, &id, &candidate, &original[1..], Some(&record), original.len(), 2).is_err());
@@ -2314,7 +2319,7 @@ mod tests {
             message_count: 1,
             tools: vec![],
             paths: vec![],
-            user_snippets: vec![],
+            user_snippets: vec![], prompts: Vec::new(),
             digest: "[context note: x]".into(),
         });
         create(&core, "/tmp/p".into()).ok();
@@ -2360,7 +2365,7 @@ mod tests {
             message_count: 1,
             tools: vec![],
             paths: vec![],
-            user_snippets: vec![],
+            user_snippets: vec![], prompts: Vec::new(),
             digest: "late".into(),
         });
         append_archive(&core, &running.id, &[ChatMessage::user("late")]);
@@ -2644,7 +2649,7 @@ mod tests {
             message_count: 3,
             tools: vec!["read_file".into()],
             paths: vec!["a.rs".into()],
-            user_snippets: vec!["do the thing".into()],
+            user_snippets: vec!["do the thing".into()], prompts: Vec::new(),
             digest: "[context note: test]".into(),
         };
         append_compaction(&core, id, &rec);
@@ -2653,7 +2658,7 @@ mod tests {
             message_count: 2,
             tools: vec![],
             paths: vec![],
-            user_snippets: vec![],
+            user_snippets: vec![], prompts: Vec::new(),
             digest: "[context note: second]".into(),
         });
         let loaded = load_compaction(&core, id);
@@ -2678,7 +2683,7 @@ mod tests {
                 message_count: ts as usize,
                 tools: vec![],
                 paths: vec![format!("src/{ts}.rs")],
-                user_snippets: vec![],
+                user_snippets: vec![], prompts: Vec::new(),
                 digest: format!("[context note: {ts}]"),
             });
         }

@@ -49,6 +49,15 @@ const MAX_DIGEST_PATH_BYTES: usize = 256;
 const MAX_DIGEST_TOOL_BYTES: usize = 64;
 /// Byte cap on one recorded user-goal snippet, same denomination as above.
 pub(crate) const MAX_DIGEST_SNIPPET_BYTES: usize = 120;
+/// Byte cap on the prompts of later turns a note carries word for word, all
+/// of them together: the newest that fit, oldest dropped first, and a newest
+/// one past the cap is cut short and marked. Instructions given after the
+/// original request are what a summary loses most often, and the archive the
+/// note names keeps every byte of the rest. They take their room from the
+/// notes' cap (`prompts_room`), so the note's bound does not move.
+const MAX_DIGEST_PROMPT_BYTES: usize = 1_000;
+/// What introduces those prompts in the note.
+const PROMPTS_LABEL: &str = "Later requests from the user, word for word, oldest first: ";
 
 /// Byte-capped take on a char boundary. Every note field, the notes, and the
 /// arguments a tool error quotes are budgeted in bytes (the
@@ -72,6 +81,9 @@ pub(crate) struct CompactionDigest {
     paths: Vec<String>,
     /// Short snippets of compacted user goals (not the original first request).
     user_snippets: Vec<String>,
+    /// The prompts of later turns the cut removed, whole, oldest first
+    /// (`MAX_DIGEST_PROMPT_BYTES` applies when the note is written).
+    prompts: Vec<String>,
     /// Every message as dropped, in transcript order, held for the notes
     /// request and the archive append.
     dropped: Vec<ChatMessage>,
@@ -82,6 +94,11 @@ impl CompactionDigest {
         self.message_count += 1;
         self.dropped.push(msg.clone());
         if msg.role == "user" {
+            // Only a turn's prompt carries an effort stamp: the user's own
+            // words, unlike a steer's gate refusal or a harness note.
+            if let Some(c) = msg.content.as_deref().filter(|c| msg.effort.is_some() && !c.trim().is_empty() && !c.starts_with(DIGEST_PREFIX)) {
+                self.prompts.push(c.to_string());
+            }
             if let Some(c) = msg.content.as_deref() {
                 let trimmed = c.trim();
                 if !trimmed.is_empty()
@@ -125,6 +142,9 @@ impl CompactionDigest {
     /// previous compaction record keeps addresses intact across any number of
     /// prunes by code, not through the summarizer, which paraphrases.
     fn absorb_prior(&mut self, prior: &sessions::CompactionRecord) {
+        // Older than anything this cut removed. Uncapped here: the note's
+        // cap keeps the newest, and the record keeps what the note shows.
+        self.prompts.splice(0..0, prior.prompts.iter().cloned());
         for tool in &prior.tools {
             if self.tools.len() >= MAX_DIGEST_TOOLS {
                 break;
@@ -147,6 +167,34 @@ impl CompactionDigest {
         }
     }
 
+    /// The prompts the note carries: the newest within
+    /// `MAX_DIGEST_PROMPT_BYTES`, in order, and when even the newest alone
+    /// is over it, that one cut short and marked.
+    fn shown_prompts(&self) -> Vec<String> {
+        let mut room = MAX_DIGEST_PROMPT_BYTES;
+        let mut shown = Vec::new();
+        for prompt in self.prompts.iter().rev() {
+            if prompt.len() <= room {
+                room -= prompt.len();
+                shown.push(prompt.clone());
+            } else {
+                if shown.is_empty() {
+                    let mark = " [cut short; the archive has it whole]";
+                    shown.push(take_note_bytes(prompt, MAX_DIGEST_PROMPT_BYTES - mark.len()) + mark);
+                }
+                break;
+            }
+        }
+        shown.reverse();
+        shown
+    }
+
+    /// The bytes the prompts take in the note, label and separators included.
+    fn prompts_room(&self) -> usize {
+        let shown = self.shown_prompts();
+        if shown.is_empty() { 0 } else { PROMPTS_LABEL.len() + shown.iter().map(|p| p.len() + 3).sum::<usize>() }
+    }
+
     /// The note a cut leaves. The model's own notes take the place of the
     /// tool and goal lists; exact paths stay listed because notes paraphrase
     /// them.
@@ -165,6 +213,10 @@ impl CompactionDigest {
         }
         if !self.paths.is_empty() {
             parts.push(format!("Files touched: {}.", self.paths.join(", ")));
+        }
+        let prompts = self.shown_prompts();
+        if !prompts.is_empty() {
+            parts.push(format!("{PROMPTS_LABEL}{}.", prompts.join(" | ")));
         }
         if summary.is_none() && !self.user_snippets.is_empty() {
             parts.push(format!(
@@ -186,6 +238,7 @@ impl CompactionDigest {
             tools: self.tools.iter().cloned().collect(),
             paths: self.paths.clone(),
             user_snippets: self.user_snippets.clone(),
+            prompts: self.shown_prompts(),
             digest,
         }
     }
@@ -195,7 +248,7 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_SUMMARY_BYTES: usize = 4_000;
 
 /// The ask that ends the notes request, after the transcript up to the cut.
-pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request is about to be removed from the conversation to keep requests small. Write the notes you will continue from. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), at most 400 words, in four labeled parts. State: what is finished and verified, what is half done, and the next step. Files: every path changed or still needed, with the names and places in it that matter. Facts: commands that work in this project, each failure seen with its cause, and every instruction the user gave after the original request, in the user's words; copy identifiers, paths and error text exactly. Open: what is unresolved or unverified. If a context note appears above, carry forward what still holds.]";
+pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request is about to be removed from the conversation to keep requests small. Write the notes you will continue from. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), at most 400 words and under 4,000 bytes in all: anything past 4,000 bytes is cut off and lost, so keep every part short. Use four labeled parts. State: what is finished and verified, what is half done, and the next step. Files: every path changed or still needed, with the names and places in it that matter. Facts: commands that work in this project, each failure seen with its cause, and every instruction the user gave after the original request, in the user's words; copy identifiers, paths and error text exactly. Open: what is unresolved or unverified. If a context note appears above, carry forward what still holds.]";
 
 /// The notes request's messages: `head`, every message the cut removes, and
 /// the ask. The ask is stamped with the effort in force, as a turn's prompt
@@ -216,7 +269,8 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 /// reply's text is taken, or, when a reply that ended on its own has no
 /// text and no call, its reasoning. A call in it never runs, nothing of this
 /// exchange is stored or shown, and an empty reply, an error, a timeout, a cancel, a
-/// cut stream or a request the spend ceiling refuses gives no notes (None).
+/// cut stream or a request the spend ceiling refuses gives no notes: the
+/// error says which, for the report of a cut skipped for want of them.
 ///
 /// The request is billed like any other: a ledger that advertises what each
 /// request cost cannot omit the one the harness makes on its own behalf.
@@ -225,13 +279,13 @@ async fn summarize_compaction(
     head: &[ChatMessage],
     digest: &CompactionDigest,
     spend: &mut RequestSpend,
-) -> Option<String> {
+) -> Result<(String, bool), String> {
     let CompactionCtx { core, session_id, client, cancelled, schemas, factor, .. } = *ctx;
     let messages = notes_messages(client, head, &digest.dropped);
     // In real tokens by the session's learned factor, as every request is
     // admitted, and by the route's estimator, which counts only what it sends.
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
-    if !spend.admits(estimated) { return None; }
+    if !spend.admits(estimated) { return Err("the notes request would pass the turn's token ceiling".into()); }
     let mut resent = Vec::new();
     let outcome = tokio::time::timeout(SUMMARY_TIMEOUT, client.stream_chat(&messages, client.reply_reserve, schemas, cancelled.clone(), |delta| {
         if let crate::client::StreamDelta::Usage(usage) = delta { resent.push(usage); }
@@ -240,14 +294,19 @@ async fn summarize_compaction(
     for usage in resent { spend.charge(core, session_id, usage); }
     let result = match outcome {
         Ok(Ok(result)) => result,
-        _ => {
+        failed => {
             // Without a completed response, charge the reply reserve it asked for.
             spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(client.reply_reserve));
-            return None;
+            return Err(match failed {
+                Ok(Err(error)) => format!("the notes request failed: {}", crate::text::one_line(&error)),
+                _ => format!("the notes reply did not finish within {} seconds", SUMMARY_TIMEOUT.as_secs()),
+            });
         }
     };
     spend.record(core, session_id, estimated, &result);
-    if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" { return None; }
+    if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" {
+        return Err(format!("the notes reply ended {}", result.finish_reason));
+    }
     let cut = result.finish_reason == "length";
     let mut summary = result.content;
     if let Some(clean) = crate::client::strip_leading_think(&summary) {
@@ -261,19 +320,19 @@ async fn summarize_compaction(
     }
     let summary = summary.trim().replace('\r', "");
     if summary.is_empty() {
-        return None;
+        return Err(format!("the notes reply had no text (finish_reason {})", result.finish_reason));
     }
-    Some(cap_notes(&summary, cut))
+    Ok((summary, cut))
 }
 
 /// Said after notes the reply limit cut, so the model does not take them as whole.
 const NOTES_CUT_MARK: &str = "\n[the notes end here: the reply limit cut them off]";
 
-/// The notes within `MAX_SUMMARY_BYTES`, with their line breaks. Notes over
-/// the cap end at their last whole line in it, if that keeps at least half,
-/// then an ellipsis; notes the reply limit cut end with `NOTES_CUT_MARK`.
-fn cap_notes(summary: &str, cut: bool) -> String {
-    let room = if cut { MAX_SUMMARY_BYTES - NOTES_CUT_MARK.len() } else { MAX_SUMMARY_BYTES };
+/// The notes within `cap` bytes, with their line breaks. Notes over the cap
+/// end at their last whole line in it, if that keeps at least half, then an
+/// ellipsis; notes the reply limit cut end with `NOTES_CUT_MARK`.
+fn cap_notes(summary: &str, cut: bool, cap: usize) -> String {
+    let room = if cut { cap - NOTES_CUT_MARK.len() } else { cap };
     let mut notes = if summary.len() > room {
         let head = take_note_bytes(summary, room);
         let end = head.rfind('\n').filter(|&i| i >= room / 2).unwrap_or(head.len());
@@ -363,28 +422,32 @@ pub(crate) struct CompactionCtx<'a> {
 /// Ask for the notes and settle the candidate's digest note: the archive
 /// material and the record, which are emitted only after the candidate
 /// transcript has been persisted. Without notes a cut the window does not
-/// force is not worth making, so this returns None and nothing is committed.
+/// force is not worth making, so this says why there are none and nothing
+/// is committed.
 async fn prepare_compaction_digest(
     ctx: &CompactionCtx<'_>,
     messages: &mut [ChatMessage],
     mut digest: CompactionDigest,
     forced: bool,
     spend: &mut RequestSpend,
-) -> Option<(Vec<ChatMessage>, sessions::CompactionRecord)> {
+) -> Result<(Vec<ChatMessage>, sessions::CompactionRecord), String> {
     let CompactionCtx { core, session_id, .. } = *ctx;
     // The cut's note sits right after the pinned head and ends the opening
     // run, so the head of the cut candidate is its slot.
     let slot = pinned_head(messages);
     let summary = summarize_compaction(ctx, &messages[..slot], &digest, spend).await;
-    if summary.is_none() && !forced {
-        return None;
-    }
+    let summary = match summary {
+        Err(why) if !forced => return Err(why),
+        summary => summary.ok(),
+    };
     // Structured fields from the previous record carry forward by
     // code: the cut may have dropped the old digest note, whose
     // prose is lossy about the paths and tools it condensed.
     if let Some(prior) = sessions::last_compaction(core, session_id) {
         digest.absorb_prior(&prior);
     }
+    // The later prompts the note carries come out of the notes' cap.
+    let summary = summary.map(|(notes, cut)| cap_notes(&notes, cut, MAX_SUMMARY_BYTES - digest.prompts_room()));
     let path = sessions::archive_display(core, session_id);
     // The note in the slot was just inserted by the cut, so replacing it
     // here keeps one digest message.
@@ -393,7 +456,7 @@ async fn prepare_compaction_digest(
         messages[slot] = ChatMessage::user(note.clone());
     }
     let record = digest.to_record(note);
-    Some((digest.dropped, record))
+    Ok((digest.dropped, record))
 }
 
 /// A failed archive or transcript write must not discard the live history.
@@ -428,11 +491,14 @@ pub(crate) async fn compact_messages(
     let carried = |fields: &[String], count: usize, cap: usize| {
         fields.iter().filter(|field| field.len() <= cap).map(|field| field.len() + 2).sum::<usize>().min(count * (cap + 2))
     };
-    let (paths, tools) = sessions::last_compaction(ctx.core, ctx.session_id).map_or((0, 0), |prior| {
-        (carried(&prior.paths, MAX_DIGEST_PATHS, MAX_DIGEST_PATH_BYTES), carried(&prior.tools, MAX_DIGEST_TOOLS, MAX_DIGEST_TOOL_BYTES))
+    // Earlier cuts' prompts join the note too, within their cap and its label
+    // (with notes they share the notes' room, so this over-reserves there).
+    let (paths, tools, prompts) = sessions::last_compaction(ctx.core, ctx.session_id).map_or((0, 0, 0), |prior| {
+        let prompts = if prior.prompts.is_empty() { 0 } else { prior.prompts.iter().map(|p| p.len() + 3).sum::<usize>().min(MAX_DIGEST_PROMPT_BYTES) + PROMPTS_LABEL.len() };
+        (carried(&prior.paths, MAX_DIGEST_PATHS, MAX_DIGEST_PATH_BYTES), carried(&prior.tools, MAX_DIGEST_TOOLS, MAX_DIGEST_TOOL_BYTES), prompts)
     });
     let address = sessions::archive_display(ctx.core, ctx.session_id).len();
-    let growth = estimate_tokens(address + paths + tools.max(MAX_SUMMARY_BYTES) + 100);
+    let growth = estimate_tokens(address + paths + tools.max(MAX_SUMMARY_BYTES) + prompts + 100);
     let mut candidate = messages.clone();
     let digest = if force {
         prune_transcript(&mut candidate, trigger, ctx.keep, schema_tokens + room, total + room, growth, ctx.estimate)
@@ -458,8 +524,17 @@ pub(crate) async fn compact_messages(
     // A cut without notes is made only when the window forces it or the
     // user asked for it; it then leaves the deterministic digest.
     let forced = force || total > budget;
-    let Some((archive, record)) = prepare_compaction_digest(ctx, &mut candidate, digest, forced, spend).await else {
-        return Ok(0);
+    let (archive, record) = match prepare_compaction_digest(ctx, &mut candidate, digest, forced, spend).await {
+        Ok(cut) => cut,
+        Err(reason) => {
+            // The history stays whole and the session goes on, so this is
+            // advisory; without it a run could not tell a cut that never
+            // happened from one that was never due. A cancel is the human's.
+            if !ctx.cancelled.is_cancelled() {
+                ctx.core.send_agent(ctx.session_id, AgentEvent::CompactionSkipped { reason });
+            }
+            return Ok(0);
+        }
     };
     crate::notes::store_note(&mut candidate, note.as_deref());
     sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, Some(&record), messages.len(), head)?;
@@ -614,8 +689,9 @@ pub(crate) fn requested_keep(requested: Option<usize>, ratio: Option<f64>) -> us
 /// What the digest note itself may cost after a cut, in tokens. An upper
 /// bound, not a guess: the prefix and count, the notes at their 4,000-byte
 /// cap (or, without notes, sixteen tool names of at most 64 bytes and four
-/// user snippets of 120), twelve paths of at most 256, the archive address,
-/// and the closing sentence. Every cap is in bytes because the estimator is
+/// user snippets of 120, and later prompts within 1,000, which with notes
+/// share their cap), twelve paths of at most 256, the archive address, and
+/// the closing sentence. Every cap is in bytes because the estimator is
 /// bytes/4. The gate test formats a digest at every cap and asserts it fits,
 /// so this constant and the format cannot drift apart. Counted into the
 /// irreducible floor below, so a trigger is only honored when its target has
@@ -886,9 +962,14 @@ fn prune_transcript(
         total = total - stale + estimate(&messages[head]);
     }
     // The turn in progress keeps its prompt: when the cut removed it, it goes
-    // back verbatim, stamp included, right after the note.
+    // back verbatim, stamp included, right after the note, which then need
+    // not carry it (it was the newest prompt the cut recorded).
     if let Some(prompt) = restored_prompt(&messages[head + 1..], &digest.dropped) {
         messages.insert(head + 1, prompt.clone());
+        if digest.prompts.last() == prompt.content.as_ref() {
+            digest.prompts.pop();
+            messages[head] = ChatMessage::user(digest.format(None, None));
+        }
     }
     Some(digest)
 }
@@ -1112,7 +1193,7 @@ pub(crate) mod tests {
                 paths: std::iter::once("p".repeat(MAX_DIGEST_PATH_BYTES + 1))
                     .chain((0..MAX_DIGEST_PATHS).map(|i| format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_BYTES - 2))))
                     .collect(),
-                user_snippets: Vec::new(),
+                user_snippets: Vec::new(), prompts: Vec::new(),
                 digest: String::new(),
             });
             let reply = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}]}}\n\n", "s".repeat(MAX_SUMMARY_BYTES * 2));
@@ -1208,7 +1289,7 @@ pub(crate) mod tests {
             message_count: 4,
             tools: vec!["bash".into(), "grep".into()],
             paths: (0..20).map(|i| format!("src/old_{i}.rs")).collect(),
-            user_snippets: vec!["earlier ask".into()],
+            user_snippets: vec!["earlier ask".into()], prompts: Vec::new(),
             digest: "[context note: 4 earlier messages were compacted.".into(),
         };
         digest.absorb_prior(&prior);
@@ -1538,7 +1619,7 @@ pub(crate) mod tests {
             message_count: 9,
             tools: vec!["x".repeat(50_000), "€".repeat(100)],
             paths: vec!["y".repeat(50_000), "Ā".repeat(200)],
-            user_snippets: Vec::new(),
+            user_snippets: Vec::new(), prompts: Vec::new(),
             digest: String::new(),
         });
         assert_eq!(digest.tools.iter().cloned().collect::<Vec<_>>(), vec!["read_file"]);
@@ -1565,9 +1646,11 @@ pub(crate) mod tests {
         for _ in 0..4 {
             digest.user_snippets.push("s".repeat(120));
         }
+        digest.prompts.push("q".repeat(MAX_DIGEST_PROMPT_BYTES * 3));
+        let notes_room = MAX_SUMMARY_BYTES - digest.prompts_room();
         let archive = "a".repeat(200);
         // The notes as `summarize_compaction` caps them, ellipsis included.
-        let summary = take_note_bytes(&"m".repeat(MAX_SUMMARY_BYTES + 1), MAX_SUMMARY_BYTES) + "…";
+        let summary = take_note_bytes(&"m".repeat(MAX_SUMMARY_BYTES + 1), notes_room) + "…";
         let costs = [digest.format(None, Some(&archive)), digest.format(Some(&summary), Some(&archive))]
             .map(|note| ChatMessage::user(note).estimated_tokens());
         for cost in costs {
@@ -1779,13 +1862,14 @@ pub(crate) mod tests {
         client: ChatClient,
         hooks: Hooks,
         cancelled: Arc<CancelToken>,
+        events: std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::types::AgentEventEnvelope>>,
     }
 
     impl Fixture {
         fn new(url: &str) -> Self {
             use std::os::unix::fs::PermissionsExt as _;
             let dir = std::env::temp_dir().join(format!("openmax-cut-{}", uuid::Uuid::new_v4()));
-            let (core, _) = Core::new(dir.join("data")).unwrap();
+            let (core, events) = Core::new(dir.join("data")).unwrap();
             let id = sessions::create(&core, dir.display().to_string()).unwrap().id;
             std::fs::create_dir_all(dir.join(".openmax/hooks")).unwrap();
             let script = dir.join("hook.sh");
@@ -1796,7 +1880,7 @@ pub(crate) mod tests {
             let hooks = crate::hooks::tests::discover_for_test(&dir);
             assert!(!hooks.is_empty(), "the fixture's hook is live");
             let client = ChatClient::new(url.into(), None, "fixture".into(), None, 512);
-            Self { dir, core, id, client, hooks, cancelled: Arc::new(CancelToken::default()) }
+            Self { dir, core, id, client, hooks, cancelled: Arc::new(CancelToken::default()), events: std::sync::Mutex::new(events) }
         }
 
         fn ctx(&self) -> CompactionCtx<'_> {
@@ -1818,6 +1902,14 @@ pub(crate) mod tests {
         async fn cut(&self, messages: &mut Vec<ChatMessage>, trigger: usize, budget: usize, spend: &mut RequestSpend) -> usize {
             assert!(sessions::save_messages(&self.core, &self.id, messages, &mut 0, true));
             compact_messages(&self.ctx(), messages, trigger, budget, 0, false, spend).await.unwrap()
+        }
+
+        /// The reasons of the skipped cuts reported so far.
+        fn skipped(&self) -> Vec<String> {
+            let mut events = self.events.lock().unwrap();
+            std::iter::from_fn(|| events.try_recv().ok())
+                .filter_map(|env| match env.event { AgentEvent::CompactionSkipped { reason } => Some(reason), _ => None })
+                .collect()
         }
 
         /// Whether a cut committed anything: an archive line, a record, or a
@@ -2077,32 +2169,36 @@ pub(crate) mod tests {
 
     /// Without notes a cut the window does not force is not made: the
     /// history, the archive, the record and the hook are as they were.
-    async fn assert_no_cut_without_notes(url: &str, spend: &mut RequestSpend) {
+    /// A cut the window does not force, whose notes do not arrive, is not
+    /// made, and is reported with the reason, which starts with `why`.
+    async fn assert_no_cut_without_notes(url: &str, spend: &mut RequestSpend, why: &str) {
         let fixture = Fixture::new(url);
         let mut messages = session(60, 2_000);
         let original: Vec<String> = messages.iter().map(wire).collect();
         assert_eq!(fixture.cut(&mut messages, 20_000, 100_000, spend).await, 0);
         assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original, "the history is whole");
         assert!(!fixture.committed(), "nothing of a cut was committed");
+        let skipped = fixture.skipped();
+        assert!(skipped.len() == 1 && skipped[0].starts_with(why), "the skip is reported once, why: {skipped:?}");
     }
 
     #[tokio::test]
     async fn a_reply_of_only_a_call_leaves_the_history_whole() {
         let (url, requests) = crate::client::tests::spawn_recording_once(reply("", true));
-        assert_no_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
+        assert_no_cut_without_notes(&url, &mut RequestSpend::new(None), "the notes reply had no text (finish_reason tool_calls)").await;
         assert_eq!(body(&requests)["messages"].as_array().unwrap().last().unwrap()["content"], NOTES_ASK);
     }
 
     #[tokio::test]
     async fn an_endpoint_error_leaves_the_history_whole() {
-        assert_no_cut_without_notes("http://127.0.0.1:9", &mut RequestSpend::new(None)).await;
+        assert_no_cut_without_notes("http://127.0.0.1:9", &mut RequestSpend::new(None), "the notes request failed: ").await;
     }
 
     #[tokio::test]
     async fn notes_the_spend_ceiling_refuses_leave_the_history_whole() {
         let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
         let mut spend = RequestSpend::new(Some(1_000));
-        assert_no_cut_without_notes(&url, &mut spend).await;
+        assert_no_cut_without_notes(&url, &mut spend, "the notes request would pass the turn's token ceiling").await;
         assert!(requests.recv_timeout(Duration::from_millis(300)).is_err(), "the refused request is never sent");
         assert_eq!(spend.tokens, 0);
     }
@@ -2250,7 +2346,57 @@ pub(crate) mod tests {
         let (url, requests) = crate::client::tests::spawn_recording_once(stream(&[
             serde_json::json!({ "choices": [{ "delta": { "reasoning_content": "State: half a thought" }, "finish_reason": "length" }] }),
         ]));
-        assert_no_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
+        assert_no_cut_without_notes(&url, &mut RequestSpend::new(None), "the notes reply had no text (finish_reason length)").await;
         drop(requests);
+    }
+    /// The bug this guards: an instruction the user gave in a later turn
+    /// lived only in the conversation, and a cut kept it only as far as the
+    /// notes paraphrased it, or as a 120-byte snippet when there were none.
+    /// Every prompt a cut removes is kept word for word in its note, the
+    /// turn in progress keeps its own prompt after the note, not in it, and
+    /// a later cut carries the earlier prompts forward.
+    #[tokio::test]
+    async fn a_later_prompt_survives_a_cut_word_for_word() {
+        const LATER: &str = "From now on, indent with tabs, never spaces, and keep \"quotes\" | pipes as written.";
+        const CURRENT: &str = "Now run the tests.";
+        let (url, _requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(30, 2_000);
+        messages.push(prompt(LATER));
+        messages.extend((30..60).flat_map(|i| exchange(i, 2_000)));
+        messages.push(prompt(CURRENT));
+        messages.extend((60..64).flat_map(|i| exchange(i, 2_000)));
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        let head = pinned_head(&messages);
+        let note = messages[head].content.clone().unwrap();
+        assert!(note.contains("Summary: State: halfway."), "{note}");
+        assert!(note.contains(&format!("Later requests from the user, word for word, oldest first: {LATER}.")), "{note}");
+        assert!(!note.contains(CURRENT), "the turn in progress keeps its prompt in the transcript: {note}");
+        assert_eq!(messages.iter().filter(|m| m.content.as_deref() == Some(CURRENT)).count(), 1, "the current prompt stays once");
+        assert_eq!(sessions::last_compaction(&fixture.core, &fixture.id).unwrap().prompts, vec![LATER.to_string()]);
+
+        // A second cut, whose notes fail and which the window forces, still
+        // carries the first cut's prompt and adds the one it removes.
+        drop(fixture);
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        sessions::append_compaction(&fixture.core, &fixture.id, &sessions::CompactionRecord {
+            ts: 0, message_count: 1, tools: Vec::new(), paths: Vec::new(), user_snippets: Vec::new(),
+            prompts: vec![LATER.to_string()], digest: String::new(),
+        });
+        let mut messages = session(30, 2_000);
+        messages.push(prompt(CURRENT));
+        messages.extend((30..60).flat_map(|i| exchange(i, 2_000)));
+        messages.push(prompt("Ship it."));
+        messages.extend((60..64).flat_map(|i| exchange(i, 2_000)));
+        assert!(fixture.cut(&mut messages, 20_000, 20_000, &mut RequestSpend::new(None)).await > 0);
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        assert!(note.contains(&format!("oldest first: {LATER} | {CURRENT}.")), "{note}");
+    }
+
+    /// The notes request states the byte cap the notes are cut at.
+    #[test]
+    fn the_notes_ask_states_the_byte_cap() {
+        assert_eq!(MAX_SUMMARY_BYTES, 4_000);
+        assert!(NOTES_ASK.contains("under 4,000 bytes in all: anything past 4,000 bytes is cut off"), "{NOTES_ASK}");
     }
 }
