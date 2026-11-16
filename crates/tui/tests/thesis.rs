@@ -125,19 +125,17 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 
 /// The suite fails over its time budget: 5 seconds after compilation, the
 /// target, times the multiplier of the machine it runs on. No test inside
-/// the suite can time the suite, so CI does: its Suite time job builds the
-/// suite and runs scripts/check-suite-time.sh on it with ubuntu-latest's
-/// multiplier, which the script explains, in a step with a timeout, and
-/// fails the pull request over that budget. It is a job of its own, so no
-/// step of the test job runs on one of its runners only, and it restores the
-/// test job's cache, saving none. Neither it nor the report gives cargo
-/// another profile than Cargo.toml's, so each times the build `cargo test`
-/// makes. macos-latest does not meet its budget, so
-/// the Reports workflow runs the script there every night instead, five
-/// times after one build with that runner's multiplier, and reports what it
-/// prints, failing only when the five runs did not finish. This test holds
-/// that wiring, and holds the gate to
-/// its job by driving it with a stand-in `cargo` that lists stand-in test
+/// the suite can time the suite, and a shared runner's own speed decides a
+/// single timing of it: in a week of CI on ubuntu-latest, 11 runs went over
+/// the budget with every test passing. So no pull request is gated on it:
+/// no job of ci.yml runs scripts/check-suite-time.sh, and the Reports
+/// workflow runs it every night on ubuntu-latest and macos-latest, each
+/// with its own multiplier, five times after one build, and reports what it
+/// prints, failing only when the five runs did not finish. Each job restores
+/// the test job's cache, saving none, and gives cargo no other profile than
+/// Cargo.toml's, so each times the build `cargo test` makes. This test holds
+/// that wiring, and holds the script to
+/// its method by driving it with a stand-in `cargo` that lists stand-in test
 /// binaries: it runs them at once (four of them each wait for the other
 /// three to start), each the way `cargo test` would (from its package
 /// directory, with Ctrl+C not ignored), passes a suite inside 5 seconds
@@ -161,50 +159,46 @@ fn ran(command: &mut Command) -> (Option<i32>, String) {
 /// without a module it needs, it stops before cargo and names the module.
 #[test]
 fn the_suite_fails_over_its_time_budget() {
-    // The gate: a job of its own on one runner, which builds the suite and
-    // then times it under a timeout, and restores the test job's cache.
-    let job = ci_job("suite-time");
+    // No gate: no job of the pull request's workflow times the suite.
     let at = |job: &[String], line: &str| job.iter().position(|l| l.trim() == line);
-    assert!(at(&job, "runs-on: ubuntu-latest").is_some(), "the suite time gate does not run on ubuntu-latest");
-    let (built, gate) =
-        (at(&job, "run: cargo test --workspace --locked --no-run"), at(&job, "run: scripts/check-suite-time.sh 3"));
-    let (Some(built), Some(gate)) = (built, gate) else {
-        panic!("the suite time job does not build the suite and then check it with a multiplier of 3: {job:?}")
-    };
-    assert!(built < gate, "the suite time gate builds under its own timeout");
+    let ci = std::fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
     assert!(
-        step_keys(&job, gate).iter().any(|key| key.starts_with("timeout-minutes:")),
-        "a test that hangs beside the others holds the suite time gate until the job's own limit"
+        !ci.lines().filter(|line| !line.trim().starts_with('#')).any(|line| line.contains("check-suite-time")),
+        "a pull request's gate times the suite, so a slow shared runner fails it with every test passing"
     );
-    for line in ["shared-key: test", "save-if: false"] {
-        assert!(at(&job, line).is_some(), "the suite time job does not restore the test job's cache without saving one: {line}");
-    }
-    let test_job = ci_job("test");
-    assert!(
-        !test_job.iter().any(|line| line.contains("check-suite-time")),
-        "the test job times the suite on every runner of its matrix, or on one of them only"
-    );
-    // The report: macos-latest, five runs, its own multiplier, run as outside
-    // GitHub Actions so a run over budget is a line and not an error, and a
-    // failure only when the five runs did not finish.
+    // The report: both runners, five runs, each runner's own multiplier, run
+    // as outside GitHub Actions so a run over budget is a line and not an
+    // error, and a failure only when the five runs did not finish.
     let report = workflow_job("reports.yml", "suite-time");
-    assert!(at(&report, "runs-on: macos-latest").is_some(), "the suite time report does not run on macos-latest");
+    assert!(at(&report, "runs-on: ${{ matrix.os }}").is_some(), "the suite time report does not run on its matrix's runners");
+    let entries: Vec<(String, String)> = report
+        .iter()
+        .map(|line| line.trim())
+        .zip(report.iter().map(|line| line.trim()).skip(1))
+        .filter_map(|(os, multiplier)| {
+            Some((os.strip_prefix("- os: ")?.to_string(), multiplier.strip_prefix("multiplier: ")?.to_string()))
+        })
+        .collect();
+    let entries: Vec<(&str, &str)> = entries.iter().map(|(os, m)| (os.as_str(), m.as_str())).collect();
+    assert_eq!(
+        entries,
+        [("ubuntu-latest", "3"), ("macos-latest", "4")],
+        "the suite time report does not run on both runners with each one's multiplier"
+    );
     assert!(at(&report, "run: cargo test --workspace --locked --no-run").is_some(), "the report builds under its timeout");
     for line in ["shared-key: test", "save-if: false"] {
         assert!(at(&report, line).is_some(), "the suite time report does not restore the test job's cache without saving one: {line}");
     }
-    // The gate and the report time the build `cargo test` makes from
-    // Cargo.toml: neither job gives cargo another profile, by a variable, a
-    // flag or a config file, as the test job does to build unoptimized.
-    for (name, lines) in [("gate", &job), ("report", &report)] {
-        let overrides: Vec<&str> = lines
-            .iter()
-            .map(|line| line.trim())
-            .filter(|line| !line.starts_with('#'))
-            .filter(|line| *line == "env:" || ["CARGO_", "RUSTFLAGS", "GITHUB_ENV", "--config", "config.toml"].iter().any(|key| line.contains(key)))
-            .collect();
-        assert!(overrides.is_empty(), "the suite time {name} can build another profile than Cargo.toml's: {overrides:?}");
-    }
+    // The report times the build `cargo test` makes from Cargo.toml: it gives
+    // cargo no other profile, by a variable, a flag or a config file, as the
+    // test job does to build unoptimized.
+    let overrides: Vec<&str> = report
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| *line == "env:" || ["CARGO_", "RUSTFLAGS", "GITHUB_ENV", "--config", "config.toml"].iter().any(|key| line.contains(key)))
+        .collect();
+    assert!(overrides.is_empty(), "the suite time report can build another profile than Cargo.toml's: {overrides:?}");
     let run = at(&report, "- name: Report the suite time").expect("the Reports workflow has no suite time report");
     assert!(
         step_keys(&report, run).iter().any(|key| key.starts_with("timeout-minutes:")),
@@ -215,18 +209,17 @@ fn the_suite_fails_over_its_time_budget() {
     assert_eq!(
         commands,
         [
-            "env -u GITHUB_ACTIONS scripts/check-suite-time.sh --runs 5 4 2>&1 | tee \"$RUNNER_TEMP/suite-time.log\"",
+            "env -u GITHUB_ACTIONS scripts/check-suite-time.sh --runs 5 ${{ matrix.multiplier }} 2>&1 | tee \"$RUNNER_TEMP/suite-time.log\"",
             "status=${PIPESTATUS[0]}",
-            "{ echo \"Reported, not gated, on macos-latest; the check exited $status:\"; echo '```'; sed -n -E '/^(run [0-9]+ of 5: |median )/p' \"$RUNNER_TEMP/suite-time.log\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
+            "{ echo \"Reported, not gated, on ${{ matrix.os }}; the check exited $status:\"; echo '```'; sed -n -E '/^(run [0-9]+ of 5: |median )/p' \"$RUNNER_TEMP/suite-time.log\"; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"",
             "grep -q '^median .* over 5 runs,' \"$RUNNER_TEMP/suite-time.log\" || { echo \"::error::the suite did not run 5 times, so it measured nothing\"; exit 1; }",
             "if grep -E 'FAILED \\(stopped at |test binaries did not report' \"$RUNNER_TEMP/suite-time.log\"; then echo \"::error::a run did not finish, so its time is not the suite's\"; exit 1; fi",
         ],
-        "the suite time report does not run the suite five times on macos-latest, report each run and the median, \
+        "the suite time report does not run the suite five times on each runner, report each run and the median, \
          and fail only when the runs did not finish"
     );
-    // Each runner's multiplier, the gate's and the report's, has its reason
-    // in the script: a multiplier raised without one passes a pull request
-    // that slowed the suite on that runner.
+    // Each runner's multiplier has its reason in the script: a multiplier
+    // raised without one hides a change that slowed the suite on that runner.
     let script = std::fs::read_to_string(repo().join("scripts/check-suite-time.sh")).unwrap();
     for (multiplier, runner) in [("3", "ubuntu-latest"), ("4", "macos-latest")] {
         assert!(
@@ -2219,8 +2212,7 @@ fn core_share_reports_the_share_of_commits_that_change_the_core() {
 /// none needs another, so the gate takes as long as its slowest job, and
 /// Clippy, which builds with a compiler of its own, pinned to a release, is a
 /// job of its own instead of steps after the tests. The jobs are the tests,
-/// the suite time, Clippy, the thesis gates, the core share and dist's plan
-/// of the release;
+/// Clippy, the thesis gates, the core share and dist's plan of the release;
 /// the six release builds are not among them (crates/tui/tests/release.rs
 /// holds their workflow and the plan). CI runs on every push to main, every
 /// pull request, every merge group of a merge queue and every night. A push
@@ -2259,7 +2251,7 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
         .skip(1)
         .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':').filter(|key| !key.starts_with([' ', '#'])))
         .collect();
-    assert_eq!(jobs, ["test", "suite-time", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
+    assert_eq!(jobs, ["test", "clippy", "thesis", "core-share", "release-plan"], "the gate's jobs changed");
     for job in &jobs {
         let waits: Vec<String> = ci_job(job).into_iter().filter(|line| line.trim().starts_with("needs:")).collect();
         assert!(waits.is_empty(), "the {job} job waits for another, so the gate takes the two one after the other: {waits:?}");
