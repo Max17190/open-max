@@ -66,7 +66,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Test builds optimize the workspace's own crates (Cargo.toml's test
-      # profile), which the Suite time job times and pays for: built that way
+      # profile), which the Reports workflow's suite timing pays for: built that way
       # the tests take 203 to 223 seconds to build on ubuntu-latest instead of
       # 35 to 37, and 425 instead of 63 on macos-latest. This job holds no time
       # budget and runs each test in a process of its own, so it builds them
@@ -121,45 +121,6 @@ jobs:
       # The binary the step above built, driven by the example's own script.
       - name: Test run task example
         run: python3 examples/run-task/test_run_task.py target/debug/openmax
-
-  # The whole suite's wall time after compilation with every test binary run
-  # at once, each with a thread pool of its own, which the test job, running
-  # each test in a process of its own, does not show.
-  # scripts/check-suite-time.sh gives the method and the budget: 5 seconds
-  # times this runner's multiplier.
-  # It gates on ubuntu-latest alone, a job of its own so that no step of the
-  # test job runs on one of its runners only. macos-latest, 3 shared cores,
-  # ran the suite in 12.5 to 33.7 seconds over 32 runs, over its 20-second
-  # budget in 19, so the Reports workflow measures it there every night
-  # instead. The job builds the test job's dependencies again, and the
-  # workspace's own crates as Cargo.toml's test profile gives them, so it
-  # restores the cache that job saves on main and saves none of its own: the
-  # repository's cache space holds no second copy. crates/tui/tests/thesis.rs
-  # holds this wiring.
-  suite-time:
-    name: Suite time
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
-        with:
-          toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: test
-          save-if: false
-
-      # What the check runs, so it builds nothing under its timeout.
-      - name: Build the tests
-        run: cargo test --workspace --locked --no-run
-
-      - name: Check suite time
-        run: scripts/check-suite-time.sh 3
-        timeout-minutes: 5
 
   # The zero-warning baseline is only real if something checks it. It was set
   # deliberately, then drifted back to three warnings because nothing did. A

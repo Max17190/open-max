@@ -20,8 +20,8 @@
 # Two tests time their own work and hold it to a bound in a debug build
 # too: harness_time_per_tool_round and
 # a_hundred_extensions_load_in_under_10_ms (`alone_tests` below). Beside
-# every other binary they time the runner instead. Over 40 runs of CI's
-# Suite time job that ran them there, the first failed beside the others
+# every other binary they time the runner instead. Over 40 runs of the
+# suite timing on ubuntu-latest that ran them there, the first failed beside the others
 # in 37 and the second in 7, and each passed when run again alone. So a
 # binary that holds one runs beside the others without it, and then runs
 # it alone, after them and on the same clock, with libtest's own pool, as
@@ -30,9 +30,10 @@
 # test fails the check when it fails alone.
 #
 # The budget is 5 seconds times the multiplier, set for each CI runner from
-# its runs. CI's Suite time job gates a multiplier of 3 on ubuntu-latest
-# (4 cores), and the Reports workflow reports
-# a multiplier of 4 on macos-latest (3 cores, M1); the target is measured
+# its runs. The Reports workflow reports a multiplier of 3 on ubuntu-latest
+# (4 cores) and a multiplier of 4 on macos-latest (3 cores, M1) every
+# night, gating neither, as the shared runners' own speed moved a run past
+# its budget with no test failing; the target is measured
 # on 10 cores. The suite's processes spend about 20 CPU-seconds, so on
 # those runners the CPU work alone takes 5.0 and 6.7 seconds beside the
 # tests that wait. Their first two runs took 6.9 and 8.5 seconds on
@@ -42,8 +43,9 @@
 # between those two runs, so each budget was set at least half again its
 # runner's slowest run. Over 29 later runs ubuntu-latest took 6.0 to 12.0
 # seconds, a fifth under its budget at the slowest, and macos-latest 12.5
-# to 33.7 seconds over 32, over its budget in 19, so only ubuntu-latest
-# gates.
+# to 33.7 seconds over 32, over its budget in 19. ubuntu-latest gated
+# pull requests until, over 2026-11-09 to 2026-11-16, it took 15.04 to
+# 18.80 seconds in 11 runs with every test passing, so neither gates now.
 #
 # Run it after `cargo test --workspace --locked` (or with `--no-run`): it
 # asks cargo for the test executables before the clock starts, which builds
