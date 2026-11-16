@@ -2362,6 +2362,7 @@ pub(crate) fn exited_outcome(
 ) -> ToolOutcome {
     let note = match output.left_running {
         Some(group) => Some(left_running_note(group, output.pipe_closed)),
+        None if output.background_terminated && !execution::leaves_running() => Some(SUB_AGENT_BACKGROUND_NOTE.to_string()),
         None => output.background_terminated.then(|| {
             match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 false => BACKGROUND_TERMINATED_NOTE,
@@ -2411,6 +2412,12 @@ pub(crate) const BACKGROUND_TERMINATED_NOTE: &str = concat!(
     "`disown` do not survive the call. To keep something running, start it ",
     "from bash, where a background process outlives the command.]"
 );
+
+/// The note under a sub-agent, where every command's background processes
+/// stop when it returns, bash's too, so starting one from bash is no way out.
+pub(crate) const SUB_AGENT_BACKGROUND_NOTE: &str = "[openmax: background processes this call \
+    left running were terminated when it returned: in a sub-agent nothing a command starts outlives it, so \
+    start a server and run what uses it in the same command.]";
 
 /// The note every later call in the session that leaves background processes
 /// behind gets instead, once the one above has explained the rule: a line

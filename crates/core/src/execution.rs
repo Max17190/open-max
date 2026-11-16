@@ -986,7 +986,7 @@ pub(crate) async fn run_process(
     };
 
     let (termination, background_terminated, left_running) =
-        supervise_child(&mut child, pid, request.timeout, &cancel, request.leave_running && LEAVE_RUNNING.load(Ordering::SeqCst)).await?;
+        supervise_child(&mut child, pid, request.timeout, &cancel, request.leave_running && leaves_running()).await?;
     group.settled();
 
     if let Some(task) = stdin_task {
@@ -1321,6 +1321,11 @@ static LEAVE_RUNNING: AtomicBool = AtomicBool::new(true);
 /// knows.
 pub fn stop_background_with_each_command() {
     LEAVE_RUNNING.store(false, Ordering::SeqCst);
+}
+
+/// False once [`stop_background_with_each_command`] has run.
+pub(crate) fn leaves_running() -> bool {
+    LEAVE_RUNNING.load(Ordering::SeqCst)
 }
 
 /// Leaders of the process groups commands started and have not settled yet.
