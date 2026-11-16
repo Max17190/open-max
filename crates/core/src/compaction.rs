@@ -213,8 +213,9 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 /// transcript up to the cut (`head`, then every message the cut removes, in
 /// order) and `NOTES_ASK`, with the turn's tools: a prompt the session
 /// already sent, so a prompt cache can serve all of it but the ask. Only the
-/// reply's text is taken. A call in it never runs, nothing of this exchange
-/// is stored or shown, and an empty reply, an error, a timeout, a cancel, a
+/// reply's text is taken, or, when a reply that ended on its own has no
+/// text and no call, its reasoning. A call in it never runs, nothing of this
+/// exchange is stored or shown, and an empty reply, an error, a timeout, a cancel, a
 /// cut stream or a request the spend ceiling refuses gives no notes (None).
 ///
 /// The request is billed like any other: a ledger that advertises what each
@@ -247,18 +248,41 @@ async fn summarize_compaction(
     };
     spend.record(core, session_id, estimated, &result);
     if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" { return None; }
+    let cut = result.finish_reason == "length";
     let mut summary = result.content;
     if let Some(clean) = crate::client::strip_leading_think(&summary) {
         summary = clean;
     }
-    let summary = summary.trim().replace(['\n', '\r'], " ");
+    // Some models write the notes in their reasoning and end the reply with
+    // no text. A reply that finished on its own with no call holds nothing
+    // else, so its reasoning is the notes.
+    if summary.trim().is_empty() && !cut && result.tool_calls.is_empty() {
+        summary = result.reasoning_content.or(result.reasoning).unwrap_or_default();
+    }
+    let summary = summary.trim().replace('\r', "");
     if summary.is_empty() {
         return None;
     }
-    if summary.len() > MAX_SUMMARY_BYTES {
-        return Some(take_note_bytes(&summary, MAX_SUMMARY_BYTES) + "…");
-    }
-    Some(summary)
+    Some(cap_notes(&summary, cut))
+}
+
+/// Said after notes the reply limit cut, so the model does not take them as whole.
+const NOTES_CUT_MARK: &str = "\n[the notes end here: the reply limit cut them off]";
+
+/// The notes within `MAX_SUMMARY_BYTES`, with their line breaks. Notes over
+/// the cap end at their last whole line in it, if that keeps at least half,
+/// then an ellipsis; notes the reply limit cut end with `NOTES_CUT_MARK`.
+fn cap_notes(summary: &str, cut: bool) -> String {
+    let room = if cut { MAX_SUMMARY_BYTES - NOTES_CUT_MARK.len() } else { MAX_SUMMARY_BYTES };
+    let mut notes = if summary.len() > room {
+        let head = take_note_bytes(summary, room);
+        let end = head.rfind('\n').filter(|&i| i >= room / 2).unwrap_or(head.len());
+        head[..end].trim_end().to_string() + "…"
+    } else {
+        summary.to_string()
+    };
+    if cut { notes.push_str(NOTES_CUT_MARK); }
+    notes
 }
 
 pub(crate) fn is_digest_message(msg: &ChatMessage) -> bool {
@@ -2172,5 +2196,61 @@ pub(crate) mod tests {
         // 1,333 three-byte chars are 3,999 bytes; the next would pass 4,000.
         assert!(note.contains(&format!("Summary: {}… ", "€".repeat(1_333))), "{note}");
         assert!(!note.contains(&"€".repeat(1_334)));
+    }
+
+    /// Notes over the cap keep their line breaks and end at their last whole
+    /// line, so a part they reach is never cut mid-sentence.
+    #[tokio::test]
+    async fn long_notes_end_at_their_last_whole_line() {
+        // 97-byte lines: the cap falls 23 bytes into the 42nd.
+        let line = format!("{}\n", "w".repeat(96));
+        let (url, _requests) = crate::client::tests::spawn_recording_once(reply(&line.repeat(60), false));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        let kept = line.repeat(40) + &"w".repeat(96);
+        assert!(note.contains(&format!("Summary: {kept}… ")), "{note}");
+        assert!(!note.contains(&format!("{kept}\nw")), "the part of the line past the cap is dropped: {note}");
+    }
+
+    fn stream(chunks: &[Value]) -> String {
+        let events: String = chunks.iter().map(|chunk| format!("data: {chunk}\n\n")).collect();
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{events}data: [DONE]\n\n")
+    }
+
+    /// A reply that writes the notes in its reasoning and ends with no text
+    /// still gives the cut its notes.
+    #[tokio::test]
+    async fn notes_written_as_reasoning_are_kept() {
+        let (url, _requests) = crate::client::tests::spawn_recording_once(stream(&[
+            serde_json::json!({ "choices": [{ "delta": { "reasoning_content": "State: wired the parser.\nOpen: the CLI flag." } }] }),
+            serde_json::json!({ "choices": [{ "delta": { "content": "" }, "finish_reason": "stop" }] }),
+        ]));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        assert!(note.contains("Summary: State: wired the parser.\nOpen: the CLI flag. "), "{note}");
+    }
+
+    /// Notes the reply limit cut are kept and say they were cut. Reasoning
+    /// with no text under a cut is not taken as notes.
+    #[tokio::test]
+    async fn notes_the_reply_limit_cut_say_so() {
+        let (url, _requests) = crate::client::tests::spawn_recording_once(stream(&[
+            serde_json::json!({ "choices": [{ "delta": { "content": "State: wired the par" }, "finish_reason": "length" }] }),
+        ]));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        assert!(note.contains(&format!("Summary: State: wired the par{NOTES_CUT_MARK} ")), "{note}");
+
+        let (url, requests) = crate::client::tests::spawn_recording_once(stream(&[
+            serde_json::json!({ "choices": [{ "delta": { "reasoning_content": "State: half a thought" }, "finish_reason": "length" }] }),
+        ]));
+        assert_no_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
+        drop(requests);
     }
 }
