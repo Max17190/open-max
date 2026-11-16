@@ -330,18 +330,34 @@ const NOTES_CUT_MARK: &str = "\n[the notes end here: the reply limit cut them of
 
 /// The notes within `cap` bytes, with their line breaks. Notes over the cap
 /// end at their last whole line in it, if that keeps at least half, then an
-/// ellipsis; notes the reply limit cut end with `NOTES_CUT_MARK`.
+/// ellipsis; their last part, what is still open, is kept after it when it is
+/// short, since a cut from the end loses it first and models write past any
+/// budget they are given. Notes the reply limit cut end with `NOTES_CUT_MARK`.
 fn cap_notes(summary: &str, cut: bool, cap: usize) -> String {
     let room = if cut { cap - NOTES_CUT_MARK.len() } else { cap };
     let mut notes = if summary.len() > room {
+        let open = summary.match_indices('\n').map(|(i, _)| i + 1).filter(|&i| opens_open_part(&summary[i..])).next_back();
+        let tail = open.map(|i| &summary[i..]).filter(|tail| tail.len() <= room / 4).unwrap_or("");
+        let room = room - if tail.is_empty() { 0 } else { tail.len() + "…\n".len() };
         let head = take_note_bytes(summary, room);
         let end = head.rfind('\n').filter(|&i| i >= room / 2).unwrap_or(head.len());
-        head[..end].trim_end().to_string() + "…"
+        let notes = head[..end].trim_end().to_string() + "…";
+        if tail.is_empty() { notes } else { notes + "\n" + tail }
     } else {
         summary.to_string()
     };
     if cut { notes.push_str(NOTES_CUT_MARK); }
     notes
+}
+
+/// Whether a line of notes starts their open part: `Open` or `Unresolved`,
+/// as a word, after any markup.
+fn opens_open_part(line: &str) -> bool {
+    let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+    ["open", "unresolved"].iter().any(|label| {
+        line.get(..label.len()).is_some_and(|word| word.eq_ignore_ascii_case(label))
+            && !line[label.len()..].starts_with(|c: char| c.is_alphanumeric())
+    })
 }
 
 pub(crate) fn is_digest_message(msg: &ChatMessage) -> bool {
@@ -2308,6 +2324,35 @@ pub(crate) mod tests {
         let kept = line.repeat(40) + &"w".repeat(96);
         assert!(note.contains(&format!("Summary: {kept}… ")), "{note}");
         assert!(!note.contains(&format!("{kept}\nw")), "the part of the line past the cap is dropped: {note}");
+    }
+
+    /// The bug this guards: models write their notes past the cap whatever
+    /// budget the request states (all 12 of one model's, offline), and the
+    /// part a cut from the end lost was the last, what is still open. A short
+    /// open part is kept after the ellipsis; a long one, or a word that only
+    /// starts with the label, is not a part to keep.
+    #[tokio::test]
+    async fn long_notes_keep_their_open_part() {
+        let line = format!("{}\n", "w".repeat(96));
+        let open = "**OPEN / unverified:** whether `make check` passes on the new parser.\n- the flag's help text";
+        for (notes, kept) in [
+            (format!("STATE: halfway.\n{}{open}", line.repeat(60)), Some(open)),
+            (format!("State: halfway.\n{}Opened: a.rs", line.repeat(60)), None),
+            (format!("State: halfway.\n{}Open: {}", line.repeat(60), "o".repeat(1_100)), None),
+        ] {
+            let (url, _requests) = crate::client::tests::spawn_recording_once(reply(&notes, false));
+            let fixture = Fixture::new(&url);
+            let mut messages = session(60, 2_000);
+            assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+            let note = messages[pinned_head(&messages)].content.clone().unwrap();
+            let summary = note.split_once("Summary: ").unwrap().1.split_once(" Files touched").unwrap().0;
+            assert!(summary.starts_with("STATE: halfway.") || summary.starts_with("State: halfway."), "{summary}");
+            assert!(summary.len() <= MAX_SUMMARY_BYTES + "…".len(), "{} bytes", summary.len());
+            match kept {
+                Some(open) => assert!(summary.ends_with(&format!("w…\n{open}")), "{summary}"),
+                None => assert!(summary.ends_with("w…"), "{summary}"),
+            }
+        }
     }
 
     fn stream(chunks: &[Value]) -> String {
