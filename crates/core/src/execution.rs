@@ -130,11 +130,8 @@ pub(crate) struct ProcessRequest {
     /// above give it, in every mode. The agent's shell takes its command text
     /// this way, so the text never sits in the shell's argument list.
     pub env: Vec<(OsString, OsString)>,
-    /// Leave what the command started in the background running when its
-    /// shell exits on its own, instead of stopping it. Only the agent's shell
-    /// sets it: a server it starts with `&` must still serve after the call
-    /// and after the harness exits. A cancel or a timeout still stops the
-    /// whole group.
+    /// Leave what the command started in the background running when its shell exits on its own: only the agent's
+    /// shell sets it, so a server started with `&` serves after the call and the harness. Cancel and timeout still stop it.
     pub leave_running: bool,
 }
 
@@ -251,8 +248,7 @@ pub(crate) struct ProcessOutput {
     /// Callers must surface it, because the caller who backgrounded a server
     /// otherwise sees a clean exit and no server.
     pub background_terminated: bool,
-    /// The process group a command that exited normally left running, with
-    /// `leave_running`: its members outlive the call and the harness.
+    /// The process group a command that exited normally left running, with `leave_running`.
     pub left_running: Option<u32>,
     /// A pipe a process left running still held could not be handed on (see `keep_draining`).
     pub pipe_closed: bool,
@@ -457,8 +453,7 @@ struct FinishedStream {
     stream: CapturedStream,
     spill_path: Option<PathBuf>,
     omitted: bool,
-    /// The pipe was still held when reading stopped and could not be handed
-    /// on, so the process holding it meets a closed pipe at its next write.
+    /// The pipe was still held when reading stopped and could not be handed on: its next write meets a closed pipe.
     pipe_closed: bool,
 }
 
@@ -603,13 +598,9 @@ where
     }
 }
 
-/// Hands a pipe a process still holds when the call stops reading it to a
-/// `cat` of its own, in a session of its own, that reads it to the end and
-/// discards it. Closed instead, the pipe kills the process that holds it on
-/// its next write (SIGPIPE, or an error a server dies of), so a server left
-/// running that logs to its output would stop at its first request. `cat`
-/// is found at its fixed paths, not on a PATH the command may have changed.
-/// Returns false when the pipe could not be handed on.
+/// Hands a pipe a process still holds when the call stops reading it to a `cat` in a session of its own, found at its
+/// fixed paths, not on PATH, which discards it to the end. Closed instead, the pipe kills a server left running that logs
+/// to it at its first request (SIGPIPE, or an error it dies of). False when the pipe could not be handed on.
 fn keep_draining<R: TryInto<std::process::Stdio>>(reader: R) -> bool {
     let Some(path) = ["/bin/cat", "/usr/bin/cat"].into_iter().find(|path| Path::new(path).exists()) else { return false };
     let Ok(stdin) = reader.try_into() else { return false };
@@ -1193,11 +1184,8 @@ async fn supervise_child(
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
             // A shell can exit while ordinary background descendants retain the
-            // group. With `leave` they are what the command meant to start, a
-            // server with `&`, and run on; the caller is told where they are.
-            // Otherwise they belong to this invocation and are cleaned up too,
-            // and the caller is told so, since the exit status alone says the
-            // server started.
+            // group. With `leave` they are what it meant to start and run on; otherwise they are cleaned up too.
+            // Either way the caller is told, since the exit status alone says a server started.
             if leave {
                 let left = if left_running(pid).await { pid } else { None };
                 return Ok((Termination::Exited(status), false, left));
@@ -1313,12 +1301,9 @@ fn configure_process_group(_: &mut std::process::Command, _: bool) {}
 /// Cleared by a sub-agent ([`stop_background_with_each_command`]).
 static LEAVE_RUNNING: AtomicBool = AtomicBool::new(true);
 
-/// Makes every later command stop what it left running in the background
-/// when it returns, as an external tool's call does, whatever its request
-/// asks. A sub-agent sets it before its child runs: nothing the child starts
-/// may outlive it, however it exits, and a group still running after its
-/// command returned is no longer one the exit's kill or the crash watcher
-/// knows.
+/// Makes every later command stop what it left in the background when it returns, as an external tool's does. A
+/// sub-agent sets it before its child runs: nothing the child starts may outlive it, however it exits, and a group
+/// left running is one the exit's kill and the crash watcher no longer know.
 pub fn stop_background_with_each_command() {
     LEAVE_RUNNING.store(false, Ordering::SeqCst);
 }
