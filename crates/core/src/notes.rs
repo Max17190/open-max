@@ -864,7 +864,8 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
 /// with `room`, the limit the next request alone carries, the note says so
 /// and asks for the content whole. Without it (that request was cut too, or
 /// the limit leaves no more room) the note asks for the content in parts,
-/// and cut text gets the note a cut thought does, byte for byte.
+/// and cut text gets the note a cut thought does, byte for byte. A cut
+/// thought with `room`, the raised limit after cuts in a row, is told it.
 pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usize>) -> String {
     let next = |ask: &str| room.map(|room| format!("The next reply alone may be up to {room} tokens: {ask}"));
     match kind {
@@ -877,7 +878,10 @@ pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usiz
             None => format!("[reply cut: it reached max_tokens ({max_tokens}) and nothing of the reply arrived here: either thinking that is not shown, or a tool call larger than the limit, which did not run. If it was a call, written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
         },
         CutKind::Text => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing text. {}]", next("continue the text from exactly where it stopped, without repeating any of it.").unwrap_or_else(|| "Continue the text from exactly where it stopped, without repeating any of it.".into())),
-        CutKind::Thought => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
+        CutKind::Thought => match room {
+            Some(room) => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; the next reply may be up to {room} tokens: continue from where it stopped, then act.]"),
+            None => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
+        },
     }
 }
 
@@ -941,10 +945,11 @@ mod tests {
             if want != "before" && want != "text" {
                 assert!(note.starts_with("[reply cut: it reached max_tokens (4096)") && note.ends_with(&format!("{SPLIT_ADVICE}]")), "{case}: {note}");
             }
-            // With room, a cut thought is still told to act, and anything else is asked for whole, not in parts.
+            // With room, a cut thought, raised after cuts in a row, is told the next limit and to act, and anything
+            // else is asked for whole, not in parts.
             let roomy = reply_cut_note(4_096, kind, Some(16_384));
             match kind {
-                CutKind::Thought => assert_eq!(roomy, before, "{case}"),
+                CutKind::Thought => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]", "{case}"),
                 CutKind::Text => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) while writing text. The next reply alone may be up to 16384 tokens: continue the text from exactly where it stopped, without repeating any of it.]", "{case}"),
                 CutKind::Lost | CutKind::Unseen => assert!(roomy.contains("The next reply alone may be up to 16384 tokens") && roomy.ends_with("again now, whole.]") && !roomy.contains("in parts"), "{case}: {roomy}"),
             }

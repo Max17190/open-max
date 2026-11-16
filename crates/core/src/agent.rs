@@ -79,8 +79,8 @@ enum ApprovalOutcome {
 }
 
 /// A reply the output cap cut before its first tool call ran nothing and
-/// answered nothing, so the turn goes on this many times in a row, each
-/// after a note (`notes::reply_cut_note`); one more such reply ends the turn `length`.
+/// answered nothing, so the turn goes on after a note (`notes::reply_cut_note`), the limit doubling from the second
+/// in a row up to its ceiling; cut where it cannot grow, this many times more, and one more ends the turn `length`.
 const MAX_CUT_CONTINUATIONS: usize = 4;
 
 /// The one failure persisted without the `Error: ` prefix: the model must
@@ -737,12 +737,12 @@ async fn run_loop(
     }
     let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
-    // Cut replies with no call since the last reply the cap did not cut.
-    let (mut cuts, mut stops) = (0, Vec::new());
+    // Cut replies with no call since the last reply the cap did not cut, those the limit could not grow after, and its doublings.
+    let (mut cuts, mut stalled, mut raise, mut stops) = (0usize, 0usize, 0u32, Vec::new());
     let mut at_reserve = false;
     // The limit is how long a reasoning model thinks in one reply before it acts, not how much a call or an answer
     // may carry: a reply it cut inside a call or its text is asked for once more with this room, and
-    // never again after a server refused a request that carried it.
+    // never again after a server refused a request that carried it, or a raised limit.
     let (mut room, mut no_room) = (None::<usize>, false);
     // Set once a request goes out over the soft trigger: a cut without notes waits for the window; a cut clears it.
     let mut soft_spent = false;
@@ -805,7 +805,7 @@ async fn run_loop(
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
         let roomy = room.take();
-        let limit = if std::mem::take(&mut at_reserve) { endpoint.reply_reserve } else { roomy.map_or(endpoint.reply_limit(used_real), |room| room.min(endpoint.reply_room(used_real))) };
+        let limit = if std::mem::take(&mut at_reserve) { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, raise))) };
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
@@ -836,10 +836,10 @@ async fn run_loop(
         let result = match result {
             Ok(r) => r,
             Err(mut message) => {
-                // The room left was misjudged: the same request goes once more at the reserve.
-                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some(); continue 'turns; }
-                // A server that refuses the room a cut reply was promised gets the request again at the usual limit.
-                if roomy.is_some() && limit > endpoint.reply_limit(used_real) && (message.starts_with("backend returned 400") || message.starts_with("backend returned 422")) && iteration + 1 < max_iterations { no_room = true; continue 'turns; }
+                // The room left was misjudged: the same request goes once more at the reserve, with no more room or raises.
+                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some() || raise > 0; raise = 0; continue 'turns; }
+                // A server that refuses the room a cut reply was promised, or a raised limit, gets the request again at the usual limit.
+                if (roomy.is_some() || raise > 0) && limit > endpoint.reply_limit(used_real) && (message.starts_with("backend returned 400") || message.starts_with("backend returned 422")) && iteration + 1 < max_iterations { no_room = true; raise = 0; continue 'turns; }
                 // A server can refuse a request that carries a reply of reasoning alone. Such
                 // replies lose their stamp, so no wire sends them, and the request goes again.
                 let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
@@ -958,9 +958,7 @@ async fn run_loop(
         // the one it was still writing, is refused with the cause, so the
         // model can split the work. The client keeps its raw arguments even
         // when the cut lands before the first byte.
-        if !capped {
-            cuts = 0;
-        }
+        if !capped { (cuts, stalled, raise) = (0, 0, 0); }
         // The room the next request may carry, when this reply was cut and was not itself the one given room.
         let grant = (capped && roomy.is_none() && !no_room && iteration + 1 < max_iterations).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
         if !tool_calls.is_empty() { room = grant; }
@@ -972,13 +970,18 @@ async fn run_loop(
             // answer, so not an end and no turn_end consult. The reply stays
             // as recorded above, the note goes after it, on disk before the
             // next request, and the loop goes round. Never on the last
-            // iteration, which has no request left to carry the note.
-            if capped && cuts < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
-                cuts += 1;
+            // iteration, which has no request left to carry the note. A second cut in a row doubles the limit, so the
+            // limit alone never ends a turn while it can grow.
+            let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
+            cuts += usize::from(capped);
+            let raised = capped && cuts > 1 && !no_room && endpoint.raised_limit(next, raise + 1) > endpoint.raised_limit(next, raise);
+            if raised { raise += 1 } else if capped && cuts > 1 { stalled += 1 }
+            if capped && stalled < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
                 let at = guard.messages().len();
                 let kind = crate::notes::cut_kind(limit, &result);
                 room = grant.filter(|_| kind != crate::notes::CutKind::Thought);
-                insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(limit, kind, room));
+                let ask = room.into_iter().chain(raised.then(|| endpoint.raised_limit(next, raise))).max();
+                insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(limit, kind, ask));
                 save_messages(core, session_id, guard.messages(), false).await;
                 continue 'turns;
             }
