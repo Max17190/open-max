@@ -168,19 +168,19 @@ impl CompactionDigest {
     }
 
     /// The prompts the note carries: the newest within
-    /// `MAX_DIGEST_PROMPT_BYTES`, in order, and when even the newest alone
-    /// is over it, that one cut short and marked.
+    /// `MAX_DIGEST_PROMPT_BYTES` counting each one's separator, in order, and
+    /// when even the newest alone is over it, that one cut short and marked.
     fn shown_prompts(&self) -> Vec<String> {
         let mut room = MAX_DIGEST_PROMPT_BYTES;
         let mut shown = Vec::new();
         for prompt in self.prompts.iter().rev() {
-            if prompt.len() <= room {
-                room -= prompt.len();
+            if prompt.len() + 3 <= room {
+                room -= prompt.len() + 3;
                 shown.push(prompt.clone());
             } else {
                 if shown.is_empty() {
                     let mark = " [cut short; the archive has it whole]";
-                    shown.push(take_note_bytes(prompt, MAX_DIGEST_PROMPT_BYTES - mark.len()) + mark);
+                    shown.push(take_note_bytes(prompt, MAX_DIGEST_PROMPT_BYTES - 3 - mark.len()) + mark);
                 }
                 break;
             }
@@ -463,7 +463,7 @@ async fn prepare_compaction_digest(
         digest.absorb_prior(&prior);
     }
     // The later prompts the note carries come out of the notes' cap.
-    let summary = summary.map(|(notes, cut)| cap_notes(&notes, cut, MAX_SUMMARY_BYTES - digest.prompts_room()));
+    let summary = summary.map(|(notes, cut)| cap_notes(&notes, cut, MAX_SUMMARY_BYTES.saturating_sub(digest.prompts_room())));
     let path = sessions::archive_display(core, session_id);
     // The note in the slot was just inserted by the cut, so replacing it
     // here keeps one digest message.
@@ -1644,6 +1644,18 @@ pub(crate) mod tests {
             digest.user_snippets.iter().all(|s| s.len() <= MAX_DIGEST_SNIPPET_BYTES),
             "snippets are byte-capped like every other note field"
         );
+    }
+
+    /// Many short prompts count their separators too, so the shown prompts
+    /// never take more than their share of the summary's bytes.
+    #[test]
+    fn many_short_prompts_stay_within_their_share() {
+        let mut digest =
+            CompactionDigest { prompts: (0..MAX_DIGEST_PROMPT_BYTES).map(|_| "q".to_string()).collect(), ..Default::default() };
+        let room = digest.prompts_room();
+        assert!(room <= PROMPTS_LABEL.len() + MAX_DIGEST_PROMPT_BYTES, "{room}");
+        digest.prompts = vec!["q".repeat(MAX_DIGEST_PROMPT_BYTES * 3)];
+        assert!(digest.prompts_room() <= PROMPTS_LABEL.len() + MAX_DIGEST_PROMPT_BYTES);
     }
 
     /// The other half of the same contract: a digest at every cap must format
