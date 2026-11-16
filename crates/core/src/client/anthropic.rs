@@ -341,12 +341,16 @@ pub(super) async fn read(
                         started = true;
                         usage = event["message"]["usage"].clone();
                     }
-                    // Blocks start in index order; a server may start the next
-                    // before it stops the last, since each event names its block.
+                    // Blocks start in index order. A server may start a call
+                    // before it stops the block before it, since each event
+                    // names its block; text and thinking stream to the reader,
+                    // so they start only once every earlier block has stopped,
+                    // and what streams is what the reply keeps, in its order.
                     Some("content_block_start") => {
                         if !started
                             || reason.is_some()
                             || event["index"].as_u64() != Some(blocks.len() as u64)
+                            || (blocks.iter().any(|b| !b.closed) && matches!(event["content_block"]["type"].as_str(), Some("text" | "thinking")))
                             || blocks.len() >= MAX_TOOL_CALLS * 4
                         {
                             return Err("invalid Messages block index or order".into());

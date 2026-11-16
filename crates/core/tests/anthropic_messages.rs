@@ -417,14 +417,20 @@ async fn native_stream_faults_are_reported_and_retryable_api_errors_restart() {
     let valid=text_response();
     let begin=|index:usize,id:&str| event(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":"inspect","input":{}}}));
     let close=|index:usize| event(json!({"type":"content_block_stop","index":index}));
-    // Blocks may overlap (the unsigned-thinking test reads one), but never start out of index order.
+    // A call may start before the block before it stops (the unsigned-thinking test reads one), but blocks never
+    // start out of index order, and text never starts while another block is open, so the streamed text keeps the
+    // reply's order.
     let out_of_order=start()+&begin(1,"second")+&begin(0,"first")+&close(0)+&close(1)+&end("tool_use");
+    let text=|index:usize,piece:&str| event(json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}))
+        +&event(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":piece}}));
+    let overlapping_text=start()+&text(0,"A")+&text(1,"B")+&event(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"C"}}))
+        +&close(0)+&close(1)+&end("end_turn");
     let wrong_index=start()+&begin(9,"first")+&close(0)+&end("tool_use");
     let after_finish=start()+&begin(0,"first")+&close(0)+&event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
         +&begin(1,"second")+&close(1)+&event(json!({"type":"message_stop"}));
     let early_finish=start()+&begin(0,"first")+&event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
         +&close(0)+&event(json!({"type":"message_stop"}));
-    let invalid=[out_of_order,wrong_index,after_finish,early_finish,valid.replace("\"input_tokens\":10","\"input_tokens\":1\ndata: 0"),valid.replacen(&start(),"",1),valid.replacen(&start(),&(start()+&start()),1),
+    let invalid=[out_of_order,overlapping_text,wrong_index,after_finish,early_finish,valid.replace("\"input_tokens\":10","\"input_tokens\":1\ndata: 0"),valid.replacen(&start(),"",1),valid.replacen(&start(),&(start()+&start()),1),
         valid.replace("\"role\":\"assistant\"","\"role\":\"user\""),valid.replace("\"content\":[]","\"content\":[{\"type\":\"text\",\"text\":\"unexpected\"}]"),
         valid.replace(&event(json!({"type":"content_block_stop","index":0})),""),valid.replace("\"stop_reason\":\"end_turn\"","\"stop_reason\":\"pause_turn\""),
         json_message(vec![json!({"type":"tool_use","id":"","name":"inspect","input":{}})],"tool_use"),
