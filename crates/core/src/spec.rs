@@ -431,7 +431,7 @@ the turn's completion. The reason is sent back as a user message and the turn
 continues from there, spending the same iteration and token budgets any other
 continuation would. Only one exit can be refused: the model falling silent
 with no tool calls, whatever `stop_reason` it carried. `max_iterations`,
-`budget_exhausted`, `cancelled`, `error`, and `truncated` still fire the hook,
+`budget_exhausted`, `cancelled`, `error`, `truncated`, and `empty` still fire the hook,
 but there is nothing left to honor a refusal with, so it is reported and the
 turn ends. The payload says which case this is (`blockable`), how many
 refusals have already been honored (`continuation`), and how many this gate

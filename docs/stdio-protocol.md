@@ -166,7 +166,7 @@ gate judged the end (none is installed, or only observe-only `turn_end` hooks
 are), when the turn ends `unverified` (a refusal past the bound or one that
 could not be persisted, a gate that could not start, a hook file failing
 closed), or when the end is not one the model asked for (`cancelled`,
-`error`, `truncated`, `max_iterations`, `budget_exhausted`). A frontend can
+`error`, `truncated`, `empty`, `max_iterations`, `budget_exhausted`). A frontend can
 therefore tell an end held to checks from one with nothing to hold it to.
 
 A `user` line sent while a turn runs steers it. A `/name args` line is
@@ -243,6 +243,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | --- | --- |
 | provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Treat any unlisted value as a normal end |
 | `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, on the third such cut in a row or the last retry, or by going silent), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
+| `empty` | The model's reply had no text and no tool call and was not a cut the harness recognized, so there is no answer; an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
 | `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8, or fewer when the gate sets `max_refusals`), its refusal could not be persisted, or in auto it could not start; or a hook file fails closed at the turn's end; the reply stands unverified |
