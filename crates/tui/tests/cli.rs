@@ -1971,6 +1971,7 @@ fn a_server_started_in_the_background_serves_after_openmax_exits() {
     let pid: i32 = std::fs::read_to_string(project.join("server.pid")).unwrap().trim().parse().unwrap();
     let get = || {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
         stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").ok()?;
         let mut reply = String::new();
         stream.read_to_string(&mut reply).ok()?;

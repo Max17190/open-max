@@ -254,6 +254,8 @@ pub(crate) struct ProcessOutput {
     /// The process group a command that exited normally left running, with
     /// `leave_running`: its members outlive the call and the harness.
     pub left_running: Option<u32>,
+    /// A pipe a process left running still held could not be handed on (see `keep_draining`).
+    pub pipe_closed: bool,
 }
 
 #[derive(Debug)]
@@ -446,6 +448,7 @@ impl StreamCapture {
             stream: self.stream,
             spill_path: self.spill_path,
             omitted: self.omitted_from_spill > 0,
+            pipe_closed: false,
         })
     }
 }
@@ -454,6 +457,9 @@ struct FinishedStream {
     stream: CapturedStream,
     spill_path: Option<PathBuf>,
     omitted: bool,
+    /// The pipe was still held when reading stopped and could not be handed
+    /// on, so the process holding it meets a closed pipe at its next write.
+    pipe_closed: bool,
 }
 
 /// Longest stretch of one line [`Redraws`] holds back in case a later `\r`
@@ -572,7 +578,7 @@ async fn drain_stream<R>(
     capture: CaptureSpec,
     name: &'static str,
     stop: Arc<CancelToken>,
-    keep: fn(R),
+    keep: fn(R) -> bool,
 ) -> io::Result<FinishedStream>
 where
     R: AsyncRead + Unpin,
@@ -590,8 +596,8 @@ where
                 buffered.push(&chunk[..count]).await;
             }
             _ = stop.cancelled() => {
-                keep(reader);
-                return buffered.finish().await;
+                let kept = keep(reader);
+                return buffered.finish().await.map(|done| FinishedStream { pipe_closed: !kept, ..done });
             }
         }
     }
@@ -601,15 +607,18 @@ where
 /// `cat` of its own, in a session of its own, that reads it to the end and
 /// discards it. Closed instead, the pipe kills the process that holds it on
 /// its next write (SIGPIPE, or an error a server dies of), so a server left
-/// running that logs to its output would stop at its first request.
-fn keep_draining<R: TryInto<std::process::Stdio>>(reader: R) {
-    let Ok(stdin) = reader.try_into() else { return };
-    let mut cat = std::process::Command::new("cat");
+/// running that logs to its output would stop at its first request. `cat`
+/// is found at its fixed paths, not on a PATH the command may have changed.
+/// Returns false when the pipe could not be handed on.
+fn keep_draining<R: TryInto<std::process::Stdio>>(reader: R) -> bool {
+    let Some(path) = ["/bin/cat", "/usr/bin/cat"].into_iter().find(|path| Path::new(path).exists()) else { return false };
+    let Ok(stdin) = reader.try_into() else { return false };
+    let mut cat = std::process::Command::new(path);
     cat.stdin(stdin).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     configure_process_group(&mut cat, true);
-    if let Ok(mut cat) = cat.spawn() {
-        std::thread::spawn(move || cat.wait());
-    }
+    let Ok(mut cat) = cat.spawn() else { return false };
+    std::thread::spawn(move || cat.wait());
+    true
 }
 
 /// Rewrite the request's argv to run under this host's sandbox backend, or
@@ -937,7 +946,6 @@ pub(crate) async fn run_process(
 
     let (mut child, group) = GroupGuard::spawn(&mut command)?;
     let pid = child.id();
-    let started = pid.and_then(start_time).filter(|_| request.leave_running);
     let stdout = child
         .stdout
         .take()
@@ -978,17 +986,15 @@ pub(crate) async fn run_process(
     };
 
     let (termination, background_terminated, left_running) =
-        supervise_child(&mut child, pid, request.timeout, &cancel, request.leave_running).await?;
+        supervise_child(&mut child, pid, request.timeout, &cancel, request.leave_running && LEAVE_RUNNING.load(Ordering::SeqCst)).await?;
     group.settled();
-    if let Some(left) = left_running {
-        LEFT_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).push((left, started));
-    }
 
     if let Some(task) = stdin_task {
         finish_stdin_task(task).await;
     }
     let (stdout, stderr) = join_streams(stdout_task, stderr_task, drain_stop).await?;
     let log_truncated = stdout.omitted || stderr.omitted;
+    let pipe_closed = stdout.pipe_closed || stderr.pipe_closed;
     let retained_limit = request
         .capture
         .head_bytes
@@ -1020,6 +1026,7 @@ pub(crate) async fn run_process(
         log_truncated,
         background_terminated,
         left_running,
+        pipe_closed,
     })
 }
 
@@ -1303,26 +1310,17 @@ fn configure_process_group(command: &mut std::process::Command, new_session: boo
 #[cfg(not(unix))]
 fn configure_process_group(_: &mut std::process::Command, _: bool) {}
 
-/// The groups commands left running when their shells exited (`leave_running`), with their leaders' start times.
-static LEFT_GROUPS: Mutex<Vec<(u32, Option<u64>)>> = Mutex::new(Vec::new());
+/// Cleared by a sub-agent ([`stop_background_with_each_command`]).
+static LEAVE_RUNNING: AtomicBool = AtomicBool::new(true);
 
-/// Stops each group a command of this process left running that is still the
-/// one it left (its leader gone, or running with the start time it had):
-/// SIGTERM, then SIGKILL for what is still there after `TERMINATION_GRACE`.
-/// A sub-agent runs this before its worktree is committed and removed, so
-/// nothing its child started outlives it; a session's own run leaves them.
-pub fn stop_left_running() {
-    let groups: Vec<u32> = std::mem::take(&mut *LEFT_GROUPS.lock().unwrap_or_else(|e| e.into_inner()))
-        .into_iter()
-        .filter(|&(pid, start)| process_group_exists(Some(pid)) && start.is_none_or(|start| start_time(pid).is_none_or(|now| now == start)))
-        .map(|(pid, _)| pid)
-        .collect();
-    groups.iter().for_each(|&pid| send_termination_group(Some(pid)));
-    let deadline = std::time::Instant::now() + TERMINATION_GRACE;
-    while groups.iter().any(|&pid| group_has_running_member(Some(pid))) && std::time::Instant::now() < deadline {
-        std::thread::sleep(GROUP_EXIT_POLL);
-    }
-    groups.iter().for_each(|&pid| send_kill_group(Some(pid)));
+/// Makes every later command stop what it left running in the background
+/// when it returns, as an external tool's call does, whatever its request
+/// asks. A sub-agent sets it before its child runs: nothing the child starts
+/// may outlive it, however it exits, and a group still running after its
+/// command returned is no longer one the exit's kill or the crash watcher
+/// knows.
+pub fn stop_background_with_each_command() {
+    LEAVE_RUNNING.store(false, Ordering::SeqCst);
 }
 
 /// Leaders of the process groups commands started and have not settled yet.
@@ -2280,6 +2278,7 @@ mod tests {
             stream: CapturedStream { total_bytes: bytes.len() as u64, head: bytes.to_vec(), tail: Vec::new() },
             spill_path: None,
             omitted: false,
+            pipe_closed: false,
         };
         let stdout = tokio::spawn(async move { Ok(finished(b"out")) });
         let stop = Arc::new(CancelToken::default());
@@ -3627,7 +3626,7 @@ mod tests {
             },
             "stdout",
             stop.clone(),
-            |_| {},
+            |_| true,
         ));
         writer.write_all(b"partial").await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;

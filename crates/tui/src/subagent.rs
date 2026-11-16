@@ -92,6 +92,8 @@ pub async fn run(
     // The project's own mode, or stricter: never a looser choice saved for
     // a path inside the worktree.
     core.hold_approval_mode(&worktree.project, core.approval_mode(project));
+    // Nothing the child's commands start in the background outlives it.
+    open_max_core::execution::stop_background_with_each_command();
     // A signal while the worktree was made leaves no turn to run.
     let code = if crate::signalled() {
         crate::quit_status()
@@ -107,10 +109,8 @@ pub async fn run(
         crate::headless::run(core.clone(), core_rx, args).await
     };
     // A turn that did not settle in time still owns its tool groups, and no
-    // tool may write in the worktree while it is committed and removed; what
-    // the child's commands left running in the background stops too.
+    // tool may write in the worktree while it is committed and removed.
     open_max_core::execution::kill_process_groups();
-    open_max_core::execution::stop_left_running();
     // A turn the stop's deadline left behind can have a file tool, which
     // runs in this process, still writing in the worktree: its work stays
     // where it is.

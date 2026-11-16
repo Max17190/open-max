@@ -2361,7 +2361,7 @@ pub(crate) fn exited_outcome(
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
     let note = match output.left_running {
-        Some(group) => Some(left_running_note(group)),
+        Some(group) => Some(left_running_note(group, output.pipe_closed)),
         None => output.background_terminated.then(|| {
             match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 false => BACKGROUND_TERMINATED_NOTE,
@@ -2394,8 +2394,9 @@ pub(crate) fn exited_outcome(
 /// What a bash command that exited left running in the background, a server
 /// started with `&` most often, keeps running after the call and after
 /// openmax exits, so the result says where it is and how to stop it.
-pub(crate) fn left_running_note(group: u32) -> String {
-    format!("[openmax: this command left background processes running in process group {group}; they keep running after this call and after openmax exits. `kill -- -{group}` stops them.]")
+pub(crate) fn left_running_note(group: u32, pipe_closed: bool) -> String {
+    let pipe = if pipe_closed { " Their output pipe could not be kept open, so a write to it fails: start them with output to a file (`cmd > log 2>&1 &`)." } else { "" };
+    format!("[openmax: this command left background processes running in process group {group}; they keep running after this call and after openmax exits. `kill -- -{group}` stops them.{pipe}]")
 }
 
 /// Each external tool call runs in its own process group, and the group is
@@ -3689,6 +3690,7 @@ mod tests {
             // background anything.
             background_terminated: false,
             left_running: None,
+            pipe_closed: false,
         }
     }
 
