@@ -960,7 +960,7 @@ async fn run_loop(
             cuts = 0;
         }
         // The room the next request may carry, when this reply was cut and was not itself the one given room.
-        let grant = (capped && roomy.is_none() && !no_room).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
+        let grant = (capped && roomy.is_none() && !no_room && iteration + 1 < max_iterations).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
         if !tool_calls.is_empty() { room = grant; }
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
