@@ -2315,6 +2315,7 @@ async fn run_bash(
         sandbox: None,
         env_allowlist: None,
         self_link: true,
+        leave_running: true,
         env: vec![(COMMAND_VAR.into(), command.into())],
     };
     match execution::run_process(request, cancel).await {
@@ -2359,17 +2360,21 @@ pub(crate) fn exited_outcome(
     cap: usize,
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
-    let note = output.background_terminated.then(|| {
-        match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            false => BACKGROUND_TERMINATED_NOTE,
-            true => BACKGROUND_TERMINATED_AGAIN,
-        }
-    });
+    let note = match output.left_running {
+        Some(group) => Some(left_running_note(group)),
+        None => output.background_terminated.then(|| {
+            match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                false => BACKGROUND_TERMINATED_NOTE,
+                true => BACKGROUND_TERMINATED_AGAIN,
+            }
+            .to_string()
+        }),
+    };
     // The note is the harness speaking, not captured output, but it
     // still has to fit the caller's cap, which `max_output_bytes`
     // can set as low as 1000 bytes. Reserve its length instead of
     // letting a fixed annotation push the result past the limit.
-    let reserved = note.map_or(0, |note| note.len() + 1);
+    let reserved = note.as_ref().map_or(0, |note| note.len() + 1);
     let budget = cap.saturating_sub(reserved).max(1);
     let (text, truncated) = render_process_output(output, budget);
     let (ok, text) = match status.success() {
@@ -2386,23 +2391,24 @@ pub(crate) fn exited_outcome(
     ToolOutcome::from_process(ok, text, output, truncated)
 }
 
-/// Each bash call and each external tool call runs in its own process group,
-/// and the group is terminated when the call returns, so a backgrounded
-/// process does not outlive it. The exit status is still the command's, which
-/// means a caller that started a server sees success and an absent server,
-/// with nothing connecting the two.
-///
-/// `setsid` is named as a conditional, not a recipe: it is util-linux and does
-/// not exist on macOS, where the harness also runs. A named tmux session is the
-/// answer that holds on both, and is what this project already documents for
-/// durable background work.
+/// What a bash command that exited left running in the background, a server
+/// started with `&` most often, keeps running after the call and after
+/// openmax exits, so the result says where it is and how to stop it.
+pub(crate) fn left_running_note(group: u32) -> String {
+    format!("[openmax: this command left background processes running in process group {group}; they keep running after this call and after openmax exits. `kill -- -{group}` stops them.]")
+}
+
+/// Each external tool call runs in its own process group, and the group is
+/// terminated when the call returns, so a backgrounded process does not
+/// outlive it. The exit status is still the tool's, which means a caller that
+/// started a server sees success and an absent server, with nothing
+/// connecting the two. A bash command's background processes run on.
 pub(crate) const BACKGROUND_TERMINATED_NOTE: &str = concat!(
-    "[openmax: this command left running background processes, and they were ",
-    "terminated when it returned. Every bash or external tool call runs in its ",
-    "own process group and that group is cleaned up on exit, so `&`, `nohup` ",
-    "and `disown` do not survive the call. To keep something running, start it ",
-    "in a named tmux session you can inspect and reattach, or, on Linux only, ",
-    "detach it from the group with `setsid`.]"
+    "[openmax: this tool left running background processes, and they were ",
+    "terminated when it returned. Every external tool call runs in its own ",
+    "process group and that group is cleaned up on exit, so `&`, `nohup` and ",
+    "`disown` do not survive the call. To keep something running, start it ",
+    "from bash, where a background process outlives the command.]"
 );
 
 /// The note every later call in the session that leaves background processes
@@ -2410,7 +2416,7 @@ pub(crate) const BACKGROUND_TERMINATED_NOTE: &str = concat!(
 /// that still says what happened and what to do instead, so it holds on its
 /// own when compaction has dropped the first.
 pub(crate) const BACKGROUND_TERMINATED_AGAIN: &str = "[openmax: background processes were \
-    terminated when this command returned; a named tmux session keeps one running.]";
+    terminated when this tool returned; one started from bash keeps running.]";
 
 /// Describe a non-success exit honestly. A signal kill has no exit code, and
 /// the former "exit code -1" pointed diagnosis at a code nothing returned;
@@ -3682,6 +3688,7 @@ mod tests {
             // This helper builds outputs for rendering tests; none of them
             // background anything.
             background_terminated: false,
+            left_running: None,
         }
     }
 
@@ -4000,6 +4007,7 @@ mod tests {
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            leave_running: false,
             env: vec![(COMMAND_VAR.into(), command.into()), ("SHELLOPTS".into(), "allexport".into())],
         };
         let output = execution::run_process(request, Arc::new(CancelToken::default())).await.unwrap();
@@ -4007,77 +4015,49 @@ mod tests {
         assert_eq!(shown, format!("0\n[{}|0]", bash_shell()), "a process the command started holds its text");
     }
 
-    /// A backgrounded process does not outlive the call that started it: the
-    /// process group is cleaned up on exit while the exit status stays the
-    /// shell's zero. A caller that started a server was handed success and no
-    /// server, with nothing in the result connecting the two, so it retried and
-    /// then reported success against a port nothing was listening on.
+    /// A process a bash command starts in the background outlives the call,
+    /// so a server started with `&` still serves after it: the bug this guards
+    /// is the group's cleanup on exit, which handed a caller that started a
+    /// server success and no server. The result names the group and how to
+    /// stop it, out of the cap, and a command that leaves nothing says nothing.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_terminated_background_process_is_reported() {
+    async fn a_background_process_outlives_its_bash_command_and_is_reported() {
         let root = temp_project();
+        let pid_file = root.join("sleep.pid");
         let out = bash_tool(
             &root.join("data"),
             &root,
-            &json!({"command": "sleep 30 & echo started"}),
+            &json!({"command": format!("sleep 30 & echo $! > {}; echo started", pid_file.display())}),
             OutputCaps::default(),
             Arc::new(CancelToken::default()),
         )
         .await;
-        // The command succeeded. That is precisely why the note has to exist:
-        // success is what the caller would otherwise act on.
         assert!(out.ok, "{}", out.output);
-        assert!(out.output.contains("started"), "{}", out.output);
-        assert!(
-            out.output.contains("were terminated when it returned"),
-            "a killed background process must be reported: {}",
-            out.output
-        );
-        // The escape it names has to exist on this platform; `setsid` is
-        // util-linux and absent on macOS, so tmux is the one always offered.
-        assert!(out.output.contains("tmux"), "{}", out.output);
+        assert!(out.output.contains("started") && out.output.contains("keep running after this call"), "{}", out.output);
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        // SAFETY: kill with signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the background process was stopped: {}", out.output);
+        let group = unsafe { libc::getpgid(pid) };
+        assert!(out.output.contains(&format!("`kill -- -{group}` stops them")), "{}", out.output);
+        unsafe { libc::kill(-group, libc::SIGKILL) };
 
-        // The note is reserved out of the cap, not added on top of it: a small
-        // `max_output_bytes` must still bound the whole result.
+        // The note is reserved out of the cap, not added on top of it.
         let tight = bash_tool(
             &root.join("data"),
             &root,
-            &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 &"}),
+            &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 > /dev/null 2>&1 & echo $! > bg.pid"}),
             OutputCaps { command_bytes: 1_000 },
             Arc::new(CancelToken::default()),
         )
         .await;
-        assert!(
-            tight.output.contains("were terminated when it returned"),
-            "{}",
-            tight.output
-        );
-        // `render_process_output` adds its own truncation notice outside
-        // max_bytes by design, so the cap was never an exact total; what this
-        // pins is that OUR note is carved out of the budget rather than added
-        // on top of it. Without the reservation this lands near 1_600.
-        assert!(
-            tight.output.len() <= 1_300,
-            "note must be reserved from the cap, not appended past it: {} bytes",
-            tight.output.len()
-        );
+        assert!(tight.output.contains("keep running after this call"), "{}", tight.output);
+        assert!(tight.output.len() <= 1_300, "note must be reserved from the cap: {} bytes", tight.output.len());
+        let pid: i32 = std::fs::read_to_string(root.join("bg.pid")).unwrap().trim().parse().unwrap();
+        unsafe { libc::kill(-libc::getpgid(pid), libc::SIGKILL) };
 
-        // A command that leaves nothing behind says nothing, or the note
-        // becomes noise on every call and stops being read.
-        let plain = bash_tool(
-            &root.join("data"),
-            &root,
-            &json!({"command": "echo plain"}),
-            OutputCaps::default(),
-            Arc::new(CancelToken::default()),
-        )
-        .await;
-        assert!(plain.ok, "{}", plain.output);
-        assert!(
-            !plain.output.contains("were terminated when it returned"),
-            "no background children, no note: {}",
-            plain.output
-        );
+        let plain = bash_tool(&root.join("data"), &root, &json!({"command": "echo plain"}), OutputCaps::default(), Arc::new(CancelToken::default())).await;
+        assert!(plain.ok && !plain.output.contains("openmax:"), "no background children, no note: {}", plain.output);
         let _ = std::fs::remove_dir_all(root);
     }
 

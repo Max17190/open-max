@@ -1398,6 +1398,7 @@ async fn spawn_external(
         sandbox,
         env_allowlist: Some(tool.env.clone()),
         self_link: false,
+        leave_running: false,
         env: Vec::new(),
     };
 
@@ -2618,9 +2619,9 @@ mutatng = true
     /// The note explains a rule every call lives under, and it rode in full
     /// on every call that left a process behind, so a model that kept
     /// starting its server with `&` paid for the same explanation each time.
-    /// The first in a session explains; every later one, from bash or an
-    /// external tool, is one line that still says what happened and what to
-    /// do instead. A call that left nothing running spends nothing, and a new
+    /// The first in a session explains; every later one is one line that
+    /// still says what happened and what to do instead. A bash command's
+    /// background processes run on, so it spends neither. A call that left nothing running spends nothing, and a new
     /// session explains again.
     #[cfg(unix)]
     #[tokio::test]
@@ -2638,9 +2639,8 @@ mutatng = true
         let caps = tools::OutputCaps::default();
         let calls = [
             ("bash", serde_json::json!({"command": "echo quiet"})),
-            ("bash", serde_json::json!({"command": "sleep 30 & echo started"})),
             ("serve", serde_json::json!({})),
-            ("bash", serde_json::json!({"command": "sleep 30 & echo started"})),
+            ("serve", serde_json::json!({})),
         ];
         let registry = session();
         let mut outputs = Vec::new();
@@ -2649,12 +2649,11 @@ mutatng = true
         }
         let (full, again) = (tools::BACKGROUND_TERMINATED_NOTE, tools::BACKGROUND_TERMINATED_AGAIN);
         assert_eq!(outputs[0], "quiet\n");
-        assert_eq!(outputs[1], format!("started\n\n{full}"));
+        assert_eq!(outputs[1], format!("ok\n\n{full}"));
         assert_eq!(outputs[2], format!("ok\n\n{again}"));
-        assert_eq!(outputs[3], format!("started\n\n{again}"));
         let (name, args) = &calls[1];
         let fresh = session().execute(name, args, data, &project, caps, no_cancel()).await;
-        assert_eq!(fresh.output, format!("started\n\n{full}"), "a new session explains again");
+        assert_eq!(fresh.output, format!("ok\n\n{full}"), "a new session explains again");
         let _ = std::fs::remove_dir_all(project);
     }
 

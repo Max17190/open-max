@@ -28,7 +28,7 @@ The design starts with one question: **What is the smallest capability Open Max 
 | External service or specialized capability | A CLI-backed TOML tool plus an on-demand skill, without an MCP runtime |
 | Reusable workflow or command | A `SKILL.md` package or prompt template slash command |
 | Isolated or parallel work | `openmax --subagent "<task>" --worktree`, one child session in a new git worktree whose changes land on a branch, or a child `openmax -p` or `openmax --stdio` process, usually in tmux |
-| Durable background work | A named tmux session that the agent can inspect and reattach |
+| Durable background work | A `bash` command's background process, which outlives the call and openmax, or a named tmux session that the agent can inspect and reattach |
 | Planning and task state | `PLAN.md` and `TODO.md`, visible to the user and every tool |
 | Lifecycle policy and events | Process hooks and permission files |
 | Compaction integration | The built-in model summary plus the `compaction` hook event |

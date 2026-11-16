@@ -130,6 +130,12 @@ pub(crate) struct ProcessRequest {
     /// above give it, in every mode. The agent's shell takes its command text
     /// this way, so the text never sits in the shell's argument list.
     pub env: Vec<(OsString, OsString)>,
+    /// Leave what the command started in the background running when its
+    /// shell exits on its own, instead of stopping it. Only the agent's shell
+    /// sets it: a server it starts with `&` must still serve after the call
+    /// and after the harness exits. A cancel or a timeout still stops the
+    /// whole group.
+    pub leave_running: bool,
 }
 
 /// Containment for a probe run: no network, filesystem reads allowed, writes
@@ -245,6 +251,9 @@ pub(crate) struct ProcessOutput {
     /// Callers must surface it, because the caller who backgrounded a server
     /// otherwise sees a clean exit and no server.
     pub background_terminated: bool,
+    /// The process group a command that exited normally left running, with
+    /// `leave_running`: its members outlive the call and the harness.
+    pub left_running: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -563,6 +572,7 @@ async fn drain_stream<R>(
     capture: CaptureSpec,
     name: &'static str,
     stop: Arc<CancelToken>,
+    keep: fn(R),
 ) -> io::Result<FinishedStream>
 where
     R: AsyncRead + Unpin,
@@ -580,9 +590,25 @@ where
                 buffered.push(&chunk[..count]).await;
             }
             _ = stop.cancelled() => {
+                keep(reader);
                 return buffered.finish().await;
             }
         }
+    }
+}
+
+/// Hands a pipe a process still holds when the call stops reading it to a
+/// `cat` of its own, in a session of its own, that reads it to the end and
+/// discards it. Closed instead, the pipe kills the process that holds it on
+/// its next write (SIGPIPE, or an error a server dies of), so a server left
+/// running that logs to its output would stop at its first request.
+fn keep_draining<R: TryInto<std::process::Stdio>>(reader: R) {
+    let Ok(stdin) = reader.try_into() else { return };
+    let mut cat = std::process::Command::new("cat");
+    cat.stdin(stdin).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    configure_process_group(&mut cat, true);
+    if let Ok(mut cat) = cat.spawn() {
+        std::thread::spawn(move || cat.wait());
     }
 }
 
@@ -911,6 +937,7 @@ pub(crate) async fn run_process(
 
     let (mut child, group) = GroupGuard::spawn(&mut command)?;
     let pid = child.id();
+    let started = pid.and_then(start_time).filter(|_| request.leave_running);
     let stdout = child
         .stdout
         .take()
@@ -926,12 +953,14 @@ pub(crate) async fn run_process(
         request.capture.clone(),
         "stdout",
         drain_stop.clone(),
+        keep_draining::<tokio::process::ChildStdout>,
     ));
     let stderr_task = tokio::spawn(drain_stream(
         stderr,
         request.capture.clone(),
         "stderr",
         drain_stop.clone(),
+        keep_draining::<tokio::process::ChildStderr>,
     ));
     let stdin_task = match request.stdin {
         StdinMode::Null => None,
@@ -948,9 +977,12 @@ pub(crate) async fn run_process(
         }),
     };
 
-    let (termination, background_terminated) =
-        supervise_child(&mut child, pid, request.timeout, &cancel).await?;
+    let (termination, background_terminated, left_running) =
+        supervise_child(&mut child, pid, request.timeout, &cancel, request.leave_running).await?;
     group.settled();
+    if let Some(left) = left_running {
+        LEFT_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).push((left, started));
+    }
 
     if let Some(task) = stdin_task {
         finish_stdin_task(task).await;
@@ -987,6 +1019,7 @@ pub(crate) async fn run_process(
         log_path,
         log_truncated,
         background_terminated,
+        left_running,
     })
 }
 
@@ -1147,28 +1180,30 @@ async fn supervise_child(
     pid: Option<u32>,
     timeout: Duration,
     cancel: &CancelToken,
-) -> Result<(Termination, bool), ProcessError> {
+    leave: bool,
+) -> Result<(Termination, bool, Option<u32>), ProcessError> {
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
             // A shell can exit while ordinary background descendants retain the
-            // group. Those belong to this invocation, so clean them up too.
-            //
-            // This is the rule that makes `some-server &` look like it worked
-            // and then serve nothing: the shell returns, the group is killed,
-            // and the caller is handed a successful exit. Report it so the
-            // caller learns the rule from the result instead of from a failing
-            // request later.
-            let background_terminated = stop_what_was_left_running(pid).await;
-            Ok((Termination::Exited(status), background_terminated))
+            // group. With `leave` they are what the command meant to start, a
+            // server with `&`, and run on; the caller is told where they are.
+            // Otherwise they belong to this invocation and are cleaned up too,
+            // and the caller is told so, since the exit status alone says the
+            // server started.
+            if leave {
+                let left = if left_running(pid).await { pid } else { None };
+                return Ok((Termination::Exited(status), false, left));
+            }
+            Ok((Termination::Exited(status), stop_what_was_left_running(pid).await, None))
         }
         _ = cancel.cancelled() => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::Cancelled, false))
+            Ok((Termination::Cancelled, false, None))
         }
         _ = tokio::time::sleep(timeout) => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::TimedOut, false))
+            Ok((Termination::TimedOut, false, None))
         }
     }
 }
@@ -1188,22 +1223,27 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
     Ok(())
 }
 
-/// Stops what a command whose shell exited left running in its group, and
-/// returns true when there was any. Members that exit within
-/// `LEFT_RUNNING_AFTER` were on their way out, not left running: reporting
-/// them told the caller of nearly every test run with a worker pool that its
-/// background processes were cut short, when it had started none. Members
-/// that exited and wait for a parent to collect them run nothing either
-/// ([`group_has_running_member`]).
-async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
+/// Whether a command whose shell exited left anything running in its group.
+/// Members that exit within `LEFT_RUNNING_AFTER` were on their way out, not
+/// left running: reporting them told the caller of nearly every test run with
+/// a worker pool that its background processes were cut short, when it had
+/// started none. Members that exited and wait for a parent to collect them
+/// run nothing either ([`group_has_running_member`]).
+async fn left_running(pid: Option<u32>) -> bool {
     let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
     while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
-            return terminate_remaining_group(pid).await;
+            return true;
         }
         tokio::time::sleep(GROUP_EXIT_POLL).await;
     }
     false
+}
+
+/// Stops what a command whose shell exited left running in its group, and
+/// returns true when there was any.
+async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
+    left_running(pid).await && terminate_remaining_group(pid).await
 }
 
 /// Returns true when group members outlived the leader and were terminated
@@ -1262,6 +1302,28 @@ fn configure_process_group(command: &mut std::process::Command, new_session: boo
 
 #[cfg(not(unix))]
 fn configure_process_group(_: &mut std::process::Command, _: bool) {}
+
+/// The groups commands left running when their shells exited (`leave_running`), with their leaders' start times.
+static LEFT_GROUPS: Mutex<Vec<(u32, Option<u64>)>> = Mutex::new(Vec::new());
+
+/// Stops each group a command of this process left running that is still the
+/// one it left (its leader gone, or running with the start time it had):
+/// SIGTERM, then SIGKILL for what is still there after `TERMINATION_GRACE`.
+/// A sub-agent runs this before its worktree is committed and removed, so
+/// nothing its child started outlives it; a session's own run leaves them.
+pub fn stop_left_running() {
+    let groups: Vec<u32> = std::mem::take(&mut *LEFT_GROUPS.lock().unwrap_or_else(|e| e.into_inner()))
+        .into_iter()
+        .filter(|&(pid, start)| process_group_exists(Some(pid)) && start.is_none_or(|start| start_time(pid).is_none_or(|now| now == start)))
+        .map(|(pid, _)| pid)
+        .collect();
+    groups.iter().for_each(|&pid| send_termination_group(Some(pid)));
+    let deadline = std::time::Instant::now() + TERMINATION_GRACE;
+    while groups.iter().any(|&pid| group_has_running_member(Some(pid))) && std::time::Instant::now() < deadline {
+        std::thread::sleep(GROUP_EXIT_POLL);
+    }
+    groups.iter().for_each(|&pid| send_kill_group(Some(pid)));
+}
 
 /// Leaders of the process groups commands started and have not settled yet.
 /// Nothing else stops such a group once the harness is going away:
@@ -2036,6 +2098,7 @@ impl PausedSpawn {
                 sandbox: None,
                 env_allowlist: None,
                 self_link: false,
+                leave_running: false,
                 env: Vec::new(),
             };
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -2202,6 +2265,7 @@ mod tests {
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            leave_running: false,
             env: Vec::new(),
         }
     }
@@ -2247,6 +2311,7 @@ mod tests {
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            leave_running: false,
             env: Vec::new(),
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
@@ -3028,6 +3093,7 @@ mod tests {
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            leave_running: false,
             env: Vec::new(),
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
@@ -3051,6 +3117,7 @@ mod tests {
             sandbox: None,
             env_allowlist: None,
             self_link: false,
+            leave_running: false,
             env: Vec::new(),
         };
         let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
@@ -3177,6 +3244,7 @@ mod tests {
             sandbox: Some(SandboxPolicy { rw_scratch: scratch.to_path_buf() }),
             env_allowlist: None,
             self_link: false,
+            leave_running: false,
             env: Vec::new(),
         }
     }
@@ -3559,6 +3627,7 @@ mod tests {
             },
             "stdout",
             stop.clone(),
+            |_| {},
         ));
         writer.write_all(b"partial").await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;

@@ -1557,6 +1557,7 @@ async fn run_hook(
         sandbox: None,
         env_allowlist: None,
         self_link: false,
+        leave_running: false,
         env: Vec::new(),
     };
 

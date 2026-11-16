@@ -1949,6 +1949,42 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// A server the agent starts in the background, with `&` and its output
+/// left on the call's pipes, still serves after the command returns and
+/// after openmax exits, as a task graded once the agent is done needs. Each
+/// request the server answers writes a log line to that pipe, which must not
+/// kill it. The call's group used to be stopped when the command returned.
+#[cfg(unix)]
+#[test]
+fn a_server_started_in_the_background_serves_after_openmax_exits() {
+    let (project, home) = fresh_dirs("background-server");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let start = format!("python3 -m http.server {port} --bind 127.0.0.1 & echo $! > server.pid; sleep 1; echo started");
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({"command": start})), true),
+        (sse_text("the server is running"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "start a web server"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let pid: i32 = std::fs::read_to_string(project.join("server.pid")).unwrap().trim().parse().unwrap();
+    let get = || {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").ok()?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).ok()?;
+        Some(reply)
+    };
+    let replies: Vec<Option<String>> = (0..3).map(|_| get()).collect();
+    // SAFETY: signals the server's own process group, which this test started through the agent.
+    unsafe { libc::kill(-libc::getpgid(pid), libc::SIGKILL) };
+    for reply in &replies {
+        assert!(reply.as_deref().is_some_and(|r| r.starts_with("HTTP/1.0 200")), "{replies:?}\n{stderr}");
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// The first error a local-model user meets is a server not started yet.
 /// Print mode says so in lines a human acts on: each retry names the server
 /// and the cause and counts to the attempt the request really ends on, and
