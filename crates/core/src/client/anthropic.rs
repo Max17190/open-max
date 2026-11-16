@@ -162,9 +162,11 @@ fn validate_blocks(blocks: &[Value]) -> Result<(), String> {
     for block in blocks {
         let valid = match block["type"].as_str() {
             Some("text") => block["text"].is_string(),
+            // A server that signs thinking sends the field and fills it; one
+            // that does not omits it, and its thinking returns only to it.
             Some("thinking") => {
                 block["thinking"].is_string()
-                    && block["signature"].as_str().is_some_and(|s| !s.is_empty())
+                    && block.get("signature").is_none_or(|s| s.as_str().is_some_and(|s| !s.is_empty()))
             }
             Some("redacted_thinking") => block["data"].as_str().is_some_and(|s| !s.is_empty()),
             Some("tool_use") => {
@@ -339,11 +341,16 @@ pub(super) async fn read(
                         started = true;
                         usage = event["message"]["usage"].clone();
                     }
+                    // Blocks start in index order. A server may start a call
+                    // before it stops the block before it, since each event
+                    // names its block; text and thinking stream to the reader,
+                    // so they start only once every earlier block has stopped,
+                    // and what streams is what the reply keeps, in its order.
                     Some("content_block_start") => {
                         if !started
                             || reason.is_some()
                             || event["index"].as_u64() != Some(blocks.len() as u64)
-                            || blocks.last().is_some_and(|b| !b.closed)
+                            || (blocks.iter().any(|b| !b.closed) && matches!(event["content_block"]["type"].as_str(), Some("text" | "thinking")))
                             || blocks.len() >= MAX_TOOL_CALLS * 4
                         {
                             return Err("invalid Messages block index or order".into());
