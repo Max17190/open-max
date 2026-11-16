@@ -2936,6 +2936,9 @@ impl App {
                 self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
                 self.dirty.mark_tail();
             }
+            AgentEvent::CompactionSkipped { reason } => {
+                self.note(&format!("context cut skipped: {}", open_max_core::text::one_line(&reason)));
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Says what it costs and what to do, not how compaction reacts:
                 // that depends on whether any room is left at all.
@@ -3032,7 +3035,7 @@ impl App {
                 if !self.queued.is_empty() {
                     // An interrupted or failed turn returns the queue to the
                     // composer instead of firing blind into a broken state.
-                    if matches!(stop_reason.as_str(), "cancelled" | "error" | "blocked" | "truncated") {
+                    if matches!(stop_reason.as_str(), "cancelled" | "error" | "blocked" | "truncated" | "empty") {
                         self.return_queue_to_composer();
                     } else {
                         self.flush_queue = true;

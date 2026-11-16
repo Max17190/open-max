@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/10`)
+# stdio protocol (`openmax-stdio/11`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/10","protocol_version":10,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/11","protocol_version":11,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -119,6 +119,7 @@ events either, but carry one).
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: one line per tool or skill file added, modified, or removed) |
 | `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the frozen tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
+| `compaction_skipped` | `reason` (a cut the trigger asked for and the window does not force was not made, because the notes it needs did not arrive: the notes request failed, timed out, ended cut or cancelled, had no text, or would pass the turn's token ceiling. The history stays whole and the turn goes on; if the window fills, the cut it forces leaves the deterministic digest) |
 | `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the cut target and nothing changed) |
 | `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`; or a hook file fails closed and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |
@@ -166,7 +167,7 @@ gate judged the end (none is installed, or only observe-only `turn_end` hooks
 are), when the turn ends `unverified` (a refusal past the bound or one that
 could not be persisted, a gate that could not start, a hook file failing
 closed), or when the end is not one the model asked for (`cancelled`,
-`error`, `truncated`, `max_iterations`, `budget_exhausted`). A frontend can
+`error`, `truncated`, `empty`, `max_iterations`, `budget_exhausted`). A frontend can
 therefore tell an end held to checks from one with nothing to hold it to.
 
 A `user` line sent while a turn runs steers it. A `/name args` line is
@@ -243,6 +244,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | --- | --- |
 | provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Treat any unlisted value as a normal end |
 | `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, on the third such cut in a row or the last retry, or by going silent), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
+| `empty` | The model's reply had no text and no tool call and was not a cut the harness recognized, so there is no answer; an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
 | `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8, or fewer when the gate sets `max_refusals`), its refusal could not be persisted, or in auto it could not start; or a hook file fails closed at the turn's end; the reply stands unverified |
@@ -312,6 +314,7 @@ Any wire change bumps `protocol_version`. What each version changed:
 
 | Version | Change |
 | --- | --- |
+| 11 | `compaction_skipped` event |
 | 10 | A `retry` can follow `token` lines of the attempt it voids: a reply the network cut after its text began is asked for again, at most twice in a row |
 | 9 | `turn_verified` event |
 | 8 | A `user` line sent while a turn runs steers that turn instead of being refused; `steer_accepted` and `steer_blocked` events |

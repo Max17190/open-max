@@ -1700,8 +1700,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/10");
-    assert_eq!(hello["protocol_version"], 10);
+    assert_eq!(hello["proto"], "openmax-stdio/11");
+    assert_eq!(hello["protocol_version"], 11);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -2343,7 +2343,7 @@ fn a_run_records_and_charges_the_reasoning_its_provider_bills_as_output() {
             "completion_tokens_details": {"reasoning_tokens": reasoning}}}),
     ]);
     let (base_url, requests, _server) =
-        spawn_scripted_server(vec![(call("c1", r#"{"path":"a.t"#, 4000, 96), true), (call("c2", r#"{"path":"a.txt"}"#, 55, 60_000), true), (sse_text("read it"), true)]);
+        spawn_scripted_server(vec![(call("c1", r#"{"path":"a.txt",}"#, 4000, 96), true), (call("c2", r#"{"path":"a.txt"}"#, 55, 60_000), true), (sse_text("read it"), true)]);
     std::fs::create_dir_all(home.join(".openmax")).unwrap();
     let settings = format!(r#"{{"base_url":"{base_url}","model":"stub-model","context_tokens":16384,"max_agent_tokens":50000}}"#);
     std::fs::write(home.join(".openmax/settings.json"), settings).unwrap();
@@ -2584,7 +2584,7 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
     assert_eq!(
         framed[0],
         format!(
-            r#"{{"type":"hello","proto":"openmax-stdio/10","protocol_version":10,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            r#"{{"type":"hello","proto":"openmax-stdio/11","protocol_version":11,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
             env!("CARGO_PKG_VERSION"),
             hello["project"],
         )

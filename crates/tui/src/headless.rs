@@ -351,6 +351,10 @@ async fn run_turn_events(
                 if std::mem::take(saw_tokens) { let _ = writeln!(stdout); }
                 let _ = writeln!(stderr, "openmax: {}; retrying ({attempt} of {max_attempts})", one_line(reason));
             }
+            AgentEvent::CompactionSkipped { reason } => {
+                // Advisory: the history stays whole and the turn goes on.
+                let _ = writeln!(stderr, "openmax: context cut skipped: {}", one_line(reason));
+            }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Advisory: the turn still runs, so the exit code is untouched.
                 let _ = writeln!(
@@ -470,7 +474,7 @@ mod tests {
         };
 
         // Every stop reason a Done event can carry, and what a caller gets.
-        // `truncated` and `blocked` reach 0 here on purpose: both emit an
+        // `truncated`, `blocked` and `empty` reach 0 here on purpose: both emit an
         // Error event first, which is what sets their 1 in a real run.
         let cases = [
             ("stop", 0),
@@ -491,8 +495,8 @@ mod tests {
             assert_eq!(code, expected, "stop reason {stop_reason}");
         }
 
-        // An Error before the Done is what a truncated or blocked turn sends.
-        for stop_reason in ["truncated", "blocked"] {
+        // An Error before the Done is what a truncated, blocked or empty turn sends.
+        for stop_reason in ["truncated", "blocked", "empty"] {
             core.send_agent("s", AgentEvent::Error { message: "boom".into() });
             core.send_agent("s", AgentEvent::Done { stop_reason: stop_reason.to_string() });
             let (mut saw_tokens, mut stop_by) = (false, None);
