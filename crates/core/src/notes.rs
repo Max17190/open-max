@@ -876,8 +876,8 @@ pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usiz
             Some(next) => format!("[reply cut: it reached max_tokens ({max_tokens}) and nothing of the reply arrived here: either thinking that is not shown, or a tool call larger than the limit, which did not run. {next}]"),
             None => format!("[reply cut: it reached max_tokens ({max_tokens}) and nothing of the reply arrived here: either thinking that is not shown, or a tool call larger than the limit, which did not run. If it was a call, written again whole it will be cut the same way. {SPLIT_ADVICE}]"),
         },
-        CutKind::Text if room.is_some() => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing text. {}]", next("continue the text from exactly where it stopped, without repeating any of it.").unwrap_or_default()),
-        CutKind::Text | CutKind::Thought => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
+        CutKind::Text => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing text. {}]", next("continue the text from exactly where it stopped, without repeating any of it.").unwrap_or_else(|| "Continue the text from exactly where it stopped, without repeating any of it.".into())),
+        CutKind::Thought => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
     }
 }
 
@@ -911,11 +911,11 @@ mod tests {
             // Reasoning that streamed while the count says less.
             ("reasoning longer than its count", reply("", Some(&long_thought), usage(4_096, Some(10))), "before"),
             // Text that arrived accounts for the output.
-            ("text that arrived", reply(&"x".repeat(16_000), None, usage(4_096, Some(0))), "before"),
+            ("text that arrived", reply(&"x".repeat(16_000), None, usage(4_096, Some(0))), "text"),
             // A few unaccounted tokens are not a lost call.
-            ("within the margin", reply(&"x".repeat(15_000), None, usage(4_096, Some(0))), "before"),
+            ("within the margin", reply(&"x".repeat(15_000), None, usage(4_096, Some(0))), "text"),
             // Dense text that did arrive: 4,096 tokens at three bytes a token.
-            ("dense text that arrived", reply(&"x".repeat(12_288), None, usage(4_096, Some(0))), "before"),
+            ("dense text that arrived", reply(&"x".repeat(12_288), None, usage(4_096, Some(0))), "text"),
             // Some text, then a call that never arrived.
             ("short text, then a lost call", reply(&"x".repeat(2_000), None, usage(4_096, Some(0))), "lost"),
             // Encrypted reasoning, its count small: its bytes do not hide the lost call.
@@ -932,12 +932,13 @@ mod tests {
             ("reasoning, no count", reply("", Some("half a thought"), usage(4_096, None)), "before"),
         ];
         for (case, reply, want) in cases {
-            // With no room to offer, the notes are the ones every such cut got before.
+            // With no room to offer, a cut thought and a lost call get the notes they got before, and cut text is
+            // asked to go on from where it stopped.
             let kind = cut_kind(4_096, &reply);
             let note = reply_cut_note(4_096, kind, None);
-            let got = if note == before { "before" } else if note.contains("did not arrive here") { "lost" } else if note.contains("nothing of the reply arrived") { "unshown" } else { "other" };
+            let got = if note == before { "before" } else if note == "[reply cut: it reached max_tokens (4096) while writing text. Continue the text from exactly where it stopped, without repeating any of it.]" { "text" } else if note.contains("did not arrive here") { "lost" } else if note.contains("nothing of the reply arrived") { "unshown" } else { "other" };
             assert_eq!(got, want, "{case}: {note}");
-            if want != "before" {
+            if want != "before" && want != "text" {
                 assert!(note.starts_with("[reply cut: it reached max_tokens (4096)") && note.ends_with(&format!("{SPLIT_ADVICE}]")), "{case}: {note}");
             }
             // With room, a cut thought is still told to act, and anything else is asked for whole, not in parts.
@@ -947,7 +948,7 @@ mod tests {
                 CutKind::Text => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) while writing text. The next reply alone may be up to 16384 tokens: continue the text from exactly where it stopped, without repeating any of it.]", "{case}"),
                 CutKind::Lost | CutKind::Unseen => assert!(roomy.contains("The next reply alone may be up to 16384 tokens") && roomy.ends_with("again now, whole.]") && !roomy.contains("in parts"), "{case}: {roomy}"),
             }
-            assert_eq!(kind == CutKind::Text, want == "before" && reply.content.len() > 2_048, "{case}");
+            assert_eq!(kind == CutKind::Text, want == "text", "{case}");
         }
     }
 

@@ -716,7 +716,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // changed lines in its result, so an edit takes one round, not one per
     // replacement plus a read-back. The opt-in soft request budget and its
     // notes. Compaction makes one cut and asks for notes in the conversation.
-    const BASELINE: usize = 44_001;
+    // A reply cut inside a call or its text is asked for once more with room,
+    // and a Responses reply cut at its output limit continues the turn.
+    const BASELINE: usize = 44_222;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

@@ -178,6 +178,24 @@ fn complete(value: &Value) -> Result<CompletionResult, String> {
     Ok(result)
 }
 
+/// A reply the output limit cut (`response.incomplete` for `max_output_tokens`), as Chat Completions reports one:
+/// finish `length` with the text that arrived, so the turn continues. No call in it is kept, since the cut one is
+/// unfinished and the model sends the rest again. A reasoning item is kept only when it finished.
+fn cut(items: Value, streamed: String, usage: &Value) -> CompletionResult {
+    let mut result = CompletionResult { finish_reason: "length".into(), usage: parse_usage(usage), ..cancelled_response() };
+    let mut reasoning = Vec::new();
+    for item in items.as_array().into_iter().flatten() {
+        match item["type"].as_str() {
+            Some("message") => item["content"].as_array().into_iter().flatten().for_each(|part| result.content.push_str(part["text"].as_str().or(part["refusal"].as_str()).unwrap_or_default())),
+            Some("reasoning") if item.get("status").is_none_or(|s| s.is_null() || s == "completed") => reasoning.push(item.clone()),
+            _ => {}
+        }
+    }
+    if result.content.len() < streamed.len() { result.content = streamed; }
+    result.reasoning_details = (!reasoning.is_empty()).then(|| serde_json::value::to_raw_value(&reasoning).ok()).flatten();
+    result
+}
+
 /// Completion is an explicit terminal event. Incomplete or cut streams never dispatch tools.
 pub(super) async fn read(
     resp: reqwest::Response,
@@ -278,6 +296,10 @@ pub(super) async fn read(
                 }
                 Some("response.failed") => return (result, failed(&event["response"]["error"])),
                 Some("error") => return (result, failed(&event)),
+                Some("response.incomplete") if event["response"]["incomplete_details"]["reason"] == "max_output_tokens" => {
+                    let items = if event["response"]["output"].as_array().is_none_or(Vec::is_empty) { output.into_values().collect() } else { event["response"]["output"].take() };
+                    return (cut(items, result.content, &event["response"]["usage"]), None);
+                }
                 Some("response.incomplete") => return (result, None),
                 _ => {}
             }
@@ -440,6 +462,26 @@ mod tests {
                 assert!(matches!(unfinished, Some(Unfinished::Interrupted(_))));
                 assert!(result.tool_calls.is_empty());
             }
+            job.await.unwrap();
+        }
+        // Cut at the output limit, it is a reply cut at `length`: the text that arrived, the reasoning that finished,
+        // and no call.
+        let reasoning = json!({"type":"reasoning","id":"rs_1","status":"completed","encrypted_content":"e"});
+        let incomplete = |output: Value| json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+            "output":output,"usage":{"input_tokens":12,"output_tokens":4096}}});
+        for (events, content, kept) in [
+            (vec![incomplete(json!([reasoning, {"type":"message","status":"incomplete","content":[{"type":"output_text","text":"half an ans"}]}]))], "half an ans", true),
+            (vec![json!({"type":"response.output_text.delta","delta":"streamed te"}), incomplete(json!([]))], "streamed te", false),
+            (vec![json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+                incomplete(json!([reasoning, {"type":"function_call","status":"incomplete","call_id":"c","name":"write_file","arguments":"{\"path\":\"a"}]))], "", true),
+        ] {
+            let body: String = events.iter().map(|event| format!("data: {event}\n\n")).collect();
+            let (client, _, job) = endpoint(vec![(200, body)]).await;
+            let response = reqwest::Client::new().post(client.endpoint()).body("{}").send().await.unwrap();
+            let (result, unfinished) = read(response, &crate::state::CancelToken::default(), std::time::Duration::from_secs(5), &mut |_| {}).await;
+            assert!(unfinished.is_none() && result.tool_calls.is_empty());
+            assert_eq!((result.finish_reason.as_str(), result.content.as_str(), result.reasoning_details.is_some()), ("length", content, kept));
+            assert!(result.hit_output_cap(4096) && result.usage.unwrap().prompt_tokens == 12);
             job.await.unwrap();
         }
         let (client, _, job) = endpoint(vec![(200, format!("data: {}\n\n", json!({"type":"response.incomplete"})))]).await;

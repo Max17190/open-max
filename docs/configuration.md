@@ -182,8 +182,10 @@ and the run that writes a key already uses it.
   last iteration), and the terminal UI and print mode say which
   `max_tokens` cut it and where it is set (the cut note and the refused
   call name the limit that request carried). Send a follow-up to continue.
-  On a Responses connection a reply that reaches the limit is reported
-  incomplete and ends the turn as truncated.
+  A reply cut while writing its text gets a note that asks for the text to
+  be continued from where it stopped. On a Responses connection a reply the
+  server reports incomplete at its output limit is continued the same way;
+  a call in it is not kept.
   For a reasoning model the limit is also a bound on how long it thinks
   in one reply before it acts; the room after a cut call or text can be
   spent on thinking too, for that one request. Setup leaves it at the default for a Chat Completions
