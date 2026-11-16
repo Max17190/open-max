@@ -1088,7 +1088,7 @@ async fn run_loop(
             // that end is not verified either. The consult IS this end's
             // turn_end run, so the late site stays quiet: one end, one fire.
             turn_end_fired = true;
-            stop_reason = if refused || outcome.unverified { "unverified".into() } else { result.finish_reason };
+            stop_reason = if refused || outcome.unverified { "unverified".into() } else if capped { "length".into() } else { result.finish_reason };
             // An end that stands with every gate passing names them, so it reads apart from one no gate judged.
             if !refused && !outcome.unverified && !outcome.passed.is_empty() {
                 core.send_agent(session_id, AgentEvent::TurnVerified { hooks: outcome.passed });
@@ -5050,14 +5050,16 @@ mod tests {
         let silent_again = thought_sse(3073, None, "stop");
         let short = thought_sse(40, None, "stop");
         let elsewhere = thought_sse(2500, None, "stop");
-        // A case: the replies in order, the stop reason, and whether a cut note went in.
-        let cases: [(&str, Vec<&str>, &str, bool); 4] = [
-            ("silent alone", vec![&silent], "empty", false),
-            ("silent and short", vec![&short], "empty", false),
-            ("silent at the count a call stopped at", vec![&read, &silent_again, STOP_SSE], "stop", true),
-            ("silent at another count", vec![&read, &elsewhere], "empty", false),
+        // A case: the replies in order, the iteration cap, the stop reason, and whether a cut note went in.
+        let cases: [(&str, Vec<&str>, usize, &str, bool); 5] = [
+            ("silent alone", vec![&silent], 50, "empty", false),
+            ("silent and short", vec![&short], 50, "empty", false),
+            ("silent at the count a call stopped at", vec![&read, &silent_again, STOP_SSE], 50, "stop", true),
+            ("silent at another count", vec![&read, &elsewhere], 50, "empty", false),
+            // On the last iteration nothing is left to continue the cut, so the turn stopped short.
+            ("silent at a repeated count on the last iteration", vec![&read, &silent_again], 2, "length", false),
         ];
-        for (case, streams, stop, noted) in cases {
+        for (case, streams, iterations, stop, noted) in cases {
             let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
             let (core, mut rx) = Core::new(dir.clone()).unwrap();
             let project = dir.join("project");
@@ -5068,7 +5070,7 @@ mod tests {
             {
                 let mut s = core.settings.lock().unwrap();
                 (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(65_536), 4096);
-                s.approval_mode = ApprovalMode::Auto;
+                (s.approval_mode, s.max_agent_iterations) = (ApprovalMode::Auto, iterations);
             }
             let id = "sess-silent";
             start_turn(core.clone(), id.into(), project.clone(), "read a.txt".into()).unwrap();
