@@ -1880,9 +1880,12 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
 }
 
 /// A reasoning model can spend a reply's whole `max_tokens` thinking: the
-/// reply comes back with finish reason `length`, no text and no call. When
-/// such cuts end the turn, the stop line names the setting, its value and
-/// where it is set. `--check --all` states the active model's limit and where
+/// reply comes back with finish reason `length`, no text and no call. Cuts in
+/// a row raise the limit up to its ceiling (four times the default when
+/// nothing declares one, within the window); once it cannot grow, the fifth
+/// cut there ends the turn, and the stop line names the setting, its value,
+/// the ceiling and where it is set. `--check --all` states the active model's
+/// limit and where
 /// it came from; on a Chat Completions connection, where a cut reply is
 /// continued, the default limit is not a warning, so the default report leaves
 /// it out. On a Responses connection the default still warns.
@@ -1891,19 +1894,19 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     let (project, home) = fresh_dirs("reply-limit");
     let cut = sse(&[serde_json::json!({"choices":[{"delta":{},"finish_reason":"length"}],
         "usage":{"prompt_tokens":10,"completion_tokens":4096}})]);
-    // The turn continues after four cut replies; the fifth in a row ends it.
-    let (base_url, requests, _server) = spawn_scripted_server(vec![(cut, true); 5]);
+    let (base_url, requests, _server) = spawn_scripted_server(vec![(cut, true); 12]);
     write_settings(&home, &base_url);
     let out = cmd(&project, &home).args(["--trust-project", "-p", "think it through"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(4), "{stderr}");
-    assert_eq!(requests.lock().unwrap().len(), 5, "{stderr}");
     assert!(stderr.contains(
         "openmax: stopped (length): the reply reached its output limit before it finished; reasoning counts toward it. \
-         The limit is max_tokens (now 4096), on the model's providers.json entry, else in settings.json. \
+         The limit is max_tokens (now 4096, raised up to 14336 while replies are cut in a row), on the model's providers.json entry, else in settings.json. \
          Run openmax --continue -p \"<follow-up>\" to continue, after raising it if replies need more room"), "{stderr}");
-    let body: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
-    assert_eq!(body["max_tokens"], 4096, "the stop line names the limit the request was sent with");
+    // The first request asks for 4096; later ones ask for more, within what the 16,384-token window leaves, and the
+    // turn ends once the limit cannot grow, before the script runs out.
+    let asked: Vec<u64> = requests.lock().unwrap().iter().map(|b| serde_json::from_str::<serde_json::Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
+    assert!(asked[0] == 4096 && asked.iter().any(|&a| a > 4096) && asked.iter().all(|&a| a <= 14_336) && asked.len() < 12, "{asked:?}");
 
     let check = |args: &[&str]| {
         let out = cmd(&project, &home).args(args).output().unwrap();
@@ -1913,7 +1916,7 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     assert_eq!(code, Some(0), "{report}");
     assert!(!report.contains("max_tokens"), "the default limit is not a warning:\n{report}");
     let (_, all) = check(&["--check", "--all"]);
-    assert!(all.lines().any(|l| l.starts_with("ok   settings") && l.contains("reply limit max_tokens = 4096 from the default;")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   settings") && l.contains("reply limit max_tokens = 4096 from the default, raised up to 14336 (four times the default) while replies are cut in a row;")), "{all}");
 
     let dir = home.join(".openmax");
     std::fs::write(dir.join("settings.json"), format!(r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"ask","context_tokens":16384,"max_tokens":8192}}"#)).unwrap();
@@ -1934,7 +1937,7 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     let (_, report) = check(&["--check"]);
     assert!(!report.contains("max_tokens"), "{report}");
     let (_, all) = check(&["--check", "--all"]);
-    assert!(all.contains("reply limit max_tokens = 4096 from the default;"), "{all}");
+    assert!(all.contains("reply limit max_tokens = 4096 from the default, raised up to 14336 (four times the default)"), "{all}");
     // A Responses connection keeps nothing of reasoning the limit cut, so
     // there the default still warns.
     std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","wire_api":"responses","models":[{{"id":"stub-model","context_tokens":16384}}]}}}}}}"#)).unwrap();
@@ -1983,6 +1986,66 @@ fn a_server_started_in_the_background_serves_after_openmax_exits() {
     for reply in &replies {
         assert!(reply.as_deref().is_some_and(|r| r.starts_with("HTTP/1.0 200")), "{replies:?}\n{stderr}");
     }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A model whose providers.json entry declares its longest reply, as a
+/// benchmark declares each model's, keeps the default limit as each request's
+/// first ask: the declared length is a ceiling, not the ask. A model that
+/// must think 6,000 and then 30,000 tokens before each call finishes its
+/// task: from the second cut in a row the limit doubles until the thought
+/// fits, and the reply after a call starts again at 4096. The limit used to
+/// be the declared length on every request, and a fifth cut thought in a row
+/// ended the turn.
+#[test]
+fn a_model_that_thinks_past_the_limit_finishes_with_its_longest_reply_declared() {
+    let (project, home) = fresh_dirs("long-thought");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let asked: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let _server = std::thread::spawn(move || {
+        // How long the model thinks before each step, and the step.
+        let steps = [(6_000u64, Some("a.txt")), (30_000, Some("b.txt")), (0, None)];
+        let mut step = 0;
+        while let Ok((mut stream, _)) = listener.accept() {
+            let Some(body) = read_request(&mut stream) else { return };
+            let limit = serde_json::from_str::<serde_json::Value>(&body).unwrap()["max_tokens"].as_u64().unwrap();
+            seen.lock().unwrap().push(limit);
+            let (think, file) = steps[step.min(steps.len() - 1)];
+            let thought = serde_json::json!({"choices":[{"delta":{"reasoning_content":"thinking it through"},"finish_reason":null}]});
+            let usage = |used: u64| serde_json::json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":used,"completion_tokens_details":{"reasoning_tokens":used.min(think)}}});
+            let sse_body = if limit < think {
+                sse(&[thought, serde_json::json!({"choices":[{"delta":{},"finish_reason":"length"}]}), usage(limit)])
+            } else {
+                step += 1;
+                match file {
+                    Some(path) => sse(&[
+                        thought,
+                        serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call_{step}"),"type":"function",
+                            "function":{"name":"write_file","arguments":serde_json::json!({"path":path,"content":"done\n"}).to_string()}}]},"finish_reason":null}]}),
+                        serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                        usage(think + 40),
+                    ]),
+                    None => sse_text("both written"),
+                }
+            };
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse_body}", sse_body.len());
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    let dir = home.join(".openmax");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"thinker","context_tokens":1048576,"max_tokens":131072}}]}}}}}}"#)).unwrap();
+    std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"thinker","approval_mode":"auto"}"#).unwrap();
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "write a.txt, then b.txt"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "both written", "{stderr}");
+    for file in ["a.txt", "b.txt"] {
+        assert_eq!(std::fs::read_to_string(project.join(file)).ok().as_deref(), Some("done\n"), "{file}: {stderr}");
+    }
+    assert_eq!(*asked.lock().unwrap(), [4096, 4096, 8192, 4096, 4096, 8192, 16384, 32768, 4096], "{stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

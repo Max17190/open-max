@@ -186,7 +186,7 @@ the prompts after it.
 | 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
 | 2 | A usage or configuration error before any turn, `--continue` found no prior session here, or `--session` named one this directory cannot continue |
 | 3 | The project is not trusted, or trust cannot be granted from this process |
-| 4 | A turn stopped short (`length` when five replies in a row reached their `max_tokens` before any tool call, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
+| 4 | A turn stopped short (`length` when replies in a row kept reaching their `max_tokens` before any tool call once it was raised to its ceiling, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
 
 [examples/run-task](../examples/run-task/README.md) is a caller built on these
 codes: it hands a print run one task and its own checks, a `turn_end` gate

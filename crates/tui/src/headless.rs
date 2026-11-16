@@ -439,7 +439,10 @@ pub(crate) fn iteration_cap_note(cap: usize, how_to_continue: &str) -> String {
 
 /// What a person reads when a reply is cut at its output limit: the setting and its value now, where it is set, then `how_to_continue`.
 pub(crate) fn reply_limit_note(core: &Core, how_to_continue: &str) -> String {
-    let now = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir).map_or(String::new(), |e| format!(" (now {})", e.max_tokens));
+    let now = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir).map_or(String::new(), |e| match e.reply_ceiling > e.max_tokens {
+        true => format!(" (now {}, raised up to {} while replies are cut in a row)", e.max_tokens, e.reply_ceiling),
+        false => format!(" (now {})", e.max_tokens),
+    });
     format!("the reply reached its output limit before it finished; reasoning counts toward it. \
              The limit is max_tokens{now}, on the model's providers.json entry, else in settings.json. {how_to_continue}")
 }
