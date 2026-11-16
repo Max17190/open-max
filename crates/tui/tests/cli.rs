@@ -2343,7 +2343,7 @@ fn a_run_records_and_charges_the_reasoning_its_provider_bills_as_output() {
             "completion_tokens_details": {"reasoning_tokens": reasoning}}}),
     ]);
     let (base_url, requests, _server) =
-        spawn_scripted_server(vec![(call("c1", r#"{"path":"a.t"#, 4000, 96), true), (call("c2", r#"{"path":"a.txt"}"#, 55, 60_000), true), (sse_text("read it"), true)]);
+        spawn_scripted_server(vec![(call("c1", r#"{"path":"a.txt",}"#, 4000, 96), true), (call("c2", r#"{"path":"a.txt"}"#, 55, 60_000), true), (sse_text("read it"), true)]);
     std::fs::create_dir_all(home.join(".openmax")).unwrap();
     let settings = format!(r#"{{"base_url":"{base_url}","model":"stub-model","context_tokens":16384,"max_agent_tokens":50000}}"#);
     std::fs::write(home.join(".openmax/settings.json"), settings).unwrap();

@@ -753,7 +753,7 @@ async fn run_loop(
     let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
     // Cut replies with no call since the last reply the cap did not cut.
-    let mut cuts = 0;
+    let (mut cuts, mut stops) = (0, Vec::new());
     let mut at_reserve = false;
     // Set once a request goes out over the soft trigger: a cut without notes waits for the window; a cut clears it.
     let mut soft_spent = false;
@@ -897,7 +897,10 @@ async fn run_loop(
         // reasoning, so the continuation resumes the thought instead of
         // starting it over; the wire skips it wherever the reasoning does
         // not go back (another endpoint, a path that does not replay it).
-        let cut_thought = result.hit_output_cap(limit)
+        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0).
+        let (silent, repeated) = (content.trim().is_empty() && tool_calls.is_empty(), result.repeats_a_stop(&mut stops, limit));
+        let capped = result.hit_output_cap(limit) || (silent && repeated);
+        let cut_thought = capped
             && (result.reasoning_content.is_some() || result.reasoning.is_some() || result.reasoning_details.is_some());
         if !content.is_empty() || !tool_calls.is_empty() || cut_thought {
             // A call whose arguments are not JSON (a model's slip, or a call a
@@ -963,7 +966,6 @@ async fn run_loop(
         // the one it was still writing, is refused with the cause, so the
         // model can split the work. The client keeps its raw arguments even
         // when the cut lands before the first byte.
-        let capped = result.hit_output_cap(limit);
         if !capped {
             cuts = 0;
         }
@@ -982,6 +984,10 @@ async fn run_loop(
                 insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(limit, &result));
                 save_messages(core, session_id, guard.messages(), false).await;
                 continue 'turns;
+            }
+            if silent && !capped {
+                core.send_agent(session_id, AgentEvent::Error { message: result.empty_reply_error() });
+                stop_reason = "empty".into(); break 'turns;
             }
             // A steer sent while the model wrote its answer is not answered
             // yet, so this is not the end: take it now and round again for
@@ -3632,7 +3638,8 @@ mod tests {
     /// that carries a call whose arguments are not JSON, and a model's JSON
     /// slip was recorded verbatim, so one bad call failed every later request
     /// of the session, new prompts included. The call is recorded with `{}`,
-    /// and its tool reply names the parse error and quotes what was sent.
+    /// and its tool reply names the cause and quotes what was sent: here
+    /// arguments that stop before their JSON closes, the shape of a cut.
     #[tokio::test]
     async fn invalid_json_arguments_are_never_sent_back() {
         let (stops, bodies) = capture_turns(UNTERMINATED_TOOL_SSE, &["what is in a.txt", "and now?"]).await;
@@ -3644,7 +3651,7 @@ mod tests {
         let body: Value = serde_json::from_str(&bodies[1]).unwrap();
         let reply = body["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
         let reply = reply["content"].as_str().unwrap();
-        assert!(reply.contains("invalid JSON in tool arguments") && reply.contains(r#"{"path": "a.t"#), "{reply}");
+        assert!(reply.contains("so its arguments were cut off") && reply.contains(r#"Arguments sent: {"path": "a.t"#), "{reply}");
     }
 
     /// The same for a call a cut stream left unfinished: it never ran, and the
@@ -4834,9 +4841,9 @@ mod tests {
     /// is refused with the cause and the limit; the calls before it keep the
     /// replies they earned on their own: a finished write runs, a write with
     /// a JSON slip gets the parse error that fixes it, a batch of reads runs
-    /// as one. Servers that report such a reply as `tool_calls` show the cut
-    /// only as a reply of exactly max_tokens, and a server that ignores the
-    /// cap (a longer reply) keeps the plain parse error.
+    /// as one. A last call whose JSON never closes is a cut however the
+    /// server reported the reply: as `tool_calls`, at exactly max_tokens,
+    /// or past it.
     #[tokio::test]
     async fn a_call_cut_off_at_max_tokens_is_refused_with_the_cause() {
         use crate::state::Core;
@@ -4856,7 +4863,7 @@ mod tests {
         let cases: [Case; 5] = [
             ("length", &[DONE], "length", None, true),
             ("tool_calls at the cap", &[DONE], "tool_calls", Some(1024), true),
-            ("tool_calls past the cap", &[DONE], "tool_calls", Some(1500), false),
+            ("tool_calls past the cap", &[DONE], "tool_calls", Some(1500), true),
             ("a slip before the cut", &[SLIP], "length", None, true),
             ("a read-only batch before the cut", &[PEEK, PEEK_AGAIN], "length", None, true),
         ];
@@ -4936,11 +4943,17 @@ mod tests {
         const CLOSED: Call = ("c2", "write_file", r#"{"content":"Big\nlorem ips"}"#, "missing required argument: path");
         const WHOLE: Call = ("c2", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#, "big.txt (+1 −0)");
         const PEEK_AGAIN: Call = ("c2", "read_file", r#"{"path":"note.txt"}"#, "noted");
+        const OPEN: Call = ("c2", "write_file", r#"{"path":"big.txt","content":"Big\nlorem ips"#, "invalid JSON");
+        const SLIP: Call = ("c2", "write_file", r#"{"path":"big.txt",}"#, "invalid JSON");
         // A case: name, the calls, finish_reason, the completion count when
         // the server sends one, and whether the reply reached the cap.
         type Case = (&'static str, &'static [Call], &'static str, Option<u64>, bool);
-        let cases: [Case; 7] = [
+        let cases: [Case; 10] = [
             ("a closed cut call alone", &[CLOSED], "length", None, true),
+            // One route reports a cut call as `tool_calls`, and a server may send no usage at all.
+            ("an open cut call finishing tool_calls with no usage", &[DONE, OPEN], "tool_calls", None, true),
+            ("an open cut call finishing stop below the limit", &[OPEN], "stop", Some(700), true),
+            ("a slip that closes is the model's own", &[DONE, SLIP], "tool_calls", None, false),
             ("a closed cut call after a finished write", &[DONE, CLOSED], "length", None, true),
             ("a complete last call at the cap", &[DONE, WHOLE], "tool_calls", Some(1024), true),
             ("a read batch at the cap", &[PEEK, PEEK_AGAIN], "length", None, true),
@@ -5009,6 +5022,72 @@ mod tests {
         "data: [DONE]\n\n",
     );
     const CUT_NOTE: &str = "[reply cut: it reached max_tokens (1024) before any tool call; continue from where it stopped: think briefly, then act.]";
+
+    /// The bug this guards: a reply with no text and no call that finished
+    /// `stop` ended the turn as a normal answer, so a print run printed
+    /// nothing and exited 0, and could not be told from a finished task. One
+    /// route ends thinking below the limit and delivers nothing, at the same
+    /// count each time: a silent reply that stops where an earlier reply of
+    /// the turn did is that cap, so it continues as a cut thought, while any
+    /// other silent reply ends the turn `empty` behind an error.
+    #[tokio::test]
+    async fn a_reply_with_nothing_in_it_is_an_error_unless_it_stopped_at_a_repeated_count() {
+        use crate::state::Core;
+
+        // A reply of reasoning only, then the given text or call, with its counts and finish.
+        fn thought_sse(reasoning_tokens: u64, call: Option<&str>, finish: &str) -> String {
+            let mut chunks = vec![serde_json::json!({ "choices": [{ "delta": { "reasoning_content": "thinking" }, "finish_reason": null }] })];
+            if let Some(args) = call {
+                chunks.push(serde_json::json!({ "choices": [{ "delta": { "tool_calls": [{ "index": 0, "id": "c1", "function": { "name": "read_file", "arguments": args } }] }, "finish_reason": null }] }));
+            }
+            chunks.push(serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": finish }] }));
+            let output = reasoning_tokens + if call.is_some() { 20 } else { 0 };
+            chunks.push(serde_json::json!({ "choices": [], "usage": { "prompt_tokens": 100, "completion_tokens": output, "completion_tokens_details": { "reasoning_tokens": reasoning_tokens } } }));
+            chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n"
+        }
+        let read = thought_sse(3072, Some(r#"{"path":"a.txt"}"#), "tool_calls");
+        let silent = thought_sse(3072, None, "stop");
+        let silent_again = thought_sse(3073, None, "stop");
+        let short = thought_sse(40, None, "stop");
+        let elsewhere = thought_sse(2500, None, "stop");
+        // A case: the replies in order, the stop reason, and whether a cut note went in.
+        let cases: [(&str, Vec<&str>, &str, bool); 4] = [
+            ("silent alone", vec![&silent], "empty", false),
+            ("silent and short", vec![&short], "empty", false),
+            ("silent at the count a call stopped at", vec![&read, &silent_again, STOP_SSE], "stop", true),
+            ("silent at another count", vec![&read, &elsewhere], "empty", false),
+        ];
+        for (case, streams, stop, noted) in cases {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("a.txt"), "a\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, requests) = scripted_endpoint(&streams).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(65_536), 4096);
+                s.approval_mode = ApprovalMode::Auto;
+            }
+            let id = "sess-silent";
+            start_turn(core.clone(), id.into(), project.clone(), "read a.txt".into()).unwrap();
+            let (got, events) = drive_turn_events(&mut rx).await;
+            assert_eq!(got, stop, "{case}");
+            assert_eq!(*requests.lock().unwrap(), streams.len(), "{case}: every reply was asked for");
+            let errors: Vec<&String> = events.iter().filter_map(|e| match e { AgentEvent::Error { message } => Some(message), _ => None }).collect();
+            if stop == "empty" {
+                assert_eq!(errors.len(), 1, "{case}: {errors:?}");
+                assert!(errors[0].contains("no text and no tool call (finish_reason stop after"), "{case}: {}", errors[0]);
+            } else {
+                assert!(errors.is_empty(), "{case}: {errors:?}");
+            }
+            let messages = transcript(&core, id).await;
+            let notes = messages.iter().filter(|m| m.content.as_deref().is_some_and(|c| c.contains("[reply cut:"))).count();
+            assert_eq!(notes, usize::from(noted), "{case}: a cut note follows only the repeated stop");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 
     /// The bug this guards: a provider that sends a tool call only when it is
     /// complete dropped a call the reply limit cut, so the reply arrived empty
