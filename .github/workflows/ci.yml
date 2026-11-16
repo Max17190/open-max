@@ -117,8 +117,8 @@ jobs:
   # They took 2.5 minutes after the tests on macos-latest, the longest part
   # of the gate's slowest job, so they run in a job of their own beside the
   # tests, on the same runners, and the two scripts run at once: each keeps
-  # its state in a temporary HOME of its own. Each script's output is shown
-  # when both have ended, and a failure of either fails the job. The job
+  # its state in a temporary HOME of its own. A failure of either fails the
+  # job, and the step after shows each script's output. The job
   # builds the test job's dependencies again, so it restores the cache that
   # job saves on main and saves none of its own.
   examples:
@@ -154,9 +154,17 @@ jobs:
           task=$!
           wait "$memory" || { echo "::error::the repository memory example failed"; failed=1; }
           wait "$task" || { echo "::error::the run task example failed"; failed=1; }
-          echo "--- repository memory example"; cat "$RUNNER_TEMP/repo-memory.log"
-          echo "--- run task example"; cat "$RUNNER_TEMP/run-task.log"
           exit ${failed:-0}
+
+      # Each script's output, after a failure or a timeout of the step above
+      # too, so a script that hung leaves the other's output and its own.
+      - name: Show the examples' output
+        if: ${{ !cancelled() }}
+        run: |
+          for log in repo-memory run-task; do
+            echo "--- $log"
+            if [ -f "$RUNNER_TEMP/$log.log" ]; then cat "$RUNNER_TEMP/$log.log"; else echo "(no output)"; fi
+          done
 
   # The zero-warning baseline is only real if something checks it. It was set
   # deliberately, then drifted back to three warnings because nothing did. A
