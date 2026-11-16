@@ -376,8 +376,24 @@ pub struct CompletionResult {
 
 impl CompletionResult {
     pub(crate) fn hit_output_cap(&self, limit: usize) -> bool {
-        // Some servers report tool_calls even when the arguments hit the cap.
+        // Some servers report tool_calls even when the arguments hit the cap, and some send no usage: a last call
+        // whose JSON stops before it closes is cut whatever was reported (blank is a call with no arguments).
         self.finish_reason == "length" || self.usage.is_some_and(|u| u.completion_tokens == limit as u64)
+            || self.tool_calls.last().is_some_and(|c| !c.function.arguments.trim().is_empty()
+                && serde_json::from_str::<Value>(&c.function.arguments).is_err_and(|e| e.is_eof()))
+    }
+
+    /// Whether this reply stopped below the limit, past half of it, within one token of where an earlier one did
+    /// (its reasoning count, else its output): a cap the provider applies without reporting it. Remembers the count.
+    pub(crate) fn repeats_a_stop(&self, stops: &mut Vec<u64>, limit: usize) -> bool {
+        let Some(n) = self.usage.map(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens)).filter(|&n| n * 2 >= limit as u64 && n < limit as u64) else { return false };
+        stops.push(n);
+        stops[..stops.len() - 1].iter().any(|&c| c.abs_diff(n) <= 1)
+    }
+
+    pub(crate) fn empty_reply_error(&self) -> String {
+        let output = self.usage.map(|u| format!(" after {} output tokens", u.completion_tokens)).unwrap_or_default();
+        format!("the model's reply had no text and no tool call (finish_reason {}{output}), so the turn ended without an answer", self.finish_reason)
     }
 
     fn normalize_empty_tool_arguments(mut self, limit: usize) -> Self {

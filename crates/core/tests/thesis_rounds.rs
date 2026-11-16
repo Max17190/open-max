@@ -270,10 +270,48 @@ fn micros(d: Duration) -> f64 {
 /// bound on the median.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_time_per_tool_round() {
-    const WARMUP: usize = 5;
-    const ROUNDS: usize = 30;
     const TARGET_US: f64 = 250.0;
     let _serial = SERIAL.lock().await;
+    // A debug build on a shared CI runner takes about five times the
+    // reference machine's debug time, so a burst of other work on the
+    // runner's cores can push one measurement past the sanity bound, as on
+    // macos-latest at 5299 and 6609 us. A change that adds work slows every
+    // measurement, so a debug build measures again, up to 3 times in all,
+    // and fails only when each one is past the bound. A release build
+    // measures once and holds the target.
+    let attempts = if cfg!(debug_assertions) { 3 } else { 1 };
+    let mut medians = Vec::new();
+    for _ in 0..attempts {
+        let (n, median, p25, p75, tool_median) = measure_tool_rounds().await;
+        println!(
+            "MEASURE harness_time_per_tool_round n={n} median={median:.0}us p25={p25:.0}us p75={p75:.0}us \
+             (read_file median {tool_median:.1}us subtracted; target {TARGET_US}us, {})",
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+        );
+        medians.push(median);
+        if median < TARGET_US * 20.0 {
+            break;
+        }
+    }
+    let median = *medians.last().unwrap();
+    if cfg!(debug_assertions) {
+        assert!(
+            median < TARGET_US * 20.0,
+            "debug harness time per round is past the 20x sanity bound in each of {} measurements: {medians:.0?} us",
+            medians.len()
+        );
+    } else {
+        assert!(median <= TARGET_US, "harness time per round {median:.0}us is past the {TARGET_US}us target");
+    }
+}
+
+/// One measurement of [`harness_time_per_tool_round`]: a warmup turn and a
+/// measured turn against a fresh scripted endpoint, then `read_file`'s own
+/// cost. Returns the gap count, the median, p25 and p75 of the gaps with
+/// that cost subtracted, and the cost.
+async fn measure_tool_rounds() -> (usize, f64, f64, f64, f64) {
+    const WARMUP: usize = 5;
+    const ROUNDS: usize = 30;
     let mut script = Vec::new();
     for rounds in [WARMUP, ROUNDS] {
         script.extend((0..rounds).map(|i| {
@@ -332,18 +370,8 @@ async fn harness_time_per_tool_round() {
         .collect();
     gaps.sort_by(f64::total_cmp);
     let (p25, median, p75) = (quantile(&gaps, 0.25), quantile(&gaps, 0.5), quantile(&gaps, 0.75));
-    println!(
-        "MEASURE harness_time_per_tool_round n={} median={median:.0}us p25={p25:.0}us p75={p75:.0}us \
-         (read_file median {tool_median:.1}us subtracted; target {TARGET_US}us, {})",
-        gaps.len(),
-        if cfg!(debug_assertions) { "debug" } else { "release" },
-    );
-    if cfg!(debug_assertions) {
-        assert!(median < TARGET_US * 20.0, "debug harness time per round {median:.0}us is past the 20x sanity bound");
-    } else {
-        assert!(median <= TARGET_US, "harness time per round {median:.0}us is past the {TARGET_US}us target");
-    }
     let _ = std::fs::remove_dir_all(dir);
+    (gaps.len(), median, p25, p75, tool_median)
 }
 
 /// The share of requests whose frozen prefix is byte-identical to the

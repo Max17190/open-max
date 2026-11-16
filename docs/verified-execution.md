@@ -120,7 +120,7 @@ and `after` exit codes, `refusals`, `gates_passed`, `changes` (the patch) and
 A completion gate is a `turn_end` hook with `blocking = true`
 (`openmax --spec hooks` prints the contract). The one end it can refuse is the
 model's own: a reply with no tool calls. An end the model did not ask for
-(`max_iterations`, `budget_exhausted`, `cancelled`, `error`, `truncated`)
+(`max_iterations`, `budget_exhausted`, `cancelled`, `error`, `truncated`, `empty`)
 still runs the hook, but nothing is left to honor a refusal with, so it is
 reported and the turn ends.
 

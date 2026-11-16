@@ -66,7 +66,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Test builds optimize the workspace's own crates (Cargo.toml's test
-      # profile), which the Suite time job times and pays for: built that way
+      # profile), which the Reports workflow's suite timing pays for: built that way
       # the tests take 203 to 223 seconds to build on ubuntu-latest instead of
       # 35 to 37, and 425 instead of 63 on macos-latest. This job holds no time
       # budget and runs each test in a process of its own, so it builds them
@@ -113,32 +113,21 @@ jobs:
       - name: Check test count
         run: scripts/check-test-count.sh
 
-      - name: Test repository memory example
-        run: |
-          cargo build --locked -p openmax
-          python3 examples/repo-memory/test_repo_memory.py target/debug/openmax
-
-      # The binary the step above built, driven by the example's own script.
-      - name: Test run task example
-        run: python3 examples/run-task/test_run_task.py target/debug/openmax
-
-  # The whole suite's wall time after compilation with every test binary run
-  # at once, each with a thread pool of its own, which the test job, running
-  # each test in a process of its own, does not show.
-  # scripts/check-suite-time.sh gives the method and the budget: 5 seconds
-  # times this runner's multiplier.
-  # It gates on ubuntu-latest alone, a job of its own so that no step of the
-  # test job runs on one of its runners only. macos-latest, 3 shared cores,
-  # ran the suite in 12.5 to 33.7 seconds over 32 runs, over its 20-second
-  # budget in 19, so the Reports workflow measures it there every night
-  # instead. The job builds the test job's dependencies again, and the
-  # workspace's own crates as Cargo.toml's test profile gives them, so it
-  # restores the cache that job saves on main and saves none of its own: the
-  # repository's cache space holds no second copy. crates/tui/tests/thesis.rs
-  # holds this wiring.
-  suite-time:
-    name: Suite time
-    runs-on: ubuntu-latest
+  # The examples' own scripts drive a debug build of the binary end to end.
+  # They took 2.5 minutes after the tests on macos-latest, the longest part
+  # of the gate's slowest job, so they run in a job of their own beside the
+  # tests, on the same runners, and the two scripts run at once: each keeps
+  # its state in a temporary HOME of its own. A failure of either fails the
+  # job, and the step after shows each script's output. The job
+  # builds the test job's dependencies again, so it restores the cache that
+  # job saves on main and saves none of its own.
+  examples:
+    name: Examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -153,13 +142,29 @@ jobs:
           shared-key: test
           save-if: false
 
-      # What the check runs, so it builds nothing under its timeout.
-      - name: Build the tests
-        run: cargo test --workspace --locked --no-run
+      - name: Build the binary
+        run: cargo build --locked -p openmax
 
-      - name: Check suite time
-        run: scripts/check-suite-time.sh 3
-        timeout-minutes: 5
+      - name: Test the examples
+        timeout-minutes: 10
+        run: |
+          python3 examples/repo-memory/test_repo_memory.py target/debug/openmax > "$RUNNER_TEMP/repo-memory.log" 2>&1 &
+          memory=$!
+          python3 examples/run-task/test_run_task.py target/debug/openmax > "$RUNNER_TEMP/run-task.log" 2>&1 &
+          task=$!
+          wait "$memory" || { echo "::error::the repository memory example failed"; failed=1; }
+          wait "$task" || { echo "::error::the run task example failed"; failed=1; }
+          exit ${failed:-0}
+
+      # Each script's output, after a failure or a timeout of the step above
+      # too, so a script that hung leaves the other's output and its own.
+      - name: Show the examples' output
+        if: ${{ !cancelled() }}
+        run: |
+          for log in repo-memory run-task; do
+            echo "--- $log"
+            if [ -f "$RUNNER_TEMP/$log.log" ]; then cat "$RUNNER_TEMP/$log.log"; else echo "(no output)"; fi
+          done
 
   # The zero-warning baseline is only real if something checks it. It was set
   # deliberately, then drifted back to three warnings because nothing did. A
