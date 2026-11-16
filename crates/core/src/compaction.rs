@@ -336,7 +336,7 @@ const NOTES_CUT_MARK: &str = "\n[the notes end here: the reply limit cut them of
 fn cap_notes(summary: &str, cut: bool, cap: usize) -> String {
     let room = if cut { cap - NOTES_CUT_MARK.len() } else { cap };
     let mut notes = if summary.len() > room {
-        let open = summary.match_indices('\n').map(|(i, _)| i + 1).filter(|&i| opens_open_part(&summary[i..])).next_back();
+        let open = summary.match_indices('\n').map(|(i, _)| i + 1).rfind(|&i| opens_open_part(&summary[i..]));
         let tail = open.map(|i| &summary[i..]).filter(|tail| tail.len() <= room / 4).unwrap_or("");
         let room = room - if tail.is_empty() { 0 } else { tail.len() + "…\n".len() };
         let head = take_note_bytes(summary, room);
