@@ -150,8 +150,18 @@ and the run that writes a key already uses it.
   every request as it is. When the server reports the cut (finish_reason
   `length`, or a usage count at the limit), the last tool call of that
   reply, the one the limit cut, never runs, even when the server closed its
-  arguments so they parse, and the model is told why and asked to send it
-  again in parts; the calls before it run as usual. A
+  arguments so they parse, and the model is told why; the calls before it
+  run as usual, once. At the default limit the next request alone then
+  carries room, four times the limit (16384) within what the window leaves,
+  and the model is asked to send the call again whole; the limit returns
+  with the request after it. The same room follows a reply cut while
+  writing its text, which is asked to continue the text, and a reply whose
+  call never arrived (below). A reply cut again at that room is asked for
+  in parts, and a server that refuses the room (HTTP 400 or 422) gets the
+  request again at the usual limit and no more room in that turn. A cut
+  thought gets no room. A limit you set, on the model's entry or as a
+  `max_tokens` other than 4096 in settings.json, is a ceiling: nothing asks
+  for more, and a cut call is asked for in parts. A
   reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
   before any tool call does not end the turn: it stays in the transcript
@@ -175,7 +185,8 @@ and the run that writes a key already uses it.
   On a Responses connection a reply that reaches the limit is reported
   incomplete and ends the turn as truncated.
   For a reasoning model the limit is also a bound on how long it thinks
-  before it acts. Setup leaves it at the default for a Chat Completions
+  in one reply before it acts; the room after a cut call or text can be
+  spent on thinking too, for that one request. Setup leaves it at the default for a Chat Completions
   connection unless the catalog reports a lower output maximum, which it
   saves; for a Responses or native Messages connection it still writes the
   catalog's output maximum when one is reported, and `openmax --check`
