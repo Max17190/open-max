@@ -1229,13 +1229,14 @@ fn members_and_their_children_outside(group: u32) -> (Vec<String>, Vec<(u32, Str
     (members.iter().copied().map(named).collect(), outside.map(|p| (p.0, named(p))).collect())
 }
 
-/// Pid, name, whether it reads Z, parent and group, from a `/proc` stat.
+/// Pid, name, whether it exited (Z with no thread left), parent and group.
 #[cfg(target_os = "linux")]
 fn proc_stat(dir: &Path) -> Option<(u32, String, bool, u32, u32)> {
     let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
     let (head, fields) = stat.rsplit_once(')')?;
     let ((pid, name), f) = (head.split_once(" (")?, fields.split_whitespace().take(3).collect::<Vec<_>>());
-    Some((positive_pid(pid)?, name.into(), *f.first()? == "Z", f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
+    let exited = *f.first()? == "Z" && std::fs::read_dir(dir.join("task")).is_ok_and(|threads| threads.count() <= 1);
+    Some((positive_pid(pid)?, name.into(), exited, f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
 }
 
 /// Returns true when group members outlived the leader and were terminated

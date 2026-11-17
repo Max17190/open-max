@@ -6541,9 +6541,17 @@ fn a_job_detached_with_setsid_is_reported_as_still_running() {
         .unwrap();
     let out = finish_with_deadline(child);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    // A detached shell writes its pid on its own schedule, which can be
+    // after the run has ended.
     let pid = |name: &str| -> i32 {
-        let recorded = std::fs::read_to_string(base.join(name)).unwrap_or_default();
-        recorded.trim().parse().unwrap_or_else(|_| panic!("{name} never recorded its pid"))
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(base.join(name)).unwrap_or_default().trim().parse() {
+                return pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "{name} never recorded its pid");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     };
     let [alone, beside, plain, only] = names.map(pid);
     assert_eq!([alone, beside, plain, only].map(runs), [true, true, false, false], "the detached jobs run, the plain ones were stopped");
