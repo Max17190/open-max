@@ -918,8 +918,7 @@ async fn run_loop(
             reply.reasoning_content = result.reasoning_content.clone();
             reply.reasoning = result.reasoning.clone();
             reply.reasoning_details = result.reasoning_details.clone();
-            let signed_calls = tool_calls.iter().any(|c| c.extra_content.is_some());
-            if reply.reasoning_content.is_some() || reply.reasoning.is_some() || reply.reasoning_details.is_some() || signed_calls {
+            if reply.reasoning_content.is_some() || reply.reasoning.is_some() || reply.reasoning_details.is_some() || tool_calls.iter().any(|c| c.extra_content.is_some()) {
                 reply.reasoning_origin = Some(client.origin());
             }
             reply.reasoning_withheld = settings.strip_stored_reasoning && !capped && ![TRUNCATED, "cancelled"].contains(&result.finish_reason.as_str()) && reply.reasoning_is_plaintext();
@@ -3253,7 +3252,7 @@ mod tests {
 
     /// One turn of a plaintext-reasoning call, a signed-reasoning call, and
     /// the answer, with `strip_stored_reasoning` as given: each request body,
-    /// and the transcript.
+    /// and the transcript as loaded from the session file.
     async fn strip_turn(strip: bool) -> (Vec<String>, Vec<ChatMessage>) {
         use crate::state::Core;
 
@@ -3271,12 +3270,13 @@ mod tests {
             (s.base_url, s.model, s.context_tokens, s.approval_mode) = (base_url, "stub".into(), Some(16384), ApprovalMode::Auto);
             s.strip_stored_reasoning = strip;
         }
-        start_turn(core.clone(), "sess-strip".into(), project.clone(), "go".into()).unwrap();
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id.clone(), project.clone(), "go".into()).unwrap();
         assert_eq!(drive_turn(&mut rx).await.0, "stop");
         // The temporary directory is the only other difference between runs.
         let bodies: Vec<String> = bodies.lock().unwrap().iter().map(|b| b.replace(&dir.display().to_string(), "<dir>")).collect();
         assert_eq!(bodies.len(), 3, "two calls, then the answer");
-        let messages = transcript(&core, "sess-strip").await;
+        let messages = sessions::load_messages(&core, &id).unwrap().expect("the saved transcript");
         let _ = std::fs::remove_dir_all(dir);
         (bodies, messages)
     }
@@ -3340,12 +3340,14 @@ mod tests {
                 (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(16384), 1024);
                 (s.approval_mode, s.strip_stored_reasoning) = (ApprovalMode::Auto, true);
             }
-            start_turn(core.clone(), "sess-strip-cut".into(), project.clone(), "go".into()).unwrap();
+            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+            start_turn(core.clone(), id.clone(), project.clone(), "go".into()).unwrap();
             assert_eq!(drive_turn(&mut rx).await.0, "stop");
             let bodies = bodies.lock().unwrap().clone();
             assert_eq!(bodies.len(), 2, "the cut reply, then its continuation");
             assert_eq!(sent_replies(&bodies[1])[0][key], want, "{}", bodies[1]);
-            assert!(transcript(&core, "sess-strip-cut").await.iter().all(|m| !m.reasoning_withheld));
+            let saved = sessions::load_messages(&core, &id).unwrap().expect("the saved transcript");
+            assert!(saved.iter().all(|m| !m.reasoning_withheld) && saved.iter().any(|m| m.reasoning_content.as_deref().or(m.reasoning.as_deref()) == Some(want)));
             let _ = std::fs::remove_dir_all(dir);
         }
     }

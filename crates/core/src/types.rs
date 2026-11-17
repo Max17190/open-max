@@ -128,11 +128,9 @@ impl ChatMessage {
     /// The loop asks only of a complete reply: a cut, interrupted or cancelled
     /// one keeps its reasoning, because the next request continues that thought.
     pub(crate) fn reasoning_is_plaintext(&self) -> bool {
-        let any = self.reasoning_content.is_some() || self.reasoning.is_some() || self.reasoning_details.is_some();
-        if !any || self.tool_calls.iter().flatten().any(|c| c.extra_content.is_some()) {
-            return false;
-        }
-        self.reasoning_details.as_deref().is_none_or(|raw| {
+        (self.reasoning_content.is_some() || self.reasoning.is_some() || self.reasoning_details.is_some())
+            && !self.tool_calls.iter().flatten().any(|c| c.extra_content.is_some())
+            && self.reasoning_details.as_deref().is_none_or(|raw| {
             serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(raw.get()).is_ok_and(|blocks| {
                 blocks.iter().all(|b| {
                     b.get("type").and_then(serde_json::Value::as_str) == Some("reasoning.text")
