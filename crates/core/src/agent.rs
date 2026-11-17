@@ -4760,15 +4760,15 @@ mod tests {
         }
         let marks = |body: &Value| body["messages"].to_string().matches("[harness: clock:").count();
         assert!(off.iter().all(|body| marks(body) == 0), "no setting, no note");
-        // Rounds end past 1.1, 2.2 and 3.3 seconds: the 1 and 2 second marks each earn a note.
+        // Exact times are the pure function's to test (notes::elapsed_notes_fall_on_doubling_marks_once): rounds of
+        // at least 1.1 seconds pass the 1 second mark by the first tool result, whatever the runner's load.
         assert_eq!(marks(&on[0]), 0, "nothing before the first tool result");
-        assert!(marks(&on[1]) >= 1 && marks(&on[3]) >= 2, "{}", on[3]);
+        assert!(marks(&on[1]) >= 1, "{}", on[1]);
         for pair in on.windows(2) {
             let (before, after) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
             assert_eq!(before[..], after[..before.len()], "a note is stored once and never moved");
         }
-        let last = on[3]["messages"].to_string();
-        assert!(last.contains("this turn has run for 0 min 1 s.") && last.contains("this turn has run for 0 min 2 s."), "{last}");
+        assert!(on[3]["messages"].to_string().contains("this turn has run for 0 min"), "{}", on[3]);
 
         let _ = std::fs::remove_dir_all(root);
     }
