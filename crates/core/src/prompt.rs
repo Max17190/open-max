@@ -707,9 +707,14 @@ fn capped_agents_md(text: &str, cap: usize) -> String {
     let (mut fence, mut open_at_cut, mut dropped) = (None, None, Vec::new());
     for (i, line) in text.lines().chain([""]).enumerate() {
         open_at_cut = if i == n { fence } else { open_at_cut };
-        match (fence, ["```", "~~~"].into_iter().find(|m| line.trim_start().starts_with(m))) {
+        // A fence is a run of 3 or more backticks or tildes; only a bare run of the
+        // same character at least as long closes it.
+        let t = line.trim_start();
+        let run = t.chars().take_while(|&c| c == t.chars().next().unwrap_or(' ')).count();
+        let marker = (run >= 3 && (t.starts_with('`') || t.starts_with('~'))).then(|| &t[..run]);
+        match (fence, marker) {
             (None, Some(m)) => fence = Some(m),
-            (Some(open), Some(m)) if open == m => fence = None,
+            (Some(open), Some(m)) if m.starts_with(open) && t[run..].trim().is_empty() => fence = None,
             (None, None) if i >= n && line.starts_with('#') => dropped.push(crate::text::one_line(line.trim_start_matches('#').trim())),
             _ => {}
         }
@@ -1285,6 +1290,11 @@ mod tests {
         );
         // A cap that holds the file shows it as written.
         assert_eq!(capped_agents_md(&text, text.len()), text);
+        // A longer fence is closed by a run as long, and a shorter run inside
+        // it is part of the example, not its end.
+        let long = format!("````md\n```bash\n{}```\n````\n## After\n", "make test\n".repeat(300));
+        let cut = capped_agents_md(&long, MIN_AGENTS_MD_BYTES);
+        assert!(cut.contains("make test\n````\n[AGENTS.md cut: ") && cut.ends_with("Sections not shown: After. read_file AGENTS.md for the rest.]"), "{cut}");
     }
 
     /// The list of dropped sections is bounded however many there are.
