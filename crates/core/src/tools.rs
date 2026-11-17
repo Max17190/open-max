@@ -2262,8 +2262,15 @@ struct BashDeadline {
     requested: Option<u64>,
 }
 
+/// The wait a bash call asked for. `timeout` is read as another name for
+/// `timeout_secs`, in the same seconds: models often write it, and the
+/// dropped key ran their 300 or 600 second builds under the 120 second
+/// default. When a call names both, the longer one is the wait, so no call is
+/// stopped before a wait it asked for. The schema still names only
+/// `timeout_secs`, so the tool list every request carries is unchanged.
 fn bash_deadline(args: &Value) -> BashDeadline {
-    match arg(args, "timeout_secs", Value::as_u64) {
+    let asked = |key| arg(args, key, Value::as_u64);
+    match asked("timeout_secs").max(asked("timeout")) {
         None => BashDeadline { secs: BASH_DEFAULT_TIMEOUT_SECS, requested: None },
         Some(asked) if asked > BASH_MAX_TIMEOUT_SECS => {
             BashDeadline { secs: BASH_MAX_TIMEOUT_SECS, requested: Some(asked) }
@@ -3894,6 +3901,24 @@ mod tests {
     /// and a retry asked for the same deadline and was held again. The
     /// heading's wiring into a real timeout is covered by the unclamped
     /// timeout test; a clamped one would need a run of the whole ceiling.
+    /// `timeout` is the same wait as `timeout_secs`, in seconds and under the
+    /// same ceiling, and a call that names both waits the longer of the two.
+    #[test]
+    fn a_wait_named_timeout_is_read_as_timeout_secs() {
+        let deadline = |args: Value| {
+            let d = bash_deadline(&args);
+            (d.secs, d.requested)
+        };
+        assert_eq!(deadline(json!({"timeout": 300})), (300, None));
+        assert_eq!(deadline(json!({"timeout": "300"})), (300, None), "a quoted number reads as timeout_secs does");
+        assert_eq!(deadline(json!({"timeout": 0})), (1, None));
+        let asked = BASH_MAX_TIMEOUT_SECS + 300;
+        assert_eq!(deadline(json!({"timeout": asked})), (BASH_MAX_TIMEOUT_SECS, Some(asked)));
+        assert_eq!(deadline(json!({"timeout_secs": 30, "timeout": 300})), (300, None));
+        assert_eq!(deadline(json!({"timeout_secs": 300, "timeout": 30})), (300, None));
+        assert_eq!(deadline(json!({"timeout": "soon"})), (BASH_DEFAULT_TIMEOUT_SECS, None));
+    }
+
     #[test]
     fn a_bash_deadline_defaults_is_held_to_the_ceiling_and_says_so() {
         let unset = bash_deadline(&json!({}));

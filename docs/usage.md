@@ -171,7 +171,9 @@ resent. A connection that drops partway through a reply is asked for the
 whole reply again, at most twice in a row; nothing from the cut reply runs,
 and the fresh reply prints from the start of a new line. An address with nothing listening fails within seconds. A tool that
 runs past its own timeout is stopped and the turn goes on; a `bash` call is
-stopped after 120 seconds unless it sets `timeout_secs` (1 to 600); a larger
+stopped after 120 seconds unless it sets `timeout_secs` (1 to 600; a wait
+named `timeout` is read the same way, and a call that names both gets the
+longer); a larger
 request is held to 600, and if that command times out, its result names the
 ceiling and the number requested. A caller that
 needs a deadline sets one, for example the `timeout_secs` of the bash call

@@ -1195,11 +1195,19 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
 /// background processes were cut short, when it had started none. Members
 /// that exited and wait for a parent to collect them run nothing either
 /// ([`group_has_running_member`]).
+///
+/// Members that only wait on processes outside the group are stopped but
+/// not reported. `cd dir && setsid server &` leaves such a member: the
+/// subshell that ran the list waits on the server, which `setsid` moved to a
+/// session of its own. Stopping the subshell leaves the server running, so a
+/// note saying the background processes were terminated was false, and the
+/// caller started a second copy of a server that was still up.
 async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
     let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
     while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
-            return terminate_remaining_group(pid).await;
+            let only_waiters = left_only_waiters(pid);
+            return terminate_remaining_group(pid).await && !only_waiters;
         }
         tokio::time::sleep(GROUP_EXIT_POLL).await;
     }
@@ -2171,6 +2179,91 @@ fn only_exited_members(proc: &Path, group: u32) -> bool {
         }
     }
     found
+}
+
+/// True when every running member of the group that `pid` leads only waits
+/// on processes outside it ([`only_waiters_on_processes_outside`]). Where
+/// members cannot be read this way, members are taken to be the command's
+/// own work, as before.
+#[cfg(target_os = "linux")]
+fn left_only_waiters(pid: Option<u32>) -> bool {
+    pid.is_some_and(|group| only_waiters_on_processes_outside(Path::new("/proc"), group))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn left_only_waiters(_: Option<u32>) -> bool {
+    false
+}
+
+/// True when `proc` lists running members of `group` and each one is blocked
+/// waiting for a child, with every running child either outside the group or
+/// another such member. Stopping those members stops no work: what they wait
+/// on is not in the group and keeps running. A member that waits on a child
+/// still in the group, such as a subshell running `nohup server`, waits on
+/// work that the group's stop ends, so it is not one of them. The kernel
+/// names the function a blocked process sleeps in under `wchan`; a member
+/// whose `wchan` cannot be read counts as doing work.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn only_waiters_on_processes_outside(proc: &Path, group: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return false;
+    };
+    // (pid, parent, group) of every process that has not exited.
+    let mut running = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(positive_pid) else {
+            continue;
+        };
+        let stat = std::fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
+        let Some((parent, member_of, main_exited)) = stat_parent_and_group(&stat) else {
+            continue;
+        };
+        let exited = main_exited
+            && std::fs::read_dir(entry.path().join("task")).is_ok_and(|tasks| {
+                tasks.flatten().all(|task| {
+                    let stat = std::fs::read_to_string(task.path().join("stat")).unwrap_or_default();
+                    stat_group(&stat).is_some_and(|(_, exited)| exited)
+                })
+            });
+        if !exited {
+            running.push((pid, parent, member_of));
+        }
+    }
+    let members: Vec<u32> = running.iter().filter(|p| p.2 == group).map(|p| p.0).collect();
+    let mut waiters: Vec<u32> = members
+        .iter()
+        .copied()
+        .filter(|pid| {
+            let wchan = std::fs::read_to_string(proc.join(pid.to_string()).join("wchan")).unwrap_or_default();
+            matches!(wchan.trim(), "do_wait" | "kernel_wait4" | "kernel_waitid")
+        })
+        .collect();
+    // Drop a waiter with no running child, or with one in the group that is
+    // not itself a waiter, until none is dropped: a chain of subshells counts
+    // only when its last link waits outside the group.
+    loop {
+        let waits_outside = |waiter: u32| {
+            let mut children = running.iter().filter(|p| p.1 == waiter).peekable();
+            children.peek().is_some() && children.all(|p| p.2 != group || waiters.contains(&p.0))
+        };
+        let kept: Vec<u32> = waiters.iter().copied().filter(|w| waits_outside(*w)).collect();
+        if kept.len() == waiters.len() {
+            break;
+        }
+        waiters = kept;
+    }
+    !members.is_empty() && members.iter().all(|m| waiters.contains(m))
+}
+
+/// A process's parent and group from its `/proc` stat, and whether it reads
+/// Z. The command name in parentheses may hold spaces or parentheses, so the
+/// fields are read after its last `)`.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn stat_parent_and_group(stat: &str) -> Option<(u32, u32, bool)> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    let exited = fields.next()? == "Z";
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?, exited))
 }
 
 #[cfg(unix)]
@@ -3724,6 +3817,48 @@ mod tests {
         assert!(!only_exited_members(&proc, 78), "a group with no member found");
         process(102, 77, &[(102, "Z"), (103, "S")]);
         assert!(!only_exited_members(&proc, 77), "a thread of 102 still runs");
+        let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    /// Members that only wait on processes outside the group, directly or
+    /// through a chain of waiting members, stopped no work; a member that
+    /// waits on a child still in the group, or that does not wait, did. Read
+    /// from a made-up `/proc`, as a kernel names `wchan`.
+    #[cfg(unix)]
+    #[test]
+    fn only_members_waiting_outside_the_group_stop_no_work() {
+        let proc = std::env::temp_dir().join(format!("openmax-proc-{}", uuid::Uuid::new_v4()));
+        let process = |pid: u32, parent: u32, group: u32, wchan: &str| {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(dir.join("task")).unwrap();
+            std::fs::write(dir.join("stat"), format!("{pid} (sh) S {parent} {group} {group} 0 -1 0")).unwrap();
+            std::fs::write(dir.join("wchan"), wchan).unwrap();
+        };
+        // `cd dir && setsid job &`: a subshell in group 10 waits on a job in
+        // its own session.
+        process(11, 1, 10, "do_wait");
+        process(12, 11, 12, "hrtimer_nanosleep");
+        assert!(only_waiters_on_processes_outside(&proc, 10), "the subshell waits on a detached job");
+        // Another subshell waits on it, so the chain still ends outside.
+        process(13, 1, 10, "do_wait");
+        std::fs::write(proc.join("11").join("stat"), "11 (sh) S 13 10 10 0 -1 0").unwrap();
+        assert!(only_waiters_on_processes_outside(&proc, 10), "a chain that ends outside the group");
+        // `cd dir && nohup job &`: the job the subshell waits on is in the
+        // group, so stopping the group stops it.
+        process(21, 1, 20, "do_wait");
+        process(22, 21, 20, "hrtimer_nanosleep");
+        assert!(!only_waiters_on_processes_outside(&proc, 20), "the job is in the group");
+        // A member that waits on nothing it started, or does not wait.
+        process(31, 1, 30, "do_wait");
+        assert!(!only_waiters_on_processes_outside(&proc, 30), "a waiter with no child");
+        process(41, 1, 40, "0");
+        process(42, 41, 42, "hrtimer_nanosleep");
+        assert!(!only_waiters_on_processes_outside(&proc, 40), "a member whose wait cannot be read");
+        // A detached job beside a plain one: the plain one is work.
+        process(12, 11, 12, "hrtimer_nanosleep");
+        process(14, 1, 10, "ep_poll");
+        assert!(!only_waiters_on_processes_outside(&proc, 10), "a plain background job beside the detached one");
+        assert!(!only_waiters_on_processes_outside(&proc, 50), "a group with no member found");
         let _ = std::fs::remove_dir_all(&proc);
     }
 
