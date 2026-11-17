@@ -1355,8 +1355,8 @@ mod first_frame {
         assert!(shown.contains("stub-model"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto, "new trust grants already default to Auto");
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested none"));
-        assert!(shown.contains("requested none"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· none"));
+        assert!(shown.contains("· none"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
         s.write(b"/permissions\r");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("new project default"));
@@ -1367,8 +1367,8 @@ mod first_frame {
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
         assert_eq!(open_max_core::config::load(&data).unwrap().reasoning_effort, Some(open_max_core::config::ReasoningEffort::None));
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested minimal"));
-        assert!(shown.contains("requested minimal"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· minimal"));
+        assert!(shown.contains("· minimal"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
         s.write(b"/permissions ask\r");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: ask"));
@@ -1455,7 +1455,7 @@ mod first_frame {
         assert!(shown.lines().any(|line| line.contains("effort default") && line.contains("omit the request setting")), "{shown}");
         s.write(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: high"));
-        assert!(shown.contains("requested: high") && shown.contains("requested high"), "{shown}");
+        assert!(shown.contains("requested: high") && shown.contains("· high"), "{shown}");
         let settings_path = s.dir.join("home/.openmax/settings.json");
         let saved = || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&settings_path).unwrap()).unwrap();
         assert_eq!(saved()["reasoning_effort"], "high");

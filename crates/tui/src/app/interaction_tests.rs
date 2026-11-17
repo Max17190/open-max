@@ -672,7 +672,6 @@ fn usage_without_prompt_tokens_reports_no_cache_rate() {
     assert_eq!(app.cache_pct, Some(25));
     app.on_agent_event(AgentEvent::Usage { prompt_tokens: 0, completion_tokens: 3, cached_tokens: Some(0) });
     assert_eq!(app.cache_pct, None);
-    assert_eq!(app.generated_tokens, 10);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -914,8 +913,7 @@ fn small_pure_rules_hold_at_their_edges() {
     assert!(!rect_contains(rect, 1, 3) && !rect_contains(rect, 2, 2));
     assert_eq!(elapsed_label(Duration::from_millis(9_940)), "9.9s");
     assert_eq!(elapsed_label(Duration::from_secs(10)), "10s");
-    assert_eq!(wide_status_right("model", None, None, 0, "ask", 100), "model  ask ");
-    assert_eq!(wide_status_right("model", None, None, 1, "ask", 100), "model  out 1  ask ");
+    assert_eq!(wide_status_right("model", None, None, "ask", 100), "model  ask ");
 }
 
 #[test]
@@ -968,14 +966,13 @@ fn find_shows_six_previews_around_the_pick() {
 fn the_status_row_fits_each_width_and_redraws_when_it_changes() {
     let (mut app, dir) = app_fixture();
     app.core.settings.lock().unwrap().model = "test-model".into();
-    app.generated_tokens = 1_500;
     let status = |app: &mut App, width| {
         let (rows, _) = frame(app, width, 12);
         let border = rows.iter().position(|row| row.starts_with('╭')).unwrap();
         rows[border - 1].clone()
     };
     let wide = status(&mut app, 100);
-    assert!(wide.ends_with("test-model  out 1.5k  ask "), "{wide:?}");
+    assert!(wide.ends_with("test-model  ask "), "{wide:?}");
     assert!(wide.starts_with(" shift+tab effort · /permissions"), "{wide:?}");
 
     // A narrower frame with nothing else changed still lays the row out
