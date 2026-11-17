@@ -1226,7 +1226,7 @@ fn members_and_their_children_outside(group: u32) -> (Vec<String>, Vec<(u32, Str
 
 /// Pid, name, whether it exited (Z with no thread left), parent and group.
 fn proc_stat(dir: &Path) -> Option<(u32, String, bool, u32, u32)> {
-    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    let stat = String::from_utf8_lossy(&std::fs::read(dir.join("stat")).ok()?).into_owned();
     let (head, fields) = stat.rsplit_once(')')?;
     let ((pid, name), f) = (head.split_once(" (")?, fields.split_whitespace().take(3).collect::<Vec<_>>());
     let exited = *f.first()? == "Z" && std::fs::read_dir(dir.join("task")).is_ok_and(|threads| threads.count() <= 1);
@@ -2214,6 +2214,18 @@ mod tests {
 
     async fn stopped_any(pid: Option<u32>) -> bool {
         stop_what_was_left_running(pid).await.is_some()
+    }
+
+    /// A name Linux allows but UTF-8 does not still reads, so the process is
+    /// neither dropped from what still runs nor reported as stopped.
+    #[test]
+    fn a_process_whose_name_is_not_utf8_is_still_read() {
+        let dir = std::env::temp_dir().join(format!("openmax-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), b"4242 (srv\xff) S 17 4242 4242 0 -1").unwrap();
+        let read = proc_stat(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read, Some((4242, "srv\u{fffd}".to_string(), false, 17, 4242)));
     }
 
     fn request(program: &str, args: &[&str]) -> ProcessRequest {
