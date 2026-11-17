@@ -164,24 +164,10 @@ pub(crate) fn settings_drift_note(core: &Arc<Core>) -> Option<String> {
     })
 }
 
-/// The one canonical form of a policy notice. A notice is reported once per
-/// session, and that "already said it" set does not persist on its own: on
-/// resume it is rebuilt by parsing the notices back out of the transcript.
-/// Identity therefore has to be taken on exactly the text that gets persisted,
-/// and the text that gets persisted has to survive the round trip, which means
-/// a notice may not spell either of the two things the transcript uses to
-/// delimit it:
-///
-/// - a line break, which would forge a second clause in a user-role message
-///   the model reads as the human's own words; and
-/// - `NOTICE_JOINER`, which separates the notices inside one note. Rehydration
-///   splits on that literal, so a notice containing it was restored as
-///   fragments whose hashes matched nothing, and the session said it again
-///   after every resume. Collapsing it needs no escape/unescape
-///   machinery on this path: the delimiter simply cannot occur in a value.
-///
-/// Identity, persistence and display are all this one text, which is what
-/// makes the once-per-session promise hold across a resume.
+/// The one canonical form of a policy notice, said once per session: on resume the "already said" set is rebuilt
+/// from the transcript, so identity, persistence and display are all this text, which must survive the round
+/// trip. It may hold neither delimiter: a line break would forge a second clause in a user-role message, and
+/// `NOTICE_JOINER` would split it into fragments whose hashes match nothing, so it was said after every resume.
 pub(crate) fn canonical_notice(notice: &str) -> String {
     crate::text::one_line(notice).replace(NOTICE_JOINER, " / ")
 }
@@ -287,13 +273,8 @@ pub(crate) fn outside_approval_note(fresh: &[String]) -> String {
 /// in auto) takes what is on record as seen and narrates nothing: those
 /// grants predate anything this turn could have been told.
 ///
-/// An unverifiable ledger never reaches this point in a turn: the hook
-/// layer fails closed on the same state first and blocks the input entirely
-/// ("input blocked: the capability ledger cannot be read...", naming
-/// --ledger-repair), and the approvals cache that gate reads is keyed on the
-/// log's content hash, so a rewrite cannot serve it a stale pass. The Result
-/// keeps the API honest for callers that must not mistake "unreadable" for
-/// "no activity".
+/// An unverifiable ledger never gets here: the hook layer blocks the input first (naming --ledger-repair), with
+/// its cache keyed on the log's hash. The Result keeps "unreadable" apart from "no activity" for callers.
 pub(crate) async fn narrate_outside_approvals(
     core: &Arc<Core>,
     session_id: &str,
@@ -537,6 +518,12 @@ pub(crate) fn request_budget_note(budget: usize, used: usize, noted: &mut usize)
     *noted = mark;
     let (percent, left) = (used.saturating_mul(100) / budget.max(1), budget.saturating_sub(used));
     Some(format!("{BUDGET_NOTE_MARK} {used} of {budget} requests used ({percent}%), {left} left. Prioritize finishing and verifying the task.]"))
+}
+
+/// The clock note once `secs` passes a mark after `noted` (marks at `first` seconds, doubling; passed together, one note). No deadline.
+pub(crate) fn elapsed_note(first: u64, secs: u64, noted: &mut u64) -> Option<String> {
+    *noted = (0..32).map(|k| first << k).take_while(|&mark| mark <= secs).last().filter(|&mark| first > 0 && mark > *noted)?;
+    Some(format!("[harness: clock: this turn has run for {} min {} s. A run can be stopped at any time, and only results saved in their final place survive a stop.]", secs / 60, secs % 60))
 }
 
 /// The budget mark owed before request `used + 1`: one the last request
@@ -972,6 +959,22 @@ mod tests {
         let small: Vec<String> = (1..=5).filter_map(|used| request_budget_note(2, used, &mut noted)).collect();
         assert_eq!(small.len(), 2, "50% at 1, then 75, 90 and 100 together at 2: {small:?}");
         assert!(small[1].contains("2 of 2 requests used (100%)"), "{small:?}");
+    }
+
+    /// A note at each doubling of the first mark, once each, none before
+    /// it; marks passed in one step earn one note, for the latest.
+    #[test]
+    fn elapsed_notes_fall_on_doubling_marks_once() {
+        let mut noted = 0;
+        let said: Vec<(u64, String)> = (0..=1000).filter_map(|secs| elapsed_note(120, secs, &mut noted).map(|note| (secs, note))).collect();
+        assert_eq!(said.iter().map(|(secs, _)| *secs).collect::<Vec<_>>(), [120, 240, 480, 960]);
+        assert_eq!(said[0].1, "[harness: clock: this turn has run for 2 min 0 s. A run can be stopped at any time, and only results saved in their final place survive a stop.]");
+        assert!(said.iter().all(|(_, note)| !note.contains("left") && !note.contains("limit")), "no deadline: {said:?}");
+        let mut noted = 0;
+        assert!(elapsed_note(0, 500, &mut noted).is_none(), "0 is off");
+        assert!(elapsed_note(1, 70, &mut noted).unwrap().contains("run for 1 min 10 s."));
+        assert_eq!(noted, 64, "1, 2 ... 64 together earn one note, for 64");
+        assert!(elapsed_note(1, 100, &mut noted).is_none());
     }
 
     fn call() -> ToolCall {

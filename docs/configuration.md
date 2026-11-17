@@ -45,6 +45,16 @@ compaction summary do not. It is guidance only: it never ends a turn and
 changes no limit, and its notes ride the history, so the system prompt and
 tools are the same bytes with or without it.
 
+`elapsed_marks_secs` is optional and off when unset or 0. When set, it is the
+first of a series of marks in a turn's elapsed wall time, each twice the one
+before (120 gives 2, 4, 8, 16 minutes and so on). The first tool result after
+a mark carries a one-line note with how long the turn has run, and that a run
+can be stopped at any time with only results saved in their final place
+surviving. Marks passed together earn one note. It states no deadline, never
+ends a turn and changes no limit, and its notes ride the history like the
+request budget's, so the system prompt and tools are the same bytes with or
+without it.
+
 `agents_md_bytes` is how much of the project's `AGENTS.md` a new session's
 prompt carries. Unset, it scales with the context window: 2% of it at 4 bytes
 a token, at least 2,000 bytes and at most 20,000, so a 16k window carries

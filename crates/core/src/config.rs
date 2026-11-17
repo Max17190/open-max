@@ -153,6 +153,9 @@ pub struct Settings {
     /// changes a limit. Unset or 0 adds no note.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_budget: Option<usize>,
+    /// Seconds to the first elapsed-time mark of a turn, doubling after; see `notes::elapsed_note`. Unset or 0: off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_marks_secs: Option<u64>,
     /// Bytes of `AGENTS.md` a new session carries; unset scales with the window (`prompt::agents_md_cap`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents_md_bytes: Option<usize>,
@@ -188,6 +191,7 @@ impl Default for Settings {
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
             request_budget: None,
+            elapsed_marks_secs: None,
             agents_md_bytes: None,
         }
     }
@@ -541,6 +545,14 @@ mod tests {
 
     /// The request budget is off unless set, and unset it stays out of a
     /// saved file, so settings written by a build without it are unchanged.
+    #[test]
+    fn elapsed_marks_are_off_by_default_and_unwritten() {
+        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().elapsed_marks_secs, None);
+        assert!(!serde_json::to_string(&Settings::default()).unwrap().contains("elapsed_marks_secs"));
+        let configured: Settings = serde_json::from_str(r#"{"elapsed_marks_secs":120}"#).unwrap();
+        assert_eq!(configured.elapsed_marks_secs, Some(120));
+    }
+
     #[test]
     fn request_budget_is_off_by_default_and_unwritten() {
         assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().request_budget, None);

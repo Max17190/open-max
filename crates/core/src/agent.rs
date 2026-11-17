@@ -735,7 +735,8 @@ async fn run_loop(
     if let Some(budget) = request_budget {
         insert_startup_note(core, session_id, guard.messages(), crate::notes::request_budget_start_note(budget));
     }
-    let mut budget_noted = 0;
+    // Elapsed-time marks (`elapsed_marks_secs`) are said like budget marks: no deadline, and they end nothing.
+    let (mut budget_noted, clock_start, mut clock_noted) = (0, std::time::Instant::now(), 0);
     let mut repeats = RepeatTracker::default();
     // Cut replies with no call since the last reply the cap did not cut, those the limit could not grow after, and its doublings.
     let (mut cuts, mut stalled, mut raise, mut stops) = (0usize, 0usize, 0u32, Vec::new());
@@ -1453,10 +1454,9 @@ async fn run_loop(
         // Every call above executed; this only annotates the reply the model
         // reads next when the iteration repeated the previous one exactly.
         let streak = repeats.observe(&tool_calls, guard.messages());
-        if streak >= REPEAT_NOTE_AT {
-            append_and_emit_note(core, session_id, guard.messages(), &repeated_result_note(streak));
-        }
-        if let Some(text) = request_budget.and_then(|budget| crate::notes::request_budget_note(budget, iteration + 1, &mut budget_noted)) {
+        let budget = request_budget.and_then(|budget| crate::notes::request_budget_note(budget, iteration + 1, &mut budget_noted));
+        let clock = settings.elapsed_marks_secs.and_then(|first| crate::notes::elapsed_note(first, clock_start.elapsed().as_secs(), &mut clock_noted));
+        for text in [(streak >= REPEAT_NOTE_AT).then(|| repeated_result_note(streak)), budget, clock].into_iter().flatten() {
             append_and_emit_note(core, session_id, guard.messages(), &text);
         }
 
@@ -4719,6 +4719,56 @@ mod tests {
         let at = start.iter().position(|m| m["content"].as_str().is_some_and(|text| text.starts_with(BUDGET_NOTE_MARK)));
         assert!(at.is_some_and(|at| at < start.len() - 1 && start[at]["role"] == "user"), "the budget precedes the prompt: {start:?}");
         assert!(on[4]["messages"].to_string().contains("4 of 4 requests used (100%), 0 left"), "{}", on[4]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Elapsed-time marks ride notes on tool results, each stored once and
+    /// never moved, and leave the system prompt and tools byte for byte as a
+    /// turn without them sends them. Without the setting no request carries one.
+    #[tokio::test]
+    async fn elapsed_marks_ride_notes_and_leave_the_prefix_alone() {
+                use crate::state::Core;
+
+        const SLEEP_SSE: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 1.1\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut runs: Vec<Vec<Value>> = Vec::new();
+        for (n, marks) in [None, Some(1)].into_iter().enumerate() {
+            let (core, mut rx) = Core::new(root.join(format!("data-{n}"))).unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, bodies) = capturing_endpoint_times(SLEEP_SSE, 3).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(16384));
+                (s.approval_mode, s.elapsed_marks_secs) = (ApprovalMode::Auto, marks);
+            }
+            start_turn(core.clone(), format!("sess-clock-{n}"), project.clone(), "wait a little".into()).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop", "the clock never ends the turn");
+            runs.push(bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect());
+        }
+        let (off, on) = (&runs[0], &runs[1]);
+        assert_eq!((off.len(), on.len()), (4, 4), "three tool rounds and the answer, with or without marks");
+        for body in off.iter().chain(on) {
+            assert_eq!(body["messages"][0], off[0]["messages"][0], "the system prompt never moves");
+            assert_eq!(body["tools"], off[0]["tools"], "the tools never move");
+        }
+        let marks = |body: &Value| body["messages"].to_string().matches("[harness: clock:").count();
+        assert!(off.iter().all(|body| marks(body) == 0), "no setting, no note");
+        // Rounds end past 1.1, 2.2 and 3.3 seconds: the 1 and 2 second marks each earn a note.
+        assert_eq!(marks(&on[0]), 0, "nothing before the first tool result");
+        assert!(marks(&on[1]) >= 1 && marks(&on[3]) >= 2, "{}", on[3]);
+        for pair in on.windows(2) {
+            let (before, after) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
+            assert_eq!(before[..], after[..before.len()], "a note is stored once and never moved");
+        }
+        let last = on[3]["messages"].to_string();
+        assert!(last.contains("this turn has run for 0 min 1 s.") && last.contains("this turn has run for 0 min 2 s."), "{last}");
 
         let _ = std::fs::remove_dir_all(root);
     }
