@@ -239,13 +239,17 @@ pub(crate) struct ProcessOutput {
     pub log_path: Option<PathBuf>,
     /// True when either stream exceeded its configured spill cap.
     pub log_truncated: bool,
-    /// True when the command exited normally but left process-group members
+    /// Set when the command exited normally but left process-group members
     /// behind that this call then terminated. Only a NORMAL exit sets it: a
     /// cancel or a timeout kills the group by design and already says so.
     /// Callers must surface it, because the caller who backgrounded a server
     /// otherwise sees a clean exit and no server.
-    pub background_terminated: bool,
+    pub left_running: Option<LeftRunning>,
 }
+
+/// The group members a stop ended, and what they started outside it that still runs (Linux), as `name (pid)`.
+#[derive(Debug, Default)]
+pub(crate) struct LeftRunning { pub stopped: Vec<String>, pub detached: Vec<String> }
 
 #[derive(Debug)]
 pub(crate) enum ProcessError {
@@ -948,7 +952,7 @@ pub(crate) async fn run_process(
         }),
     };
 
-    let (termination, background_terminated) =
+    let (termination, left_running) =
         supervise_child(&mut child, pid, request.timeout, &cancel).await?;
     group.settled();
 
@@ -986,7 +990,7 @@ pub(crate) async fn run_process(
         stderr: stderr.stream,
         log_path,
         log_truncated,
-        background_terminated,
+        left_running,
     })
 }
 
@@ -1147,7 +1151,7 @@ async fn supervise_child(
     pid: Option<u32>,
     timeout: Duration,
     cancel: &CancelToken,
-) -> Result<(Termination, bool), ProcessError> {
+) -> Result<(Termination, Option<LeftRunning>), ProcessError> {
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
@@ -1159,16 +1163,16 @@ async fn supervise_child(
             // and the caller is handed a successful exit. Report it so the
             // caller learns the rule from the result instead of from a failing
             // request later.
-            let background_terminated = stop_what_was_left_running(pid).await;
-            Ok((Termination::Exited(status), background_terminated))
+            let left_running = stop_what_was_left_running(pid).await;
+            Ok((Termination::Exited(status), left_running))
         }
         _ = cancel.cancelled() => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::Cancelled, false))
+            Ok((Termination::Cancelled, None))
         }
         _ = tokio::time::sleep(timeout) => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::TimedOut, false))
+            Ok((Termination::TimedOut, None))
         }
     }
 }
@@ -1189,21 +1193,44 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
 }
 
 /// Stops what a command whose shell exited left running in its group, and
-/// returns true when there was any. Members that exit within
+/// says what when there was any. Members that exit within
 /// `LEFT_RUNNING_AFTER` were on their way out, not left running: reporting
 /// them told the caller of nearly every test run with a worker pool that its
 /// background processes were cut short, when it had started none. Members
 /// that exited and wait for a parent to collect them run nothing either
 /// ([`group_has_running_member`]).
-async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
+async fn stop_what_was_left_running(pid: Option<u32>) -> Option<LeftRunning> {
     let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
     while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
-            return terminate_remaining_group(pid).await;
+            let (stopped, mut detached) = pid.map(members_and_their_children_outside).unwrap_or_default();
+            terminate_remaining_group(pid).await.then_some(())?;
+            detached.retain(|(pid, _)| proc_stat(&Path::new("/proc").join(pid.to_string())).is_some_and(|s| !s.2));
+            return Some(LeftRunning { stopped, detached: detached.into_iter().map(|d| d.1).collect() });
         }
         tokio::time::sleep(GROUP_EXIT_POLL).await;
     }
-    false
+    None
+}
+
+/// The running members of `group`, and the running children they have outside
+/// it, read from `/proc`: none where there is no `/proc`.
+fn members_and_their_children_outside(group: u32) -> (Vec<String>, Vec<(u32, String)>) {
+    let entries = std::fs::read_dir("/proc").into_iter().flatten().flatten();
+    let running: Vec<_> = entries.filter_map(|entry| proc_stat(&entry.path())).filter(|p| !p.2).collect();
+    let named = |p: &(u32, String, bool, u32, u32)| format!("{} ({})", p.1, p.0);
+    let members: Vec<_> = running.iter().filter(|p| p.4 == group).collect();
+    let outside = running.iter().filter(|p| p.4 != group && members.iter().any(|m| m.0 == p.3)).map(|p| (p.0, named(p)));
+    (members.iter().copied().map(named).collect(), outside.collect())
+}
+
+/// Pid, name, whether it exited (Z with no thread left), parent and group.
+fn proc_stat(dir: &Path) -> Option<(u32, String, bool, u32, u32)> {
+    let stat = String::from_utf8_lossy(&std::fs::read(dir.join("stat")).ok()?).into_owned();
+    let (head, fields) = stat.rsplit_once(')')?;
+    let ((pid, name), f) = (head.split_once(" (")?, fields.split_whitespace().take(3).collect::<Vec<_>>());
+    let exited = *f.first()? == "Z" && std::fs::read_dir(dir.join("task")).is_ok_and(|threads| threads.count() <= 1);
+    Some((pid.parse().ok()?, name.into(), exited, f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
 }
 
 /// Returns true when group members outlived the leader and were terminated
@@ -2184,6 +2211,22 @@ fn signal_group(pid: Option<u32>, signal: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stopped_any(pid: Option<u32>) -> bool {
+        stop_what_was_left_running(pid).await.is_some()
+    }
+
+    /// A name Linux allows but UTF-8 does not still reads, so the process is
+    /// neither dropped from what still runs nor reported as stopped.
+    #[test]
+    fn a_process_whose_name_is_not_utf8_is_still_read() {
+        let dir = std::env::temp_dir().join(format!("openmax-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), b"4242 (srv\xff) S 17 4242 4242 0 -1").unwrap();
+        let read = proc_stat(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read, Some((4242, "srv\u{fffd}".to_string(), false, 17, 4242)));
+    }
 
     fn request(program: &str, args: &[&str]) -> ProcessRequest {
         ProcessRequest {
@@ -3605,7 +3648,7 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "background descendant survived process cleanup");
-        assert!(output.background_terminated, "a stopped background child was not reported");
+        assert!(output.left_running.is_some(), "a stopped background child was not reported");
     }
 
     /// A program whose helper exits just after it, as a test runner's worker
@@ -3646,7 +3689,7 @@ mod tests {
         program.wait().await.unwrap();
         drop(pipe);
         assert_eq!(said.read(&mut byte).await.unwrap(), 1, "the helper never saw its pipe close");
-        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), helper.wait());
+        let (reported, exited) = tokio::join!(stopped_any(group), helper.wait());
         assert_eq!(exited.unwrap().code(), Some(0), "the helper was stopped instead of exiting on its own");
         assert!(!reported, "a helper on its way out was reported as left running");
     }
@@ -3670,7 +3713,7 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "the daemonized process survived the call");
-        assert!(output.background_terminated, "the stopped daemon was not reported");
+        assert!(output.left_running.is_some(), "the stopped daemon was not reported");
     }
 
     /// A process group whose leader has exited and left `member` running in
@@ -3757,7 +3800,7 @@ mod tests {
         leader.wait().await.unwrap();
         until_exited(&worker).await;
         assert!(process_group_exists(Some(group)), "the zombie does not hold its group");
-        let reported = stop_what_was_left_running(Some(group)).await;
+        let reported = stopped_any(Some(group)).await;
         worker.wait().unwrap();
         assert!(!reported, "a group holding only a zombie was reported as left running");
     }
@@ -3773,7 +3816,7 @@ mod tests {
         zombie.process_group(i32::try_from(group.unwrap()).unwrap());
         let mut zombie = zombie.spawn().unwrap();
         until_exited(&zombie).await;
-        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+        let (reported, exited) = tokio::join!(stopped_any(group), member.wait());
         zombie.wait().unwrap();
         assert!(reported, "the running member was not reported");
         assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the running member was not stopped");
@@ -3795,7 +3838,7 @@ mod tests {
         for _ in 0..5 {
             let (group, mut member) = group_whose_leader_exited(&["sleep", "6845"]).await;
             let started = std::time::Instant::now();
-            let (found, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+            let (found, exited) = tokio::join!(stopped_any(group), member.wait());
             fastest = fastest.min(started.elapsed());
             assert!(found, "the background child was not found");
             assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the background child did not stop on SIGTERM");
