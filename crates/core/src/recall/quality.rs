@@ -248,7 +248,7 @@ fn build(core: &Core, project: &Path) -> HashMap<&'static str, String> {
             "config/nginx/upstream.conf".into(),
             "src/payment/charge.rs".into(),
         ],
-        user_snippets: vec!["fix the 502s".into()], prompts: Vec::new(),
+        user_snippets: vec!["fix the 502s".into()], prompts: Vec::new(), prompts_omitted: 0,
         digest: "[context note: keepalive fix across proxy, reaper, upstream]".into(),
     });
 

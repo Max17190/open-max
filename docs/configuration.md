@@ -45,6 +45,14 @@ compaction summary do not. It is guidance only: it never ends a turn and
 changes no limit, and its notes ride the history, so the system prompt and
 tools are the same bytes with or without it.
 
+`agents_md_bytes` is how much of the project's `AGENTS.md` a new session's
+prompt carries. Unset, it scales with the context window: 2% of it at 4 bytes
+a token, at least 2,000 bytes and at most 20,000, so a 16k window carries
+2,000 and a window of 256k tokens or more carries 20,000. A longer file is
+cut at the end of a line, an open code block is closed, and a closing line
+gives the bytes shown against the total and names the headings of the
+sections left out, so the model knows what to read.
+
 A missing settings file means defaults, and the default `base_url` and `model`
 are empty: endpoint resolution fails until `base_url`, `model` and
 `context_tokens` are set, here or through a named provider, and one error

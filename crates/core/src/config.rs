@@ -153,6 +153,9 @@ pub struct Settings {
     /// changes a limit. Unset or 0 adds no note.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_budget: Option<usize>,
+    /// Bytes of `AGENTS.md` a new session carries; unset scales with the window (`prompt::agents_md_cap`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents_md_bytes: Option<usize>,
 }
 
 /// A change across several files with its tests routinely takes more than
@@ -185,6 +188,7 @@ impl Default for Settings {
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),
             request_budget: None,
+            agents_md_bytes: None,
         }
     }
 }

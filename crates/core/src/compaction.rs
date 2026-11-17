@@ -59,6 +59,11 @@ const MAX_DIGEST_PROMPT_BYTES: usize = 1_000;
 /// What introduces those prompts in the note.
 const PROMPTS_LABEL: &str = "Later requests from the user, word for word, oldest first: ";
 
+/// Counts the prompts the cap left out, so the list does not read as complete.
+fn omitted_clause(omitted: usize) -> String {
+    if omitted == 0 { String::new() } else { format!("(earlier requests not shown: {omitted}; the archive has every one) ") }
+}
+
 /// Byte-capped take on a char boundary. Every note field, the notes, and the
 /// arguments a tool error quotes are budgeted in bytes (the
 /// estimator is bytes/4), and a plain byte slice could split a multibyte
@@ -84,6 +89,8 @@ pub(crate) struct CompactionDigest {
     /// The prompts of later turns the cut removed, whole, oldest first
     /// (`MAX_DIGEST_PROMPT_BYTES` applies when the note is written).
     prompts: Vec<String>,
+    /// Prompts earlier notes left out (`CompactionRecord::prompts_omitted`).
+    prompts_omitted: usize,
     /// Every message as dropped, in transcript order, held for the notes
     /// request and the archive append.
     dropped: Vec<ChatMessage>,
@@ -145,6 +152,7 @@ impl CompactionDigest {
         // Older than anything this cut removed. Uncapped here: the note's
         // cap keeps the newest, and the record keeps what the note shows.
         self.prompts.splice(0..0, prior.prompts.iter().cloned());
+        self.prompts_omitted = prior.prompts_omitted;
         for tool in &prior.tools {
             if self.tools.len() >= MAX_DIGEST_TOOLS {
                 break;
@@ -169,9 +177,12 @@ impl CompactionDigest {
 
     /// The prompts the note carries: the newest within
     /// `MAX_DIGEST_PROMPT_BYTES` counting each one's separator, in order, and
-    /// when even the newest alone is over it, that one cut short and marked.
-    fn shown_prompts(&self) -> Vec<String> {
-        let mut room = MAX_DIGEST_PROMPT_BYTES;
+    /// when even the newest alone is over it, that one cut short and marked;
+    /// and how many this and earlier notes left out, whose clause the cap pays for.
+    fn shown_prompts(&self) -> (Vec<String>, usize) {
+        let fits = self.prompts_omitted == 0 && self.prompts.iter().map(|p| p.len() + 3).sum::<usize>() <= MAX_DIGEST_PROMPT_BYTES;
+        let cap = MAX_DIGEST_PROMPT_BYTES - if fits { 0 } else { omitted_clause(usize::MAX).len() };
+        let mut room = cap;
         let mut shown = Vec::new();
         for prompt in self.prompts.iter().rev() {
             if prompt.len() + 3 <= room {
@@ -180,19 +191,20 @@ impl CompactionDigest {
             } else {
                 if shown.is_empty() {
                     let mark = " [cut short; the archive has it whole]";
-                    shown.push(take_note_bytes(prompt, MAX_DIGEST_PROMPT_BYTES - 3 - mark.len()) + mark);
+                    shown.push(take_note_bytes(prompt, cap - 3 - mark.len()) + mark);
                 }
                 break;
             }
         }
+        let omitted = self.prompts_omitted + self.prompts.len() - shown.len();
         shown.reverse();
-        shown
+        (shown, omitted)
     }
 
     /// The bytes the prompts take in the note, label and separators included.
     fn prompts_room(&self) -> usize {
-        let shown = self.shown_prompts();
-        if shown.is_empty() { 0 } else { PROMPTS_LABEL.len() + shown.iter().map(|p| p.len() + 3).sum::<usize>() }
+        let (shown, omitted) = self.shown_prompts();
+        if shown.is_empty() { 0 } else { PROMPTS_LABEL.len() + omitted_clause(omitted).len() + shown.iter().map(|p| p.len() + 3).sum::<usize>() }
     }
 
     /// The note a cut leaves. The model's own notes take the place of the
@@ -214,9 +226,9 @@ impl CompactionDigest {
         if !self.paths.is_empty() {
             parts.push(format!("Files touched: {}.", self.paths.join(", ")));
         }
-        let prompts = self.shown_prompts();
+        let (prompts, omitted) = self.shown_prompts();
         if !prompts.is_empty() {
-            parts.push(format!("{PROMPTS_LABEL}{}.", prompts.join(" | ")));
+            parts.push(format!("{PROMPTS_LABEL}{}{}.", omitted_clause(omitted), prompts.join(" | ")));
         }
         if summary.is_none() && !self.user_snippets.is_empty() {
             parts.push(format!(
@@ -232,13 +244,15 @@ impl CompactionDigest {
     }
 
     fn to_record(&self, digest: String) -> sessions::CompactionRecord {
+        let (prompts, prompts_omitted) = self.shown_prompts();
         sessions::CompactionRecord {
             ts: sessions::unix_now(),
             message_count: self.message_count,
             tools: self.tools.iter().cloned().collect(),
             paths: self.paths.clone(),
             user_snippets: self.user_snippets.clone(),
-            prompts: self.shown_prompts(),
+            prompts,
+            prompts_omitted,
             digest,
         }
     }
@@ -1209,7 +1223,7 @@ pub(crate) mod tests {
                 paths: std::iter::once("p".repeat(MAX_DIGEST_PATH_BYTES + 1))
                     .chain((0..MAX_DIGEST_PATHS).map(|i| format!("{}{i:02}", "p".repeat(MAX_DIGEST_PATH_BYTES - 2))))
                     .collect(),
-                user_snippets: Vec::new(), prompts: Vec::new(),
+                user_snippets: Vec::new(), prompts: Vec::new(), prompts_omitted: 0,
                 digest: String::new(),
             });
             let reply = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}]}}\n\n", "s".repeat(MAX_SUMMARY_BYTES * 2));
@@ -1305,7 +1319,7 @@ pub(crate) mod tests {
             message_count: 4,
             tools: vec!["bash".into(), "grep".into()],
             paths: (0..20).map(|i| format!("src/old_{i}.rs")).collect(),
-            user_snippets: vec!["earlier ask".into()], prompts: Vec::new(),
+            user_snippets: vec!["earlier ask".into()], prompts: Vec::new(), prompts_omitted: 0,
             digest: "[context note: 4 earlier messages were compacted.".into(),
         };
         digest.absorb_prior(&prior);
@@ -1635,7 +1649,7 @@ pub(crate) mod tests {
             message_count: 9,
             tools: vec!["x".repeat(50_000), "€".repeat(100)],
             paths: vec!["y".repeat(50_000), "Ā".repeat(200)],
-            user_snippets: Vec::new(), prompts: Vec::new(),
+            user_snippets: Vec::new(), prompts: Vec::new(), prompts_omitted: 0,
             digest: String::new(),
         });
         assert_eq!(digest.tools.iter().cloned().collect::<Vec<_>>(), vec!["read_file"]);
@@ -2438,7 +2452,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("http://127.0.0.1:9");
         sessions::append_compaction(&fixture.core, &fixture.id, &sessions::CompactionRecord {
             ts: 0, message_count: 1, tools: Vec::new(), paths: Vec::new(), user_snippets: Vec::new(),
-            prompts: vec![LATER.to_string()], digest: String::new(),
+            prompts: vec![LATER.to_string()], prompts_omitted: 0, digest: String::new(),
         });
         let mut messages = session(30, 2_000);
         messages.push(prompt(CURRENT));
@@ -2448,6 +2462,51 @@ pub(crate) mod tests {
         assert!(fixture.cut(&mut messages, 20_000, 20_000, &mut RequestSpend::new(None)).await > 0);
         let note = messages[pinned_head(&messages)].content.clone().unwrap();
         assert!(note.contains(&format!("oldest first: {LATER} | {CURRENT}.")), "{note}");
+    }
+
+    /// The scripted multi-turn check: turns that each add a constraint, then
+    /// cuts the window forces. Every constraint stays in context: in the note
+    /// word for word, or counted there as not shown with the archive that
+    /// holds it, so the list never reads as complete when it is not, and the
+    /// count carries across cuts though the record keeps only what it shows.
+    #[tokio::test]
+    async fn constraints_from_later_turns_stay_in_context_across_cuts() {
+        let constraint = |i: usize| format!("Constraint {i}: {}", format!("never touch module_{i} ").repeat(18));
+        assert!((0..8).all(|i| (390..410).contains(&constraint(i).len())));
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        let mut messages = session(10, 2_000);
+        for i in 0..6 {
+            messages.push(prompt(&constraint(i)));
+            messages.extend((10 * (i + 1)..10 * (i + 2)).flat_map(|j| exchange(j, 2_000)));
+        }
+        messages.push(prompt("Now run the tests."));
+        messages.extend((70..74).flat_map(|i| exchange(i, 2_000)));
+        assert!(fixture.cut(&mut messages, 20_000, 20_000, &mut RequestSpend::new(None)).await > 0);
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        assert!(note.contains(&format!("oldest first: (earlier requests not shown: 4; the archive has every one) {} | {}.", constraint(4), constraint(5))), "{note}");
+        let archive = sessions::load_archive(&fixture.core, &fixture.id);
+        for i in 0..4 {
+            assert!(!note.contains(&constraint(i)));
+            assert!(archive.iter().any(|m| m.content.as_deref() == Some(constraint(i).as_str())), "the archive holds constraint {i}");
+        }
+        let record = sessions::last_compaction(&fixture.core, &fixture.id).unwrap();
+        assert_eq!((record.prompts.len(), record.prompts_omitted), (2, 4));
+
+        // One more request, then another cut: the count grows by the one the
+        // new request pushes out, though the record held only two.
+        messages.push(prompt(&constraint(6)));
+        messages.extend((80..110).flat_map(|i| exchange(i, 2_000)));
+        messages.push(prompt("Ship it."));
+        messages.extend((110..114).flat_map(|i| exchange(i, 2_000)));
+        assert!(fixture.cut(&mut messages, 20_000, 20_000, &mut RequestSpend::new(None)).await > 0);
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        let shown = format!("(earlier requests not shown: 5; the archive has every one) {} | Now run the tests. | {}.", constraint(5), constraint(6));
+        assert!(note.contains(&shown), "{note}");
+        assert!(messages.iter().any(|m| m.content.as_deref() == Some("Ship it.")), "the turn in progress keeps its prompt");
+
+        // With room for every request, the label adds nothing.
+        let digest = CompactionDigest { prompts: vec!["a".into(), "b".into()], ..Default::default() };
+        assert!(digest.format(None, None).contains("oldest first: a | b."));
     }
 
     /// The notes request states the byte cap the notes are cut at.

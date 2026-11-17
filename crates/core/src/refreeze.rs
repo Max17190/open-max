@@ -52,7 +52,7 @@ pub async fn reload_session(
     let mut registry = tokio::task::spawn_blocking(move || Registry::from_snapshot(snapshot))
         .await
         .map_err(|e| format!("reload discovery failed: {e}"))?;
-    let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+    let (prompt, note, breakdown) = session_context(project_root, &mut registry, crate::prompt::agents_md_cap(&core.settings.lock().unwrap(), &core.data_dir));
 
     ensure_session_hydrated(core, session_id, project_root).await?;
 
