@@ -365,13 +365,6 @@ pub struct App {
     budget: Option<(usize, usize)>,
     /// Prompt-cache hit rate of the last completion, from server usage.
     cache_pct: Option<u8>,
-    /// Completion tokens generated since this app run started (or /new),
-    /// summed from Usage events. A live meter for the status line, not an
-    /// accounting record: a resumed session counts from the resume, and
-    /// /context stays the audited view. Prompt tokens are deliberately not
-    /// summed; every request resends the history, so their sum measures
-    /// resending, not work, and cache% already tells the input story.
-    generated_tokens: u64,
     quit_armed: bool,
     spinner_i: usize,
     tick_i: u64,
@@ -763,7 +756,6 @@ impl App {
             last_assistant_response: None,
             budget: None,
             cache_pct: None,
-            generated_tokens: 0,
             quit_armed: false,
             spinner_i: 0,
             tick_i: 0,
@@ -984,7 +976,6 @@ impl App {
         self.last_assistant_response = None;
         self.budget = None;
         self.cache_pct = None;
-        self.generated_tokens = 0;
         self.completion = None;
         self.history_search = None;
         self.scroll_search = None;
@@ -2758,14 +2749,13 @@ impl App {
                 self.budget = Some((used_tokens, context_tokens));
                 self.dirty.mark_chrome();
             }
-            AgentEvent::Usage { prompt_tokens, completion_tokens, cached_tokens } => {
+            AgentEvent::Usage { prompt_tokens, cached_tokens, .. } => {
                 self.cache_pct = match cached_tokens {
                     Some(c) if prompt_tokens > 0 => {
                         Some(((c as f64 / prompt_tokens as f64) * 100.0).round() as u8)
                     }
                     _ => None,
                 };
-                self.generated_tokens += completion_tokens;
                 self.dirty.mark_chrome();
             }
             AgentEvent::ToolStart { call_id, name, args } => {
@@ -3712,8 +3702,8 @@ impl App {
             let short_model = extensions::short_model(&model);
             let billed_model = self.chatgpt_account.as_ref().map(|account| format!("Using ChatGPT plan ({account}) · {short_model}"));
             let short_model = billed_model.as_deref().unwrap_or(short_model);
-            let requested = effort.map(|level| format!("{short_model} · requested {}", level.as_str()));
-            let short_model = requested.as_deref().unwrap_or(short_model);
+            let with_effort = effort.map(|level| format!("{short_model} · {}", level.as_str()));
+            let short_model = with_effort.as_deref().unwrap_or(short_model);
             // The widest tier labels its numbers: two unlabeled percents
             // (context fill, cache hits) would be indistinguishable. The
             // narrower tiers keep their historical shapes.
@@ -3722,7 +3712,6 @@ impl App {
                     short_model,
                     self.budget,
                     self.cache_pct,
-                    self.generated_tokens,
                     &approvals,
                     width,
                 )
@@ -3882,12 +3871,11 @@ enum Presence {
 /// The widest status tier: the labeled metrics and the approval mode are the
 /// point of the tier, so the tail is built first and the model id gives way,
 /// clipped to the width the tail leaves over. Rendering the full id let a
-/// long model name push ctx, cache, out, and the approval mode off the row.
+/// long model name push ctx, cache, and the approval mode off the row.
 fn wide_status_right(
     short_model: &str,
     budget: Option<(usize, usize)>,
     cache_pct: Option<u8>,
-    generated_tokens: u64,
     approvals: &str,
     width: usize,
 ) -> String {
@@ -3899,27 +3887,9 @@ fn wide_status_right(
     if let Some(cache) = cache_pct {
         tail.push_str(&format!("  cache {cache}%"));
     }
-    if generated_tokens > 0 {
-        tail.push_str(&format!("  out {}", compact_count(generated_tokens)));
-    }
     tail.push_str(&format!("  {approvals} "));
     let model_max = width.saturating_sub(crate::ui::text::width(&tail));
     format!("{}{tail}", clip(short_model, model_max))
-}
-
-/// Humanized token count for the status line: `842`, `16.8k`, `2.4M`,
-/// with a whole `.0` dropped (`17k`, never `17.0k`).
-fn compact_count(n: u64) -> String {
-    let (value, suffix) = if n >= 1_000_000 {
-        (n as f64 / 1e6, "M")
-    } else if n >= 1_000 {
-        (n as f64 / 1e3, "k")
-    } else {
-        return n.to_string();
-    };
-    let s = format!("{value:.1}");
-    let s = s.strip_suffix(".0").unwrap_or(&s);
-    format!("{s}{suffix}")
 }
 
 fn project_label(project: &std::path::Path) -> String {
@@ -4494,7 +4464,7 @@ mod tests {
         approval_card_lines, approval_choice_hit_regions, command_parts, compact_approval_lines,
         wrap_str_preserving,
         conversation_layout, elapsed_label, header_path_line, help_line, home_shortened, kv,
-        compact_count, is_shift_tab, paint_text_selection, parse_change_counts, plural,
+        is_shift_tab, paint_text_selection, parse_change_counts, plural,
         wide_status_right,
         model_selection, paint_pacing, presence_title, rect_contains, turn_end_rings,
         draw_frame, App, Dirty, Focus, Mode, Paint, Presence, TermEvent, Wake, MIN_DRAW_INTERVAL, TICK,
@@ -8044,28 +8014,19 @@ mod tests {
         let long =
             "org/some-preview-model-with-an-extremely-long-identifier-2026-08-26-instruct";
         let right =
-            wide_status_right(long, Some((50_000, 100_000)), Some(93), 12_500, "auto", 100);
+            wide_status_right(long, Some((50_000, 100_000)), Some(93), "auto", 100);
         assert!(crate::ui::text::width(&right) <= 100, "fits the row: {right}");
-        for label in ["ctx 50%", "cache 93%", "out", "auto"] {
+        for label in ["ctx 50%", "cache 93%", "auto"] {
             assert!(right.contains(label), "{label} survives: {right}");
         }
         // A short id is untouched: the tier's historical shape holds.
         let short =
-            wide_status_right("gpt-x", Some((50_000, 100_000)), Some(93), 12_500, "auto", 100);
+            wide_status_right("gpt-x", Some((50_000, 100_000)), Some(93), "auto", 100);
         assert!(short.starts_with("gpt-x  ctx 50%"), "{short}");
     }
 
     #[test]
-    fn compact_counts_read_like_a_human_wrote_them() {
-        assert_eq!(compact_count(842), "842");
-        assert_eq!(compact_count(1_000), "1k");
-        assert_eq!(compact_count(16_842), "16.8k");
-        assert_eq!(compact_count(17_000), "17k");
-        assert_eq!(compact_count(2_400_000), "2.4M");
-    }
-
-    #[test]
-    fn wide_status_line_labels_context_cache_and_generated_tokens() {
+    fn wide_status_line_labels_context_and_cache() {
         let (mut app, dir) = app_fixture();
         app.on_agent_event(AgentEvent::Budget {
             used_tokens: 50_000,
@@ -8080,8 +8041,8 @@ mod tests {
         let status = rows(&buffer).into_iter().rev().find(|r| r.contains("ctx")).unwrap();
         assert!(status.contains("ctx 25%"), "status: {status}");
         assert!(status.contains("cache 87%"), "status: {status}");
-        assert!(status.contains("out 16.8k"), "status: {status}");
-        // A second usage report accumulates generation, so the meter moves.
+        assert!(!status.contains("out "), "status: {status}");
+        // A second usage report moves the cache meter.
         app.on_agent_event(AgentEvent::Usage {
             prompt_tokens: 12_000,
             completion_tokens: 158,
@@ -8089,7 +8050,6 @@ mod tests {
         });
         let buffer = render_app(&mut app, 120, 12);
         let status = rows(&buffer).into_iter().rev().find(|r| r.contains("ctx")).unwrap();
-        assert!(status.contains("out 17k"), "status: {status}");
         assert!(status.contains("cache 100%"), "status: {status}");
         // The historical 78-column tier keeps its unlabeled shape.
         let buffer = render_app(&mut app, 80, 12);
