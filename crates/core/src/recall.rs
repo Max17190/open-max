@@ -1230,7 +1230,7 @@ mod tests {
             message_count: 2,
             tools: vec!["edit_file".into()],
             paths: vec!["infra/nginx.conf".into()],
-            user_snippets: vec![], prompts: Vec::new(),
+            user_snippets: vec![], prompts: Vec::new(), prompts_omitted: 0,
             digest: "[context note: wired the healthcheck port]".into(),
         });
         std::fs::create_dir_all(project.join(".openmax/memory")).unwrap();
@@ -1288,7 +1288,7 @@ mod tests {
                 message_count: 1,
                 tools: vec![],
                 paths: vec![path.into()],
-                user_snippets: vec![], prompts: Vec::new(),
+                user_snippets: vec![], prompts: Vec::new(), prompts_omitted: 0,
                 digest: format!("[context note: edited {path}]"),
             });
             if path.contains("nginx") {
@@ -1751,7 +1751,7 @@ mod tests {
             message_count: 1,
             tools: vec![],
             paths: vec!["infra/nginx.conf".into()],
-            user_snippets: vec![], prompts: Vec::new(),
+            user_snippets: vec![], prompts: Vec::new(), prompts_omitted: 0,
             digest: "[context note: edited nginx]".into(),
         });
         let c = collect_chunks(&core, &project, sessions::unix_now(), 2_000, &[]);
@@ -2319,7 +2319,7 @@ mod tests {
                 message_count: 1,
                 tools: vec![],
                 paths: vec!["infra/nginx.conf".into()],
-                user_snippets: vec![], prompts: Vec::new(),
+                user_snippets: vec![], prompts: Vec::new(), prompts_omitted: 0,
                 digest: "[context note: probe wiring]".into(),
             });
             for i in 0..noise {

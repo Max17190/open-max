@@ -1531,7 +1531,7 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         let started = Instant::now();
         let mut registry = Registry::build(&data, &project);
         let built = Instant::now();
-        let (prompt, _, _) = open_max_core::prompt::session_context(&project, &mut registry);
+        let (prompt, _, _) = open_max_core::prompt::session_context(&project, &mut registry, open_max_core::prompt::MIN_AGENTS_MD_BYTES);
         let prompted = Instant::now();
         let hooks = Hooks::discover_for_mode(&project, &data, ApprovalMode::Ask);
         let hooked = Instant::now();
