@@ -210,6 +210,9 @@ struct CliArgs {
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
     prompts: Vec<String>,
+    /// Every command-line word that is prompt text, as given, for
+    /// `hide_from_command_line`.
+    prompt_words: Vec<String>,
 }
 
 fn parse_args() -> Result<CliArgs, lexopt::Error> {
@@ -258,6 +261,7 @@ where
         subagent: None,
         worktree: false,
         prompts: Vec::new(),
+        prompt_words: Vec::new(),
     };
     // Tokens for the current -p group; flushed into prompts on the next -p or end.
     let mut current: Vec<String> = Vec::new();
@@ -335,7 +339,9 @@ where
                 if let Some(target) = target.filter(|target| target.is_none() && current.is_empty() && !out.print) {
                     *target = Some(v.string()?);
                 } else {
-                    current.push(v.string()?);
+                    let word = v.string()?;
+                    out.prompt_words.push(word.clone());
+                    current.push(word);
                 }
             }
             _ if out.mcp_list || out.mcp_call => {
@@ -495,6 +501,8 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         subagent,
         worktree,
         prompts,
+        // The words `prompts` is made of; not a flag of its own.
+        prompt_words: _,
     } = cli;
     // Each operation, named by its flag. `--check --stdio` is one operation
     // of its own: validating a protocol stream on stdin.
@@ -694,6 +702,9 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         }
     };
 
+    // While this is the only thread, and before any tool or hook can run.
+    hide_from_command_line(cli.prompt_words.iter().chain(&cli.subagent));
+
     if let Some(file) = &cli.replay {
         std::process::exit(replay(std::path::Path::new(file)));
     }
@@ -711,6 +722,62 @@ fn main() -> std::io::Result<std::process::ExitCode> {
     }
     runtime(None, runtime_workers(&cli)).block_on(run(cli))
 }
+
+/// Blank each argv word that equals one of `words` (the prompt and a
+/// `--subagent` task) in this process's command line, as `/proc/<pid>/cmdline`
+/// shows it to `ps`, `pgrep -f` and `pkill -f`. A task names the processes it
+/// asks for ("write /app/pystan_analysis.py"), so a prompt left there makes
+/// a tool's `pkill -f pystan_analysis` stop the run itself: two
+/// Terminal-Bench trials ended that way, at exit 143. The program and its
+/// options stay listed. Linux only, where the kernel names the argument
+/// block's bounds in `/proc/self/stat`; elsewhere, and on any read that
+/// fails, the command line is left as it is. `main` has read its arguments
+/// before this, and nothing reads them after.
+#[cfg(target_os = "linux")]
+fn hide_from_command_line<'a>(words: impl Iterator<Item = &'a String>) {
+    let words: Vec<&[u8]> = words.map(|w| w.as_bytes()).filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return;
+    }
+    let Some((start, end)) = std::fs::read_to_string("/proc/self/stat").ok().and_then(|stat| {
+        // After the command name's closing parenthesis, field 3 comes first;
+        // arg_start and arg_end are fields 48 and 49.
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace().skip(45);
+        Some((fields.next()?.parse::<usize>().ok()?, fields.next()?.parse::<usize>().ok()?))
+    }) else {
+        return;
+    };
+    if start == 0 || end <= start {
+        return;
+    }
+    // SAFETY: [start, end) is this process's argument block, which the kernel
+    // placed on the main thread's stack at exec and which stays mapped and
+    // writable for the process's life. No other thread runs yet, and no
+    // reference into it is held: the standard library keeps raw pointers to
+    // it and copies a word out only when the arguments are read, which
+    // `main` has finished.
+    let block = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, end - start) };
+    for word in block.split_mut(|b| *b == 0).skip(1) {
+        if let Some(hidden) = hidden_part(word, &words) {
+            word[hidden].fill(0);
+        }
+    }
+}
+
+/// The bytes of argv word `word` that are one of `words`: the whole word, or
+/// the value of an option given as `--option=<value>` (`--subagent=<task>`),
+/// whose name stays listed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn hidden_part(word: &[u8], words: &[&[u8]]) -> Option<std::ops::Range<usize>> {
+    if words.contains(&word) {
+        return Some(0..word.len());
+    }
+    let value = word.strip_prefix(b"--")?.iter().position(|b| *b == b'=')? + 3;
+    words.contains(&&word[value..]).then_some(value..word.len())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hide_from_command_line<'a>(_: impl Iterator<Item = &'a String>) {}
 
 /// The worker threads of a print or stdio run's runtime. Its frontend, which
 /// writes the events and waits on a quit or on a stop's deadline, runs on the
@@ -3561,6 +3628,25 @@ mod tests {
         (&["--mcp-call"], "--mcp-call"),
         (&["--subagent", "x", "--worktree"], "--subagent"),
     ];
+
+    /// The words `main` hides from the command line are found whether given
+    /// as their own argument or attached to their option, and an option's
+    /// name stays listed.
+    #[test]
+    fn a_hidden_word_is_found_alone_or_attached_to_its_option() {
+        let cli = cli_of(&["--subagent=stop the pystan_analysis job", "--worktree"]);
+        let task = cli.subagent.clone().unwrap();
+        let words: Vec<&[u8]> = vec![task.as_bytes()];
+        let attached = b"--subagent=stop the pystan_analysis job";
+        assert_eq!(hidden_part(attached, &words), Some(11..attached.len()));
+        assert_eq!(hidden_part(task.as_bytes(), &words), Some(0..task.len()));
+        assert_eq!(hidden_part(b"--worktree", &words), None);
+        assert_eq!(hidden_part(b"--model=stop the pystan_analysis", &words), None);
+        let cli = cli_of(&["-p", "stop", "the pystan_analysis job"]);
+        let words: Vec<&[u8]> = cli.prompt_words.iter().map(|w| w.as_bytes()).collect();
+        assert_eq!(hidden_part(b"the pystan_analysis job", &words), Some(0..23));
+        assert_eq!(hidden_part(b"-p", &words), None);
+    }
 
     /// Whether a refusal names `flag` as a whole flag, so `--ledger` is not
     /// satisfied by `--ledger-repair`.
