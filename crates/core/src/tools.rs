@@ -2262,11 +2262,9 @@ struct BashDeadline {
     requested: Option<u64>,
 }
 
-/// `timeout`, which models often write, is the same wait as `timeout_secs`;
-/// with both, the longer one counts. The schema names only `timeout_secs`.
+/// `timeout`, which models often write, is `timeout_secs` (the schema's name); with both, the longer counts.
 fn bash_deadline(args: &Value) -> BashDeadline {
-    let asked = |key| arg(args, key, Value::as_u64);
-    match asked("timeout_secs").max(asked("timeout")) {
+    match arg(args, "timeout_secs", Value::as_u64).max(arg(args, "timeout", Value::as_u64)) {
         None => BashDeadline { secs: BASH_DEFAULT_TIMEOUT_SECS, requested: None },
         Some(asked) if asked > BASH_MAX_TIMEOUT_SECS => {
             BashDeadline { secs: BASH_MAX_TIMEOUT_SECS, requested: Some(asked) }
@@ -3897,24 +3895,6 @@ mod tests {
     /// and a retry asked for the same deadline and was held again. The
     /// heading's wiring into a real timeout is covered by the unclamped
     /// timeout test; a clamped one would need a run of the whole ceiling.
-    /// `timeout` is the same wait as `timeout_secs`, in seconds and under the
-    /// same ceiling, and a call that names both waits the longer of the two.
-    #[test]
-    fn a_wait_named_timeout_is_read_as_timeout_secs() {
-        let deadline = |args: Value| {
-            let d = bash_deadline(&args);
-            (d.secs, d.requested)
-        };
-        assert_eq!(deadline(json!({"timeout": 300})), (300, None));
-        assert_eq!(deadline(json!({"timeout": "300"})), (300, None), "a quoted number reads as timeout_secs does");
-        assert_eq!(deadline(json!({"timeout": 0})), (1, None));
-        let asked = BASH_MAX_TIMEOUT_SECS + 300;
-        assert_eq!(deadline(json!({"timeout": asked})), (BASH_MAX_TIMEOUT_SECS, Some(asked)));
-        assert_eq!(deadline(json!({"timeout_secs": 30, "timeout": 300})), (300, None));
-        assert_eq!(deadline(json!({"timeout_secs": 300, "timeout": 30})), (300, None));
-        assert_eq!(deadline(json!({"timeout": "soon"})), (BASH_DEFAULT_TIMEOUT_SECS, None));
-    }
-
     #[test]
     fn a_bash_deadline_defaults_is_held_to_the_ceiling_and_says_so() {
         let unset = bash_deadline(&json!({}));
@@ -3939,6 +3919,24 @@ mod tests {
             schema.contains(&format!("Default {BASH_DEFAULT_TIMEOUT_SECS}, max {BASH_MAX_TIMEOUT_SECS}")),
             "the schema promises the numbers the clamp enforces: {schema}"
         );
+    }
+
+    /// `timeout` is the same wait as `timeout_secs`, in seconds and under the
+    /// same ceiling, and a call that names both waits the longer of the two.
+    #[test]
+    fn a_wait_named_timeout_is_read_as_timeout_secs() {
+        let deadline = |args: Value| {
+            let d = bash_deadline(&args);
+            (d.secs, d.requested)
+        };
+        assert_eq!(deadline(json!({"timeout": 300})), (300, None));
+        assert_eq!(deadline(json!({"timeout": "300"})), (300, None), "a quoted number reads as timeout_secs does");
+        assert_eq!(deadline(json!({"timeout": 0})), (1, None));
+        let asked = BASH_MAX_TIMEOUT_SECS + 300;
+        assert_eq!(deadline(json!({"timeout": asked})), (BASH_MAX_TIMEOUT_SECS, Some(asked)));
+        assert_eq!(deadline(json!({"timeout_secs": 30, "timeout": 300})), (300, None));
+        assert_eq!(deadline(json!({"timeout_secs": 300, "timeout": 30})), (300, None));
+        assert_eq!(deadline(json!({"timeout": "soon"})), (BASH_DEFAULT_TIMEOUT_SECS, None));
     }
 
     /// A segfault or an OOM kill has no exit code; reporting "exit code -1"

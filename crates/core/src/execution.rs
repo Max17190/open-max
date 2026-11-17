@@ -247,8 +247,7 @@ pub(crate) struct ProcessOutput {
     pub left_running: Option<LeftRunning>,
 }
 
-/// The group members a stop ended, and what they started outside the group
-/// that still runs after it (Linux), as `name (pid)`: `setsid server &` runs on.
+/// The group members a stop ended, and what they started outside it that still runs (Linux), as `name (pid)`.
 #[derive(Debug, Default)]
 pub(crate) struct LeftRunning { pub stopped: Vec<String>, pub detached: Vec<String> }
 
@@ -1204,12 +1203,8 @@ async fn stop_what_was_left_running(pid: Option<u32>) -> Option<LeftRunning> {
     let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
     while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
-            #[cfg(target_os = "linux")]
             let (stopped, mut detached) = pid.map(members_and_their_children_outside).unwrap_or_default();
-            #[cfg(not(target_os = "linux"))]
-            let (stopped, mut detached): (_, Vec<(u32, String)>) = (Vec::new(), Vec::new());
             terminate_remaining_group(pid).await.then_some(())?;
-            #[cfg(target_os = "linux")]
             detached.retain(|(pid, _)| proc_stat(&Path::new("/proc").join(pid.to_string())).is_some_and(|s| !s.2));
             return Some(LeftRunning { stopped, detached: detached.into_iter().map(|d| d.1).collect() });
         }
@@ -1218,25 +1213,24 @@ async fn stop_what_was_left_running(pid: Option<u32>) -> Option<LeftRunning> {
     None
 }
 
-/// The running members of `group`, and the running children they have outside it.
-#[cfg(target_os = "linux")]
+/// The running members of `group`, and the running children they have outside
+/// it, read from `/proc`: none where there is no `/proc`.
 fn members_and_their_children_outside(group: u32) -> (Vec<String>, Vec<(u32, String)>) {
     let entries = std::fs::read_dir("/proc").into_iter().flatten().flatten();
     let running: Vec<_> = entries.filter_map(|entry| proc_stat(&entry.path())).filter(|p| !p.2).collect();
     let named = |p: &(u32, String, bool, u32, u32)| format!("{} ({})", p.1, p.0);
     let members: Vec<_> = running.iter().filter(|p| p.4 == group).collect();
-    let outside = running.iter().filter(|p| p.4 != group && members.iter().any(|m| m.0 == p.3));
-    (members.iter().copied().map(named).collect(), outside.map(|p| (p.0, named(p))).collect())
+    let outside = running.iter().filter(|p| p.4 != group && members.iter().any(|m| m.0 == p.3)).map(|p| (p.0, named(p)));
+    (members.iter().copied().map(named).collect(), outside.collect())
 }
 
 /// Pid, name, whether it exited (Z with no thread left), parent and group.
-#[cfg(target_os = "linux")]
 fn proc_stat(dir: &Path) -> Option<(u32, String, bool, u32, u32)> {
     let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
     let (head, fields) = stat.rsplit_once(')')?;
     let ((pid, name), f) = (head.split_once(" (")?, fields.split_whitespace().take(3).collect::<Vec<_>>());
     let exited = *f.first()? == "Z" && std::fs::read_dir(dir.join("task")).is_ok_and(|threads| threads.count() <= 1);
-    Some((positive_pid(pid)?, name.into(), exited, f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
+    Some((pid.parse().ok()?, name.into(), exited, f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
 }
 
 /// Returns true when group members outlived the leader and were terminated
