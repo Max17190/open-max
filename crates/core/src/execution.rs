@@ -1234,10 +1234,8 @@ fn members_and_their_children_outside(group: u32) -> (Vec<String>, Vec<(u32, Str
 fn proc_stat(dir: &Path) -> Option<(u32, String, bool, u32, u32)> {
     let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
     let (head, fields) = stat.rsplit_once(')')?;
-    let (pid, name) = head.split_once(" (")?;
-    let mut fields = fields.split_whitespace();
-    let exited = fields.next()? == "Z";
-    Some((positive_pid(pid)?, name.to_string(), exited, fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+    let ((pid, name), f) = (head.split_once(" (")?, fields.split_whitespace().take(3).collect::<Vec<_>>());
+    Some((positive_pid(pid)?, name.into(), *f.first()? == "Z", f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
 }
 
 /// Returns true when group members outlived the leader and were terminated

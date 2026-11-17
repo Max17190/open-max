@@ -2362,21 +2362,11 @@ pub(crate) fn exited_outcome(
     cap: usize,
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
-    let named = |names: &[String]| match names.len() {
-        0..=8 => names.join(", "),
-        n => format!("{} and {} more", names[..8].join(", "), n - 8),
-    };
+    let named = |n: &[String]| if n.len() > 8 { format!("{} and {} more", n[..8].join(", "), n.len() - 8) } else { n.join(", ") };
     let note = output.left_running.as_ref().map(|left| match left.detached.is_empty() {
-        false => format!(
-            "[openmax: when this command returned, the processes it left in its process group were stopped: {}. \
-             Processes they started outside the group are still running: {}.]",
-            named(&left.stopped),
-            named(&left.detached)
-        ),
-        true => match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            false => BACKGROUND_TERMINATED_NOTE.to_string(),
-            true => BACKGROUND_TERMINATED_AGAIN.to_string(),
-        },
+        false => format!("[openmax: when this command returned, the processes it left in its process group were stopped: {}. Processes they started outside the group are still running: {}.]", named(&left.stopped), named(&left.detached)),
+        true if background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) => BACKGROUND_TERMINATED_AGAIN.to_string(),
+        true => BACKGROUND_TERMINATED_NOTE.to_string(),
     });
     // The note is the harness speaking, not captured output, but it
     // still has to fit the caller's cap, which `max_output_bytes`
