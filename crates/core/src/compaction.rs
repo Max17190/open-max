@@ -18,7 +18,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::Value;
 
@@ -258,7 +257,6 @@ impl CompactionDigest {
     }
 }
 
-const SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_SUMMARY_BYTES: usize = 4_000;
 
 /// The ask that ends the notes request, after the transcript up to the cut.
@@ -282,9 +280,15 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 /// already sent, so a prompt cache can serve all of it but the ask. Only the
 /// reply's text is taken, or, when a reply that ended on its own has no
 /// text and no call, its reasoning. A call in it never runs, nothing of this
-/// exchange is stored or shown, and an empty reply, an error, a timeout, a cancel, a
+/// exchange is stored or shown, and an empty reply, an error, a cancel, a
 /// cut stream or a request the spend ceiling refuses gives no notes: the
 /// error says which, for the report of a cut skipped for want of them.
+///
+/// Like every turn request it has no overall deadline, only the client's
+/// silence timeout: the notes are a full reply at the reply limit, which a
+/// slow route takes minutes to write, and a skipped cut is not retried until
+/// the window forces one, so a deadline there costs every later request the
+/// context the cut would have removed.
 ///
 /// The request is billed like any other: a ledger that advertises what each
 /// request cost cannot omit the one the harness makes on its own behalf.
@@ -301,20 +305,17 @@ async fn summarize_compaction(
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
     if !spend.admits(estimated) { return Err("the notes request would pass the turn's token ceiling".into()); }
     let mut resent = Vec::new();
-    let outcome = tokio::time::timeout(SUMMARY_TIMEOUT, client.stream_chat(&messages, client.reply_reserve, schemas, cancelled.clone(), |delta| {
+    let outcome = client.stream_chat(&messages, client.reply_reserve, schemas, cancelled.clone(), |delta| {
         if let crate::client::StreamDelta::Usage(usage) = delta { resent.push(usage); }
-    })).await;
+    }).await;
     // A reply the client asked for again was paid for, however this one ended.
     for usage in resent { spend.charge(core, session_id, usage); }
     let result = match outcome {
-        Ok(Ok(result)) => result,
-        failed => {
+        Ok(result) => result,
+        Err(error) => {
             // Without a completed response, charge the reply reserve it asked for.
             spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(client.reply_reserve));
-            return Err(match failed {
-                Ok(Err(error)) => format!("the notes request failed: {}", crate::text::one_line(&error)),
-                _ => format!("the notes reply did not finish within {} seconds", SUMMARY_TIMEOUT.as_secs()),
-            });
+            return Err(format!("the notes request failed: {}", crate::text::one_line(&error)));
         }
     };
     spend.record(core, session_id, estimated, &result);
@@ -1007,6 +1008,7 @@ fn prune_transcript(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::time::Duration;
     use crate::notes::execution_policy_note;
     use crate::config::ApprovalMode;
     use crate::types::{ToolCall, ToolCallFunction};
