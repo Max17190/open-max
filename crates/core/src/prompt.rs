@@ -31,9 +31,11 @@ use std::path::Path;
 use crate::registry::{Registry, ToolKind};
 use crate::skills::SkillSpec;
 
-/// AGENTS.md content is user-authored instructions; cap it so a sprawling
-/// file cannot crowd a 16k window.
-const MAX_AGENTS_MD_BYTES: usize = 2_000;
+/// AGENTS.md is user-authored instructions, capped by the window
+/// (`agents_md_cap`): the floor keeps a 16k window uncrowded, the ceiling
+/// shows about nine real files in ten whole.
+pub const MIN_AGENTS_MD_BYTES: usize = 2_000;
+const MAX_AGENTS_MD_BYTES: usize = 20_000;
 /// The layout map exists to save discovery round trips, not to describe the
 /// tree exhaustively; ~300 tokens is the budget. The cap charges each entry
 /// its full path as the map writes it (quoted when it needs to be) and a
@@ -83,7 +85,7 @@ pub const NOTE_SEPARATOR: &str = "\n\n";
 /// The prompt text alone, for tests that only assert on its content.
 #[cfg(test)]
 fn system_prompt(project_root: &Path, registry: &Registry) -> String {
-    system_prompt_with_breakdown(project_root, registry).0
+    system_prompt_with_breakdown(project_root, registry, MIN_AGENTS_MD_BYTES).0
 }
 
 /// What one session's frozen prompt prefix is spent on, measured at the only
@@ -203,9 +205,10 @@ impl PromptBreakdown {
     }
 }
 
-/// The prompt a new session would freeze, and what it costs.
-pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown) {
-    let (prompt, breakdown, _) = session_prompt(project_root, registry);
+/// The prompt a new session would freeze, and what it costs, with
+/// `agents_md_cap` bytes of AGENTS.md (`agents_md_cap()`).
+pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry, agents_md_cap: usize) -> (String, PromptBreakdown) {
+    let (prompt, breakdown, _) = session_prompt(project_root, registry, agents_md_cap);
     (prompt, breakdown)
 }
 
@@ -221,7 +224,7 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry) ->
 /// with two or three list_dir/glob calls just to learn the layout, and each
 /// of those is a full prefill+decode round trip. The record it returns is
 /// what the index shows, read from the same scans as the text.
-pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, PromptBreakdown, PromptIndex) {
+pub fn session_prompt(project_root: &Path, registry: &Registry, agents_md_cap: usize) -> (String, PromptBreakdown, PromptIndex) {
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
     // Tool-specific guidance lives in each tool's schema description (which
@@ -252,7 +255,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
     if let Some(instructions) = &instructions {
         let before = prompt.len();
         prompt.push_str("\n\nProject instructions (AGENTS.md):\n");
-        prompt.push_str(&capped_agents_md(instructions));
+        prompt.push_str(&capped_agents_md(instructions, agents_md_cap));
         breakdown.components.push(("AGENTS.md".into(), prompt.len() - before));
     }
     // The memory index rides the frozen prefix like the skills index: a line
@@ -299,8 +302,8 @@ pub fn session_prompt(project_root: &Path, registry: &Registry) -> (String, Prom
 /// the prompt, its record and the memory rows it carries installed on the
 /// registry, and the note against it (none, unless a file changed between
 /// the two reads), with one breakdown pricing both.
-pub fn session_context(project_root: &Path, registry: &mut Registry) -> (String, Option<String>, PromptBreakdown) {
-    let (prompt, mut breakdown, index) = session_prompt(project_root, registry);
+pub fn session_context(project_root: &Path, registry: &mut Registry, agents_md_cap: usize) -> (String, Option<String>, PromptBreakdown) {
+    let (prompt, mut breakdown, index) = session_prompt(project_root, registry, agents_md_cap);
     registry.prompt_index = std::sync::Arc::new(index);
     registry.frozen_memory_rows = Some(breakdown.memory.clone());
     let (note, components) = trailing_note(project_root, registry);
@@ -684,15 +687,43 @@ fn agents_md(project_root: &Path) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// AGENTS.md as the prompt carries it, capped. The de facto convention for
-/// handing agents project conventions; ignoring it wastes the user's own
-/// groundwork.
-fn capped_agents_md(text: &str) -> String {
-    if text.len() <= MAX_AGENTS_MD_BYTES {
+/// Bytes of AGENTS.md a new session carries: `agents_md_bytes`, else 2% of
+/// the window at 4 bytes a token within the bounds (the floor when no window resolves).
+pub fn agents_md_cap(settings: &crate::config::Settings, data_dir: &Path) -> usize {
+    let window = crate::providers::resolve(settings, data_dir).map_or(0, |endpoint| endpoint.context_tokens);
+    settings.agents_md_bytes.unwrap_or((window.saturating_mul(4) / 50).clamp(MIN_AGENTS_MD_BYTES, MAX_AGENTS_MD_BYTES))
+}
+
+/// AGENTS.md as the prompt carries it, within `cap`. A longer file is cut at
+/// a line with an open code block closed, and a last line gives the bytes
+/// shown and the headings of the sections left out (at most 600 bytes).
+fn capped_agents_md(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
         return text.to_string();
     }
-    let cut = crate::text::floor_char_boundary(text, MAX_AGENTS_MD_BYTES);
-    format!("{}\n…[AGENTS.md truncated; read_file it for the rest]", &text[..cut])
+    let cut = crate::text::floor_char_boundary(text, cap);
+    let shown = text[..text[..cut].rfind('\n').unwrap_or(cut)].trim_end();
+    let n = shown.lines().count();
+    let (mut fence, mut open_at_cut, mut dropped) = (None, None, Vec::new());
+    for (i, line) in text.lines().chain([""]).enumerate() {
+        open_at_cut = if i == n { fence } else { open_at_cut };
+        // A fence is a run of 3 or more backticks or tildes; only a bare run of the
+        // same character at least as long closes it.
+        let t = line.trim_start();
+        let run = t.chars().take_while(|&c| c == t.chars().next().unwrap_or(' ')).count();
+        let marker = (run >= 3 && (t.starts_with('`') || t.starts_with('~'))).then(|| &t[..run]);
+        match (fence, marker) {
+            (None, Some(m)) => fence = Some(m),
+            (Some(open), Some(m)) if m.starts_with(open) && t[run..].trim().is_empty() => fence = None,
+            (None, None) if i >= n && line.starts_with('#') => dropped.push(crate::text::one_line(line.trim_start_matches('#').trim())),
+            _ => {}
+        }
+    }
+    let close = open_at_cut.map_or(String::new(), |m| format!("\n{m}"));
+    dropped.retain(|h| !h.is_empty());
+    let sections = crate::compaction::take_note_bytes(&dropped.join("; "), 600);
+    let sections = if sections.is_empty() { String::new() } else { format!(" Sections not shown: {sections}.") };
+    format!("{shown}{close}\n[AGENTS.md cut: {} of {} bytes shown.{sections} read_file AGENTS.md for the rest.]", shown.len(), text.len())
 }
 
 /// A shallow, gitignore-aware file map, capped in depth and bytes. The first
@@ -1019,7 +1050,7 @@ mod tests {
         }
         let registry = Registry::build(&dir.join("data"), &dir);
         assert_eq!(registry.skills_omitted, 0, "all under the count cap");
-        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry, MIN_AGENTS_MD_BYTES);
         let shown = prompt.matches("\n- skill-").count();
         assert!(shown > 0 && shown < total, "the byte cap must bite for this test to mean anything");
 
@@ -1232,8 +1263,74 @@ mod tests {
 
         std::fs::write(dir.join("AGENTS.md"), "x".repeat(10_000)).unwrap();
         let prompt = builtin_prompt(&dir);
-        assert!(prompt.contains("AGENTS.md truncated"));
+        assert!(prompt.contains("[AGENTS.md cut: 2000 of 10000 bytes shown."), "{prompt}");
         assert!(prompt.len() < 10_000 + 2_500, "cap must hold, got {}", prompt.len());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The shape of the one large instruction file on record: a long file
+    /// whose cap falls inside a code block, with the rule that mattered in a
+    /// section past it. The cut ends on a line, closes the block, and names
+    /// the section, so the model knows the rule exists and where to read it.
+    #[test]
+    fn a_cut_file_ends_on_a_line_closes_its_block_and_names_what_it_dropped() {
+        let mut text = String::from("# Project\n\nIntro line.\n\n## Commands\n\n```bash\n");
+        while text.len() < 2_100 {
+            text.push_str("pnpm run test --filter some-package-with-a-long-name\n");
+        }
+        text.push_str("```\n\n## Type safety\n\nNever cast through `as unknown as T`.\n\n```ts\n# not a heading\n```\n\n## Style\n\nTabs.\n");
+        let cut = capped_agents_md(&text, MIN_AGENTS_MD_BYTES);
+        let (body, trailer) = cut.rsplit_once("\n[AGENTS.md cut: ").expect("a cut file ends with its trailer");
+        assert!(body.ends_with("long-name\n```"), "ends on a whole line with the block closed: {body:?}");
+        assert!(body.len() <= MIN_AGENTS_MD_BYTES + 4, "{}", body.len());
+        let shown = body.len() - 4;
+        assert_eq!(
+            trailer,
+            format!("{shown} of {} bytes shown. Sections not shown: Type safety; Style. read_file AGENTS.md for the rest.]", text.len())
+        );
+        // A cap that holds the file shows it as written.
+        assert_eq!(capped_agents_md(&text, text.len()), text);
+        // A longer fence is closed by a run as long, and a shorter run inside
+        // it is part of the example, not its end.
+        let long = format!("````md\n```bash\n{}```\n````\n## After\n", "make test\n".repeat(300));
+        let cut = capped_agents_md(&long, MIN_AGENTS_MD_BYTES);
+        assert!(cut.contains("make test\n````\n[AGENTS.md cut: ") && cut.ends_with("Sections not shown: After. read_file AGENTS.md for the rest.]"), "{cut}");
+    }
+
+    /// The list of dropped sections is bounded however many there are.
+    #[test]
+    fn the_dropped_section_list_is_bounded() {
+        let mut text = "a".repeat(1_990) + "\n";
+        for i in 0..200 {
+            text.push_str(&format!("## Section number {i:03}\nbody\n"));
+        }
+        let cut = capped_agents_md(&text, MIN_AGENTS_MD_BYTES);
+        let trailer = cut.rsplit_once("\n[AGENTS.md cut: ").unwrap().1;
+        assert!(trailer.len() <= 600 + 120, "{}", trailer.len());
+        assert!(trailer.contains("Sections not shown: Section number 000; Section number 001;"), "{trailer}");
+    }
+
+    /// The cap follows the window: a 16k window keeps the old 2,000 bytes,
+    /// a large one carries a typical file whole, and the setting overrides
+    /// both.
+    #[test]
+    fn the_agents_md_cap_scales_with_the_window() {
+        let dir = temp_project();
+        let at = |window: Option<usize>, bytes: Option<usize>| {
+            let settings = crate::config::Settings {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "m".into(),
+                context_tokens: window,
+                agents_md_bytes: bytes,
+                ..Default::default()
+            };
+            agents_md_cap(&settings, &dir.join("data"))
+        };
+        assert_eq!(at(Some(16_384), None), MIN_AGENTS_MD_BYTES);
+        assert_eq!(at(Some(131_072), None), 10_485);
+        assert_eq!(at(Some(1_048_576), None), MAX_AGENTS_MD_BYTES);
+        assert_eq!(at(None, None), MIN_AGENTS_MD_BYTES, "an endpoint that does not resolve gets the floor");
+        assert_eq!(at(Some(1_048_576), Some(2_000)), 2_000);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1343,7 +1440,7 @@ mod tests {
     fn frozen_prompt_fits_token_budget() {
         let dir = temp_project();
         let registry = crate::registry::Registry::build(&dir.join("data"), &dir);
-        let (_, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        let (_, breakdown) = system_prompt_with_breakdown(&dir, &registry, MIN_AGENTS_MD_BYTES);
         let base_chars = breakdown
             .components
             .iter()
@@ -1404,8 +1501,8 @@ mod tests {
         };
         let bytes = text.trim().len();
         assert!(
-            bytes <= MAX_AGENTS_MD_BYTES,
-            "AGENTS.example.md is {bytes} bytes; agents_md() injects at most {MAX_AGENTS_MD_BYTES}, \
+            bytes <= MIN_AGENTS_MD_BYTES,
+            "AGENTS.example.md is {bytes} bytes; a 16k window injects at most {MIN_AGENTS_MD_BYTES} of agents_md(), \
              so a verbatim copy is truncated. Trim it rather than raising the cap."
         );
     }
@@ -1472,7 +1569,7 @@ mod tests {
     fn dump_frozen_prompt_payload_for_tokenizer() {
         let dir = temp_project();
         let registry = crate::registry::Registry::build(&dir.join("data"), &dir);
-        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        let (prompt, breakdown) = system_prompt_with_breakdown(&dir, &registry, MIN_AGENTS_MD_BYTES);
         let base_chars: usize = breakdown
             .components
             .iter()
@@ -1508,7 +1605,7 @@ mod tests {
         )
         .unwrap();
         let fresh = Registry::build(&dir.join("data"), &dir);
-        let (prompt, live) = system_prompt_with_breakdown(&dir, &fresh);
+        let (prompt, live) = system_prompt_with_breakdown(&dir, &fresh, MIN_AGENTS_MD_BYTES);
         assert_eq!(live.memory.len(), 2, "both memories index: {:?}", live.memory);
 
         let resumed_fresh = PromptBreakdown::from_persisted(&prompt, &fresh, &dir);
@@ -1587,7 +1684,7 @@ mod tests {
             "# The deploy port is 7443\nSet in infra/nginx.conf.",
         )
         .unwrap();
-        let (with, breakdown) = system_prompt_with_breakdown(&dir, &registry);
+        let (with, breakdown) = system_prompt_with_breakdown(&dir, &registry, MIN_AGENTS_MD_BYTES);
         assert!(
             with.contains("Memory (facts saved by earlier turns or sessions"),
             "memory section must appear:\n{with}"

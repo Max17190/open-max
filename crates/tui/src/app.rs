@@ -2476,7 +2476,7 @@ impl App {
                 };
                 let (breakdown, is_frozen) = match frozen {
                     Some(b) => (b, true),
-                    None => (prompt::system_prompt_with_breakdown(&self.project, &self.preview_registry().await).1, false),
+                    None => (prompt::system_prompt_with_breakdown(&self.project, &self.preview_registry().await, prompt::agents_md_cap(&self.core.settings.lock().unwrap(), &self.core.data_dir)).1, false),
                 };
                 let session_cache = self
                     .session_id

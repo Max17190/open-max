@@ -2407,7 +2407,8 @@ fn print_usage_economics() {
     // real breakdown here so "what does my prompt cost" is answered truthfully
     // and never as a false zero - a project with only an AGENTS.md or a memory
     // note pays real bytes the old "zero extension cost" line hid.
-    let (_, breakdown) = open_max_core::prompt::system_prompt_with_breakdown(&project, &registry);
+    let cap = open_max_core::config::load(&data_dir).map_or(open_max_core::prompt::MIN_AGENTS_MD_BYTES, |s| open_max_core::prompt::agents_md_cap(&s, &data_dir));
+    let (_, breakdown) = open_max_core::prompt::system_prompt_with_breakdown(&project, &registry, cap);
     // The whole serialized array is what rides every request, including the
     // brackets and commas between schemas, so measure the wire bytes rather
     // than summing each schema alone (that undercounts the array overhead).
