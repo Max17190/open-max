@@ -711,8 +711,10 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // notes. Compaction makes one cut and asks for notes in the conversation.
     // A cut skipped for want of notes is reported, and the prompts of later
     // turns a cut removes stay in its note word for word, and long notes keep
-    // their open part.
-    const BASELINE: usize = 44_274;
+    // their open part. A bash wait named `timeout`, and a result that names
+    // the group members a call stopped and what they started outside the
+    // group that still runs, so a `setsid` job is not reported as terminated.
+    const BASELINE: usize = 44_515;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

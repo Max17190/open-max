@@ -239,13 +239,18 @@ pub(crate) struct ProcessOutput {
     pub log_path: Option<PathBuf>,
     /// True when either stream exceeded its configured spill cap.
     pub log_truncated: bool,
-    /// True when the command exited normally but left process-group members
+    /// Set when the command exited normally but left process-group members
     /// behind that this call then terminated. Only a NORMAL exit sets it: a
     /// cancel or a timeout kills the group by design and already says so.
     /// Callers must surface it, because the caller who backgrounded a server
     /// otherwise sees a clean exit and no server.
-    pub background_terminated: bool,
+    pub left_running: Option<LeftRunning>,
 }
+
+/// The group members a stop ended, and what they started outside the group
+/// that still runs after it (Linux), as `name (pid)`: `setsid server &` runs on.
+#[derive(Debug, Default)]
+pub(crate) struct LeftRunning { pub stopped: Vec<String>, pub detached: Vec<String> }
 
 #[derive(Debug)]
 pub(crate) enum ProcessError {
@@ -948,7 +953,7 @@ pub(crate) async fn run_process(
         }),
     };
 
-    let (termination, background_terminated) =
+    let (termination, left_running) =
         supervise_child(&mut child, pid, request.timeout, &cancel).await?;
     group.settled();
 
@@ -986,7 +991,7 @@ pub(crate) async fn run_process(
         stderr: stderr.stream,
         log_path,
         log_truncated,
-        background_terminated,
+        left_running,
     })
 }
 
@@ -1147,7 +1152,7 @@ async fn supervise_child(
     pid: Option<u32>,
     timeout: Duration,
     cancel: &CancelToken,
-) -> Result<(Termination, bool), ProcessError> {
+) -> Result<(Termination, Option<LeftRunning>), ProcessError> {
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
@@ -1159,16 +1164,16 @@ async fn supervise_child(
             // and the caller is handed a successful exit. Report it so the
             // caller learns the rule from the result instead of from a failing
             // request later.
-            let background_terminated = stop_what_was_left_running(pid).await;
-            Ok((Termination::Exited(status), background_terminated))
+            let left_running = stop_what_was_left_running(pid).await;
+            Ok((Termination::Exited(status), left_running))
         }
         _ = cancel.cancelled() => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::Cancelled, false))
+            Ok((Termination::Cancelled, None))
         }
         _ = tokio::time::sleep(timeout) => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::TimedOut, false))
+            Ok((Termination::TimedOut, None))
         }
     }
 }
@@ -1189,29 +1194,50 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
 }
 
 /// Stops what a command whose shell exited left running in its group, and
-/// returns true when there was any. Members that exit within
+/// says what when there was any. Members that exit within
 /// `LEFT_RUNNING_AFTER` were on their way out, not left running: reporting
 /// them told the caller of nearly every test run with a worker pool that its
 /// background processes were cut short, when it had started none. Members
 /// that exited and wait for a parent to collect them run nothing either
 /// ([`group_has_running_member`]).
-///
-/// Members that only wait on processes outside the group are stopped but
-/// not reported. `cd dir && setsid server &` leaves such a member: the
-/// subshell that ran the list waits on the server, which `setsid` moved to a
-/// session of its own. Stopping the subshell leaves the server running, so a
-/// note saying the background processes were terminated was false, and the
-/// caller started a second copy of a server that was still up.
-async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
+async fn stop_what_was_left_running(pid: Option<u32>) -> Option<LeftRunning> {
     let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
     while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
-            let only_waiters = left_only_waiters(pid);
-            return terminate_remaining_group(pid).await && !only_waiters;
+            #[cfg(target_os = "linux")]
+            let (stopped, mut detached) = pid.map(members_and_their_children_outside).unwrap_or_default();
+            #[cfg(not(target_os = "linux"))]
+            let (stopped, mut detached): (_, Vec<(u32, String)>) = (Vec::new(), Vec::new());
+            terminate_remaining_group(pid).await.then_some(())?;
+            #[cfg(target_os = "linux")]
+            detached.retain(|(pid, _)| proc_stat(&Path::new("/proc").join(pid.to_string())).is_some_and(|s| !s.2));
+            return Some(LeftRunning { stopped, detached: detached.into_iter().map(|d| d.1).collect() });
         }
         tokio::time::sleep(GROUP_EXIT_POLL).await;
     }
-    false
+    None
+}
+
+/// The running members of `group`, and the running children they have outside it.
+#[cfg(target_os = "linux")]
+fn members_and_their_children_outside(group: u32) -> (Vec<String>, Vec<(u32, String)>) {
+    let entries = std::fs::read_dir("/proc").into_iter().flatten().flatten();
+    let running: Vec<_> = entries.filter_map(|entry| proc_stat(&entry.path())).filter(|p| !p.2).collect();
+    let named = |p: &(u32, String, bool, u32, u32)| format!("{} ({})", p.1, p.0);
+    let members: Vec<_> = running.iter().filter(|p| p.4 == group).collect();
+    let outside = running.iter().filter(|p| p.4 != group && members.iter().any(|m| m.0 == p.3));
+    (members.iter().copied().map(named).collect(), outside.map(|p| (p.0, named(p))).collect())
+}
+
+/// Pid, name, whether it reads Z, parent and group, from a `/proc` stat.
+#[cfg(target_os = "linux")]
+fn proc_stat(dir: &Path) -> Option<(u32, String, bool, u32, u32)> {
+    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    let (head, fields) = stat.rsplit_once(')')?;
+    let (pid, name) = head.split_once(" (")?;
+    let mut fields = fields.split_whitespace();
+    let exited = fields.next()? == "Z";
+    Some((positive_pid(pid)?, name.to_string(), exited, fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
 }
 
 /// Returns true when group members outlived the leader and were terminated
@@ -2181,91 +2207,6 @@ fn only_exited_members(proc: &Path, group: u32) -> bool {
     found
 }
 
-/// True when every running member of the group that `pid` leads only waits
-/// on processes outside it ([`only_waiters_on_processes_outside`]). Where
-/// members cannot be read this way, members are taken to be the command's
-/// own work, as before.
-#[cfg(target_os = "linux")]
-fn left_only_waiters(pid: Option<u32>) -> bool {
-    pid.is_some_and(|group| only_waiters_on_processes_outside(Path::new("/proc"), group))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn left_only_waiters(_: Option<u32>) -> bool {
-    false
-}
-
-/// True when `proc` lists running members of `group` and each one is blocked
-/// waiting for a child, with every running child either outside the group or
-/// another such member. Stopping those members stops no work: what they wait
-/// on is not in the group and keeps running. A member that waits on a child
-/// still in the group, such as a subshell running `nohup server`, waits on
-/// work that the group's stop ends, so it is not one of them. The kernel
-/// names the function a blocked process sleeps in under `wchan`; a member
-/// whose `wchan` cannot be read counts as doing work.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-fn only_waiters_on_processes_outside(proc: &Path, group: u32) -> bool {
-    let Ok(entries) = std::fs::read_dir(proc) else {
-        return false;
-    };
-    // (pid, parent, group) of every process that has not exited.
-    let mut running = Vec::new();
-    for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(positive_pid) else {
-            continue;
-        };
-        let stat = std::fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
-        let Some((parent, member_of, main_exited)) = stat_parent_and_group(&stat) else {
-            continue;
-        };
-        let exited = main_exited
-            && std::fs::read_dir(entry.path().join("task")).is_ok_and(|tasks| {
-                tasks.flatten().all(|task| {
-                    let stat = std::fs::read_to_string(task.path().join("stat")).unwrap_or_default();
-                    stat_group(&stat).is_some_and(|(_, exited)| exited)
-                })
-            });
-        if !exited {
-            running.push((pid, parent, member_of));
-        }
-    }
-    let members: Vec<u32> = running.iter().filter(|p| p.2 == group).map(|p| p.0).collect();
-    let mut waiters: Vec<u32> = members
-        .iter()
-        .copied()
-        .filter(|pid| {
-            let wchan = std::fs::read_to_string(proc.join(pid.to_string()).join("wchan")).unwrap_or_default();
-            matches!(wchan.trim(), "do_wait" | "kernel_wait4" | "kernel_waitid")
-        })
-        .collect();
-    // Drop a waiter with no running child, or with one in the group that is
-    // not itself a waiter, until none is dropped: a chain of subshells counts
-    // only when its last link waits outside the group.
-    loop {
-        let waits_outside = |waiter: u32| {
-            let mut children = running.iter().filter(|p| p.1 == waiter).peekable();
-            children.peek().is_some() && children.all(|p| p.2 != group || waiters.contains(&p.0))
-        };
-        let kept: Vec<u32> = waiters.iter().copied().filter(|w| waits_outside(*w)).collect();
-        if kept.len() == waiters.len() {
-            break;
-        }
-        waiters = kept;
-    }
-    !members.is_empty() && members.iter().all(|m| waiters.contains(m))
-}
-
-/// A process's parent and group from its `/proc` stat, and whether it reads
-/// Z. The command name in parentheses may hold spaces or parentheses, so the
-/// fields are read after its last `)`.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-fn stat_parent_and_group(stat: &str) -> Option<(u32, u32, bool)> {
-    let (_, fields) = stat.rsplit_once(')')?;
-    let mut fields = fields.split_whitespace();
-    let exited = fields.next()? == "Z";
-    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?, exited))
-}
-
 #[cfg(unix)]
 fn signal_group(pid: Option<u32>, signal: libc::c_int) {
     if let Some(pid) = pid {
@@ -2277,6 +2218,10 @@ fn signal_group(pid: Option<u32>, signal: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stopped_any(pid: Option<u32>) -> bool {
+        stop_what_was_left_running(pid).await.is_some()
+    }
 
     fn request(program: &str, args: &[&str]) -> ProcessRequest {
         ProcessRequest {
@@ -3698,7 +3643,7 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "background descendant survived process cleanup");
-        assert!(output.background_terminated, "a stopped background child was not reported");
+        assert!(output.left_running.is_some(), "a stopped background child was not reported");
     }
 
     /// A program whose helper exits just after it, as a test runner's worker
@@ -3739,7 +3684,7 @@ mod tests {
         program.wait().await.unwrap();
         drop(pipe);
         assert_eq!(said.read(&mut byte).await.unwrap(), 1, "the helper never saw its pipe close");
-        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), helper.wait());
+        let (reported, exited) = tokio::join!(stopped_any(group), helper.wait());
         assert_eq!(exited.unwrap().code(), Some(0), "the helper was stopped instead of exiting on its own");
         assert!(!reported, "a helper on its way out was reported as left running");
     }
@@ -3763,7 +3708,7 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "the daemonized process survived the call");
-        assert!(output.background_terminated, "the stopped daemon was not reported");
+        assert!(output.left_running.is_some(), "the stopped daemon was not reported");
     }
 
     /// A process group whose leader has exited and left `member` running in
@@ -3820,48 +3765,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&proc);
     }
 
-    /// Members that only wait on processes outside the group, directly or
-    /// through a chain of waiting members, stopped no work; a member that
-    /// waits on a child still in the group, or that does not wait, did. Read
-    /// from a made-up `/proc`, as a kernel names `wchan`.
-    #[cfg(unix)]
-    #[test]
-    fn only_members_waiting_outside_the_group_stop_no_work() {
-        let proc = std::env::temp_dir().join(format!("openmax-proc-{}", uuid::Uuid::new_v4()));
-        let process = |pid: u32, parent: u32, group: u32, wchan: &str| {
-            let dir = proc.join(pid.to_string());
-            std::fs::create_dir_all(dir.join("task")).unwrap();
-            std::fs::write(dir.join("stat"), format!("{pid} (sh) S {parent} {group} {group} 0 -1 0")).unwrap();
-            std::fs::write(dir.join("wchan"), wchan).unwrap();
-        };
-        // `cd dir && setsid job &`: a subshell in group 10 waits on a job in
-        // its own session.
-        process(11, 1, 10, "do_wait");
-        process(12, 11, 12, "hrtimer_nanosleep");
-        assert!(only_waiters_on_processes_outside(&proc, 10), "the subshell waits on a detached job");
-        // Another subshell waits on it, so the chain still ends outside.
-        process(13, 1, 10, "do_wait");
-        std::fs::write(proc.join("11").join("stat"), "11 (sh) S 13 10 10 0 -1 0").unwrap();
-        assert!(only_waiters_on_processes_outside(&proc, 10), "a chain that ends outside the group");
-        // `cd dir && nohup job &`: the job the subshell waits on is in the
-        // group, so stopping the group stops it.
-        process(21, 1, 20, "do_wait");
-        process(22, 21, 20, "hrtimer_nanosleep");
-        assert!(!only_waiters_on_processes_outside(&proc, 20), "the job is in the group");
-        // A member that waits on nothing it started, or does not wait.
-        process(31, 1, 30, "do_wait");
-        assert!(!only_waiters_on_processes_outside(&proc, 30), "a waiter with no child");
-        process(41, 1, 40, "0");
-        process(42, 41, 42, "hrtimer_nanosleep");
-        assert!(!only_waiters_on_processes_outside(&proc, 40), "a member whose wait cannot be read");
-        // A detached job beside a plain one: the plain one is work.
-        process(12, 11, 12, "hrtimer_nanosleep");
-        process(14, 1, 10, "ep_poll");
-        assert!(!only_waiters_on_processes_outside(&proc, 10), "a plain background job beside the detached one");
-        assert!(!only_waiters_on_processes_outside(&proc, 50), "a group with no member found");
-        let _ = std::fs::remove_dir_all(&proc);
-    }
-
     /// A process that has exited stays in its group until its parent waits
     /// for it. Wait until `child`, which nothing waits for, has exited.
     #[cfg(target_os = "linux")]
@@ -3892,7 +3795,7 @@ mod tests {
         leader.wait().await.unwrap();
         until_exited(&worker).await;
         assert!(process_group_exists(Some(group)), "the zombie does not hold its group");
-        let reported = stop_what_was_left_running(Some(group)).await;
+        let reported = stopped_any(Some(group)).await;
         worker.wait().unwrap();
         assert!(!reported, "a group holding only a zombie was reported as left running");
     }
@@ -3908,7 +3811,7 @@ mod tests {
         zombie.process_group(i32::try_from(group.unwrap()).unwrap());
         let mut zombie = zombie.spawn().unwrap();
         until_exited(&zombie).await;
-        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+        let (reported, exited) = tokio::join!(stopped_any(group), member.wait());
         zombie.wait().unwrap();
         assert!(reported, "the running member was not reported");
         assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the running member was not stopped");
@@ -3930,7 +3833,7 @@ mod tests {
         for _ in 0..5 {
             let (group, mut member) = group_whose_leader_exited(&["sleep", "6845"]).await;
             let started = std::time::Instant::now();
-            let (found, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+            let (found, exited) = tokio::join!(stopped_any(group), member.wait());
             fastest = fastest.min(started.elapsed());
             assert!(found, "the background child was not found");
             assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the background child did not stop on SIGTERM");

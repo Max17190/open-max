@@ -2262,12 +2262,8 @@ struct BashDeadline {
     requested: Option<u64>,
 }
 
-/// The wait a bash call asked for. `timeout` is read as another name for
-/// `timeout_secs`, in the same seconds: models often write it, and the
-/// dropped key ran their 300 or 600 second builds under the 120 second
-/// default. When a call names both, the longer one is the wait, so no call is
-/// stopped before a wait it asked for. The schema still names only
-/// `timeout_secs`, so the tool list every request carries is unchanged.
+/// `timeout`, which models often write, is the same wait as `timeout_secs`;
+/// with both, the longer one counts. The schema names only `timeout_secs`.
 fn bash_deadline(args: &Value) -> BashDeadline {
     let asked = |key| arg(args, key, Value::as_u64);
     match asked("timeout_secs").max(asked("timeout")) {
@@ -2366,17 +2362,27 @@ pub(crate) fn exited_outcome(
     cap: usize,
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
-    let note = output.background_terminated.then(|| {
-        match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            false => BACKGROUND_TERMINATED_NOTE,
-            true => BACKGROUND_TERMINATED_AGAIN,
-        }
+    let named = |names: &[String]| match names.len() {
+        0..=8 => names.join(", "),
+        n => format!("{} and {} more", names[..8].join(", "), n - 8),
+    };
+    let note = output.left_running.as_ref().map(|left| match left.detached.is_empty() {
+        false => format!(
+            "[openmax: when this command returned, the processes it left in its process group were stopped: {}. \
+             Processes they started outside the group are still running: {}.]",
+            named(&left.stopped),
+            named(&left.detached)
+        ),
+        true => match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            false => BACKGROUND_TERMINATED_NOTE.to_string(),
+            true => BACKGROUND_TERMINATED_AGAIN.to_string(),
+        },
     });
     // The note is the harness speaking, not captured output, but it
     // still has to fit the caller's cap, which `max_output_bytes`
     // can set as low as 1000 bytes. Reserve its length instead of
     // letting a fixed annotation push the result past the limit.
-    let reserved = note.map_or(0, |note| note.len() + 1);
+    let reserved = note.as_ref().map_or(0, |note| note.len() + 1);
     let budget = cap.saturating_sub(reserved).max(1);
     let (text, truncated) = render_process_output(output, budget);
     let (ok, text) = match status.success() {
@@ -3688,7 +3694,7 @@ mod tests {
             log_truncated,
             // This helper builds outputs for rendering tests; none of them
             // background anything.
-            background_terminated: false,
+            left_running: None,
         }
     }
 
@@ -4117,7 +4123,7 @@ mod tests {
             let body = "x".repeat(len);
             let mut output =
                 rendered_output(stream(len as u64, b"", body.as_bytes()), stream(0, b"", b""), None, false);
-            output.background_terminated = true;
+            output.left_running = Some(execution::LeftRunning::default());
             let Termination::Exited(status) = &output.termination else { unreachable!() };
             exited_outcome(&output, status, cap, &AtomicBool::new(noted))
         };

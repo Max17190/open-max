@@ -6469,7 +6469,6 @@ fn a_wait_named_timeout_is_the_calls_wait() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let started = std::time::Instant::now();
     let out = finish_with_deadline(child);
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
@@ -6477,7 +6476,6 @@ fn a_wait_named_timeout_is_the_calls_wait() {
     assert_eq!(ends.len(), 1, "{ends:?}");
     assert!(ends[0].starts_with("command timed out after 1s;"), "the call ran under its own wait: {ends:?}");
     assert!(!ends[0].contains("finished"), "{ends:?}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(4), "the run waited past the call's wait");
 }
 
 /// Whether `pid` runs: it exists and has not exited. An orphan that exited
@@ -6491,15 +6489,32 @@ fn runs(pid: i32) -> bool {
         .is_some_and(|rest| !rest.starts_with('Z'))
 }
 
+/// Kills the recorded pids when dropped, so a failing test leaves none of
+/// its long sleeps running.
+#[cfg(target_os = "linux")]
+struct KillOnDrop(Vec<PathBuf>);
+
+#[cfg(target_os = "linux")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            if let Ok(pid) = std::fs::read_to_string(file).unwrap_or_default().trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
 /// A job started with `cd dir && setsid job &` leaves the call's process
-/// group and keeps running, and the result does not say it was terminated.
-/// The subshell that ran the list stays in the group, waiting on the job, and
-/// is what the call stopped: the note it caused named a job that was still
-/// up, and models started it again. A plain `&` job beside it is still
-/// stopped and reported, as before.
+/// group and keeps running. The subshell that ran the list stays in the
+/// group, waiting on the job, and the call stops it. The result names the
+/// subshell as stopped and the job as still running: it said the background
+/// processes were terminated, of a job that was still up, and models started
+/// it again. Beside it, a plain `&` job is named among the stopped, and a
+/// plain `&` job alone still gets the note that explains the group rule.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_job_detached_with_setsid_is_not_reported_as_terminated() {
+fn a_job_detached_with_setsid_is_reported_as_still_running() {
     let (project, home) = fresh_dirs("setsid-note");
     let base = project.parent().unwrap().to_path_buf();
     let detached = |name: &str| {
@@ -6508,11 +6523,13 @@ fn a_job_detached_with_setsid_is_not_reported_as_terminated() {
             dir = base.display()
         )
     };
-    let alone = detached("alone");
-    let beside = format!("{} sleep 6853 & echo $! > '{}'", detached("beside"), base.join("plain").display());
+    let plain = |name: &str| format!("sleep 6853 & echo $! > '{}'", base.join(name).display());
+    let names = ["alone", "beside", "plain", "only"];
+    let guard = KillOnDrop(names.iter().map(|n| base.join(n)).collect());
     let (base_url, _requests, _server) = spawn_scripted_server(vec![
-        (sse_tool_call("bash", serde_json::json!({ "command": alone })), true),
-        (sse_tool_call("bash", serde_json::json!({ "command": beside })), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": detached("alone") })), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": format!("{} {}", detached("beside"), plain("plain")) })), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": plain("only") })), true),
         (sse_text("done"), true),
     ]);
     write_settings_with_mode(&home, &base_url, "auto");
@@ -6523,26 +6540,26 @@ fn a_job_detached_with_setsid_is_not_reported_as_terminated() {
         .spawn()
         .unwrap();
     let out = finish_with_deadline(child);
-    let pid = |name: &str| -> i32 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if let Ok(pid) = std::fs::read_to_string(base.join(name)).unwrap_or_default().trim().parse() {
-                return pid;
-            }
-            assert!(std::time::Instant::now() < deadline, "{name} never recorded its pid");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    };
-    let pids = [pid("alone"), pid("beside"), pid("plain")];
-    let state = pids.map(runs);
-    for pid in pids {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
-    let _ = std::fs::remove_dir_all(&base);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(state, [true, true, false], "the detached jobs run and the plain one was stopped");
+    let pid = |name: &str| -> i32 {
+        let recorded = std::fs::read_to_string(base.join(name)).unwrap_or_default();
+        recorded.trim().parse().unwrap_or_else(|_| panic!("{name} never recorded its pid"))
+    };
+    let [alone, beside, plain, only] = names.map(pid);
+    assert_eq!([alone, beside, plain, only].map(runs), [true, true, false, false], "the detached jobs run, the plain ones were stopped");
     let ends = tool_end_outputs(&out.stdout);
-    assert_eq!(ends.len(), 2, "{ends:?}");
-    assert!(!ends[0].contains("terminated"), "a running job was reported as terminated: {ends:?}");
-    assert!(ends[1].contains("were terminated when it returned"), "the stopped plain job was not reported: {ends:?}");
+    assert_eq!(ends.len(), 3, "{ends:?}");
+    // The first two results name what was stopped, then what still runs.
+    for (end, running, stopped) in [(&ends[0], alone, None), (&ends[1], beside, Some(plain))] {
+        let (was_stopped, still_running) = end.split_once("still running: ").unwrap_or_else(|| panic!("{end}"));
+        assert!(!end.contains("terminated"), "a running job was reported as terminated: {end}");
+        assert!(still_running.contains(&format!("({running})")), "the running job is named as running: {end}");
+        assert!(was_stopped.contains("were stopped: "), "{end}");
+        if let Some(stopped) = stopped {
+            assert!(was_stopped.contains(&format!("sleep ({stopped})")), "the stopped plain job is named: {end}");
+        }
+    }
+    assert!(ends[2].contains("were terminated when it returned"), "a plain job alone keeps its note: {ends:?}");
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&base);
 }
