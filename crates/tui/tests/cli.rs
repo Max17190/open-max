@@ -6412,3 +6412,30 @@ fn one_edit_call_carries_several_replacements_end_to_end() {
         assert!(result.contains(line), "the model sees {line:?} without a read: {result}");
     }
 }
+
+/// A tool's `pkill -f` on a word of the task does not stop the run: the
+/// prompt is not in the run's command line. Two Terminal-Bench trials ended at
+/// exit 143 when the agent ran `pkill -f pystan_analysis` on a task that named
+/// `/app/pystan_analysis.py`. The pattern is split in the command, so the
+/// shell that runs it does not match it either.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pkill_on_a_word_of_the_prompt_does_not_stop_the_run() {
+    let (project, home) = fresh_dirs("pkill-prompt");
+    let command = "pkill -f 'om-prompt''-word-7c1'; echo survived";
+    let (base_url, requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": command })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings(&home, &base_url);
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+
+    let out = cmd(&project, &home).args(["-p", "stop the om-prompt-word-7c1 job"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "the run went on to its next request: {requests:#?}");
+    let sent: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+    assert!(sent.to_string().contains("om-prompt-word-7c1"), "the prompt still reaches the model: {sent}");
+    assert!(requests[1].contains("survived"), "the command finished: {}", requests[1]);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}

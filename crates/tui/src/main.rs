@@ -210,6 +210,9 @@ struct CliArgs {
     /// One prompt string per headless turn (tokens between repeated -p flags
     /// are joined with spaces into a single turn).
     prompts: Vec<String>,
+    /// Every command-line word that is prompt text, as given, for
+    /// `hide_from_command_line`.
+    prompt_words: Vec<String>,
 }
 
 fn parse_args() -> Result<CliArgs, lexopt::Error> {
@@ -258,6 +261,7 @@ where
         subagent: None,
         worktree: false,
         prompts: Vec::new(),
+        prompt_words: Vec::new(),
     };
     // Tokens for the current -p group; flushed into prompts on the next -p or end.
     let mut current: Vec<String> = Vec::new();
@@ -335,7 +339,9 @@ where
                 if let Some(target) = target.filter(|target| target.is_none() && current.is_empty() && !out.print) {
                     *target = Some(v.string()?);
                 } else {
-                    current.push(v.string()?);
+                    let word = v.string()?;
+                    out.prompt_words.push(word.clone());
+                    current.push(word);
                 }
             }
             _ if out.mcp_list || out.mcp_call => {
@@ -495,6 +501,8 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         subagent,
         worktree,
         prompts,
+        // The words `prompts` is made of; not a flag of its own.
+        prompt_words: _,
     } = cli;
     // Each operation, named by its flag. `--check --stdio` is one operation
     // of its own: validating a protocol stream on stdin.
@@ -694,6 +702,9 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         }
     };
 
+    // While this is the only thread, and before any tool or hook can run.
+    hide_from_command_line(cli.prompt_words.iter().chain(&cli.subagent));
+
     if let Some(file) = &cli.replay {
         std::process::exit(replay(std::path::Path::new(file)));
     }
@@ -711,6 +722,50 @@ fn main() -> std::io::Result<std::process::ExitCode> {
     }
     runtime(None, runtime_workers(&cli)).block_on(run(cli))
 }
+
+/// Blank each argv word that equals one of `words` (the prompt and a
+/// `--subagent` task) in this process's command line, as `/proc/<pid>/cmdline`
+/// shows it to `ps`, `pgrep -f` and `pkill -f`. A task names the processes it
+/// asks for ("write /app/pystan_analysis.py"), so a prompt left there makes
+/// a tool's `pkill -f pystan_analysis` stop the run itself: two
+/// Terminal-Bench trials ended that way, at exit 143. The program and its
+/// options stay listed. Linux only, where the kernel names the argument
+/// block's bounds in `/proc/self/stat`; elsewhere, and on any read that
+/// fails, the command line is left as it is. `main` has read its arguments
+/// before this, and nothing reads them after.
+#[cfg(target_os = "linux")]
+fn hide_from_command_line<'a>(words: impl Iterator<Item = &'a String>) {
+    let words: Vec<&[u8]> = words.map(|w| w.as_bytes()).filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return;
+    }
+    let Some((start, end)) = std::fs::read_to_string("/proc/self/stat").ok().and_then(|stat| {
+        // After the command name's closing parenthesis, field 3 comes first;
+        // arg_start and arg_end are fields 48 and 49.
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace().skip(45);
+        Some((fields.next()?.parse::<usize>().ok()?, fields.next()?.parse::<usize>().ok()?))
+    }) else {
+        return;
+    };
+    if start == 0 || end <= start {
+        return;
+    }
+    // SAFETY: [start, end) is this process's argument block, which the kernel
+    // placed on the main thread's stack at exec and which stays mapped and
+    // writable for the process's life. No other thread runs yet, and no
+    // reference into it is held: the standard library keeps raw pointers to
+    // it and copies a word out only when the arguments are read, which
+    // `main` has finished.
+    let block = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, end - start) };
+    for word in block.split_mut(|b| *b == 0).skip(1) {
+        if words.contains(&&*word) {
+            word.fill(0);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hide_from_command_line<'a>(_: impl Iterator<Item = &'a String>) {}
 
 /// The worker threads of a print or stdio run's runtime. Its frontend, which
 /// writes the events and waits on a quit or on a stop's deadline, runs on the
