@@ -758,10 +758,22 @@ fn hide_from_command_line<'a>(words: impl Iterator<Item = &'a String>) {
     // `main` has finished.
     let block = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, end - start) };
     for word in block.split_mut(|b| *b == 0).skip(1) {
-        if words.contains(&&*word) {
-            word.fill(0);
+        if let Some(hidden) = hidden_part(word, &words) {
+            word[hidden].fill(0);
         }
     }
+}
+
+/// The bytes of argv word `word` that are one of `words`: the whole word, or
+/// the value of an option given as `--option=<value>` (`--subagent=<task>`),
+/// whose name stays listed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn hidden_part(word: &[u8], words: &[&[u8]]) -> Option<std::ops::Range<usize>> {
+    if words.contains(&word) {
+        return Some(0..word.len());
+    }
+    let value = word.strip_prefix(b"--")?.iter().position(|b| *b == b'=')? + 3;
+    words.contains(&&word[value..]).then_some(value..word.len())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3616,6 +3628,25 @@ mod tests {
         (&["--mcp-call"], "--mcp-call"),
         (&["--subagent", "x", "--worktree"], "--subagent"),
     ];
+
+    /// The words `main` hides from the command line are found whether given
+    /// as their own argument or attached to their option, and an option's
+    /// name stays listed.
+    #[test]
+    fn a_hidden_word_is_found_alone_or_attached_to_its_option() {
+        let cli = cli_of(&["--subagent=stop the pystan_analysis job", "--worktree"]);
+        let task = cli.subagent.clone().unwrap();
+        let words: Vec<&[u8]> = vec![task.as_bytes()];
+        let attached = b"--subagent=stop the pystan_analysis job";
+        assert_eq!(hidden_part(attached, &words), Some(11..attached.len()));
+        assert_eq!(hidden_part(task.as_bytes(), &words), Some(0..task.len()));
+        assert_eq!(hidden_part(b"--worktree", &words), None);
+        assert_eq!(hidden_part(b"--model=stop the pystan_analysis", &words), None);
+        let cli = cli_of(&["-p", "stop", "the pystan_analysis job"]);
+        let words: Vec<&[u8]> = cli.prompt_words.iter().map(|w| w.as_bytes()).collect();
+        assert_eq!(hidden_part(b"the pystan_analysis job", &words), Some(0..23));
+        assert_eq!(hidden_part(b"-p", &words), None);
+    }
 
     /// Whether a refusal names `flag` as a whole flag, so `--ledger` is not
     /// satisfied by `--ledger-repair`.
