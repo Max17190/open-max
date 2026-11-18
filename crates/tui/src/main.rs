@@ -138,12 +138,7 @@ options:
                          of -p, --stdio and --subagent, and stdout not a
                          terminal, no session starts: the grant alone exits
                          0, and with --continue or a settings flag it exits 1
-      --update           update this install to the latest release with the
-                         command that installed it (Homebrew, npm, bun or the
-                         install script). The interactive session checks for
-                         a newer release once a day and names it; it never
-                         installs one. OPENMAX_NO_UPDATE_CHECK=1 turns the
-                         check off
+      --update           update to the latest release the way it was installed
   -V, --version          print the version
   -h, --help             this help
 
@@ -212,7 +207,6 @@ struct CliArgs {
     /// `--subagent`: the task one child session runs in a new worktree (see
     /// `subagent`).
     subagent: Option<String>,
-    /// `--update`: run the command that updates this install (`update`).
     update: bool,
     /// `--worktree`: the isolation `--subagent` runs its child in.
     worktree: bool,
@@ -897,10 +891,15 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     start_input();
     let runtime = runtime(granted.as_deref(), None);
     let args = app::Args { continue_session: cli.continue_session, quit: quit.clone() };
-    let (result, warnings) = runtime.block_on(app::run(terminal, core, core_rx, args));
+    let (result, warnings) = runtime.block_on(app::run(terminal, core.clone(), core_rx, args));
     restore_terminal();
     runtime.block_on(open_max_core::chatgpt::finish_refreshes());
-    end_session(result, warnings, granted)
+    let code = end_session(result, warnings, granted);
+    drop(runtime);
+    match update::relaunch(&core) {
+        Some(failed) => Ok(std::process::ExitCode::from(u8::try_from(failed).unwrap_or(1))),
+        None => code,
+    }
 }
 
 /// End a run that cannot go on, on the shell: hand back the terminal a

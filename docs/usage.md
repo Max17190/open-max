@@ -485,6 +485,7 @@ watcher nor a later launch stops them.
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint, cache, performance, privacy, and network details |
+| `/update` | Update to the latest release, then resume this session in it |
 | `/quit` | Exit |
 
 The persistent status line stays limited to model, context use, and approval

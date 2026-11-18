@@ -1,87 +1,48 @@
-//! Update notices and `openmax --update`.
-//!
-//! The interactive session checks for a newer release at most once a day, in
-//! the background, and never installs anything itself: Homebrew, npm, bun and
-//! the install script each own the binary they put in place, and a version
-//! that changes under a running eval or session would make its results
-//! unreproducible. A newer release is named once, at the start of the next
-//! session, with the one command that updates this install, and
-//! `openmax --update` runs that command.
-//!
-//! Only an install made by one of those four is checked: a source build or a
-//! binary copied by hand makes no request. `OPENMAX_NO_UPDATE_CHECK=1` turns
-//! the check off, and print, stdio, sub-agent and check runs never make it.
+//! Update notices and `openmax --update` (docs/install.md#updating). A session
+//! of an installed release asks GitHub for the latest release at most daily,
+//! in the background, and names a newer one at the next start. Nothing ever
+//! installs itself: the package manager owns the binary, and evals need it
+//! pinned. Source builds and copied binaries are never checked.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// The latest published release. Prereleases and drafts are not "latest".
 pub const RELEASES_URL: &str = "https://api.github.com/repos/Max17190/open-max/releases/latest";
-const INSTALL_SCRIPT: &str = "https://useopenmax.dev/install.sh";
-const INSTALL_DOCS: &str = "https://github.com/Max17190/open-max/blob/main/docs/install.md";
-/// How old a cached answer may be before a session asks again.
-const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SCRIPT: &str = "curl -fsSL https://useopenmax.dev/install.sh |";
+const DAY: u64 = 24 * 60 * 60;
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
-/// How this binary was installed, which decides the command that updates it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Install {
-    Homebrew,
-    Npm,
-    Bun,
-    Pnpm,
-    /// The install script, into this directory.
-    Script { dir: PathBuf, default_dir: bool },
-    /// A source build, a copied binary, or anything else: never checked.
-    Unknown,
-}
+pub enum Install { Homebrew, Npm, Bun, Pnpm, Script { dir: PathBuf, default_dir: bool }, Unknown }
 
 impl Install {
-    /// The install this process runs from, from its executable's real path.
     pub fn current() -> Self {
-        let Some(exe) = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()) else {
-            return Self::Unknown;
-        };
+        let Some(exe) = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()) else { return Self::Unknown };
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let receipt_dir = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| h.join(".config")))
-            .and_then(|config| receipt_prefix(&config.join("openmax/openmax-receipt.json")));
-        Self::detect(&exe, home.as_deref(), receipt_dir.as_deref())
+        let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".config")));
+        // The install script's receipt records the directory it installed into.
+        let receipt = config.and_then(|c| std::fs::read_to_string(c.join("openmax/openmax-receipt.json")).ok());
+        let prefix = receipt.and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+            .and_then(|r| r["install_prefix"].as_str().map(PathBuf::from));
+        Self::detect(&exe, home.as_deref(), prefix.as_deref())
     }
 
-    /// `exe` is the canonical path of the binary; `receipt_dir` the directory
-    /// the install script's receipt says it installed into.
+    /// From the binary's canonical path: the npm launcher keeps it in its own
+    /// `node_modules/.bin_real`; an `npx` copy is replaced by the next run.
     pub fn detect(exe: &Path, home: Option<&Path>, receipt_dir: Option<&Path>) -> Self {
         let path = exe.to_string_lossy();
-        if path.contains("/Cellar/openmax/") {
-            return Self::Homebrew;
-        }
-        // The npm package's launcher fetches the binary into its own
-        // `node_modules/.bin_real`. A one-off `npx` run lives in npm's
-        // cache and is replaced by the next one, so it is not checked.
+        if path.contains("/Cellar/openmax/") { return Self::Homebrew }
         if path.contains("/node_modules/openmax-cli/") && !path.contains("/_npx/") {
-            return if path.contains("/.bun/") {
-                Self::Bun
-            } else if path.contains("/pnpm/") || path.contains("/.pnpm/") {
-                Self::Pnpm
-            } else {
-                Self::Npm
-            };
+            return if path.contains("/.bun/") { Self::Bun } else if path.contains("pnpm/") { Self::Pnpm } else { Self::Npm };
         }
         let Some(dir) = exe.parent() else { return Self::Unknown };
-        let default = home.map(|h| h.join(".openmax/bin"));
         let same = |other: &Path| other.canonicalize().is_ok_and(|other| other == dir);
-        if default.as_deref().is_some_and(same) {
-            return Self::Script { dir: dir.to_path_buf(), default_dir: true };
+        match (home.map(|h| h.join(".openmax/bin")).as_deref().is_some_and(same), receipt_dir.is_some_and(same)) {
+            (false, false) => Self::Unknown,
+            (default_dir, _) => Self::Script { dir: dir.to_path_buf(), default_dir },
         }
-        if receipt_dir.is_some_and(same) {
-            return Self::Script { dir: dir.to_path_buf(), default_dir: false };
-        }
-        Self::Unknown
     }
 
     /// The command that updates this install, as a user would type it.
@@ -91,163 +52,66 @@ impl Install {
             Self::Npm => "npm install -g openmax-cli@latest".into(),
             Self::Bun => "bun install -g openmax-cli@latest".into(),
             Self::Pnpm => "pnpm add -g openmax-cli@latest".into(),
-            Self::Script { default_dir: true, .. } => format!("curl -fsSL {INSTALL_SCRIPT} | sh"),
-            Self::Script { dir, default_dir: false } => {
-                format!("curl -fsSL {INSTALL_SCRIPT} | OPENMAX_INSTALL_DIR={} sh", shell_quote(&dir.to_string_lossy()))
-            }
+            Self::Script { default_dir: true, .. } => format!("{SCRIPT} sh"),
+            Self::Script { dir, .. } => format!("{SCRIPT} OPENMAX_INSTALL_DIR={} sh", open_max_core::doctor::shell_quote(dir)),
             Self::Unknown => return None,
         })
     }
-
-    /// The process that runs `command`. The install script leaves the
-    /// shell profile alone: the first install already put the directory on
-    /// `PATH`.
-    fn process(&self) -> Option<std::process::Command> {
-        let words: &[&str] = match self {
-            Self::Homebrew => &["brew", "upgrade", "openmax"],
-            Self::Npm => &["npm", "install", "-g", "openmax-cli@latest"],
-            Self::Bun => &["bun", "install", "-g", "openmax-cli@latest"],
-            Self::Pnpm => &["pnpm", "add", "-g", "openmax-cli@latest"],
-            Self::Script { dir, .. } => {
-                let mut command = std::process::Command::new("sh");
-                command
-                    .args(["-c", &format!("curl -fsSL {INSTALL_SCRIPT} | sh")])
-                    .env("OPENMAX_NO_MODIFY_PATH", "1")
-                    .env("OPENMAX_INSTALL_DIR", dir);
-                return Some(command);
-            }
-            Self::Unknown => return None,
-        };
-        let mut command = std::process::Command::new(words[0]);
-        command.args(&words[1..]);
-        Some(command)
-    }
 }
 
-fn shell_quote(word: &str) -> String {
-    if !word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-~".contains(&b)) {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
-    }
-}
-
-/// The `install_prefix` the install script's receipt records.
-fn receipt_prefix(receipt: &Path) -> Option<PathBuf> {
-    #[derive(Deserialize)]
-    struct Receipt {
-        install_prefix: PathBuf,
-    }
-    let text = std::fs::read_to_string(receipt).ok()?;
-    serde_json::from_str::<Receipt>(&text).ok().map(|r| r.install_prefix)
-}
-
-/// Whether `latest` is a later release than `current`. Versions are dotted
-/// numbers (`2026.11.3`); anything else is never newer.
+/// Whether `latest` is a later dotted-number version than `current`.
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| v.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
-    match (parse(latest), parse(current)) {
-        (Some(latest), Some(current)) => latest > current,
-        _ => false,
-    }
+    let parse = |v: &str| v.trim_start_matches('v').split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
 }
 
-/// Whether the background check may run: `OPENMAX_NO_UPDATE_CHECK` unset
-/// (or `0`), and an install it knows how to update.
-pub fn check_enabled(install: &Install) -> bool {
-    let off = std::env::var("OPENMAX_NO_UPDATE_CHECK").is_ok_and(|v| !v.is_empty() && v != "0");
-    !off && *install != Install::Unknown
+fn check_enabled(install: &Install) -> bool {
+    *install != Install::Unknown && std::env::var("OPENMAX_NO_UPDATE_CHECK").map_or(true, |v| v.is_empty() || v == "0")
 }
 
-/// The last answer, kept in `~/.openmax/update-check.json`.
+/// `~/.openmax/update-check.json`: the last attempt (answered or not, so an
+/// offline machine asks daily, not every launch) and the last answer.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Cache {
-    /// Unix seconds of the last attempt, answered or not.
-    pub checked_at: u64,
-    /// The latest release the last answered check saw.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest: Option<String>,
-}
+pub struct Cache { pub checked_at: u64, pub latest: Option<String> }
 
-pub fn cache_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("update-check.json")
-}
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
+fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) }
 
 impl Cache {
     pub fn read(data_dir: &Path) -> Self {
-        std::fs::read_to_string(cache_path(data_dir))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+        std::fs::read(data_dir.join("update-check.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
-    /// Written to a temporary file and renamed, so a session reading it
-    /// never sees half of one.
-    fn write(&self, data_dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(data_dir)?;
+    fn write(&self, data_dir: &Path) {
         let tmp = data_dir.join(format!("update-check.json.{}", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default())?;
-        std::fs::rename(&tmp, cache_path(data_dir))
+        let _ = std::fs::create_dir_all(data_dir).and_then(|_| std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default()))
+            .and_then(|_| std::fs::rename(&tmp, data_dir.join("update-check.json")));
     }
 
-    /// Due for another check at `now`: never checked, older than a day, or
-    /// stamped in the future by a clock that moved back.
-    pub fn due(&self, now: u64) -> bool {
-        now.saturating_sub(self.checked_at) >= CHECK_INTERVAL.as_secs() || self.checked_at > now
-    }
+    /// A day old, never checked, or stamped ahead by a clock that moved back.
+    pub fn due(&self, now: u64) -> bool { now.saturating_sub(self.checked_at) >= DAY || self.checked_at > now }
 }
 
-/// The latest release's version from a releases API answer at `url`.
 pub async fn fetch_latest(url: &str) -> Result<String, String> {
-    #[derive(Deserialize)]
-    struct Release {
-        tag_name: String,
-    }
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(concat!("openmax/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let release: Release = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    let version = release.tag_name.trim_start_matches('v').to_string();
-    if is_newer(&version, "0") {
-        Ok(version)
-    } else {
-        Err(format!("unexpected release tag {:?}", release.tag_name))
-    }
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("openmax/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
+    let reply = client.get(url).header("Accept", "application/vnd.github+json").send().await.and_then(|r| r.error_for_status());
+    let release: serde_json::Value = reply.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    let version = release["tag_name"].as_str().unwrap_or_default().trim_start_matches('v');
+    if is_newer(version, "0") { Ok(version.to_string()) } else { Err(format!("unexpected release {}", release["tag_name"])) }
 }
 
-/// Refresh the cache from `url`. A failed check still stamps the time, so an
-/// offline machine asks once a day rather than on every launch.
 pub async fn refresh(data_dir: &Path, url: &str) -> Cache {
-    let previous = Cache::read(data_dir);
-    let latest = fetch_latest(url).await.ok().or(previous.latest);
+    let latest = fetch_latest(url).await.ok().or(Cache::read(data_dir).latest);
     let cache = Cache { checked_at: now(), latest };
-    let _ = cache.write(data_dir);
+    cache.write(data_dir);
     cache
 }
 
-/// The session's start: the notice the cached answer gives, if any, and a
-/// background refresh when the answer is a day old. The refresh never
-/// delays the session; what it finds is shown at the next one.
+/// At a session's start: the notice the cached answer gives, and a refresh
+/// in the background when it is a day old, shown at the next start.
 pub fn on_session_start(data_dir: &Path) -> Option<String> {
     let install = Install::current();
-    if !check_enabled(&install) {
-        return None;
-    }
+    if !check_enabled(&install) { return None }
     let cache = Cache::read(data_dir);
     if cache.due(now()) {
         let data_dir = data_dir.to_path_buf();
@@ -256,66 +120,84 @@ pub fn on_session_start(data_dir: &Path) -> Option<String> {
     notice(&cache, &install)
 }
 
-/// The one line a session shows when the cache names a newer release.
 pub fn notice(cache: &Cache, install: &Install) -> Option<String> {
     let latest = cache.latest.as_deref().filter(|latest| is_newer(latest, CURRENT))?;
-    let command = install.command()?;
-    Some(format!("openmax {latest} is available (this is {CURRENT}); update with `openmax --update` or `{command}`"))
+    Some(format!("openmax {latest} is available (this is {CURRENT}); type /update, or run `{}`", install.command()?))
 }
 
-/// What `/status` says about update checks.
 pub fn status() -> String {
-    let install = Install::current();
-    if !check_enabled(&install) {
-        return match install {
-            Install::Unknown => "off (not a Homebrew, npm, bun or install-script install)".into(),
-            _ => "off (OPENMAX_NO_UPDATE_CHECK)".into(),
-        };
+    match Install::current() {
+        Install::Unknown => "off (not installed by Homebrew, npm, bun or the install script)".into(),
+        install if !check_enabled(&install) => "off (OPENMAX_NO_UPDATE_CHECK)".into(),
+        _ => "daily check of api.github.com for a newer release; nothing installs itself".into(),
     }
-    "daily check of api.github.com for a newer release; nothing installs itself".into()
 }
 
-/// `openmax --update`: say whether a newer release exists, then run the
-/// command that updates this install. A failed check still runs it: the
-/// package manager has the last word. Returns the exit code.
-pub async fn run(data_dir: &Path) -> i32 {
-    let install = Install::current();
-    let Some(mut process) = install.process() else {
-        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-        eprintln!(
-            "openmax: {exe} was not installed by Homebrew, npm, bun or the install script, so it cannot update itself; \
-             see {INSTALL_DOCS}"
-        );
-        return 1;
-    };
+const NOT_INSTALLED: &str = "this binary was not installed by Homebrew, npm, bun or the install script, so it cannot update itself; \
+    see https://github.com/Max17190/open-max/blob/main/docs/install.md";
+
+/// The session `/update` leaves: Some once asked for, holding its id if any.
+static REQUESTED: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+/// Whether `/update` should leave the session: an install it can update, and
+/// a newer release or a failed check (the package manager then decides).
+pub async fn prepare() -> Result<(), String> {
+    Install::current().command().ok_or(NOT_INSTALLED)?;
     match fetch_latest(RELEASES_URL).await {
-        Ok(latest) => {
-            let _ = Cache { checked_at: now(), latest: Some(latest.clone()) }.write(data_dir);
-            if !is_newer(&latest, CURRENT) {
-                println!("openmax {CURRENT} is the latest release");
-                return 0;
-            }
-            println!("updating openmax {CURRENT} to {latest}");
-        }
+        Ok(latest) if !is_newer(&latest, CURRENT) => Err(format!("openmax {CURRENT} is the latest release")),
+        _ => Ok(()),
+    }
+}
+
+pub fn request(session: Option<String>) {
+    *REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
+}
+
+/// Run this install's update command on the restored terminal; Ok when it succeeded.
+fn install(data_dir: &Path) -> Result<(), i32> {
+    let command = Install::current().command().ok_or_else(|| { eprintln!("openmax: {NOT_INSTALLED}"); 1 })?;
+    Cache { checked_at: now(), latest: None }.write(data_dir);
+    println!("$ {command}");
+    // The first install already put the directory on PATH.
+    match std::process::Command::new("sh").args(["-c", &command]).env("OPENMAX_NO_MODIFY_PATH", "1").status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => { eprintln!("openmax: `{command}` failed ({status})"); Err(status.code().unwrap_or(1)) }
+        Err(e) => { eprintln!("openmax: could not run `{command}`: {e}"); Err(1) }
+    }
+}
+
+/// After a session `/update` ended, once its terminal is restored: update,
+/// then replace this process with the new binary resuming that session.
+/// None when no `/update` was asked for; else the exit code of a failure.
+pub fn relaunch(core: &open_max_core::state::Core) -> Option<i32> {
+    let session = REQUESTED.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    // A session discarded on exit for being empty has nothing to resume.
+    let resume = session.filter(|id| open_max_core::sessions::meta(core, id).is_some());
+    let hint = if resume.is_some() { "openmax --continue" } else { "openmax" };
+    if let Err(code) = install(&core.data_dir) {
+        eprintln!("openmax: continue with `{hint}`");
+        return Some(code);
+    }
+    // The name it was started by, so a PATH lookup finds the new version.
+    let program = std::env::args_os().next().unwrap_or_else(|| "openmax".into());
+    let error = std::os::unix::process::CommandExt::exec(std::process::Command::new(program).args(resume.map(|_| "--continue")));
+    eprintln!("openmax: updated, but could not start it again ({error}); continue with `{hint}`");
+    Some(1)
+}
+
+/// `openmax --update`: run this install's update command when a newer
+/// release exists, or when the check fails (the package manager decides).
+pub async fn run(data_dir: &Path) -> i32 {
+    if Install::current().command().is_none() {
+        eprintln!("openmax: {NOT_INSTALLED}");
+        return 1;
+    }
+    match fetch_latest(RELEASES_URL).await {
+        Ok(latest) if !is_newer(&latest, CURRENT) => { println!("openmax {CURRENT} is the latest release"); return 0 }
+        Ok(latest) => println!("updating openmax {CURRENT} to {latest}"),
         Err(e) => eprintln!("openmax: could not check for a newer release ({e}); updating anyway"),
     }
-    let command = install.command().unwrap_or_default();
-    println!("$ {command}");
-    match tokio::task::spawn_blocking(move || process.status()).await {
-        Ok(Ok(status)) if status.success() => 0,
-        Ok(Ok(status)) => {
-            eprintln!("openmax: `{command}` failed ({status})");
-            status.code().unwrap_or(1)
-        }
-        Ok(Err(e)) => {
-            eprintln!("openmax: could not run `{command}`: {e}");
-            1
-        }
-        Err(e) => {
-            eprintln!("openmax: {e}");
-            1
-        }
-    }
+    install(data_dir).err().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -391,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_check_is_due_daily() {
-        let day = CHECK_INTERVAL.as_secs();
+        let day = DAY;
         assert!(Cache::default().due(1_000_000));
         assert!(!Cache { checked_at: 1_000_000, latest: None }.due(1_000_000 + day - 1));
         assert!(Cache { checked_at: 1_000_000, latest: None }.due(1_000_000 + day));

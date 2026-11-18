@@ -2591,6 +2591,14 @@ impl App {
                 ];
                 self.transcript.push(block);
             }
+            "update" if self.running => self.note("finish or cancel the turn before /update"),
+            "update" => match crate::update::prepare().await {
+                Ok(()) => {
+                    crate::update::request(self.session_id.clone());
+                    self.should_quit = true;
+                }
+                Err(why) => self.note(&why),
+            },
             "quit" | "exit" => self.should_quit = true,
             other => self.note(&format!(
                 "unknown command: /{other} (see /help; prompt templates live in .agents/prompts/)"
