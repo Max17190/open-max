@@ -2594,7 +2594,7 @@ impl App {
                 self.transcript.push(block);
             }
             "update" if self.running => self.note("finish or cancel the turn before /update"),
-            "update" => match crate::update::prepare().await {
+            "update" => match Box::pin(crate::update::prepare()).await {
                 Ok(()) => {
                     crate::update::request(self.session_id.clone());
                     self.should_quit = true;

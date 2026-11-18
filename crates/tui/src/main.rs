@@ -1044,7 +1044,7 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         return Ok(authenticate(|dir| async move { Box::pin(setup::run(&dir, action, target, None)).await }).await);
     }
     if cli.update {
-        return Ok(std::process::ExitCode::from(u8::try_from(update::run(&default_data_dir()).await).unwrap_or(1)));
+        return Ok(std::process::ExitCode::from(u8::try_from(Box::pin(update::run(&default_data_dir())).await).unwrap_or(1)));
     }
     if let Some(action) = &cli.chatgpt {
         if matches!(action.as_str(), "login" | "logout") {
