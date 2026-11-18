@@ -1700,8 +1700,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/11");
-    assert_eq!(hello["protocol_version"], 11);
+    assert_eq!(hello["proto"], "openmax-stdio/12");
+    assert_eq!(hello["protocol_version"], 12);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -2647,7 +2647,7 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
     assert_eq!(
         framed[0],
         format!(
-            r#"{{"type":"hello","proto":"openmax-stdio/11","protocol_version":11,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            r#"{{"type":"hello","proto":"openmax-stdio/12","protocol_version":12,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
             env!("CARGO_PKG_VERSION"),
             hello["project"],
         )
@@ -6448,6 +6448,40 @@ fn tool_end_outputs(stdout: &[u8]) -> Vec<String> {
         .filter(|l| l["type"] == "tool_end")
         .map(|l| l["output"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// Each tool result on the wire carries how long the call took, and nothing
+/// of it reaches the model: the request after the call is the one a run
+/// without the field would send.
+#[test]
+fn a_tool_end_carries_its_duration_and_no_request_sees_it() {
+    let (project, home) = fresh_dirs("tool-duration");
+    let (base_url, requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": "sleep 1.2; echo slept" })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "run the step"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let ends: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["type"] == "tool_end")
+        .collect();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    let ms = ends[0]["duration_ms"].as_u64().expect("a started call's end carries its duration");
+    assert!((1_000..60_000).contains(&ms), "the call slept 1.2 s: {ms} ms");
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "{requests:#?}");
+    assert!(requests[1].contains("slept"), "the result reached the model: {}", requests[1]);
+    assert!(requests.iter().all(|r| !r.contains("duration_ms")), "no request carries the duration: {requests:#?}");
 }
 
 /// A bash call that names its wait `timeout` gets that wait, as one naming

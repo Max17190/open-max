@@ -153,7 +153,7 @@ async fn a_deny_rule_written_this_turn_gates_the_same_turn() {
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
         match envelope.event {
-            AgentEvent::ToolEnd { ok, output, call_id } => {
+            AgentEvent::ToolEnd { ok, output, call_id, .. } => {
                 if call_id == "call-bash" {
                     bash_outputs.push((ok, output));
                 }
@@ -235,7 +235,7 @@ async fn a_deny_live_at_turn_start_survives_its_own_removal_for_the_turn() {
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
         match envelope.event {
-            AgentEvent::ToolEnd { ok, output, call_id } => {
+            AgentEvent::ToolEnd { ok, output, call_id, .. } => {
                 if call_id == "call-bash" {
                     bash_outputs.push((ok, output));
                 }
@@ -312,7 +312,7 @@ async fn a_deny_added_mid_turn_survives_its_removal_for_the_turn() {
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
         match envelope.event {
-            AgentEvent::ToolEnd { ok, output, call_id } => {
+            AgentEvent::ToolEnd { ok, output, call_id, .. } => {
                 if call_id == "call-bash" {
                     bash_outputs.push((ok, output));
                 }
@@ -384,7 +384,7 @@ async fn a_deny_written_earlier_in_the_same_response_gates_the_next_call() {
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
         match envelope.event {
-            AgentEvent::ToolEnd { ok, output, call_id } => {
+            AgentEvent::ToolEnd { ok, output, call_id, .. } => {
                 if call_id.contains("bash") {
                     bash_outputs.push((ok, output));
                 }
@@ -456,7 +456,7 @@ async fn a_policy_written_by_a_failed_mutation_still_gates() {
                     rm_outputs.push(call_id);
                 }
             }
-            AgentEvent::ToolEnd { ok, output, call_id } => {
+            AgentEvent::ToolEnd { ok, output, call_id, .. } => {
                 if rm_outputs.contains(&call_id) {
                     assert!(!ok, "the rm call must be refused, got: {output}");
                 }

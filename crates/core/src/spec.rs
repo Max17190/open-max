@@ -1042,14 +1042,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/11)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/12)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/11","protocol_version":11,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/12","protocol_version":12,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -1116,7 +1116,7 @@ fields. Parse by field name, never by key order. Only two lines carry no
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
 the tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
-(call_id, name, args), `tool_end` (call_id, ok, output), `harness_note`
+(call_id, name, args), `tool_end` (call_id, ok, output, duration_ms), `harness_note`
 (call_id, text: a note the harness wrote into the MODEL's transcript - a
 refreeze receipt, or a policy/providers/settings/approval notice - surfaced
 here so a frontend can render what the model sees; `call_id` links it to the
@@ -1893,7 +1893,7 @@ mod tests {
                 name: String::new(),
                 args: serde_json::Value::Null,
             },
-            AgentEvent::ToolEnd { call_id: String::new(), ok: true, output: String::new() },
+            AgentEvent::ToolEnd { call_id: String::new(), ok: true, output: String::new(), duration_ms: None },
             AgentEvent::HarnessNote { call_id: String::new(), text: String::new() },
             AgentEvent::Retry { attempt: 0, max_attempts: 0, reason: String::new() },
             AgentEvent::Diff {
