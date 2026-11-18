@@ -45,18 +45,31 @@ fn function_type() -> String {
     "function".to_string()
 }
 
-/// An image a tool result shows the model (`image_input`): its media type
-/// and its bytes in base64. Each wire sends it as its own image part.
+/// An image a tool result shows the model (`image_input`): its media type,
+/// its bytes in base64 and the size its header gives. Each wire sends it as
+/// its own image part.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
     pub mime: String,
     pub data: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
 }
 
 impl Image {
     /// `data:` URL form, as Chat Completions and Responses take it.
     pub fn data_url(&self) -> String {
         format!("data:{};base64,{}", self.mime, self.data)
+    }
+
+    /// What the image costs its model in context: a token per 750 pixels,
+    /// each side counted up to the 2,000 a model is sent at most; 1,600 for
+    /// one stored without a size.
+    pub fn tokens(&self) -> usize {
+        let side = |s: u32| s.min(2_000) as usize;
+        if self.width == 0 || self.height == 0 { 1_600 } else { (side(self.width) * side(self.height)).div_ceil(750) }
     }
 }
 
@@ -157,8 +170,7 @@ impl ChatMessage {
                 }
             }
         }
-        // An image costs its model about this many tokens, whatever its bytes.
-        estimate_tokens(chars) + 8 + self.images.as_ref().map_or(0, |images| images.len() * 1_600)
+        estimate_tokens(chars) + 8 + self.images.iter().flatten().map(Image::tokens).sum::<usize>()
     }
 }
 
@@ -387,6 +399,23 @@ mod tests {
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
     /// is added without an assertion below.
+    /// An image is estimated from the size it is delivered at, each side
+    /// counted up to 2,000, and one stored without a size at the flat 1,600.
+    #[test]
+    fn an_images_estimate_follows_its_dimensions() {
+        let image = |width, height| Image { mime: "image/png".into(), data: "AAAA".into(), width, height };
+        assert_eq!(image(100, 75).tokens(), 10);
+        assert_eq!(image(1_000, 750).tokens(), 1_000);
+        assert_eq!(image(2_000, 2_000).tokens(), 5_334);
+        assert_eq!(image(8_000, 2_000).tokens(), 5_334, "each side clamps to 2,000");
+        assert_eq!(image(8_000, 100).tokens(), image(2_000, 100).tokens());
+        assert_eq!(image(0, 0).tokens(), 1_600);
+        let mut message = ChatMessage::tool("c1", "a.png");
+        let text = message.estimated_tokens();
+        message.images = Some(vec![image(1_000, 750), image(100, 75)]);
+        assert_eq!(message.estimated_tokens(), text + 1_010);
+    }
+
     #[test]
     fn event_envelope_wire_is_stable() {
         assert_eq!(

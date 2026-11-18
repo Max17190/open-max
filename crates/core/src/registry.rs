@@ -1455,7 +1455,9 @@ async fn spawn_external(
         },
     };
     if let Some(dir) = image_dir {
-        outcome.images = tools::take_tool_images(&dir);
+        let omitted;
+        (outcome.images, omitted) = tools::take_tool_images(&dir);
+        omitted.iter().for_each(|line| outcome.output = format!("{}\n{line}", outcome.output.trim_end()));
     }
     outcome
 }
@@ -2571,9 +2573,10 @@ mutatng = true
     }
 
     /// With image_input on, an image a tool leaves in the folder it is handed
-    /// reaches the model with that call's result, in name order, and the folder
-    /// is gone after the call. A file that is not an image, and a link, are not
-    /// shown. Off, the tool is handed no folder at all.
+    /// reaches the model with that call's result, in name order, with the
+    /// size its header gives, and the folder is gone after the call. A file
+    /// that is not an image, and a link, are named as not shown. Off, the
+    /// tool is handed no folder at all.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_external_tools_images_come_back_with_its_result() {
@@ -2582,10 +2585,13 @@ mutatng = true
         let data = temp_dir("imgdata");
         let tools_dir = project.join(".openmax").join("tools");
         std::fs::create_dir_all(&tools_dir).unwrap();
+        let png = |width: u32| [&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13][..], b"IHDR", &width.to_be_bytes(), &90u32.to_be_bytes()].concat();
+        std::fs::write(project.join("first.png"), png(160)).unwrap();
+        std::fs::write(project.join("second.png"), png(120)).unwrap();
         let script = write_script(
             &project,
             "plot.sh",
-            "#!/bin/sh\nread -r line\n[ -n \"$OPENMAX_IMAGE_DIR\" ] || { echo no folder; exit 0; }\nprintf '\\211PNG second' > \"$OPENMAX_IMAGE_DIR/0001\"\nprintf '\\211PNG first' > \"$OPENMAX_IMAGE_DIR/0000\"\necho text > \"$OPENMAX_IMAGE_DIR/0002\"\nln -s /etc/hostname \"$OPENMAX_IMAGE_DIR/0003\"\necho plotted\n",
+            "#!/bin/sh\nread -r line\n[ -n \"$OPENMAX_IMAGE_DIR\" ] || { echo no folder; exit 0; }\ncp second.png \"$OPENMAX_IMAGE_DIR/0001\"\ncp first.png \"$OPENMAX_IMAGE_DIR/0000\"\necho text > \"$OPENMAX_IMAGE_DIR/0002\"\nln -s /etc/hostname \"$OPENMAX_IMAGE_DIR/0003\"\necho plotted\n",
         );
         write_tool(
             &tools_dir,
@@ -2596,13 +2602,13 @@ mutatng = true
         let on = tools::OutputCaps { images: true, ..tools::OutputCaps::default() };
         let out = registry.execute("plot", &serde_json::json!({}), &data, &project, on, no_cancel()).await;
         assert!(out.ok, "{}", out.output);
-        assert_eq!(out.output.trim(), "plotted");
-        let shown: Vec<(String, Vec<u8>)> = out
+        assert_eq!(out.output.trim(), "plotted\n[image 0002 (5 bytes) not shown: not a PNG, JPEG, GIF or WebP image]\n[image 0003 not shown: not a regular file]");
+        let shown: Vec<(Vec<u8>, u32, u32)> = out
             .images
             .iter()
-            .map(|i| (i.mime.clone(), base64::engine::general_purpose::STANDARD.decode(&i.data).unwrap()))
+            .map(|i| (base64::engine::general_purpose::STANDARD.decode(&i.data).unwrap(), i.width, i.height))
             .collect();
-        assert_eq!(shown, [("image/png".into(), b"\x89PNG first".to_vec()), ("image/png".into(), b"\x89PNG second".to_vec())]);
+        assert_eq!(shown, [(png(160), 160, 90), (png(120), 120, 90)]);
         assert_eq!(std::fs::read_dir(data.join("tool-images")).unwrap().count(), 0, "the folder is removed after the call");
 
         let off = registry

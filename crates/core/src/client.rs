@@ -3938,7 +3938,7 @@ pub(crate) mod tests {
     fn a_tool_result_carries_its_images_on_every_wire() {
         let call = ToolCall { id: "c1".into(), kind: "function".into(), function: crate::types::ToolCallFunction { name: "read_file".into(), arguments: "{}".into() }, extra_content: None };
         let mut shown = ChatMessage::tool("c1", "a.png: image/png, 3 bytes, shown to you as an image");
-        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into() }]);
+        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 1, height: 1 }]);
         let messages = vec![ChatMessage::user("look"), ChatMessage::assistant(None, Some(vec![call])), shown, ChatMessage::tool("c2", "plain")];
         let tools = "[]";
         let chat: Value = serde_json::from_slice(&serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, 64, tools).unwrap()).unwrap();

@@ -318,16 +318,21 @@ and the run that writes a key already uses it.
   with lone-`\r` line endings printed through bash shows only its last
   record the same way; `tr '\r' '\n' < file` shows every record.
 - `image_input` (default false): `read_file` on a PNG, JPEG, GIF or WebP
-  file of at most 5 MiB returns a one-line description and the image itself,
-  sent as an image part of the tool result on every wire (Chat Completions
-  `image_url`, Responses `input_image`, native Messages `image`). Larger
-  images and other binary files read as before. An external tool's images
-  come back with its result the same way: the tool is handed a fresh folder
-  in `OPENMAX_IMAGE_DIR`, and each image file it leaves there (at most 8, in
-  name order) is sent with that call's result, with no file for the model to
-  read back. The MCP bridge puts a server's image results there. Set it only
-  for a model that takes images:
-  one that does not refuses the request. Off, no request changes.
+  file returns a one-line description (type, width x height, bytes) and the
+  image itself, sent as an image part of the tool result on every wire (Chat
+  Completions `image_url`, Responses `input_image`, native Messages `image`).
+  An external tool's images come back with its result the same way: the tool
+  is handed a fresh folder in `OPENMAX_IMAGE_DIR`, and each image file it
+  leaves there, in name order, is sent with that call's result, with no file
+  for the model to read back. The MCP bridge puts a server's image results
+  there. Both paths share one step: the type comes from the file's first
+  bytes, the size from its header, and one call shows at most 8 images and
+  5 MiB of them in all, counted before base64. An image left out (over that
+  budget, past the eighth, not an image, or with no size in its header) gets
+  a line in the result naming it, its bytes and the reason. Each image counts
+  toward the context estimate as one token per 750 pixels, each side counted
+  up to 2,000. Set it only for a model that takes images: one that does not
+  refuses the request. Off, no request changes.
 - `max_agent_iterations` (default 300): tool-call rounds one turn may take.
   A turn that reaches it stops and says so; a follow-up message (or
   `openmax --continue -p "<follow-up>"`) carries on from there. Settings are
