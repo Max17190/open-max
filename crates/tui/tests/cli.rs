@@ -1700,8 +1700,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/11");
-    assert_eq!(hello["protocol_version"], 11);
+    assert_eq!(hello["proto"], "openmax-stdio/12");
+    assert_eq!(hello["protocol_version"], 12);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -2612,6 +2612,22 @@ fn stdio_lines(project: &Path, home: &Path, args: &[&str], commands: &[&str]) ->
     stdout.lines().map(|line| line.replace(id, "S")).collect()
 }
 
+/// `lines` with each `"duration_ms":<n>` written as `"duration_ms":0`.
+fn mask_durations(lines: &[String]) -> Vec<String> {
+    const KEY: &str = "\"duration_ms\":";
+    lines
+        .iter()
+        .map(|line| match line.find(KEY) {
+            Some(at) => {
+                let digits = at + KEY.len();
+                let end = line[digits..].find(|c: char| !c.is_ascii_digit()).map_or(line.len(), |n| digits + n);
+                format!("{}0{}", &line[..digits], &line[end..])
+            }
+            None => line.clone(),
+        })
+        .collect()
+}
+
 /// `--stdio` and `--print --json` render one event stream, and
 /// docs/stdio-protocol.md gives every event line as `session_id`, then
 /// `type`, then the fields in declaration order. So one turn is framed in
@@ -2647,11 +2663,14 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
     assert_eq!(
         framed[0],
         format!(
-            r#"{{"type":"hello","proto":"openmax-stdio/11","protocol_version":11,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            r#"{{"type":"hello","proto":"openmax-stdio/12","protocol_version":12,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
             env!("CARGO_PKG_VERSION"),
             hello["project"],
         )
     );
+    // A tool_end carries the call's wall time, which differs between the two
+    // runs, so it is masked; its place among the fields is still compared.
+    let (framed, printed) = (mask_durations(&framed), mask_durations(&printed));
     assert_eq!(framed[1..], printed[..], "stdio and print mode framed one turn differently");
 
     let resumed = stdio_lines(&project, &home, &["--continue", "--stdio"], &[]);
@@ -6450,6 +6469,40 @@ fn tool_end_outputs(stdout: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Each tool result on the wire carries how long the call took, and nothing
+/// of it reaches the model: the request after the call is the one a run
+/// without the field would send.
+#[test]
+fn a_tool_end_carries_its_duration_and_no_request_sees_it() {
+    let (project, home) = fresh_dirs("tool-duration");
+    let (base_url, requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": "sleep 1.2; echo slept" })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "run the step"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let ends: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["type"] == "tool_end")
+        .collect();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    let ms = ends[0]["duration_ms"].as_u64().expect("a started call's end carries its duration");
+    assert!((1_000..60_000).contains(&ms), "the call slept 1.2 s: {ms} ms");
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "{requests:#?}");
+    assert!(requests[1].contains("slept"), "the result reached the model: {}", requests[1]);
+    assert!(requests.iter().all(|r| !r.contains("duration_ms")), "no request carries the duration: {requests:#?}");
+}
+
 /// A bash call that names its wait `timeout` gets that wait, as one naming
 /// it `timeout_secs` does. Models often write `timeout`, and the tool dropped
 /// it: a 600 second build ran under the 120 second default and was stopped.
@@ -6570,4 +6623,26 @@ fn a_job_detached_with_setsid_is_reported_as_still_running() {
     assert!(ends[2].contains("were terminated when it returned"), "a plain job alone keeps its note: {ends:?}");
     drop(guard);
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A binary no installer put in place (this test's own build) cannot update
+/// itself: `--update` says so and how to install, exits 1, and makes no
+/// request first, so a source build never reaches the network for it.
+#[test]
+fn update_refuses_a_build_no_installer_made() {
+    let (project, home) = fresh_dirs("update");
+    let output = cmd(&project, &home)
+        .arg("--update")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot update itself"), "{stderr}");
+    assert!(stderr.contains("docs/install.md"), "{stderr}");
+    assert!(!stderr.contains("could not check"), "no check was attempted: {stderr}");
+    assert!(!home.join(".openmax/update-check.json").exists());
+    let refused = cmd(&project, &home).args(["--update", "--check"]).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2));
 }

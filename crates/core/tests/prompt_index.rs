@@ -327,7 +327,7 @@ async fn a_tool_written_mid_session_runs_by_its_own_name() {
     let events = drive_turn(&core, &mut rx, "by-name", &project, "write and run a tool").await;
 
     let ran = events.iter().find_map(|e| match e {
-        AgentEvent::ToolEnd { call_id, ok, output } if call_id == "c2" => Some((*ok, output.clone())),
+        AgentEvent::ToolEnd { call_id, ok, output, .. } if call_id == "c2" => Some((*ok, output.clone())),
         _ => None,
     });
     assert!(

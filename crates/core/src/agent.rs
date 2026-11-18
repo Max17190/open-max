@@ -113,7 +113,7 @@ pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &t
         let (path, diff, added, removed) = (d.path.clone(), d.diff.clone(), d.added, d.removed);
         core.send_agent(session_id, AgentEvent::Diff { call_id: call_id.into(), path, diff, added, removed });
     }
-    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: outcome.ok, output: outcome.output.clone() });
+    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: outcome.ok, output: outcome.output.clone(), duration_ms: None });
     messages.push(ChatMessage::tool(call_id, tool_message_content(outcome)));
 }
 
@@ -123,7 +123,7 @@ const USER_CANCELLED: &str = "The user cancelled this turn.";
 /// End a started call the user cancelled. Its reply carries no "Error:"
 /// prefix: nothing failed, and the turn stops here.
 fn end_cancelled(core: &Core, session_id: &str, call_id: &str, messages: &mut Vec<ChatMessage>) {
-    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: false, output: USER_CANCELLED.into() });
+    core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: false, output: USER_CANCELLED.into(), duration_ms: None });
     messages.push(ChatMessage::tool(call_id, USER_CANCELLED));
 }
 
@@ -257,9 +257,9 @@ async fn finish_session_work(core: &Core, id: &str, events: Vec<AgentEvent>) {
     let mut state = core.sessions.lock().await;
     let mut running = core.running.lock().unwrap();
     core.cancel_flags.lock().unwrap().remove(id);
-    // Closes the steer queue: a steer the turn never reached is dropped
-    // here, and its frontend, which saw no SteerAccepted for it, still has it.
+    // Closes the steer queue: a steer the turn never reached is dropped here; its frontend saw no SteerAccepted for it.
     core.steers.lock().unwrap().remove(id);
+    core.tool_starts.lock().unwrap().retain(|(session, _), _| session != id); // a turn that failed mid-call sent no ToolEnd
     running.remove(id);
     // Into the session's event log while this process still holds it: the
     // detach below can release it (see `sessions::record_receipts`).
@@ -5487,7 +5487,7 @@ mod tests {
             {
                 match env.event {
                     AgentEvent::ToolStart { call_id, .. } => order.push(format!("start {call_id}")),
-                    AgentEvent::ToolEnd { call_id, ok, output } => {
+                    AgentEvent::ToolEnd { call_id, ok, output, .. } => {
                         assert!(ok, "{call_id} failed: {output}");
                         order.push(format!("end {call_id}"));
                     }
@@ -5581,7 +5581,7 @@ mod tests {
                         cards += 1;
                         core.respond_approval(&approval_id, true);
                     }
-                    AgentEvent::ToolEnd { call_id, ok, output } => ends.push((call_id, ok, output)),
+                    AgentEvent::ToolEnd { call_id, ok, output, .. } => ends.push((call_id, ok, output)),
                     AgentEvent::Done { stop_reason } => {
                         stop = Some(stop_reason);
                         break;
@@ -5694,7 +5694,7 @@ mod tests {
                         cards += 1;
                         core.respond_approval(&approval_id, false);
                     }
-                    AgentEvent::ToolEnd { call_id, ok, output } => ends.push((call_id, ok, output)),
+                    AgentEvent::ToolEnd { call_id, ok, output, .. } => ends.push((call_id, ok, output)),
                     AgentEvent::Done { stop_reason } => {
                         stop = Some(stop_reason);
                         break;

@@ -263,6 +263,7 @@ fn conversation_layout(
 
 pub struct Args {
     pub continue_session: bool,
+    pub session: Option<String>, // `--session`: resumed instead of the latest
     /// Notified when a signal asks the session to end. The loop treats it
     /// as /quit, so the normal exit path restores the terminal. The signal
     /// watcher holds it weakly: once the loop drops it, a signal exits at
@@ -802,14 +803,18 @@ impl App {
 
     async fn startup(&mut self, args: &Args) {
         self.refresh_billing();
+        if let Some(notice) = crate::update::on_session_start(&self.core.data_dir) {
+            self.note(&notice);
+        }
         if args.continue_session {
             let project = self.project.display().to_string();
-            match sessions::latest(&self.core, &project) {
+            let here = sessions::list(&self.core, &project); // a damaged index is an error, not "missing"
+            match here.map(|here| here.into_iter().find(|m| args.session.as_ref().is_none_or(|id| *id == m.id))) {
                 Ok(Some(meta)) => {
                     self.session_id = Some(meta.id.clone());
                     self.replay(&meta.id);
                 }
-                Ok(None) => self.note("no previous session here; starting fresh"),
+                Ok(None) => self.note(&format!("no {} here; starting fresh", args.session.as_ref().map_or("previous session".into(), |id| format!("session {id}")))),
                 Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
             }
         }
@@ -2584,9 +2589,18 @@ impl App {
                         "  privacy",
                         "no telemetry · sessions stay local · external tools may use the network",
                     ),
+                    kv("  updates", &crate::update::status()),
                 ];
                 self.transcript.push(block);
             }
+            "update" if self.running => self.note("finish or cancel the turn before /update"),
+            "update" => match Box::pin(crate::update::prepare()).await {
+                Ok(()) => {
+                    crate::update::request(self.session_id.clone());
+                    self.should_quit = true;
+                }
+                Err(why) => self.note(&why),
+            },
             "quit" | "exit" => self.should_quit = true,
             other => self.note(&format!(
                 "unknown command: /{other} (see /help; prompt templates live in .agents/prompts/)"
@@ -2776,7 +2790,7 @@ impl App {
             AgentEvent::Diff { call_id, path, diff, added, removed } => {
                 self.pending_diffs.insert(call_id, DiffText { path, diff, added, removed });
             }
-            AgentEvent::ToolEnd { call_id, ok, output } => {
+            AgentEvent::ToolEnd { call_id, ok, output, .. } => {
                 let meta = self
                     .tool_meta
                     .remove(&call_id)
@@ -4663,7 +4677,7 @@ mod tests {
         // A resumed session was not this app's to create, so it stays even
         // though nothing was ever saved to it.
         let resumed = open_max_core::sessions::create(&core, key.clone()).unwrap().id;
-        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        app.startup(&super::Args { continue_session: true, session: None, quit: Default::default() }).await;
         assert_eq!(app.session_id.as_deref(), Some(resumed.as_str()));
         app.handle_submit("/new".into()).await.unwrap();
         assert_eq!(ids(&core), vec![resumed.clone()], "a resumed session was discarded");
@@ -5727,7 +5741,7 @@ mod tests {
         let index = damage_session_index(&dir);
         let path = index.display().to_string();
 
-        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        app.startup(&super::Args { continue_session: true, session: None, quit: Default::default() }).await;
         let continued = app.transcript.export_text();
         assert!(
             continued.contains(&path)
@@ -7300,6 +7314,7 @@ mod tests {
             call_id: "call-1".into(),
             ok: true,
             output: "test one ok\ntest two ok\ntest three ok\ntest four ok".into(),
+            duration_ms: None,
         });
         let complete = render_app(&mut app, 96, 22);
         let complete_text = buffer_text(&complete);
@@ -7354,6 +7369,7 @@ mod tests {
                 call_id: call_id.into(),
                 ok,
                 output: "exit 1\nerror: linking failed".into(),
+                duration_ms: None,
             });
         }
         app.composer.load("a draft");

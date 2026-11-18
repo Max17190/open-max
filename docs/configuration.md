@@ -388,8 +388,9 @@ no text that ended on its own and made no call gives its reasoning as the
 notes, since some models write them there. Notes over the cap end at their
 last whole line, and notes the reply limit cut end with a line that says so.
 A call in that reply never runs, and nothing else of the exchange is kept.
-When no notes come back (an error, an empty reply, a timeout, or a request
-`max_agent_tokens` refuses), automatic compaction makes no cut until the
+The notes request has no overall deadline, as no request does: only a
+connection that falls silent ends it. When no notes come back (an error, an
+empty reply, a silent connection, or a request `max_agent_tokens` refuses), automatic compaction makes no cut until the
 window forces one, and does not ask again in that turn before then. A cut the
 window forces, or a `/compact`, is made without notes when none come back,
 and its note lists the tools used, the files touched and the earlier goals
