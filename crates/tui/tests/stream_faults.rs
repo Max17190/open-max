@@ -2264,12 +2264,13 @@ fn a_truncated_first_prompt_skips_the_prompts_after_it() {
 
 /// A reply the limit cuts before any call is continued four times; the fifth
 /// in a row ends the turn `length`, which exits 4 and skips the prompts after
-/// it. The `stop` reply reports one token under the limit: a usage count equal
-/// to the limit counts as a cut whatever the finish reason, so a `stop` reply
-/// of exactly 32 tokens would be continued too.
+/// it. The `stop` reply reports 22 tokens, under 70% of the limit: a usage
+/// count equal to the limit counts as a cut whatever the finish reason, and a
+/// `stop` reply with no call at 70% of the limit or more (23 of 32 here) is
+/// read as a cut thought, so either would be continued too.
 #[test]
 fn a_reply_cut_by_the_provider_exits_four_and_skips_later_prompts() {
-    for (reason, used, code, turns, requests) in [("length", 32, 4, 1, 5), ("stop", 31, 0, 2, 2)] {
+    for (reason, used, code, turns, requests) in [("length", 32, 4, 1, 5), ("stop", 22, 0, 2, 2)] {
         let usage = data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":used}}));
         let reply = format!("{}{}{usage}{DONE}", content("first answer"), finish(reason));
         let mut script: Vec<Step> = (turns..=requests).map(|_| Step::Finished(reply.clone())).collect();

@@ -383,14 +383,6 @@ impl CompletionResult {
                 && serde_json::from_str::<Value>(&c.function.arguments).is_err_and(|e| e.is_eof()))
     }
 
-    /// Whether this reply ended on its own (not at the limit) with no tool call after its reasoning, else its whole
-    /// output, spent 70% of the limit or more: the budget ran out on the thought, and whatever closes it was written
-    /// to stop, not as an answer, so it is read as a cut thought. A reply without usage is never read so.
-    pub(crate) fn stopped_near_limit_without_call(&self, limit: usize) -> bool {
-        self.tool_calls.is_empty() && limit > 0 && !matches!(self.finish_reason.as_str(), "length" | "cancelled" | TRUNCATED)
-            && self.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7)
-    }
-
     /// Whether this reply stopped below the limit, past half of it, within one token of where an earlier one did
     /// (its reasoning count, else its output): a cap the provider applies without reporting it. Remembers the count.
     pub(crate) fn repeats_a_stop(&self, stops: &mut Vec<u64>, limit: usize) -> bool {
