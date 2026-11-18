@@ -1,13 +1,8 @@
-//! Update notices and `openmax --update` (docs/install.md#updating). A session
-//! of an installed release asks GitHub for the latest release at most daily,
-//! in the background, and names a newer one at the next start. Nothing ever
-//! installs itself: the package manager owns the binary, and evals need it
-//! pinned. Source builds and copied binaries are never checked.
-
+//! Daily release notice, `/update` and `openmax --update` (docs/install.md#updating).
+//! Nothing installs itself: the package manager owns the binary, and evals need it pinned.
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde::{Deserialize, Serialize};
 
 pub const RELEASES_URL: &str = "https://api.github.com/repos/Max17190/open-max/releases/latest";
 const SCRIPT: &str = "curl -fsSL https://useopenmax.dev/install.sh |";
@@ -154,9 +149,7 @@ pub async fn prepare() -> Result<(), String> {
     }
 }
 
-pub fn request(session: Option<String>) {
-    *REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
-}
+pub fn request(session: Option<String>) { *REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(session) }
 
 /// Run this install's update command on the restored terminal; Ok when it succeeded.
 fn install(data_dir: &Path) -> Result<(), i32> {

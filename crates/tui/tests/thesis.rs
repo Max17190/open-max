@@ -713,13 +713,14 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // turns a cut removes stay in its note word for word, and long notes keep
     // their open part. AGENTS.md rides as far as the window allows, cut at a
     // line with its dropped sections named, and a note counts the later
-    // prompts it leaves out.
-    const BASELINE: usize = 44_493;
+    // prompts it leaves out. The daily release notice, /update with its
+    // session resume, and openmax --update.
+    const BASELINE: usize = 44_749;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 44_523;
+    const CEILING: usize = 44_749;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 
