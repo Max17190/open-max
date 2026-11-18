@@ -321,9 +321,12 @@ and the run that writes a key already uses it.
   file of at most 5 MiB returns a one-line description and the image itself,
   sent as an image part of the tool result on every wire (Chat Completions
   `image_url`, Responses `input_image`, native Messages `image`). Larger
-  images and other binary files read as before. An MCP tool's image result
-  is saved to a file in the temp directory that the result names, so the
-  model can read it the same way. Set it only for a model that takes images:
+  images and other binary files read as before. An external tool's images
+  come back with its result the same way: the tool is handed a fresh folder
+  in `OPENMAX_IMAGE_DIR`, and each image file it leaves there (at most 8, in
+  name order) is sent with that call's result, with no file for the model to
+  read back. The MCP bridge puts a server's image results there. Set it only
+  for a model that takes images:
   one that does not refuses the request. Off, no request changes.
 - `max_agent_iterations` (default 300): tool-call rounds one turn may take.
   A turn that reaches it stops and says so; a follow-up message (or

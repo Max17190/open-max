@@ -1387,6 +1387,15 @@ async fn spawn_external(
     sandbox: Option<execution::SandboxPolicy>,
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
+    // With image_input on, the tool gets a fresh folder for images that go
+    // back with its result. A probe run (sandboxed) never sees images.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let image_dir = (caps.images && sandbox.is_none())
+        .then(|| {
+            let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            data_dir.join("tool-images").join(format!("{}-{n}", std::process::id()))
+        })
+        .filter(|dir| std::fs::create_dir_all(dir).is_ok());
     let request = ProcessRequest {
         program: tool.command.clone().into(),
         args: tool.args.iter().cloned().map(Into::into).collect(),
@@ -1403,10 +1412,10 @@ async fn spawn_external(
         sandbox,
         env_allowlist: Some(tool.env.clone()),
         self_link: false,
-        env: Vec::new(),
+        env: image_dir.iter().map(|dir| (tools::IMAGE_DIR_ENV.into(), dir.clone().into_os_string())).collect(),
     };
 
-    match execution::run_process(request, cancel).await {
+    let mut outcome = match execution::run_process(request, cancel).await {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!(
                 "failed to start external tool '{name}' (command '{}', defined in {}): {e}",
                 tool.command,
@@ -1444,7 +1453,11 @@ async fn spawn_external(
                 tools::exited_outcome(&output, status, caps.command_bytes, background_noted)
             }
         },
+    };
+    if let Some(dir) = image_dir {
+        outcome.images = tools::take_tool_images(&dir);
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -2555,6 +2568,49 @@ mutatng = true
         assert!(produced > out.output.len() as u64, "the result is a bounded rendering");
         assert!(out.process_truncated);
         let _ = std::fs::remove_dir_all(project);
+    }
+
+    /// With image_input on, an image a tool leaves in the folder it is handed
+    /// reaches the model with that call's result, in name order, and the folder
+    /// is gone after the call. A file that is not an image, and a link, are not
+    /// shown. Off, the tool is handed no folder at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_external_tools_images_come_back_with_its_result() {
+        use base64::Engine;
+        let project = temp_dir("imgproj");
+        let data = temp_dir("imgdata");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let script = write_script(
+            &project,
+            "plot.sh",
+            "#!/bin/sh\nread -r line\n[ -n \"$OPENMAX_IMAGE_DIR\" ] || { echo no folder; exit 0; }\nprintf '\\211PNG second' > \"$OPENMAX_IMAGE_DIR/0001\"\nprintf '\\211PNG first' > \"$OPENMAX_IMAGE_DIR/0000\"\necho text > \"$OPENMAX_IMAGE_DIR/0002\"\nln -s /etc/hostname \"$OPENMAX_IMAGE_DIR/0003\"\necho plotted\n",
+        );
+        write_tool(
+            &tools_dir,
+            "plot.toml",
+            &format!("name = \"plot\"\ndescription = \"d\"\ncommand = \"{}\"\n\n[params]\ntype = \"object\"\n", script.display()),
+        );
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let on = tools::OutputCaps { images: true, ..tools::OutputCaps::default() };
+        let out = registry.execute("plot", &serde_json::json!({}), &data, &project, on, no_cancel()).await;
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output.trim(), "plotted");
+        let shown: Vec<(String, Vec<u8>)> = out
+            .images
+            .iter()
+            .map(|i| (i.mime.clone(), base64::engine::general_purpose::STANDARD.decode(&i.data).unwrap()))
+            .collect();
+        assert_eq!(shown, [("image/png".into(), b"\x89PNG first".to_vec()), ("image/png".into(), b"\x89PNG second".to_vec())]);
+        assert_eq!(std::fs::read_dir(data.join("tool-images")).unwrap().count(), 0, "the folder is removed after the call");
+
+        let off = registry
+            .execute("plot", &serde_json::json!({}), &data, &project, tools::OutputCaps::default(), no_cancel())
+            .await;
+        assert_eq!((off.output.trim(), off.images.len()), ("no folder", 0));
+        let _ = std::fs::remove_dir_all(project);
+        let _ = std::fs::remove_dir_all(data);
     }
 
     /// An external tool runs in its own process group like bash, and the

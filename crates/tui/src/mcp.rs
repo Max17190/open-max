@@ -641,9 +641,9 @@ fn render_content(result: &Value) -> Result<String, String> {
             let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
             match field("type") {
                 "text" => field("text").to_string(),
-                "image" => match saved_image(field("mimeType"), field("data")) {
-                    Some(path) => format!("[image {}, {} bytes, saved to {path}: read_file it to see it]", field("mimeType"), base64_len(field("data"))),
-                    None => format!("[image {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
+                "image" => match handed_image(field("data")) {
+                    true => format!("[image {}, {} bytes, shown to you with this result]", field("mimeType"), base64_len(field("data"))),
+                    false => format!("[image {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
                 },
                 media @ "audio" => {
                     format!("[{media} {}, {} bytes]", field("mimeType"), base64_len(field("data")))
@@ -669,16 +669,22 @@ fn render_content(result: &Value) -> Result<String, String> {
         .join("\n"))
 }
 
-/// An image result written to a file read_file can show the model (with
-/// `image_input` on), named by a hash of its bytes so a repeat reuses it.
-fn saved_image(mime: &str, data: &str) -> Option<String> {
+/// Hand an image result to the harness, which shows it to the model with
+/// this call's result: with `image_input` on, the harness names a folder in
+/// `OPENMAX_IMAGE_DIR` and takes every image file left there. Off (or the
+/// bridge run by hand), or in a format the model would not be sent, nothing is
+/// written and the line only describes the image. Files are numbered so the
+/// harness keeps the server's order.
+fn handed_image(data: &str) -> bool {
     use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim_end()).ok()?;
-    let ext = mime.strip_prefix("image/").filter(|ext| ext.chars().all(|c| c.is_ascii_alphanumeric()))?;
-    let name = format!("openmax-mcp-{}.{ext}", &open_max_core::ledger::sha256_hex(&bytes)[..16]);
-    let path = std::env::temp_dir().join(name);
-    std::fs::write(&path, bytes).ok()?;
-    Some(path.display().to_string())
+    static HANDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(dir) = std::env::var_os(open_max_core::tools::IMAGE_DIR_ENV) else { return false };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim_end()) else { return false };
+    if open_max_core::tools::image_mime(&bytes).is_none() {
+        return false;
+    }
+    let n = HANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::fs::write(std::path::Path::new(&dir).join(format!("{n:04}")), bytes).is_ok()
 }
 
 /// The decoded size of base64 text, without decoding it.
@@ -831,8 +837,7 @@ mod tests {
         ]});
         assert_eq!(
             render_content(&result).unwrap(),
-            format!("one\n[image image/png, 5 bytes, saved to {}: read_file it to see it]\n[resource file:///a.txt]\nbody\n[resource link file:///b b]",
-                std::env::temp_dir().join(format!("openmax-mcp-{}.png", &open_max_core::ledger::sha256_hex(b"hello")[..16])).display())
+            "one\n[image image/png, 5 bytes]\n[resource file:///a.txt]\nbody\n[resource link file:///b b]"
         );
         assert_eq!(render_content(&json!({"content": [], "structuredContent": {"n": 1}})).unwrap(), r#"{"n":1}"#);
         assert_eq!(render_content(&json!({})).unwrap(), "");

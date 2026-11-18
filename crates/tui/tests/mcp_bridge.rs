@@ -545,7 +545,7 @@ fn proxy_tool_from_the_spec() {
         result.contains("echo: hello from the model; NOTES_TOKEN=granted-token; NOT_GRANTED=unset"),
         "the call reaches the server with exactly the granted credentials: {result}"
     );
-    assert!(result.contains("[image image/png, 2 bytes, saved to "), "{result}");
+    assert!(result.contains("[image image/png, 2 bytes]"), "{result}");
     assert!(result.contains("fixture basic: serving"), "the server's stderr passes through: {result}");
     assert!(!result.contains("exit code"), "{result}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
@@ -679,10 +679,9 @@ fn paginated_list() {
 fn server_traffic_mid_call() {
     let run = bridge(&["--mcp-call"], &["basic"], r#"{"tool":"echo","arguments":{"text":"x"}}"#);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    let saved = std::env::temp_dir().join("openmax-mcp-8f434346648f6b96.png");
     assert_eq!(
         run.stdout,
-        format!("echo: x; NOTES_TOKEN=unset; NOT_GRANTED=unset\n[image image/png, 2 bytes, saved to {}: read_file it to see it]\n", saved.display()),
+        "echo: x; NOTES_TOKEN=unset; NOT_GRANTED=unset\n[image image/png, 2 bytes]\n",
         "{}",
         run.stderr
     );

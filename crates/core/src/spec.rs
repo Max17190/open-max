@@ -879,7 +879,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   Unset, it follows the model's window, from 16 KiB to 48 KiB.
 - `image_input` (default false): read_file on a PNG, JPEG, GIF or WebP file
   of at most 5 MiB returns it to the model as an image part beside a short
-  text line. Set it only for a model that takes images.
+  text line, and an external tool's images (an MCP tool's included) come back
+  with its result. Set it only for a model that takes images.
 - `compaction_tokens`: optional global ceiling for compaction. Unset uses the
   active model's ceiling, else four fifths of the window; the window budget
   always caps it.
@@ -1250,7 +1251,8 @@ between calls, a login done once per process) is not supported yet.
   definitions instead.
 - `openmax --mcp-call -- <server command...>` reads
   {"tool": "<name>", "arguments": {...}} on stdin, calls that tool, and prints
-  the result's text. A result the tool marks as an error, an error reply, a
+  the result's text. With `image_input` on, an image in the result is shown to
+  you with the call's result; otherwise a line only describes it. A result the tool marks as an error, an error reply, a
   malformed reply, and a server that exits or stops answering all exit 1 with
   the reason on stderr. Input it cannot read exits 2 before the server starts.
 

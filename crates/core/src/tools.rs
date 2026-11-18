@@ -68,7 +68,8 @@ const MAX_DIR_ENTRIES: usize = 200;
 #[derive(Clone, Copy)]
 pub struct OutputCaps {
     pub command_bytes: usize,
-    /// read_file shows an image file to the model as an image (`image_input`).
+    /// read_file shows an image file to the model as an image, and an
+    /// external tool's images reach it with the result (`image_input`).
     pub images: bool,
 }
 
@@ -563,7 +564,7 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
 
 /// The media type of an image file from its first bytes, for the formats
 /// image-taking models accept.
-fn image_mime(head: &[u8]) -> Option<&'static str> {
+pub fn image_mime(head: &[u8]) -> Option<&'static str> {
     match head {
         [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
         [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
@@ -575,6 +576,37 @@ fn image_mime(head: &[u8]) -> Option<&'static str> {
 
 /// Larger images are read as files, as without `image_input`.
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// The variable naming the folder an external tool may put images in, set
+/// only when `image_input` is on. Each file there, in name order, reaches the
+/// model as an image part of that call's result, and the folder is removed
+/// after the call, so the picture needs no file the model reads back and no
+/// extra round. The MCP bridge writes a server's image results there.
+pub const IMAGE_DIR_ENV: &str = "OPENMAX_IMAGE_DIR";
+
+/// One call shows at most this many images, the first by name.
+const MAX_TOOL_IMAGES: usize = 8;
+
+/// The images an external tool left in `dir`, then the folder removed. Only
+/// regular files of at most 5 MiB in a format `image_mime` knows are taken; a
+/// link is skipped, so the folder cannot point the call at another file.
+pub(crate) fn take_tool_images(dir: &Path) -> Vec<crate::types::Image> {
+    use base64::Engine;
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    paths.sort();
+    let images = paths
+        .iter()
+        .filter(|p| p.symlink_metadata().is_ok_and(|m| m.is_file() && m.len() <= MAX_IMAGE_BYTES))
+        .filter_map(|p| {
+            let bytes = std::fs::read(p).ok()?;
+            let mime = image_mime(&bytes)?;
+            Some(crate::types::Image { mime: mime.into(), data: base64::engine::general_purpose::STANDARD.encode(&bytes) })
+        })
+        .take(MAX_TOOL_IMAGES)
+        .collect();
+    let _ = std::fs::remove_dir_all(dir);
+    images
+}
 
 fn read_file(root: &Path, args: &Value, caps: OutputCaps, cancel: &CancelToken) -> ToolOutcome {
     let max_bytes = caps.read_bytes();
