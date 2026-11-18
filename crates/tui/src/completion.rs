@@ -113,6 +113,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "endpoint, cache, performance, privacy, and network details",
         true,
     ),
+    command("update", "", "update to the latest release and resume this session", true),
     command("quit", "", "exit", true),
 ];
 

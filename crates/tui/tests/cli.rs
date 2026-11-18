@@ -2612,6 +2612,22 @@ fn stdio_lines(project: &Path, home: &Path, args: &[&str], commands: &[&str]) ->
     stdout.lines().map(|line| line.replace(id, "S")).collect()
 }
 
+/// `lines` with each `"duration_ms":<n>` written as `"duration_ms":0`.
+fn mask_durations(lines: &[String]) -> Vec<String> {
+    const KEY: &str = "\"duration_ms\":";
+    lines
+        .iter()
+        .map(|line| match line.find(KEY) {
+            Some(at) => {
+                let digits = at + KEY.len();
+                let end = line[digits..].find(|c: char| !c.is_ascii_digit()).map_or(line.len(), |n| digits + n);
+                format!("{}0{}", &line[..digits], &line[end..])
+            }
+            None => line.clone(),
+        })
+        .collect()
+}
+
 /// `--stdio` and `--print --json` render one event stream, and
 /// docs/stdio-protocol.md gives every event line as `session_id`, then
 /// `type`, then the fields in declaration order. So one turn is framed in
@@ -2652,6 +2668,9 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
             hello["project"],
         )
     );
+    // A tool_end carries the call's wall time, which differs between the two
+    // runs, so it is masked; its place among the fields is still compared.
+    let (framed, printed) = (mask_durations(&framed), mask_durations(&printed));
     assert_eq!(framed[1..], printed[..], "stdio and print mode framed one turn differently");
 
     let resumed = stdio_lines(&project, &home, &["--continue", "--stdio"], &[]);
@@ -6604,4 +6623,26 @@ fn a_job_detached_with_setsid_is_reported_as_still_running() {
     assert!(ends[2].contains("were terminated when it returned"), "a plain job alone keeps its note: {ends:?}");
     drop(guard);
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A binary no installer put in place (this test's own build) cannot update
+/// itself: `--update` says so and how to install, exits 1, and makes no
+/// request first, so a source build never reaches the network for it.
+#[test]
+fn update_refuses_a_build_no_installer_made() {
+    let (project, home) = fresh_dirs("update");
+    let output = cmd(&project, &home)
+        .arg("--update")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot update itself"), "{stderr}");
+    assert!(stderr.contains("docs/install.md"), "{stderr}");
+    assert!(!stderr.contains("could not check"), "no check was attempted: {stderr}");
+    assert!(!home.join(".openmax/update-check.json").exists());
+    let refused = cmd(&project, &home).args(["--update", "--check"]).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2));
 }
