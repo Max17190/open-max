@@ -30,12 +30,15 @@ impl Install {
     }
 
     /// From the binary's canonical path: the npm launcher keeps it in its own
-    /// `node_modules/.bin_real`; an `npx` copy is replaced by the next run.
+    /// `node_modules/.bin_real`.
     pub fn detect(exe: &Path, home: Option<&Path>, receipt_dir: Option<&Path>) -> Self {
         let path = exe.to_string_lossy();
         if path.contains("/Cellar/openmax/") { return Self::Homebrew }
-        if path.contains("/node_modules/openmax-cli/") && !path.contains("/_npx/") {
-            return if path.contains("/.bun/") { Self::Bun } else if path.contains("pnpm/") { Self::Pnpm } else { Self::Npm };
+        // Global installs only: a project's own node_modules is its package.json's to update.
+        if path.contains("/node_modules/openmax-cli/") {
+            if path.contains("/lib/node_modules/openmax-cli/") { return Self::Npm }
+            if path.contains("/.bun/install/global/") { return Self::Bun }
+            if path.contains("/pnpm/global/") { return Self::Pnpm }
         }
         let Some(dir) = exe.parent() else { return Self::Unknown };
         let same = |other: &Path| other.canonicalize().is_ok_and(|other| other == dir);
@@ -114,6 +117,8 @@ pub fn on_session_start(data_dir: &Path) -> Option<String> {
     if !check_enabled(&install) { return None }
     let cache = Cache::read(data_dir);
     if cache.due(now()) {
+        // Claimed before asking, so sessions opened together ask once.
+        Cache { checked_at: now(), latest: cache.latest.clone() }.write(data_dir);
         let data_dir = data_dir.to_path_buf();
         tokio::spawn(async move { refresh(&data_dir, RELEASES_URL).await });
     }
@@ -156,10 +161,12 @@ pub fn request(session: Option<String>) {
 /// Run this install's update command on the restored terminal; Ok when it succeeded.
 fn install(data_dir: &Path) -> Result<(), i32> {
     let command = Install::current().command().ok_or_else(|| { eprintln!("openmax: {NOT_INSTALLED}"); 1 })?;
+    // A failed download must fail the update, not feed `sh` an empty script.
+    let run = command.replacen(SCRIPT, r#"s=$(curl -fsSL https://useopenmax.dev/install.sh) && printf '%s\n' "$s" |"#, 1);
     Cache { checked_at: now(), latest: None }.write(data_dir);
     println!("$ {command}");
     // The first install already put the directory on PATH.
-    match std::process::Command::new("sh").args(["-c", &command]).env("OPENMAX_NO_MODIFY_PATH", "1").status() {
+    match std::process::Command::new("sh").args(["-c", &run]).env("OPENMAX_NO_MODIFY_PATH", "1").status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => { eprintln!("openmax: `{command}` failed ({status})"); Err(status.code().unwrap_or(1)) }
         Err(e) => { eprintln!("openmax: could not run `{command}`: {e}"); Err(1) }
@@ -244,6 +251,11 @@ mod tests {
             Install::Unknown
         );
         assert_eq!(
+            detect(Path::new("/u/app/node_modules/openmax-cli/node_modules/.bin_real/openmax"), None),
+            Install::Unknown,
+            "a project's own copy is its package.json's to update"
+        );
+        assert_eq!(
             detect(&default_bin.join("openmax"), None),
             Install::Script { dir: default_bin.clone(), default_dir: true }
         );
@@ -264,6 +276,7 @@ mod tests {
         let script = Install::Script { dir: "/home/u/.openmax/bin".into(), default_dir: true };
         assert_eq!(script.command().unwrap(), "curl -fsSL https://useopenmax.dev/install.sh | sh");
         let custom = Install::Script { dir: "/opt/my tools".into(), default_dir: false };
+        assert!(Install::Script { dir: "/x".into(), default_dir: true }.command().unwrap().starts_with(SCRIPT));
         assert_eq!(
             custom.command().unwrap(),
             "curl -fsSL https://useopenmax.dev/install.sh | OPENMAX_INSTALL_DIR='/opt/my tools' sh"
