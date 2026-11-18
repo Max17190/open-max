@@ -48,6 +48,7 @@ openmax --chatgpt login              # browser sign-in and account model catalog
 openmax --chatgpt status             # account labels, without credential values
 openmax --chatgpt models --account work   # refresh one account's model catalog
 openmax --chatgpt logout             # revoke and clear this account's tokens
+openmax --update                     # update to the latest release
 ```
 
 Use `/login` and `/logout` inside a session for the same setup flow. Open Max
@@ -132,13 +133,14 @@ without content approval; ask uses the documented approval and sandbox rules.
 It honors permission rules, `pre_tool_use` hooks, and `approval_mode` exactly
 as a turn does. See [extending](extending.md#proof-of-life).
 
-`--session <id>` continues that session instead of the latest one, with `-p`
-or `--stdio`, and implies `--continue`; it is a separate option because
+`--session <id>` continues that session instead of the latest one, in a
+session or with `-p` or `--stdio`, and implies `--continue`; it is a separate option because
 `--continue` takes no value, so a word after it stays prompt text. The id is
 the `session_id` every event line carries. An id that no session of this
 directory has, one of another project's sessions, and one whose transcript is
 missing or does not load are each refused with exit 2 and a line that says
-which. Trust, approvals and permissions are those of `--continue`.
+which; a session at a terminal says which and starts fresh instead. Trust,
+approvals and permissions are those of `--continue`.
 
 A print prompt that starts with `-` parses as options, not text. Put it
 last, after `--`, which ends the options: `openmax -p -- '- list the files'`.
@@ -213,8 +215,10 @@ ends it the same way. A second signal exits without waiting for the turn, with
 128 plus its own number, and kills the tools outright. Either exit first waits up
 to 250 ms for a tool command still being started, so one that starts within that
 wait is killed with the rest. Neither stops a process that leaves its tool's
-group (one that starts a session of its own, as `setsid` does), or a tool command
-whose start outlasts that wait: it runs on after openmax has exited. SIGKILL,
+session (as `setsid` does), on macOS one that leaves its tool's group, or a tool
+command whose start outlasts that wait: it runs on after openmax has exited. On
+Linux a process that only moves to another group of its tool's session, as GNU
+`timeout` moves its command, is stopped with the rest. SIGKILL,
 or a crash that runs no handler, runs none of openmax's code, so its watcher
 stops its tools instead: each `bash` call, external tool and hook it started,
 with every process each started that is still in its group. A sub-agent's
@@ -482,6 +486,7 @@ watcher nor a later launch stops them.
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint, cache, performance, privacy, and network details |
+| `/update` | Update to the latest release, then resume this session in it |
 | `/quit` | Exit |
 
 The persistent status line stays limited to model, context use, and approval

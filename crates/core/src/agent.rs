@@ -737,13 +737,13 @@ async fn run_loop(
     }
     let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
-    // Cut replies with no call since the last reply the cap did not cut, those the limit could not grow after, its doublings, and a silent reply asked again.
-    let (mut cuts, mut stalled, mut raise, mut stops, mut asked) = (0usize, 0usize, 0u32, Vec::new(), false);
+    // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
+    let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
     let mut at_reserve = false;
     // The limit is how long a reasoning model thinks in one reply before it acts, not how much a call or an answer
     // may carry: a reply it cut inside a call or its text is asked for once more with this room, and
-    // never again after a server refused a request that carried it, or a raised limit.
-    let (mut room, mut no_room) = (None::<usize>, false);
+    // never again after a server refused a request that carried it, or a raised limit, or after it was spent: cut on a call or text.
+    let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
     // Set once a request goes out over the soft trigger: a cut without notes waits for the window; a cut clears it.
     let mut soft_spent = false;
 
@@ -889,9 +889,10 @@ async fn run_loop(
         // reasoning, so the continuation resumes the thought instead of
         // starting it over; the wire skips it wherever the reasoning does
         // not go back (another endpoint, a path that does not replay it).
-        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0).
+        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). One with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not).
         let (silent, repeated) = (content.trim().is_empty() && tool_calls.is_empty(), result.repeats_a_stop(&mut stops, limit));
-        let capped = result.hit_output_cap(limit) || (silent && repeated);
+        let near = endpoint.chatgpt.is_none() && tool_calls.is_empty() && !result.hit_output_cap(limit) && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED) && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
+        let capped = result.hit_output_cap(limit) || (silent && repeated) || near;
         let cut_thought = capped
             && (result.reasoning_content.is_some() || result.reasoning.is_some() || result.reasoning_details.is_some());
         if !content.is_empty() || !tool_calls.is_empty() || cut_thought {
@@ -957,11 +958,11 @@ async fn run_loop(
         // calls it finished before the cut run as usual. Only the last call,
         // the one it was still writing, is refused with the cause, so the
         // model can split the work. The client keeps its raw arguments even
-        // when the cut lands before the first byte.
-        if !capped { (cuts, stalled, raise) = (0, 0, 0); }
-        // The room the next request may carry, when this reply was cut and was not itself the one given room.
-        let grant = (capped && roomy.is_none() && !no_room && iteration + 1 < max_iterations).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
-        if !tool_calls.is_empty() { room = grant; }
+        // when the cut lands before the first byte. Then the room the next request may carry, when this reply was cut and was not itself the one given room.
+        let kind = if near { crate::notes::CutKind::Thought } else { crate::notes::cut_kind(limit, &result) };
+        if !capped { (cuts, stalled, raise, floor) = (0, 0, 0, 0) } else if roomy.is_some() && (!tool_calls.is_empty() || kind != crate::notes::CutKind::Thought) { (spent, floor) = (true, floor.max(limit)) }
+        let grant = (capped && roomy.is_none() && !no_room && !spent && iteration + 1 < max_iterations).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
+        if !tool_calls.is_empty() { room = grant; stalled += usize::from(capped && spent); }
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
@@ -971,17 +972,16 @@ async fn run_loop(
             // as recorded above, the note goes after it, on disk before the
             // next request, and the loop goes round. Never on the last
             // iteration, which has no request left to carry the note. A second cut in a row doubles the limit, so the
-            // limit alone never ends a turn while it can grow. A silent reply below the limit is asked again once per turn.
+            // limit alone never ends a turn while it can grow; past a spent room, to the first doubling above it, but a cut thought plainly. A silent reply below the limit is asked again once per turn.
             let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
             cuts += usize::from(capped);
-            let raised = capped && cuts > 1 && !no_room && endpoint.raised_limit(next, raise + 1) > endpoint.raised_limit(next, raise);
-            if raised { raise += 1 } else if capped && cuts > 1 { stalled += 1 }
+            let up = (raise + 1..raise + 32).find(|&r| endpoint.raised_limit(next, r) > endpoint.raised_limit(next, raise).max(if kind == crate::notes::CutKind::Thought { 0 } else { floor })).filter(|_| capped && (cuts > 1 || floor > 0 && kind != crate::notes::CutKind::Thought) && !no_room);
+            if let Some(up) = up { raise = up } else if capped && cuts > 1 { stalled += 1 }
             if (capped && stalled < MAX_CUT_CONTINUATIONS || silent && !capped && !asked) && iteration + 1 < max_iterations {
                 let at = guard.messages().len();
-                let kind = crate::notes::cut_kind(limit, &result);
                 room = grant.filter(|_| kind != crate::notes::CutKind::Thought);
-                let ask = room.into_iter().chain(raised.then(|| endpoint.raised_limit(next, raise))).max();
-                let note = if capped { crate::notes::reply_cut_note(limit, kind, ask) } else { asked = true; crate::notes::EMPTY_REPLY_NOTE.into() };
+                let ask = room.into_iter().chain(up.map(|_| endpoint.raised_limit(next, raise))).max();
+                let note = if capped { crate::notes::reply_cut_note(limit, kind, ask) } else { asked = true; "[empty reply: it had no text and no tool call. Continue the task: call a tool, or give the final answer.]".into() };
                 insert_note(core, session_id, guard.messages(), at, note);
                 save_messages(core, session_id, guard.messages(), false).await; continue 'turns;
             }
@@ -1487,6 +1487,7 @@ async fn run_loop(
         // receipt's, before the save that writes that result.
         store_note(guard.messages(), note.as_deref());
         save_messages(core, session_id, guard.messages(), false).await;
+        if capped && spent && stalled >= MAX_CUT_CONTINUATIONS { stop_reason = "length".into(); break 'turns; }
     }
 
     // A turn can end with the last assistant's tool_calls persisted but never
@@ -5047,11 +5048,12 @@ mod tests {
             chunks.push(serde_json::json!({ "choices": [], "usage": { "prompt_tokens": 100, "completion_tokens": output, "completion_tokens_details": { "reasoning_tokens": reasoning_tokens } } }));
             chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n"
         }
-        let read = thought_sse(3072, Some(r#"{"path":"a.txt"}"#), "tool_calls");
-        let silent = thought_sse(3072, None, "stop");
-        let silent_again = thought_sse(3073, None, "stop");
+        // Below 70% of the limit (2,867 of 4,096), where a reply that stops on its own is read as cut by its count.
+        let read = thought_sse(2600, Some(r#"{"path":"a.txt"}"#), "tool_calls");
+        let silent = thought_sse(2600, None, "stop");
+        let silent_again = thought_sse(2601, None, "stop");
         let short = thought_sse(40, None, "stop");
-        let elsewhere = thought_sse(2500, None, "stop");
+        let elsewhere = thought_sse(2200, None, "stop");
         // A case: the replies in order, the iteration cap, the stop reason, and the note that went in: a cut note or an empty-reply note.
         type Case<'a> = (&'a str, Vec<&'a str>, usize, &'a str, Option<&'a str>);
         let cases: [Case; 8] = [
@@ -5095,6 +5097,96 @@ mod tests {
             for kind in ["[reply cut:", "[empty reply:"] {
                 let count = messages.iter().filter(|m| m.content.as_deref().is_some_and(|c| c.contains(kind))).count();
                 assert_eq!(count, usize::from(note == Some(kind)), "{case}: {kind}");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The bug this guards: a reply that spent most of the limit on its
+    /// thought, then stopped on its own with a line and no call ("I can't
+    /// complete this task", or a summary of work never done), ended the turn
+    /// as an answer, so the run stopped mid-task with nothing changed. Such a
+    /// reply, its reasoning (else its output) at 70% of the limit or more, is
+    /// read as a cut thought: the cut-thought note follows it, and the same
+    /// ladder applies: from the second in a row the limit doubles where it can,
+    /// and where it cannot a fifth such reply ends the turn `length`. A short
+    /// final answer, or one below the share, still ends the turn as it did.
+    #[tokio::test]
+    async fn a_reply_that_stops_near_the_limit_without_a_call_continues_as_a_cut_thought() {
+        use crate::state::Core;
+
+        // A reply of reasoning, then the given text, finished `stop`, with the reasoning count reported or not.
+        fn final_sse(text: &str, output: u64, reasoning: Option<u64>) -> String {
+            let mut usage = serde_json::json!({ "prompt_tokens": 100, "completion_tokens": output });
+            if let Some(r) = reasoning {
+                usage["completion_tokens_details"] = serde_json::json!({ "reasoning_tokens": r });
+            }
+            [
+                serde_json::json!({ "choices": [{ "delta": { "reasoning_content": "thinking" }, "finish_reason": null }] }),
+                serde_json::json!({ "choices": [{ "delta": { "content": text }, "finish_reason": null }] }),
+                serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+                serde_json::json!({ "choices": [], "usage": usage }),
+            ]
+            .iter()
+            .map(|c| format!("data: {c}\n\n"))
+            .collect::<String>()
+                + "data: [DONE]\n\n"
+        }
+        const NOTE: &str = "[reply cut: it reached max_tokens (4096) before any tool call; continue from where it stopped: think briefly, then act.]";
+        const RAISED: &str = "[reply cut: it reached max_tokens (4096) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]";
+        const RAISED_AGAIN: &str = "[reply cut: it reached max_tokens (8192) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]";
+        let gave_up = final_sse("I can't complete this task.", 3100, Some(3080));
+        let at_share = final_sse("I can't complete this task.", 2868, Some(2868));
+        let output_only = final_sse("Done.", 3000, None);
+        let answer = final_sse("Done: a.txt says hello.", 60, Some(40));
+        let below = final_sse("Done: a.txt says hello.", 2900, Some(2800));
+        // Near the raised limit of 8,192 too.
+        let gave_up_raised = final_sse("I can't complete this task.", 6000, Some(5900));
+        // At a 1,024 limit in a 16,384 window, where the limit cannot grow.
+        let gave_up_small = final_sse("I can't complete this task.", 1000, Some(990));
+        // A case: the replies in order (the last repeats), the window and limit, the stop reason, the requests, and
+        // the cut notes.
+        type Case<'a> = (&'a str, Vec<&'a str>, (usize, usize), &'a str, usize, Vec<&'a str>);
+        let cases: [Case; 8] = [
+            ("near the limit, then a call and an answer", vec![&gave_up, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 3, vec![NOTE]),
+            ("exactly at 70% of the limit", vec![&at_share, STOP_SSE], (65_536, 4096), "stop", 2, vec![NOTE]),
+            ("the output counts when no reasoning count is reported", vec![&output_only, STOP_SSE], (65_536, 4096), "stop", 2, vec![NOTE]),
+            // The second in a row raises the limit, under which the same reply is below the share: an answer.
+            ("near the limit twice, then below it at the raised limit", vec![&gave_up], (65_536, 4096), "stop", 3, vec![NOTE, RAISED]),
+            // A budget stop at the raised limit too: the limit doubles again, and the turn goes on to its call.
+            ("near the limit, then near it again at each raised limit", vec![&gave_up, &gave_up, &gave_up_raised, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 5, vec![NOTE, RAISED, RAISED_AGAIN]),
+            ("near a limit that cannot grow five times in a row", vec![&gave_up_small], (16_384, 1024), "length", 5, vec![CUT_NOTE; 4]),
+            ("a short final answer", vec![&answer], (65_536, 4096), "stop", 1, vec![]),
+            ("a final answer below 70% of the limit", vec![&below], (65_536, 4096), "stop", 1, vec![]),
+        ];
+        for (case, streams, (window, limit), want, want_requests, want_notes) in cases {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("a.txt"), "hello\n").unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, requests) = scripted_endpoint(&streams).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(window), limit);
+                (s.approval_mode, s.max_agent_iterations) = (ApprovalMode::Auto, 50);
+            }
+            let id = "sess-near-limit";
+            start_turn(core.clone(), id.into(), project.clone(), "read a.txt".into()).unwrap();
+            let (got, events) = drive_turn_events(&mut rx).await;
+            assert_eq!(got, want, "{case}");
+            assert_eq!(*requests.lock().unwrap(), want_requests, "{case}");
+            let errors: Vec<&String> = events.iter().filter_map(|e| match e { AgentEvent::Error { message } => Some(message), _ => None }).collect();
+            assert!(errors.is_empty(), "{case}: {errors:?}");
+            let messages = transcript(&core, id).await;
+            // Each note is the cut-thought note, right after the reply it follows, which stays as it came.
+            let notes: Vec<usize> = (1..messages.len()).filter(|&i| messages[i].content.as_deref().is_some_and(|c| c.starts_with("[reply cut"))).collect();
+            assert_eq!(notes.iter().map(|&i| messages[i].content.as_deref().unwrap()).collect::<Vec<_>>(), want_notes, "{case}");
+            for i in notes {
+                assert_eq!(messages[i].role, "user", "{case}");
+                assert_eq!(messages[i - 1].role, "assistant", "{case}");
+                assert!(messages[i - 1].tool_calls.is_none(), "{case}");
             }
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -5215,6 +5307,101 @@ mod tests {
             assert_eq!(std::fs::read_to_string(project.join("done.txt")).ok().as_deref(), (cut_replies > 0).then_some("whole\n"), "{case}");
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// One turn of "write big.txt" on a 262,144-token window against replies
+    /// in order (the last repeats), with the model's longest reply declared
+    /// when `ceiling` is set. Returns the stop reason, the limit each request
+    /// carried, and every cut note and refused call in the transcript.
+    async fn cut_recovery_turn(streams: &[&str], ceiling: Option<usize>) -> (String, Vec<u64>, Vec<String>) {
+        use crate::state::Core;
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let (base_url, bodies) = refusing_endpoint(streams, |_, _| None).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            match ceiling {
+                Some(ceiling) => {
+                    let entry = serde_json::json!({"providers": {"p": {"base_url": base_url, "models": [{"id": "m", "context_tokens": 262_144, "max_tokens": ceiling}]}}});
+                    std::fs::write(crate::providers::providers_path(&core.data_dir), entry.to_string()).unwrap();
+                    (s.provider, s.model) = (Some("p".into()), "m".into());
+                }
+                None => (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(262_144)),
+            }
+            s.approval_mode = ApprovalMode::Auto;
+            s.max_agent_iterations = 14;
+        }
+        start_turn(core.clone(), "sess-cuts".into(), project, "write big.txt".into()).unwrap();
+        let (stop, _) = drive_turn(&mut rx).await;
+        let sent = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
+        let said = transcript(&core, "sess-cuts").await.into_iter().filter_map(|m| m.content).filter(|c| c.contains("[reply cut") || c.contains("Not run:")).collect();
+        let _ = std::fs::remove_dir_all(dir);
+        (stop, sent, said)
+    }
+
+    /// The bug this guards: a call the route holds until it is complete, cut
+    /// at the room, was offered 8192 tokens, half the limit it was just cut
+    /// at, and told to send the call again whole; the doublings under the room
+    /// were tried again before the advice to split. A call cut at the room now
+    /// goes to the first doubling above it where the model declares a longer
+    /// reply, and is asked for in parts at once where it does not. A cut
+    /// thought in the room keeps the plain doubling.
+    #[tokio::test]
+    async fn a_call_cut_at_its_room_is_never_offered_less_than_that_room() {
+        const LOST: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4095,\"completion_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":4196}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
+        const SPLIT: &str = "written again whole it will be cut the same way";
+        // A case: the replies in order, the declared longest reply, the stop, the limits sent, and what each note says.
+        type Case<'a> = (&'static str, Vec<&'a str>, Option<usize>, &'static str, &'static [u64], &'static [&'static str]);
+        let cases: [Case; 3] = [
+            ("no longer reply declared: parts at once", vec![LOST], None, "length", &[4096, 16384, 4096, 4096, 4096],
+                &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while", SPLIT, SPLIT]),
+            ("a longer reply declared: the first doubling above the room", vec![LOST, LOST, &whole, STOP_SSE], Some(393_216), "stop", &[4096, 16384, 32768, 4096],
+                &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 32768 tokens"]),
+            ("a thought cut in the room keeps the doubling", vec![LOST, CUT_SSE, STOP_SSE], None, "stop", &[4096, 16384, 8192],
+                &["The next reply alone may be up to 16384 tokens", "[reply cut: it reached max_tokens (16384) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]"]),
+        ];
+        for (case, streams, ceiling, want, limits, says) in cases {
+            let (stop, sent, said) = cut_recovery_turn(&streams, ceiling).await;
+            assert_eq!((stop.as_str(), sent.as_slice()), (want, limits), "{case}");
+            assert_eq!(said.len(), says.len(), "{case}: {said:#?}");
+            for (note, say) in said.iter().zip(says) {
+                assert!(note.contains(say), "{case}: {say}\n{note}");
+            }
+            if case.starts_with("no longer") {
+                assert!(said[1].contains(SPLIT), "{case}: the call cut at the room is asked for in parts at once: {}", said[1]);
+            }
+        }
+    }
+
+    /// The bug this guards: a call the route streams, cut at every size, was
+    /// offered the room again after each cut at the usual limit, so the limits
+    /// alternated 4096 and 16384 until the iteration cap, with no count to end
+    /// it. The room is offered once a turn, and the calls cut after it count
+    /// toward the cap of four a run of cut replies has.
+    #[tokio::test]
+    async fn a_call_cut_again_after_its_room_ends_the_turn_within_four_cuts() {
+        let cut = raw_calls_sse(&[("c2", "write_file", r#"{"path":"big.txt","content":"Big\nlorem ips"#)], "length", None);
+        let (stop, sent, said) = cut_recovery_turn(&[&cut], None).await;
+        assert_eq!((stop.as_str(), sent.as_slice()), ("length", &[4096u64, 16384, 4096, 4096, 4096][..]));
+        assert_eq!(said.iter().filter(|n| n.contains("may be up to 16384 tokens")).count(), 1, "the room is offered once: {said:#?}");
+        assert_eq!(said.iter().filter(|n| n.contains("Send large content in parts")).count(), 4, "{said:#?}");
+        // A streamed call cut, then nothing arriving at its room: the first doubling above the room, at once.
+        const LOST: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4095,\"completion_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":4196}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
+        let (stop, sent, said) = cut_recovery_turn(&[&cut, LOST, &whole, STOP_SSE], Some(393_216)).await;
+        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[4096u64, 16384, 32768, 4096][..]), "{said:#?}");
     }
 
     /// The bug this guards: a reply the output cap cut before any call ran
@@ -8998,12 +9185,11 @@ echo run >> {}
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A turn whose endpoint never writes notes asks for them once. Without
-    /// notes the soft trigger cuts nothing, and the turn then waits for the
-    /// window, so a missing note costs one request until a cut lands, not
-    /// one per iteration.
+    /// A turn whose endpoint never writes notes asks for them once, and the
+    /// cut still lands on the digest: a missing note costs one request and
+    /// never turns the ceiling off.
     #[tokio::test]
-    async fn a_turn_without_notes_asks_for_them_once() {
+    async fn a_turn_without_notes_asks_for_them_once_and_still_cuts() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -9035,7 +9221,7 @@ echo run >> {}
         start_turn(core.clone(), id.clone(), project, "keep reading".into()).unwrap();
         assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
         assert_eq!(*requests.lock().unwrap(), 6 + 1, "six turn requests and one notes request");
-        assert!(!transcript(&core, &id).await.iter().any(is_digest_message), "no cut without notes");
+        assert!(transcript(&core, &id).await.iter().any(is_digest_message), "the cut lands on the digest without notes");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -166,9 +166,15 @@ and the run that writes a key already uses it.
   with the request after it. The same room follows a reply cut while
   writing its text, which is asked to continue the text, and a reply whose
   call never arrived (below). A reply cut again at that room is asked for
-  in parts, and a server that refuses the room (HTTP 400 or 422) gets the
-  request again at the usual limit and no more room in that turn. A cut
-  thought gets no room of its own. The ceiling is the most any request asks
+  in parts, except that one with no call, where the ceiling allows, gets
+  the first doubled limit above the room: no note offers less than the
+  room just cut. A room cut on a call or its text is spent: no request in
+  that turn carries room again, and from then on each reply cut on a call
+  counts as a cut the limit could not grow past (below), so the fifth cut
+  in a row ends the turn with `length`. A server that refuses the room
+  (HTTP 400 or 422) gets the request again at the usual limit and no more
+  room in that turn. A cut thought gets no room of its own, and its raised
+  limit is the plain doubling. The ceiling is the most any request asks
   for: the model entry's `max_tokens`, which is the model's longest reply,
   so declaring it keeps the default limit as each request's first ask; a
   `max_tokens` other than 4096 in settings.json is both the limit and a
@@ -372,7 +378,9 @@ between, and never shortens a kept message, so between cuts the history stays
 byte-stable and the server can reuse its prompt cache. Before the cut, the
 session's own model writes the notes it will continue from: one extra
 request whose prompt is the conversation up to the cut, as earlier requests
-already sent it, with the same tools, plus one ask. The notes, up to 4,000
+already sent it, with the same tools and `tool_choice` set to `none`, plus one
+ask; a route that refuses that field is asked again without it. A reply the
+limit cut before any text is asked for once more at twice the limit. The notes, up to 4,000
 bytes, take the removed span's place in one context note. A reply with
 no text that ended on its own and made no call gives its reasoning as the
 notes, since some models write them there. Notes over the cap end at their
@@ -380,11 +388,10 @@ last whole line, and notes the reply limit cut end with a line that says so.
 A call in that reply never runs, and nothing else of the exchange is kept.
 The notes request has no overall deadline, as no request does: only a
 connection that falls silent ends it. When no notes come back (an error, an
-empty reply, a silent connection, or a request `max_agent_tokens` refuses), automatic compaction makes no cut until the
-window forces one, and does not ask again in that turn before then. A cut the
-window forces, or a `/compact`, is made without notes when none come back,
-and its note lists the tools used, the files touched and the earlier goals
-instead. Everything a cut removes is appended verbatim to
+empty reply, a call, a silent connection, or a request `max_agent_tokens`
+refuses), the cut is made anyway, as a cut the window forces or a `/compact`
+is, and its note lists the tools used, the files touched and the earlier goals
+instead. Only a cancelled turn makes no cut it was not forced to. Everything a cut removes is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note names that
 path, so compaction stays reversible: the notes are the bounded view, the
 archive is the lossless record. The `compaction` hook observes each cut.

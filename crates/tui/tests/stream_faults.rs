@@ -2264,12 +2264,13 @@ fn a_truncated_first_prompt_skips_the_prompts_after_it() {
 
 /// A reply the limit cuts before any call is continued four times; the fifth
 /// in a row ends the turn `length`, which exits 4 and skips the prompts after
-/// it. The `stop` reply reports one token under the limit: a usage count equal
-/// to the limit counts as a cut whatever the finish reason, so a `stop` reply
-/// of exactly 32 tokens would be continued too.
+/// it. The `stop` reply reports 22 tokens, under 70% of the limit: a usage
+/// count equal to the limit counts as a cut whatever the finish reason, and a
+/// `stop` reply with no call at 70% of the limit or more (23 of 32 here) is
+/// read as a cut thought, so either would be continued too.
 #[test]
 fn a_reply_cut_by_the_provider_exits_four_and_skips_later_prompts() {
-    for (reason, used, code, turns, requests) in [("length", 32, 4, 1, 5), ("stop", 31, 0, 2, 2)] {
+    for (reason, used, code, turns, requests) in [("length", 32, 4, 1, 5), ("stop", 22, 0, 2, 2)] {
         let usage = data(&json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":used}}));
         let reply = format!("{}{}{usage}{DONE}", content("first answer"), finish(reason));
         let mut script: Vec<Step> = (turns..=requests).map(|_| Step::Finished(reply.clone())).collect();
@@ -2386,8 +2387,8 @@ fn a_named_session_continues_with_its_own_transcript() {
 
 /// A session id this directory cannot continue is a usage error that says
 /// which: one no session has, one of another project's sessions, one whose
-/// transcript is gone, and one whose transcript does not load. So is
-/// `--session` on an interactive session. Each exits 2 before any request.
+/// transcript is gone, and one whose transcript does not load. Each exits 2
+/// before any request.
 #[test]
 fn a_session_this_directory_cannot_continue_is_refused() {
     let env = Env::new("named-refused", "sessions that cannot be continued", vec![
@@ -2418,7 +2419,6 @@ fn a_session_this_directory_cannot_continue_is_refused() {
     };
     refuse(&["--session", "no-such-session", "-p", "go"], "openmax: session no-such-session does not exist in this project");
     refuse(&["--session", &other_sid, "--json", "-p", "go"], &format!("openmax: session {other_sid} belongs to another project"));
-    refuse(&["--session", &first.sid], "openmax: --session requires --stdio, or --print");
     let kept = std::fs::read(&transcript).unwrap();
     std::fs::remove_file(&transcript).unwrap();
     refuse(&["--session", &first.sid, "-p", "go"], &format!("openmax: session {} has no saved transcript to resume", first.sid));
