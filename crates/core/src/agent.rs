@@ -5125,22 +5125,27 @@ mod tests {
         }
         const NOTE: &str = "[reply cut: it reached max_tokens (4096) before any tool call; continue from where it stopped: think briefly, then act.]";
         const RAISED: &str = "[reply cut: it reached max_tokens (4096) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]";
+        const RAISED_AGAIN: &str = "[reply cut: it reached max_tokens (8192) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]";
         let gave_up = final_sse("I can't complete this task.", 3100, Some(3080));
         let at_share = final_sse("I can't complete this task.", 2868, Some(2868));
         let output_only = final_sse("Done.", 3000, None);
         let answer = final_sse("Done: a.txt says hello.", 60, Some(40));
         let below = final_sse("Done: a.txt says hello.", 2900, Some(2800));
+        // Near the raised limit of 8,192 too.
+        let gave_up_raised = final_sse("I can't complete this task.", 6000, Some(5900));
         // At a 1,024 limit in a 16,384 window, where the limit cannot grow.
         let gave_up_small = final_sse("I can't complete this task.", 1000, Some(990));
         // A case: the replies in order (the last repeats), the window and limit, the stop reason, the requests, and
         // the cut notes.
         type Case<'a> = (&'a str, Vec<&'a str>, (usize, usize), &'a str, usize, Vec<&'a str>);
-        let cases: [Case; 7] = [
+        let cases: [Case; 8] = [
             ("near the limit, then a call and an answer", vec![&gave_up, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 3, vec![NOTE]),
             ("exactly at 70% of the limit", vec![&at_share, STOP_SSE], (65_536, 4096), "stop", 2, vec![NOTE]),
             ("the output counts when no reasoning count is reported", vec![&output_only, STOP_SSE], (65_536, 4096), "stop", 2, vec![NOTE]),
             // The second in a row raises the limit, under which the same reply is below the share: an answer.
             ("near the limit twice, then below it at the raised limit", vec![&gave_up], (65_536, 4096), "stop", 3, vec![NOTE, RAISED]),
+            // A budget stop at the raised limit too: the limit doubles again, and the turn goes on to its call.
+            ("near the limit, then near it again at each raised limit", vec![&gave_up, &gave_up, &gave_up_raised, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 5, vec![NOTE, RAISED, RAISED_AGAIN]),
             ("near a limit that cannot grow five times in a row", vec![&gave_up_small], (16_384, 1024), "length", 5, vec![CUT_NOTE; 4]),
             ("a short final answer", vec![&answer], (65_536, 4096), "stop", 1, vec![]),
             ("a final answer below 70% of the limit", vec![&below], (65_536, 4096), "stop", 1, vec![]),
