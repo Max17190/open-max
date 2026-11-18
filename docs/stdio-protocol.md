@@ -244,7 +244,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 | --- | --- |
 | provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Treat any unlisted value as a normal end |
 | `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, on the third such cut in a row or the last retry, or by going silent), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
-| `empty` | The model's reply had no text and no tool call and was not a cut the harness recognized, so there is no answer; an `error` line precedes it |
+| `empty` | The model's reply had no text and no tool call and was not a cut the harness recognized, and it was asked for once more in the turn (where an iteration was left) with the same result, so there is no answer; an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |
 | `budget_exhausted` | The per-turn `max_agent_tokens` cap refused the next request at admission; nothing was sent, and resubmitting continues the work |
 | `unverified` | A blocking `turn_end` hook refused the completion more times than the harness honors (8, or fewer when the gate sets `max_refusals`), its refusal could not be persisted, or in auto it could not start; or a hook file fails closed at the turn's end; the reply stands unverified |
