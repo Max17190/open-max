@@ -737,8 +737,7 @@ async fn run_loop(
     }
     let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
-    // Cut replies with no call since the last reply the cap did not cut, those the limit could not grow after, and its doublings.
-    // ...and whether this turn already asked again after a reply with nothing in it.
+    // Cut replies with no call since the last reply the cap did not cut, those the limit could not grow after, its doublings, and a silent reply asked again.
     let (mut cuts, mut stalled, mut raise, mut stops, mut asked) = (0usize, 0usize, 0u32, Vec::new(), false);
     let mut at_reserve = false;
     // The limit is how long a reasoning model thinks in one reply before it acts, not how much a call or an answer
@@ -972,24 +971,18 @@ async fn run_loop(
             // as recorded above, the note goes after it, on disk before the
             // next request, and the loop goes round. Never on the last
             // iteration, which has no request left to carry the note. A second cut in a row doubles the limit, so the
-            // limit alone never ends a turn while it can grow.
+            // limit alone never ends a turn while it can grow. A silent reply below the limit is asked again once per turn.
             let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
             cuts += usize::from(capped);
             let raised = capped && cuts > 1 && !no_room && endpoint.raised_limit(next, raise + 1) > endpoint.raised_limit(next, raise);
             if raised { raise += 1 } else if capped && cuts > 1 { stalled += 1 }
-            if capped && stalled < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
+            if (capped && stalled < MAX_CUT_CONTINUATIONS || silent && !capped && !asked) && iteration + 1 < max_iterations {
                 let at = guard.messages().len();
                 let kind = crate::notes::cut_kind(limit, &result);
                 room = grant.filter(|_| kind != crate::notes::CutKind::Thought);
                 let ask = room.into_iter().chain(raised.then(|| endpoint.raised_limit(next, raise))).max();
-                insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(limit, kind, ask));
-                save_messages(core, session_id, guard.messages(), false).await;
-                continue 'turns;
-            }
-            // A reply with nothing in it below the limit is asked for once more before the turn ends `empty`.
-            if silent && !capped && !asked && iteration + 1 < max_iterations {
-                let at = guard.messages().len(); asked = true;
-                insert_note(core, session_id, guard.messages(), at, crate::notes::EMPTY_REPLY_NOTE.into());
+                let note = if capped { crate::notes::reply_cut_note(limit, kind, ask) } else { asked = true; crate::notes::EMPTY_REPLY_NOTE.into() };
+                insert_note(core, session_id, guard.messages(), at, note);
                 save_messages(core, session_id, guard.messages(), false).await; continue 'turns;
             }
             if silent && !capped {
