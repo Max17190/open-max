@@ -239,6 +239,12 @@ and the run that writes a key already uses it.
   `compaction_tokens`, and a cut still keeps at most a quarter of its trigger.
   A smaller value makes the requests after a cut cheaper and leaves the model
   less of its recent work to continue from.
+- `compaction_drop_reasoning` (default off): when an automatic cut is due, it
+  first removes the stored reasoning of every reply older than the newest
+  exchanges, keeping their text, calls and tool outputs, and moves what it
+  removed to the session archive. When that brings the request to half the
+  trigger or under, that is the whole cut and no notes are asked for.
+  Otherwise the cut goes on as below. `/compact` is not affected.
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's

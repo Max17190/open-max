@@ -127,6 +127,9 @@ pub struct Settings {
     /// still keeps at most a quarter of its trigger.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_keep_tokens: Option<usize>,
+    /// On, an automatic cut first archives older replies' reasoning; notes only if still above half the trigger.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compaction_drop_reasoning: bool,
     /// Ceiling on the tokens one turn may spend across the agent requests it
     /// makes, counted as a provider bills them: prompt plus completion, with
     /// cached prompt tokens at full value, because what this bounds is the
@@ -184,6 +187,7 @@ impl Default for Settings {
             max_output_bytes: None,
             compaction_tokens: None,
             compaction_keep_tokens: None,
+            compaction_drop_reasoning: false,
             max_agent_tokens: None,
             max_agent_iterations: default_max_agent_iterations(),
             max_parallel_tools: default_max_parallel_tools(),

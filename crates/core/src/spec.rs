@@ -883,6 +883,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `compaction_keep_tokens`: optional most a cut keeps of the newest
   exchanges, note included. Unset keeps 20,000; floored at 4,000; at most a
   quarter of the trigger.
+- `compaction_drop_reasoning`: off by default. On, an automatic cut first archives
+  older replies' reasoning, and asks for notes only if still above half the trigger.
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction notes. Unaffordable notes leave the history uncut unless the
   window forces a prune.

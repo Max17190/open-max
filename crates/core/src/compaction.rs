@@ -554,6 +554,18 @@ pub(crate) async fn compact_messages(
     {
         return Err("compaction refused: the session transcript or its replay boundaries could not be saved".into());
     }
+    // `compaction_drop_reasoning`: older replies' reasoning goes to the archive first, the whole cut at half the trigger.
+    if !force && ctx.core.settings.lock().unwrap().compaction_drop_reasoning {
+        let (mut thin, mut archive) = (messages.clone(), Vec::new());
+        for m in thin[..protected_tail_start(messages, head)].iter_mut().filter(|m| m.reasoning_content.is_some() || m.reasoning.is_some() || m.reasoning_details.is_some()) {
+            archive.push(std::mem::replace(m, ChatMessage { reasoning_content: None, reasoning: None, reasoning_details: None, ..m.clone() }));
+        }
+        if !archive.is_empty() && schema_tokens + thin.iter().map(ctx.estimate).sum::<usize>() <= trigger / 2 {
+            sessions::commit_compaction(ctx.core, ctx.session_id, &thin, &archive, None, messages.len(), head)?;
+            *messages = thin;
+            return Ok(archive.len());
+        }
+    }
     let dropped = digest.message_count;
     // A cut without notes is made only when the window forces it or the
     // user asked for it; it then leaves the deterministic digest.
@@ -650,13 +662,7 @@ fn protected_tail_start(messages: &[ChatMessage], head: usize) -> usize {
 /// most a quarter of `budget` and at most `keep` (`requested_keep`), and never
 /// past `budget`, which a cut must reach however the schemas and the opening
 /// crowd it. A quarter leaves a gap so the turns after a cut append.
-pub(crate) fn cut_target(
-    budget: usize,
-    keep: usize,
-    schema_tokens: usize,
-    messages: &[ChatMessage],
-    estimate: &dyn Fn(&ChatMessage) -> usize,
-) -> usize {
+pub(crate) fn cut_target(budget: usize, keep: usize, schema_tokens: usize, messages: &[ChatMessage], estimate: &dyn Fn(&ChatMessage) -> usize) -> usize {
     let head = pinned_head(messages).min(messages.len());
     (schema_tokens + messages[..head].iter().map(estimate).sum::<usize>() + (budget / 4).min(keep)).min(budget)
 }
@@ -756,15 +762,7 @@ const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_900;
 ///
 /// `ceiling` is in real tokens. The budget, schema cost, and trigger use
 /// estimator units so the window can cap the trigger independently.
-pub(crate) fn compaction_trigger(
-    budget: usize,
-    schema_tokens: usize,
-    ceiling: usize,
-    keep: usize,
-    ratio: Option<f64>,
-    messages: &[ChatMessage],
-    estimate: &dyn Fn(&ChatMessage) -> usize,
-) -> usize {
+pub(crate) fn compaction_trigger(budget: usize, schema_tokens: usize, ceiling: usize, keep: usize, ratio: Option<f64>, messages: &[ChatMessage], estimate: &dyn Fn(&ChatMessage) -> usize) -> usize {
     let trigger = requested_trigger(ceiling, ratio, budget);
     if trigger == budget || schemas_outgrow_budget(trigger, schema_tokens) {
         return budget;
@@ -908,14 +906,7 @@ pub(crate) fn to_real(estimate: usize, factor: f64) -> usize {
 ///
 /// Returns the digest of what the cut removed, or None when it removed
 /// nothing.
-pub(crate) fn enforce_budget(
-    messages: &mut Vec<ChatMessage>,
-    budget: usize,
-    keep: usize,
-    schema_tokens: usize,
-    growth: usize,
-    estimate: &dyn Fn(&ChatMessage) -> usize,
-) -> Option<CompactionDigest> {
+pub(crate) fn enforce_budget(messages: &mut Vec<ChatMessage>, budget: usize, keep: usize, schema_tokens: usize, growth: usize, estimate: &dyn Fn(&ChatMessage) -> usize) -> Option<CompactionDigest> {
     let total: usize =
         schema_tokens + messages.iter().map(estimate).sum::<usize>();
     // No transcript fits under overhead this large, so do nothing rather than
@@ -933,15 +924,7 @@ pub(crate) fn enforce_budget(
 /// Drops whole exchanges into the digest until `cut_target` is met with
 /// `growth` tokens to spare for what the digest note gains later. No message
 /// it keeps is changed.
-fn prune_transcript(
-    messages: &mut Vec<ChatMessage>,
-    budget: usize,
-    keep: usize,
-    schema_tokens: usize,
-    mut total: usize,
-    growth: usize,
-    estimate: &dyn Fn(&ChatMessage) -> usize,
-) -> Option<CompactionDigest> {
+fn prune_transcript(messages: &mut Vec<ChatMessage>, budget: usize, keep: usize, schema_tokens: usize, mut total: usize, growth: usize, estimate: &dyn Fn(&ChatMessage) -> usize) -> Option<CompactionDigest> {
     let target = cut_target(budget, keep, schema_tokens, messages, estimate);
     // Fixed for the whole cut: once an exchange is dropped, later user
     // messages would join the opening run and pin themselves.
@@ -2326,6 +2309,51 @@ pub(crate) mod tests {
         assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
         let choices: Vec<Value> = requests.try_iter().map(|b| b["tool_choice"].clone()).collect();
         assert_eq!(choices, ["none", "auto"]);
+    }
+
+    /// `n` exchanges whose calls each carry `thought` bytes of reasoning, in a fixture that drops old reasoning.
+    fn thinking_session(url: &str, n: usize, thought: usize) -> (Fixture, Vec<ChatMessage>) {
+        let fixture = Fixture::new(url);
+        fixture.core.settings.lock().unwrap().compaction_drop_reasoning = true;
+        let mut messages = session(n, 200);
+        for m in messages.iter_mut().filter(|m| m.tool_calls.is_some()) {
+            m.reasoning_content = Some("t".repeat(thought));
+        }
+        (fixture, messages)
+    }
+
+    /// Only replies older than the protected tail lose their reasoning, and it lands in the archive.
+    #[tokio::test]
+    async fn dropping_reasoning_spares_the_newest_exchanges() {
+        let (fixture, mut messages) = thinking_session("http://127.0.0.1:9", 40, 4_000);
+        let tail = protected_tail_start(&messages, pinned_head(&messages));
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0, "the cut lands");
+        assert!(messages[..tail].iter().all(|m| m.reasoning_content.is_none()), "old reasoning is gone");
+        assert!(messages[tail..].iter().any(|m| m.reasoning_content.is_some()), "the newest keeps its reasoning");
+        let archived = sessions::load_archive(&fixture.core, &fixture.id);
+        assert!(archived.len() == 38 && archived.iter().all(|m| m.reasoning_content.is_some()), "{}", archived.len());
+        assert!(sessions::last_compaction(&fixture.core, &fixture.id).is_none() && fixture.skipped().is_empty(), "no notes, no digest");
+    }
+
+    /// Calls and their outputs stay as they were, in place, and nothing else in the transcript changes.
+    #[tokio::test]
+    async fn dropping_reasoning_leaves_calls_and_outputs_whole() {
+        let (fixture, mut messages) = thinking_session("http://127.0.0.1:9", 40, 4_000);
+        let bare = |m: &ChatMessage| wire(&ChatMessage { reasoning_content: None, ..m.clone() });
+        let original: Vec<String> = messages.iter().map(bare).collect();
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        assert_eq!(messages.iter().map(bare).collect::<Vec<_>>(), original);
+    }
+
+    /// Reasoning too small to reach half the trigger falls through to the notes cut.
+    #[tokio::test]
+    async fn dropping_too_little_reasoning_falls_through_to_notes() {
+        let (url, requests) = serve_in_order(vec![reply("State: halfway.", false)]);
+        let (fixture, mut messages) = thinking_session(&url, 150, 400);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
+        assert_eq!(requests.try_iter().count(), 1, "the notes were asked for");
+        assert!(sessions::last_compaction(&fixture.core, &fixture.id).is_some());
     }
 
     /// The notes request is admitted in real tokens by the session's learned
