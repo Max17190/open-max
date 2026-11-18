@@ -459,8 +459,11 @@ pub fn load(data_dir: &Path) -> Result<Settings, String> {
         }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    serde_json::from_str(&text)
-        .map_err(|e| format!("invalid settings file {}: {e}", path.display()))
+    let settings: Settings = serde_json::from_str(&text)
+        .map_err(|e| format!("invalid settings file {}: {e}", path.display()))?;
+    // Registries built from here on tell the model read_file shows images.
+    crate::tools::IMAGE_INPUT.store(settings.image_input, std::sync::atomic::Ordering::Relaxed);
+    Ok(settings)
 }
 
 /// Write settings.json and return the exact bytes written. The one caller

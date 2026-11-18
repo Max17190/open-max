@@ -937,6 +937,11 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
 fn with_builtins(entries: impl IntoIterator<Item = Value>) -> Value {
     let mut schemas = tools::tool_schemas().clone();
     if let Some(arr) = schemas.as_array_mut() {
+        if tools::IMAGE_INPUT.load(std::sync::atomic::Ordering::Relaxed) {
+            for entry in arr.iter_mut().filter(|entry| entry_name(entry) == "read_file") {
+                entry["function"]["description"] = tools::READ_FILE_IMAGE_DESCRIPTION.into();
+            }
+        }
         arr.extend(entries);
     }
     schemas
