@@ -10,6 +10,7 @@ mod stdio;
 mod subagent;
 mod theme;
 mod ui;
+mod update;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
@@ -137,6 +138,12 @@ options:
                          of -p, --stdio and --subagent, and stdout not a
                          terminal, no session starts: the grant alone exits
                          0, and with --continue or a settings flag it exits 1
+      --update           update this install to the latest release with the
+                         command that installed it (Homebrew, npm, bun or the
+                         install script). The interactive session checks for
+                         a newer release once a day and names it; it never
+                         installs one. OPENMAX_NO_UPDATE_CHECK=1 turns the
+                         check off
   -V, --version          print the version
   -h, --help             this help
 
@@ -205,6 +212,8 @@ struct CliArgs {
     /// `--subagent`: the task one child session runs in a new worktree (see
     /// `subagent`).
     subagent: Option<String>,
+    /// `--update`: run the command that updates this install (`update`).
+    update: bool,
     /// `--worktree`: the isolation `--subagent` runs its child in.
     worktree: bool,
     /// One prompt string per headless turn (tokens between repeated -p flags
@@ -259,6 +268,7 @@ where
         mcp_timeout: None,
         trust_project: false,
         subagent: None,
+        update: false,
         worktree: false,
         prompts: Vec::new(),
         prompt_words: Vec::new(),
@@ -316,6 +326,7 @@ where
             Long("approve") => set_once(&mut out.approve, "--approve", &mut parser)?,
             Long("forget") => set_once(&mut out.forget, "--forget", &mut parser)?,
             Long("ledger") => out.ledger = true,
+            Long("update") => out.update = true,
             Long("recall") => set_once(&mut out.recall, "--recall", &mut parser)?,
             Long("replay") => set_once(&mut out.replay, "--replay", &mut parser)?,
             Long("ledger-repair") => out.ledger_repair = true,
@@ -499,6 +510,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         mcp_timeout,
         trust_project,
         subagent,
+        update,
         worktree,
         prompts,
         // The words `prompts` is made of; not a flag of its own.
@@ -523,6 +535,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         (*stdio && !*check, "--stdio"),
         (*print, "--print"),
         (subagent.is_some(), "--subagent"),
+        (*update, "--update"),
     ]
     .into_iter()
     .filter_map(|(on, flag)| on.then_some(flag))
@@ -1030,6 +1043,9 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             return Ok(std::process::ExitCode::from(3));
         }
         return Ok(authenticate(|dir| async move { Box::pin(setup::run(&dir, action, target, None)).await }).await);
+    }
+    if cli.update {
+        return Ok(std::process::ExitCode::from(u8::try_from(update::run(&default_data_dir()).await).unwrap_or(1)));
     }
     if let Some(action) = &cli.chatgpt {
         if matches!(action.as_str(), "login" | "logout") {
@@ -3609,7 +3625,7 @@ mod tests {
     /// comes after `--`, so `refusal_of` closes such a line with one. An
     /// empty name is the interactive session. `--replay` is given with the
     /// `--json` it requires.
-    const OPERATIONS: [(&[&str], &str); 18] = [
+    const OPERATIONS: [(&[&str], &str); 19] = [
         (&[], ""),
         (&["--login"], "--login"),
         (&["--logout"], "--logout"),
@@ -3628,6 +3644,7 @@ mod tests {
         (&["--mcp-list"], "--mcp-list"),
         (&["--mcp-call"], "--mcp-call"),
         (&["--subagent", "x", "--worktree"], "--subagent"),
+        (&["--update"], "--update"),
     ];
 
     /// The words `main` hides from the command line are found whether given

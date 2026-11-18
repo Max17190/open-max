@@ -802,6 +802,9 @@ impl App {
 
     async fn startup(&mut self, args: &Args) {
         self.refresh_billing();
+        if let Some(notice) = crate::update::on_session_start(&self.core.data_dir) {
+            self.note(&notice);
+        }
         if args.continue_session {
             let project = self.project.display().to_string();
             match sessions::latest(&self.core, &project) {
@@ -2584,6 +2587,7 @@ impl App {
                         "  privacy",
                         "no telemetry · sessions stay local · external tools may use the network",
                     ),
+                    kv("  updates", &crate::update::status()),
                 ];
                 self.transcript.push(block);
             }

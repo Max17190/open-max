@@ -34,6 +34,6 @@ An openmax killed outright (`kill -9`, or a crash that runs no handler) runs non
 
 Permissions, approvals, and `mutating` metadata control dispatch and user experience, not operating-system isolation.
 
-Open Max itself has no telemetry. Apart from native child processes, the harness contacts your configured model endpoint and, for an explicitly connected ChatGPT account, OpenAI's authentication service for sign-in, renewal, and sign-out.
+Open Max itself has no telemetry. Apart from native child processes, the harness contacts your configured model endpoint, for an explicitly connected ChatGPT account, OpenAI's authentication service for sign-in, renewal, and sign-out, and, at most once a day from an interactive session of an installed release, `api.github.com` for the latest release's version, which `OPENMAX_NO_UPDATE_CHECK=1` turns off (see [updating](install.md#updating)).
 
 Sessions, settings, tools, and skills stay under `~/.openmax/` and your project directory. `/status` lists the destinations configured by the harness and detailed runtime information; it does not enforce or enumerate child-process network access, and external tools you install may open their own network connections.

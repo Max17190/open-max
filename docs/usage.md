@@ -48,6 +48,7 @@ openmax --chatgpt login              # browser sign-in and account model catalog
 openmax --chatgpt status             # account labels, without credential values
 openmax --chatgpt models --account work   # refresh one account's model catalog
 openmax --chatgpt logout             # revoke and clear this account's tokens
+openmax --update                     # update to the latest release
 ```
 
 Use `/login` and `/logout` inside a session for the same setup flow. Open Max
