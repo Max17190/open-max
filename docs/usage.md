@@ -213,8 +213,10 @@ ends it the same way. A second signal exits without waiting for the turn, with
 128 plus its own number, and kills the tools outright. Either exit first waits up
 to 250 ms for a tool command still being started, so one that starts within that
 wait is killed with the rest. Neither stops a process that leaves its tool's
-group (one that starts a session of its own, as `setsid` does), or a tool command
-whose start outlasts that wait: it runs on after openmax has exited. SIGKILL,
+session (as `setsid` does), on macOS one that leaves its tool's group, or a tool
+command whose start outlasts that wait: it runs on after openmax has exited. On
+Linux a process that only moves to another group of its tool's session, as GNU
+`timeout` moves its command, is stopped with the rest. SIGKILL,
 or a crash that runs no handler, runs none of openmax's code, so its watcher
 stops its tools instead: each `bash` call, external tool and hook it started,
 with every process each started that is still in its group. A sub-agent's
