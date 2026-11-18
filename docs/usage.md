@@ -48,6 +48,7 @@ openmax --chatgpt login              # browser sign-in and account model catalog
 openmax --chatgpt status             # account labels, without credential values
 openmax --chatgpt models --account work   # refresh one account's model catalog
 openmax --chatgpt logout             # revoke and clear this account's tokens
+openmax --update                     # update to the latest release
 ```
 
 Use `/login` and `/logout` inside a session for the same setup flow. Open Max
@@ -132,13 +133,14 @@ without content approval; ask uses the documented approval and sandbox rules.
 It honors permission rules, `pre_tool_use` hooks, and `approval_mode` exactly
 as a turn does. See [extending](extending.md#proof-of-life).
 
-`--session <id>` continues that session instead of the latest one, with `-p`
-or `--stdio`, and implies `--continue`; it is a separate option because
+`--session <id>` continues that session instead of the latest one, in a
+session or with `-p` or `--stdio`, and implies `--continue`; it is a separate option because
 `--continue` takes no value, so a word after it stays prompt text. The id is
 the `session_id` every event line carries. An id that no session of this
 directory has, one of another project's sessions, and one whose transcript is
 missing or does not load are each refused with exit 2 and a line that says
-which. Trust, approvals and permissions are those of `--continue`.
+which; a session at a terminal says which and starts fresh instead. Trust,
+approvals and permissions are those of `--continue`.
 
 A print prompt that starts with `-` parses as options, not text. Put it
 last, after `--`, which ends the options: `openmax -p -- '- list the files'`.
@@ -484,6 +486,7 @@ watcher nor a later launch stops them.
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint, cache, performance, privacy, and network details |
+| `/update` | Update to the latest release, then resume this session in it |
 | `/quit` | Exit |
 
 The persistent status line stays limited to model, context use, and approval
