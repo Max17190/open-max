@@ -177,6 +177,7 @@ pub struct Core {
     /// log holds a session's events in the order its frontend reads them.
     /// Leaf-only: nothing else is locked while it is held.
     pub(crate) event_log: Mutex<crate::sessions::EventLog>,
+    tool_starts: Mutex<HashMap<(String, String), std::time::Instant>>, // open calls by session; leaf-only
     events: mpsc::UnboundedSender<AgentEventEnvelope>,
 }
 
@@ -358,6 +359,7 @@ impl Core {
             message_restorations: Default::default(),
             run_only: Mutex::new(None),
             event_log: Default::default(),
+            tool_starts: Default::default(),
             events,
         })
     }
@@ -480,7 +482,10 @@ impl Core {
     /// Send `event` to the frontend and record it in the session's event log
     /// (`sessions::record_event`), both under one lock, so the log holds the
     /// session's events in the order the frontend reads them.
-    pub fn send_agent(&self, session_id: &str, event: AgentEvent) {
+    pub fn send_agent(&self, session_id: &str, mut event: AgentEvent) {
+        let starts = || self.tool_starts.lock().unwrap_or_else(|e| e.into_inner()); // ToolEnd's duration_ms
+        if let AgentEvent::ToolStart { call_id, .. } = &event { starts().insert((session_id.into(), call_id.clone()), std::time::Instant::now()); }
+        if let AgentEvent::ToolEnd { call_id, duration_ms, .. } = &mut event { *duration_ms = starts().remove(&(session_id.into(), call_id.clone())).map(|at| at.elapsed().as_millis() as u64); }
         let envelope = AgentEventEnvelope { session_id: session_id.to_string(), event };
         let mut log = self.event_log.lock().unwrap_or_else(|e| e.into_inner());
         crate::sessions::record_event(&mut log, self, &envelope);

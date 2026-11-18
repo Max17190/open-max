@@ -174,7 +174,7 @@ pub enum AgentEvent {
     /// step is paying a full prompt re-prefill.
     Usage { prompt_tokens: u64, completion_tokens: u64, cached_tokens: Option<u64> },
     ToolStart { call_id: String, name: String, args: serde_json::Value },
-    ToolEnd { call_id: String, ok: bool, output: String },
+    ToolEnd { call_id: String, ok: bool, output: String, #[serde(default)] duration_ms: Option<u64> },
     /// A harness-authored note the MODEL reads in its transcript (a refreeze
     /// receipt, a policy/providers/settings/approval notice), surfaced on the
     /// wire so a custom frontend can render what the model sees. `call_id`
@@ -411,8 +411,8 @@ mod tests {
             r#"{"session_id":"s1","type":"tool_start","call_id":"c1","name":"read_file","args":{"path":"a.rs"}}"#
         );
         assert_eq!(
-            env(AgentEvent::ToolEnd { call_id: "c1".into(), ok: true, output: "ok".into() }),
-            r#"{"session_id":"s1","type":"tool_end","call_id":"c1","ok":true,"output":"ok"}"#
+            env(AgentEvent::ToolEnd { call_id: "c1".into(), ok: true, output: "ok".into(), duration_ms: Some(12) }),
+            r#"{"session_id":"s1","type":"tool_end","call_id":"c1","ok":true,"output":"ok","duration_ms":12}"#
         );
         assert_eq!(
             env(AgentEvent::Diff {

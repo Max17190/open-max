@@ -2776,7 +2776,7 @@ impl App {
             AgentEvent::Diff { call_id, path, diff, added, removed } => {
                 self.pending_diffs.insert(call_id, DiffText { path, diff, added, removed });
             }
-            AgentEvent::ToolEnd { call_id, ok, output } => {
+            AgentEvent::ToolEnd { call_id, ok, output, .. } => {
                 let meta = self
                     .tool_meta
                     .remove(&call_id)
@@ -7300,6 +7300,7 @@ mod tests {
             call_id: "call-1".into(),
             ok: true,
             output: "test one ok\ntest two ok\ntest three ok\ntest four ok".into(),
+            duration_ms: None,
         });
         let complete = render_app(&mut app, 96, 22);
         let complete_text = buffer_text(&complete);
@@ -7354,6 +7355,7 @@ mod tests {
                 call_id: call_id.into(),
                 ok,
                 output: "exit 1\nerror: linking failed".into(),
+                duration_ms: None,
             });
         }
         app.composer.load("a draft");

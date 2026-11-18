@@ -1365,7 +1365,10 @@ fn shape(events: &[Value]) -> Vec<String> {
             "token" => format!("token {}", event["text"].as_str().unwrap()),
             _ => {
                 let mut event = event.clone();
-                event.as_object_mut().unwrap().remove("session_id");
+                // The session and a call's wall time differ between runs.
+                let fields = event.as_object_mut().unwrap();
+                fields.remove("session_id");
+                fields.remove("duration_ms");
                 event.to_string()
             }
         };

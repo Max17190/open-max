@@ -1116,7 +1116,7 @@ fields. Parse by field name, never by key order. Only two lines carry no
 (text), `message_done` (text), `budget` (used_tokens: the transcript plus
 the tool schemas sent on every request, context_tokens),
 `usage` (prompt_tokens, completion_tokens, cached_tokens|null), `tool_start`
-(call_id, name, args), `tool_end` (call_id, ok, output), `harness_note`
+(call_id, name, args), `tool_end` (call_id, ok, output, duration_ms), `harness_note`
 (call_id, text: a note the harness wrote into the MODEL's transcript - a
 refreeze receipt, or a policy/providers/settings/approval notice - surfaced
 here so a frontend can render what the model sees; `call_id` links it to the
@@ -1893,7 +1893,7 @@ mod tests {
                 name: String::new(),
                 args: serde_json::Value::Null,
             },
-            AgentEvent::ToolEnd { call_id: String::new(), ok: true, output: String::new() },
+            AgentEvent::ToolEnd { call_id: String::new(), ok: true, output: String::new(), duration_ms: None },
             AgentEvent::HarnessNote { call_id: String::new(), text: String::new() },
             AgentEvent::Retry { attempt: 0, max_attempts: 0, reason: String::new() },
             AgentEvent::Diff {
