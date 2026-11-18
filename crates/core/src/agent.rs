@@ -738,7 +738,8 @@ async fn run_loop(
     let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
     // Cut replies with no call since the last reply the cap did not cut, those the limit could not grow after, and its doublings.
-    let (mut cuts, mut stalled, mut raise, mut stops) = (0usize, 0usize, 0u32, Vec::new());
+    // ...and whether this turn already asked again after a reply with nothing in it.
+    let (mut cuts, mut stalled, mut raise, mut stops, mut asked) = (0usize, 0usize, 0u32, Vec::new(), false);
     let mut at_reserve = false;
     // The limit is how long a reasoning model thinks in one reply before it acts, not how much a call or an answer
     // may carry: a reply it cut inside a call or its text is asked for once more with this room, and
@@ -984,6 +985,12 @@ async fn run_loop(
                 insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(limit, kind, ask));
                 save_messages(core, session_id, guard.messages(), false).await;
                 continue 'turns;
+            }
+            // A reply with nothing in it below the limit is asked for once more before the turn ends `empty`.
+            if silent && !capped && !asked && iteration + 1 < max_iterations {
+                let at = guard.messages().len(); asked = true;
+                insert_note(core, session_id, guard.messages(), at, crate::notes::EMPTY_REPLY_NOTE.into());
+                save_messages(core, session_id, guard.messages(), false).await; continue 'turns;
             }
             if silent && !capped {
                 core.send_agent(session_id, AgentEvent::Error { message: result.empty_reply_error() });
@@ -5028,8 +5035,10 @@ mod tests {
     /// nothing and exited 0, and could not be told from a finished task. One
     /// route ends thinking below the limit and delivers nothing, at the same
     /// count each time: a silent reply that stops where an earlier reply of
-    /// the turn did is that cap, so it continues as a cut thought, while any
-    /// other silent reply ends the turn `empty` behind an error.
+    /// the turn did is that cap, so it continues as a cut thought. Any other
+    /// silent reply is asked for once more, with a note, when an iteration
+    /// is left: a model that then answers or acts carries on, and a second
+    /// silent reply ends the turn `empty` behind an error.
     #[tokio::test]
     async fn a_reply_with_nothing_in_it_is_an_error_unless_it_stopped_at_a_repeated_count() {
         use crate::state::Core;
@@ -5050,16 +5059,20 @@ mod tests {
         let silent_again = thought_sse(3073, None, "stop");
         let short = thought_sse(40, None, "stop");
         let elsewhere = thought_sse(2500, None, "stop");
-        // A case: the replies in order, the iteration cap, the stop reason, and whether a cut note went in.
-        let cases: [(&str, Vec<&str>, usize, &str, bool); 5] = [
-            ("silent alone", vec![&silent], 50, "empty", false),
-            ("silent and short", vec![&short], 50, "empty", false),
-            ("silent at the count a call stopped at", vec![&read, &silent_again, STOP_SSE], 50, "stop", true),
-            ("silent at another count", vec![&read, &elsewhere], 50, "empty", false),
+        // A case: the replies in order, the iteration cap, the stop reason, and the note that went in: a cut note or an empty-reply note.
+        type Case<'a> = (&'a str, Vec<&'a str>, usize, &'a str, Option<&'a str>);
+        let cases: [Case; 8] = [
+            ("silent twice", vec![&silent, &short], 50, "empty", Some("[empty reply:")),
+            ("short silent twice", vec![&short, &silent], 50, "empty", Some("[empty reply:")),
+            ("silent, then an answer once asked again", vec![&silent, STOP_SSE], 50, "stop", Some("[empty reply:")),
+            ("silent, then a call once asked again", vec![&short, &read, STOP_SSE], 50, "stop", Some("[empty reply:")),
+            ("silent on the last iteration is not asked again", vec![&silent], 1, "empty", None),
+            ("silent at the count a call stopped at", vec![&read, &silent_again, STOP_SSE], 50, "stop", Some("[reply cut:")),
+            ("silent at another count", vec![&read, &elsewhere, &short], 50, "empty", Some("[empty reply:")),
             // On the last iteration nothing is left to continue the cut, so the turn stopped short.
-            ("silent at a repeated count on the last iteration", vec![&read, &silent_again], 2, "length", false),
+            ("silent at a repeated count on the last iteration", vec![&read, &silent_again], 2, "length", None),
         ];
-        for (case, streams, iterations, stop, noted) in cases {
+        for (case, streams, iterations, stop, note) in cases {
             let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
             let (core, mut rx) = Core::new(dir.clone()).unwrap();
             let project = dir.join("project");
@@ -5085,8 +5098,11 @@ mod tests {
                 assert!(errors.is_empty(), "{case}: {errors:?}");
             }
             let messages = transcript(&core, id).await;
-            let notes = messages.iter().filter(|m| m.content.as_deref().is_some_and(|c| c.contains("[reply cut:"))).count();
-            assert_eq!(notes, usize::from(noted), "{case}: a cut note follows only the repeated stop");
+            // A cut note follows only the repeated stop; an empty-reply note, once, any other silent reply with an iteration left.
+            for kind in ["[reply cut:", "[empty reply:"] {
+                let count = messages.iter().filter(|m| m.content.as_deref().is_some_and(|c| c.contains(kind))).count();
+                assert_eq!(count, usize::from(note == Some(kind)), "{case}: {kind}");
+            }
             let _ = std::fs::remove_dir_all(dir);
         }
     }
