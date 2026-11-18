@@ -714,8 +714,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // their open part. AGENTS.md rides as far as the window allows, cut at a
     // line with its dropped sections named, and a note counts the later
     // prompts it leaves out. The daily release notice, /update with its
-    // session resume, and openmax --update.
-    const BASELINE: usize = 44_749;
+    // session resume, and openmax --update. Turn-time marks
+    // (elapsed_marks_secs) condense notes and leave 8 lines fewer.
+    const BASELINE: usize = 44_741;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
