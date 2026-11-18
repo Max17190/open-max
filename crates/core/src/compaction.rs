@@ -282,13 +282,12 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 /// text and no call, its reasoning. A call in it never runs, nothing of this
 /// exchange is stored or shown, and an empty reply, an error, a cancel, a
 /// cut stream or a request the spend ceiling refuses gives no notes: the
-/// error says which, for the report of a cut skipped for want of them.
+/// error says which, and the cut then lands on the digest instead.
 ///
 /// Like every turn request it has no overall deadline, only the client's
 /// silence timeout: the notes are a full reply at the reply limit, which a
-/// slow route takes minutes to write, and a skipped cut is not retried until
-/// the window forces one, so a deadline there costs every later request the
-/// context the cut would have removed.
+/// slow route takes minutes to write, and a deadline there would trade the
+/// notes for the digest on every slow route.
 ///
 /// The request is billed like any other: a ledger that advertises what each
 /// request cost cannot omit the one the harness makes on its own behalf.
@@ -560,15 +559,8 @@ pub(crate) async fn compact_messages(
     let forced = force || total > budget;
     let (archive, record) = match prepare_compaction_digest(ctx, &mut candidate, digest, forced, spend).await {
         Ok(cut) => cut,
-        Err(reason) => {
-            // The history stays whole and the session goes on, so this is
-            // advisory; without it a run could not tell a cut that never
-            // happened from one that was never due. A cancel is the human's.
-            if !ctx.cancelled.is_cancelled() {
-                ctx.core.send_agent(ctx.session_id, AgentEvent::CompactionSkipped { reason });
-            }
-            return Ok(0);
-        }
+        // Only a cancelled turn's unforced cut fails here; the cancel is the human's, so no skip is reported.
+        Err(_) => return Ok(0),
     };
     crate::notes::store_note(&mut candidate, note.as_deref());
     sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, Some(&record), messages.len(), head)?;
