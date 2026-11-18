@@ -2612,6 +2612,22 @@ fn stdio_lines(project: &Path, home: &Path, args: &[&str], commands: &[&str]) ->
     stdout.lines().map(|line| line.replace(id, "S")).collect()
 }
 
+/// `lines` with each `"duration_ms":<n>` written as `"duration_ms":0`.
+fn mask_durations(lines: &[String]) -> Vec<String> {
+    const KEY: &str = "\"duration_ms\":";
+    lines
+        .iter()
+        .map(|line| match line.find(KEY) {
+            Some(at) => {
+                let digits = at + KEY.len();
+                let end = line[digits..].find(|c: char| !c.is_ascii_digit()).map_or(line.len(), |n| digits + n);
+                format!("{}0{}", &line[..digits], &line[end..])
+            }
+            None => line.clone(),
+        })
+        .collect()
+}
+
 /// `--stdio` and `--print --json` render one event stream, and
 /// docs/stdio-protocol.md gives every event line as `session_id`, then
 /// `type`, then the fields in declaration order. So one turn is framed in
@@ -2652,6 +2668,9 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
             hello["project"],
         )
     );
+    // A tool_end carries the call's wall time, which differs between the two
+    // runs, so it is masked; its place among the fields is still compared.
+    let (framed, printed) = (mask_durations(&framed), mask_durations(&printed));
     assert_eq!(framed[1..], printed[..], "stdio and print mode framed one turn differently");
 
     let resumed = stdio_lines(&project, &home, &["--continue", "--stdio"], &[]);
