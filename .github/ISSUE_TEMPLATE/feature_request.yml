@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a change or a new capability.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open Max keeps its core small, and much new capability fits as a tool, skill, prompt template or hook the agent can write ([Extending](https://github.com/Max17190/open-max/blob/main/docs/extending.md)). If yours could be one, say so below.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The task or workflow, and where Open Max gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you have tried
+      description: Including any extension you wrote for it.
