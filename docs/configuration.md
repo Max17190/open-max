@@ -378,7 +378,9 @@ between, and never shortens a kept message, so between cuts the history stays
 byte-stable and the server can reuse its prompt cache. Before the cut, the
 session's own model writes the notes it will continue from: one extra
 request whose prompt is the conversation up to the cut, as earlier requests
-already sent it, with the same tools, plus one ask. The notes, up to 4,000
+already sent it, with the same tools and `tool_choice` set to `none`, plus one
+ask; a route that refuses that field is asked again without it. A reply the
+limit cut before any text is asked for once more at twice the limit. The notes, up to 4,000
 bytes, take the removed span's place in one context note. A reply with
 no text that ended on its own and made no call gives its reasoning as the
 notes, since some models write them there. Notes over the cap end at their
@@ -386,11 +388,10 @@ last whole line, and notes the reply limit cut end with a line that says so.
 A call in that reply never runs, and nothing else of the exchange is kept.
 The notes request has no overall deadline, as no request does: only a
 connection that falls silent ends it. When no notes come back (an error, an
-empty reply, a silent connection, or a request `max_agent_tokens` refuses), automatic compaction makes no cut until the
-window forces one, and does not ask again in that turn before then. A cut the
-window forces, or a `/compact`, is made without notes when none come back,
-and its note lists the tools used, the files touched and the earlier goals
-instead. Everything a cut removes is appended verbatim to
+empty reply, a call, a silent connection, or a request `max_agent_tokens`
+refuses), the cut is made anyway, as a cut the window forces or a `/compact`
+is, and its note lists the tools used, the files touched and the earlier goals
+instead. Only a cancelled turn makes no cut it was not forced to. Everything a cut removes is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note names that
 path, so compaction stays reversible: the notes are the bounded view, the
 archive is the lossless record. The `compaction` hook observes each cut.
