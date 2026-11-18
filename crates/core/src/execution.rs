@@ -1842,7 +1842,8 @@ fn owner_is_running(pid: u32, recorded_start: Option<&str>) -> bool {
 /// ends. `recorded` ([`is_recorded_group`]) tells whether a group is still
 /// the one recorded, and each is dropped the first time it is not, never to
 /// be signalled again: once a group has ended, its id can name a new group,
-/// which reads as recorded when its own leader has exited.
+/// which reads as recorded when its own leader has exited. A group whose
+/// session still holds other groups is kept: their session id holds its pid.
 #[cfg(unix)]
 fn stop_groups(groups: &[(u32, u64)], grace: Duration, mut recorded: impl FnMut(u32, u64) -> bool) {
     let mut stopping: Vec<(u32, u64)> = groups.iter().copied().filter(|&(pid, start)| recorded(pid, start)).collect();
@@ -1851,7 +1852,7 @@ fn stop_groups(groups: &[(u32, u64)], grace: Duration, mut recorded: impl FnMut(
     }
     let deadline = std::time::Instant::now() + grace;
     loop {
-        stopping.retain(|&(pid, start)| recorded(pid, start));
+        stopping.retain(|&(pid, start)| recorded(pid, start) || !session_groups(Path::new("/proc"), pid).is_empty());
         if stopping.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }
@@ -2013,7 +2014,15 @@ fn stat_group(stat: &str) -> Option<(u32, u32, bool)> {
 fn session_groups(proc: &Path, session: u32) -> Vec<u32> {
     let stats = std::fs::read_dir(proc).into_iter().flatten().flatten().filter_map(|e| std::fs::read(e.path().join("stat")).ok());
     let groups = stats.filter_map(|stat| stat_group(&String::from_utf8_lossy(&stat)));
-    groups.filter(|&(group, of, _)| of == session && group != session).map(|g| g.0).collect()
+    let mut groups: Vec<u32> = groups.filter(|&(group, of, _)| of == session && group != session).map(|g| g.0).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
+#[cfg(not(target_os = "linux"))]
+fn session_groups(_: &Path, _: u32) -> Vec<u32> {
+    Vec::new()
 }
 
 #[cfg(all(test, unix))]
@@ -2192,7 +2201,6 @@ fn signal_group(pid: Option<u32>, signal: libc::c_int) {
     if let Some(pid) = pid {
         // A missing group simply means every process has already exited.
         unsafe { libc::kill(-(pid as libc::pid_t), signal) };
-        #[cfg(target_os = "linux")]
         session_groups(Path::new("/proc"), pid).into_iter().for_each(|g| unsafe { libc::kill(-(g as libc::pid_t), signal); });
     }
 }
@@ -2469,6 +2477,43 @@ mod tests {
         assert!(stubborn_stopped, "a group that ignores SIGTERM outlived the reap");
         assert_eq!(stubborn.wait().unwrap().signal(), Some(libc::SIGKILL));
         assert!(took >= LEFT_BEHIND_GRACE, "a group that ignores SIGTERM was killed {took:?} into its {LEFT_BEHIND_GRACE:?} grace");
+    }
+
+    /// A recorded session whose leader ends on SIGTERM and is reaped at once,
+    /// as init reaps a tool whose harness died, still has a worker under GNU
+    /// `timeout` in another of its groups that ignores SIGTERM: the stop keeps
+    /// the session through the grace and kills the worker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_kills_a_session_worker_that_outlives_its_leader() {
+        use std::{io::BufRead, os::unix::process::CommandExt};
+        let pid_file = std::env::temp_dir().join(format!("openmax-session-stop-{}", uuid::Uuid::new_v4()));
+        let script = format!(
+            "timeout 540 sh -c \"trap '' TERM; echo \\$\\$ > '{0}'; exec sleep 6852\" & while [ ! -s '{0}' ]; do sleep 0.01; done; echo ready; exec sleep 300",
+            pid_file.display()
+        );
+        let mut leader = std::process::Command::new("/bin/sh");
+        leader.args(["-c", &script]).stdout(std::process::Stdio::piped());
+        // SAFETY: setsid is async-signal-safe.
+        unsafe { leader.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }) };
+        let mut leader = leader.spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        let (pid, start) = (leader.id(), start_time(leader.id()).unwrap());
+        let reaper = std::thread::spawn(move || leader.wait());
+        let worker = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        stop_groups(&[(pid, start)], Duration::from_millis(500), is_recorded_group);
+        reaper.join().unwrap().unwrap();
+        let running = || proc_stat(&Path::new("/proc").join(worker.to_string())).is_some_and(|p| !p.2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = running();
+        unsafe { libc::kill(worker, libc::SIGKILL) };
+        assert!(!survived, "a worker in another group of the session outlived the stop");
     }
 
     /// A group that ends on SIGTERM is given the grace to, and the grace is
@@ -4052,7 +4097,7 @@ mod tests {
         run_process(request("/bin/sh", &["-c", &script]), Arc::new(CancelToken::default())).await.unwrap();
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        let alive = proc_stat(&Path::new("/proc").join(pid.to_string())).is_some_and(|p| !p.2);
         unsafe { libc::kill(pid, libc::SIGKILL) };
         assert!(alive, "a process in a session of its own was stopped with the command");
     }
