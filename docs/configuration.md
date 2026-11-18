@@ -166,9 +166,15 @@ and the run that writes a key already uses it.
   with the request after it. The same room follows a reply cut while
   writing its text, which is asked to continue the text, and a reply whose
   call never arrived (below). A reply cut again at that room is asked for
-  in parts, and a server that refuses the room (HTTP 400 or 422) gets the
-  request again at the usual limit and no more room in that turn. A cut
-  thought gets no room of its own. The ceiling is the most any request asks
+  in parts, except that one with no call, where the ceiling allows, gets
+  the first doubled limit above the room: no note offers less than the
+  room just cut. A room cut on a call or its text is spent: no request in
+  that turn carries room again, and from then on each reply cut on a call
+  counts as a cut the limit could not grow past (below), so the fifth cut
+  in a row ends the turn with `length`. A server that refuses the room
+  (HTTP 400 or 422) gets the request again at the usual limit and no more
+  room in that turn. A cut thought gets no room of its own, and its raised
+  limit is the plain doubling. The ceiling is the most any request asks
   for: the model entry's `max_tokens`, which is the model's longest reply,
   so declaring it keeps the default limit as each request's first ask; a
   `max_tokens` other than 4096 in settings.json is both the limit and a
