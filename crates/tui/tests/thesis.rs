@@ -715,8 +715,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // line with its dropped sections named, and a note counts the later
     // prompts it leaves out. The daily release notice, /update with its
     // session resume, and openmax --update. A cut whose notes do not arrive
-    // lands on the digest, so the skip report's branch is gone.
-    const BASELINE: usize = 44_745;
+    // lands on the digest, so the skip report's branch is gone, and a notes
+    // reply cut before any text is asked again within the reply bounds.
+    const BASELINE: usize = 44_748;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

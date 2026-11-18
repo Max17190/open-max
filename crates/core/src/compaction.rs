@@ -303,7 +303,7 @@ async fn summarize_compaction(
     // admitted, and by the route's estimator, which counts only what it sends.
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
     if !spend.admits(estimated) { return Err("the notes request would pass the turn's token ceiling".into()); }
-    // tool_choice "none" beside the same tools makes the reply notes, not a call (a route refusing it is asked without); a reply the limit cut before any text is asked again at twice the limit.
+    // tool_choice "none" beside the same tools makes the reply notes, not a call (a route refusing it is asked without); a reply the limit cut before any text is asked again at twice the limit, within the longest reply and the window left.
     let (mut limit, mut choice, flag) = (client.reply_reserve, true, &client.notes_only);
     let result = loop {
         flag.store(choice, std::sync::atomic::Ordering::Relaxed);
@@ -319,9 +319,10 @@ async fn summarize_compaction(
             Err(error) => { spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(limit)); return Err(format!("the notes request failed: {}", crate::text::one_line(&error))); }
         };
         spend.record(core, session_id, estimated, &result);
-        let unwritten = result.finish_reason == "length" && result.content.trim().is_empty();
-        if !(unwritten && limit == client.reply_reserve && spend.admits(estimated)) { break result; }
-        limit *= 2;
+        let unwritten = result.finish_reason == "length" && crate::client::strip_leading_think(&result.content).unwrap_or_else(|| result.content.clone()).trim().is_empty();
+        let room = (limit * 2).min(client.reply_bounds.0).min(client.reply_bounds.1.saturating_sub(1024 + estimated));
+        if !(unwritten && limit == client.reply_reserve && room > limit && spend.admits(estimated)) { break result; }
+        limit = room;
     };
     if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" {
         return Err(format!("the notes reply ended {}", result.finish_reason));
@@ -2304,6 +2305,19 @@ pub(crate) mod tests {
         let (url, requests) = serve_in_order(vec![thought.clone(), thought.clone(), reply("State: halfway.", false)]);
         assert_digest_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
         assert_eq!(requests.try_iter().count(), 2, "asked again once, not twice");
+
+        // A thought in a leading think tag is no text either, and the second ask stays within the longest reply
+        // and the window the prompt leaves; where neither has room above the first limit it is not sent.
+        let think = stream(&[serde_json::json!({ "choices": [{ "delta": { "content": "<think>half a thought" }, "finish_reason": "length" }] })]);
+        for (bounds, sent, notes) in [((768, usize::MAX), vec![512, 768], true), ((usize::MAX, 1_024), vec![512], false), ((512, usize::MAX), vec![512], false)] {
+            let (url, requests) = serve_in_order(vec![think.clone(), reply("State: halfway.", false)]);
+            let mut fixture = Fixture::new(&url);
+            fixture.client.reply_bounds = bounds;
+            let mut messages = session(60, 2_000);
+            assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0, "{bounds:?}");
+            assert_eq!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."), notes, "{bounds:?}");
+            assert_eq!(requests.try_iter().map(|b| b["max_tokens"].as_u64().unwrap()).collect::<Vec<_>>(), sent, "{bounds:?}");
+        }
     }
 
     /// A route that refuses tool_choice is asked again without it.

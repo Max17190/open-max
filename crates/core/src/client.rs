@@ -451,6 +451,7 @@ pub struct ChatClient {
     cache_key: Option<String>,
     /// Set while the notes request goes out: tool_choice "none" beside the same tools, so a reply is notes, not a call.
     pub(crate) notes_only: std::sync::atomic::AtomicBool,
+    pub(crate) reply_bounds: (usize, usize), // The longest reply and the window: bound a notes reply asked again higher.
     http: reqwest::Client,
 }
 
@@ -592,7 +593,7 @@ impl ChatClient {
             prefer_reasoning_details: false,
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
-            cache_key: None, notes_only: Default::default(),
+            cache_key: None, notes_only: Default::default(), reply_bounds: (usize::MAX, usize::MAX),
             http,
         }
     }
@@ -609,6 +610,7 @@ impl ChatClient {
             use_max_completion_tokens: ep.compat.use_max_completion_tokens,
             send_stream_options: ep.compat.send_stream_options,
             prefer_reasoning_details: ep.compat.prefer_reasoning_details,
+            reply_bounds: (ep.reply_ceiling, ep.context_tokens),
             ..Self::new(ep.base_url.clone(), ep.api_key.clone(), ep.model.clone(), ep.temperature, ep.reply_reserve)
         }
     }
