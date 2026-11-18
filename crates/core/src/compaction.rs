@@ -304,21 +304,26 @@ async fn summarize_compaction(
     // admitted, and by the route's estimator, which counts only what it sends.
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
     if !spend.admits(estimated) { return Err("the notes request would pass the turn's token ceiling".into()); }
-    let mut resent = Vec::new();
-    let outcome = client.stream_chat(&messages, client.reply_reserve, schemas, cancelled.clone(), |delta| {
-        if let crate::client::StreamDelta::Usage(usage) = delta { resent.push(usage); }
-    }).await;
-    // A reply the client asked for again was paid for, however this one ended.
-    for usage in resent { spend.charge(core, session_id, usage); }
-    let result = match outcome {
-        Ok(result) => result,
-        Err(error) => {
-            // Without a completed response, charge the reply reserve it asked for.
-            spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(client.reply_reserve));
-            return Err(format!("the notes request failed: {}", crate::text::one_line(&error)));
-        }
+    // tool_choice "none" beside the same tools makes the reply notes, not a call (a route refusing it is asked without); a reply the limit cut before any text is asked again at twice the limit.
+    let (mut limit, mut choice, flag) = (client.reply_reserve, true, &client.notes_only);
+    let result = loop {
+        flag.store(choice, std::sync::atomic::Ordering::Relaxed);
+        let mut resent = Vec::new();
+        let outcome = client.stream_chat(&messages, limit, schemas, cancelled.clone(), |delta| {
+            if let crate::client::StreamDelta::Usage(usage) = delta { resent.push(usage); }
+        }).await;
+        // Paid for however it ended: the client's resends, and without a completed response the reply it asked for.
+        flag.store(false, std::sync::atomic::Ordering::Relaxed); for usage in resent { spend.charge(core, session_id, usage); }
+        let result = match outcome {
+            Err(error) if choice && error.contains("tool_choice") => { choice = false; continue; }
+            Ok(result) => result,
+            Err(error) => { spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(limit)); return Err(format!("the notes request failed: {}", crate::text::one_line(&error))); }
+        };
+        spend.record(core, session_id, estimated, &result);
+        let unwritten = result.finish_reason == "length" && result.content.trim().is_empty();
+        if !(unwritten && limit == client.reply_reserve && spend.admits(estimated)) { break result; }
+        limit *= 2;
     };
-    spend.record(core, session_id, estimated, &result);
     if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" {
         return Err(format!("the notes reply ended {}", result.finish_reason));
     }
@@ -450,11 +455,9 @@ pub(crate) struct CompactionCtx<'a> {
     pub(crate) keep: usize,
 }
 
-/// Ask for the notes and settle the candidate's digest note: the archive
-/// material and the record, which are emitted only after the candidate
-/// transcript has been persisted. Without notes a cut the window does not
-/// force is not worth making, so this says why there are none and nothing
-/// is committed.
+/// Ask for the notes and settle the candidate's digest note: the archive material and the record, which are emitted
+/// only after the candidate transcript has been persisted. Without notes the cut lands on the digest a forced cut
+/// leaves, so a failed notes request never turns the ceiling off; a cancelled turn's unforced cut says why instead.
 async fn prepare_compaction_digest(
     ctx: &CompactionCtx<'_>,
     messages: &mut [ChatMessage],
@@ -468,7 +471,7 @@ async fn prepare_compaction_digest(
     let slot = pinned_head(messages);
     let summary = summarize_compaction(ctx, &messages[..slot], &digest, spend).await;
     let summary = match summary {
-        Err(why) if !forced => return Err(why),
+        Err(why) if !forced && ctx.cancelled.is_cancelled() => return Err(why),
         summary => summary.ok(),
     };
     // Structured fields from the previous record carry forward by
@@ -2187,6 +2190,7 @@ pub(crate) mod tests {
         assert_eq!((&sent[cut]["role"], &sent[cut]["content"]), (&"user".into(), &NOTES_ASK.into()));
         assert_eq!(notes["tools"], before["tools"]);
         assert_eq!(notes["tools"], serde_json::from_str::<Value>(SCHEMAS).unwrap(), "the turn's tools");
+        assert_eq!((&notes["tool_choice"], &before["tool_choice"]), (&"none".into(), &"auto".into()), "the notes ask is answered in text");
         assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
     }
 
@@ -2211,40 +2215,117 @@ pub(crate) mod tests {
         assert!(!messages.iter().chain(&archive).any(leaked), "the notes exchange was stored");
     }
 
-    /// Without notes a cut the window does not force is not made: the
-    /// history, the archive, the record and the hook are as they were.
-    /// A cut the window does not force, whose notes do not arrive, is not
-    /// made, and is reported with the reason, which starts with `why`.
-    async fn assert_no_cut_without_notes(url: &str, spend: &mut RequestSpend, why: &str) {
+    /// The bug this guards: a notes request that came back without notes
+    /// skipped the cut, and the ceiling then stayed off for the rest of the
+    /// session. Without notes the cut lands anyway on the digest a forced cut
+    /// leaves (tools, paths, the archive), and no skip is reported.
+    async fn assert_digest_cut_without_notes(url: &str, spend: &mut RequestSpend) {
         let fixture = Fixture::new(url);
         let mut messages = session(60, 2_000);
-        let original: Vec<String> = messages.iter().map(wire).collect();
-        assert_eq!(fixture.cut(&mut messages, 20_000, 100_000, spend).await, 0);
-        assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original, "the history is whole");
-        assert!(!fixture.committed(), "nothing of a cut was committed");
-        let skipped = fixture.skipped();
-        assert!(skipped.len() == 1 && skipped[0].starts_with(why), "the skip is reported once, why: {skipped:?}");
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, spend).await > 0, "the cut lands");
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        assert!(note.contains("Tools used: read_file.") && !note.contains("Summary:"), "{note}");
+        assert!(fixture.committed() && fixture.skipped().is_empty(), "the archive, the record and the hook, and no skip");
     }
 
+    /// An endpoint that answers successive connections with the given whole
+    /// responses and records each request's body.
+    fn serve_in_order(responses: Vec<String>) -> (String, std::sync::mpsc::Receiver<Value>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (url, (sent, bodies)) = (format!("http://{}/v1", listener.local_addr().unwrap()), std::sync::mpsc::channel());
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) { head.push(byte[0]); }
+                let head = String::from_utf8_lossy(&head).to_lowercase();
+                let length = head.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap());
+                let mut body = vec![0u8; length];
+                stream.read_exact(&mut body).unwrap();
+                let _ = sent.send(serde_json::from_slice(&body).unwrap());
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, bodies)
+    }
+
+    /// Each way a notes request can end without notes still cuts: a call
+    /// with no text, an empty reply, a failed request, and a request the
+    /// spend ceiling refuses, which is never sent.
     #[tokio::test]
-    async fn a_reply_of_only_a_call_leaves_the_history_whole() {
+    async fn a_reply_of_only_a_call_cuts_on_the_digest() {
         let (url, requests) = crate::client::tests::spawn_recording_once(reply("", true));
-        assert_no_cut_without_notes(&url, &mut RequestSpend::new(None), "the notes reply had no text (finish_reason tool_calls)").await;
-        assert_eq!(body(&requests)["messages"].as_array().unwrap().last().unwrap()["content"], NOTES_ASK);
+        assert_digest_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
+        let sent = body(&requests);
+        assert_eq!((sent["messages"].as_array().unwrap().last().unwrap()["content"].as_str(), sent["tool_choice"].as_str()), (Some(NOTES_ASK), Some("none")));
     }
 
     #[tokio::test]
-    async fn an_endpoint_error_leaves_the_history_whole() {
-        assert_no_cut_without_notes("http://127.0.0.1:9", &mut RequestSpend::new(None), "the notes request failed: ").await;
+    async fn an_empty_reply_cuts_on_the_digest_without_asking_again() {
+        let (url, requests) = serve_in_order(vec![reply("", false), reply("State: halfway.", false)]);
+        assert_digest_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
+        assert!(requests.recv_timeout(Duration::from_secs(5)).is_ok() && requests.recv_timeout(Duration::from_millis(300)).is_err(), "asked once");
     }
 
     #[tokio::test]
-    async fn notes_the_spend_ceiling_refuses_leave_the_history_whole() {
+    async fn an_endpoint_error_cuts_on_the_digest() {
+        assert_digest_cut_without_notes("http://127.0.0.1:9", &mut RequestSpend::new(None)).await;
+    }
+
+    #[tokio::test]
+    async fn notes_the_spend_ceiling_refuses_cut_on_the_digest() {
         let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
         let mut spend = RequestSpend::new(Some(1_000));
-        assert_no_cut_without_notes(&url, &mut spend, "the notes request would pass the turn's token ceiling").await;
+        assert_digest_cut_without_notes(&url, &mut spend).await;
         assert!(requests.recv_timeout(Duration::from_millis(300)).is_err(), "the refused request is never sent");
         assert_eq!(spend.tokens, 0);
+    }
+
+    /// A turn cancelled while its notes were asked for makes no cut it was
+    /// not forced to; the cancel is the human's, so no skip is reported.
+    #[tokio::test]
+    async fn a_cancelled_turn_without_notes_leaves_the_history_whole() {
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        fixture.cancelled.cancel();
+        let mut messages = session(60, 2_000);
+        let original: Vec<String> = messages.iter().map(wire).collect();
+        assert_eq!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await, 0);
+        assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original, "the history is whole");
+        assert!(!fixture.committed() && fixture.skipped().is_empty());
+    }
+
+    /// A reply the limit cut before any text is asked for once more at twice
+    /// the limit: notes that then arrive are the cut's, and a second such
+    /// reply leaves the digest.
+    #[tokio::test]
+    async fn a_reply_the_limit_cut_before_any_text_is_asked_again_at_twice_the_limit() {
+        let thought = stream(&[serde_json::json!({ "choices": [{ "delta": { "reasoning_content": "State: half a thought" }, "finish_reason": "length" }] })]);
+        let (url, requests) = serve_in_order(vec![thought.clone(), reply("State: halfway.", false)]);
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
+        let limits: Vec<Value> = requests.try_iter().map(|b| b["max_tokens"].clone()).collect();
+        assert_eq!(limits, [512, 1024]);
+
+        let (url, requests) = serve_in_order(vec![thought.clone(), thought.clone(), reply("State: halfway.", false)]);
+        assert_digest_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
+        assert_eq!(requests.try_iter().count(), 2, "asked again once, not twice");
+    }
+
+    /// A route that refuses tool_choice is asked again without it.
+    #[tokio::test]
+    async fn a_route_that_refuses_tool_choice_is_asked_without_it() {
+        let refusal = r#"{"error":{"message":"tool_choice none is not supported"}}"#;
+        let refused = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}", refusal.len());
+        let (url, requests) = serve_in_order(vec![refused, reply("State: halfway.", false)]);
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
+        assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
+        let choices: Vec<Value> = requests.try_iter().map(|b| b["tool_choice"].clone()).collect();
+        assert_eq!(choices, ["none", "auto"]);
     }
 
     /// The notes request is admitted in real tokens by the session's learned
@@ -2265,13 +2346,11 @@ pub(crate) mod tests {
         let (url, _requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
         let fixture = Fixture::new(&url);
         let mut messages = session(60, 2_000);
-        let original: Vec<String> = messages.iter().map(wire).collect();
         assert!(sessions::save_messages(&fixture.core, &fixture.id, &messages, &mut 0, true));
         let mut spend = RequestSpend::new(Some(estimated * 3 / 2));
         let ctx = CompactionCtx { factor: 2.0, ..fixture.ctx() };
-        assert_eq!(compact_messages(&ctx, &mut messages, 20_000, 100_000, 0, false, &mut spend).await.unwrap(), 0);
-        assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original, "the history is whole");
-        assert!(!fixture.committed(), "nothing of a cut was committed");
+        assert!(compact_messages(&ctx, &mut messages, 20_000, 100_000, 0, false, &mut spend).await.unwrap() > 0, "the cut lands on the digest");
+        assert!(!messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary:"));
         assert_eq!(spend.tokens, 0, "the refused request is never sent, so nothing is charged");
     }
 
@@ -2403,8 +2482,7 @@ pub(crate) mod tests {
         assert!(note.contains("Summary: State: wired the parser.\nOpen: the CLI flag. "), "{note}");
     }
 
-    /// Notes the reply limit cut are kept and say they were cut. Reasoning
-    /// with no text under a cut is not taken as notes.
+    /// Notes the reply limit cut are kept and say they were cut.
     #[tokio::test]
     async fn notes_the_reply_limit_cut_say_so() {
         let (url, _requests) = crate::client::tests::spawn_recording_once(stream(&[
@@ -2416,11 +2494,6 @@ pub(crate) mod tests {
         let note = messages[pinned_head(&messages)].content.clone().unwrap();
         assert!(note.contains(&format!("Summary: State: wired the par{NOTES_CUT_MARK} ")), "{note}");
 
-        let (url, requests) = crate::client::tests::spawn_recording_once(stream(&[
-            serde_json::json!({ "choices": [{ "delta": { "reasoning_content": "State: half a thought" }, "finish_reason": "length" }] }),
-        ]));
-        assert_no_cut_without_notes(&url, &mut RequestSpend::new(None), "the notes reply had no text (finish_reason length)").await;
-        drop(requests);
     }
     /// The bug this guards: an instruction the user gave in a later turn
     /// lived only in the conversation, and a cut kept it only as far as the

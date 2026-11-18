@@ -310,7 +310,7 @@ fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], li
         stream: true,
         stream_options: client.send_stream_options.then_some(StreamOptions { include_usage: true }),
         tools,
-        tool_choice: include_tools.then_some("auto"),
+        tool_choice: include_tools.then_some(if client.notes_only.load(std::sync::atomic::Ordering::Relaxed) { "none" } else { "auto" }),
     };
     serde_json::to_vec(&req).map_err(|e| format!("failed to serialize chat request: {e}"))
 }
@@ -449,6 +449,8 @@ pub struct ChatClient {
     /// The prompt cache key of the conversation this client serves (see
     /// `for_conversation`).
     cache_key: Option<String>,
+    /// Set while the notes request goes out: tool_choice "none" beside the same tools, so a reply is notes, not a call.
+    pub(crate) notes_only: std::sync::atomic::AtomicBool,
     http: reqwest::Client,
 }
 
@@ -590,7 +592,7 @@ impl ChatClient {
             prefer_reasoning_details: false,
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
-            cache_key: None,
+            cache_key: None, notes_only: Default::default(),
             http,
         }
     }
