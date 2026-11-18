@@ -64,12 +64,12 @@ impl Image {
         format!("data:{};base64,{}", self.mime, self.data)
     }
 
-    /// What the image costs its model in context: a token per 750 pixels,
-    /// each side counted up to the 2,000 a model is sent at most; 1,600 for
-    /// one stored without a size.
+    /// What the image costs its model in context: a token per 750 pixels of
+    /// the size it is sent at, which nothing here shrinks, so a provider that
+    /// scales it down costs less than this, never more; 1,600 for one stored
+    /// without a size.
     pub fn tokens(&self) -> usize {
-        let side = |s: u32| s.min(2_000) as usize;
-        if self.width == 0 || self.height == 0 { 1_600 } else { (side(self.width) * side(self.height)).div_ceil(750) }
+        if self.width == 0 || self.height == 0 { 1_600 } else { (self.width as usize * self.height as usize).div_ceil(750) }
     }
 }
 
@@ -399,16 +399,16 @@ mod tests {
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
     /// is added without an assertion below.
-    /// An image is estimated from the size it is delivered at, each side
-    /// counted up to 2,000, and one stored without a size at the flat 1,600.
+    /// An image is estimated from the size its header gives, however large,
+    /// and one stored without a size at the flat 1,600.
     #[test]
     fn an_images_estimate_follows_its_dimensions() {
         let image = |width, height| Image { mime: "image/png".into(), data: "AAAA".into(), width, height };
         assert_eq!(image(100, 75).tokens(), 10);
         assert_eq!(image(1_000, 750).tokens(), 1_000);
         assert_eq!(image(2_000, 2_000).tokens(), 5_334);
-        assert_eq!(image(8_000, 2_000).tokens(), 5_334, "each side clamps to 2,000");
-        assert_eq!(image(8_000, 100).tokens(), image(2_000, 100).tokens());
+        assert_eq!(image(8_000, 2_000).tokens(), 21_334, "no side is clamped: nothing is resized");
+        assert_eq!(image(u32::MAX, u32::MAX).tokens(), (u32::MAX as usize).pow(2).div_ceil(750));
         assert_eq!(image(0, 0).tokens(), 1_600);
         let mut message = ChatMessage::tool("c1", "a.png");
         let text = message.estimated_tokens();

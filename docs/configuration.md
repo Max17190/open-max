@@ -330,8 +330,8 @@ and the run that writes a key already uses it.
   5 MiB of them in all, counted before base64. An image left out (over that
   budget, past the eighth, not an image, or with no size in its header) gets
   a line in the result naming it, its bytes and the reason. Each image counts
-  toward the context estimate as one token per 750 pixels, each side counted
-  up to 2,000. Set it only for a model that takes images: one that does not
+  toward the context estimate as one token per 750 pixels of its header size,
+  which nothing resizes, so a provider that scales it down costs less. Set it only for a model that takes images: one that does not
   refuses the request. Off, no request changes.
 - `max_agent_iterations` (default 300): tool-call rounds one turn may take.
   A turn that reaches it stops and says so; a follow-up message (or
