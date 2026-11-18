@@ -114,7 +114,9 @@ pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &t
         core.send_agent(session_id, AgentEvent::Diff { call_id: call_id.into(), path, diff, added, removed });
     }
     core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: outcome.ok, output: outcome.output.clone(), duration_ms: None });
-    messages.push(ChatMessage::tool(call_id, tool_message_content(outcome)));
+    let mut message = ChatMessage::tool(call_id, tool_message_content(outcome));
+    message.images = Some(outcome.images.clone()).filter(|images| !images.is_empty());
+    messages.push(message);
 }
 
 /// What a call the user cancelled answers, on the wire and to the model.

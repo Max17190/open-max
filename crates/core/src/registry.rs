@@ -2600,7 +2600,7 @@ mutatng = true
         // A session's first note is the full one, and it is the one the cap
         // has to make room for.
         registry.background_noted.store(false, std::sync::atomic::Ordering::Relaxed);
-        let tight = tools::OutputCaps { command_bytes: 1_000 };
+        let tight = tools::OutputCaps { command_bytes: 1_000, images: false };
         let plain = run("tight_plain", tight).await;
         assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
         assert!(!plain.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", plain.output);

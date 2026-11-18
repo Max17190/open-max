@@ -641,7 +641,11 @@ fn render_content(result: &Value) -> Result<String, String> {
             let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
             match field("type") {
                 "text" => field("text").to_string(),
-                media @ ("image" | "audio") => {
+                "image" => match saved_image(field("mimeType"), field("data")) {
+                    Some(path) => format!("[image {}, {} bytes, saved to {path}: read_file it to see it]", field("mimeType"), base64_len(field("data"))),
+                    None => format!("[image {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
+                },
+                media @ "audio" => {
                     format!("[{media} {}, {} bytes]", field("mimeType"), base64_len(field("data")))
                 }
                 "resource" => {
@@ -663,6 +667,18 @@ fn render_content(result: &Value) -> Result<String, String> {
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// An image result written to a file read_file can show the model (with
+/// `image_input` on), named by a hash of its bytes so a repeat reuses it.
+fn saved_image(mime: &str, data: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim_end()).ok()?;
+    let ext = mime.strip_prefix("image/").filter(|ext| ext.chars().all(|c| c.is_ascii_alphanumeric()))?;
+    let name = format!("openmax-mcp-{}.{ext}", &open_max_core::ledger::sha256_hex(&bytes)[..16]);
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, bytes).ok()?;
+    Some(path.display().to_string())
 }
 
 /// The decoded size of base64 text, without decoding it.
@@ -815,7 +831,8 @@ mod tests {
         ]});
         assert_eq!(
             render_content(&result).unwrap(),
-            "one\n[image image/png, 5 bytes]\n[resource file:///a.txt]\nbody\n[resource link file:///b b]"
+            format!("one\n[image image/png, 5 bytes, saved to {}: read_file it to see it]\n[resource file:///a.txt]\nbody\n[resource link file:///b b]",
+                std::env::temp_dir().join(format!("openmax-mcp-{}.png", &open_max_core::ledger::sha256_hex(b"hello")[..16])).display())
         );
         assert_eq!(render_content(&json!({"content": [], "structuredContent": {"n": 1}})).unwrap(), r#"{"n":1}"#);
         assert_eq!(render_content(&json!({})).unwrap(), "");

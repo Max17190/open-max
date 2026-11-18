@@ -24,7 +24,9 @@ pub(super) fn serialize(client: &ChatClient, messages: &[ChatMessage], limit: us
             }
         }
         if m.role == "tool" {
-            input.push(json!({"type":"function_call_output","call_id":m.tool_call_id,"output":content}));
+            let images = m.images.iter().flatten().map(|image| json!({"type":"input_image","image_url":image.data_url()}));
+            let output = if m.images.is_some() { Value::Array(std::iter::once(json!({"type":"input_text","text":content})).chain(images).collect()) } else { json!(content) };
+            input.push(json!({"type":"function_call_output","call_id":m.tool_call_id,"output":output}));
         } else if !content.is_empty() {
             input.push(json!({"role":if m.role == "system" { "developer" } else { &m.role },"content":content}));
         }

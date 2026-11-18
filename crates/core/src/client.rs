@@ -183,7 +183,7 @@ impl Serialize for WireMessages<'_> {
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             WireMessage {
                 role: &m.role,
-                content: wire_text(m).map(|text| WireContent { text, mark: text_mark }),
+                content: wire_text(m).map(|text| WireContent { text, mark: text_mark, images: m.images.as_deref().unwrap_or_default() }),
                 tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
                 tool_call_id: m.tool_call_id.as_deref(),
                 reasoning_content: m.reasoning_content.as_deref().filter(|_| plain),
@@ -239,11 +239,16 @@ struct WireMessage<'a> {
 struct WireContent<'a> {
     text: &'a str,
     mark: bool,
+    images: &'a [crate::types::Image],
 }
 
 impl Serialize for WireContent<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.mark && !self.text.is_empty() {
+        if !self.images.is_empty() {
+            let text = serde_json::json!({"type": "text", "text": self.text});
+            let images = self.images.iter().map(|image| serde_json::json!({"type": "image_url", "image_url": {"url": image.data_url()}}));
+            serializer.collect_seq(std::iter::once(text).chain(images))
+        } else if self.mark && !self.text.is_empty() {
             serializer.collect_seq([serde_json::json!({"type": "text", "text": self.text, "cache_control": {"type": "ephemeral"}})])
         } else {
             serializer.serialize_str(self.text)
@@ -3925,6 +3930,34 @@ pub(crate) mod tests {
         assert!(!quota_exhausted(r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#));
         assert!(!quota_exhausted("insufficient_quota"));
         assert!(!quota_exhausted(""));
+    }
+
+    /// A tool result's images go out as image parts beside its text on each
+    /// wire; a result without images keeps its plain string content.
+    #[test]
+    fn a_tool_result_carries_its_images_on_every_wire() {
+        let call = ToolCall { id: "c1".into(), kind: "function".into(), function: crate::types::ToolCallFunction { name: "read_file".into(), arguments: "{}".into() }, extra_content: None };
+        let mut shown = ChatMessage::tool("c1", "a.png: image/png, 3 bytes, shown to you as an image");
+        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into() }]);
+        let messages = vec![ChatMessage::user("look"), ChatMessage::assistant(None, Some(vec![call])), shown, ChatMessage::tool("c2", "plain")];
+        let tools = "[]";
+        let chat: Value = serde_json::from_slice(&serialize_chat_request_body(&chat_client("m", None, 64, false, true), &messages, 64, tools).unwrap()).unwrap();
+        assert_eq!(chat["messages"][2]["content"], json!([
+            {"type": "text", "text": "a.png: image/png, 3 bytes, shown to you as an image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]));
+        assert_eq!(chat["messages"][3]["content"], "plain");
+        let mut client = chat_client("m", None, 64, false, true);
+        client.wire_api = crate::providers::WireApi::Responses;
+        let responses: Value = serde_json::from_slice(&responses::serialize(&client, &messages, 64, tools).unwrap()).unwrap();
+        let outputs: Vec<&Value> = responses["input"].as_array().unwrap().iter().filter(|i| i["type"] == "function_call_output").collect();
+        assert_eq!(outputs[0]["output"][1], json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA"}));
+        assert_eq!(outputs[1]["output"], "plain");
+        client.wire_api = crate::providers::WireApi::Anthropic;
+        let native: Value = serde_json::from_slice(&anthropic::serialize(&client, &messages, 64, tools).unwrap()).unwrap();
+        let results: Vec<&Value> = native["messages"].as_array().unwrap().iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|b| b["type"] == "tool_result").collect();
+        assert_eq!(results[0]["content"][1], json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}));
+        assert_eq!(results[1]["content"], "plain");
     }
 
     #[test]

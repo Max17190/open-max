@@ -20,6 +20,7 @@ name = "openmax"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 open-max-core = { path = "../core" }
 # Only the crossterm backend. The defaults add the calendar widget (and the
 # `time` crate family behind it), ratatui-macros and a layout cache, none of

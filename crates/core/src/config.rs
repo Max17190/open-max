@@ -116,6 +116,10 @@ pub struct Settings {
     /// Byte cap for bash/external tool output before truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
+    /// read_file shows an image file (PNG, JPEG, GIF, WebP, up to 5 MiB) to
+    /// the model as an image. For models that take images; off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_input: bool,
     /// Global compaction ceiling for transcript plus frozen tool schemas.
     /// Unset uses the active model's ceiling or the built-in default.
     /// The ceiling is floored at 20,000 tokens, capped by the window budget,
@@ -182,6 +186,7 @@ impl Default for Settings {
             temperature: None,
             reasoning_effort: None,
             max_output_bytes: None,
+            image_input: false,
             compaction_tokens: None,
             compaction_keep_tokens: None,
             max_agent_tokens: None,

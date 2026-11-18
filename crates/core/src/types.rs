@@ -45,6 +45,21 @@ fn function_type() -> String {
     "function".to_string()
 }
 
+/// An image a tool result shows the model (`image_input`): its media type
+/// and its bytes in base64. Each wire sends it as its own image part.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    pub mime: String,
+    pub data: String,
+}
+
+impl Image {
+    /// `data:` URL form, as Chat Completions and Responses take it.
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.data)
+    }
+}
+
 /// A message in the OpenAI chat wire format. `content` is optional because
 /// assistant messages that only carry tool calls have no content.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,6 +109,9 @@ pub struct ChatMessage {
     /// it is never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_tool_output: Option<String>,
+    /// Images a tool result carries, sent beside its text as image parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<Image>>,
 }
 
 impl ChatMessage {
@@ -113,7 +131,7 @@ impl ChatMessage {
     /// Every constructor starts without reasoning: only the agent loop
     /// attaches it, from a reply, together with its origin.
     fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
-        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None }
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None, images: None }
     }
 
     /// Rough size estimate of the stored message, including reasoning.
@@ -139,7 +157,8 @@ impl ChatMessage {
                 }
             }
         }
-        estimate_tokens(chars) + 8
+        // An image costs its model about this many tokens, whatever its bytes.
+        estimate_tokens(chars) + 8 + self.images.as_ref().map_or(0, |images| images.len() * 1_600)
     }
 }
 

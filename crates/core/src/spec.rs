@@ -877,6 +877,9 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   Explicit selections persist unless the endpoint is a launch override.
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
   Unset, it follows the model's window, from 16 KiB to 48 KiB.
+- `image_input` (default false): read_file on a PNG, JPEG, GIF or WebP file
+  of at most 5 MiB returns it to the model as an image part beside a short
+  text line. Set it only for a model that takes images.
 - `compaction_tokens`: optional global ceiling for compaction. Unset uses the
   active model's ceiling, else four fifths of the window; the window budget
   always caps it.

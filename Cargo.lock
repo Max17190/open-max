@@ -902,6 +902,7 @@ dependencies = [
 name = "openmax"
 version = "2026.11.5"
 dependencies = [
+ "base64",
  "crossterm",
  "futures-util",
  "ignore",

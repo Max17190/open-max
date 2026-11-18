@@ -317,6 +317,14 @@ and the run that writes a key already uses it.
   frame starts after it instead of running on from their last byte. A file
   with lone-`\r` line endings printed through bash shows only its last
   record the same way; `tr '\r' '\n' < file` shows every record.
+- `image_input` (default false): `read_file` on a PNG, JPEG, GIF or WebP
+  file of at most 5 MiB returns a one-line description and the image itself,
+  sent as an image part of the tool result on every wire (Chat Completions
+  `image_url`, Responses `input_image`, native Messages `image`). Larger
+  images and other binary files read as before. An MCP tool's image result
+  is saved to a file in the temp directory that the result names, so the
+  model can read it the same way. Set it only for a model that takes images:
+  one that does not refuses the request. Off, no request changes.
 - `max_agent_iterations` (default 300): tool-call rounds one turn may take.
   A turn that reaches it stops and says so; a follow-up message (or
   `openmax --continue -p "<follow-up>"`) carries on from there. Settings are

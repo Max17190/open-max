@@ -68,11 +68,13 @@ const MAX_DIR_ENTRIES: usize = 200;
 #[derive(Clone, Copy)]
 pub struct OutputCaps {
     pub command_bytes: usize,
+    /// read_file shows an image file to the model as an image (`image_input`).
+    pub images: bool,
 }
 
 impl Default for OutputCaps {
     fn default() -> Self {
-        Self { command_bytes: MAX_OUTPUT_BYTES }
+        Self { command_bytes: MAX_OUTPUT_BYTES, images: false }
     }
 }
 
@@ -92,7 +94,7 @@ impl OutputCaps {
             (None, Some(tokens)) => (tokens.saturating_mul(3) / 8).clamp(MAX_OUTPUT_BYTES, MAX_WINDOW_OUTPUT_BYTES),
             (None, None) => MAX_OUTPUT_BYTES,
         };
-        Self { command_bytes }
+        Self { command_bytes, images: settings.image_input }
     }
 
     /// The bytes one read_file call may return: the command cap, held
@@ -129,6 +131,9 @@ pub struct ToolOutcome {
     pub process_bytes: Option<u64>,
     /// True when `output` dropped part of what the process produced.
     pub process_truncated: bool,
+    /// Images the result shows the model beside `output` (read_file on an
+    /// image with `image_input` on).
+    pub images: Vec<crate::types::Image>,
 }
 
 impl ToolOutcome {
@@ -164,6 +169,7 @@ impl ToolOutcome {
                 process.stdout.total_bytes.saturating_add(process.stderr.total_bytes),
             ),
             process_truncated: truncated,
+            images: Vec::new(),
         }
     }
 }
@@ -481,7 +487,7 @@ pub(crate) async fn execute_in_session(
     let task_cancel = cancel.clone();
     let task = tokio::task::spawn_blocking(move || match name.as_str() {
             "list_dir" => list_dir(&root, &args),
-            "read_file" => read_file(&root, &args, caps.read_bytes(), &task_cancel),
+            "read_file" => read_file(&root, &args, caps, &task_cancel),
             "write_file" => write_file(&root, &args),
             "edit_file" => edit_file(&root, &args),
             "glob" => glob_tool(&root, &args),
@@ -549,7 +555,23 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome::ok(output)
 }
 
-fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) -> ToolOutcome {
+/// The media type of an image file from its first bytes, for the formats
+/// image-taking models accept.
+fn image_mime(head: &[u8]) -> Option<&'static str> {
+    match head {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Larger images are read as files, as without `image_input`.
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+fn read_file(root: &Path, args: &Value, caps: OutputCaps, cancel: &CancelToken) -> ToolOutcome {
+    let max_bytes = caps.read_bytes();
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
@@ -580,6 +602,14 @@ fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) 
         }
         Err(e) => return ToolOutcome::err(e.message(rel)),
     };
+    if caps.images && meta.len() <= MAX_IMAGE_BYTES {
+        use base64::Engine;
+        if let Some((mime, bytes)) = std::fs::read(&path).ok().and_then(|b| Some((image_mime(&b)?, b))) {
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let output = format!("{rel}: {mime}, {} bytes, shown to you as an image", bytes.len());
+            return ToolOutcome { ok: true, output, images: vec![crate::types::Image { mime: mime.into(), data }], ..ToolOutcome::default() };
+        }
+    }
     // The cap keeps a whole-file read of a huge file out of memory. A
     // window of one streams instead, and the refusal below tells the model
     // to ask for one: refusing that too would leave it nothing to retry. It
@@ -3077,7 +3107,7 @@ mod tests {
 
     /// read_file in a call nothing cancels.
     fn read_file(root: &Path, args: &Value) -> ToolOutcome {
-        super::read_file(root, args, OutputCaps::default().read_bytes(), &CancelToken::default())
+        super::read_file(root, args, OutputCaps::default(), &CancelToken::default())
     }
 
     /// A bash call in a session of its own, which no result has yet told
@@ -4062,7 +4092,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 &"}),
-            OutputCaps { command_bytes: 1_000 },
+            OutputCaps { command_bytes: 1_000, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4306,7 +4336,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "echo RESULT; for i in $(seq 1 3000); do echo warn-$i >&2; done"}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4337,7 +4367,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4376,7 +4406,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4616,7 +4646,7 @@ mod tests {
         std::fs::write(root.join("big.log"), line.repeat(MAX_FILE_BYTES as usize / line.len() + 1)).unwrap();
         let cancel = CancelToken::default();
         cancel.cancel();
-        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), MAX_READ_BYTES, &cancel);
+        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), OutputCaps::default(), &cancel);
         assert_eq!((out.ok, out.output.as_str()), (false, "tool cancelled by user"));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4645,6 +4675,28 @@ mod tests {
         assert_eq!(next_line(&mut reader, &mut kept, 0).unwrap(), Some(2));
         assert!(kept.is_empty());
         assert_eq!(next_line(&mut reader, &mut kept, 2).unwrap(), None);
+    }
+
+    /// With `image_input` on, read_file returns an image file as an image
+    /// beside one line of text; off, and for text files, nothing changes.
+    #[test]
+    fn read_file_shows_an_image_only_with_image_input() {
+        use base64::Engine;
+        let root = temp_project();
+        let png = [&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A][..], &[7u8; 40]].concat();
+        std::fs::write(root.join("board.png"), &png).unwrap();
+        let on = OutputCaps { images: true, ..OutputCaps::default() };
+        let read = |args: Value, caps| super::read_file(&root, &args, caps, &CancelToken::default());
+        let off = read(json!({"path": "board.png"}), OutputCaps::default());
+        assert_eq!((off.ok, off.output.as_str(), off.images.len()), (false, "board.png is not a UTF-8 text file", 0));
+        let shown = read(json!({"path": "board.png"}), on);
+        assert!(shown.ok, "{}", shown.output);
+        assert_eq!(shown.output, "board.png: image/png, 48 bytes, shown to you as an image");
+        assert_eq!(shown.images.len(), 1);
+        assert_eq!(shown.images[0].mime, "image/png");
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&shown.images[0].data).unwrap(), png);
+        let text = read(json!({"path": "src/a.rs"}), on);
+        assert_eq!((text.output, text.images.len()), (read(json!({"path": "src/a.rs"}), OutputCaps::default()).output, 0));
     }
 
     /// read_file discarded the read error and called every failure "not a
@@ -5446,7 +5498,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_over_the_cap_is_a_quarter_cap_preview_of_its_log() {
         let root = temp_project();
-        let caps = OutputCaps { command_bytes: 4_000 };
+        let caps = OutputCaps { command_bytes: 4_000, images: false };
         let data = root.join("data");
         let fill = json!({"command": "head -c 4000 /dev/zero | tr '\\0' a"});
         let fits = bash_tool(&data, &root, &fill, caps, Arc::new(CancelToken::default())).await;
