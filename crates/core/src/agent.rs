@@ -974,7 +974,7 @@ async fn run_loop(
             // limit alone never ends a turn while it can grow; past a spent room, to the first doubling above it, but a cut thought plainly.
             let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
             cuts += usize::from(capped);
-            let up = (raise + 1..raise + 32).find(|&r| endpoint.raised_limit(next, r) > endpoint.raised_limit(next, raise).max(if kind == crate::notes::CutKind::Thought { 0 } else { floor })).filter(|_| capped && cuts > 1 && !no_room);
+            let up = (raise + 1..raise + 32).find(|&r| endpoint.raised_limit(next, r) > endpoint.raised_limit(next, raise).max(if kind == crate::notes::CutKind::Thought { 0 } else { floor })).filter(|_| capped && (cuts > 1 || floor > 0 && kind != crate::notes::CutKind::Thought) && !no_room);
             if let Some(up) = up { raise = up } else if capped && cuts > 1 { stalled += 1 }
             if capped && stalled < MAX_CUT_CONTINUATIONS && iteration + 1 < max_iterations {
                 let at = guard.messages().len();
@@ -5292,6 +5292,15 @@ mod tests {
         assert_eq!((stop.as_str(), sent.as_slice()), ("length", &[4096u64, 16384, 4096, 4096, 4096][..]));
         assert_eq!(said.iter().filter(|n| n.contains("may be up to 16384 tokens")).count(), 1, "the room is offered once: {said:#?}");
         assert_eq!(said.iter().filter(|n| n.contains("Send large content in parts")).count(), 4, "{said:#?}");
+        // A streamed call cut, then nothing arriving at its room: the first doubling above the room, at once.
+        const LOST: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4095,\"completion_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":4196}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
+        let (stop, sent, said) = cut_recovery_turn(&[&cut, LOST, &whole, STOP_SSE], Some(393_216)).await;
+        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[4096u64, 16384, 32768, 4096][..]), "{said:#?}");
     }
 
     /// The bug this guards: a reply the output cap cut before any call ran
