@@ -263,6 +263,7 @@ fn conversation_layout(
 
 pub struct Args {
     pub continue_session: bool,
+    pub session: Option<String>, // `--session`: resumed instead of the latest
     /// Notified when a signal asks the session to end. The loop treats it
     /// as /quit, so the normal exit path restores the terminal. The signal
     /// watcher holds it weakly: once the loop drops it, a signal exits at
@@ -807,7 +808,8 @@ impl App {
         }
         if args.continue_session {
             let project = self.project.display().to_string();
-            match sessions::latest(&self.core, &project) {
+            let named = args.session.as_ref().map(|id| sessions::meta(&self.core, id).filter(|m| m.project == project).ok_or(format!("no session {id} in this directory")));
+            match named.map_or_else(|| sessions::latest(&self.core, &project), |m| m.map(Some)) {
                 Ok(Some(meta)) => {
                     self.session_id = Some(meta.id.clone());
                     self.replay(&meta.id);
@@ -4675,7 +4677,7 @@ mod tests {
         // A resumed session was not this app's to create, so it stays even
         // though nothing was ever saved to it.
         let resumed = open_max_core::sessions::create(&core, key.clone()).unwrap().id;
-        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        app.startup(&super::Args { continue_session: true, session: None, quit: Default::default() }).await;
         assert_eq!(app.session_id.as_deref(), Some(resumed.as_str()));
         app.handle_submit("/new".into()).await.unwrap();
         assert_eq!(ids(&core), vec![resumed.clone()], "a resumed session was discarded");
@@ -5739,7 +5741,7 @@ mod tests {
         let index = damage_session_index(&dir);
         let path = index.display().to_string();
 
-        app.startup(&super::Args { continue_session: true, quit: Default::default() }).await;
+        app.startup(&super::Args { continue_session: true, session: None, quit: Default::default() }).await;
         let continued = app.transcript.export_text();
         assert!(
             continued.contains(&path)

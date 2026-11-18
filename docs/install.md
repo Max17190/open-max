@@ -76,7 +76,7 @@ Or run it in place with `cargo run --release -p openmax`.
 
 In a session, type `/update`. When a newer release exists, the session ends,
 the update runs on your terminal, and the new version starts again on the
-same session, as `openmax --continue` would. If the update fails, it prints
+same session, as `openmax --session <id>` would. If the update fails, it prints
 the command that resumes. From a shell, run `openmax --update` instead.
 
 Both run the update command for how you installed: `brew upgrade openmax`,

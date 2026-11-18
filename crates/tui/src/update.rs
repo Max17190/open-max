@@ -133,14 +133,12 @@ pub fn status() -> String {
     }
 }
 
-const NOT_INSTALLED: &str = "this binary was not installed by Homebrew, npm, bun or the install script, so it cannot update itself; \
-    see https://github.com/Max17190/open-max/blob/main/docs/install.md";
+const NOT_INSTALLED: &str = "this binary was not installed by Homebrew, npm, bun or the install script, so it cannot update itself; see https://github.com/Max17190/open-max/blob/main/docs/install.md";
 
 /// The session `/update` leaves: Some once asked for, holding its id if any.
 static REQUESTED: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
-/// Whether `/update` should leave the session: an install it can update, and
-/// a newer release or a failed check (the package manager then decides).
+/// Whether `/update` should leave the session: an updatable install, and a newer release or a failed check.
 pub async fn prepare() -> Result<(), String> {
     Install::current().command().ok_or(NOT_INSTALLED)?;
     match fetch_latest(RELEASES_URL).await {
@@ -153,40 +151,40 @@ pub fn request(session: Option<String>) { *REQUESTED.lock().unwrap_or_else(|e| e
 
 /// Run this install's update command on the restored terminal; Ok when it succeeded.
 fn install(data_dir: &Path) -> Result<(), i32> {
-    let command = Install::current().command().ok_or_else(|| { eprintln!("openmax: {NOT_INSTALLED}"); 1 })?;
+    let install = Install::current();
+    let command = install.command().ok_or_else(|| { eprintln!("openmax: {NOT_INSTALLED}"); 1 })?;
     // A failed download must fail the update, not feed `sh` an empty script.
     let run = command.replacen(SCRIPT, r#"s=$(curl -fsSL https://useopenmax.dev/install.sh) && printf '%s\n' "$s" |"#, 1);
     Cache { checked_at: now(), latest: None }.write(data_dir);
     println!("$ {command}");
-    // The first install already put the directory on PATH.
-    match std::process::Command::new("sh").args(["-c", &run]).env("OPENMAX_NO_MODIFY_PATH", "1").status() {
+    // The first install already put the directory on PATH; an exported OPENMAX_INSTALL_DIR must not redirect it.
+    let mut sh = std::process::Command::new("sh");
+    if let Install::Script { dir, .. } = install { sh.env("OPENMAX_INSTALL_DIR", dir); }
+    match sh.args(["-c", &run]).env("OPENMAX_NO_MODIFY_PATH", "1").status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => { eprintln!("openmax: `{command}` failed ({status})"); Err(status.code().unwrap_or(1)) }
         Err(e) => { eprintln!("openmax: could not run `{command}`: {e}"); Err(1) }
     }
 }
 
-/// After a session `/update` ended, once its terminal is restored: update,
-/// then replace this process with the new binary resuming that session.
-/// None when no `/update` was asked for; else the exit code of a failure.
+/// After `/update` ended the session: update, then exec the new binary on it; Some(exit code) of a failure.
 pub fn relaunch(core: &open_max_core::state::Core) -> Option<i32> {
     let session = REQUESTED.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     // A session discarded on exit for being empty has nothing to resume.
     let resume = session.filter(|id| open_max_core::sessions::meta(core, id).is_some());
-    let hint = if resume.is_some() { "openmax --continue" } else { "openmax" };
+    let hint = resume.as_ref().map_or("openmax".into(), |id| format!("openmax --session {id}"));
     if let Err(code) = install(&core.data_dir) {
         eprintln!("openmax: continue with `{hint}`");
         return Some(code);
     }
     // The name it was started by, so a PATH lookup finds the new version.
     let program = std::env::args_os().next().unwrap_or_else(|| "openmax".into());
-    let error = std::os::unix::process::CommandExt::exec(std::process::Command::new(program).args(resume.map(|_| "--continue")));
+    let error = std::os::unix::process::CommandExt::exec(std::process::Command::new(program).args(resume.map(|id| ["--session".into(), id]).into_iter().flatten()));
     eprintln!("openmax: updated, but could not start it again ({error}); continue with `{hint}`");
     Some(1)
 }
 
-/// `openmax --update`: run this install's update command when a newer
-/// release exists, or when the check fails (the package manager decides).
+/// `openmax --update`: update when a newer release exists or the check fails (the package manager decides).
 pub async fn run(data_dir: &Path) -> i32 {
     if Install::current().command().is_none() {
         eprintln!("openmax: {NOT_INSTALLED}");

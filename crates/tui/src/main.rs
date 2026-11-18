@@ -34,8 +34,8 @@ options:
                          login, logout, status, or models for ChatGPT plan use
       --account <label>  saved ChatGPT account (default: main)
   -c, --continue         resume the latest session in this directory
-      --session <id>     with -p or --stdio, continue that session of this
-                         directory instead of the latest (implies --continue)
+      --session <id>     continue that session of this directory instead of
+                         the latest (implies --continue)
       --base-url <url>   the model server's API root (settings key base_url)
   -m, --model <id>       the model id it expects (settings key model)
       --api-key <key>    its key, a literal or '$ENV_VAR' naming a set variable
@@ -548,7 +548,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
-        (session.is_some(), "--session", &[Some("--stdio"), Some("--print")]),
+        (session.is_some(), "--session", SESSIONS),
         (model.is_some(), "--model", RUNS),
         (reasoning_effort.is_some(), "--effort", RUNS),
         (provider.is_some(), "--provider", RUNS),
@@ -890,7 +890,7 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let granted = granted.into_iter().chain(notes).reduce(|lines, line| format!("{lines}\n{line}"));
     start_input();
     let runtime = runtime(granted.as_deref(), None);
-    let args = app::Args { continue_session: cli.continue_session, quit: quit.clone() };
+    let args = app::Args { continue_session: cli.continue_session, session: cli.session, quit: quit.clone() };
     let (result, warnings) = runtime.block_on(app::run(terminal, core.clone(), core_rx, args));
     restore_terminal();
     runtime.block_on(open_max_core::chatgpt::finish_refreshes());
@@ -1596,7 +1596,7 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         terminal,
         core,
         core_rx,
-        app::Args { continue_session: cli.continue_session, quit: quit.clone() },
+        app::Args { continue_session: cli.continue_session, session: cli.session, quit: quit.clone() },
     )
     .await;
     restore_terminal();
