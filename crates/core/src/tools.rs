@@ -2262,8 +2262,9 @@ struct BashDeadline {
     requested: Option<u64>,
 }
 
+/// `timeout`, which models often write, is `timeout_secs` (the schema's name); with both, the longer counts.
 fn bash_deadline(args: &Value) -> BashDeadline {
-    match arg(args, "timeout_secs", Value::as_u64) {
+    match arg(args, "timeout_secs", Value::as_u64).max(arg(args, "timeout", Value::as_u64)) {
         None => BashDeadline { secs: BASH_DEFAULT_TIMEOUT_SECS, requested: None },
         Some(asked) if asked > BASH_MAX_TIMEOUT_SECS => {
             BashDeadline { secs: BASH_MAX_TIMEOUT_SECS, requested: Some(asked) }
@@ -2359,17 +2360,17 @@ pub(crate) fn exited_outcome(
     cap: usize,
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
-    let note = output.background_terminated.then(|| {
-        match background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            false => BACKGROUND_TERMINATED_NOTE,
-            true => BACKGROUND_TERMINATED_AGAIN,
-        }
+    let named = |n: &[String]| if n.len() > 8 { format!("{} and {} more", n[..8].join(", "), n.len() - 8) } else { n.join(", ") };
+    let note = output.left_running.as_ref().map(|left| match left.detached.is_empty() {
+        false => format!("[openmax: when this command returned, the processes it left in its process group were stopped: {}. Processes they started outside the group are still running: {}.]", named(&left.stopped), named(&left.detached)),
+        true if background_noted.swap(true, std::sync::atomic::Ordering::Relaxed) => BACKGROUND_TERMINATED_AGAIN.to_string(),
+        true => BACKGROUND_TERMINATED_NOTE.to_string(),
     });
     // The note is the harness speaking, not captured output, but it
     // still has to fit the caller's cap, which `max_output_bytes`
     // can set as low as 1000 bytes. Reserve its length instead of
     // letting a fixed annotation push the result past the limit.
-    let reserved = note.map_or(0, |note| note.len() + 1);
+    let reserved = note.as_ref().map_or(0, |note| note.len() + 1);
     let budget = cap.saturating_sub(reserved).max(1);
     let (text, truncated) = render_process_output(output, budget);
     let (ok, text) = match status.success() {
@@ -3681,7 +3682,7 @@ mod tests {
             log_truncated,
             // This helper builds outputs for rendering tests; none of them
             // background anything.
-            background_terminated: false,
+            left_running: None,
         }
     }
 
@@ -3920,6 +3921,24 @@ mod tests {
         );
     }
 
+    /// `timeout` is the same wait as `timeout_secs`, in seconds and under the
+    /// same ceiling, and a call that names both waits the longer of the two.
+    #[test]
+    fn a_wait_named_timeout_is_read_as_timeout_secs() {
+        let deadline = |args: Value| {
+            let d = bash_deadline(&args);
+            (d.secs, d.requested)
+        };
+        assert_eq!(deadline(json!({"timeout": 300})), (300, None));
+        assert_eq!(deadline(json!({"timeout": "300"})), (300, None), "a quoted number reads as timeout_secs does");
+        assert_eq!(deadline(json!({"timeout": 0})), (1, None));
+        let asked = BASH_MAX_TIMEOUT_SECS + 300;
+        assert_eq!(deadline(json!({"timeout": asked})), (BASH_MAX_TIMEOUT_SECS, Some(asked)));
+        assert_eq!(deadline(json!({"timeout_secs": 30, "timeout": 300})), (300, None));
+        assert_eq!(deadline(json!({"timeout_secs": 300, "timeout": 30})), (300, None));
+        assert_eq!(deadline(json!({"timeout": "soon"})), (BASH_DEFAULT_TIMEOUT_SECS, None));
+    }
+
     /// A segfault or an OOM kill has no exit code; reporting "exit code -1"
     /// pointed diagnosis at a code nothing returned. The signal is the fact.
     #[cfg(unix)]
@@ -4092,7 +4111,7 @@ mod tests {
             let body = "x".repeat(len);
             let mut output =
                 rendered_output(stream(len as u64, b"", body.as_bytes()), stream(0, b"", b""), None, false);
-            output.background_terminated = true;
+            output.left_running = Some(execution::LeftRunning::default());
             let Termination::Exited(status) = &output.termination else { unreachable!() };
             exited_outcome(&output, status, cap, &AtomicBool::new(noted))
         };

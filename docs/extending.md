@@ -622,7 +622,7 @@ request after the read.
 The frozen prefix of every request is the system prompt (messages[0]) and the
 `tools` array, and both are byte-identical for the whole session, a resume
 included. Both are built when the session is created: the prompt from the base
-rules, `AGENTS.md` (capped at 2000 bytes), the memory index, the layout map,
+rules, `AGENTS.md` (capped by `agents_md_bytes`, 2,000 to 20,000 bytes by window), the memory index, the layout map,
 and the skills index as they stand then, and the array from the built-ins
 (the `bash` schema carries the extension pointer) and the tool files that
 load then. The prompt is persisted

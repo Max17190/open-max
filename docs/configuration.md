@@ -45,6 +45,14 @@ compaction summary do not. It is guidance only: it never ends a turn and
 changes no limit, and its notes ride the history, so the system prompt and
 tools are the same bytes with or without it.
 
+`agents_md_bytes` is how much of the project's `AGENTS.md` a new session's
+prompt carries. Unset, it scales with the context window: 2% of it at 4 bytes
+a token, at least 2,000 bytes and at most 20,000, so a 16k window carries
+2,000 and a window of 256k tokens or more carries 20,000. A longer file is
+cut at the end of a line, an open code block is closed, and a closing line
+gives the bytes shown against the total and names the headings of the
+sections left out, so the model knows what to read.
+
 A missing settings file means defaults, and the default `base_url` and `model`
 are empty: endpoint resolution fails until `base_url`, `model` and
 `context_tokens` are set, here or through a named provider, and one error
@@ -376,8 +384,9 @@ no text that ended on its own and made no call gives its reasoning as the
 notes, since some models write them there. Notes over the cap end at their
 last whole line, and notes the reply limit cut end with a line that says so.
 A call in that reply never runs, and nothing else of the exchange is kept.
-When no notes come back (an error, an empty reply, a timeout, or a request
-`max_agent_tokens` refuses), automatic compaction makes no cut until the
+The notes request has no overall deadline, as no request does: only a
+connection that falls silent ends it. When no notes come back (an error, an
+empty reply, a silent connection, or a request `max_agent_tokens` refuses), automatic compaction makes no cut until the
 window forces one, and does not ask again in that turn before then. A cut the
 window forces, or a `/compact`, is made without notes when none come back,
 and its note lists the tools used, the files touched and the earlier goals

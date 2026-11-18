@@ -1700,8 +1700,8 @@ fn stdio_handshake_speaks_the_contract() {
     reader.read_line(&mut hello).unwrap();
     let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["proto"], "openmax-stdio/11");
-    assert_eq!(hello["protocol_version"], 11);
+    assert_eq!(hello["proto"], "openmax-stdio/12");
+    assert_eq!(hello["protocol_version"], 12);
     assert!(hello["session_id"].is_string());
 
     writeln!(stdin, r#"{{"cmd":"quit"}}"#).unwrap();
@@ -2612,6 +2612,22 @@ fn stdio_lines(project: &Path, home: &Path, args: &[&str], commands: &[&str]) ->
     stdout.lines().map(|line| line.replace(id, "S")).collect()
 }
 
+/// `lines` with each `"duration_ms":<n>` written as `"duration_ms":0`.
+fn mask_durations(lines: &[String]) -> Vec<String> {
+    const KEY: &str = "\"duration_ms\":";
+    lines
+        .iter()
+        .map(|line| match line.find(KEY) {
+            Some(at) => {
+                let digits = at + KEY.len();
+                let end = line[digits..].find(|c: char| !c.is_ascii_digit()).map_or(line.len(), |n| digits + n);
+                format!("{}0{}", &line[..digits], &line[end..])
+            }
+            None => line.clone(),
+        })
+        .collect()
+}
+
 /// `--stdio` and `--print --json` render one event stream, and
 /// docs/stdio-protocol.md gives every event line as `session_id`, then
 /// `type`, then the fields in declaration order. So one turn is framed in
@@ -2647,11 +2663,14 @@ fn stdio_frames_a_turn_in_the_bytes_print_json_prints() {
     assert_eq!(
         framed[0],
         format!(
-            r#"{{"type":"hello","proto":"openmax-stdio/11","protocol_version":11,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
+            r#"{{"type":"hello","proto":"openmax-stdio/12","protocol_version":12,"session_id":"S","version":"{}","project":{},"continued":false}}"#,
             env!("CARGO_PKG_VERSION"),
             hello["project"],
         )
     );
+    // A tool_end carries the call's wall time, which differs between the two
+    // runs, so it is masked; its place among the fields is still compared.
+    let (framed, printed) = (mask_durations(&framed), mask_durations(&printed));
     assert_eq!(framed[1..], printed[..], "stdio and print mode framed one turn differently");
 
     let resumed = stdio_lines(&project, &home, &["--continue", "--stdio"], &[]);
@@ -6438,4 +6457,192 @@ fn a_pkill_on_a_word_of_the_prompt_does_not_stop_the_run() {
     assert!(sent.to_string().contains("om-prompt-word-7c1"), "the prompt still reaches the model: {sent}");
     assert!(requests[1].contains("survived"), "the command finished: {}", requests[1]);
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// The tool_end outputs of a `--json` run, in order.
+fn tool_end_outputs(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["type"] == "tool_end")
+        .map(|l| l["output"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Each tool result on the wire carries how long the call took, and nothing
+/// of it reaches the model: the request after the call is the one a run
+/// without the field would send.
+#[test]
+fn a_tool_end_carries_its_duration_and_no_request_sees_it() {
+    let (project, home) = fresh_dirs("tool-duration");
+    let (base_url, requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": "sleep 1.2; echo slept" })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "run the step"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let ends: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["type"] == "tool_end")
+        .collect();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    let ms = ends[0]["duration_ms"].as_u64().expect("a started call's end carries its duration");
+    assert!((1_000..60_000).contains(&ms), "the call slept 1.2 s: {ms} ms");
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "{requests:#?}");
+    assert!(requests[1].contains("slept"), "the result reached the model: {}", requests[1]);
+    assert!(requests.iter().all(|r| !r.contains("duration_ms")), "no request carries the duration: {requests:#?}");
+}
+
+/// A bash call that names its wait `timeout` gets that wait, as one naming
+/// it `timeout_secs` does. Models often write `timeout`, and the tool dropped
+/// it: a 600 second build ran under the 120 second default and was stopped.
+/// A one second wait on a five second command shows the key is read: with
+/// the key dropped the command ran to its end.
+#[test]
+fn a_wait_named_timeout_is_the_calls_wait() {
+    let (project, home) = fresh_dirs("timeout-alias");
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": "sleep 5; echo finished", "timeout": 1 })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "run the slow step"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let ends = tool_end_outputs(&out.stdout);
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert!(ends[0].starts_with("command timed out after 1s;"), "the call ran under its own wait: {ends:?}");
+    assert!(!ends[0].contains("finished"), "{ends:?}");
+}
+
+/// Whether `pid` runs: it exists and has not exited. An orphan that exited
+/// can stay listed until an init that reaps it does, so a signal probe alone
+/// would count it.
+#[cfg(target_os = "linux")]
+fn runs(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().to_string()))
+        .is_some_and(|rest| !rest.starts_with('Z'))
+}
+
+/// Kills the recorded pids when dropped, so a failing test leaves none of
+/// its long sleeps running.
+#[cfg(target_os = "linux")]
+struct KillOnDrop(Vec<PathBuf>);
+
+#[cfg(target_os = "linux")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            if let Ok(pid) = std::fs::read_to_string(file).unwrap_or_default().trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// A job started with `cd dir && setsid job &` leaves the call's process
+/// group and keeps running. The subshell that ran the list stays in the
+/// group, waiting on the job, and the call stops it. The result names the
+/// subshell as stopped and the job as still running: it said the background
+/// processes were terminated, of a job that was still up, and models started
+/// it again. Beside it, a plain `&` job is named among the stopped, and a
+/// plain `&` job alone still gets the note that explains the group rule.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_job_detached_with_setsid_is_reported_as_still_running() {
+    let (project, home) = fresh_dirs("setsid-note");
+    let base = project.parent().unwrap().to_path_buf();
+    let detached = |name: &str| {
+        format!(
+            "cd '{dir}' && setsid sh -c 'echo $$ > {name}; exec sleep 6852' >/dev/null 2>&1 &",
+            dir = base.display()
+        )
+    };
+    let plain = |name: &str| format!("sleep 6853 & echo $! > '{}'", base.join(name).display());
+    let names = ["alone", "beside", "plain", "only"];
+    let guard = KillOnDrop(names.iter().map(|n| base.join(n)).collect());
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": detached("alone") })), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": format!("{} {}", detached("beside"), plain("plain")) })), true),
+        (sse_tool_call("bash", serde_json::json!({ "command": plain("only") })), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "start the server"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    // A detached shell writes its pid on its own schedule, which can be
+    // after the run has ended.
+    let pid = |name: &str| -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(base.join(name)).unwrap_or_default().trim().parse() {
+                return pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "{name} never recorded its pid");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    let [alone, beside, plain, only] = names.map(pid);
+    assert_eq!([alone, beside, plain, only].map(runs), [true, true, false, false], "the detached jobs run, the plain ones were stopped");
+    let ends = tool_end_outputs(&out.stdout);
+    assert_eq!(ends.len(), 3, "{ends:?}");
+    // The first two results name what was stopped, then what still runs.
+    for (end, running, stopped) in [(&ends[0], alone, None), (&ends[1], beside, Some(plain))] {
+        let (was_stopped, still_running) = end.split_once("still running: ").unwrap_or_else(|| panic!("{end}"));
+        assert!(!end.contains("terminated"), "a running job was reported as terminated: {end}");
+        assert!(still_running.contains(&format!("({running})")), "the running job is named as running: {end}");
+        assert!(was_stopped.contains("were stopped: "), "{end}");
+        if let Some(stopped) = stopped {
+            assert!(was_stopped.contains(&format!("sleep ({stopped})")), "the stopped plain job is named: {end}");
+        }
+    }
+    assert!(ends[2].contains("were terminated when it returned"), "a plain job alone keeps its note: {ends:?}");
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A binary no installer put in place (this test's own build) cannot update
+/// itself: `--update` says so and how to install, exits 1, and makes no
+/// request first, so a source build never reaches the network for it.
+#[test]
+fn update_refuses_a_build_no_installer_made() {
+    let (project, home) = fresh_dirs("update");
+    let output = cmd(&project, &home)
+        .arg("--update")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot update itself"), "{stderr}");
+    assert!(stderr.contains("docs/install.md"), "{stderr}");
+    assert!(!stderr.contains("could not check"), "no check was attempted: {stderr}");
+    assert!(!home.join(".openmax/update-check.json").exists());
+    let refused = cmd(&project, &home).args(["--update", "--check"]).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2));
 }

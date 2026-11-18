@@ -190,11 +190,7 @@ pub(crate) async fn execute_readonly_batch(
                 // Close every ToolStart already emitted in this batch so the
                 // transcript stays well-formed, then stop the turn.
                 for prior in calls.iter().take(parsed.len()) {
-                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd {
-                        call_id: prior.id.clone(),
-                        ok: false,
-                        output: "cancelled".to_string(),
-                    });
+                    ctx.core.send_agent(ctx.session_id, AgentEvent::ToolEnd { call_id: prior.id.clone(), ok: false, output: "cancelled".into(), duration_ms: None });
                     messages.push(ChatMessage::tool(prior.id.clone(), "cancelled".to_string()));
                 }
                 return true;

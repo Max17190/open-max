@@ -71,3 +71,24 @@ cargo install --path crates/tui --locked
 ```
 
 Or run it in place with `cargo run --release -p openmax`.
+
+## Updating
+
+In a session, type `/update`. When a newer release exists, the session ends,
+the update runs on your terminal, and the new version starts again on the
+same session, as `openmax --session <id>` would. If the update fails, it prints
+the command that resumes. From a shell, run `openmax --update` instead.
+
+Both run the update command for how you installed: `brew upgrade openmax`,
+`npm install -g openmax-cli@latest` (or the bun or pnpm equivalent), or the
+install script again into the same directory. You can run that command
+yourself instead.
+
+An interactive session checks for a newer release at most once a day, in the
+background, and names it at the start of the next session. It never installs
+anything on its own, so a version only changes when you update. Print, stdio,
+sub-agent and check runs never check, and neither does a build from source or
+a binary no installer put in place. Set `OPENMAX_NO_UPDATE_CHECK=1` to turn the
+check off; `/status` says whether it is on. The check is one request to
+`api.github.com` with an `openmax/<version>` user agent and nothing else, and
+its answer is kept in `~/.openmax/update-check.json`.

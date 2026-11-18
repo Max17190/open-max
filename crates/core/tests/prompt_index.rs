@@ -8,7 +8,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{close, drive_turn, note_marker, recording_endpoint};
-use open_max_core::prompt::{session_context, trailing_note, PromptBreakdown, MAX_NOTE_BYTES, NOTE_HEADER};
+use open_max_core::prompt::{session_context, trailing_note, PromptBreakdown, MAX_NOTE_BYTES, MIN_AGENTS_MD_BYTES, NOTE_HEADER};
 use open_max_core::registry::Registry;
 use open_max_core::state::Core;
 use open_max_core::types::AgentEvent;
@@ -142,7 +142,7 @@ fn the_note_holds_only_what_changed_since_the_prompt() {
     }
     let data = dir.join("data");
     let mut first = Registry::build(&data, &project);
-    let (prompt, note, _) = session_context(&project, &mut first);
+    let (prompt, note, _) = session_context(&project, &mut first, MIN_AGENTS_MD_BYTES);
     assert_eq!(note, None, "a new prompt has nothing to amend");
     let shown: Vec<String> = (0..30).map(|i| format!("fact-{i:02}")).filter(|n| prompt.contains(&format!("- {n}:"))).collect();
     let hidden: Vec<String> = (0..30).map(|i| format!("fact-{i:02}")).filter(|n| !shown.contains(n)).collect();
@@ -197,7 +197,7 @@ fn the_note_reports_skill_edits_by_what_the_index_shows() {
     }
     let data = dir.join("data");
     let mut first = Registry::build(&data, &project);
-    let (prompt, _, _) = session_context(&project, &mut first);
+    let (prompt, _, _) = session_context(&project, &mut first, MIN_AGENTS_MD_BYTES);
     let shown: Vec<usize> = (0..30).filter(|i| prompt.contains(&format!("- skill-{i:02}:"))).collect();
     assert_eq!(shown, (0..17).collect::<Vec<_>>(), "the cap must bite after 17 lines:\n{prompt}");
 
@@ -229,8 +229,8 @@ fn an_agents_md_edit_past_the_prompt_cap_is_noticed() {
     std::fs::write(project.join("AGENTS.md"), format!("{head}Deploy on Fridays.\n")).unwrap();
     let data = dir.join("data");
     let mut first = Registry::build(&data, &project);
-    let (prompt, _, _) = session_context(&project, &mut first);
-    assert!(prompt.contains("AGENTS.md truncated") && !prompt.contains("Fridays"), "the edit lands past the cap");
+    let (prompt, _, _) = session_context(&project, &mut first, MIN_AGENTS_MD_BYTES);
+    assert!(prompt.contains("[AGENTS.md cut: ") && !prompt.contains("Fridays"), "the edit lands past the cap");
     std::fs::write(project.join("AGENTS.md"), format!("{head}Never deploy on Fridays.\n")).unwrap();
     let note = note_against(&first, &data, &project).0.unwrap_or_default();
     assert!(note.contains("AGENTS.md changed after the system prompt was built"), "{note}");
@@ -251,11 +251,11 @@ fn the_index_counts_tool_files_past_the_load_cap() {
     (0..64).for_each(tool);
     let data = dir.join("data");
     let trailer = |n: usize| format!("… {n} more tools were discovered but not loaded (64-tool cap)");
-    let (under, _, _) = session_context(&project, &mut Registry::build(&data, &project));
+    let (under, _, _) = session_context(&project, &mut Registry::build(&data, &project), MIN_AGENTS_MD_BYTES);
     assert!(!under.contains("more tools were discovered"), "no trailer under the cap");
     tool(64);
     let mut first = Registry::build(&data, &project);
-    let (prompt, note, _) = session_context(&project, &mut first);
+    let (prompt, note, _) = session_context(&project, &mut first, MIN_AGENTS_MD_BYTES);
     assert!(prompt.contains(&trailer(1)) && note.is_none(), "{prompt}");
     // A resume restores the count with the record, so an unchanged project
     // has nothing to say past the cap either.
@@ -290,7 +290,7 @@ fn the_note_stays_under_its_cap() {
     std::fs::create_dir_all(&project).unwrap();
     let data = dir.join("data");
     let mut first = Registry::build(&data, &project);
-    session_context(&project, &mut first);
+    session_context(&project, &mut first, MIN_AGENTS_MD_BYTES);
     let properties: String = (0..45).map(|i| format!("p{i:02} = {{ type = \"string\", description = \"{}\" }}\n", "d".repeat(40))).collect();
     for i in 0..4 {
         write(&project, &format!(".openmax/tools/big-{i}.toml"), &format!("name = \"big-{i}\"\ndescription = \"d\"\ncommand = \"/bin/echo\"\n[params]\ntype = \"object\"\n[params.properties]\n{properties}"));
@@ -327,7 +327,7 @@ async fn a_tool_written_mid_session_runs_by_its_own_name() {
     let events = drive_turn(&core, &mut rx, "by-name", &project, "write and run a tool").await;
 
     let ran = events.iter().find_map(|e| match e {
-        AgentEvent::ToolEnd { call_id, ok, output } if call_id == "c2" => Some((*ok, output.clone())),
+        AgentEvent::ToolEnd { call_id, ok, output, .. } if call_id == "c2" => Some((*ok, output.clone())),
         _ => None,
     });
     assert!(
@@ -437,7 +437,7 @@ fn a_resumed_breakdown_prices_the_skills_the_prompt_carries() {
     let project = project_with_one_of_each(&dir);
     let data = dir.join("data");
     let mut first = Registry::build(&data, &project);
-    let (prompt, _, created) = session_context(&project, &mut first);
+    let (prompt, _, created) = session_context(&project, &mut first, MIN_AGENTS_MD_BYTES);
     write(&project, ".agents/skills/deploy/SKILL.md", "---\nname: deploy\ndescription: ship the build\n---\nSteps.\n");
     // The refreeze that loads the new skill, then the manifest it saves read
     // back by a resume.

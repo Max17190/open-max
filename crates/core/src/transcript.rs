@@ -62,7 +62,7 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             }
             None => {
                 let mut registry = Registry::build(&core.data_dir, project_root);
-                let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+                let (prompt, note, breakdown) = session_context(project_root, &mut registry, crate::prompt::agents_md_cap(&core.settings.lock().unwrap(), &core.data_dir));
                 if needs_system {
                     messages.insert(0, ChatMessage::system(prompt));
                 } else {
@@ -143,7 +143,7 @@ pub(crate) fn build_session_data(core: &Arc<Core>, session_id: &str, project_roo
             }
             None => Registry::build(&core.data_dir, project_root),
         };
-        let (prompt, note, breakdown) = session_context(project_root, &mut registry);
+        let (prompt, note, breakdown) = session_context(project_root, &mut registry, crate::prompt::agents_md_cap(&core.settings.lock().unwrap(), &core.data_dir));
         // Always persisted (even builtin-only) so the extension fingerprint
         // and the record of what the prompt indexes travel with the session;
         // without them every resume would look like a self-modification and
@@ -402,5 +402,42 @@ impl Drop for MessageGuard {
                 // No runtime means process teardown; disk saves bound the loss.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A new session's prompt carries AGENTS.md as far as the window it will
+    /// run in allows: the 16 KB file on record whole in a large window, its
+    /// rule past the old 2,000-byte cut included, and the old cut in a 16k
+    /// window, where `agents_md_bytes` also lands when set.
+    #[test]
+    fn a_new_session_carries_agents_md_as_its_window_allows() {
+        let dir = std::env::temp_dir().join(format!("openmax-agents-md-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let rule = "## Type safety\n\nNever cast through `as unknown as T`.\n";
+        let file = format!("# Project\n\n{}{rule}", "Run the linters before every commit.\n".repeat(440));
+        assert!((16_000..16_500).contains(&file.len()), "{}", file.len());
+        std::fs::write(project.join("AGENTS.md"), &file).unwrap();
+        let (core, _rx) = Core::new(dir.join("data")).unwrap();
+        let prompt = |window: usize, bytes: Option<usize>| {
+            {
+                let mut settings = core.settings.lock().unwrap();
+                (settings.base_url, settings.model) = ("http://127.0.0.1:9/v1".into(), "m".into());
+                (settings.context_tokens, settings.agents_md_bytes) = (Some(window), bytes);
+            }
+            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+            build_session_data(&core, &id, &project).unwrap().messages[0].content.clone().unwrap()
+        };
+        let large = prompt(1_048_576, None);
+        assert!(large.contains(file.trim()) && !large.contains("[AGENTS.md cut: "), "the file rides whole");
+        let small = prompt(16_384, None);
+        assert!(!small.contains("as unknown as T"));
+        assert!(small.contains(" of 16") && small.contains("Sections not shown: Type safety."), "the cut names the rule's section");
+        assert_eq!(prompt(1_048_576, Some(2_000)), small, "the setting restores the 2,000-byte cut");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

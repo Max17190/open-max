@@ -176,7 +176,7 @@ async fn drive_turn(
             .expect("turn finishes within 30s")
             .expect("event channel stays open");
         match envelope.event {
-            AgentEvent::ToolEnd { call_id, ok, output } => turn.calls.push((call_id, ok, output)),
+            AgentEvent::ToolEnd { call_id, ok, output, .. } => turn.calls.push((call_id, ok, output)),
             AgentEvent::HarnessNote { text, .. } => turn.notes.push(text),
             AgentEvent::HookFailed { event, detail, .. } => turn.hook_failures.push((event, detail)),
             AgentEvent::Error { message } => turn.errors.push(message),

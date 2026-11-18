@@ -239,13 +239,17 @@ pub(crate) struct ProcessOutput {
     pub log_path: Option<PathBuf>,
     /// True when either stream exceeded its configured spill cap.
     pub log_truncated: bool,
-    /// True when the command exited normally but left process-group members
+    /// Set when the command exited normally but left process-group members
     /// behind that this call then terminated. Only a NORMAL exit sets it: a
     /// cancel or a timeout kills the group by design and already says so.
     /// Callers must surface it, because the caller who backgrounded a server
     /// otherwise sees a clean exit and no server.
-    pub background_terminated: bool,
+    pub left_running: Option<LeftRunning>,
 }
+
+/// The group members a stop ended, and what they started outside it that still runs (Linux), as `name (pid)`.
+#[derive(Debug, Default)]
+pub(crate) struct LeftRunning { pub stopped: Vec<String>, pub detached: Vec<String> }
 
 #[derive(Debug)]
 pub(crate) enum ProcessError {
@@ -948,7 +952,7 @@ pub(crate) async fn run_process(
         }),
     };
 
-    let (termination, background_terminated) =
+    let (termination, left_running) =
         supervise_child(&mut child, pid, request.timeout, &cancel).await?;
     group.settled();
 
@@ -986,7 +990,7 @@ pub(crate) async fn run_process(
         stderr: stderr.stream,
         log_path,
         log_truncated,
-        background_terminated,
+        left_running,
     })
 }
 
@@ -1147,7 +1151,7 @@ async fn supervise_child(
     pid: Option<u32>,
     timeout: Duration,
     cancel: &CancelToken,
-) -> Result<(Termination, bool), ProcessError> {
+) -> Result<(Termination, Option<LeftRunning>), ProcessError> {
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
@@ -1159,28 +1163,28 @@ async fn supervise_child(
             // and the caller is handed a successful exit. Report it so the
             // caller learns the rule from the result instead of from a failing
             // request later.
-            let background_terminated = stop_what_was_left_running(pid).await;
-            Ok((Termination::Exited(status), background_terminated))
+            let left_running = stop_what_was_left_running(pid).await;
+            Ok((Termination::Exited(status), left_running))
         }
         _ = cancel.cancelled() => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::Cancelled, false))
+            Ok((Termination::Cancelled, None))
         }
         _ = tokio::time::sleep(timeout) => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::TimedOut, false))
+            Ok((Termination::TimedOut, None))
         }
     }
 }
 
 async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<(), ProcessError> {
-    send_termination(child, pid);
+    stop_group(Some(child), pid, false);
     let reaped = tokio::time::timeout(TERMINATION_GRACE, child.wait()).await;
     match reaped {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => return Err(ProcessError::Wait(error)),
         Err(_) => {
-            send_kill(child, pid);
+            stop_group(Some(child), pid, true);
             child.wait().await.map_err(ProcessError::Wait)?;
         }
     }
@@ -1189,21 +1193,46 @@ async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<
 }
 
 /// Stops what a command whose shell exited left running in its group, and
-/// returns true when there was any. Members that exit within
+/// says what when there was any. Members that exit within
 /// `LEFT_RUNNING_AFTER` were on their way out, not left running: reporting
 /// them told the caller of nearly every test run with a worker pool that its
 /// background processes were cut short, when it had started none. Members
 /// that exited and wait for a parent to collect them run nothing either
 /// ([`group_has_running_member`]).
-async fn stop_what_was_left_running(pid: Option<u32>) -> bool {
+async fn stop_what_was_left_running(pid: Option<u32>) -> Option<LeftRunning> {
     let deadline = tokio::time::Instant::now() + LEFT_RUNNING_AFTER;
     while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
-            return terminate_remaining_group(pid).await;
+            let (stopped, mut detached) = pid.map(members_and_their_children_outside).unwrap_or_default();
+            terminate_remaining_group(pid).await.then_some(())?;
+            detached.retain(|(pid, _)| proc_stat(&Path::new("/proc").join(pid.to_string())).is_some_and(|s| !s.2));
+            return Some(LeftRunning { stopped, detached: detached.into_iter().map(|d| d.1).collect() });
         }
         tokio::time::sleep(GROUP_EXIT_POLL).await;
     }
-    false
+    None
+}
+
+/// The running members of `group`, and the running children they have outside
+/// it, read from `/proc`: none where there is no `/proc`. Members include the session's other groups.
+fn members_and_their_children_outside(group: u32) -> (Vec<String>, Vec<(u32, String)>) {
+    let entries = std::fs::read_dir("/proc").into_iter().flatten().flatten();
+    let running: Vec<_> = entries.filter_map(|entry| proc_stat(&entry.path())).filter(|p| !p.2).collect();
+    let named = |p: &(u32, String, bool, u32, u32, u32)| format!("{} ({})", p.1, p.0);
+    let member = |p: &&(u32, String, bool, u32, u32, u32)| p.4 == group || p.5 == group;
+    let members: Vec<_> = running.iter().filter(member).collect();
+    let outside = running.iter().filter(|p| !member(p) && members.iter().any(|m| m.0 == p.3)).map(|p| (p.0, named(p)));
+    (members.iter().copied().map(named).collect(), outside.collect())
+}
+
+/// Pid, name, whether it exited (Z with no thread left), parent, group and session.
+fn proc_stat(dir: &Path) -> Option<(u32, String, bool, u32, u32, u32)> {
+    let stat = String::from_utf8_lossy(&std::fs::read(dir.join("stat")).ok()?).into_owned();
+    let (head, fields) = stat.rsplit_once(')')?;
+    let ((pid, name), f) = (head.split_once(" (")?, fields.split_whitespace().take(4).collect::<Vec<_>>());
+    let exited = *f.first()? == "Z" && std::fs::read_dir(dir.join("task")).is_ok_and(|threads| threads.count() <= 1);
+    let n = |i: usize| f.get(i)?.parse().ok();
+    Some((pid.parse().ok()?, name.into(), exited, n(1)?, n(2)?, n(3)?))
 }
 
 /// Returns true when group members outlived the leader and were terminated
@@ -1217,11 +1246,11 @@ async fn terminate_remaining_group(pid: Option<u32>) -> bool {
     if !group_has_running_member(pid) {
         return false;
     }
-    send_termination_group(pid);
+    stop_group(None, pid, false);
     let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
     while group_has_running_member(pid) {
         if tokio::time::Instant::now() >= deadline {
-            send_kill_group(pid);
+            stop_group(None, pid, true);
             break;
         }
         tokio::time::sleep(GROUP_EXIT_POLL).await;
@@ -1306,7 +1335,7 @@ pub fn kill_process_groups() {
         std::thread::sleep(Duration::from_millis(5));
     }
     for pid in live_groups().iter() {
-        send_kill_group(Some(*pid));
+        stop_group(None, Some(*pid), true);
     }
     // Every group listed was just killed, so the record lists none a later
     // launch must stop, and the exit removes it.
@@ -1366,7 +1395,7 @@ impl Drop for GroupGuard {
             // running.
             let mut live = live_groups();
             forget(&mut live, pid);
-            send_kill_group(Some(pid));
+            stop_group(None, Some(pid), true);
             unrecord(pid);
         }
     }
@@ -1813,23 +1842,24 @@ fn owner_is_running(pid: u32, recorded_start: Option<&str>) -> bool {
 /// ends. `recorded` ([`is_recorded_group`]) tells whether a group is still
 /// the one recorded, and each is dropped the first time it is not, never to
 /// be signalled again: once a group has ended, its id can name a new group,
-/// which reads as recorded when its own leader has exited.
+/// which reads as recorded when its own leader has exited. A group whose
+/// session still holds other groups is kept: their session id holds its pid.
 #[cfg(unix)]
 fn stop_groups(groups: &[(u32, u64)], grace: Duration, mut recorded: impl FnMut(u32, u64) -> bool) {
     let mut stopping: Vec<(u32, u64)> = groups.iter().copied().filter(|&(pid, start)| recorded(pid, start)).collect();
     for (pid, _) in &stopping {
-        send_termination_group(Some(*pid));
+        stop_group(None, Some(*pid), false);
     }
     let deadline = std::time::Instant::now() + grace;
     loop {
-        stopping.retain(|&(pid, start)| recorded(pid, start));
+        stopping.retain(|&(pid, start)| recorded(pid, start) || !session_groups(Path::new("/proc"), pid).is_empty());
         if stopping.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }
         sleep_on_time(GROUP_EXIT_POLL);
     }
     for (pid, _) in stopping {
-        send_kill_group(Some(pid));
+        stop_group(None, Some(pid), true);
     }
 }
 
@@ -1968,14 +1998,31 @@ fn stat_started(stat: &str) -> Option<(u64, bool)> {
     Some((fields.nth(22 - 4)?.parse().ok()?, exited))
 }
 
-/// Field 5, the process group, of a `/proc/<pid>/stat` line, and whether
+/// Fields 5 and 6, the process group and session, of a `/proc/<pid>/stat` line, and whether
 /// field 3, the state, is Z, counted as [`stat_started`] counts them.
 #[cfg(any(target_os = "linux", all(test, unix)))]
-fn stat_group(stat: &str) -> Option<(u32, bool)> {
+fn stat_group(stat: &str) -> Option<(u32, u32, bool)> {
     let (_, fields) = stat.rsplit_once(')')?;
     let mut fields = fields.split_whitespace();
     let exited = fields.next()? == "Z";
-    Some((fields.nth(1)?.parse().ok()?, exited))
+    Some((fields.nth(1)?.parse().ok()?, fields.next()?.parse().ok()?, exited))
+}
+
+/// The other groups of the session `session` leads, from `/proc`: GNU `timeout` moves its command to one,
+/// out of reach of a group signal. One that left with `setsid`, the documented way to keep it running, is not listed.
+#[cfg(target_os = "linux")]
+fn session_groups(proc: &Path, session: u32) -> Vec<u32> {
+    let stats = std::fs::read_dir(proc).into_iter().flatten().flatten().filter_map(|e| std::fs::read(e.path().join("stat")).ok());
+    let groups = stats.filter_map(|stat| stat_group(&String::from_utf8_lossy(&stat)));
+    let mut groups: Vec<u32> = groups.filter(|&(group, of, _)| of == session && group != session).map(|g| g.0).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
+#[cfg(not(target_os = "linux"))]
+fn session_groups(_: &Path, _: u32) -> Vec<u32> {
+    Vec::new()
 }
 
 #[cfg(all(test, unix))]
@@ -2066,41 +2113,17 @@ impl Drop for PausedSpawn {
     }
 }
 
-#[cfg(unix)]
-fn send_termination(_: &mut Child, pid: Option<u32>) {
-    signal_group(pid, libc::SIGTERM);
+/// Signals the command's group, SIGKILL with `kill` and SIGTERM without.
+/// Where there are no groups, `child` is killed, if there is one.
+fn stop_group(child: Option<&mut Child>, pid: Option<u32>, kill: bool) {
+    #[cfg(unix)]
+    {
+        let _ = child;
+        signal_group(pid, if kill { libc::SIGKILL } else { libc::SIGTERM });
+    }
+    #[cfg(not(unix))]
+    let _ = (pid, kill, child.map(|child| child.start_kill()));
 }
-
-#[cfg(not(unix))]
-fn send_termination(child: &mut Child, _: Option<u32>) {
-    let _ = child.start_kill();
-}
-
-#[cfg(unix)]
-fn send_kill(_: &mut Child, pid: Option<u32>) {
-    signal_group(pid, libc::SIGKILL);
-}
-
-#[cfg(not(unix))]
-fn send_kill(child: &mut Child, _: Option<u32>) {
-    let _ = child.start_kill();
-}
-
-#[cfg(unix)]
-fn send_kill_group(pid: Option<u32>) {
-    signal_group(pid, libc::SIGKILL);
-}
-
-#[cfg(not(unix))]
-fn send_kill_group(_: Option<u32>) {}
-
-#[cfg(unix)]
-fn send_termination_group(pid: Option<u32>) {
-    signal_group(pid, libc::SIGTERM);
-}
-
-#[cfg(not(unix))]
-fn send_termination_group(_: Option<u32>) {}
 
 #[cfg(unix)]
 fn process_group_exists(pid: Option<u32>) -> bool {
@@ -2128,10 +2151,10 @@ fn process_group_exists(_: Option<u32>) -> bool {
 /// found, the probe answers.
 #[cfg(target_os = "linux")]
 fn group_has_running_member(pid: Option<u32>) -> bool {
-    let Some(group) = pid.filter(|_| process_group_exists(pid)) else {
+    let proc = Path::new("/proc");
+    let Some(group) = pid.filter(|&group| process_group_exists(pid) || !session_groups(proc, group).is_empty()) else {
         return false;
     };
-    let proc = Path::new("/proc");
     !(only_exited_members(proc, group) && only_exited_members(proc, group))
 }
 
@@ -2151,7 +2174,7 @@ fn only_exited_members(proc: &Path, group: u32) -> bool {
     };
     let exited = |stat: &Path| {
         let stat = std::fs::read_to_string(stat).unwrap_or_default();
-        stat_group(&stat).map(|(member_of, exited)| (member_of == group, exited))
+        stat_group(&stat).map(|(member_of, session, exited)| (member_of == group || session == group, exited))
     };
     let mut found = false;
     for entry in entries.flatten() {
@@ -2178,12 +2201,29 @@ fn signal_group(pid: Option<u32>, signal: libc::c_int) {
     if let Some(pid) = pid {
         // A missing group simply means every process has already exited.
         unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+        session_groups(Path::new("/proc"), pid).into_iter().for_each(|g| unsafe { libc::kill(-(g as libc::pid_t), signal); });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stopped_any(pid: Option<u32>) -> bool {
+        stop_what_was_left_running(pid).await.is_some()
+    }
+
+    /// A name Linux allows but UTF-8 does not still reads, so the process is
+    /// neither dropped from what still runs nor reported as stopped.
+    #[test]
+    fn a_process_whose_name_is_not_utf8_is_still_read() {
+        let dir = std::env::temp_dir().join(format!("openmax-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), b"4242 (srv\xff) S 17 4242 4242 0 -1").unwrap();
+        let read = proc_stat(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read, Some((4242, "srv\u{fffd}".to_string(), false, 17, 4242, 4242)));
+    }
 
     fn request(program: &str, args: &[&str]) -> ProcessRequest {
         ProcessRequest {
@@ -2289,8 +2329,8 @@ mod tests {
         assert_eq!(stat_started(stat), Some((98765, false)));
         assert_eq!(stat_started(&stat.replace(") S ", ") Z ")), Some((98765, true)), "a state of Z is an exited process");
         assert_eq!(stat_started("4242 (cut"), None);
-        assert_eq!(stat_group(stat), Some((4242, false)), "the group is field 5");
-        assert_eq!(stat_group(&stat.replace(") S 1 4242", ") Z 1 77")), Some((77, true)));
+        assert_eq!(stat_group(stat), Some((4242, 4242, false)), "the group is field 5 and the session field 6");
+        assert_eq!(stat_group(&stat.replace(") S 1 4242 4242", ") Z 1 77 76")), Some((77, 76, true)));
         assert_eq!(stat_group("4242 (cut) S 1"), None);
     }
 
@@ -2437,6 +2477,43 @@ mod tests {
         assert!(stubborn_stopped, "a group that ignores SIGTERM outlived the reap");
         assert_eq!(stubborn.wait().unwrap().signal(), Some(libc::SIGKILL));
         assert!(took >= LEFT_BEHIND_GRACE, "a group that ignores SIGTERM was killed {took:?} into its {LEFT_BEHIND_GRACE:?} grace");
+    }
+
+    /// A recorded session whose leader ends on SIGTERM and is reaped at once,
+    /// as init reaps a tool whose harness died, still has a worker under GNU
+    /// `timeout` in another of its groups that ignores SIGTERM: the stop keeps
+    /// the session through the grace and kills the worker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_kills_a_session_worker_that_outlives_its_leader() {
+        use std::{io::BufRead, os::unix::process::CommandExt};
+        let pid_file = std::env::temp_dir().join(format!("openmax-session-stop-{}", uuid::Uuid::new_v4()));
+        let script = format!(
+            "timeout 540 sh -c \"trap '' TERM; echo \\$\\$ > '{0}'; exec sleep 6852\" & while [ ! -s '{0}' ]; do sleep 0.01; done; echo ready; exec sleep 300",
+            pid_file.display()
+        );
+        let mut leader = std::process::Command::new("/bin/sh");
+        leader.args(["-c", &script]).stdout(std::process::Stdio::piped());
+        // SAFETY: setsid is async-signal-safe.
+        unsafe { leader.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }) };
+        let mut leader = leader.spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        let (pid, start) = (leader.id(), start_time(leader.id()).unwrap());
+        let reaper = std::thread::spawn(move || leader.wait());
+        let worker = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        stop_groups(&[(pid, start)], Duration::from_millis(500), is_recorded_group);
+        reaper.join().unwrap().unwrap();
+        let running = || proc_stat(&Path::new("/proc").join(worker.to_string())).is_some_and(|p| !p.2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = running();
+        unsafe { libc::kill(worker, libc::SIGKILL) };
+        assert!(!survived, "a worker in another group of the session outlived the stop");
     }
 
     /// A group that ends on SIGTERM is given the grace to, and the grace is
@@ -3605,7 +3682,7 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "background descendant survived process cleanup");
-        assert!(output.background_terminated, "a stopped background child was not reported");
+        assert!(output.left_running.is_some(), "a stopped background child was not reported");
     }
 
     /// A program whose helper exits just after it, as a test runner's worker
@@ -3646,7 +3723,7 @@ mod tests {
         program.wait().await.unwrap();
         drop(pipe);
         assert_eq!(said.read(&mut byte).await.unwrap(), 1, "the helper never saw its pipe close");
-        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), helper.wait());
+        let (reported, exited) = tokio::join!(stopped_any(group), helper.wait());
         assert_eq!(exited.unwrap().code(), Some(0), "the helper was stopped instead of exiting on its own");
         assert!(!reported, "a helper on its way out was reported as left running");
     }
@@ -3670,7 +3747,7 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "the daemonized process survived the call");
-        assert!(output.background_terminated, "the stopped daemon was not reported");
+        assert!(output.left_running.is_some(), "the stopped daemon was not reported");
     }
 
     /// A process group whose leader has exited and left `member` running in
@@ -3757,7 +3834,7 @@ mod tests {
         leader.wait().await.unwrap();
         until_exited(&worker).await;
         assert!(process_group_exists(Some(group)), "the zombie does not hold its group");
-        let reported = stop_what_was_left_running(Some(group)).await;
+        let reported = stopped_any(Some(group)).await;
         worker.wait().unwrap();
         assert!(!reported, "a group holding only a zombie was reported as left running");
     }
@@ -3773,7 +3850,7 @@ mod tests {
         zombie.process_group(i32::try_from(group.unwrap()).unwrap());
         let mut zombie = zombie.spawn().unwrap();
         until_exited(&zombie).await;
-        let (reported, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+        let (reported, exited) = tokio::join!(stopped_any(group), member.wait());
         zombie.wait().unwrap();
         assert!(reported, "the running member was not reported");
         assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the running member was not stopped");
@@ -3795,7 +3872,7 @@ mod tests {
         for _ in 0..5 {
             let (group, mut member) = group_whose_leader_exited(&["sleep", "6845"]).await;
             let started = std::time::Instant::now();
-            let (found, exited) = tokio::join!(stop_what_was_left_running(group), member.wait());
+            let (found, exited) = tokio::join!(stopped_any(group), member.wait());
             fastest = fastest.min(started.elapsed());
             assert!(found, "the background child was not found");
             assert_eq!(exited.unwrap().signal(), Some(libc::SIGTERM), "the background child did not stop on SIGTERM");
@@ -3937,6 +4014,92 @@ mod tests {
         let pid = recorded_pid(&pid_file);
         let _ = std::fs::remove_file(&pid_file);
         assert!(!lifeline.survived(pid), "a descendant outlived the timeout that stopped its command");
+    }
+
+    /// One launch of the shape an archived trial leaked from: a worker
+    /// started under GNU `timeout`, which moves itself and the worker to a
+    /// process group of their own inside the command's session. The
+    /// worker's parent is then killed, as the kernel's memory killer did,
+    /// and the command waits out its timeout. Returns the output, the
+    /// worker's lifeline and its pid.
+    #[cfg(target_os = "linux")]
+    async fn a_launch_whose_worker_left_the_group() -> (ProcessOutput, Lifeline, libc::pid_t) {
+        let pid_file = std::env::temp_dir().join(format!("openmax-regrouped-{}", uuid::Uuid::new_v4()));
+        let mut tried = None;
+        for second in TRIAL_SECONDS {
+            let _ = std::fs::remove_file(&pid_file);
+            let lifeline = Lifeline::new();
+            let script = format!(
+                "{}; timeout 540 sh -c \"trap '' TERM; echo \\$\\$ > '{1}'; exec sleep 6846\" & exec 3>&-; while [ ! -s '{1}' ]; do sleep 0.01; done; kill -9 $!; sleep 30",
+                lifeline.open_in_shell(),
+                pid_file.display()
+            );
+            let mut request = request("/bin/sh", &["-c", &script]);
+            request.timeout = second;
+            let output = run_process(request, Arc::new(CancelToken::default())).await.unwrap();
+            tried = Some((output, lifeline));
+            if std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                break;
+            }
+        }
+        let (output, lifeline) = tried.unwrap();
+        let pid = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        (output, lifeline, pid)
+    }
+
+    /// A timeout stops a worker that left the command's process group but
+    /// not its session, and names it, so a retry of the same command does
+    /// not run beside the first launch's worker. Checked after the retry,
+    /// as the archived trial held workers from two launches.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timeout_stops_a_worker_that_left_the_group_before_a_retry() {
+        let (first, mut first_lifeline, first_pid) = a_launch_whose_worker_left_the_group().await;
+        let (retry, mut retry_lifeline, retry_pid) = a_launch_whose_worker_left_the_group().await;
+        assert!(matches!(first.termination, Termination::TimedOut));
+        assert!(matches!(retry.termination, Termination::TimedOut));
+        let first_survived = first_lifeline.survived(first_pid);
+        let retry_survived = retry_lifeline.survived(retry_pid);
+        assert!(!first_survived, "the first launch's worker was still running at the retry");
+        assert!(!retry_survived, "the retry's worker outlived its timeout");
+    }
+
+    /// A command that returns while a worker it started under `timeout`
+    /// runs in another group of its session stops the worker and names it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_return_stops_a_worker_that_left_the_group() {
+        let mut lifeline = Lifeline::new();
+        let pid_file = std::env::temp_dir().join(format!("openmax-regrouped-{}", uuid::Uuid::new_v4()));
+        let script = format!(
+            "{}; timeout 540 sh -c \"echo \\$\\$ > '{1}'; exec sleep 6847\" & exec 3>&-; while [ ! -s '{1}' ]; do sleep 0.01; done",
+            lifeline.open_in_shell(),
+            pid_file.display()
+        );
+        let output = run_process(request("/bin/sh", &["-c", &script]), Arc::new(CancelToken::default())).await.unwrap();
+        let pid = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(!lifeline.survived(pid), "a worker that left the group survived the call");
+        assert!(output.left_running.is_some(), "the stopped worker was not named");
+    }
+
+    /// A process that leaves the command's session with `setsid`, the
+    /// documented way to keep one running, still outlives the call.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_return_leaves_a_process_that_left_the_session_running() {
+        let pid_file = std::env::temp_dir().join(format!("openmax-own-session-{}", uuid::Uuid::new_v4()));
+        let script = format!(
+            "setsid sh -c \"echo \\$\\$ > '{0}'; exec sleep 6850\" & while [ ! -s '{0}' ]; do sleep 0.01; done",
+            pid_file.display()
+        );
+        run_process(request("/bin/sh", &["-c", &script]), Arc::new(CancelToken::default())).await.unwrap();
+        let pid = recorded_pid(&pid_file);
+        let _ = std::fs::remove_file(&pid_file);
+        let alive = proc_stat(&Path::new("/proc").join(pid.to_string())).is_some_and(|p| !p.2);
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(alive, "a process in a session of its own was stopped with the command");
     }
 
     /// A command dropped mid-run (the runtime shutting down under a TUI that

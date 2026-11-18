@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/11`)
+# stdio protocol (`openmax-stdio/12`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/11","protocol_version":11,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/12","protocol_version":12,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -111,7 +111,7 @@ events either, but carry one).
 | `budget` | `used_tokens` (estimated: transcript plus the frozen tool schemas re-sent every request, scaled up when the server reported more prompt tokens than estimated for the session's last request, or refused a request for length (recognized by the error's wording) that the estimate said fit), `context_tokens` |
 | `usage` | `prompt_tokens`, `completion_tokens` (the reply's output as the provider bills it, reasoning included: a server that reports reasoning beside its own `completion_tokens` and in its `total_tokens`, as xAI's Chat Completions does, has it added), `cached_tokens` (or null) |
 | `tool_start` | `call_id`, `name`, `args` (object) |
-| `tool_end` | `call_id`, `ok` (bool), `output` |
+| `tool_end` | `call_id`, `ok` (bool), `output`, `duration_ms` (wall time since the call's `tool_start`, approval waits included; null for an end with no start on record) |
 | `harness_note` | `call_id`, `text` (a note the harness wrote into the model's transcript: a refreeze receipt; an execution policy, policy, permission, hook, providers, settings, or approval notice; the repeated identical call note; or the note after a reply the output limit cut before any tool call, which continues the turn. `--print` without `--json` prints no line for it. `call_id` links it to the tool result it rode; it is empty for a note inserted before the next prompt, such as a turn-start receipt) |
 | `retry` | `attempt`, `max_attempts`, `reason` (the model request is being resent: `attempt` is the one that goes out after a backoff wait, and `max_attempts` the one the request ends on if it keeps failing the same way, `reason` having ended the previous one with a transport failure, a 429 or transient server error (500, 502, 503, 504, 529), or, before any reply text arrived, a stream that died, went silent, or carried a data line the client cannot read, or a stream or reply the provider failed with a rate limit, an overload, or a server fault. A stream that died or carried a data line the client cannot read after reply text arrived is resent too, at most twice in a row, and its `reason` starts `the reply was cut short`; a stream that went silent after reply text is not, since the idle interval is the client's own limit. The wait is the backoff, or the response's `Retry-After` in seconds when that is longer. A `Retry-After` of more than a minute is not retried: the request fails at once and the error names the server's wait. Neither is a 429 reporting an exhausted quota (`insufficient_quota`). Emitted before the wait; a `cancel` during it ends the turn and the attempt never goes out. `thinking` and `token` lines already emitted for that attempt are void and the reply starts over; `message_done` carries only the reply that finished. A request gives up before its budget after three attempts in a row that failed to connect or timed out: while that streak runs, `max_attempts` counts to its third attempt (or to the budget, if that comes first), and it returns to the budget when an attempt ends any other way) |
 | `diff` | `call_id`, `path`, `diff`, `added`, `removed` |
@@ -314,6 +314,7 @@ Any wire change bumps `protocol_version`. What each version changed:
 
 | Version | Change |
 | --- | --- |
+| 12 | `tool_end` carries `duration_ms` |
 | 11 | `compaction_skipped` event |
 | 10 | A `retry` can follow `token` lines of the attempt it voids: a reply the network cut after its text began is asked for again, at most twice in a row |
 | 9 | `turn_verified` event |
