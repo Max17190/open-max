@@ -687,7 +687,8 @@ async fn run_loop(
             return "error".into();
         }
     };
-    let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    let mut client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    client.thought_bound = settings.thought_bound_tokens;
     // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
     if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(client.effort_stamp()); }
     // Frozen wire form: every request of the session injects the same tool
@@ -833,7 +834,7 @@ async fn run_loop(
                 data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
             }
         }
-        let result = match result {
+        let mut result = match result {
             Ok(r) => r,
             Err(mut message) => {
                 // The room left was misjudged: the same request goes once more at the reserve, with no more room or raises.
@@ -867,6 +868,8 @@ async fn run_loop(
         };
 
         refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
+        // A reply the thought bound ended has no server usage: its prompt counts at the estimate admission used.
+        if let Some(u) = result.usage.as_mut().filter(|_| result.bounded) { u.prompt_tokens = used_real as u64; }
         // Charged in the units admission used, so a reply without usage pays
         // the calibrated estimate rather than a raw one that undercounts it.
         spend.record(core, session_id, used_real, &result);
@@ -980,8 +983,9 @@ async fn run_loop(
                 let at = guard.messages().len();
                 let kind = crate::notes::cut_kind(limit, &result);
                 room = grant.filter(|_| kind != crate::notes::CutKind::Thought);
-                let ask = room.into_iter().chain(raised.then(|| endpoint.raised_limit(next, raise))).max();
-                insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(limit, kind, ask));
+                let ask = room.into_iter().chain(raised.then(|| endpoint.raised_limit(next, raise))).max().filter(|_| !result.bounded);
+                let shown = if result.bounded { client.thought_bound.unwrap_or(limit) } else { limit };
+                insert_note(core, session_id, guard.messages(), at, crate::notes::reply_cut_note(shown, kind, ask));
                 save_messages(core, session_id, guard.messages(), false).await;
                 continue 'turns;
             }

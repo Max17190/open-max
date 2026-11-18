@@ -156,6 +156,10 @@ pub struct Settings {
     /// Bytes of `AGENTS.md` a new session carries; unset scales with the window (`prompt::agents_md_cap`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents_md_bytes: Option<usize>,
+    /// Ends a Chat Completions reply whose readable reasoning passes this many estimated tokens before any text or
+    /// tool call has started, as if the reply limit had cut it there. Unset (the default) bounds nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_bound_tokens: Option<usize>,
 }
 
 /// A change across several files with its tests routinely takes more than
@@ -189,6 +193,7 @@ impl Default for Settings {
             max_parallel_tools: default_max_parallel_tools(),
             request_budget: None,
             agents_md_bytes: None,
+            thought_bound_tokens: None,
         }
     }
 }

@@ -372,6 +372,8 @@ pub struct CompletionResult {
     pub finish_reason: String,
     /// Server-reported token accounting, when the backend provides it.
     pub usage: Option<Usage>,
+    /// The thought bound ended this reply (`read_sse`): its usage is the reasoning estimate, prompt not included.
+    pub bounded: bool,
 }
 
 impl CompletionResult {
@@ -449,6 +451,8 @@ pub struct ChatClient {
     /// The prompt cache key of the conversation this client serves (see
     /// `for_conversation`).
     cache_key: Option<String>,
+    /// `thought_bound_tokens`: a Chat Completions reply still only thinking past it ends as cut (`read_sse`).
+    pub thought_bound: Option<usize>,
     http: reqwest::Client,
 }
 
@@ -591,6 +595,7 @@ impl ChatClient {
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
             cache_key: None,
+            thought_bound: None,
             http,
         }
     }
@@ -948,7 +953,7 @@ impl ChatClient {
                     (reply, unfinished)
                 }
                 crate::providers::WireApi::Responses => Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await,
-                crate::providers::WireApi::ChatCompletions => read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await,
+                crate::providers::WireApi::ChatCompletions => read_sse(resp, &cancelled, self.idle_timeout, self.thought_bound, &mut on_delta).await,
             };
             // The restart rules: nothing the caller keeps has streamed yet,
             // and the budget has an attempt left. A reply the network cut
@@ -1041,9 +1046,11 @@ async fn read_sse(
     resp: reqwest::Response,
     cancelled: &crate::state::CancelToken,
     idle: std::time::Duration,
+    thought_bound: Option<usize>,
     on_delta: &mut impl FnMut(StreamDelta),
 ) -> (CompletionResult, Option<Unfinished>) {
     let mut content = String::new();
+    let mut bounded = false;
     // One buffer per key, so the reply goes back under the key that carried
     // it. `None` until the server sends that key as a string, even an empty one.
     let mut reasoning_content: Option<String> = None;
@@ -1215,6 +1222,16 @@ async fn read_sse(
                     merge_reasoning_detail(&mut reasoning_details, &mut open_details, part);
                 }
             }
+            // A reply still only thinking past the bound ends here, as the reply limit would end it: the thinking so
+            // far is kept and the server, its stream dropped, stops generating. One that began text or a call keeps
+            // today's limit. Without the server's usage, which only comes at the end, the reasoning counts at its estimate.
+            let thought = reasoning_content.as_ref().or(reasoning.as_ref()).map_or(0, |t| crate::types::estimate_tokens(t.len()));
+            if thought_bound.is_some_and(|bound| thought > bound) && content.is_empty() && partials.is_empty() && delta.tool_calls.is_none() {
+                let n = thought as u64;
+                (bounded, saw_terminator, finish_reason) = (true, true, "length".into());
+                usage = Some(Usage { completion_tokens: n, output_tokens: n, reasoning_tokens: Some(n), ..usage.unwrap_or_default() });
+                break 'outer;
+            }
             if let Some(calls) = delta.tool_calls {
                 for tc in calls {
                     let (name, args) = tc.function.map_or((None, None), |f| (f.name, f.arguments));
@@ -1282,7 +1299,7 @@ async fn read_sse(
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
     let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
-    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
+    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage, bounded }, unfinished)
 }
 
 /// Where each text or summary block of a streaming reply's
@@ -1468,7 +1485,7 @@ fn parse_complete_response(
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
     let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
-    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage })
+    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage, bounded: false })
 }
 
 /// A value from a one-shot reply, kept to send back; null is absent. It is

@@ -2197,6 +2197,75 @@ fn sse_text(text: &str) -> String {
     ])
 }
 
+/// A reply that thinks for 40 pieces of 400 bytes (about 4,000 tokens), then
+/// calls a tool. Its usage comes last, as servers send it.
+fn sse_long_thought_then_call() -> String {
+    let mut chunks: Vec<serde_json::Value> = (0..40)
+        .map(|_| serde_json::json!({"choices":[{"delta":{"reasoning_content":"t".repeat(400)},"finish_reason":null}]}))
+        .collect();
+    let call = serde_json::json!({"index": 0, "id": "call_0", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"echo ran\"}"}});
+    chunks.push(serde_json::json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":null}]}));
+    chunks.push(serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
+    chunks.push(serde_json::json!({"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":4010}}));
+    sse(&chunks)
+}
+
+/// One run of the long thought, then a call, then an answer, with `extra`
+/// spliced into settings.json: the requests (project path blanked) and the
+/// `--json` events.
+fn run_long_thought(tag: &str, extra: &str) -> (Vec<String>, Vec<serde_json::Value>) {
+    let (project, home) = fresh_dirs(tag);
+    let (base_url, requests, _server) =
+        spawn_scripted_server(vec![(sse_long_thought_then_call(), true), (sse_text("done"), true), (sse_text("done"), true)]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let path = home.join(".openmax/settings.json");
+    let settings = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, settings.replacen('{', &format!("{{{extra}"), 1)).unwrap();
+    let child = cmd(&project, &home)
+        .args(["--trust-project", "--json", "-p", "think, then run the step"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_with_deadline(child);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let root = project.parent().unwrap().to_string_lossy().to_string();
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    let requests = requests.lock().unwrap().iter().map(|r| r.replace(&root, "ROOT")).collect();
+    let events = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    (requests, events)
+}
+
+/// Without `thought_bound_tokens` nothing changes: a bound the reply never
+/// passes sends the same request bytes, and the long thought runs to its call.
+/// With a bound, a reply still only thinking past it ends there, as the reply
+/// limit would end it: the call never comes, the thinking so far goes back,
+/// the cut note names the bound, and usage counts every reasoning token that
+/// arrived.
+#[test]
+fn a_thought_bound_ends_a_long_thought_and_leaves_everything_else_alone() {
+    let (plain, plain_events) = run_long_thought("thought-unset", "");
+    let (far, _) = run_long_thought("thought-far", r#""thought_bound_tokens":1000000,"#);
+    assert_eq!(plain.len(), 2, "the call ran, then the answer: {plain:#?}");
+    assert_eq!(plain, far, "a bound the reply never passes changes no request byte");
+    assert!(plain[1].contains(&"t".repeat(16_000)), "the whole thought went back");
+    let usage: Vec<_> = plain_events.iter().filter(|e| e["type"] == "usage").collect();
+    assert_eq!(usage[0]["completion_tokens"], 4010, "{usage:?}");
+
+    let (bounded, events) = run_long_thought("thought-bound", r#""thought_bound_tokens":1000,"#);
+    assert_eq!(bounded.len(), 2, "the cut thought, then the answer: {bounded:#?}");
+    assert!(!events.iter().any(|e| e["type"] == "tool_start"), "the call after the bound never came: {events:?}");
+    let sent: serde_json::Value = serde_json::from_str(&bounded[1]).unwrap();
+    let messages = sent["messages"].as_array().unwrap();
+    let reply = messages.iter().find(|m| m["role"] == "assistant").expect("the cut thought went back");
+    let thought = reply["reasoning_content"].as_str().unwrap().len();
+    assert!((4_000..=4_800).contains(&thought), "the thinking up to the bound, not past it: {thought} bytes");
+    assert!(bounded[1].contains("reached max_tokens (1000) before any tool call"), "{}", bounded[1]);
+    let usage: Vec<_> = events.iter().filter(|e| e["type"] == "usage").collect();
+    assert_eq!(usage[0]["completion_tokens"], (thought / 4) as u64, "every reasoning token that arrived is counted: {usage:?}");
+    assert!(usage[0]["prompt_tokens"].as_u64().unwrap() > 0, "the prompt counts at its estimate: {usage:?}");
+}
+
 /// Emitting the same unapproved tool twice in one message is the bypass:
 /// consecutive external non-mutating calls are routed to the concurrent batch
 /// path, which has no approval UI. The gate has to survive that routing, so

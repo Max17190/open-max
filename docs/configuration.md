@@ -53,6 +53,17 @@ cut at the end of a line, an open code block is closed, and a closing line
 gives the bytes shown against the total and names the headings of the
 sections left out, so the model knows what to read.
 
+`thought_bound_tokens` ends a reply that is still only thinking once its
+readable reasoning passes that many tokens (estimated at 4 bytes a token),
+before any text or tool call has started. The reply then takes the path of a
+reply the output limit cut while thinking: its thinking so far goes back, and
+the note after it names the bound. A reply that has begun text or a call keeps
+the usual limit, so a large tool call is never cut by the bound. Dropping the
+stream stops the server generating, and the server's usage, which arrives
+last, never comes: the reply counts its reasoning at the estimate and its
+prompt at the estimate the request was admitted with. Chat Completions only.
+Unset (the default) bounds nothing and changes no request.
+
 A missing settings file means defaults, and the default `base_url` and `model`
 are empty: endpoint resolution fails until `base_url`, `model` and
 `context_tokens` are set, here or through a named provider, and one error

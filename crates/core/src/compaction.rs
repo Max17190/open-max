@@ -1765,6 +1765,7 @@ pub(crate) mod tests {
             reasoning_details: None,
             finish_reason: "stop".into(),
             usage,
+            bounded: false,
         };
         let reported = |prompt_tokens| {
             completion(Some(crate::client::Usage { prompt_tokens, ..Default::default() }))
