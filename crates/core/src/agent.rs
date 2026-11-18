@@ -257,8 +257,7 @@ async fn finish_session_work(core: &Core, id: &str, events: Vec<AgentEvent>) {
     let mut state = core.sessions.lock().await;
     let mut running = core.running.lock().unwrap();
     core.cancel_flags.lock().unwrap().remove(id);
-    // Closes the steer queue: a steer the turn never reached is dropped
-    // here, and its frontend, which saw no SteerAccepted for it, still has it.
+    // Closes the steer queue: a steer the turn never reached is dropped here; its frontend saw no SteerAccepted for it.
     core.steers.lock().unwrap().remove(id);
     core.tool_starts.lock().unwrap().retain(|(session, _), _| session != id); // a turn that failed mid-call sent no ToolEnd
     running.remove(id);
