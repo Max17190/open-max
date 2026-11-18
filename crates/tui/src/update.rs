@@ -13,7 +13,7 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 pub enum Install { Homebrew, Npm, Bun, Pnpm, Script { dir: PathBuf, default_dir: bool }, Unknown }
 
 impl Install {
-    pub fn current() -> Self {
+    #[cold] pub fn current() -> Self {
         let Some(exe) = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()) else { return Self::Unknown };
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".config")));
@@ -26,7 +26,7 @@ impl Install {
 
     /// From the binary's canonical path: the npm launcher keeps it in its own
     /// `node_modules/.bin_real`.
-    pub fn detect(exe: &Path, home: Option<&Path>, receipt_dir: Option<&Path>) -> Self {
+    #[cold] pub fn detect(exe: &Path, home: Option<&Path>, receipt_dir: Option<&Path>) -> Self {
         let path = exe.to_string_lossy();
         if path.contains("/Cellar/openmax/") { return Self::Homebrew }
         // Global installs only: a project's own node_modules is its package.json's to update.
@@ -44,7 +44,7 @@ impl Install {
     }
 
     /// The command that updates this install, as a user would type it.
-    pub fn command(&self) -> Option<String> {
+    #[cold] pub fn command(&self) -> Option<String> {
         Some(match self {
             Self::Homebrew => "brew upgrade openmax".into(),
             Self::Npm => "npm install -g openmax-cli@latest".into(),
@@ -58,12 +58,12 @@ impl Install {
 }
 
 /// Whether `latest` is a later dotted-number version than `current`.
-pub fn is_newer(latest: &str, current: &str) -> bool {
+#[cold] pub fn is_newer(latest: &str, current: &str) -> bool {
     let parse = |v: &str| v.trim_start_matches('v').split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
     matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
 }
 
-fn check_enabled(install: &Install) -> bool {
+#[cold] fn check_enabled(install: &Install) -> bool {
     *install != Install::Unknown && std::env::var("OPENMAX_NO_UPDATE_CHECK").map_or(true, |v| v.is_empty() || v == "0")
 }
 
@@ -72,24 +72,24 @@ fn check_enabled(install: &Install) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Cache { pub checked_at: u64, pub latest: Option<String> }
 
-fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) }
+#[cold] fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) }
 
 impl Cache {
-    pub fn read(data_dir: &Path) -> Self {
+    #[cold] pub fn read(data_dir: &Path) -> Self {
         std::fs::read(data_dir.join("update-check.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
-    fn write(&self, data_dir: &Path) {
+    #[cold] fn write(&self, data_dir: &Path) {
         let tmp = data_dir.join(format!("update-check.json.{}", std::process::id()));
         let _ = std::fs::create_dir_all(data_dir).and_then(|_| std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default()))
             .and_then(|_| std::fs::rename(&tmp, data_dir.join("update-check.json")));
     }
 
     /// A day old, never checked, or stamped ahead by a clock that moved back.
-    pub fn due(&self, now: u64) -> bool { now.saturating_sub(self.checked_at) >= DAY || self.checked_at > now }
+    #[cold] pub fn due(&self, now: u64) -> bool { now.saturating_sub(self.checked_at) >= DAY || self.checked_at > now }
 }
 
-pub async fn fetch_latest(url: &str) -> Result<String, String> {
+#[cold] pub async fn fetch_latest(url: &str) -> Result<String, String> {
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10))
         .user_agent(concat!("openmax/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
     let reply = client.get(url).header("Accept", "application/vnd.github+json").send().await.and_then(|r| r.error_for_status());
@@ -98,7 +98,7 @@ pub async fn fetch_latest(url: &str) -> Result<String, String> {
     if is_newer(version, "0") { Ok(version.to_string()) } else { Err(format!("unexpected release {}", release["tag_name"])) }
 }
 
-pub async fn refresh(data_dir: &Path, url: &str) -> Cache {
+#[cold] pub async fn refresh(data_dir: &Path, url: &str) -> Cache {
     let latest = fetch_latest(url).await.ok().or(Cache::read(data_dir).latest);
     let cache = Cache { checked_at: now(), latest };
     cache.write(data_dir);
@@ -107,7 +107,7 @@ pub async fn refresh(data_dir: &Path, url: &str) -> Cache {
 
 /// At a session's start: the notice the cached answer gives, and a refresh
 /// in the background when it is a day old, shown at the next start.
-pub fn on_session_start(data_dir: &Path) -> Option<String> {
+#[cold] pub fn on_session_start(data_dir: &Path) -> Option<String> {
     let install = Install::current();
     if !check_enabled(&install) { return None }
     let cache = Cache::read(data_dir);
@@ -120,12 +120,12 @@ pub fn on_session_start(data_dir: &Path) -> Option<String> {
     notice(&cache, &install)
 }
 
-pub fn notice(cache: &Cache, install: &Install) -> Option<String> {
+#[cold] pub fn notice(cache: &Cache, install: &Install) -> Option<String> {
     let latest = cache.latest.as_deref().filter(|latest| is_newer(latest, CURRENT))?;
     Some(format!("openmax {latest} is available (this is {CURRENT}); type /update, or run `{}`", install.command()?))
 }
 
-pub fn status() -> String {
+#[cold] pub fn status() -> String {
     match Install::current() {
         Install::Unknown => "off (not installed by Homebrew, npm, bun or the install script)".into(),
         install if !check_enabled(&install) => "off (OPENMAX_NO_UPDATE_CHECK)".into(),
@@ -139,7 +139,7 @@ const NOT_INSTALLED: &str = "this binary was not installed by Homebrew, npm, bun
 static REQUESTED: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
 /// Whether `/update` should leave the session: an updatable install, and a newer release or a failed check.
-pub async fn prepare() -> Result<(), String> {
+#[cold] pub async fn prepare() -> Result<(), String> {
     Install::current().command().ok_or(NOT_INSTALLED)?;
     match fetch_latest(RELEASES_URL).await {
         Ok(latest) if !is_newer(&latest, CURRENT) => Err(format!("openmax {CURRENT} is the latest release")),
@@ -147,10 +147,10 @@ pub async fn prepare() -> Result<(), String> {
     }
 }
 
-pub fn request(session: Option<String>) { *REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(session) }
+#[cold] pub fn request(session: Option<String>) { *REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(session) }
 
 /// Run this install's update command on the restored terminal; Ok when it succeeded.
-fn install(data_dir: &Path) -> Result<(), i32> {
+#[cold] fn install(data_dir: &Path) -> Result<(), i32> {
     let install = Install::current();
     let command = install.command().ok_or_else(|| { eprintln!("openmax: {NOT_INSTALLED}"); 1 })?;
     // A failed download must fail the update, not feed `sh` an empty script.
@@ -168,7 +168,7 @@ fn install(data_dir: &Path) -> Result<(), i32> {
 }
 
 /// After `/update` ended the session: update, then exec the new binary on it; Some(exit code) of a failure.
-pub fn relaunch(core: &open_max_core::state::Core) -> Option<i32> {
+#[cold] pub fn relaunch(core: &open_max_core::state::Core) -> Option<i32> {
     let session = REQUESTED.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     // A session discarded on exit for being empty has nothing to resume.
     let resume = session.filter(|id| open_max_core::sessions::meta(core, id).is_some());
@@ -185,7 +185,7 @@ pub fn relaunch(core: &open_max_core::state::Core) -> Option<i32> {
 }
 
 /// `openmax --update`: update when a newer release exists or the check fails (the package manager decides).
-pub async fn run(data_dir: &Path) -> i32 {
+#[cold] pub async fn run(data_dir: &Path) -> i32 {
     if Install::current().command().is_none() {
         eprintln!("openmax: {NOT_INSTALLED}");
         return 1;

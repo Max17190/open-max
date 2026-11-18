@@ -808,13 +808,13 @@ impl App {
         }
         if args.continue_session {
             let project = self.project.display().to_string();
-            let named = args.session.as_ref().map(|id| sessions::meta(&self.core, id).filter(|m| m.project == project).ok_or(format!("no session {id} in this directory")));
-            match named.map_or_else(|| sessions::latest(&self.core, &project), |m| m.map(Some)) {
+            let here = sessions::list(&self.core, &project); // a damaged index is an error, not "missing"
+            match here.map(|here| here.into_iter().find(|m| args.session.as_ref().is_none_or(|id| *id == m.id))) {
                 Ok(Some(meta)) => {
                     self.session_id = Some(meta.id.clone());
                     self.replay(&meta.id);
                 }
-                Ok(None) => self.note("no previous session here; starting fresh"),
+                Ok(None) => self.note(&format!("no {} here; starting fresh", args.session.as_ref().map_or("previous session".into(), |id| format!("session {id}")))),
                 Err(e) => self.error(&sessions::refusal_with_repair(&self.core, e)),
             }
         }
