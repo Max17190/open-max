@@ -4780,8 +4780,9 @@ fn headless_turn_peak_rss_stays_under_its_ratchet() {
     // 4 MB, in bytes (above).
     const TARGET: u64 = 4_000_000;
     // The pinned turn's memory beyond the pinned floor, measured above, plus
-    // 128 KiB.
-    const RATCHET: u64 = (3888 + 128) * KIB;
+    // 128 KiB, plus 32 KiB (two code pages) for the update notice and
+    // /update, which CI's runner measured at 4,032 KiB against main's 4,000.
+    const RATCHET: u64 = (3888 + 128 + 32) * KIB;
     const RUNS: usize = 11;
     // Where the ratchet was measured: macOS on Apple silicon, in a release
     // build.
