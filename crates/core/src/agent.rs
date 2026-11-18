@@ -260,6 +260,7 @@ async fn finish_session_work(core: &Core, id: &str, events: Vec<AgentEvent>) {
     // Closes the steer queue: a steer the turn never reached is dropped
     // here, and its frontend, which saw no SteerAccepted for it, still has it.
     core.steers.lock().unwrap().remove(id);
+    core.tool_starts.lock().unwrap().retain(|(session, _), _| session != id); // a turn that failed mid-call sent no ToolEnd
     running.remove(id);
     // Into the session's event log while this process still holds it: the
     // detach below can release it (see `sessions::record_receipts`).
