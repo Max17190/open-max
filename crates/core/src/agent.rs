@@ -9857,6 +9857,8 @@ echo run >> {}
             assert_eq!(sent["messages"][0]["content"].as_str().unwrap().replace(dir, "<dir>"), before["system"].as_str().unwrap());
             let tools = serde_json::to_string(&sent["tools"]).unwrap();
             assert!(!tools.contains("openmax --recall"), "{tools}");
+            // The background-process sentence came later, and is not what this test pins.
+            let tools = tools.replacen(" Background processes end when the call returns; a named tmux session keeps one running.", "", 1);
             let restored = tools.replacen("openmax --check verifies.", r#"openmax --check verifies; openmax --recall \"<query>\" searches past sessions."#, 1);
             assert_eq!(restored, before["tools"].as_str().unwrap());
         }
