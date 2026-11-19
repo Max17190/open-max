@@ -292,7 +292,7 @@ pub(super) async fn read(
                             }
                             (done, None)
                         }
-                        Err(message) => (result, Some(Unfinished::Failed(ServerFailure { message, retryable: false }))),
+                        Err(message) => (result, Some(Unfinished::Failed(ServerFailure { message, retryable: false, limited: false }))),
                     }
                 }
                 Some("response.failed") => return (result, failed(&event["response"]["error"])),

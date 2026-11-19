@@ -918,10 +918,8 @@ impl ChatClient {
             };
             unreached = 0;
             let status = resp.status();
-            // The server's wait governs a resend whether it refused the
-            // request by status or failed it inside a 200. An ask past the
-            // cap outlasts any wait this turn takes: resending would only
-            // meet the same refusal.
+            // The server's wait governs a resend whether it refused the request by status or failed
+            // it inside a 200. An ask past the cap outlasts any wait this turn takes, so is not resent.
             let asked = retry_after_secs(resp.headers());
             let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
             if !status.is_success() {
@@ -973,6 +971,7 @@ impl ChatClient {
                 let error = [&v["error"], &choice["error"]].into_iter().find(|e| !e.is_null());
                 if error.is_some() || choice["finish_reason"] == "error" {
                     let failure = server_failure(error.unwrap_or(&Value::Null), &String::from_utf8_lossy(&body));
+                    if failure.limited { budget = RATE_LIMIT_ATTEMPTS; }
                     if failure.retryable && attempt < budget && beyond_cap.is_none() {
                         if !resend_after(attempt, budget, &failure.message, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
@@ -994,11 +993,10 @@ impl ChatClient {
                 crate::providers::WireApi::Responses => Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await,
                 crate::providers::WireApi::ChatCompletions => read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await,
             };
-            // The restart rules: nothing the caller keeps has streamed yet,
-            // and the budget has an attempt left. A reply the network cut, or
-            // a retryable server fault ended, after its text began is asked
-            // for again too, CUT_RETRIES times at most between them: the caller
-            // loses the partial text it showed, where keeping it ends the turn.
+            // The restart rules: nothing the caller keeps has streamed yet, and the budget has an attempt
+            // left. A reply the network cut, or a retryable server fault ended, after its text began is asked for
+            // again too, CUT_RETRIES times at most: the caller loses the partial text, where keeping it ends the turn.
+            if let Some(Unfinished::Failed(ServerFailure { limited: true, .. })) = unfinished { budget = RATE_LIMIT_ATTEMPTS; }
             let restartable = reply.content.is_empty() && attempt < budget;
             let cut = !restartable && attempt < budget && cuts < CUT_RETRIES;
             let (again, cut_last) = (" and is asked for again from its start", budget.min(attempt + CUT_RETRIES - cuts));
@@ -1041,11 +1039,12 @@ enum Unfinished {
 struct ServerFailure {
     /// The error to return, or the reason to give for a retry.
     message: String,
-    /// A rate limit, an overloaded server, or a server fault: what a fresh
-    /// attempt can outlast, on the terms [`is_retryable_status`] resends a
-    /// refused status. A refused request, an exhausted quota, or a filtered
-    /// reply would fail the same way again.
+    /// A rate limit, an overloaded server, or a server fault: what a fresh attempt can
+    /// outlast, as [`is_retryable_status`] resends a refused status. A refused request,
+    /// an exhausted quota, or a filtered reply would fail the same way again.
     retryable: bool,
+    /// A rate limit (429, or a code or type naming one) and not a quota: given [`RATE_LIMIT_ATTEMPTS`].
+    limited: bool,
 }
 
 /// Read an `error` value (an object, or a bare message string) so the
@@ -1066,6 +1065,7 @@ fn server_failure(error: &Value, raw: &str) -> ServerFailure {
             Some(status) => u16::try_from(status).is_ok_and(is_retryable_status),
             None => kinds().any(|kind| ["rate_limit", "overloaded", "server_error"].iter().any(|k| kind.contains(k))),
         };
+    let limited = retryable && (status == Some(429) || kinds().any(|kind| kind.contains("rate_limit")));
     let code = match code {
         Value::Null => String::new(),
         // Without the quotes a JSON string would print with.
@@ -1073,7 +1073,7 @@ fn server_failure(error: &Value, raw: &str) -> ServerFailure {
         code => format!(" ({code})"),
     };
     let message = error["message"].as_str().or(error.as_str()).map_or_else(|| describe_backend(raw), |m| truncate(m, 600));
-    ServerFailure { message: format!("backend reported an error{code}: {message}"), retryable }
+    ServerFailure { message: format!("backend reported an error{code}: {message}"), retryable, limited }
 }
 
 /// Parse one SSE stream to its end. The second value says why the stream
@@ -1218,7 +1218,7 @@ async fn read_sse(
                     // Refused as the labeled body is, and not resent: the same
                     // body would come back.
                     Err(message) => {
-                        unfinished = Some(Unfinished::Failed(ServerFailure { message, retryable: false }));
+                        unfinished = Some(Unfinished::Failed(ServerFailure { message, retryable: false, limited: false }));
                         break 'outer;
                     }
                 }
@@ -1320,7 +1320,7 @@ async fn read_sse(
     if tool_calls.is_empty() && content.is_empty() && finish_reason == "tool_calls" && unfinished.is_none() {
         unfinished = Some(Unfinished::Failed(ServerFailure {
             message: "backend ended the reply with finish_reason tool_calls but sent no tool call".into(),
-            retryable: false,
+            retryable: false, limited: false,
         }));
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
@@ -3313,6 +3313,8 @@ pub(crate) mod tests {
                 "backend reported an error (429): Rate limit exceeded",
             ),
         ] {
+            // A rate limit raises the budget, as a 429 status does.
+            let budget = if failure.contains("429") || failure.contains("rate_limit") { RATE_LIMIT_ATTEMPTS } else { MAX_ATTEMPTS };
             let (result, deltas, served) = try_stream_sequence(vec![failure, FINISHED.into()]).await;
             let result = result.expect("the second attempt finished");
             assert_eq!(served, 2);
@@ -3320,7 +3322,7 @@ pub(crate) mod tests {
             assert_eq!(result.content, "all of it");
             assert_eq!(
                 deltas,
-                vec![format!("retry:2/{MAX_ATTEMPTS}:{reason}"), "content:all of it".to_string()]
+                vec![format!("retry:2/{budget}:{reason}"), "content:all of it".to_string()]
             );
         }
     }
@@ -3338,7 +3340,8 @@ pub(crate) mod tests {
             if is_retryable_status(code) {
                 assert_eq!(result.expect("the second attempt finished").content, "all of it", "{code}");
                 assert_eq!(served, 2, "{code} is resent as its status is");
-                assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:backend reported an error ({code}): upstream failed"));
+                let budget = if code == 429 { RATE_LIMIT_ATTEMPTS } else { MAX_ATTEMPTS };
+                assert_eq!(deltas[0], format!("retry:2/{budget}:backend reported an error ({code}): upstream failed"));
             } else {
                 assert_eq!(result.err(), Some(format!("backend reported an error ({code}): upstream failed")));
                 assert_eq!(served, 1, "{code} is reported at once, as its status is");
@@ -3440,6 +3443,44 @@ pub(crate) mod tests {
         assert!(started.elapsed() >= BACKOFF_UNIT * 95);
         assert_eq!((result.content.as_str(), served), ("all of it", 10));
         assert_eq!(deltas[8], format!("retry:10/{RATE_LIMIT_ATTEMPTS}:backend returned 429 Too Many Requests: rate limited"));
+    }
+
+    /// A rate limit a gateway reports inside a 200 gets the same longer
+    /// budget as a 429 status, in each shape it arrives in on a stream: an
+    /// error chunk with code 429, a choice that finished as `error` with code
+    /// 429, and a JSON body. Nine in a row would have ended the request at
+    /// eight attempts; the tenth now gets the reply.
+    #[tokio::test]
+    async fn nine_rate_limits_inside_a_200_no_longer_end_the_request() {
+        let json = |body: &str| format!(
+            "RAW:HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        for (failure, reason) in [
+            (gateway_error_chunk(json!(429), "rate limit reached upstream"), "backend reported an error (429): rate limit reached upstream"),
+            (
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\",\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\"}}]}\n\n".to_string(),
+                "backend reported an error (429): Rate limit exceeded",
+            ),
+            (json(r#"{"error":{"code":429,"message":"rate limit reached upstream"}}"#), "backend reported an error (429): rate limit reached upstream"),
+        ] {
+            let mut bodies = vec![failure; 9];
+            bodies.push(FINISHED.into());
+            let (result, deltas, served) = try_stream_sequence(bodies).await;
+            assert_eq!(result.expect("the tenth attempt finished").content, "all of it", "{reason}");
+            assert_eq!(served, 10, "{reason}");
+            assert_eq!(deltas[8], format!("retry:10/{RATE_LIMIT_ATTEMPTS}:{reason}"));
+        }
+    }
+
+    /// A quota reported inside a 200 is no rate limit: it keeps the short
+    /// budget's terms and is reported at once.
+    #[tokio::test]
+    async fn a_quota_inside_a_200_does_not_get_the_longer_budget() {
+        let quota = gateway_error_chunk(json!("insufficient_quota"), "out of credit");
+        let (result, deltas, served) = try_stream_sequence(vec![quota, FINISHED.into()]).await;
+        assert!(result.err().expect("a quota is reported").contains("out of credit"));
+        assert_eq!((served, deltas.len()), (1, 0));
     }
 
     /// The longer budget has an end: a limit that never lifts is reported
