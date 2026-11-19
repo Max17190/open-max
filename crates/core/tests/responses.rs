@@ -499,14 +499,14 @@ async fn transient_stream_failures_retry_frozen_requests_without_running_abandon
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transient_failure_after_visible_text_does_not_retry_or_run_calls() {
+async fn transient_failure_after_visible_text_is_asked_for_again_without_running_its_calls() {
     let scratch = Scratch::new();
     let payload = event(json!({"type":"response.output_text.delta","delta":"Working"}))
         + &event(json!({"type":"response.output_item.done","output_index":0,
             "item":call("write_file", json!({"path":"forbidden","content":"bad"}))}))
         + &event(json!({"type":"response.failed","response":{"error":{
             "code":"subscription_sharing_usage_unavailable","message":"try again"}}}));
-    let (url, requests, job) = server(vec![payload]).await;
+    let (url, requests, job) = server(vec![payload, done(json!([message("Done")]))]).await;
     scratch.configure(&url);
     open_max_core::trust::grant_trust(&scratch.data(), &scratch.project(), ApprovalMode::Auto)
         .unwrap();
@@ -517,18 +517,15 @@ async fn transient_failure_after_visible_text_does_not_retry_or_run_calls() {
             .iter()
             .any(|e| matches!(e, AgentEvent::Token { text } if text == "Working"))
     );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("try again")))
-    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Retry { reason, .. }
+        if reason.starts_with("the reply failed partway (") && reason.contains("try again"))));
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Retry { .. } | AgentEvent::ToolStart { .. }))
+            .any(|e| matches!(e, AgentEvent::Error { .. } | AgentEvent::ToolStart { .. }))
     );
     assert!(!scratch.project().join("forbidden").exists());
-    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(requests.lock().unwrap().len(), 2);
     job.await.unwrap();
 }
 

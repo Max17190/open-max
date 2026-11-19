@@ -15,8 +15,7 @@
 //! caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
 //! a Retry-After longer than a minute, are reported at once: no wait the
 //! turn would take lets the request succeed. Once reply text has streamed,
-//! a stream the network cut, or one a retryable server fault ended, is
-//! resent at most [`CUT_RETRIES`] times between them, the
+//! a stream the network cut or a retryable server fault ended is resent at most [`CUT_RETRIES`] times, the
 //! announcement saying the caller's partial text is void; a cut after that,
 //! or silence past the idle deadline, is reported as a truncation. A
 //! failure the server reports inside a 200 response (an `error` object on the chunk or reply
@@ -957,33 +956,26 @@ impl ChatClient {
             };
             // The restart rules: nothing the caller keeps has streamed yet,
             // and the budget has an attempt left. A reply the network cut, or
-            // a server fault a fresh attempt can outlast ended, after its
-            // text began is asked for again too, CUT_RETRIES times at most:
-            // the caller loses the partial text it showed, where keeping it
-            // would end the turn.
+            // a retryable server fault ended, after its text began is asked
+            // for again too, CUT_RETRIES times at most between them: the caller
+            // loses the partial text it showed, where keeping it ends the turn.
             let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
             let cut = !restartable && attempt < MAX_ATTEMPTS && cuts < CUT_RETRIES;
+            let (again, cut_last) = (" and is asked for again from its start", MAX_ATTEMPTS.min(attempt + CUT_RETRIES - cuts));
             let (reason, wait, last) = match unfinished {
                 // The network cut it: the server's headers never spoke to that.
                 Some(Unfinished::Interrupted(reason) | Unfinished::Silent(reason)) if restartable => (reason, backoff(attempt, None), MAX_ATTEMPTS),
-                Some(Unfinished::Interrupted(reason)) if cut => {
-                    cuts += 1;
-                    let reason = format!("the reply was cut short ({reason}) and is asked for again from its start");
-                    (reason, backoff(attempt, None), MAX_ATTEMPTS.min(attempt + 1 + CUT_RETRIES - cuts))
-                }
+                Some(Unfinished::Interrupted(reason)) if cut => (format!("the reply was cut short ({reason}){again}"), backoff(attempt, None), cut_last),
                 Some(Unfinished::Failed(failure)) if failure.retryable && restartable && beyond_cap.is_none() => {
                     (failure.message, backoff(attempt, asked), MAX_ATTEMPTS)
                 }
-                Some(Unfinished::Failed(failure)) if failure.retryable && cut && beyond_cap.is_none() => {
-                    cuts += 1;
-                    let reason = format!("the reply failed partway ({}) and is asked for again from its start", failure.message);
-                    (reason, backoff(attempt, asked), MAX_ATTEMPTS.min(attempt + 1 + CUT_RETRIES - cuts))
-                }
+                Some(Unfinished::Failed(f)) if f.retryable && cut && beyond_cap.is_none() => (format!("the reply failed partway ({}){again}", f.message), backoff(attempt, asked), cut_last),
                 // Never a truncated reply: the server said this one failed,
                 // and a tool call it carried must not run.
                 Some(Unfinished::Failed(failure)) => return Err(naming_wait(failure.message, beyond_cap)),
                 _ => return Ok(reply.normalize_empty_tool_arguments(limit)),
             };
+            cuts += u32::from(cut);
             if let Some(usage) = reply.usage { on_delta(StreamDelta::Usage(usage)); }
             if !resend_after(attempt, last, &reason, wait, &cancelled, &mut on_delta).await {
                 return Ok(cancelled_response());
