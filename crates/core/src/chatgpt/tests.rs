@@ -763,6 +763,7 @@ async fn catalog_creates_a_provider_and_preserves_configured_model_limits() {
     saved[2]["context_tokens"] = json!(4096);
     saved[2]["max_tokens"] = json!(1);
     saved[2]["compaction_tokens"] = json!(120_000);
+    saved[2]["image_input"] = json!(true);
     saved[3]["context_tokens"] = json!(0);
     saved[3]["max_tokens"] = json!(0);
     std::fs::write(&path, file.to_string()).unwrap();
@@ -770,6 +771,7 @@ async fn catalog_creates_a_provider_and_preserves_configured_model_limits() {
     assert_eq!(models[2].context_tokens, Some(4096));
     assert_eq!(models[2].max_tokens, Some(1));
     assert_eq!(models[2].compaction_tokens, Some(120_000));
+    assert!(models[2].image_input && !models[3].image_input);
     assert_eq!(models[3].context_tokens, None);
     assert_eq!(models[3].max_tokens, None);
     std::fs::remove_file(&path).unwrap();

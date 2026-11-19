@@ -120,6 +120,8 @@ struct WireMessages<'a> {
     origin: &'a str,
     marks: bool,
     prefer_reasoning_details: bool,
+    /// Whether the endpoint reads images (see `ChatClient::images`).
+    images: bool,
 }
 
 #[derive(Deserialize)]
@@ -175,13 +177,22 @@ pub(crate) fn blank_on_wire(message: &ChatMessage, replay: bool) -> bool {
 
 impl Serialize for WireMessages<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let sent = |m: &&ChatMessage| !blank_on_wire(m, m.reasoning_origin.as_deref() == Some(self.origin));
-        let last = self.messages.iter().filter(sent).count().saturating_sub(1);
-        serializer.collect_seq(self.messages.iter().filter(sent).enumerate().map(|(at, m)| {
+        let sent: Vec<&ChatMessage> = self.messages.iter()
+            .filter(|m| !blank_on_wire(m, m.reasoning_origin.as_deref() == Some(self.origin))).collect();
+        let last = sent.len().saturating_sub(1);
+        let mut run = 0; // Where the current run of tool results began.
+        serializer.collect_seq(sent.iter().enumerate().flat_map(|(at, m)| {
             let (replay, plain) = chat_replay(m, self.origin, self.prefer_reasoning_details);
-            let mark = self.marks && (at == last || m.role == "system");
+            // A tool message's content is text only on this wire, so the
+            // images of a run of tool results follow it in one user message,
+            // which then carries the last message's cache marker.
+            if m.role != "tool" { run = at + 1; }
+            let ends_run = m.role == "tool" && sent.get(at + 1).is_none_or(|next| next.role != "tool");
+            let images: Vec<&crate::types::Image> = sent[run..=at].iter()
+                .filter(|_| self.images && ends_run).flat_map(|m| m.images.iter().flatten()).collect();
+            let mark = self.marks && ((at == last && images.is_empty()) || m.role == "system");
             let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
-            WireMessage {
+            let message = WireMessage {
                 role: &m.role,
                 content: wire_text(m).map(|text| WireContent { text, mark: text_mark }),
                 tool_calls: m.tool_calls.as_deref().map(|calls| WireToolCalls { calls, replay }),
@@ -190,9 +201,28 @@ impl Serialize for WireMessages<'_> {
                 reasoning: m.reasoning.as_deref().filter(|_| plain),
                 reasoning_details: m.reasoning_details.as_deref().filter(|_| replay),
                 cache_control: (mark && !text_mark).then(|| serde_json::json!({"type": "ephemeral"})),
-            }
+            };
+            let images = (!images.is_empty()).then(|| {
+                let parts = images.iter().map(|image| serde_json::json!({"type": "image_url", "image_url": {"url": image.data_url()}}));
+                let text = serde_json::json!({"type": "text", "text": "The images the tool results above returned."});
+                let mut content: Vec<Value> = std::iter::once(text).chain(parts).collect();
+                if self.marks && at == last {
+                    content.last_mut().unwrap()["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+                WireItem::Images(serde_json::json!({"role": "user", "content": content}))
+            });
+            std::iter::once(WireItem::Message(message)).chain(images)
         }))
     }
+}
+
+/// A message on the Chat Completions wire, or the user message that carries
+/// a run of tool results' images.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireItem<'a> {
+    Message(WireMessage<'a>),
+    Images(Value),
 }
 
 /// A message's text as it goes out. A reply that called tools goes back
@@ -301,7 +331,7 @@ fn serialize_chat_request_body(client: &ChatClient, messages: &[ChatMessage], li
         model: &client.model,
         messages: WireMessages {
             messages, origin: &origin, marks: client.cache_marks(),
-            prefer_reasoning_details: client.prefers_reasoning_details(),
+            prefer_reasoning_details: client.prefers_reasoning_details(), images: client.images,
         },
         temperature: client.temperature,
         reasoning_effort: client.reasoning_effort,
@@ -441,6 +471,9 @@ pub struct ChatClient {
     pub use_max_completion_tokens: bool,
     pub send_stream_options: bool,
     prefer_reasoning_details: bool,
+    /// Whether the endpoint reads images: when not, a stored tool result's
+    /// images stay in the session and only its text goes out.
+    pub(crate) images: bool,
     /// How long the endpoint may send nothing before an attempt ends.
     idle_timeout: std::time::Duration,
     /// Why the settings key was withheld from this endpoint, for a 401 to
@@ -591,6 +624,7 @@ impl ChatClient {
             use_max_completion_tokens: false,
             send_stream_options: true,
             prefer_reasoning_details: false,
+            images: false,
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
             cache_key: None, notes_only: Default::default(), reply_bounds: (usize::MAX, usize::MAX),
@@ -610,6 +644,7 @@ impl ChatClient {
             use_max_completion_tokens: ep.compat.use_max_completion_tokens,
             send_stream_options: ep.compat.send_stream_options,
             prefer_reasoning_details: ep.compat.prefer_reasoning_details,
+            images: ep.image_input,
             reply_bounds: (ep.reply_ceiling, ep.context_tokens),
             ..Self::new(ep.base_url.clone(), ep.api_key.clone(), ep.model.clone(), ep.temperature, ep.reply_reserve)
         }
@@ -645,13 +680,16 @@ impl ChatClient {
         let chat = self.wire_api == crate::providers::WireApi::ChatCompletions;
         let prefer_details = self.prefers_reasoning_details();
         let ratio_origin = if prefer_details { format!("{origin}:details") } else { origin.to_owned() };
+        let images = self.images;
+        // A stored image an endpoint does not read is not sent, so not counted.
         let estimate = move |message: &ChatMessage| {
-            if chat {
+            let tokens = if chat {
                 let (replay, plain) = chat_replay(message, origin, prefer_details);
                 message.estimated_tokens_with_replay(replay, plain)
             } else {
                 message.estimated_tokens()
-            }
+            };
+            if images { tokens } else { tokens - message.image_tokens() }
         };
         (ratio_origin, estimate)
     }
@@ -3948,6 +3986,70 @@ pub(crate) mod tests {
         assert!(!quota_exhausted(""));
     }
 
+    /// A stored image counts toward a request only to an endpoint it is sent to.
+    #[test]
+    fn an_image_the_endpoint_does_not_read_is_not_estimated() {
+        let mut message = ChatMessage::tool("c1", "a.png");
+        message.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 750, height: 1 }]);
+        let mut client = chat_client("m", None, 64, false, true);
+        let blind = client.message_estimator("o").1(&message);
+        client.images = true;
+        assert_eq!(client.message_estimator("o").1(&message), blind + 1);
+        assert_eq!(blind, ChatMessage::tool("c1", "a.png").estimated_tokens());
+    }
+
+    /// A tool result's images go out on each wire to an endpoint that reads
+    /// them: beside its text in Responses and Messages, and in one user
+    /// message after the run of tool results in Chat Completions, whose tool
+    /// messages take text only. An endpoint that does not read images gets
+    /// the text alone, byte for byte as if there were none.
+    #[test]
+    fn a_tool_result_carries_its_images_on_every_wire() {
+        let call = ToolCall { id: "c1".into(), kind: "function".into(), function: crate::types::ToolCallFunction { name: "read_file".into(), arguments: "{}".into() }, extra_content: None };
+        let text = "a.png: image/png, 3 bytes, shown to you as an image";
+        let mut shown = ChatMessage::tool("c1", text);
+        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 1, height: 1 }]);
+        let messages = vec![ChatMessage::user("look"), ChatMessage::assistant(None, Some(vec![call])), shown, ChatMessage::tool("c2", "plain")];
+        let mut bare = messages.clone();
+        bare[2].images = None;
+        let tools = "[]";
+        let mut client = chat_client("m", None, 64, false, true);
+        client.images = true;
+        let chat: Value = serde_json::from_slice(&serialize_chat_request_body(&client, &messages, 64, tools).unwrap()).unwrap();
+        assert_eq!(chat["messages"][2]["content"], text);
+        assert_eq!(chat["messages"][3]["content"], "plain");
+        assert_eq!(chat["messages"][4], json!({"role": "user", "content": [
+            {"type": "text", "text": "The images the tool results above returned."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}));
+        assert_eq!(chat["messages"].as_array().unwrap().len(), 5);
+        client.wire_api = crate::providers::WireApi::Responses;
+        let responses: Value = serde_json::from_slice(&responses::serialize(&client, &messages, 64, tools).unwrap()).unwrap();
+        let outputs: Vec<&Value> = responses["input"].as_array().unwrap().iter().filter(|i| i["type"] == "function_call_output").collect();
+        assert_eq!(outputs[0]["output"][1], json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA"}));
+        assert_eq!(outputs[1]["output"], "plain");
+        client.wire_api = crate::providers::WireApi::Anthropic;
+        let native: Value = serde_json::from_slice(&anthropic::serialize(&client, &messages, 64, tools).unwrap()).unwrap();
+        let results: Vec<&Value> = native["messages"].as_array().unwrap().iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|b| b["type"] == "tool_result").collect();
+        assert_eq!(results[0]["content"][1], json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}));
+        assert_eq!(results[1]["content"], "plain");
+        // With cache markers, the image message ends the request and so
+        // carries the last marker; the tool result before it carries none.
+        let marked = serde_json::to_value(WireMessages { messages: &messages[..3], origin: "o", marks: true, prefer_reasoning_details: false, images: true }).unwrap();
+        assert_eq!(marked[2].get("cache_control"), None);
+        assert_eq!(marked[3]["content"][1]["cache_control"], json!({"type": "ephemeral"}));
+        client.images = false;
+        for wire in [crate::providers::WireApi::ChatCompletions, crate::providers::WireApi::Responses, crate::providers::WireApi::Anthropic] {
+            client.wire_api = wire;
+            let body = |messages: &[ChatMessage]| match wire {
+                crate::providers::WireApi::Responses => responses::serialize(&client, messages, 64, tools),
+                crate::providers::WireApi::Anthropic => anthropic::serialize(&client, messages, 64, tools),
+                _ => serialize_chat_request_body(&client, messages, 64, tools),
+            }.unwrap();
+            assert_eq!(body(&messages), body(&bare));
+        }
+    }
+
     #[test]
     fn serialize_chat_request_body_includes_expected_fields_and_messages() {
         let messages = vec![
@@ -4312,7 +4414,7 @@ pub(crate) mod tests {
 
     /// The messages array exactly as `origin` would receive it.
     fn wire(messages: &[ChatMessage], origin: &str) -> String {
-        serde_json::to_string(&WireMessages { messages, origin, marks: false, prefer_reasoning_details: false }).unwrap()
+        serde_json::to_string(&WireMessages { messages, origin, marks: false, prefer_reasoning_details: false, images: false }).unwrap()
     }
 
     /// A reply of reasoning alone whose reasoning a server refused loses its
@@ -4451,7 +4553,7 @@ pub(crate) mod tests {
         assert!(!responses.cache_marks(), "only Chat Completions");
 
         let marked = |text: &str| json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
-        let sent = |messages: &[ChatMessage]| serde_json::to_value(WireMessages { messages, origin: "o", marks: true, prefer_reasoning_details: false }).unwrap();
+        let sent = |messages: &[ChatMessage]| serde_json::to_value(WireMessages { messages, origin: "o", marks: true, prefer_reasoning_details: false, images: false }).unwrap();
         let round = vec![
             ChatMessage::system("p"),
             ChatMessage::user("hi"),

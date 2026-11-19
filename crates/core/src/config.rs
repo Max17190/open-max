@@ -116,6 +116,10 @@ pub struct Settings {
     /// Byte cap for bash/external tool output before truncation with
     /// spill-to-file. Unset means the tuned built-in default.
     pub max_output_bytes: Option<usize>,
+    /// read_file shows an image file (PNG, JPEG, GIF, WebP, up to 5 MiB) to
+    /// the model as an image. Unset follows the model entry's `image_input`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
     /// Global compaction ceiling for transcript plus frozen tool schemas.
     /// Unset uses the active model's ceiling or the built-in default.
     /// The ceiling is floored at 20,000 tokens, capped by the window budget,
@@ -182,6 +186,7 @@ impl Default for Settings {
             temperature: None,
             reasoning_effort: None,
             max_output_bytes: None,
+            image_input: None,
             compaction_tokens: None,
             compaction_keep_tokens: None,
             max_agent_tokens: None,
@@ -454,8 +459,11 @@ pub fn load(data_dir: &Path) -> Result<Settings, String> {
         }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    serde_json::from_str(&text)
-        .map_err(|e| format!("invalid settings file {}: {e}", path.display()))
+    let settings: Settings = serde_json::from_str(&text)
+        .map_err(|e| format!("invalid settings file {}: {e}", path.display()))?;
+    // Registries built from here on tell the model read_file shows images.
+    let _ = crate::providers::resolve(&settings, data_dir);
+    Ok(settings)
 }
 
 /// Write settings.json and return the exact bytes written. The one caller

@@ -81,6 +81,10 @@ pub struct ProviderModel {
     pub max_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_tokens: Option<usize>,
+    /// The model takes images: `image_input` is on for it unless settings
+    /// turn it off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_input: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -162,6 +166,9 @@ pub struct ActiveEndpoint {
     /// sent and how to give the provider its own, for the error a 401 from
     /// it reports.
     pub key_hint: Option<String>,
+    /// Whether tool results show this model images: settings' `image_input`
+    /// when set, else what the model entry declares, else off.
+    pub image_input: bool,
 }
 
 /// The reply limit (leaving 2048 tokens of window) and the input budget's reserve: it, at most max(4096, window/8).
@@ -645,6 +652,14 @@ fn join_list(items: &[&str], last: &str) -> String {
 /// When `settings.provider` is set, that name must exist. Silent fallback to
 /// flat `base_url` would send traffic to the wrong endpoint.
 pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
+    let endpoint = resolve_endpoint(settings, data_dir)?;
+    // Registries built from here on tell the model read_file shows images
+    // (`tools::IMAGE_INPUT`): a run's first resolve comes before its session's.
+    crate::tools::IMAGE_INPUT.store(endpoint.image_input, std::sync::atomic::Ordering::Relaxed);
+    Ok(endpoint)
+}
+
+fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
     let (providers, parse_error) = load_snapshot(data_dir);
     let provider_name = settings
         .provider
@@ -730,6 +745,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
             compat: p.compat.clone(),
             idle_timeout_secs: p.idle_timeout_secs,
             key_hint,
+            image_input: settings.image_input.unwrap_or(model_entry.is_some_and(|m| m.image_input)),
         });
     }
 
@@ -774,6 +790,7 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
         compat: CompatFlagsFile::default().into(),
         idle_timeout_secs: None,
         key_hint: None,
+        image_input: settings.image_input.unwrap_or(false),
     })
 }
 
@@ -934,6 +951,27 @@ mod tests {
     fn write_providers(dir: &Path, json: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(providers_path(dir), json).unwrap();
+    }
+
+    /// Image input follows the model entry: on for a model that declares it,
+    /// off for one that does not and on the flat path, and `image_input` in
+    /// settings overrides either way. Read through `resolve_endpoint`, so
+    /// the process-wide description switch stays as other tests expect it.
+    #[test]
+    fn image_input_follows_the_model_entry_unless_settings_set_it() {
+        let dir = std::env::temp_dir().join(format!("openmax-prov-{}", uuid::Uuid::new_v4()));
+        write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://127.0.0.1:9/v1","models":[
+            {"id":"sees","context_tokens":65536,"image_input":true},{"id":"blind","context_tokens":65536}]}}}"#);
+        invalidate_providers_cache();
+        let on = |model: &str, setting: Option<bool>| {
+            let s = Settings { provider: Some("p".into()), model: model.into(), image_input: setting, ..Default::default() };
+            resolve_endpoint(&s, &dir).unwrap().image_input
+        };
+        assert_eq!([on("sees", None), on("sees", Some(false)), on("blind", None), on("blind", Some(true))], [true, false, false, true]);
+        let flat = |setting| Settings { base_url: "http://127.0.0.1:9/v1".into(), model: "m".into(), context_tokens: Some(65_536), image_input: setting, ..Default::default() };
+        assert!(!resolve_endpoint(&flat(None), &dir).unwrap().image_input);
+        assert!(resolve_endpoint(&flat(Some(true)), &dir).unwrap().image_input);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

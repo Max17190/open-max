@@ -68,11 +68,14 @@ const MAX_DIR_ENTRIES: usize = 200;
 #[derive(Clone, Copy)]
 pub struct OutputCaps {
     pub command_bytes: usize,
+    /// read_file shows an image file to the model as an image, and an
+    /// external tool's images reach it with the result (`image_input`).
+    pub images: bool,
 }
 
 impl Default for OutputCaps {
     fn default() -> Self {
-        Self { command_bytes: MAX_OUTPUT_BYTES }
+        Self { command_bytes: MAX_OUTPUT_BYTES, images: false }
     }
 }
 
@@ -92,7 +95,7 @@ impl OutputCaps {
             (None, Some(tokens)) => (tokens.saturating_mul(3) / 8).clamp(MAX_OUTPUT_BYTES, MAX_WINDOW_OUTPUT_BYTES),
             (None, None) => MAX_OUTPUT_BYTES,
         };
-        Self { command_bytes }
+        Self { command_bytes, images: settings.image_input == Some(true) }
     }
 
     /// The bytes one read_file call may return: the command cap, held
@@ -129,6 +132,9 @@ pub struct ToolOutcome {
     pub process_bytes: Option<u64>,
     /// True when `output` dropped part of what the process produced.
     pub process_truncated: bool,
+    /// Images the result shows the model beside `output` (read_file on an
+    /// image with `image_input` on).
+    pub images: Vec<crate::types::Image>,
 }
 
 impl ToolOutcome {
@@ -164,6 +170,7 @@ impl ToolOutcome {
                 process.stdout.total_bytes.saturating_add(process.stderr.total_bytes),
             ),
             process_truncated: truncated,
+            images: Vec::new(),
         }
     }
 }
@@ -201,6 +208,13 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
 /// pointer at all. Every command it names runs through bash.
 pub(crate) const BASH_DESCRIPTION: &str = "Run a shell command in the project root. Extend Open Max: openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp|subagent> prints a contract; openmax --check verifies.";
 
+/// Set when the loaded settings turn `image_input` on: the read_file entry
+/// of every tools array built after says it shows images. Off, the array is
+/// exactly `tool_schemas()`.
+pub static IMAGE_INPUT: AtomicBool = AtomicBool::new(false);
+pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a file as numbered lines.";
+pub(crate) const READ_FILE_IMAGE_DESCRIPTION: &str = "Read a file as numbered lines. An image file (PNG, JPEG, GIF, WebP) is shown to you as an image.";
+
 /// Tool schemas in the OpenAI `tools` wire format. Kept deliberately small and
 /// strict — small local models do much better with fewer, simpler parameters.
 pub fn tool_schemas() -> &'static Value {
@@ -225,7 +239,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file as numbered lines.",
+                "description": READ_FILE_DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -481,7 +495,7 @@ pub(crate) async fn execute_in_session(
     let task_cancel = cancel.clone();
     let task = tokio::task::spawn_blocking(move || match name.as_str() {
             "list_dir" => list_dir(&root, &args),
-            "read_file" => read_file(&root, &args, caps.read_bytes(), &task_cancel),
+            "read_file" => read_file(&root, &args, caps, &task_cancel),
             "write_file" => write_file(&root, &args),
             "edit_file" => edit_file(&root, &args),
             "glob" => glob_tool(&root, &args),
@@ -549,7 +563,114 @@ fn list_dir(root: &Path, args: &Value) -> ToolOutcome {
     ToolOutcome::ok(output)
 }
 
-fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) -> ToolOutcome {
+/// The media type of an image file from its first bytes, for the formats
+/// image-taking models accept.
+pub fn image_mime(head: &[u8]) -> Option<&'static str> {
+    match head {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Width and height from an image's header, for the formats `image_mime`
+/// knows; None when the header is cut short or names no size.
+pub fn image_size(b: &[u8]) -> Option<(u32, u32)> {
+    let be = |i: usize, n: usize| b.get(i..i + n).map(|s| s.iter().fold(0u32, |a, &x| a << 8 | u32::from(x)));
+    let le = |i: usize, n: usize| b.get(i..i + n).map(|s| s.iter().rev().fold(0u32, |a, &x| a << 8 | u32::from(x)));
+    let size = match image_mime(b)? {
+        "image/png" => (be(16, 4)?, be(20, 4)?),
+        "image/gif" => (le(6, 2)?, le(8, 2)?),
+        "image/webp" => match b.get(12..16)? {
+            b"VP8 " => (le(26, 2)? & 0x3FFF, le(28, 2)? & 0x3FFF),
+            b"VP8L" => le(21, 4).map(|v| ((v & 0x3FFF) + 1, (v >> 14 & 0x3FFF) + 1))?,
+            b"VP8X" => (le(24, 3)? + 1, le(27, 3)? + 1),
+            _ => return None,
+        },
+        // JPEG: the segments up to the first start of frame, past fill bytes.
+        _ => {
+            let mut i = 2;
+            loop {
+                match (*b.get(i)?, *b.get(i + 1)?) {
+                    (0xFF, 0xFF) => i += 1,
+                    (0xFF, 0xC0..=0xCF) if !matches!(b[i + 1], 0xC4 | 0xC8 | 0xCC) => break (be(i + 7, 2)?, be(i + 5, 2)?),
+                    (0xFF, _) => i += 2 + be(i + 2, 2)? as usize,
+                    _ => return None,
+                }
+            }
+        }
+    };
+    Some(size).filter(|&(w, h)| w > 0 && h > 0)
+}
+
+/// What one call may show: this many bytes of images in all, counted before
+/// base64, and at most `MAX_IMAGES` of them, the first in order.
+const IMAGE_BUDGET: u64 = 5 * 1024 * 1024;
+const MAX_IMAGES: usize = 8;
+
+/// The variable naming the folder an external tool may put images in, set
+/// only when `image_input` is on. Each file there, in name order, reaches the
+/// model as an image part of that call's result, and the folder is removed
+/// after the call, so the picture needs no file the model reads back and no
+/// extra round. The MCP bridge writes a server's image results there.
+pub const IMAGE_DIR_ENV: &str = "OPENMAX_IMAGE_DIR";
+
+/// The one step every image takes before it enters the history: read_file
+/// and an external tool's folder both come here. Each file, in the order
+/// given, is sniffed, sized from its header and held to the call's budget;
+/// one left out gets a line saying why. A resize to fit the model would go
+/// between the size and the budget, so the budget counts what is sent.
+pub(crate) fn prepare_images(files: &[(String, PathBuf)]) -> (Vec<crate::types::Image>, Vec<String>) {
+    use base64::Engine;
+    let (mut images, mut omitted, mut spent) = (Vec::new(), Vec::new(), 0u64);
+    for (name, path) in files {
+        let len = std::fs::metadata(path).map_or(0, |m| m.len());
+        let why = if images.len() == MAX_IMAGES {
+            format!("one call shows at most {MAX_IMAGES} images")
+        } else if spent + len > IMAGE_BUDGET {
+            format!("over the 5 MiB of images one call shows, {} bytes of it left", IMAGE_BUDGET - spent)
+        } else {
+            // Read no more than the budget left, plus a byte to tell a file
+            // that grew since its size was taken.
+            let mut bytes = Vec::new();
+            let left = IMAGE_BUDGET - spent;
+            match std::fs::File::open(path).and_then(|file| std::io::Read::read_to_end(&mut std::io::Read::take(file, left + 1), &mut bytes)) {
+                Err(e) => format!("unreadable: {e}"),
+                Ok(_) if bytes.len() as u64 > left => format!("over the 5 MiB of images one call shows, {left} bytes of it left"),
+                Ok(_) => match (image_mime(&bytes), image_size(&bytes)) {
+                    (None, _) => "not a PNG, JPEG, GIF or WebP image".into(),
+                    (Some(mime), None) => format!("{mime} whose header gives no size"),
+                    (Some(mime), Some((width, height))) => {
+                        spent += bytes.len() as u64;
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        images.push(crate::types::Image { mime: mime.into(), data, width, height });
+                        continue;
+                    }
+                },
+            }
+        };
+        omitted.push(format!("[image {name} ({len} bytes) not shown: {why}]"));
+    }
+    (images, omitted)
+}
+
+/// The images an external tool left in `dir`, in name order, with a line for
+/// each one left out, then the folder removed. A link is never followed, so
+/// the folder cannot point the call at another file.
+pub(crate) fn take_tool_images(dir: &Path) -> (Vec<crate::types::Image>, Vec<String>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.path())).collect();
+    entries.sort();
+    let (files, links): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, p)| p.symlink_metadata().is_ok_and(|m| m.is_file()));
+    let (images, mut omitted) = prepare_images(&files);
+    omitted.extend(links.iter().map(|(name, _)| format!("[image {name} not shown: not a regular file]")));
+    let _ = std::fs::remove_dir_all(dir);
+    (images, omitted)
+}
+
+fn read_file(root: &Path, args: &Value, caps: OutputCaps, cancel: &CancelToken) -> ToolOutcome {
+    let max_bytes = caps.read_bytes();
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
     };
@@ -580,6 +701,12 @@ fn read_file(root: &Path, args: &Value, max_bytes: usize, cancel: &CancelToken) 
         }
         Err(e) => return ToolOutcome::err(e.message(rel)),
     };
+    let mut head = [0u8; 12];
+    if caps.images && std::fs::File::open(&path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && image_mime(&head).is_some() {
+        let (images, omitted) = prepare_images(&[(rel.to_string(), path)]);
+        let output = images.first().map_or_else(|| omitted.concat(), |i| format!("{rel}: {}, {}x{}, {} bytes, shown to you as an image", i.mime, i.width, i.height, meta.len()));
+        return ToolOutcome { ok: !images.is_empty(), output, images, ..ToolOutcome::default() };
+    }
     // The cap keeps a whole-file read of a huge file out of memory. A
     // window of one streams instead, and the refusal below tells the model
     // to ask for one: refusing that too would leave it nothing to retry. It
@@ -3077,7 +3204,7 @@ mod tests {
 
     /// read_file in a call nothing cancels.
     fn read_file(root: &Path, args: &Value) -> ToolOutcome {
-        super::read_file(root, args, OutputCaps::default().read_bytes(), &CancelToken::default())
+        super::read_file(root, args, OutputCaps::default(), &CancelToken::default())
     }
 
     /// A bash call in a session of its own, which no result has yet told
@@ -4062,7 +4189,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 &"}),
-            OutputCaps { command_bytes: 1_000 },
+            OutputCaps { command_bytes: 1_000, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4306,7 +4433,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "echo RESULT; for i in $(seq 1 3000); do echo warn-$i >&2; done"}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4337,7 +4464,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4376,7 +4503,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap },
+            OutputCaps { command_bytes: cap, images: false },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4616,7 +4743,7 @@ mod tests {
         std::fs::write(root.join("big.log"), line.repeat(MAX_FILE_BYTES as usize / line.len() + 1)).unwrap();
         let cancel = CancelToken::default();
         cancel.cancel();
-        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), MAX_READ_BYTES, &cancel);
+        let out = super::read_file(&root, &json!({"path": "big.log", "offset": 1, "limit": 1}), OutputCaps::default(), &cancel);
         assert_eq!((out.ok, out.output.as_str()), (false, "tool cancelled by user"));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4645,6 +4772,100 @@ mod tests {
         assert_eq!(next_line(&mut reader, &mut kept, 0).unwrap(), Some(2));
         assert!(kept.is_empty());
         assert_eq!(next_line(&mut reader, &mut kept, 2).unwrap(), None);
+    }
+
+    /// A PNG header of the given size, padded to `len` bytes.
+    pub(crate) fn png(width: u32, height: u32, len: usize) -> Vec<u8> {
+        let mut b = [&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13][..], b"IHDR", &width.to_be_bytes(), &height.to_be_bytes()].concat();
+        b.resize(len.max(b.len()), 7);
+        b
+    }
+
+    /// With `image_input` on, read_file returns an image file as an image
+    /// beside one line of text, or says why it is not shown; off, and for
+    /// text files, nothing changes.
+    #[test]
+    fn read_file_shows_an_image_only_with_image_input() {
+        use base64::Engine;
+        let root = temp_project();
+        let png = png(640, 480, 48);
+        std::fs::write(root.join("board.png"), &png).unwrap();
+        std::fs::write(root.join("huge.png"), self::png(9, 9, 5 * 1024 * 1024 + 1)).unwrap();
+        std::fs::write(root.join("cut.png"), &png[..12]).unwrap();
+        let on = OutputCaps { images: true, ..OutputCaps::default() };
+        let read = |path: &str, caps| super::read_file(&root, &json!({"path": path}), caps, &CancelToken::default());
+        let off = read("board.png", OutputCaps::default());
+        assert_eq!((off.ok, off.output.as_str(), off.images.len()), (false, "board.png is not a UTF-8 text file", 0));
+        let shown = read("board.png", on);
+        assert!(shown.ok, "{}", shown.output);
+        assert_eq!(shown.output, "board.png: image/png, 640x480, 48 bytes, shown to you as an image");
+        assert_eq!(shown.images.len(), 1);
+        assert_eq!((shown.images[0].mime.as_str(), shown.images[0].width, shown.images[0].height), ("image/png", 640, 480));
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&shown.images[0].data).unwrap(), png);
+        let huge = read("huge.png", on);
+        assert_eq!((huge.ok, huge.images.len()), (false, 0));
+        assert_eq!(huge.output, "[image huge.png (5242881 bytes) not shown: over the 5 MiB of images one call shows, 5242880 bytes of it left]");
+        let cut = read("cut.png", on);
+        assert_eq!((cut.ok, cut.output.as_str()), (false, "[image cut.png (12 bytes) not shown: image/png whose header gives no size]"));
+        let text = read("src/a.rs", on);
+        assert_eq!((text.output, text.images.len()), (read("src/a.rs", OutputCaps::default()).output, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The header gives the size of each format a model takes, and nothing
+    /// for a header cut short or a file that is not an image.
+    #[test]
+    fn image_size_reads_each_formats_header() {
+        let gif = [&b"GIF89a"[..], &300u16.to_le_bytes(), &200u16.to_le_bytes()].concat();
+        // A JPEG: start of image, an APP0 segment, a fill byte, then a baseline frame.
+        let jpeg = [&[0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xFF, 0xC0, 0, 17, 8][..], &768u16.to_be_bytes(), &1024u16.to_be_bytes()].concat();
+        let webp = |chunk: &[u8], rest: &[u8]| [&b"RIFF\0\0\0\0WEBP"[..], chunk, &[0; 4], rest].concat();
+        let vp8 = webp(b"VP8 ", &[0, 0, 0, 0x9D, 0x01, 0x2A, 0x40, 0x01, 0xF0, 0x00]);
+        // VP8L: the signature byte, then 14 bits of width less one and 14 of height less one.
+        let lossless = webp(b"VP8L", &[&[0x2F][..], &(319u32 | 239 << 14).to_le_bytes()].concat());
+        let extended = webp(b"VP8X", &[0, 0, 0, 0, 0x7F, 0x07, 0, 0x37, 0x04, 0]);
+        for (case, bytes, size) in [
+            ("png", png(640, 480, 0), Some((640, 480))),
+            ("gif", gif.clone(), Some((300, 200))),
+            ("jpeg", jpeg.clone(), Some((1024, 768))),
+            ("webp lossy", vp8, Some((320, 240))),
+            ("webp lossless", lossless, Some((320, 240))),
+            ("webp extended", extended, Some((1920, 1080))),
+            ("png cut short", png(640, 480, 0)[..20].to_vec(), None),
+            ("jpeg with no frame", jpeg[..8].to_vec(), None),
+            ("gif of no size", [&b"GIF89a"[..], &[0; 4]].concat(), None),
+            ("text", b"hello, world".to_vec(), None),
+        ] {
+            assert_eq!(image_size(&bytes), size, "{case}");
+        }
+    }
+
+    /// One call's images share 5 MiB of raw bytes and eight places, taken in
+    /// the order given; each one left out, and each file that is not an
+    /// image, gets a line with its size and the reason.
+    #[test]
+    fn a_calls_images_share_one_budget_and_each_omitted_one_is_named() {
+        let root = temp_project();
+        let file = |name: &str, bytes: Vec<u8>| { std::fs::write(root.join(name), bytes).unwrap(); (name.to_string(), root.join(name)) };
+        let mib = 1024 * 1024;
+        let files = vec![
+            file("a.png", png(10, 10, 2 * mib)),
+            file("b.png", png(10, 10, 2 * mib)),
+            file("c.png", png(10, 10, 2 * mib)),
+            file("d.txt", b"not an image".to_vec()),
+            file("e.png", png(10, 10, mib - 100)),
+        ];
+        let (images, omitted) = prepare_images(&files);
+        assert_eq!(images.len(), 3, "a, b and e fit; c would pass 5 MiB");
+        assert_eq!(omitted, [
+            format!("[image c.png ({} bytes) not shown: over the 5 MiB of images one call shows, {mib} bytes of it left]", 2 * mib),
+            "[image d.txt (12 bytes) not shown: not a PNG, JPEG, GIF or WebP image]".to_string(),
+        ]);
+        let many: Vec<_> = (0..10).map(|i| file(&format!("{i}.png"), png(10 + i, 10, 100))).collect();
+        let (images, omitted) = prepare_images(&many);
+        assert_eq!(images.iter().map(|i| i.width).collect::<Vec<_>>(), (10..18).collect::<Vec<_>>(), "the first eight in order");
+        assert_eq!(omitted, ["[image 8.png (100 bytes) not shown: one call shows at most 8 images]", "[image 9.png (100 bytes) not shown: one call shows at most 8 images]"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// read_file discarded the read error and called every failure "not a
@@ -5446,7 +5667,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_over_the_cap_is_a_quarter_cap_preview_of_its_log() {
         let root = temp_project();
-        let caps = OutputCaps { command_bytes: 4_000 };
+        let caps = OutputCaps { command_bytes: 4_000, images: false };
         let data = root.join("data");
         let fill = json!({"command": "head -c 4000 /dev/zero | tr '\\0' a"});
         let fits = bash_tool(&data, &root, &fill, caps, Arc::new(CancelToken::default())).await;

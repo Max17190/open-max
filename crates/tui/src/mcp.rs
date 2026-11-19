@@ -641,7 +641,11 @@ fn render_content(result: &Value) -> Result<String, String> {
             let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
             match field("type") {
                 "text" => field("text").to_string(),
-                media @ ("image" | "audio") => {
+                "image" => match handed_image(field("data")) {
+                    Some(name) => format!("[image {name}, {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
+                    None => format!("[image {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
+                },
+                media @ "audio" => {
                     format!("[{media} {}, {} bytes]", field("mimeType"), base64_len(field("data")))
                 }
                 "resource" => {
@@ -663,6 +667,23 @@ fn render_content(result: &Value) -> Result<String, String> {
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// Hand an image result to the harness, which shows it to the model with
+/// this call's result: with `image_input` on, the harness names a folder in
+/// `OPENMAX_IMAGE_DIR` and takes every image file left there. Off (or the
+/// bridge run by hand), or in a format the model would not be sent, nothing is
+/// written and the line only describes the image. Files are numbered so the
+/// harness keeps the server's order, and the line names its file, which a
+/// note the harness adds names again if the image is not shown.
+fn handed_image(data: &str) -> Option<String> {
+    use base64::Engine;
+    static HANDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::var_os(open_max_core::tools::IMAGE_DIR_ENV)?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim_end()).ok()?;
+    open_max_core::tools::image_mime(&bytes)?;
+    let name = format!("{:04}", HANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    std::fs::write(std::path::Path::new(&dir).join(&name), bytes).ok().map(|_| name)
 }
 
 /// The decoded size of base64 text, without decoding it.

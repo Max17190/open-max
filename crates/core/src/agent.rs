@@ -114,7 +114,9 @@ pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &t
         core.send_agent(session_id, AgentEvent::Diff { call_id: call_id.into(), path, diff, added, removed });
     }
     core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: outcome.ok, output: outcome.output.clone(), duration_ms: None });
-    messages.push(ChatMessage::tool(call_id, tool_message_content(outcome)));
+    let mut message = ChatMessage::tool(call_id, tool_message_content(outcome));
+    message.images = Some(outcome.images.clone()).filter(|images| !images.is_empty());
+    messages.push(message);
 }
 
 /// What a call the user cancelled answers, on the wire and to the model.
@@ -424,7 +426,7 @@ async fn run_compact(
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
     // The same overhead the turn loop budgets with: the tool schemas.
-    let schemas_wire = registry.schemas_wire_arc();
+    let schemas_wire = registry.schemas_wire_for(endpoint.image_input);
     let schema_tokens = request_overhead(&schemas_wire);
     // In estimator units, like the turn loop's; the receipt converts back.
     let factor = token_factor(prompt_ratio);
@@ -693,9 +695,10 @@ async fn run_loop(
     // Frozen wire form: every request of the session injects the same tool
     // schema bytes without re-serializing the Value array. A refreeze swaps
     // the registry and keeps these (a tool file written since rides the
-    // note), so they never move until /reload.
-    let schemas_wire = registry.schemas_wire_arc();
-    let caps = tools::OutputCaps::from_settings(&settings, Some(endpoint.context_tokens));
+    // note), so they never move until /reload, read_file's description
+    // aside, which follows the endpoint's image input.
+    let schemas_wire = registry.schemas_wire_for(endpoint.image_input);
+    let caps = tools::OutputCaps { images: endpoint.image_input, ..tools::OutputCaps::from_settings(&settings, Some(endpoint.context_tokens)) };
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).
     if first_turn {
@@ -5349,6 +5352,40 @@ mod tests {
     /// goes to the first doubling above it where the model declares a longer
     /// reply, and is asked for in parts at once where it does not. A cut
     /// thought in the room keeps the plain doubling.
+    /// A model whose entry declares no image input, with `image_input` unset,
+    /// sends today's request: read_file on a PNG answers with the text error
+    /// and no image part, and read_file keeps its usual description.
+    #[tokio::test]
+    async fn a_model_without_image_input_sends_todays_request() {
+        use crate::state::Core;
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.png"), [&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13][..], b"IHDR", &[0, 0, 0, 9, 0, 0, 0, 9]].concat()).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let read = raw_calls_sse(&[("c1", "read_file", r#"{"path":"a.png"}"#)], "tool_calls", None);
+        let (base_url, bodies) = refusing_endpoint(&[&read, STOP_SSE], |_, _| None).await;
+        let entry = serde_json::json!({"providers": {"p": {"base_url": base_url, "models": [{"id": "m", "context_tokens": 65_536}]}}});
+        std::fs::write(crate::providers::providers_path(&core.data_dir), entry.to_string()).unwrap();
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.provider, s.model, s.approval_mode) = (Some("p".into()), "m".into(), ApprovalMode::Auto);
+        }
+        start_turn(core.clone(), "sess-blind".into(), project, "look at a.png".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        let sent: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let result = sent["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(result["content"], "Error: a.png is not a UTF-8 text file", "a plain string, as today");
+        assert!(bodies.iter().all(|b| !b.contains("image_url") && !b.contains("shown to you as an image")), "no image part or image description");
+        let described = |b: &Value| b["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "read_file").unwrap()["function"]["description"].clone();
+        let today = crate::tools::tool_schemas().as_array().unwrap().iter().find(|t| t["function"]["name"] == "read_file").unwrap()["function"]["description"].clone();
+        assert_eq!(described(&sent), today);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn a_call_cut_at_its_room_is_never_offered_less_than_that_room() {
         const LOST: &str = concat!(

@@ -606,8 +606,20 @@ impl Registry {
 
     /// Owned handle to the same frozen bytes, for turn state that must
     /// outlive a mid-turn registry swap.
+    #[cfg(test)]
     pub(crate) fn schemas_wire_arc(&self) -> Arc<str> {
         self.schemas_wire.clone()
+    }
+
+    /// The frozen tools array as an endpoint that does (or does not) read
+    /// images is sent it: the read_file entry says so, so a model switch
+    /// that turns image input on or off is told without a /reload. Unchanged
+    /// when the freeze already matches.
+    pub(crate) fn schemas_wire_for(&self, images: bool) -> Arc<str> {
+        let entry = |text: &str| format!("\"description\":{}", Value::from(text));
+        let (text, image) = (entry(tools::READ_FILE_DESCRIPTION), entry(tools::READ_FILE_IMAGE_DESCRIPTION));
+        let (from, to) = if images { (text, image) } else { (image, text) };
+        if self.schemas_wire.contains(&from) { self.schemas_wire.replacen(&from, &to, 1).into() } else { self.schemas_wire.clone() }
     }
 
     /// Estimated tokens the frozen schemas add to *every* request in this
@@ -937,6 +949,11 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
 fn with_builtins(entries: impl IntoIterator<Item = Value>) -> Value {
     let mut schemas = tools::tool_schemas().clone();
     if let Some(arr) = schemas.as_array_mut() {
+        if tools::IMAGE_INPUT.load(std::sync::atomic::Ordering::Relaxed) {
+            for entry in arr.iter_mut().filter(|entry| entry_name(entry) == "read_file") {
+                entry["function"]["description"] = tools::READ_FILE_IMAGE_DESCRIPTION.into();
+            }
+        }
         arr.extend(entries);
     }
     schemas
@@ -1382,6 +1399,18 @@ async fn spawn_external(
     sandbox: Option<execution::SandboxPolicy>,
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
+    // With image_input on, the tool gets a fresh folder for images that go
+    // back with its result. A probe run (sandboxed) never sees images. The
+    // folder is created here or not used, so one a killed run left behind
+    // under the same name is never taken as this call's.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let image_dir = (caps.images && sandbox.is_none())
+        .then(|| {
+            let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            data_dir.join("tool-images").join(format!("{}-{nanos}-{n}", std::process::id()))
+        })
+        .filter(|dir| dir.parent().is_some_and(|parent| std::fs::create_dir_all(parent).is_ok()) && std::fs::create_dir(dir).is_ok());
     let request = ProcessRequest {
         program: tool.command.clone().into(),
         args: tool.args.iter().cloned().map(Into::into).collect(),
@@ -1398,10 +1427,10 @@ async fn spawn_external(
         sandbox,
         env_allowlist: Some(tool.env.clone()),
         self_link: false,
-        env: Vec::new(),
+        env: image_dir.iter().map(|dir| (tools::IMAGE_DIR_ENV.into(), dir.clone().into_os_string())).collect(),
     };
 
-    match execution::run_process(request, cancel).await {
+    let mut outcome = match execution::run_process(request, cancel).await {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!(
                 "failed to start external tool '{name}' (command '{}', defined in {}): {e}",
                 tool.command,
@@ -1439,12 +1468,38 @@ async fn spawn_external(
                 tools::exited_outcome(&output, status, caps.command_bytes, background_noted)
             }
         },
+    };
+    if let Some(dir) = image_dir {
+        let omitted;
+        (outcome.images, omitted) = tools::take_tool_images(&dir);
+        omitted.iter().for_each(|line| outcome.output = format!("{}\n{line}", outcome.output.trim_end()));
     }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session frozen for one endpoint, sent to one whose image input
+    /// differs, gets read_file's description for the endpoint it reaches;
+    /// one that matches keeps its frozen bytes.
+    #[test]
+    fn read_files_description_follows_the_endpoints_image_input() {
+        let registry = Registry::builtin_only();
+        let frozen = registry.schemas_wire_arc();
+        assert!(Arc::ptr_eq(&registry.schemas_wire_for(false), &frozen));
+        let described = |wire: &str| {
+            let tools: Value = serde_json::from_str(wire).unwrap();
+            tools.as_array().unwrap().iter().find(|t| entry_name(t) == "read_file").unwrap()["function"]["description"].clone()
+        };
+        let with_images = registry.schemas_wire_for(true);
+        assert_eq!(described(&with_images), tools::READ_FILE_IMAGE_DESCRIPTION);
+        assert_eq!(with_images.replacen(tools::READ_FILE_IMAGE_DESCRIPTION, tools::READ_FILE_DESCRIPTION, 1), *frozen, "nothing else moves");
+        let mut image_frozen = Registry::builtin_only();
+        image_frozen.schemas_wire = with_images.clone();
+        assert_eq!(*image_frozen.schemas_wire_for(false), *frozen);
+    }
     use crate::state::CancelToken;
 
     fn no_cancel() -> Arc<CancelToken> {
@@ -2552,6 +2607,53 @@ mutatng = true
         let _ = std::fs::remove_dir_all(project);
     }
 
+    /// With image_input on, an image a tool leaves in the folder it is handed
+    /// reaches the model with that call's result, in name order, with the
+    /// size its header gives, and the folder is gone after the call. A file
+    /// that is not an image, and a link, are named as not shown. Off, the
+    /// tool is handed no folder at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_external_tools_images_come_back_with_its_result() {
+        use base64::Engine;
+        let project = temp_dir("imgproj");
+        let data = temp_dir("imgdata");
+        let tools_dir = project.join(".openmax").join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let png = |width: u32| [&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13][..], b"IHDR", &width.to_be_bytes(), &90u32.to_be_bytes()].concat();
+        std::fs::write(project.join("first.png"), png(160)).unwrap();
+        std::fs::write(project.join("second.png"), png(120)).unwrap();
+        let script = write_script(
+            &project,
+            "plot.sh",
+            "#!/bin/sh\nread -r line\n[ -n \"$OPENMAX_IMAGE_DIR\" ] || { echo no folder; exit 0; }\ncp second.png \"$OPENMAX_IMAGE_DIR/0001\"\ncp first.png \"$OPENMAX_IMAGE_DIR/0000\"\necho text > \"$OPENMAX_IMAGE_DIR/0002\"\nln -s /etc/hostname \"$OPENMAX_IMAGE_DIR/0003\"\necho plotted\n",
+        );
+        write_tool(
+            &tools_dir,
+            "plot.toml",
+            &format!("name = \"plot\"\ndescription = \"d\"\ncommand = \"{}\"\n\n[params]\ntype = \"object\"\n", script.display()),
+        );
+        let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
+        let on = tools::OutputCaps { images: true, ..tools::OutputCaps::default() };
+        let out = registry.execute("plot", &serde_json::json!({}), &data, &project, on, no_cancel()).await;
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output.trim(), "plotted\n[image 0002 (5 bytes) not shown: not a PNG, JPEG, GIF or WebP image]\n[image 0003 not shown: not a regular file]");
+        let shown: Vec<(Vec<u8>, u32, u32)> = out
+            .images
+            .iter()
+            .map(|i| (base64::engine::general_purpose::STANDARD.decode(&i.data).unwrap(), i.width, i.height))
+            .collect();
+        assert_eq!(shown, [(png(160), 160, 90), (png(120), 120, 90)]);
+        assert_eq!(std::fs::read_dir(data.join("tool-images")).unwrap().count(), 0, "the folder is removed after the call");
+
+        let off = registry
+            .execute("plot", &serde_json::json!({}), &data, &project, tools::OutputCaps::default(), no_cancel())
+            .await;
+        assert_eq!((off.output.trim(), off.images.len()), ("no folder", 0));
+        let _ = std::fs::remove_dir_all(project);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     /// An external tool runs in its own process group like bash, and the
     /// group is cleaned up when the tool exits. A tool that starts a helper in
     /// the background (a long-lived server it means to talk to later) still
@@ -2600,7 +2702,7 @@ mutatng = true
         // A session's first note is the full one, and it is the one the cap
         // has to make room for.
         registry.background_noted.store(false, std::sync::atomic::Ordering::Relaxed);
-        let tight = tools::OutputCaps { command_bytes: 1_000 };
+        let tight = tools::OutputCaps { command_bytes: 1_000, images: false };
         let plain = run("tight_plain", tight).await;
         assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
         assert!(!plain.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", plain.output);

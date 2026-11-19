@@ -1010,7 +1010,7 @@ pub(crate) mod tests {
     use crate::types::{ToolCall, ToolCallFunction};
 
     pub(crate) fn msg(role: &str, len: usize) -> ChatMessage {
-        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None }
+        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None, images: None }
     }
 
     /// The tool schemas the fixtures' requests carry.

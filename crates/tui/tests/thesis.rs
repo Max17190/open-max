@@ -719,12 +719,15 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // reply cut before any text is asked again within the reply bounds. A
     // reply with no call that stops near the limit is read as a cut thought.
     // A retryable server fault after reply text is asked for again as a cut is.
-    const BASELINE: usize = 44_748;
+    // Image input (read_file and tool images, one shared preparation step,
+    // on for a model entry that declares it, and its images sent only to an
+    // endpoint that reads them), raised for by its owner.
+    const BASELINE: usize = 45_040;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 44_749;
+    const CEILING: usize = 45_040;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 

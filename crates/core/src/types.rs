@@ -45,6 +45,34 @@ fn function_type() -> String {
     "function".to_string()
 }
 
+/// An image a tool result shows the model (`image_input`): its media type,
+/// its bytes in base64 and the size its header gives. Each wire sends it as
+/// its own image part.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    pub mime: String,
+    pub data: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+}
+
+impl Image {
+    /// `data:` URL form, as Chat Completions and Responses take it.
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.data)
+    }
+
+    /// What the image costs its model in context: a token per 750 pixels of
+    /// the size it is sent at, which nothing here shrinks, so a provider that
+    /// scales it down costs less than this, never more; 1,600 for one stored
+    /// without a size.
+    pub fn tokens(&self) -> usize {
+        if self.width == 0 || self.height == 0 { 1_600 } else { (self.width as usize * self.height as usize).div_ceil(750) }
+    }
+}
+
 /// A message in the OpenAI chat wire format. `content` is optional because
 /// assistant messages that only carry tool calls have no content.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,6 +122,9 @@ pub struct ChatMessage {
     /// it is never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_tool_output: Option<String>,
+    /// Images a tool result carries, sent beside its text as image parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<Image>>,
 }
 
 impl ChatMessage {
@@ -113,7 +144,7 @@ impl ChatMessage {
     /// Every constructor starts without reasoning: only the agent loop
     /// attaches it, from a reply, together with its origin.
     fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
-        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None }
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None, images: None }
     }
 
     /// Rough size estimate of the stored message, including reasoning.
@@ -139,7 +170,12 @@ impl ChatMessage {
                 }
             }
         }
-        estimate_tokens(chars) + 8
+        estimate_tokens(chars) + 8 + self.image_tokens()
+    }
+
+    /// What the message's images add to its estimate.
+    pub(crate) fn image_tokens(&self) -> usize {
+        self.images.iter().flatten().map(Image::tokens).sum()
     }
 }
 
@@ -368,6 +404,23 @@ mod tests {
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant
     /// is added without an assertion below.
+    /// An image is estimated from the size its header gives, however large,
+    /// and one stored without a size at the flat 1,600.
+    #[test]
+    fn an_images_estimate_follows_its_dimensions() {
+        let image = |width, height| Image { mime: "image/png".into(), data: "AAAA".into(), width, height };
+        assert_eq!(image(100, 75).tokens(), 10);
+        assert_eq!(image(1_000, 750).tokens(), 1_000);
+        assert_eq!(image(2_000, 2_000).tokens(), 5_334);
+        assert_eq!(image(8_000, 2_000).tokens(), 21_334, "no side is clamped: nothing is resized");
+        assert_eq!(image(u32::MAX, u32::MAX).tokens(), (u32::MAX as usize).pow(2).div_ceil(750));
+        assert_eq!(image(0, 0).tokens(), 1_600);
+        let mut message = ChatMessage::tool("c1", "a.png");
+        let text = message.estimated_tokens();
+        message.images = Some(vec![image(1_000, 750), image(100, 75)]);
+        assert_eq!(message.estimated_tokens(), text + 1_010);
+    }
+
     #[test]
     fn event_envelope_wire_is_stable() {
         assert_eq!(
