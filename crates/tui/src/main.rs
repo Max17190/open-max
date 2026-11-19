@@ -60,6 +60,8 @@ options:
                          beside it
   -p, --print            headless: run one turn and exit (prompt required, read
                          from piped stdin when -p has none; repeat -p for multi-turn)
+      --second-look      with --print and one prompt: a run that ends with status 0 within
+                         10,000 output tokens is checked by a new session; status unchanged
       --json             with --print, --replay or --subagent, emit AgentEvent envelopes
                          as JSONL; with --check, emit every finding as one JSON array
       --replay <file> --json
@@ -176,6 +178,7 @@ struct CliArgs {
     max_agent_tokens: Option<usize>,
     max_agent_iterations: Option<usize>,
     print: bool,
+    second_look: bool,
     json: bool,
     stdio: bool,
     check: bool,
@@ -244,6 +247,7 @@ where
         max_agent_tokens: None,
         max_agent_iterations: None,
         print: false,
+        second_look: false,
         json: false,
         stdio: false,
         check: false,
@@ -312,6 +316,7 @@ where
                 }
                 out.print = true;
             }
+            Long("second-look") => out.second_look = true,
             Long("json") => out.json = true,
             Long("stdio") => out.stdio = true,
             Long("check") => out.check = true,
@@ -484,6 +489,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         max_agent_tokens,
         max_agent_iterations,
         print,
+        second_look,
         json,
         stdio,
         check,
@@ -542,7 +548,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // A sub-agent's child is a session too, but a new one in a new worktree.
     const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 17] = [
+    let options: [(bool, &str, &[Option<&str>]); 18] = [
         (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
         (*continue_session, "--continue", SESSIONS),
@@ -560,6 +566,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         (*all, "--all", &[Some("--check")]),
         (mcp_timeout.is_some(), "--mcp-timeout", MCP),
         (*worktree, "--worktree", &[Some("--subagent")]),
+        (*second_look, "--second-look", &[Some("--print")]),
     ];
     for (on, flag, readers) in options {
         if !on || readers.contains(&operation) {
@@ -577,6 +584,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
             }
         });
     }
+    if *second_look && prompts.len() > 1 { return Err("--second-look checks one prompt; give a single -p".into()) }
     // A replay prints the JSON lines `--print --json` prints, so it is asked
     // for the same way.
     if operation == Some("--replay") && !*json {
@@ -1566,6 +1574,8 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 continue_session: cli.continue_session,
                 session: cli.session,
                 json: cli.json,
+                second_look: cli.second_look,
+                written: Default::default(),
                 quit: quit.clone(),
             };
             headless::run(core, core_rx, args).await

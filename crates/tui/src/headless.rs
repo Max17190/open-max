@@ -2,7 +2,10 @@
 //! Proves the harness is the product and the terminal UI is one client.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use open_max_core::agent;
@@ -23,17 +26,94 @@ pub struct HeadlessArgs {
     pub continue_session: bool,
     pub session: Option<String>,
     pub json: bool,
+    /// `--second-look` (see `run`), and the output tokens the run's usage events reported.
+    pub second_look: bool,
+    pub written: AtomicU64,
     /// Notified on a quit signal (see `watch_quit_signals`).
     pub quit: Arc<Notify>,
+}
+
+/// The second look's prompt: this text, then the run's prompt.
+const SECOND_LOOK: &str = include_str!("../second-look.txt");
+/// The most output tokens a run may write and still get a second look.
+pub(crate) const SECOND_LOOK_MAX_OUTPUT: u64 = 10_000;
+/// The most files a project may hold for a run there to get a second look:
+/// past it the listing that shows the run left them untouched costs too much.
+pub(crate) const SECOND_LOOK_MAX_FILES: usize = 20_000;
+
+/// Every file under `root`, `.git` included, with its size and modification
+/// time; None past `SECOND_LOOK_MAX_FILES` or when a directory cannot be read.
+/// Links are files here, never followed: the file tools stay inside the root.
+fn file_states(root: &Path) -> Option<HashMap<PathBuf, (u64, Option<SystemTime>)>> {
+    let (mut files, mut dirs) = (HashMap::new(), vec![root.to_path_buf()]);
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let Ok(meta) = entry.metadata() else { return None };
+            if meta.is_dir() { dirs.push(entry.path()) } else { files.insert(entry.path(), (meta.len(), meta.modified().ok())); }
+            if files.len() > SECOND_LOOK_MAX_FILES { return None }
+        }
+    }
+    Some(files)
+}
+
+/// Run the prompts; with `second_look`, a run that ended with status 0, wrote
+/// at most `SECOND_LOOK_MAX_OUTPUT` tokens and left every file it was given
+/// as it found it (created files aside) is followed by a new session in the
+/// same project that gets `SECOND_LOOK` and the prompt, none of the first's
+/// reasoning. Working the request out again is only sound while the problem
+/// it states is still there: on a tree the run already changed, the second
+/// session can undo a correct repair. The exit status stays the first's
+/// unless a signal lands.
+pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
+    // Both scans run off this thread so a signal still ends the run in time.
+    let project = args.project.clone();
+    let given = match args.second_look {
+        false => None,
+        true => match crate::until_stopped(args.quit.notified(), &mut None, move || file_states(&project)).await {
+            Some(given) if !crate::signalled() => Some(given),
+            _ => return crate::quit_status(),
+        },
+    };
+    let code = run_session(&core, &mut core_rx, &args).await;
+    let written = args.written.load(Ordering::Relaxed);
+    let Some(given) = given.filter(|_| code == 0 && !crate::signalled()) else { return code };
+    let changed = move || given.map(|files| files.iter().filter(|(path, was)| {
+        std::fs::symlink_metadata(path).ok().map(|m| (m.len(), m.modified().ok())).as_ref() != Some(was)
+    }).count());
+    let touched = match crate::until_stopped(args.quit.notified(), &mut None, changed).await {
+        Some(touched) if !crate::signalled() => touched,
+        _ => return crate::quit_status(),
+    };
+    let skip = match touched {
+        _ if written > SECOND_LOOK_MAX_OUTPUT => format!("the run wrote {written} output tokens, over {SECOND_LOOK_MAX_OUTPUT}"),
+        None => format!("the project holds more than {SECOND_LOOK_MAX_FILES} files, or one of its directories could not be read"),
+        Some(0) => String::new(),
+        Some(n) => format!("the run changed {n} of the files it was given"),
+    };
+    if !skip.is_empty() {
+        eprintln!("openmax: second look skipped: {skip}");
+        return code;
+    }
+    eprintln!("openmax: second look: a new session checks the work ({written} output tokens written)");
+    let prompts = vec![format!("{SECOND_LOOK}{}", args.prompts.concat())];
+    let look = HeadlessArgs { prompts, session: None, continue_session: false, second_look: false, written: AtomicU64::new(0), ..args };
+    match run_session(&core, &mut core_rx, &look).await {
+        _ if crate::signalled() => crate::quit_status(),
+        0 => code,
+        failed => {
+            eprintln!("openmax: second look ended with status {failed}; the run's status {code} stands");
+            code
+        }
+    }
 }
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in
 /// `ask` mode are declined so unattended runs never hang; set `approval_mode`
 /// to `auto` for unattended mutations. Multiple prompts reuse one session_id.
-pub async fn run(
-    core: Arc<Core>,
-    mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
-    args: HeadlessArgs,
+async fn run_session(
+    core: &Arc<Core>,
+    core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    args: &HeadlessArgs,
 ) -> i32 {
     let project_key = args.project.display().to_string();
 
@@ -55,13 +135,13 @@ pub async fn run(
     let code = if stop_by.is_some() {
         crate::quit_status()
     } else {
-        run_prompts(&core, &mut core_rx, &session_id, &args, &mut stop_by).await
+        run_prompts(core, core_rx, &session_id, args, &mut stop_by).await
     };
     // A run whose every turn ended before anything was persisted (an endpoint
     // that never resolved, a prompt a gate refused) leaves an index entry with
     // nothing behind it.
     if !args.continue_session {
-        crate::discard_empty_session(&core, &session_id, &args.quit, stop_by).await;
+        crate::discard_empty_session(core, &session_id, &args.quit, stop_by).await;
     }
     code
 }
@@ -299,6 +379,9 @@ async fn run_turn_events(
                 }
                 return stopping.unwrap_or(exit_code);
             }
+            AgentEvent::Usage { completion_tokens, .. } => {
+                args.written.fetch_add(*completion_tokens, Ordering::Relaxed);
+            }
             // Every other event is only printed, and `--json` printed it above.
             _ if json => {}
             AgentEvent::Token { text } => {
@@ -382,7 +465,6 @@ async fn run_turn_events(
             AgentEvent::HarnessNote { .. }
             | AgentEvent::Thinking { .. }
             | AgentEvent::Budget { .. }
-            | AgentEvent::Usage { .. }
             | AgentEvent::Diff { .. }
             | AgentEvent::SteerAccepted { .. }
             | AgentEvent::SteerBlocked { .. }
@@ -473,6 +555,8 @@ mod tests {
             continue_session: false,
             session: None,
             json: true,
+            second_look: false,
+            written: Default::default(),
             quit: Arc::new(Notify::new()),
         };
 
@@ -539,6 +623,8 @@ mod tests {
             continue_session: false,
             session: None,
             json: true,
+            second_look: false,
+            written: Default::default(),
             quit: Arc::new(Notify::new()),
         };
 
