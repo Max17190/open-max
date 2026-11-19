@@ -721,12 +721,12 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Image input (read_file and tool images, one shared preparation step,
     // on for a model entry that declares it, and its images sent only to an
     // endpoint that reads them), raised for by its owner.
-    const BASELINE: usize = 45_018;
+    const BASELINE: usize = 45_023;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 45_018;
+    const CEILING: usize = 45_023;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 

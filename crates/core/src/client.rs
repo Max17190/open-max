@@ -183,14 +183,15 @@ impl Serialize for WireMessages<'_> {
         let mut run = 0; // Where the current run of tool results began.
         serializer.collect_seq(sent.iter().enumerate().flat_map(|(at, m)| {
             let (replay, plain) = chat_replay(m, self.origin, self.prefer_reasoning_details);
-            let mark = self.marks && (at == last || m.role == "system");
-            let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             // A tool message's content is text only on this wire, so the
-            // images of a run of tool results follow it in one user message.
+            // images of a run of tool results follow it in one user message,
+            // which then carries the last message's cache marker.
             if m.role != "tool" { run = at + 1; }
             let ends_run = m.role == "tool" && sent.get(at + 1).is_none_or(|next| next.role != "tool");
             let images: Vec<&crate::types::Image> = sent[run..=at].iter()
                 .filter(|_| self.images && ends_run).flat_map(|m| m.images.iter().flatten()).collect();
+            let mark = self.marks && ((at == last && images.is_empty()) || m.role == "system");
+            let text_mark = mark && matches!(m.role.as_str(), "system" | "user");
             let message = WireMessage {
                 role: &m.role,
                 content: wire_text(m).map(|text| WireContent { text, mark: text_mark }),
@@ -204,7 +205,11 @@ impl Serialize for WireMessages<'_> {
             let images = (!images.is_empty()).then(|| {
                 let parts = images.iter().map(|image| serde_json::json!({"type": "image_url", "image_url": {"url": image.data_url()}}));
                 let text = serde_json::json!({"type": "text", "text": "The images the tool results above returned."});
-                WireItem::Images(serde_json::json!({"role": "user", "content": std::iter::once(text).chain(parts).collect::<Vec<_>>()}))
+                let mut content: Vec<Value> = std::iter::once(text).chain(parts).collect();
+                if self.marks && at == last {
+                    content.last_mut().unwrap()["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+                WireItem::Images(serde_json::json!({"role": "user", "content": content}))
             });
             std::iter::once(WireItem::Message(message)).chain(images)
         }))
@@ -3992,6 +3997,11 @@ pub(crate) mod tests {
         let results: Vec<&Value> = native["messages"].as_array().unwrap().iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|b| b["type"] == "tool_result").collect();
         assert_eq!(results[0]["content"][1], json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}));
         assert_eq!(results[1]["content"], "plain");
+        // With cache markers, the image message ends the request and so
+        // carries the last marker; the tool result before it carries none.
+        let marked = serde_json::to_value(WireMessages { messages: &messages[..3], origin: "o", marks: true, prefer_reasoning_details: false, images: true }).unwrap();
+        assert_eq!(marked[2].get("cache_control"), None);
+        assert_eq!(marked[3]["content"][1]["cache_control"], json!({"type": "ephemeral"}));
         client.images = false;
         for wire in [crate::providers::WireApi::ChatCompletions, crate::providers::WireApi::Responses, crate::providers::WireApi::Anthropic] {
             client.wire_api = wire;
