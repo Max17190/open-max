@@ -631,9 +631,14 @@ pub(crate) fn prepare_images(files: &[(String, PathBuf)]) -> (Vec<crate::types::
         } else if spent + len > IMAGE_BUDGET {
             format!("over the 5 MiB of images one call shows, {} bytes of it left", IMAGE_BUDGET - spent)
         } else {
-            match std::fs::read(path) {
+            // Read no more than the budget left, plus a byte to tell a file
+            // that grew since its size was taken.
+            let mut bytes = Vec::new();
+            let left = IMAGE_BUDGET - spent;
+            match std::fs::File::open(path).and_then(|file| std::io::Read::read_to_end(&mut std::io::Read::take(file, left + 1), &mut bytes)) {
                 Err(e) => format!("unreadable: {e}"),
-                Ok(bytes) => match (image_mime(&bytes), image_size(&bytes)) {
+                Ok(_) if bytes.len() as u64 > left => format!("over the 5 MiB of images one call shows, {left} bytes of it left"),
+                Ok(_) => match (image_mime(&bytes), image_size(&bytes)) {
                     (None, _) => "not a PNG, JPEG, GIF or WebP image".into(),
                     (Some(mime), None) => format!("{mime} whose header gives no size"),
                     (Some(mime), Some((width, height))) => {

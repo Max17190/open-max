@@ -54,8 +54,8 @@ pub(super) fn serialize(client: &ChatClient, messages: &[ChatMessage], limit: us
         if blocks.is_empty() {
             if message.role == "tool" {
                 let id = message.tool_call_id.as_deref().filter(|id| !id.is_empty()).ok_or("Messages tool result lacks call ID")?;
-                let images = message.images.iter().flatten().map(|image| json!({"type":"image","source":{"type":"base64","media_type":image.mime,"data":image.data}}));
-                let content = if message.images.is_some() { Value::Array(std::iter::once(json!({"type":"text","text":text})).chain(images).collect()) } else { json!(text) };
+                let images = message.images.iter().flatten().filter(|_| client.images).map(|image| json!({"type":"image","source":{"type":"base64","media_type":image.mime,"data":image.data}}));
+                let content = if client.images && message.images.is_some() { Value::Array(std::iter::once(json!({"type":"text","text":text})).chain(images).collect()) } else { json!(text) };
                 blocks.push(json!({"type":"tool_result","tool_use_id":id,"content":content}));
             } else {
                 if !text.is_empty() {

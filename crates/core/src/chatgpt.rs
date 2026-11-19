@@ -720,6 +720,7 @@ pub async fn save_catalog(
                     });
                     m.max_tokens = old["max_tokens"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0);
                     m.compaction_tokens = old["compaction_tokens"].as_u64().and_then(|n| usize::try_from(n).ok());
+                    m.image_input = old["image_input"].as_bool().unwrap_or(false);
                 }
                 m
             })
