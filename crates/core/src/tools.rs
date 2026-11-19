@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -466,6 +466,18 @@ pub async fn execute(
     execute_in_session(name, args, data_dir, root, caps, cancel, &AtomicBool::new(false)).await
 }
 
+/// One more than the OOM-kill count the last bash result saw (only rising, across sessions); 0 before the first bash call.
+static OOM_KILLS: AtomicU64 = AtomicU64::new(0);
+/// The kernel's OOM-kill count for this process's memory cgroup and those under it: v2 `memory.events` (at /sys/fs/cgroup or, hybrid, /unified)
+/// or v1 `memory.oom_control` in the hierarchy listing `memory`, at the cgroup's path or else the root, where a container shows its own.
+fn oom_kills() -> Option<u64> {
+    let read = |f: String| std::fs::read_to_string(f).ok()?.lines().find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok());
+    std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().filter_map(|l| l.split_once(':')?.1.split_once(':')).flat_map(|(c, path)| {
+        let (dirs, file) = if c.is_empty() { (vec![String::new(), "/unified".into()], "memory.events") } else if c.split(',').any(|c| c == "memory") { (vec!["/memory".into(), format!("/{c}")], "memory.oom_control") } else { (vec![], "") };
+        dirs.into_iter().flat_map(move |d| [format!("/sys/fs/cgroup{d}{}/{file}", path.trim_end_matches('/')), format!("/sys/fs/cgroup{d}/{file}")])
+    }).find_map(read)
+}
+
 /// [`execute`] for one call of a session. `background_noted` is the
 /// session's record that a result has already explained why background
 /// processes do not outlive a call (see [`exited_outcome`]).
@@ -479,7 +491,12 @@ pub(crate) async fn execute_in_session(
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
     if name == "bash" {
-        return run_bash(data_dir, root, args, caps, cancel, background_noted).await;
+        if let Some(n) = oom_kills() { let _ = OOM_KILLS.compare_exchange(0, n + 1, Relaxed, Relaxed); }
+        let mut outcome = run_bash(data_dir, root, args, caps, cancel, background_noted).await;
+        if let Some((before, now)) = oom_kills().map(|n| (OOM_KILLS.fetch_max(n + 1, Relaxed), n + 1)).filter(|&(before, now)| before != 0 && before < now) {
+            outcome.output.push_str(&format!("\n[openmax: since the last result, the kernel killed {} process(es) in this cgroup for running out of memory.]", now - before));
+        }
+        return outcome;
     }
     if cancel.is_cancelled() {
         return ToolOutcome::err("tool cancelled by user");
@@ -2461,12 +2478,7 @@ async fn run_bash(
             // failure into a guess.
             Termination::TimedOut => {
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
-                ToolOutcome::from_process(
-                    false,
-                    format!("{}\n{text}", deadline.timed_out_heading()),
-                    &output,
-                    truncated,
-                )
+                ToolOutcome::from_process(false, format!("{}\n{text}", deadline.timed_out_heading()), &output, truncated)
             }
             Termination::Exited(status) => {
                 exited_outcome(&output, status, caps.command_bytes, background_noted)
@@ -2500,17 +2512,11 @@ pub(crate) fn exited_outcome(
     let reserved = note.as_ref().map_or(0, |note| note.len() + 1);
     let budget = cap.saturating_sub(reserved).max(1);
     let (text, truncated) = render_process_output(output, budget);
-    let (ok, text) = match status.success() {
-        true => (true, text),
-        false => (false, format!("{}\n{text}", describe_exit(status))),
-    };
+    let (ok, text) = if status.success() { (true, text) } else { (false, format!("{}\n{text}", describe_exit(status))) };
     // A backgrounded server dies with the call and the exit status
     // is still 0, so without this the next step is a request to a
     // port nothing is listening on.
-    let text = match note {
-        Some(note) => format!("{text}\n{note}"),
-        None => text,
-    };
+    let text = match note { Some(note) => format!("{text}\n{note}"), None => text };
     ToolOutcome::from_process(ok, text, output, truncated)
 }
 
@@ -2553,20 +2559,8 @@ pub(crate) fn describe_exit(status: &std::process::ExitStatus) -> String {
             // Only numbers that are identical on Linux and macOS get a name;
             // platform-divergent ones (e.g. SIGBUS: 7 vs 10) stay numeric
             // rather than risk a wrong label.
-            let name = match signal {
-                1 => " (SIGHUP)",
-                2 => " (SIGINT)",
-                4 => " (SIGILL)",
-                6 => " (SIGABRT)",
-                8 => " (SIGFPE)",
-                9 => " (SIGKILL)",
-                11 => " (SIGSEGV)",
-                13 => " (SIGPIPE)",
-                14 => " (SIGALRM)",
-                15 => " (SIGTERM)",
-                24 => " (SIGXCPU)",
-                _ => "",
-            };
+            let names = [(1, "HUP"), (2, "INT"), (4, "ILL"), (6, "ABRT"), (8, "FPE"), (9, "KILL"), (11, "SEGV"), (13, "PIPE"), (14, "ALRM"), (15, "TERM"), (24, "XCPU")];
+            let name = names.iter().find(|(n, _)| *n == signal).map_or(String::new(), |(_, name)| format!(" (SIG{name})"));
             return format!("killed by signal {signal}{name}");
         }
     }
