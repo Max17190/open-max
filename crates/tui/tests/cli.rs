@@ -2107,6 +2107,51 @@ fn a_print_turn_expands_a_prompt_template() {
     assert!(!sent.contains("/greet world"), "the raw slash line must not be sent: {sent}");
 }
 
+/// A bare `-p` with piped standard input takes the prompt from it, so the
+/// task text is on no command line. An agent's `pkill -f <word from the
+/// task>` then matches nothing of the harness: the call prints `alive`, the
+/// turn ends in `done`, and the model is told the call's output. The same
+/// prompt given as `-p <text>` from a shell, as a benchmark harness launches
+/// it, is in that shell's arguments, and the same call kills the shell.
+#[test]
+fn a_print_prompt_on_stdin_survives_pkill_of_a_word_in_it() {
+    let word = "quillfeatherzonk";
+    let prompt = format!("Tidy the {word} report and stop.");
+    let call = || sse_tool_call("bash", serde_json::json!({ "command": format!("pkill -f {word}; echo alive") }));
+    for piped in [true, false] {
+        let (project, home) = fresh_dirs(if piped { "stdin-prompt" } else { "argv-prompt" });
+        let record = home.join("wire.jsonl");
+        let (base_url, _server) = spawn_recording_server(vec![call(), sse_text("finished")], record.clone());
+        write_settings(&home, &base_url);
+        let mut command = cmd(&project, &home);
+        if !piped {
+            let program = command.get_program().to_owned();
+            command = Command::new("sh");
+            command.current_dir(&project).env("HOME", &home).env("OPENMAX_HUMAN_ATTEST", "1").env_remove("OPENMAX_API_KEY").env_remove("OPENMAX_SESSION");
+            command.args(["-c", r#""$0" --trust-project --json -p "$1"; echo "shell survived""#]).arg(program).arg(&prompt).stdin(Stdio::null());
+        } else {
+            command.args(["--trust-project", "--json", "-p"]).stdin(Stdio::piped());
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        if piped { child.stdin.take().unwrap().write_all(prompt.as_bytes()).unwrap() }
+        let out = finish_with_deadline(child);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !piped {
+            assert!(!stdout.contains("shell survived") && out.status.code().is_none(), "pkill -f matched the shell: {stdout}\n{stderr}");
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+        let last: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "done", "{stdout}");
+        let wire = std::fs::read_to_string(&record).unwrap();
+        let first: serde_json::Value = serde_json::from_str(wire.lines().next().unwrap()).unwrap();
+        assert!(first["messages"].to_string().contains(&prompt), "the model got the piped prompt: {first}");
+        assert!(wire.lines().nth(1).unwrap().contains("alive"), "the call's output reached the model: {wire}");
+    }
+}
+
 /// One scripted SSE completion per request, and every request body appended to
 /// `record`, so a test can assert both what openmax did and what the model was
 /// told afterwards. Records to a file (not memory) so a test can read the wire
