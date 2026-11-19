@@ -212,6 +212,7 @@ pub(crate) const BASH_DESCRIPTION: &str = "Run a shell command in the project ro
 /// of every tools array built after says it shows images. Off, the array is
 /// exactly `tool_schemas()`.
 pub static IMAGE_INPUT: AtomicBool = AtomicBool::new(false);
+pub(crate) const READ_FILE_DESCRIPTION: &str = "Read a file as numbered lines.";
 pub(crate) const READ_FILE_IMAGE_DESCRIPTION: &str = "Read a file as numbered lines. An image file (PNG, JPEG, GIF, WebP) is shown to you as an image.";
 
 /// Tool schemas in the OpenAI `tools` wire format. Kept deliberately small and
@@ -238,7 +239,7 @@ pub fn tool_schemas() -> &'static Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file as numbered lines.",
+                "description": READ_FILE_DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {

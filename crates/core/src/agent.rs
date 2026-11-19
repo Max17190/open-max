@@ -426,7 +426,7 @@ async fn run_compact(
     };
     let mut guard = MessageGuard::new(core.clone(), session_id, messages, take_seq);
     // The same overhead the turn loop budgets with: the tool schemas.
-    let schemas_wire = registry.schemas_wire_arc();
+    let schemas_wire = registry.schemas_wire_for(endpoint.image_input);
     let schema_tokens = request_overhead(&schemas_wire);
     // In estimator units, like the turn loop's; the receipt converts back.
     let factor = token_factor(prompt_ratio);
@@ -695,8 +695,9 @@ async fn run_loop(
     // Frozen wire form: every request of the session injects the same tool
     // schema bytes without re-serializing the Value array. A refreeze swaps
     // the registry and keeps these (a tool file written since rides the
-    // note), so they never move until /reload.
-    let schemas_wire = registry.schemas_wire_arc();
+    // note), so they never move until /reload, read_file's description
+    // aside, which follows the endpoint's image input.
+    let schemas_wire = registry.schemas_wire_for(endpoint.image_input);
     let caps = tools::OutputCaps { images: endpoint.image_input, ..tools::OutputCaps::from_settings(&settings, Some(endpoint.context_tokens)) };
     // Fires exactly once per session, on the turn that first populates it
     // (fresh session or a resume that only had its system prompt).

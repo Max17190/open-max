@@ -680,13 +680,16 @@ impl ChatClient {
         let chat = self.wire_api == crate::providers::WireApi::ChatCompletions;
         let prefer_details = self.prefers_reasoning_details();
         let ratio_origin = if prefer_details { format!("{origin}:details") } else { origin.to_owned() };
+        let images = self.images;
+        // A stored image an endpoint does not read is not sent, so not counted.
         let estimate = move |message: &ChatMessage| {
-            if chat {
+            let tokens = if chat {
                 let (replay, plain) = chat_replay(message, origin, prefer_details);
                 message.estimated_tokens_with_replay(replay, plain)
             } else {
                 message.estimated_tokens()
-            }
+            };
+            if images { tokens } else { tokens - message.image_tokens() }
         };
         (ratio_origin, estimate)
     }
@@ -3981,6 +3984,18 @@ pub(crate) mod tests {
         assert!(!quota_exhausted(r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#));
         assert!(!quota_exhausted("insufficient_quota"));
         assert!(!quota_exhausted(""));
+    }
+
+    /// A stored image counts toward a request only to an endpoint it is sent to.
+    #[test]
+    fn an_image_the_endpoint_does_not_read_is_not_estimated() {
+        let mut message = ChatMessage::tool("c1", "a.png");
+        message.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 750, height: 1 }]);
+        let mut client = chat_client("m", None, 64, false, true);
+        let blind = client.message_estimator("o").1(&message);
+        client.images = true;
+        assert_eq!(client.message_estimator("o").1(&message), blind + 1);
+        assert_eq!(blind, ChatMessage::tool("c1", "a.png").estimated_tokens());
     }
 
     /// A tool result's images go out on each wire to an endpoint that reads

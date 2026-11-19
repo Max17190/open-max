@@ -642,8 +642,8 @@ fn render_content(result: &Value) -> Result<String, String> {
             match field("type") {
                 "text" => field("text").to_string(),
                 "image" => match handed_image(field("data")) {
-                    true => format!("[image {}, {} bytes, shown to you with this result]", field("mimeType"), base64_len(field("data"))),
-                    false => format!("[image {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
+                    Some(name) => format!("[image {name}, {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
+                    None => format!("[image {}, {} bytes]", field("mimeType"), base64_len(field("data"))),
                 },
                 media @ "audio" => {
                     format!("[{media} {}, {} bytes]", field("mimeType"), base64_len(field("data")))
@@ -674,17 +674,16 @@ fn render_content(result: &Value) -> Result<String, String> {
 /// `OPENMAX_IMAGE_DIR` and takes every image file left there. Off (or the
 /// bridge run by hand), or in a format the model would not be sent, nothing is
 /// written and the line only describes the image. Files are numbered so the
-/// harness keeps the server's order.
-fn handed_image(data: &str) -> bool {
+/// harness keeps the server's order, and the line names its file, which a
+/// note the harness adds names again if the image is not shown.
+fn handed_image(data: &str) -> Option<String> {
     use base64::Engine;
     static HANDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let Some(dir) = std::env::var_os(open_max_core::tools::IMAGE_DIR_ENV) else { return false };
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim_end()) else { return false };
-    if open_max_core::tools::image_mime(&bytes).is_none() {
-        return false;
-    }
-    let n = HANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::fs::write(std::path::Path::new(&dir).join(format!("{n:04}")), bytes).is_ok()
+    let dir = std::env::var_os(open_max_core::tools::IMAGE_DIR_ENV)?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim_end()).ok()?;
+    open_max_core::tools::image_mime(&bytes)?;
+    let name = format!("{:04}", HANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    std::fs::write(std::path::Path::new(&dir).join(&name), bytes).ok().map(|_| name)
 }
 
 /// The decoded size of base64 text, without decoding it.

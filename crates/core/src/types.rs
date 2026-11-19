@@ -170,7 +170,12 @@ impl ChatMessage {
                 }
             }
         }
-        estimate_tokens(chars) + 8 + self.images.iter().flatten().map(Image::tokens).sum::<usize>()
+        estimate_tokens(chars) + 8 + self.image_tokens()
+    }
+
+    /// What the message's images add to its estimate.
+    pub(crate) fn image_tokens(&self) -> usize {
+        self.images.iter().flatten().map(Image::tokens).sum()
     }
 }
 

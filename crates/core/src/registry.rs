@@ -606,8 +606,20 @@ impl Registry {
 
     /// Owned handle to the same frozen bytes, for turn state that must
     /// outlive a mid-turn registry swap.
+    #[cfg(test)]
     pub(crate) fn schemas_wire_arc(&self) -> Arc<str> {
         self.schemas_wire.clone()
+    }
+
+    /// The frozen tools array as an endpoint that does (or does not) read
+    /// images is sent it: the read_file entry says so, so a model switch
+    /// that turns image input on or off is told without a /reload. Unchanged
+    /// when the freeze already matches.
+    pub(crate) fn schemas_wire_for(&self, images: bool) -> Arc<str> {
+        let entry = |text: &str| format!("\"description\":{}", Value::from(text));
+        let (text, image) = (entry(tools::READ_FILE_DESCRIPTION), entry(tools::READ_FILE_IMAGE_DESCRIPTION));
+        let (from, to) = if images { (text, image) } else { (image, text) };
+        if self.schemas_wire.contains(&from) { self.schemas_wire.replacen(&from, &to, 1).into() } else { self.schemas_wire.clone() }
     }
 
     /// Estimated tokens the frozen schemas add to *every* request in this
@@ -1388,14 +1400,17 @@ async fn spawn_external(
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
     // With image_input on, the tool gets a fresh folder for images that go
-    // back with its result. A probe run (sandboxed) never sees images.
+    // back with its result. A probe run (sandboxed) never sees images. The
+    // folder is created here or not used, so one a killed run left behind
+    // under the same name is never taken as this call's.
     static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let image_dir = (caps.images && sandbox.is_none())
         .then(|| {
             let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            data_dir.join("tool-images").join(format!("{}-{n}", std::process::id()))
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            data_dir.join("tool-images").join(format!("{}-{nanos}-{n}", std::process::id()))
         })
-        .filter(|dir| std::fs::create_dir_all(dir).is_ok());
+        .filter(|dir| dir.parent().is_some_and(|parent| std::fs::create_dir_all(parent).is_ok()) && std::fs::create_dir(dir).is_ok());
     let request = ProcessRequest {
         program: tool.command.clone().into(),
         args: tool.args.iter().cloned().map(Into::into).collect(),
@@ -1465,6 +1480,26 @@ async fn spawn_external(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session frozen for one endpoint, sent to one whose image input
+    /// differs, gets read_file's description for the endpoint it reaches;
+    /// one that matches keeps its frozen bytes.
+    #[test]
+    fn read_files_description_follows_the_endpoints_image_input() {
+        let registry = Registry::builtin_only();
+        let frozen = registry.schemas_wire_arc();
+        assert!(Arc::ptr_eq(&registry.schemas_wire_for(false), &frozen));
+        let described = |wire: &str| {
+            let tools: Value = serde_json::from_str(wire).unwrap();
+            tools.as_array().unwrap().iter().find(|t| entry_name(t) == "read_file").unwrap()["function"]["description"].clone()
+        };
+        let with_images = registry.schemas_wire_for(true);
+        assert_eq!(described(&with_images), tools::READ_FILE_IMAGE_DESCRIPTION);
+        assert_eq!(with_images.replacen(tools::READ_FILE_IMAGE_DESCRIPTION, tools::READ_FILE_DESCRIPTION, 1), *frozen, "nothing else moves");
+        let mut image_frozen = Registry::builtin_only();
+        image_frozen.schemas_wire = with_images.clone();
+        assert_eq!(*image_frozen.schemas_wire_for(false), *frozen);
+    }
     use crate::state::CancelToken;
 
     fn no_cancel() -> Arc<CancelToken> {
