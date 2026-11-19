@@ -58,8 +58,8 @@ options:
       --provider <name>  use a named provider from ~/.openmax/providers.json
                          for this run; --base-url and --api-key are refused
                          beside it
-  -p, --print            headless: run one turn and exit (prompt required;
-                         repeat -p for multi-turn on the same session)
+  -p, --print            headless: run one turn and exit (prompt required, read
+                         from piped stdin when -p has none; repeat -p for multi-turn)
       --json             with --print, --replay or --subagent, emit AgentEvent envelopes
                          as JSONL; with --check, emit every finding as one JSON array
       --replay <file> --json
@@ -366,10 +366,8 @@ where
             _ => return Err(arg.unexpected()),
         }
     }
-    if out.print {
-        flush_prompt_tokens(&mut out.prompts, &mut current)?;
-    } else if !current.is_empty() {
-        // Freeform args without --print are rejected in main; still clear cleanly.
+    // Freeform args without --print are rejected in main. A lone -p with no text is read from standard input there.
+    if !current.is_empty() || (out.print && !out.prompts.is_empty()) {
         flush_prompt_tokens(&mut out.prompts, &mut current)?;
     }
     Ok(out)
@@ -1033,7 +1031,7 @@ async fn authenticate<F: std::future::Future<Output = Result<(), String>>>(
 }
 
 /// The run of everything but a session painted first (see `main`).
-async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
+async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let request = cli.login.as_ref().map(|target| (setup::Action::Login, target.as_deref(), "--login"))
         .or_else(|| cli.logout.as_ref().map(|target| (setup::Action::Logout, target.as_deref(), "--logout")));
     if let Some((action, target, flag)) = request {
@@ -1538,6 +1536,8 @@ async fn run(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         }
     }
 
+    // The prompt on standard input keeps the task text off every command line, where `pkill -f` matches it.
+    if cli.print && cli.prompts.is_empty() && !std::io::stdin().is_terminal() { cli.prompts.push(std::io::read_to_string(std::io::stdin()).unwrap_or_else(|e| { eprintln!("openmax: reading the --print prompt from stdin: {e}"); std::process::exit(2) })) }
     if cli.print && (cli.prompts.is_empty() || cli.prompts.iter().all(|p| p.trim().is_empty())) {
         eprintln!("openmax: --print requires a prompt\n\n{HELP}");
         std::process::exit(2);
@@ -3551,7 +3551,11 @@ mod tests {
     #[test]
     fn empty_print_group_is_rejected() {
         assert!(parse_args_from(["-p", "-p", "second"]).is_err());
-        assert!(parse_args_from(["-p"]).is_err());
+        assert!(parse_args_from(["-p", "first", "-p"]).is_err());
+        assert!(parse_args_from(["-p", ""]).is_err());
+        // A lone -p parses with no prompt; run() reads it from piped stdin.
+        let cli = parse_args_from(["-p"]).unwrap();
+        assert!(cli.print && cli.prompts.is_empty());
     }
 
     /// A prompt that starts with a dash reads as an option, and the refusal
