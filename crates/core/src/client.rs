@@ -15,7 +15,8 @@
 //! caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
 //! a Retry-After longer than a minute, are reported at once: no wait the
 //! turn would take lets the request succeed. Once reply text has streamed,
-//! a stream the network cut is resent at most [`CUT_RETRIES`] times, the
+//! a stream the network cut, or one a retryable server fault ended, is
+//! resent at most [`CUT_RETRIES`] times between them, the
 //! announcement saying the caller's partial text is void; a cut after that,
 //! or silence past the idle deadline, is reported as a truncation. A
 //! failure the server reports inside a 200 response (an `error` object on the chunk or reply
@@ -955,10 +956,11 @@ impl ChatClient {
                 crate::providers::WireApi::ChatCompletions => read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await,
             };
             // The restart rules: nothing the caller keeps has streamed yet,
-            // and the budget has an attempt left. A reply the network cut
-            // after its text began is asked for again too, CUT_RETRIES times
-            // at most: the caller loses the partial text it showed, where
-            // keeping it would end the turn.
+            // and the budget has an attempt left. A reply the network cut, or
+            // a server fault a fresh attempt can outlast ended, after its
+            // text began is asked for again too, CUT_RETRIES times at most:
+            // the caller loses the partial text it showed, where keeping it
+            // would end the turn.
             let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
             let cut = !restartable && attempt < MAX_ATTEMPTS && cuts < CUT_RETRIES;
             let (reason, wait, last) = match unfinished {
@@ -971,6 +973,11 @@ impl ChatClient {
                 }
                 Some(Unfinished::Failed(failure)) if failure.retryable && restartable && beyond_cap.is_none() => {
                     (failure.message, backoff(attempt, asked), MAX_ATTEMPTS)
+                }
+                Some(Unfinished::Failed(failure)) if failure.retryable && cut && beyond_cap.is_none() => {
+                    cuts += 1;
+                    let reason = format!("the reply failed partway ({}) and is asked for again from its start", failure.message);
+                    (reason, backoff(attempt, asked), MAX_ATTEMPTS.min(attempt + 1 + CUT_RETRIES - cuts))
                 }
                 // Never a truncated reply: the server said this one failed,
                 // and a tool call it carried must not run.
@@ -3205,21 +3212,43 @@ pub(crate) mod tests {
         assert_eq!(served, 1, "a refused request is not resent");
         assert!(deltas.is_empty(), "{deltas:?}");
 
-        // A retryable failure after reply text streamed is reported, not
-        // resent: the caller has already shown that text.
+        // A refusal after reply text is reported too, and not resent.
+        let (result, deltas, served) = try_stream_sequence(vec![
+            format!("{HALF}{}", gateway_error_chunk(json!(400), "the prompt is longer than this endpoint accepts")),
+            FINISHED.into(),
+        ])
+        .await;
+        assert!(result.err().expect("a refusal is an error").contains("the prompt is longer"));
+        assert_eq!(served, 1);
+        assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+    }
+
+    const HALF: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+
+    /// The bug this guards: a server fault reported inside the stream after
+    /// reply text began ended the turn, while a network cut at the same point
+    /// was asked for again, and a rerun of that trial passed. It is asked for
+    /// again from its start on the terms of a cut, and a fault that persists
+    /// is reported once the cut budget is spent.
+    #[tokio::test]
+    async fn a_retryable_error_after_reply_text_is_asked_for_again() {
         for code in [json!("server_error"), json!(520)] {
-            let (result, deltas, served) = try_stream_sequence(vec![
-                format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"half an ans\"}},\"finish_reason\":null}}]}}\n\n{}",
-                    gateway_error_chunk(code, "upstream disconnected unexpectedly")
-                ),
-                FINISHED.into(),
-            ])
-            .await;
-            let err = result.err().expect("a failure after reply text is still an error");
-            assert!(err.contains("upstream disconnected unexpectedly"), "{err}");
-            assert_eq!(served, 1);
-            assert_eq!(deltas, vec!["content:half an ans".to_string()]);
+            let failed = format!("{HALF}{}", gateway_error_chunk(code.clone(), "upstream disconnected unexpectedly"));
+            let (result, deltas, served) = try_stream_sequence(vec![failed.clone(), FINISHED.into()]).await;
+            assert_eq!(result.expect("the second attempt finished").content, "all of it", "{code}");
+            assert_eq!(served, 2, "{code}");
+            let code = code.as_str().map_or_else(|| code.to_string(), str::to_string);
+            assert_eq!(deltas, [
+                "content:half an ans".to_string(),
+                format!("retry:2/3:the reply failed partway (backend reported an error ({code}): upstream disconnected unexpectedly) and is asked for again from its start"),
+                "content:all of it".to_string(),
+            ]);
+
+            let mut replies = vec![failed; 1 + CUT_RETRIES as usize];
+            replies.push(FINISHED.into());
+            let (result, _, served) = try_stream_sequence(replies).await;
+            assert!(result.err().expect("a fault that persists is reported").contains("upstream disconnected unexpectedly"));
+            assert_eq!(served, 1 + CUT_RETRIES as usize, "{code}");
         }
     }
 
