@@ -35,6 +35,7 @@ const CANCEL_STUB: &str = "The user cancelled this turn.";
 const INCOMPLETE: &str = "provider response was interrupted or exceeded client limits; the reply above is incomplete";
 const STREAM_ENDED: &str = "the stream ended before the reply finished";
 const CUT: &str = "the reply was cut short (";
+const RESTARTED: &str = ") and is asked for again from its start";
 const SILENCE: &str = "the endpoint sent nothing for 1s";
 const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n";
 const JSON_TYPE: &str = "Content-Type: application/json\r\n";
@@ -726,14 +727,14 @@ fn check_windows(run: &Run, new: &[ChatMessage], stop: &str, log: &str) {
         let last = w + 1 == opens.len();
         let window = &run.events[open + 1..opens.get(w + 1).copied().unwrap_or(run.events.len())];
         let of = |kind: &str| window.iter().filter(|e| e["type"] == kind).collect::<Vec<_>>();
-        // Reply text streams before a retry only when the reply was cut, and
-        // the retry says so: what streamed before it is void.
+        // Reply text streams before a retry only when the reply was cut or
+        // failed partway, and the retry says so: what streamed before it is void.
         let mut streamed = false;
         for event in window {
             match event["type"].as_str().unwrap() {
                 "token" => streamed = true,
                 "retry" if streamed => {
-                    assert!(event["reason"].as_str().unwrap().starts_with(CUT), "a retry after reply text names the cut: {log}");
+                    assert!(event["reason"].as_str().unwrap().ends_with(RESTARTED), "a retry after reply text says it starts over: {log}");
                     streamed = false;
                 }
                 _ => {}
@@ -1377,21 +1378,45 @@ fn shape(events: &[Value]) -> Vec<String> {
     shape
 }
 
-/// Once reply text has streamed, a reply the provider fails is an error and
-/// is not resent: the turn fails with the provider's message, keeps none of
-/// the partial text, and never runs a call that streamed before the failure.
+/// A reply the provider fails with a retryable fault after its text began is
+/// asked for again from its start, as a reply the network cut is: a call that
+/// streamed before the failure never runs, and the resent reply is kept once.
+/// A fault that persists past the cut budget fails the turn with the
+/// provider's message and keeps none of the partial text.
 #[test]
-fn an_error_chunk_after_reply_text_fails_the_turn_and_keeps_no_partial_text() {
+fn an_error_chunk_after_reply_text_is_asked_for_again() {
     let failed = format!("{}{}data: {OVERLOADED}\n\n{DONE}", content("partial "), call("e1", "never"));
-    let env = Env::new("error-after-text", "error chunk after reply text", vec![Step::Finished(failed), Step::Finished(sse_text("resumed"))]);
+    let env = Env::new("error-after-text", "error chunk after reply text", vec![
+        Step::Finished(failed.clone()),
+        Step::Finished(sse_text("whole")),
+        Step::Finished(sse_text("resumed")),
+    ])
+    .fast();
+    let run = env.first("go");
+    let log = run.log();
+    assert_eq!(run.code, Some(0), "{log}");
+    assert_eq!(run.stop_reason(), "stop", "{log}");
+    assert_eq!(run.retry_reasons(), ["the reply failed partway (backend reported an error (503): overloaded mid-reply) and is asked for again from its start"], "{log}");
+    assert_eq!(run.requests.len(), 2, "{log}");
+    assert_eq!(run.requests[0], run.requests[1], "the resend is the same request: {log}");
+    assert_eq!(run.message_done(), ["whole"], "{log}");
+    assert_eq!(env.ran_log(), "", "{log}");
+    env.resume(&run, &run.after);
+
+    let env = Env::new("error-after-text-persists", "error chunk after reply text, every time", vec![
+        Step::Finished(failed.clone()),
+        Step::Finished(failed.clone()),
+        Step::Finished(failed),
+        Step::Finished(sse_text("resumed")),
+    ])
+    .fast();
     let run = env.first("go");
     let log = run.log();
     assert_eq!(run.code, Some(1), "{log}");
     assert_eq!(run.stop_reason(), "error", "{log}");
-    assert_eq!(run.of("token").map(|e| e["text"].as_str().unwrap()).collect::<String>(), "partial ", "{log}");
     assert_eq!(run.errors(), ["backend reported an error (503): overloaded mid-reply"], "{log}");
-    assert_eq!(run.count("message_done") + run.count("tool_start") + run.count("retry"), 0, "{log}");
-    assert_eq!(run.requests.len(), 1, "{log}");
+    assert_eq!(run.requests.len(), 3, "{log}");
+    assert_eq!(run.count("message_done") + run.count("tool_start"), 0, "{log}");
     assert_eq!(env.ran_log(), "", "{log}");
     let messages = run.messages();
     assert_eq!(messages.last().map(|m| m.role.as_str()), Some("user"), "only the prompt is kept: {log}");
