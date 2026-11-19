@@ -65,13 +65,25 @@ fn file_states(root: &Path) -> Option<HashMap<PathBuf, (u64, Option<SystemTime>)
 /// session can undo a correct repair. The exit status stays the first's
 /// unless a signal lands.
 pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
-    let given = args.second_look.then(|| file_states(&args.project));
+    // Both scans run off this thread so a signal still ends the run in time.
+    let project = args.project.clone();
+    let given = match args.second_look {
+        false => None,
+        true => match crate::until_stopped(args.quit.notified(), &mut None, move || file_states(&project)).await {
+            Some(given) if !crate::signalled() => Some(given),
+            _ => return crate::quit_status(),
+        },
+    };
     let code = run_session(&core, &mut core_rx, &args).await;
     let written = args.written.load(Ordering::Relaxed);
     let Some(given) = given.filter(|_| code == 0 && !crate::signalled()) else { return code };
-    let touched = given.as_ref().map(|files| files.iter().filter(|(path, was)| {
-        std::fs::symlink_metadata(path).ok().map(|m| (m.len(), m.modified().ok())).as_ref() != Some(*was)
+    let changed = move || given.map(|files| files.iter().filter(|(path, was)| {
+        std::fs::symlink_metadata(path).ok().map(|m| (m.len(), m.modified().ok())).as_ref() != Some(was)
     }).count());
+    let touched = match crate::until_stopped(args.quit.notified(), &mut None, changed).await {
+        Some(touched) if !crate::signalled() => touched,
+        _ => return crate::quit_status(),
+    };
     let skip = match touched {
         _ if written > SECOND_LOOK_MAX_OUTPUT => format!("the run wrote {written} output tokens, over {SECOND_LOOK_MAX_OUTPUT}"),
         None => format!("the project holds more than {SECOND_LOOK_MAX_FILES} files, or one of its directories could not be read"),
