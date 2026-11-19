@@ -9768,6 +9768,21 @@ echo run >> {}
     /// system prompt and the tool schemas, which other files write, stand as
     /// placeholders; every other byte is as sent.
     async fn default_limit_bodies(window: usize) -> Vec<String> {
+        sent_bodies(window)
+            .await
+            .into_iter()
+            .map(|body| {
+                let sent: Value = serde_json::from_str(&body).unwrap();
+                let system = serde_json::to_string(&sent["messages"][0]["content"]).unwrap();
+                let tools = serde_json::to_string(&sent["tools"]).unwrap();
+                assert!(body.contains(&system) && body.contains(&tools), "{body}");
+                body.replacen(&system, "\"<system prompt>\"", 1).replacen(&tools, "\"<tool schemas>\"", 1)
+            })
+            .collect()
+    }
+
+    /// The request bodies of that session exactly as sent.
+    async fn sent_bodies(window: usize) -> Vec<String> {
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
         let project = dir.join("project");
@@ -9785,15 +9800,28 @@ echo run >> {}
         let _ = std::fs::remove_dir_all(dir);
         let bodies = bodies.lock().unwrap().clone();
         bodies
-            .into_iter()
-            .map(|body| {
-                let sent: Value = serde_json::from_str(&body).unwrap();
-                let system = serde_json::to_string(&sent["messages"][0]["content"]).unwrap();
-                let tools = serde_json::to_string(&sent["tools"]).unwrap();
-                assert!(body.contains(&system) && body.contains(&tools), "{body}");
-                body.replacen(&system, "\"<system prompt>\"", 1).replacen(&tools, "\"<tool schemas>\"", 1)
-            })
-            .collect()
+    }
+
+    /// The bug this guards: the bash description named `openmax --recall` as
+    /// a search of past sessions, and models in fresh benchmark containers
+    /// called it hoping to find earlier attempts at their task. Dropping that
+    /// clause changes no other byte of a request: the system prompt and the
+    /// tool schemas, with the clause put back, are those `main` sent before
+    /// the cut, and every other byte is pinned by
+    /// `the_default_reply_limit_sends_the_bytes_it_always_sent`.
+    #[tokio::test]
+    async fn dropping_the_recall_hint_changes_only_the_bash_description() {
+        let before: Value = serde_json::from_str(include_str!("../tests/fixtures/request-before-recall-cut.json")).unwrap();
+        for body in sent_bodies(1_048_576).await {
+            let sent: Value = serde_json::from_str(&body).unwrap();
+            let dir = sent["messages"][0]["content"].as_str().unwrap().split(" working on the project at ").nth(1).unwrap();
+            let dir = dir.split("/project").next().unwrap();
+            assert_eq!(sent["messages"][0]["content"].as_str().unwrap().replace(dir, "<dir>"), before["system"].as_str().unwrap());
+            let tools = serde_json::to_string(&sent["tools"]).unwrap();
+            assert!(!tools.contains("openmax --recall"), "{tools}");
+            let restored = tools.replacen("openmax --check verifies.", r#"openmax --check verifies; openmax --recall \"<query>\" searches past sessions."#, 1);
+            assert_eq!(restored, before["tools"].as_str().unwrap());
+        }
     }
 
     /// A reply limit no larger than the reserve's cap, the default 4096

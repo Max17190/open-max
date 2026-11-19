@@ -855,7 +855,8 @@ mod tests {
         assert_eq!(bash["function"]["description"], pointer);
         assert!(pointer.contains("openmax --spec <tools|"));
         assert!(pointer.contains("openmax --check"));
-        assert!(pointer.contains("openmax --recall"), "preserved history must be findable");
+        // Named, recall read as a way to find earlier attempts at the task.
+        assert!(!pointer.contains("openmax --recall"), "the pointer does not invite a search of past sessions");
         // Capability-file history is no longer recorded, so a pointer to it
         // would be bytes every request pays for a command with nothing to show.
         assert!(!pointer.contains("openmax --ledger"), "no pointer to history that is not kept");
@@ -1374,8 +1375,8 @@ mod tests {
         // Every surface the pointer names must exist, and the omissions must
         // be exactly the deliberate ones: settings, recall, and usage are not
         // authoring surfaces, and the moments that need them carry their own
-        // pointer (--check settings rows print "openmax --spec settings"; the
-        // pointer names openmax --recall itself). `subagent` is not one
+        // pointer (--check settings rows print "openmax --spec settings";
+        // recall is left out of the pointer on purpose). `subagent` is not one
         // either, but it is named: it is how the agent finds delegation, and
         // `openmax --help` lists --subagent and its recipe too. A new --spec
         // surface must
