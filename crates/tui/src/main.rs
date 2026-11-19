@@ -1537,7 +1537,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     }
 
     // The prompt on standard input keeps the task text off every command line, where `pkill -f` matches it.
-    if cli.print && cli.prompts.is_empty() && !std::io::stdin().is_terminal() { cli.prompts.push(std::io::read_to_string(std::io::stdin()).unwrap_or_default()) }
+    if cli.print && cli.prompts.is_empty() && !std::io::stdin().is_terminal() { cli.prompts.push(std::io::read_to_string(std::io::stdin()).unwrap_or_else(|e| { eprintln!("openmax: reading the --print prompt from stdin: {e}"); std::process::exit(2) })) }
     if cli.print && (cli.prompts.is_empty() || cli.prompts.iter().all(|p| p.trim().is_empty())) {
         eprintln!("openmax: --print requires a prompt\n\n{HELP}");
         std::process::exit(2);

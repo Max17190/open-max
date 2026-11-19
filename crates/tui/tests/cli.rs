@@ -2153,6 +2153,20 @@ fn a_print_prompt_on_stdin_survives_pkill_of_a_word_in_it() {
     }
 }
 
+/// Piped input that cannot be read as text is named as such, not reported as
+/// a missing prompt.
+#[test]
+fn a_piped_print_prompt_that_is_not_utf8_is_named() {
+    let (project, home) = fresh_dirs("stdin-not-utf8");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let mut child = cmd(&project, &home).args(["--trust-project", "-p"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"tidy \xff report").unwrap();
+    let out = finish_with_deadline(child);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("openmax: reading the --print prompt from stdin: stream did not contain valid UTF-8"), "{stderr}");
+}
+
 /// One scripted SSE completion per request, and every request body appended to
 /// `record`, so a test can assert both what openmax did and what the model was
 /// told afterwards. Records to a file (not memory) so a test can read the wire
