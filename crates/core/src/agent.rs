@@ -9814,8 +9814,9 @@ echo run >> {}
         let before: Value = serde_json::from_str(include_str!("../tests/fixtures/request-before-recall-cut.json")).unwrap();
         for body in sent_bodies(1_048_576).await {
             let sent: Value = serde_json::from_str(&body).unwrap();
-            let dir = sent["messages"][0]["content"].as_str().unwrap().split(" working on the project at ").nth(1).unwrap();
-            let dir = dir.split("/project").next().unwrap();
+            let line = sent["messages"][0]["content"].as_str().unwrap().lines().next().unwrap();
+            let project = line.split_once(" working on the project at ").unwrap().1.strip_suffix('.').unwrap();
+            let dir = project.strip_suffix("/project").unwrap();
             assert_eq!(sent["messages"][0]["content"].as_str().unwrap().replace(dir, "<dir>"), before["system"].as_str().unwrap());
             let tools = serde_json::to_string(&sent["tools"]).unwrap();
             assert!(!tools.contains("openmax --recall"), "{tools}");
