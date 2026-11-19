@@ -95,7 +95,7 @@ impl OutputCaps {
             (None, Some(tokens)) => (tokens.saturating_mul(3) / 8).clamp(MAX_OUTPUT_BYTES, MAX_WINDOW_OUTPUT_BYTES),
             (None, None) => MAX_OUTPUT_BYTES,
         };
-        Self { command_bytes, images: settings.image_input }
+        Self { command_bytes, images: settings.image_input == Some(true) }
     }
 
     /// The bytes one read_file call may return: the command cap, held

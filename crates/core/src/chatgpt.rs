@@ -696,7 +696,7 @@ pub async fn save_catalog(
                 name: m["display_name"].as_str().map(str::to_string),
                 context_tokens: m["context_window"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0),
                 max_tokens: None,
-                compaction_tokens: None,
+                compaction_tokens: None, image_input: false,
             })
         })
         .collect();

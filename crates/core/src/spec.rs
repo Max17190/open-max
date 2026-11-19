@@ -751,8 +751,9 @@ Shape: `{"providers": {"<name>": { ... }}}`. Per provider:
   gets no key, and a 401 from it names how to give the provider its own.
 - `headers` (optional): extra HTTP headers as a string map.
 - `models` (optional): list of `{"id", "name"?, "context_tokens"?,
-  "max_tokens"?, "compaction_tokens"?}`. Ids are sent unchanged; order is
-  preserved in `/model`.
+  "max_tokens"?, "compaction_tokens"?, "image_input"?}`. Ids are sent
+  unchanged; order is preserved in `/model`. `"image_input": true` turns
+  image input on for that model unless settings turn it off.
 - `compat` (optional): wire quirks for picky servers:
   `{"use_max_completion_tokens": false, "send_stream_options": true}` are the
   defaults.
@@ -877,7 +878,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   Explicit selections persist unless the endpoint is a launch override.
 - `max_output_bytes`: tool-output byte cap before truncation with spill.
   Unset, it follows the model's window, from 16 KiB to 48 KiB.
-- `image_input` (default false): read_file on a PNG, JPEG, GIF or WebP file
+- `image_input` (unset: on for a model whose providers.json entry declares
+  `"image_input": true`, else off; true or false overrides): read_file on a PNG, JPEG, GIF or WebP file
   returns it to the model as an image part beside a short text line, and an
   external tool's images (an MCP tool's included) come back with its result.
   One call shows at most 8 images, 5 MiB in all; the result names any left

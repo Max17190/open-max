@@ -317,7 +317,9 @@ and the run that writes a key already uses it.
   frame starts after it instead of running on from their last byte. A file
   with lone-`\r` line endings printed through bash shows only its last
   record the same way; `tr '\r' '\n' < file` shows every record.
-- `image_input` (default false): `read_file` on a PNG, JPEG, GIF or WebP
+- `image_input` (unset: on for a model whose providers.json entry declares
+  `"image_input": true`, off otherwise; `true` or `false` overrides the
+  entry): `read_file` on a PNG, JPEG, GIF or WebP
   file returns a one-line description (type, width x height, bytes) and the
   image itself, sent as an image part of the tool result on every wire (Chat
   Completions `image_url`, Responses `input_image`, native Messages `image`).
@@ -505,6 +507,10 @@ requests.
   }
 }
 ```
+
+Add `"image_input": true` to a model object for a model that takes images:
+tool results then show it images unless settings set `image_input` to
+`false`. A model without it sends exactly the requests it did before.
 
 Add `"compaction_tokens": 220000` to a model object to set that model's
 compaction cap. Without one, the cap is four fifths of that model's
