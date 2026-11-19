@@ -359,7 +359,7 @@ mod tests {
                 (200, completed("recovered"))], 2, None),
             (vec![(429, json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"app limit"}}).to_string()),
                 (200, completed("unexpected"))], 1, Some("https://chatgpt.com/settings/usage")),
-            (vec![(429, json!({"error":{"code":"rate_limit_exceeded","message":"busy"}}).to_string()); 9], 8, Some("backend reported an error (rate_limit_exceeded): busy")),
+            (vec![(429, json!({"error":{"code":"rate_limit_exceeded","message":"busy"}}).to_string()); 21], 20, Some("backend reported an error (rate_limit_exceeded): busy")),
             (vec![(400, json!({"message":"request rejected"}).to_string())], 1, Some("request rejected")),
             (vec![(200, format!("data: {}\n\n", json!({"type":"error","code":"server_error","message":"busy"}))),
                 (200, completed("recovered"))], 2, None),
@@ -367,6 +367,7 @@ mod tests {
                 8, Some("backend reported an error (server_error): busy")),
         ] {
             let streamed_error = replies[0].0 == 200;
+            let budget = if replies[0].0 == 429 { super::super::RATE_LIMIT_ATTEMPTS } else { 8 };
             let (client, requests, job) = endpoint(replies).await;
             let mut retries = Vec::new();
             let mut reasons = Vec::new();
@@ -389,7 +390,7 @@ mod tests {
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), expected_requests);
             assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
-            assert_eq!(retries, (2..=expected_requests as u32).map(|attempt| (attempt, 8)).collect::<Vec<_>>());
+            assert_eq!(retries, (2..=expected_requests as u32).map(|attempt| (attempt, budget)).collect::<Vec<_>>());
             if streamed_error { assert!(reasons[0].contains("server_error")); }
         }
         let (client, requests, job) = endpoint(vec![(200, String::new()); 9]).await;
