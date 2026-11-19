@@ -206,6 +206,9 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
 /// narrower tool calls. Carried in this description instead, the same
 /// content does not, and the first response reasons as it does with no
 /// pointer at all. Every command it names runs through bash.
+#[cfg(target_os = "linux")]
+pub(crate) const BASH_DESCRIPTION: &str = "Run a shell command in the project root. Background jobs end with the call; setsid keeps one. Extend Open Max: openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp|subagent> prints a contract; openmax --check verifies.";
+#[cfg(not(target_os = "linux"))]
 pub(crate) const BASH_DESCRIPTION: &str = "Run a shell command in the project root. Background processes end with the call; tmux keeps one. Extend Open Max: openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp|subagent> prints a contract; openmax --check verifies.";
 
 /// Set when the loaded settings turn `image_input` on: the read_file entry
@@ -2543,8 +2546,10 @@ pub(crate) const BACKGROUND_TERMINATED_NOTE: &str = concat!(
 /// behind gets instead, once the one above has explained the rule: a line
 /// that still says what happened and what to do instead, so it holds on its
 /// own when compaction has dropped the first.
-pub(crate) const BACKGROUND_TERMINATED_AGAIN: &str = "[openmax: background processes were \
-    terminated when this command returned; a named tmux session keeps one running.]";
+#[cfg(target_os = "linux")]
+pub(crate) const BACKGROUND_TERMINATED_AGAIN: &str = "[openmax: background processes were terminated when this command returned; `setsid` or a named tmux session keeps one running.]";
+#[cfg(not(target_os = "linux"))]
+pub(crate) const BACKGROUND_TERMINATED_AGAIN: &str = "[openmax: background processes were terminated when this command returned; a named tmux session keeps one running.]";
 
 /// Describe a non-success exit honestly. A signal kill has no exit code, and
 /// the former "exit code -1" pointed diagnosis at a code nothing returned;
@@ -4219,6 +4224,16 @@ mod tests {
             plain.output
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Linux builds point at `setsid` in the two places an agent reads first,
+    /// and other builds keep tmux, the answer that also holds on macOS.
+    #[test]
+    fn the_background_keeper_named_fits_the_build() {
+        let (keeper, other) = if cfg!(target_os = "linux") { ("setsid keeps one", "tmux keeps one") } else { ("tmux keeps one", "setsid") };
+        assert!(BASH_DESCRIPTION.contains(keeper) && !BASH_DESCRIPTION.contains(other), "{BASH_DESCRIPTION}");
+        let first = if cfg!(target_os = "linux") { "`setsid`" } else { "a named tmux session" };
+        assert!(BACKGROUND_TERMINATED_AGAIN.contains(&format!("returned; {first}")), "{BACKGROUND_TERMINATED_AGAIN}");
     }
 
     /// The note is carved out of the cap by its own length: output that

@@ -724,7 +724,7 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // endpoint that reads them), raised for by its owner. Saying in a bash
     // result that the kernel killed a process for memory, with offsetting
     // trims, removed 6.
-    const BASELINE: usize = 45_034;
+    const BASELINE: usize = 45_039;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
