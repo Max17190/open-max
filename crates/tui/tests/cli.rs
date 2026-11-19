@@ -2118,7 +2118,8 @@ fn a_print_prompt_on_stdin_survives_pkill_of_a_word_in_it() {
     let word = "quillfeatherzonk";
     let prompt = format!("Tidy the {word} report and stop.");
     let call = || sse_tool_call("bash", serde_json::json!({ "command": format!("pkill -f {word}; echo alive") }));
-    for piped in [true, false] {
+    // The fault is shown on Linux, where procps `pkill -f` reads the shell's whole command line; macOS's did not match it.
+    for piped in [true, false].into_iter().filter(|piped| *piped || cfg!(target_os = "linux")) {
         let (project, home) = fresh_dirs(if piped { "stdin-prompt" } else { "argv-prompt" });
         let record = home.join("wire.jsonl");
         let (base_url, _server) = spawn_recording_server(vec![call(), sse_text("finished")], record.clone());
