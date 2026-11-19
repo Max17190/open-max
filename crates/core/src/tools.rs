@@ -466,15 +466,16 @@ pub async fn execute(
     execute_in_session(name, args, data_dir, root, caps, cancel, &AtomicBool::new(false)).await
 }
 
-/// The OOM-kill count the last bash result saw, or `u64::MAX` until the process's first bash call takes its starting count.
-static OOM_KILLS: AtomicU64 = AtomicU64::new(u64::MAX);
-/// The kernel's OOM-kill count for this process's memory cgroup and those under it (v2 `memory.events`, v1
-/// `memory.oom_control`), or the cgroup root's where a container shows its own cgroup there; None where none reads.
+/// One more than the OOM-kill count the last bash result saw (only rising, across sessions); 0 before the first bash call.
+static OOM_KILLS: AtomicU64 = AtomicU64::new(0);
+/// The kernel's OOM-kill count for this process's memory cgroup and those under it: v2 `memory.events` (at /sys/fs/cgroup or, hybrid, /unified)
+/// or v1 `memory.oom_control` in the hierarchy listing `memory`, at the cgroup's path or else the root, where a container shows its own.
 fn oom_kills() -> Option<u64> {
-    let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let files = cgroups.lines().filter_map(|l| match l.splitn(3, ':').skip(1).collect::<Vec<_>>()[..] { ["", path] => Some(("", "memory.events", path)), ["memory", path] => Some(("/memory", "memory.oom_control", path)), _ => None });
     let read = |f: String| std::fs::read_to_string(f).ok()?.lines().find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok());
-    files.flat_map(|(dir, file, path)| [format!("/sys/fs/cgroup{dir}{}/{file}", path.trim_end_matches('/')), format!("/sys/fs/cgroup{dir}/{file}")]).find_map(read)
+    std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().filter_map(|l| l.split_once(':')?.1.split_once(':')).flat_map(|(c, path)| {
+        let (dirs, file) = if c.is_empty() { (vec![String::new(), "/unified".into()], "memory.events") } else if c.split(',').any(|c| c == "memory") { (vec!["/memory".into(), format!("/{c}")], "memory.oom_control") } else { (vec![], "") };
+        dirs.into_iter().flat_map(move |d| [format!("/sys/fs/cgroup{d}{}/{file}", path.trim_end_matches('/')), format!("/sys/fs/cgroup{d}/{file}")])
+    }).find_map(read)
 }
 
 /// [`execute`] for one call of a session. `background_noted` is the
@@ -490,9 +491,9 @@ pub(crate) async fn execute_in_session(
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
     if name == "bash" {
-        if let Some(n) = oom_kills() { let _ = OOM_KILLS.compare_exchange(u64::MAX, n, Relaxed, Relaxed); }
+        if let Some(n) = oom_kills() { let _ = OOM_KILLS.compare_exchange(0, n + 1, Relaxed, Relaxed); }
         let mut outcome = run_bash(data_dir, root, args, caps, cancel, background_noted).await;
-        if let Some((before, now)) = oom_kills().map(|now| (OOM_KILLS.swap(now, Relaxed), now)).filter(|(before, now)| before < now) {
+        if let Some((before, now)) = oom_kills().map(|n| (OOM_KILLS.fetch_max(n + 1, Relaxed), n + 1)).filter(|&(before, now)| before != 0 && before < now) {
             outcome.output.push_str(&format!("\n[openmax: since the last result, the kernel killed {} process(es) in this cgroup for running out of memory.]", now - before));
         }
         return outcome;
@@ -2511,17 +2512,11 @@ pub(crate) fn exited_outcome(
     let reserved = note.as_ref().map_or(0, |note| note.len() + 1);
     let budget = cap.saturating_sub(reserved).max(1);
     let (text, truncated) = render_process_output(output, budget);
-    let (ok, text) = match status.success() {
-        true => (true, text),
-        false => (false, format!("{}\n{text}", describe_exit(status))),
-    };
+    let (ok, text) = if status.success() { (true, text) } else { (false, format!("{}\n{text}", describe_exit(status))) };
     // A backgrounded server dies with the call and the exit status
     // is still 0, so without this the next step is a request to a
     // port nothing is listening on.
-    let text = match note {
-        Some(note) => format!("{text}\n{note}"),
-        None => text,
-    };
+    let text = match note { Some(note) => format!("{text}\n{note}"), None => text };
     ToolOutcome::from_process(ok, text, output, truncated)
 }
 
