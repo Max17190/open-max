@@ -466,15 +466,13 @@ pub async fn execute(
     execute_in_session(name, args, data_dir, root, caps, cancel, &AtomicBool::new(false)).await
 }
 
-/// The OOM-kill count bash results were last checked against: `u64::MAX` until the first bash call of the process
-/// takes the count it starts at, and each result then reports the kills since the last.
+/// The OOM-kill count the last bash result saw, or `u64::MAX` until the process's first bash call takes its starting count.
 static OOM_KILLS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The kernel's OOM-kill count for this process's memory cgroup and those under it (v2 `memory.events`, v1
 /// `memory.oom_control`), or the cgroup root's where a container shows its own cgroup there; None where none reads.
 fn oom_kills() -> Option<u64> {
     let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let files = cgroups.lines().filter_map(|l| match l.splitn(3, ':').skip(1).collect::<Vec<_>>()[..] {
-        ["", path] => Some(("", "memory.events", path)), ["memory", path] => Some(("/memory", "memory.oom_control", path)), _ => None });
+    let files = cgroups.lines().filter_map(|l| match l.splitn(3, ':').skip(1).collect::<Vec<_>>()[..] { ["", path] => Some(("", "memory.events", path)), ["memory", path] => Some(("/memory", "memory.oom_control", path)), _ => None });
     let read = |f: String| std::fs::read_to_string(f).ok()?.lines().find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok());
     files.flat_map(|(dir, file, path)| [format!("/sys/fs/cgroup{dir}{}/{file}", path.trim_end_matches('/')), format!("/sys/fs/cgroup{dir}/{file}")]).find_map(read)
 }
