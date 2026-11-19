@@ -1,0 +1,4 @@
+Another engineer was given the request below and reports it done. Their work is in this environment and nobody has checked it. Check it against the request, one requirement at a time. Where the request asks for an answer, work the answer out again yourself by a different route before you look at theirs, then compare. Where it asks for something that runs, run it under the conditions the request describes. Where your result and theirs differ, find the cause before you change anything. Fix what is wrong or missing and leave alone what already holds.
+
+The request:
+

@@ -3177,6 +3177,97 @@ fn a_truncated_stream_never_runs_the_tool_call_it_carried() {
     );
 }
 
+const STREAM_ERROR_SSE: &str = concat!(
+    "data: {\"error\":{\"code\":400,\"message\":\"upstream rejected the request\"},",
+    "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// A finished answer whose usage reports `written` output tokens.
+fn answer_writing(text: &str, written: u64) -> String {
+    sse(&[
+        serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":written}}),
+    ])
+}
+
+/// `-p --json --second-look` against `script`: the exit status, the request
+/// bodies the server got, the JSON lines and stderr.
+fn second_look_run(tag: &str, script: Vec<String>) -> (Option<i32>, Vec<serde_json::Value>, Vec<serde_json::Value>, String) {
+    let (project, home) = fresh_dirs(tag);
+    let (base_url, requests, _server) = spawn_scripted_server(script.into_iter().map(|sse| (sse, true)).collect());
+    write_settings_with_mode(&home, &base_url, "auto");
+    let out = cmd(&project, &home).args(["--trust-project", "--json", "--second-look", "-p", "list the files"]).output().unwrap();
+    let lines = String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let sent = requests.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap()).collect();
+    (out.status.code(), sent, lines, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// `--second-look` follows a run that ended with status 0 and wrote at most
+/// 10,000 output tokens with a new session: a new session id, whose first
+/// request holds the system prompt and one user message, the fixed review
+/// text followed by the prompt, and nothing of the first session. Its events
+/// follow the first `done`. One token more and it is skipped, with a line on
+/// stderr either way.
+#[test]
+fn a_second_look_follows_a_clean_run_within_the_output_limit() {
+    let review = include_str!("../second-look.txt");
+    for (written, looks) in [(10_000u64, true), (10_001, false)] {
+        // The bulk rides a tool call's reply: an answer that long would read as a cut one.
+        let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function",
+            "function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":written - 5}});
+        let script = vec![sse(&[call]), answer_writing("first answer", 5), answer_writing("checked", 5)];
+        let (code, sent, lines, stderr) = second_look_run(&format!("second-look-{written}"), script);
+        assert_eq!(code, Some(0), "{stderr}");
+        let sessions: Vec<&str> = lines.iter().filter(|l| l["type"] == "done").map(|l| l["session_id"].as_str().unwrap()).collect();
+        if !looks {
+            assert_eq!((sent.len(), sessions.len()), (2, 1), "{stderr}");
+            assert!(stderr.contains("openmax: second look skipped: the run wrote 10001 output tokens, over 10000"), "{stderr}");
+            continue;
+        }
+        assert!(stderr.contains("openmax: second look: a new session checks the work (10000 output tokens written)"), "{stderr}");
+        assert_eq!(sent.len(), 3, "{stderr}");
+        assert!(sessions.len() == 2 && sessions[0] != sessions[1], "{lines:?}");
+        assert_eq!(lines.last().unwrap()["type"], "done");
+        let messages = sent[2]["messages"].as_array().unwrap();
+        // The system prompt, the execution policy note every session's first request carries, and the review prompt.
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[1]["content"].as_str().unwrap().starts_with("[execution policy:"), "{messages:?}");
+        assert_eq!(messages[2]["content"], format!("{review}list the files"), "{messages:?}");
+        assert!(!messages.iter().any(|m| m["role"] == "assistant") && !sent[2].to_string().contains("first answer"), "{messages:?}");
+    }
+}
+
+/// No second look after a failed run, and a second look that fails does not
+/// turn a finished run into a failed one: the exit status is the first run's.
+#[test]
+fn a_second_look_keeps_the_first_runs_exit_status() {
+    let (code, sent, _, stderr) = second_look_run("second-look-failed", vec![STREAM_ERROR_SSE.to_string(), answer_writing("checked", 5)]);
+    assert_eq!((code, sent.len()), (Some(1), 1), "{stderr}");
+    assert!(!stderr.contains("second look"), "{stderr}");
+
+    let (code, sent, _, stderr) = second_look_run("second-look-fails", vec![answer_writing("done", 5), STREAM_ERROR_SSE.to_string()]);
+    assert_eq!((code, sent.len()), (Some(0), 2), "{stderr}");
+    assert!(stderr.contains("openmax: second look ended with status 1; the run's status 0 stands"), "{stderr}");
+}
+
+/// Off unless asked for, and only for one print prompt.
+#[test]
+fn a_second_look_is_opt_in_and_takes_one_print_prompt() {
+    let (project, home) = fresh_dirs("second-look-off");
+    let (base_url, requests, _server) = spawn_scripted_server(vec![(answer_writing("done", 5), true), (answer_writing("x", 5), true)]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "list the files"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    for args in [&["--second-look", "-p", "a", "-p", "b"][..], &["--second-look"][..]] {
+        let out = cmd(&project, &home).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+}
+
 /// A provider that fails after its 200 has gone out says so inside the
 /// stream. That used to read as a clean end: the turn stopped with nothing
 /// reported, and a tool call that streamed before the failure ran. The turn
