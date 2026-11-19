@@ -241,7 +241,7 @@ pub(super) async fn read(
     let mut reply = cancelled_response();
     reply.finish_reason = TRUNCATED.into();
     let request_id = resp.headers().get("request-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let failed = |message: String| Some(Unfinished::Failed(ServerFailure { message, retryable: false }));
+    let failed = |message: String| Some(Unfinished::Failed(ServerFailure { message, retryable: false, limited: false }));
     let failure = |error: &Value| {
         let api_error = error["type"] == "api_error";
         let mut error = server_failure(error, &error.to_string());

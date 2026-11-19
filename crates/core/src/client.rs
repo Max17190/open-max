@@ -842,6 +842,7 @@ impl ChatClient {
         let mut unreached = 0u32;
         // Replies cut after their text began.
         let mut cuts = 0u32;
+        let mut budget = MAX_ATTEMPTS;
         loop {
             attempt += 1;
             let mut req = self
@@ -884,8 +885,8 @@ impl ChatClient {
                 Err(_) => {
                     unreached = 0;
                     let msg = format!("request failed: {}", silence(self.idle_timeout));
-                    if attempt < MAX_ATTEMPTS {
-                        if !resend_after(attempt, MAX_ATTEMPTS, &msg, backoff(attempt, None), &cancelled, &mut on_delta).await {
+                    if attempt < budget {
+                        if !resend_after(attempt, budget, &msg, backoff(attempt, None), &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
@@ -901,8 +902,8 @@ impl ChatClient {
                     // first. The retry line counts to it, not to a budget a
                     // dead address never spends.
                     let last = match unreached {
-                        0 => MAX_ATTEMPTS,
-                        n => MAX_ATTEMPTS.min(attempt + UNREACHED_ATTEMPTS - n),
+                        0 => budget,
+                        n => budget.min(attempt + UNREACHED_ATTEMPTS - n),
                     };
                     let (msg, repair) = never_connected(&e, e.url().is_some_and(through_proxy))
                         .unwrap_or_else(|| (format!("request failed: {}", describe_transport(&e)), ""));
@@ -917,10 +918,8 @@ impl ChatClient {
             };
             unreached = 0;
             let status = resp.status();
-            // The server's wait governs a resend whether it refused the
-            // request by status or failed it inside a 200. An ask past the
-            // cap outlasts any wait this turn takes: resending would only
-            // meet the same refusal.
+            // The server's wait governs a resend whether it refused the request by status or failed
+            // it inside a 200. An ask past the cap outlasts any wait this turn takes, so is not resent.
             let asked = retry_after_secs(resp.headers());
             let beyond_cap = asked.filter(|&secs| secs > RETRY_AFTER_CAP_SECS);
             if !status.is_success() {
@@ -944,8 +943,9 @@ impl ChatClient {
                 }
                 let exhausted = quota_exhausted(&text)
                     || (self.wire_api == crate::providers::WireApi::Responses && responses::plan_limit(&text));
-                if attempt < MAX_ATTEMPTS && is_retryable_status(code) && !exhausted && beyond_cap.is_none() {
-                    if !resend_after(attempt, MAX_ATTEMPTS, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
+                if code == 429 && !exhausted { budget = RATE_LIMIT_ATTEMPTS; }
+                if attempt < budget && is_retryable_status(code) && !exhausted && beyond_cap.is_none() {
+                    if !resend_after(attempt, budget, &err, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                         return Ok(cancelled_response());
                     }
                     continue;
@@ -971,8 +971,9 @@ impl ChatClient {
                 let error = [&v["error"], &choice["error"]].into_iter().find(|e| !e.is_null());
                 if error.is_some() || choice["finish_reason"] == "error" {
                     let failure = server_failure(error.unwrap_or(&Value::Null), &String::from_utf8_lossy(&body));
-                    if failure.retryable && attempt < MAX_ATTEMPTS && beyond_cap.is_none() {
-                        if !resend_after(attempt, MAX_ATTEMPTS, &failure.message, backoff(attempt, asked), &cancelled, &mut on_delta).await {
+                    if failure.limited { budget = RATE_LIMIT_ATTEMPTS; }
+                    if failure.retryable && attempt < budget && beyond_cap.is_none() {
+                        if !resend_after(attempt, budget, &failure.message, backoff(attempt, asked), &cancelled, &mut on_delta).await {
                             return Ok(cancelled_response());
                         }
                         continue;
@@ -992,20 +993,19 @@ impl ChatClient {
                 crate::providers::WireApi::Responses => Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await,
                 crate::providers::WireApi::ChatCompletions => read_sse(resp, &cancelled, self.idle_timeout, &mut on_delta).await,
             };
-            // The restart rules: nothing the caller keeps has streamed yet,
-            // and the budget has an attempt left. A reply the network cut, or
-            // a retryable server fault ended, after its text began is asked
-            // for again too, CUT_RETRIES times at most between them: the caller
-            // loses the partial text it showed, where keeping it ends the turn.
-            let restartable = reply.content.is_empty() && attempt < MAX_ATTEMPTS;
-            let cut = !restartable && attempt < MAX_ATTEMPTS && cuts < CUT_RETRIES;
-            let (again, cut_last) = (" and is asked for again from its start", MAX_ATTEMPTS.min(attempt + CUT_RETRIES - cuts));
+            // The restart rules: nothing the caller keeps has streamed yet, and the budget has an attempt
+            // left. A reply the network cut, or a retryable server fault ended, after its text began is asked for
+            // again too, CUT_RETRIES times at most: the caller loses the partial text, where keeping it ends the turn.
+            if let Some(Unfinished::Failed(ServerFailure { limited: true, .. })) = unfinished { budget = RATE_LIMIT_ATTEMPTS; }
+            let restartable = reply.content.is_empty() && attempt < budget;
+            let cut = !restartable && attempt < budget && cuts < CUT_RETRIES;
+            let (again, cut_last) = (" and is asked for again from its start", budget.min(attempt + CUT_RETRIES - cuts));
             let (reason, wait, last) = match unfinished {
                 // The network cut it: the server's headers never spoke to that.
-                Some(Unfinished::Interrupted(reason) | Unfinished::Silent(reason)) if restartable => (reason, backoff(attempt, None), MAX_ATTEMPTS),
+                Some(Unfinished::Interrupted(reason) | Unfinished::Silent(reason)) if restartable => (reason, backoff(attempt, None), budget),
                 Some(Unfinished::Interrupted(reason)) if cut => (format!("the reply was cut short ({reason}){again}"), backoff(attempt, None), cut_last),
                 Some(Unfinished::Failed(failure)) if failure.retryable && restartable && beyond_cap.is_none() => {
-                    (failure.message, backoff(attempt, asked), MAX_ATTEMPTS)
+                    (failure.message, backoff(attempt, asked), budget)
                 }
                 Some(Unfinished::Failed(f)) if f.retryable && cut && beyond_cap.is_none() => (format!("the reply failed partway ({}){again}", f.message), backoff(attempt, asked), cut_last),
                 // Never a truncated reply: the server said this one failed,
@@ -1039,11 +1039,12 @@ enum Unfinished {
 struct ServerFailure {
     /// The error to return, or the reason to give for a retry.
     message: String,
-    /// A rate limit, an overloaded server, or a server fault: what a fresh
-    /// attempt can outlast, on the terms [`is_retryable_status`] resends a
-    /// refused status. A refused request, an exhausted quota, or a filtered
-    /// reply would fail the same way again.
+    /// A rate limit, an overloaded server, or a server fault: what a fresh attempt can
+    /// outlast, as [`is_retryable_status`] resends a refused status. A refused request,
+    /// an exhausted quota, or a filtered reply would fail the same way again.
     retryable: bool,
+    /// A rate limit (429, or a code or type naming one) and not a quota: given [`RATE_LIMIT_ATTEMPTS`].
+    limited: bool,
 }
 
 /// Read an `error` value (an object, or a bare message string) so the
@@ -1064,6 +1065,7 @@ fn server_failure(error: &Value, raw: &str) -> ServerFailure {
             Some(status) => u16::try_from(status).is_ok_and(is_retryable_status),
             None => kinds().any(|kind| ["rate_limit", "overloaded", "server_error"].iter().any(|k| kind.contains(k))),
         };
+    let limited = retryable && (status == Some(429) || kinds().any(|kind| kind.contains("rate_limit")));
     let code = match code {
         Value::Null => String::new(),
         // Without the quotes a JSON string would print with.
@@ -1071,7 +1073,7 @@ fn server_failure(error: &Value, raw: &str) -> ServerFailure {
         code => format!(" ({code})"),
     };
     let message = error["message"].as_str().or(error.as_str()).map_or_else(|| describe_backend(raw), |m| truncate(m, 600));
-    ServerFailure { message: format!("backend reported an error{code}: {message}"), retryable }
+    ServerFailure { message: format!("backend reported an error{code}: {message}"), retryable, limited }
 }
 
 /// Parse one SSE stream to its end. The second value says why the stream
@@ -1216,7 +1218,7 @@ async fn read_sse(
                     // Refused as the labeled body is, and not resent: the same
                     // body would come back.
                     Err(message) => {
-                        unfinished = Some(Unfinished::Failed(ServerFailure { message, retryable: false }));
+                        unfinished = Some(Unfinished::Failed(ServerFailure { message, retryable: false, limited: false }));
                         break 'outer;
                     }
                 }
@@ -1318,7 +1320,7 @@ async fn read_sse(
     if tool_calls.is_empty() && content.is_empty() && finish_reason == "tool_calls" && unfinished.is_none() {
         unfinished = Some(Unfinished::Failed(ServerFailure {
             message: "backend ended the reply with finish_reason tool_calls but sent no tool call".into(),
-            retryable: false,
+            retryable: false, limited: false,
         }));
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
@@ -1733,28 +1735,26 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Attempts per request. With [`BACKOFF_UNIT`] doubling up to
-/// [`BACKOFF_CAP`], the last attempt goes out about a minute after the
+/// [`BACKOFF_CAP`] units, the last attempt goes out about a minute after the
 /// first, later only when a server's Retry-After asks for longer waits, up
 /// to [`RETRY_AFTER_CAP_SECS`] each (see [`backoff`]); a longer ask is
 /// reported instead of retried. A transient fault on the path to an
-/// endpoint (a reset or a TLS alert on send, a stream cut mid-reply) can
-/// recur for minutes and clears within seconds most times and within a
-/// minute at worst, so attempts packed into one second only ever observe the
-/// fault and end a turn the next connection would have completed. Every
-/// wait is announced and cancellable.
+/// endpoint (a reset or a TLS alert on send, a stream cut mid-reply) clears
+/// within seconds most times and within a minute at worst, so attempts packed
+/// into one second only observe it. Every wait is announced and cancellable.
 const MAX_ATTEMPTS: u32 = 8;
+/// Attempts once a 429 that is not an exhausted quota refused one: about five
+/// minutes of waits, since a provider's shared pool can stay saturated that long.
+const RATE_LIMIT_ATTEMPTS: u32 = 20;
 /// Attempts in a row that may fail before any connection exists (refused,
-/// unresolvable, a connect timeout, a failed TLS handshake) before the
-/// request gives up early. That is an address with nothing listening far
-/// more often than a blip, and a user who forgot to start a local server
-/// should hear so after the two short waits, not a minute. A refused
-/// address fails in about three seconds; one that drops packets pays the
-/// connect timeout on each attempt as well.
+/// unresolvable, a connect timeout, a failed TLS handshake) before the request
+/// gives up early: far more often an address with nothing listening than a
+/// blip, and a user who forgot to start a local server should hear so in
+/// seconds, not a minute (plus the connect timeouts of one that drops packets).
 const UNREACHED_ATTEMPTS: u32 = 3;
 /// Times in a row a request is sent again after the network cut its reply
-/// once text had streamed. A dropped connection mid-reply would otherwise end
-/// an unattended turn although nothing from the reply ran; a reply cut this
-/// often is reported truncated rather than paid for again.
+/// once text had streamed, since nothing from that reply ran; a reply cut
+/// this often is reported truncated rather than paid for again.
 const CUT_RETRIES: u32 = 2;
 
 /// One second: the step of the backoff and the unit a Retry-After header
@@ -1765,12 +1765,10 @@ const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// applies, never seconds of wall clock.
 #[cfg(test)]
 const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_millis(1);
-const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(16);
+const BACKOFF_CAP: u32 = 16;
 /// The longest Retry-After this client waits out, in seconds: a minute, the
-/// whole window of a per-minute rate limit. A longer ask is a limit that
-/// resets hours away (a daily quota, a maintenance window). No resend before
-/// then can succeed and holding the turn that long helps no one, so the
-/// refusal is reported at once with the server's wait.
+/// window of a per-minute rate limit. A longer ask (a daily quota, a
+/// maintenance window) is reported at once with the server's wait.
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 /// Statuses that say the server could not take the request just now: a rate
@@ -1808,17 +1806,19 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 
 /// The wait after `attempt` (1-based, the one that just failed): the
 /// doubling backoff, or the server's Retry-After (`asked`, in seconds) when
-/// that is longer, up to [`RETRY_AFTER_CAP_SECS`]. A shorter ask never
-/// undercuts the backoff, so a server answering 0 to every client at once
-/// cannot pull this one into a tight loop. The unit is [`BACKOFF_UNIT`], or
-/// in a debug binary `OPENMAX_TEST_BACKOFF_UNIT_MS` milliseconds when set,
-/// for the CLI tests that wait a backoff out.
+/// that is longer, up to [`RETRY_AFTER_CAP_SECS`], plus a random quarter of
+/// the backoff at most, so sessions refused together do not retry in step. A
+/// shorter ask never undercuts the backoff, so a server answering 0 to every
+/// client at once cannot pull this one into a tight loop. The unit is
+/// [`BACKOFF_UNIT`], or in a debug binary `OPENMAX_TEST_BACKOFF_UNIT_MS`
+/// milliseconds when set, for the CLI tests that wait a backoff out.
 fn backoff(attempt: u32, asked: Option<u64>) -> std::time::Duration {
     let set = cfg!(all(debug_assertions, not(test))).then(|| std::env::var("OPENMAX_TEST_BACKOFF_UNIT_MS").ok()?.parse().ok()).flatten();
     let unit = set.map_or(BACKOFF_UNIT, std::time::Duration::from_millis);
-    let floor = unit.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
+    let floor = unit.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(unit * BACKOFF_CAP);
     let asked = unit.saturating_mul(asked.unwrap_or(0).min(RETRY_AFTER_CAP_SECS) as u32);
-    floor.max(asked)
+    let draw = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), attempt);
+    floor.max(asked) + floor.mul_f64(draw as f64 / u64::MAX as f64 / 4.0)
 }
 
 /// Why an attempt ended when the endpoint sent nothing for `idle`.
@@ -3313,6 +3313,8 @@ pub(crate) mod tests {
                 "backend reported an error (429): Rate limit exceeded",
             ),
         ] {
+            // A rate limit raises the budget, as a 429 status does.
+            let budget = if failure.contains("429") || failure.contains("rate_limit") { RATE_LIMIT_ATTEMPTS } else { MAX_ATTEMPTS };
             let (result, deltas, served) = try_stream_sequence(vec![failure, FINISHED.into()]).await;
             let result = result.expect("the second attempt finished");
             assert_eq!(served, 2);
@@ -3320,7 +3322,7 @@ pub(crate) mod tests {
             assert_eq!(result.content, "all of it");
             assert_eq!(
                 deltas,
-                vec![format!("retry:2/{MAX_ATTEMPTS}:{reason}"), "content:all of it".to_string()]
+                vec![format!("retry:2/{budget}:{reason}"), "content:all of it".to_string()]
             );
         }
     }
@@ -3338,7 +3340,8 @@ pub(crate) mod tests {
             if is_retryable_status(code) {
                 assert_eq!(result.expect("the second attempt finished").content, "all of it", "{code}");
                 assert_eq!(served, 2, "{code} is resent as its status is");
-                assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:backend reported an error ({code}): upstream failed"));
+                let budget = if code == 429 { RATE_LIMIT_ATTEMPTS } else { MAX_ATTEMPTS };
+                assert_eq!(deltas[0], format!("retry:2/{budget}:backend reported an error ({code}): upstream failed"));
             } else {
                 assert_eq!(result.err(), Some(format!("backend reported an error ({code}): upstream failed")));
                 assert_eq!(served, 1, "{code} is reported at once, as its status is");
@@ -3359,8 +3362,139 @@ pub(crate) mod tests {
         let waited = started.elapsed();
         assert_eq!(served, 2);
         assert_eq!(result.content, "all of it");
-        assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:backend returned 429 Too Many Requests: rate limited"));
+        assert_eq!(deltas[0], format!("retry:2/{RATE_LIMIT_ATTEMPTS}:backend returned 429 Too Many Requests: rate limited"));
         assert!(waited >= BACKOFF_UNIT * 40, "resent after {waited:?}, before the 40 units the server asked for");
+    }
+
+    /// Waits are drawn, not fixed: sessions a limit refused at the same
+    /// moment would otherwise all come back at the same moment, into it again.
+    #[test]
+    fn backoff_waits_are_spread_so_sessions_do_not_retry_in_step() {
+        let waits: std::collections::HashSet<_> = (0..32).map(|_| backoff(5, None)).collect();
+        assert!(waits.len() > 1, "32 draws were all {waits:?}");
+    }
+
+    /// Serve 429 for `window` after the first request, then a finished
+    /// reply. Returns the url and the requests served.
+    fn spawn_limited_for(window: std::time::Duration) -> (String, Arc<std::sync::Mutex<usize>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = Arc::new(std::sync::Mutex::new(0usize));
+        let count = served.clone();
+        std::thread::spawn(move || {
+            let mut first = None;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    buf.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&buf).to_lowercase();
+                let length = head.lines().find_map(|l| l.strip_prefix("content-length:")?.trim().parse().ok()).unwrap_or(0);
+                let _ = stream.read_exact(&mut vec![0u8; length]);
+                *count.lock().unwrap() += 1;
+                let since = *first.get_or_insert_with(std::time::Instant::now);
+                let lifted = since.elapsed() >= window;
+                let reply = if !lifted {
+                    status_response("429 Too Many Requests", "", r#"{"error":{"code":429,"message":"rate limited upstream"}}"#)[4..].to_string()
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{FINISHED}", FINISHED.len())
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                if lifted { return; }
+            }
+        });
+        (url, served)
+    }
+
+    /// The bug this guards: a provider's shared pool answered 429 for over a
+    /// minute, and a turn gave up after the eight attempts that fit in one,
+    /// although the pool cleared soon after. A rate limit now gets about five
+    /// minutes. Here the stub refuses for 90 units (seconds outside tests),
+    /// then answers. Wall time on a loaded runner can stretch eight attempts'
+    /// 63 to 79 units past 90, so the count is left to the test below.
+    #[tokio::test]
+    async fn a_rate_limit_that_lasts_ninety_seconds_is_waited_out() {
+        let (url, served) = spawn_limited_for(BACKOFF_UNIT * 90);
+        let started = std::time::Instant::now();
+        let mut retries = Vec::new();
+        let result = ChatClient::new(url, None, "m".into(), None, 64)
+            .stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |d| {
+                if let StreamDelta::Retry { attempt, max_attempts, .. } = d {
+                    retries.push((attempt, max_attempts));
+                }
+            })
+            .await;
+        assert_eq!(result.unwrap().content, "all of it");
+        assert!(started.elapsed() >= BACKOFF_UNIT * 90);
+        let served = *served.lock().unwrap();
+        assert_eq!(retries, (2..=served as u32).map(|attempt| (attempt, RATE_LIMIT_ATTEMPTS)).collect::<Vec<_>>());
+    }
+
+    /// Nine refusals in a row span at least 1+2+4+8+16*5 = 95 units of waits,
+    /// more than the eight attempts of [`MAX_ATTEMPTS`] could outlast: the
+    /// tenth attempt gets the reply.
+    #[tokio::test]
+    async fn nine_rate_limits_in_a_row_no_longer_end_the_request() {
+        let limited = status_response("429 Too Many Requests", "", r#"{"error":{"message":"rate limited"}}"#);
+        let mut bodies = vec![limited; 9];
+        bodies.push(FINISHED.into());
+        let started = std::time::Instant::now();
+        let (result, deltas, served) = stream_sequence(bodies).await;
+        assert!(started.elapsed() >= BACKOFF_UNIT * 95);
+        assert_eq!((result.content.as_str(), served), ("all of it", 10));
+        assert_eq!(deltas[8], format!("retry:10/{RATE_LIMIT_ATTEMPTS}:backend returned 429 Too Many Requests: rate limited"));
+    }
+
+    /// A rate limit a gateway reports inside a 200 gets the same longer
+    /// budget as a 429 status, in each shape it arrives in on a stream: an
+    /// error chunk with code 429, a choice that finished as `error` with code
+    /// 429, and a JSON body. Nine in a row would have ended the request at
+    /// eight attempts; the tenth now gets the reply.
+    #[tokio::test]
+    async fn nine_rate_limits_inside_a_200_no_longer_end_the_request() {
+        let json = |body: &str| format!(
+            "RAW:HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        for (failure, reason) in [
+            (gateway_error_chunk(json!(429), "rate limit reached upstream"), "backend reported an error (429): rate limit reached upstream"),
+            (
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\",\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\"}}]}\n\n".to_string(),
+                "backend reported an error (429): Rate limit exceeded",
+            ),
+            (json(r#"{"error":{"code":429,"message":"rate limit reached upstream"}}"#), "backend reported an error (429): rate limit reached upstream"),
+        ] {
+            let mut bodies = vec![failure; 9];
+            bodies.push(FINISHED.into());
+            let (result, deltas, served) = try_stream_sequence(bodies).await;
+            assert_eq!(result.expect("the tenth attempt finished").content, "all of it", "{reason}");
+            assert_eq!(served, 10, "{reason}");
+            assert_eq!(deltas[8], format!("retry:10/{RATE_LIMIT_ATTEMPTS}:{reason}"));
+        }
+    }
+
+    /// A quota reported inside a 200 is no rate limit: it keeps the short
+    /// budget's terms and is reported at once.
+    #[tokio::test]
+    async fn a_quota_inside_a_200_does_not_get_the_longer_budget() {
+        let quota = gateway_error_chunk(json!("insufficient_quota"), "out of credit");
+        let (result, deltas, served) = try_stream_sequence(vec![quota, FINISHED.into()]).await;
+        assert!(result.err().expect("a quota is reported").contains("out of credit"));
+        assert_eq!((served, deltas.len()), (1, 0));
+    }
+
+    /// The longer budget has an end: a limit that never lifts is reported
+    /// after RATE_LIMIT_ATTEMPTS, each wait announced first.
+    #[tokio::test]
+    async fn a_rate_limit_that_never_lifts_is_reported_after_the_longer_budget() {
+        let limited = status_response("429 Too Many Requests", "", r#"{"error":{"message":"rate limited"}}"#);
+        let (result, deltas, served) = try_stream_sequence(vec![limited; RATE_LIMIT_ATTEMPTS as usize + 1]).await;
+        assert_eq!(result.err().as_deref(), Some("backend returned 429 Too Many Requests: rate limited"));
+        assert_eq!(served, RATE_LIMIT_ATTEMPTS as usize);
+        assert_eq!(deltas.len(), RATE_LIMIT_ATTEMPTS as usize - 1, "each resend was announced");
     }
 
     /// Stream against a server that sends `refusal` and then a finished
@@ -3953,12 +4087,17 @@ pub(crate) mod tests {
     /// backoff.
     #[test]
     fn retry_after_stretches_the_backoff_but_never_shortens_it() {
-        assert_eq!(backoff(1, None), BACKOFF_UNIT);
-        assert_eq!(backoff(4, None), BACKOFF_UNIT * 8);
-        assert_eq!(backoff(1, Some(40)), BACKOFF_UNIT * 40);
-        assert_eq!(backoff(1, Some(u64::MAX)), BACKOFF_UNIT * RETRY_AFTER_CAP_SECS as u32);
-        assert_eq!(backoff(4, Some(0)), BACKOFF_UNIT * 8);
-        assert_eq!(backoff(4, Some(3)), BACKOFF_UNIT * 8);
+        // The wait is the larger of the two, plus at most a quarter of the backoff.
+        let waits = |attempt, asked, base: u32, step: u32| {
+            let wait = backoff(attempt, asked);
+            assert!(wait >= BACKOFF_UNIT * base && wait <= BACKOFF_UNIT * base + BACKOFF_UNIT * step / 4, "{attempt} {asked:?}: {wait:?}");
+        };
+        waits(1, None, 1, 1);
+        waits(4, None, 8, 8);
+        waits(1, Some(40), 40, 1);
+        waits(1, Some(u64::MAX), RETRY_AFTER_CAP_SECS as u32, 1);
+        waits(4, Some(0), 8, 8);
+        waits(4, Some(3), 8, 8);
 
         let header = |value: &str| {
             let mut headers = reqwest::header::HeaderMap::new();
