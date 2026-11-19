@@ -216,6 +216,39 @@ impl Serialize for WireMessages<'_> {
     }
 }
 
+/// The most images one request carries. Routes cap them (30 on one, 256 on
+/// another) and refuse the whole request past that; a session that reads
+/// more sends its newest ones and the rest as their text lines.
+pub(crate) const IMAGE_WINDOW: usize = 24;
+/// What a result whose image a request leaves out says after its text.
+pub(crate) const IMAGE_DROPPED: &str = "\n[image no longer shown: read the file again to see it]";
+
+fn image_count(messages: &[ChatMessage]) -> usize {
+    messages.iter().map(|m| m.images.as_ref().map_or(0, Vec::len)).sum()
+}
+
+/// The transcript as a request sends it with at most `cap` images: past
+/// that, the oldest go a batch of half the window at a time, so the drop
+/// point, and with it the cached prefix, moves once a batch, not each read.
+pub(crate) fn image_window(messages: &[ChatMessage], cap: usize) -> std::borrow::Cow<'_, [ChatMessage]> {
+    let batch = (cap / 2).max(1);
+    let mut drop = match image_count(messages).checked_sub(cap) {
+        Some(over) if over > 0 => over.div_ceil(batch) * batch,
+        _ => return std::borrow::Cow::Borrowed(messages),
+    };
+    let mut sent = messages.to_vec();
+    for message in sent.iter_mut().filter(|m| m.images.is_some()) {
+        let images = message.images.as_mut().unwrap();
+        let n = images.len().min(drop);
+        if n == 0 { break; }
+        images.drain(..n);
+        drop -= n;
+        message.content.get_or_insert_default().push_str(IMAGE_DROPPED);
+        if images.is_empty() { message.images = None; }
+    }
+    std::borrow::Cow::Owned(sent)
+}
+
 /// A message on the Chat Completions wire, or the user message that carries
 /// a run of tool results' images.
 #[derive(Serialize)]
@@ -484,6 +517,9 @@ pub struct ChatClient {
     cache_key: Option<String>,
     /// Set while the notes request goes out: tool_choice "none" beside the same tools, so a reply is notes, not a call.
     pub(crate) notes_only: std::sync::atomic::AtomicBool,
+    /// The most images a request carries; a refusal of a request with
+    /// images halves it for the rest of the session (`image_window`).
+    pub(crate) image_cap: std::sync::atomic::AtomicUsize,
     pub(crate) reply_bounds: (usize, usize), // The longest reply and the window: bound a notes reply asked again higher.
     http: reqwest::Client,
 }
@@ -627,7 +663,7 @@ impl ChatClient {
             images: false,
             idle_timeout: IDLE_TIMEOUT,
             key_hint: None,
-            cache_key: None, notes_only: Default::default(), reply_bounds: (usize::MAX, usize::MAX),
+            cache_key: None, notes_only: Default::default(), image_cap: IMAGE_WINDOW.into(), reply_bounds: (usize::MAX, usize::MAX),
             http,
         }
     }
@@ -828,11 +864,16 @@ impl ChatClient {
         // long transcript into Value (and re-serializing) on every attempt is not.
         // Tools ride as RawValue from the frozen registry wire form.
         // Compat flags (max_completion_tokens / stream_options) are baked in.
-        let body = if self.wire_api == crate::providers::WireApi::Anthropic {
-            anthropic::serialize(self, messages, limit, tools_wire)?
-        } else if self.wire_api == crate::providers::WireApi::Responses {
-            responses::serialize(self, messages, limit, tools_wire)?
-        } else { serialize_chat_request_body(self, messages, limit, tools_wire)? };
+        let serialize = |cap: usize| {
+            let sent = if self.images { image_window(messages, cap) } else { std::borrow::Cow::Borrowed(messages) };
+            let body = match self.wire_api {
+                crate::providers::WireApi::Anthropic => anthropic::serialize(self, &sent, limit, tools_wire),
+                crate::providers::WireApi::Responses => responses::serialize(self, &sent, limit, tools_wire),
+                crate::providers::WireApi::ChatCompletions => serialize_chat_request_body(self, &sent, limit, tools_wire),
+            };
+            body.map(|body| (body, if self.images { image_count(&sent) } else { 0 }))
+        };
+        let (mut request, mut shown) = serialize(self.image_cap.load(std::sync::atomic::Ordering::Relaxed))?;
         // Native Messages takes an effort change as history under its beta.
         let beta = (self.wire_api == crate::providers::WireApi::Anthropic && !self.effort_plan(messages).1.is_empty()).then_some(("anthropic-beta", crate::providers::EFFORT_BETA));
 
@@ -848,7 +889,7 @@ impl ChatClient {
                 .http
                 .post(self.endpoint())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body.clone());
+                .body(request.clone());
             let access = if let Some(auth) = &self.chatgpt {
                 tokio::select! {
                     result = auth.access() => Some(result?),
@@ -950,6 +991,15 @@ impl ChatClient {
                     }
                     continue;
                 }
+                // A route refuses a request past the images it takes per
+                // request; it is asked once more with half as many, and the
+                // smaller window stays for the session.
+                if shown > 1 && matches!(code, 400 | 404 | 413 | 422) && attempt < MAX_ATTEMPTS {
+                    self.image_cap.store(shown / 2, std::sync::atomic::Ordering::Relaxed);
+                    (request, _) = serialize(shown / 2)?;
+                    shown = 0; // Once: a second refusal ends the request.
+                    continue;
+                }
                 return Err(naming_wait(err, beyond_cap));
             }
             let is_json = self.wire_api == crate::providers::WireApi::ChatCompletions && resp
@@ -986,7 +1036,7 @@ impl ChatClient {
             let (reply, unfinished) = match self.wire_api {
                 crate::providers::WireApi::Anthropic => {
                     let (mut reply, unfinished) = Box::pin(anthropic::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await;
-                    anthropic::stamp(&mut reply, &body)?;
+                    anthropic::stamp(&mut reply, &request)?;
                     (reply, unfinished)
                 }
                 crate::providers::WireApi::Responses => Box::pin(responses::read(resp, &cancelled, self.idle_timeout, &mut on_delta)).await,
