@@ -3194,7 +3194,13 @@ fn answer_writing(text: &str, written: u64) -> String {
 /// `-p --json --second-look` against `script`: the exit status, the request
 /// bodies the server got, the JSON lines and stderr.
 fn second_look_run(tag: &str, script: Vec<String>) -> (Option<i32>, Vec<serde_json::Value>, Vec<serde_json::Value>, String) {
+    second_look_in(tag, |_| {}, script)
+}
+
+/// [`second_look_run`] in a project that `given` fills first.
+fn second_look_in(tag: &str, given: impl Fn(&Path), script: Vec<String>) -> (Option<i32>, Vec<serde_json::Value>, Vec<serde_json::Value>, String) {
     let (project, home) = fresh_dirs(tag);
+    given(&project);
     let (base_url, requests, _server) = spawn_scripted_server(script.into_iter().map(|sse| (sse, true)).collect());
     write_settings_with_mode(&home, &base_url, "auto");
     let out = cmd(&project, &home).args(["--trust-project", "--json", "--second-look", "-p", "list the files"]).output().unwrap();
@@ -3251,6 +3257,49 @@ fn a_second_look_keeps_the_first_runs_exit_status() {
     let (code, sent, _, stderr) = second_look_run("second-look-fails", vec![answer_writing("done", 5), STREAM_ERROR_SSE.to_string()]);
     assert_eq!((code, sent.len()), (Some(0), 2), "{stderr}");
     assert!(stderr.contains("openmax: second look ended with status 1; the run's status 0 stands"), "{stderr}");
+}
+
+/// The second look checks only runs that left every file they were given as
+/// it was: one that only created files gets it, and one that changed,
+/// deleted or committed (which rewrites files under .git) is skipped, as is
+/// a project too large to compare.
+#[test]
+fn a_second_look_skips_a_run_that_changed_a_file_it_was_given() {
+    let git = |dir: &Path, args: &[&str]| {
+        let ok = std::process::Command::new("git").current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]).args(args).status().unwrap();
+        assert!(ok.success(), "git {args:?}");
+    };
+    let repo = |dir: &Path| {
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(dir, &["init", "-q"]);
+        git(dir, &["add", "a.txt"]);
+        git(dir, &["commit", "-qm", "start"]);
+    };
+    let huge = |dir: &Path| (0..=20_000).for_each(|i| std::fs::write(dir.join(format!("f{i}")), "").unwrap());
+    type Given<'a> = &'a dyn Fn(&Path);
+    let cases: [(&str, Given, &str, &str); 5] = [
+        ("created", &repo, "echo two > b.txt", ""),
+        ("modified", &repo, "echo two >> a.txt", "the run changed 1 of the files it was given"),
+        ("deleted", &repo, "rm a.txt", "the run changed 1 of the files it was given"),
+        ("committed", &repo, "git -c user.name=t -c user.email=t@t commit -qm again --allow-empty", "the run changed"),
+        ("oversized", &huge, "echo two > b.txt", "the project holds more than 20000 files"),
+    ];
+    for (tag, given, command, skipped) in cases {
+        let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function",
+            "function":{"name":"bash","arguments":serde_json::json!({"command": command}).to_string()}}]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5}});
+        let script = vec![sse(&[call]), answer_writing("done", 5), answer_writing("checked", 5)];
+        let (code, sent, _, stderr) = second_look_in(&format!("second-look-{tag}"), given, script);
+        assert_eq!(code, Some(0), "{tag}: {stderr}");
+        if skipped.is_empty() {
+            assert_eq!(sent.len(), 3, "{tag}: {stderr}");
+            assert!(stderr.contains("openmax: second look: a new session"), "{tag}: {stderr}");
+        } else {
+            assert_eq!(sent.len(), 2, "{tag}: {stderr}");
+            assert!(stderr.contains(&format!("openmax: second look skipped: {skipped}")), "{tag}: {stderr}");
+        }
+    }
 }
 
 /// Off unless asked for, and only for one print prompt.

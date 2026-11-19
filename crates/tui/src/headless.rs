@@ -2,7 +2,9 @@
 //! Proves the harness is the product and the terminal UI is one client.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -35,18 +37,49 @@ pub struct HeadlessArgs {
 const SECOND_LOOK: &str = include_str!("../second-look.txt");
 /// The most output tokens a run may write and still get a second look.
 pub(crate) const SECOND_LOOK_MAX_OUTPUT: u64 = 10_000;
+/// The most files a project may hold for a run there to get a second look:
+/// past it the listing that shows the run left them untouched costs too much.
+pub(crate) const SECOND_LOOK_MAX_FILES: usize = 20_000;
 
-/// Run the prompts; with `second_look`, a run that ended with status 0 and
-/// wrote at most `SECOND_LOOK_MAX_OUTPUT` tokens is followed by a new session
-/// in the same project that gets `SECOND_LOOK` and the prompt, none of the
-/// first's reasoning. The exit status stays the first's unless a signal lands.
+/// Every file under `root`, `.git` included, with its size and modification
+/// time; None past `SECOND_LOOK_MAX_FILES` or when a directory cannot be read.
+/// Links are files here, never followed: the file tools stay inside the root.
+fn file_states(root: &Path) -> Option<HashMap<PathBuf, (u64, Option<SystemTime>)>> {
+    let (mut files, mut dirs) = (HashMap::new(), vec![root.to_path_buf()]);
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let Ok(meta) = entry.metadata() else { return None };
+            if meta.is_dir() { dirs.push(entry.path()) } else { files.insert(entry.path(), (meta.len(), meta.modified().ok())); }
+            if files.len() > SECOND_LOOK_MAX_FILES { return None }
+        }
+    }
+    Some(files)
+}
+
+/// Run the prompts; with `second_look`, a run that ended with status 0, wrote
+/// at most `SECOND_LOOK_MAX_OUTPUT` tokens and left every file it was given
+/// as it found it (created files aside) is followed by a new session in the
+/// same project that gets `SECOND_LOOK` and the prompt, none of the first's
+/// reasoning. Working the request out again is only sound while the problem
+/// it states is still there: on a tree the run already changed, the second
+/// session can undo a correct repair. The exit status stays the first's
+/// unless a signal lands.
 pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
+    let given = args.second_look.then(|| file_states(&args.project));
     let code = run_session(&core, &mut core_rx, &args).await;
     let written = args.written.load(Ordering::Relaxed);
-    if !args.second_look || code != 0 || crate::signalled() {
-        return code;
-    } else if written > SECOND_LOOK_MAX_OUTPUT {
-        eprintln!("openmax: second look skipped: the run wrote {written} output tokens, over {SECOND_LOOK_MAX_OUTPUT}");
+    let Some(given) = given.filter(|_| code == 0 && !crate::signalled()) else { return code };
+    let touched = given.as_ref().map(|files| files.iter().filter(|(path, was)| {
+        std::fs::symlink_metadata(path).ok().map(|m| (m.len(), m.modified().ok())).as_ref() != Some(*was)
+    }).count());
+    let skip = match touched {
+        _ if written > SECOND_LOOK_MAX_OUTPUT => format!("the run wrote {written} output tokens, over {SECOND_LOOK_MAX_OUTPUT}"),
+        None => format!("the project holds more than {SECOND_LOOK_MAX_FILES} files, or one of its directories could not be read"),
+        Some(0) => String::new(),
+        Some(n) => format!("the run changed {n} of the files it was given"),
+    };
+    if !skip.is_empty() {
+        eprintln!("openmax: second look skipped: {skip}");
         return code;
     }
     eprintln!("openmax: second look: a new session checks the work ({written} output tokens written)");
