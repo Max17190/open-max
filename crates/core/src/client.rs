@@ -1735,7 +1735,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Attempts per request. With [`BACKOFF_UNIT`] doubling up to
-/// [`BACKOFF_CAP`], the last attempt goes out about a minute after the
+/// [`BACKOFF_CAP`] units, the last attempt goes out about a minute after the
 /// first, later only when a server's Retry-After asks for longer waits, up
 /// to [`RETRY_AFTER_CAP_SECS`] each (see [`backoff`]); a longer ask is
 /// reported instead of retried. A transient fault on the path to an
@@ -1765,7 +1765,7 @@ const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// applies, never seconds of wall clock.
 #[cfg(test)]
 const BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_millis(1);
-const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(16);
+const BACKOFF_CAP: u32 = 16;
 /// The longest Retry-After this client waits out, in seconds: a minute, the
 /// window of a per-minute rate limit. A longer ask (a daily quota, a
 /// maintenance window) is reported at once with the server's wait.
@@ -1815,7 +1815,7 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 fn backoff(attempt: u32, asked: Option<u64>) -> std::time::Duration {
     let set = cfg!(all(debug_assertions, not(test))).then(|| std::env::var("OPENMAX_TEST_BACKOFF_UNIT_MS").ok()?.parse().ok()).flatten();
     let unit = set.map_or(BACKOFF_UNIT, std::time::Duration::from_millis);
-    let floor = unit.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(BACKOFF_CAP);
+    let floor = unit.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(unit * BACKOFF_CAP);
     let asked = unit.saturating_mul(asked.unwrap_or(0).min(RETRY_AFTER_CAP_SECS) as u32);
     let draw = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), attempt);
     floor.max(asked) + floor.mul_f64(draw as f64 / u64::MAX as f64 / 4.0)
@@ -3396,12 +3396,14 @@ pub(crate) mod tests {
                 let _ = stream.read_exact(&mut vec![0u8; length]);
                 *count.lock().unwrap() += 1;
                 let since = *first.get_or_insert_with(std::time::Instant::now);
-                let reply = if since.elapsed() < window {
+                let lifted = since.elapsed() >= window;
+                let reply = if !lifted {
                     status_response("429 Too Many Requests", "", r#"{"error":{"code":429,"message":"rate limited upstream"}}"#)[4..].to_string()
                 } else {
                     format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{FINISHED}", FINISHED.len())
                 };
                 let _ = stream.write_all(reply.as_bytes());
+                if lifted { return; }
             }
         });
         (url, served)
@@ -3411,7 +3413,8 @@ pub(crate) mod tests {
     /// minute, and a turn gave up after the eight attempts that fit in one,
     /// although the pool cleared soon after. A rate limit now gets about five
     /// minutes. Here the stub refuses for 90 units (seconds outside tests),
-    /// then answers.
+    /// then answers. Wall time on a loaded runner can stretch eight attempts'
+    /// 63 to 79 units past 90, so the count is left to the test below.
     #[tokio::test]
     async fn a_rate_limit_that_lasts_ninety_seconds_is_waited_out() {
         let (url, served) = spawn_limited_for(BACKOFF_UNIT * 90);
