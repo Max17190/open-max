@@ -2680,10 +2680,14 @@ mutatng = true
             );
         }
         let registry = Registry::assemble(discover_external_in(&[tools_dir]), Vec::new());
-        let data = Path::new("/nonexistent-openmax-data");
+        // A data dir no output log can be made under, for root too: with a
+        // log, a truncated result is a short preview and the baseline below
+        // no longer measures the cap. A path under / is creatable as root.
+        let data = project.join("data-is-a-file");
+        std::fs::write(&data, "").unwrap();
         let args = serde_json::json!({});
         let run = |name: &'static str, caps| {
-            registry.execute(name, &args, data, &project, caps, no_cancel())
+            registry.execute(name, &args, &data, &project, caps, no_cancel())
         };
 
         let out = run("serve", tools::OutputCaps::default()).await;
