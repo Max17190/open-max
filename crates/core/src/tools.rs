@@ -206,7 +206,7 @@ pub fn summarize_call(name: &str, args: &Value) -> String {
 /// narrower tool calls. Carried in this description instead, the same
 /// content does not, and the first response reasons as it does with no
 /// pointer at all. Every command it names runs through bash.
-pub(crate) const BASH_DESCRIPTION: &str = "Run a shell command in the project root. Background processes end when the call returns; a named tmux session keeps one running. Extend Open Max: openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp|subagent> prints a contract; openmax --check verifies.";
+pub(crate) const BASH_DESCRIPTION: &str = "Run a shell command in the project root. Background processes end with the call; tmux keeps one. Extend Open Max: openmax --spec <tools|skills|prompts|hooks|permissions|providers|memory|stdio|mcp|subagent> prints a contract; openmax --check verifies.";
 
 /// Set when the loaded settings turn `image_input` on: the read_file entry
 /// of every tools array built after says it shows images. Off, the array is
