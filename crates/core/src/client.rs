@@ -4784,4 +4784,106 @@ pub(crate) mod tests {
             assert_eq!(head.contains(&header), routed, "{model}: {head}");
         }
     }
+
+
+    /// A transcript of `n` read_file results, each carrying one image.
+    fn image_reads(n: usize) -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage::user("look")];
+        for i in 0..n {
+            let call = ToolCall { id: format!("c{i}"), kind: "function".into(), function: crate::types::ToolCallFunction { name: "read_file".into(), arguments: "{}".into() }, extra_content: None };
+            messages.push(ChatMessage::assistant(None, Some(vec![call])));
+            let mut shown = ChatMessage::tool(&format!("c{i}"), &format!("f{i}.png: image/png, 3 bytes, shown to you as an image"));
+            shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: format!("IMG{i}"), width: 1, height: 1 }]);
+            messages.push(shown);
+        }
+        messages
+    }
+
+    fn images_sent(body: &Value) -> Vec<String> {
+        body["messages"].as_array().unwrap().iter().flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter_map(|part| part["image_url"]["url"].as_str().map(str::to_owned)).collect()
+    }
+
+    /// The bug this guards: a route takes so many images per request (30 on
+    /// one, 256 on another) and refused the whole request past that, so a
+    /// session that kept reading images ended at the refusal. A request
+    /// carries the newest `IMAGE_WINDOW` images at most; an older one goes as
+    /// its text line with a note to read the file again. Older images drop a
+    /// batch at a time, so the requests between two drops keep the same
+    /// prefix and the provider's cache holds.
+    #[test]
+    fn a_long_run_of_images_sends_the_newest_and_drops_older_ones_in_batches() {
+        let mut client = chat_client("m", None, 64, false, true);
+        client.images = true;
+        let body = |n: usize| -> Value { serde_json::from_slice(&serialize_chat_request_body(&client, &image_window(&image_reads(n), IMAGE_WINDOW), 64, "[]").unwrap()).unwrap() };
+        let forty = body(40);
+        let sent = images_sent(&forty);
+        assert!(sent.len() <= IMAGE_WINDOW && sent.len() > IMAGE_WINDOW / 2, "{}", sent.len());
+        assert_eq!(sent.last().unwrap(), "data:image/png;base64,IMG39");
+        let first: Vec<&str> = forty["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").filter_map(|m| m["content"].as_str()).collect();
+        assert_eq!(first[0], format!("f0.png: image/png, 3 bytes, shown to you as an image{IMAGE_DROPPED}"));
+        assert_eq!(first[39], "f39.png: image/png, 3 bytes, shown to you as an image");
+        // The drop point moves only when a batch is full.
+        let dropped = |n: usize| n - images_sent(&body(n)).len();
+        let points: std::collections::BTreeSet<usize> = (1..=60).map(dropped).collect();
+        assert_eq!(points.len(), 1 + (60 - IMAGE_WINDOW).div_ceil(IMAGE_WINDOW / 2));
+        let changes = (2..=60).filter(|&n| dropped(n) != dropped(n - 1)).count();
+        assert_eq!(changes, points.len() - 1);
+        // Within a batch, each request's messages are the last one's plus the newest read.
+        let (a, b) = (body(30), body(31));
+        let (a, b) = (a["messages"].as_array().unwrap(), b["messages"].as_array().unwrap());
+        assert_eq!(a[..a.len() - 1], b[..a.len() - 1]);
+    }
+
+    /// A transcript within the window, or with no image at all, goes out
+    /// exactly as it did before there was a window.
+    #[test]
+    fn a_request_within_the_window_is_unchanged() {
+        for messages in [image_reads(IMAGE_WINDOW), vec![ChatMessage::user("hi"), ChatMessage::tool("c1", "plain")]] {
+            assert!(matches!(image_window(&messages, IMAGE_WINDOW), std::borrow::Cow::Borrowed(_)));
+        }
+    }
+
+    /// A route that still refuses the images a request carries gets it once
+    /// more with half as many, and the client keeps the smaller window for
+    /// the requests after. A refusal of a request with no images is not
+    /// asked again.
+    #[tokio::test]
+    async fn a_refused_request_with_images_is_sent_once_more_with_fewer() {
+        use std::io::{Read as _, Write as _};
+        let refusal = r#"{"error":{"message":"No endpoints found for m. Every candidate endpoint was removed during routing: Filter by Image Support removed p","code":404}}"#;
+        let serve = |replies: Vec<String>| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") { if stream.read(&mut byte).unwrap_or(0) == 0 { return } head.push(byte[0]); }
+                let head = String::from_utf8_lossy(&head).to_lowercase();
+                let len: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap());
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).unwrap();
+                let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+                let _ = stream.write_all(reply.as_bytes());
+            });
+            (format!("http://{addr}/v1"), rx)
+        };
+        let refused = format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}", refusal.len());
+        let finished = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{FINISHED}");
+        let (url, bodies) = serve(vec![refused.clone(), finished]);
+        let mut client = ChatClient::new(url, None, "m".into(), None, 64);
+        client.images = true;
+        let messages = image_reads(20);
+        let reply = client.stream_chat(&messages, 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
+        assert_eq!(reply.unwrap().content, "all of it");
+        let sent: Vec<usize> = bodies.try_iter().map(|b| images_sent(&serde_json::from_str(&b).unwrap()).len()).collect();
+        assert_eq!(sent, [20, 10]);
+        assert_eq!(client.image_cap.load(std::sync::atomic::Ordering::Relaxed), 10);
+        let (url, bodies) = serve(vec![refused]);
+        let client = ChatClient::new(url, None, "m".into(), None, 64);
+        assert!(client.stream_chat(&[ChatMessage::user("hi")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.is_err());
+        assert_eq!(bodies.try_iter().count(), 1);
+    }
 }
