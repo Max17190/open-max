@@ -866,8 +866,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   the other. `openmax --check` warns while it is missing.
 - `max_tokens`: the reply's limit (default 4096), reserved from input up to
   max(4096, window/8). A per-model `max_tokens` in providers.json is the
-  model's longest reply: a ceiling the limit doubles up to while replies are
-  cut in a row before any call, and the limit itself only when lower.
+  model's longest reply: the first ask up to 16384, doubled up to it while
+  replies are cut in a row before any call (with neither set, up to 4x).
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
 - `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,

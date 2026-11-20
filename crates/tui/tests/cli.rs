@@ -1953,15 +1953,13 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
 }
 
 /// A model whose providers.json entry declares its longest reply, as a
-/// benchmark declares each model's, keeps the default limit as each request's
-/// first ask: the declared length is a ceiling, not the ask. A model that
-/// must think 6,000 and then 30,000 tokens before each call finishes its
-/// task: from the second cut in a row the limit doubles until the thought
-/// fits, and the reply after a call starts again at 4096. The limit used to
-/// be the declared length on every request, and a fifth cut thought in a row
-/// ended the turn.
+/// benchmark declares each model's, gets it as each request's first ask up
+/// to 16,384. A model that must think 6,000 and then 30,000 tokens before
+/// each call finishes its task: the first thought fits, and the second is
+/// cut twice before the limit doubles to fit it; the reply after a call
+/// starts again at 16,384.
 #[test]
-fn a_model_that_thinks_past_the_limit_finishes_with_its_longest_reply_declared() {
+fn a_model_that_thinks_past_the_first_ask_finishes_with_its_longest_reply_declared() {
     let (project, home) = fresh_dirs("long-thought");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -2008,7 +2006,7 @@ fn a_model_that_thinks_past_the_limit_finishes_with_its_longest_reply_declared()
     for file in ["a.txt", "b.txt"] {
         assert_eq!(std::fs::read_to_string(project.join(file)).ok().as_deref(), Some("done\n"), "{file}: {stderr}");
     }
-    assert_eq!(*asked.lock().unwrap(), [4096, 4096, 8192, 4096, 4096, 8192, 16384, 32768, 4096], "{stderr}");
+    assert_eq!(*asked.lock().unwrap(), [16_384, 16_384, 16_384, 32_768, 16_384], "{stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
