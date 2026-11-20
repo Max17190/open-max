@@ -5,51 +5,37 @@
 //! `stream_options`, and provider-specific headers. The request body is
 //! serialized once before the retry loop so a retry resends identical bytes.
 //!
-//! Retries cover what can end one request before the reply exists: a
-//! transport failure on send, a rate limit or transient server error (429,
-//! 500, 502, 503, 504, 520, 529), and a stream that died, went silent, or
-//! carried a data line this client cannot read, or a stream or reply the
-//! server failed with a rate limit, an overload, or a server fault, before
-//! any reply text arrived. Each attempt resends the same bytes after an
-//! exponential backoff, stretched to a server's Retry-After, and tells the
-//! caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
-//! a Retry-After longer than a minute, are reported at once: no wait the
-//! turn would take lets the request succeed. Once reply text has streamed,
-//! a stream the network cut or a retryable server fault ended is resent at most [`CUT_RETRIES`] times, the
-//! announcement saying the caller's partial text is void; a cut after that,
-//! or silence past the idle deadline, is reported as a truncation. A
-//! failure the server reports inside a 200 response (an `error` object on the chunk or reply
-//! or on its choice, or finish_reason `error`) is never a reply, whatever
-//! partial output came with it: unless it is retried, it is an error
-//! carrying the server's own message (a bare finish_reason `error`, with no
-//! error object, is resent as a network cut). So is a reply the server finished as
-//! `tool_calls` with no call in it and no text: returned, it would end the
-//! turn with nothing done and nothing said. A cut after the server finished
-//! its reply leaves the reply finished. Reasoning deltas do not count: a
-//! retried attempt's reasoning is void, and the result carries only the
-//! final attempt's. A stream this client ends on purpose (the size cap, an
-//! out-of-range tool index, cancellation) is never retried: the next attempt
-//! would end the same way. A reply carrying only tool calls has no reply
-//! text, so a server that never sends a completion signal costs the whole
-//! budget on such a reply before its truncation is reported.
+//! Retries cover what can end one request before the reply exists: a transport failure on send, a rate limit or
+//! transient server error (429, 500, 502, 503, 504, 520, 529), and a stream that died, went silent, or carried a data
+//! line this client cannot read, or a stream or reply the server failed with a rate limit, an overload, or a server
+//! fault, before any reply text arrived. Each attempt resends the same bytes after an exponential backoff, stretched
+//! to a server's Retry-After, and tells the caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
+//! a Retry-After longer than a minute, are reported at once: no wait the turn would take lets the request succeed.
+//! Once reply text has streamed, a stream the network cut or a retryable server fault ended is resent at most
+//! [`CUT_RETRIES`] times, the announcement saying the caller's partial text is void; a cut after that, or silence
+//! past the idle deadline, is reported as a truncation. A failure the server reports inside a 200 response (an
+//! `error` object on the chunk or reply or on its choice, or finish_reason `error`) is never a reply, whatever
+//! partial output came with it: unless it is retried, it is an error carrying the server's own message (a bare
+//! finish_reason `error`, with no error object, is resent as a network cut). So is a reply the server finished as
+//! `tool_calls` with no call in it and no text: returned, it would end the turn with nothing done and nothing said. A
+//! cut after the server finished its reply leaves the reply finished. Reasoning deltas do not count: a retried
+//! attempt's reasoning is void, and the result carries only the final attempt's. A stream this client ends on purpose
+//! (the size cap, an out-of-range tool index, cancellation) is never retried: the next attempt would end the same
+//! way. A reply carrying only tool calls has no reply text, so a server that never sends a completion signal costs
+//! the whole budget on such a reply before its truncation is reported.
 //!
-//! There is no overall request timeout. A local or slow endpoint can
-//! legitimately take minutes to generate, and a deadline here would look like
-//! a bug in the model rather than a policy in the client. Silence ends an
-//! attempt instead: an endpoint that sends nothing at all (no response
-//! headers, no reply bytes, not even an SSE keepalive comment) for
-//! [`IDLE_TIMEOUT`], or its provider's `idle_timeout_secs`, is a connection
-//! that failed, under the rules above. A one-shot JSON reply or a refusal
-//! whose body goes silent is an error, as a cut there is.
-//! A stream that ends without `[DONE]` and without a `finish_reason` is
-//! reported as truncated rather than treated as a complete reply.
+//! There is no overall request timeout. A local or slow endpoint can legitimately take minutes to generate, and a
+//! deadline here would look like a bug in the model rather than a policy in the client. Silence ends an attempt
+//! instead: an endpoint that sends nothing at all (no response headers, no reply bytes, not even an SSE keepalive
+//! comment) for [`IDLE_TIMEOUT`], or its provider's `idle_timeout_secs`, is a connection that failed, under the rules
+//! above. A one-shot JSON reply or a refusal whose body goes silent is an error, as a cut there is. A stream that
+//! ends without `[DONE]` and without a `finish_reason` is reported as truncated rather than treated as a complete
+//! reply.
 //!
-//! A credential never crosses plain http to another machine: a request that
-//! would carry the key, a credential header (Authorization, X-API-Key, or any
-//! header named as one, see `is_credential_header`), or user:password from
-//! the base_url that way is refused before it is sent. Nor does a request
-//! leave the server the base_url names: a redirect is followed only on the
-//! same scheme, host, and port, and one anywhere else fails the request.
+//! A credential never crosses plain http to another machine: a request that would carry the key, a credential header
+//! (Authorization, X-API-Key, or any header named as one, see `is_credential_header`), or user:password from the
+//! base_url that way is refused before it is sent. Nor does a request leave the server the base_url names: a redirect
+//! is followed only on the same scheme, host, and port, and one anywhere else fails the request.
 
 mod responses;
 mod anthropic;
@@ -4149,7 +4135,7 @@ pub(crate) mod tests {
     #[test]
     fn an_image_the_endpoint_does_not_read_is_not_estimated() {
         let mut message = ChatMessage::tool("c1", "a.png");
-        message.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 750, height: 1, name: String::new() }]);
+        message.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 750, height: 1 }]);
         let mut client = chat_client("m", None, 64, false, true);
         let blind = client.message_estimator("o").1(&message);
         client.images = true;
@@ -4167,7 +4153,7 @@ pub(crate) mod tests {
         let call = ToolCall { id: "c1".into(), kind: "function".into(), function: crate::types::ToolCallFunction { name: "read_file".into(), arguments: "{}".into() }, extra_content: None };
         let text = "a.png: image/png, 3 bytes, shown to you as an image";
         let mut shown = ChatMessage::tool("c1", text);
-        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 1, height: 1, name: "a.png".into() }]);
+        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 1, height: 1 }]);
         let messages = vec![ChatMessage::user("look"), ChatMessage::assistant(None, Some(vec![call])), shown, ChatMessage::tool("c2", "plain")];
         let mut bare = messages.clone();
         bare[2].images = None;

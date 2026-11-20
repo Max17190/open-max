@@ -56,9 +56,6 @@ pub struct Image {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
-    /// The file it was read from, named by a line that replaces it. Never sent.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub name: String,
 }
 
 impl Image {
@@ -220,17 +217,13 @@ pub enum AgentEvent {
     /// links it to the tool result it rides when it rode one, else empty (a
     /// note inserted before the next prompt, e.g. a turn-start receipt).
     HarnessNote { call_id: String, text: String },
-    /// The model request is being resent: `attempt` goes out after a
-    /// backoff, and `max_attempts` is the attempt the request ends on if it
-    /// keeps failing the same way (the budget, or sooner while the latest
-    /// attempts in a row failed to connect or timed out), `reason` having
-    /// ended the previous one (a transport failure, a 429 or transient 5xx,
-    /// or, before any reply text, a stream that died or went silent, or a
-    /// stream or reply the provider failed with a rate limit, an overload,
-    /// or a server fault, or a reply the network cut after its text began,
-    /// at most twice). Emitted before the wait; a cancel during it ends the
-    /// turn and the attempt never goes out. What streamed for it is void.
-    /// Also attempt 2 of 2 when a host refused new tool images, resent as lines.
+    /// The model request is being resent: `attempt` goes out after a backoff, and `max_attempts` is the attempt the
+    /// request ends on if it keeps failing the same way (the budget, or sooner while the latest attempts in a row
+    /// failed to connect or timed out), `reason` having ended the previous one (a transport failure, a 429 or
+    /// transient 5xx, or, before any reply text, a stream that died or went silent, or a stream or reply the provider
+    /// failed with a rate limit, an overload, or a server fault, or a reply the network cut after its text began, at
+    /// most twice). Emitted before the wait; a cancel during it ends the turn and the attempt never goes out. What
+    /// streamed for it is void. Also attempt 2 of 2 when a host refused new tool images, resent as lines.
     Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
@@ -412,7 +405,7 @@ mod tests {
     /// and one stored without a size at the flat 1,600.
     #[test]
     fn an_images_estimate_follows_its_dimensions() {
-        let image = |width, height| Image { mime: "image/png".into(), data: "AAAA".into(), width, height, name: String::new() };
+        let image = |width, height| Image { mime: "image/png".into(), data: "AAAA".into(), width, height };
         assert_eq!(image(100, 75).tokens(), 10);
         assert_eq!(image(1_000, 750).tokens(), 1_000);
         assert_eq!(image(2_000, 2_000).tokens(), 5_334);
