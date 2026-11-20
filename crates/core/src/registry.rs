@@ -1417,6 +1417,7 @@ async fn spawn_external(
         cwd: root.to_path_buf(),
         stdin: StdinMode::json_line(args),
         timeout: execution::timeout_secs(tool.timeout_secs),
+        stuck_after: None,
         capture: CaptureSpec {
             head_bytes: 0,
             tail_bytes: caps.command_bytes,
@@ -1449,7 +1450,7 @@ async fn spawn_external(
             ),
             // Same contract as bash: the tail is already captured when the
             // timeout fires, and it is the only clue to what the tool hung on.
-            Termination::TimedOut => {
+            Termination::TimedOut | Termination::Stuck { .. } => {
                 let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
                 ToolOutcome::from_process(
                     false,
@@ -2706,7 +2707,7 @@ mutatng = true
         // A session's first note is the full one, and it is the one the cap
         // has to make room for.
         registry.background_noted.store(false, std::sync::atomic::Ordering::Relaxed);
-        let tight = tools::OutputCaps { command_bytes: 1_000, images: false };
+        let tight = tools::OutputCaps { command_bytes: 1_000, images: false, stuck_after: None };
         let plain = run("tight_plain", tight).await;
         assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
         assert!(!plain.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", plain.output);

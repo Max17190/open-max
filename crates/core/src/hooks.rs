@@ -1545,6 +1545,7 @@ async fn run_hook(
         cwd: cwd.to_path_buf(),
         stdin: StdinMode::json_line(&payload),
         timeout: Duration::from_secs(hook.timeout_secs),
+        stuck_after: None,
         capture: CaptureSpec {
             // Hook block reasons keep their beginning and are character-capped
             // below. Four bytes per character covers valid UTF-8.
@@ -1581,7 +1582,7 @@ async fn run_hook(
         }
         Ok(output) => match output.termination {
             Termination::Cancelled => HookRun::Cancelled,
-            Termination::TimedOut => HookRun::Block(format!(
+            Termination::TimedOut | Termination::Stuck { .. } => HookRun::Block(format!(
                 "hook '{}' timed out after {}s",
                 hook.source_path.display(),
                 hook.timeout_secs
