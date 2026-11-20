@@ -1413,10 +1413,11 @@ mod tests {
     }
 
     /// The path-free base rules and builtin schemas, the extension pointer
-    /// among them in the bash description, must fit in 2,737 bytes, what
-    /// they measured when the base rules began asking to follow what the
+    /// among them in the bash description, must fit in 2,740 bytes, what
+    /// the macOS runner measured (2,737 on Linux, 138 bytes over the cap
+    /// before it) when the base rules began asking to follow what the
     /// request and files show and to add no step only because it is
-    /// conventional (138 bytes). Before that the cap was 2,599 bytes (594
+    /// conventional. Before that the cap was 2,599 bytes (594
     /// o200k tokens), what they measured when the bash description began
     /// saying that background processes end with the call (56 bytes, 12
     /// tokens, over the 2,543 bytes and 582 tokens they measured just
@@ -1473,7 +1474,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_737;
+        const CAP: usize = 2_740;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \
