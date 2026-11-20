@@ -104,9 +104,7 @@ pub(crate) struct ProcessRequest {
     pub cwd: PathBuf,
     pub stdin: StdinMode,
     pub timeout: Duration,
-    /// Stop the command early once its session's processes have used no CPU
-    /// and read or written nothing for this long (Linux; see
-    /// [`watch_for_stuck`]). `None` waits for the exit or the timeout.
+    /// Stop the command once its processes sit this long with nothing to do ([`watch_for_stuck`]).
     pub stuck_after: Option<Duration>,
     pub capture: CaptureSpec,
     /// OS-level containment for this one spawn. `None` is the default and
@@ -196,8 +194,7 @@ pub(crate) enum Termination {
     Exited(ExitStatus),
     Cancelled,
     TimedOut,
-    /// Stopped by [`ProcessRequest::stuck_after`]: the processes still
-    /// running at the stop, as `name (pid)`, and how long they sat idle.
+    /// Stopped by [`ProcessRequest::stuck_after`] after `idle`, with the processes still `running`.
     Stuck { idle: Duration, running: Vec<String> },
 }
 
@@ -922,28 +919,12 @@ pub(crate) async fn run_process(
 
     let (mut child, group) = GroupGuard::spawn(&mut command)?;
     let pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ProcessError::Wait(io::Error::other("stdout pipe unavailable")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ProcessError::Wait(io::Error::other("stderr pipe unavailable")))?;
+    let stdout = child.stdout.take().ok_or_else(|| ProcessError::Wait(io::Error::other("stdout pipe unavailable")))?;
+    let stderr = child.stderr.take().ok_or_else(|| ProcessError::Wait(io::Error::other("stderr pipe unavailable")))?;
 
     let drain_stop = Arc::new(CancelToken::default());
-    let stdout_task = tokio::spawn(drain_stream(
-        stdout,
-        request.capture.clone(),
-        "stdout",
-        drain_stop.clone(),
-    ));
-    let stderr_task = tokio::spawn(drain_stream(
-        stderr,
-        request.capture.clone(),
-        "stderr",
-        drain_stop.clone(),
-    ));
+    let stdout_task = tokio::spawn(drain_stream(stdout, request.capture.clone(), "stdout", drain_stop.clone()));
+    let stderr_task = tokio::spawn(drain_stream(stderr, request.capture.clone(), "stderr", drain_stop.clone()));
     let stdin_task = match request.stdin {
         StdinMode::Null => None,
         StdinMode::Bytes(bytes) => child.stdin.take().map(|mut stdin| {
@@ -959,8 +940,7 @@ pub(crate) async fn run_process(
         }),
     };
 
-    let (termination, left_running) =
-        supervise_child(&mut child, pid, request.timeout, request.stuck_after, &cancel).await?;
+    let (termination, left_running) = supervise_child(&mut child, pid, request.timeout, request.stuck_after, &cancel).await?;
     group.settled();
 
     if let Some(task) = stdin_task {
@@ -968,47 +948,20 @@ pub(crate) async fn run_process(
     }
     let (stdout, stderr) = join_streams(stdout_task, stderr_task, drain_stop).await?;
     let log_truncated = stdout.omitted || stderr.omitted;
-    let retained_limit = request
-        .capture
-        .head_bytes
-        .saturating_add(request.capture.tail_bytes) as u64;
-    let combined_total = stdout
-        .stream
-        .total_bytes
-        .saturating_add(stderr.stream.total_bytes);
-    let force_combined_log = stdout.spill_path.is_none()
-        && stderr.spill_path.is_none()
-        && stdout.stream.total_bytes <= retained_limit
-        && stderr.stream.total_bytes <= retained_limit
-        && combined_total > retained_limit;
-    let log_path = combine_logs(
-        &request.capture.spill_dir,
-        stdout.spill_path,
-        stderr.spill_path,
-        &stdout.stream,
-        &stderr.stream,
-        force_combined_log,
-    )
-    .await?;
+    let retained_limit = request.capture.head_bytes.saturating_add(request.capture.tail_bytes) as u64;
+    let combined_total = stdout.stream.total_bytes.saturating_add(stderr.stream.total_bytes);
+    let force_combined_log = stdout.spill_path.is_none() && stderr.spill_path.is_none()
+        && stdout.stream.total_bytes <= retained_limit && stderr.stream.total_bytes <= retained_limit && combined_total > retained_limit;
+    let log_path = combine_logs(&request.capture.spill_dir, stdout.spill_path, stderr.spill_path, &stdout.stream, &stderr.stream, force_combined_log).await?;
 
-    Ok(ProcessOutput {
-        termination,
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-        log_path,
-        log_truncated,
-        left_running,
-    })
+    Ok(ProcessOutput { termination, stdout: stdout.stream, stderr: stderr.stream, log_path, log_truncated, left_running })
 }
 
 async fn finish_stdin_task(mut task: tokio::task::JoinHandle<io::Result<()>>) {
     // A detached descendant can inherit the read end without consuming it.
     // Once the supervised process is gone, stdin is best effort and must not
     // strand the invocation.
-    if tokio::time::timeout(TERMINATION_GRACE, &mut task)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(TERMINATION_GRACE, &mut task).await.is_err() {
         task.abort();
         let _ = task.await;
     }
@@ -1039,14 +992,10 @@ async fn join_streams(
     let Some((stdout_result, stderr_result)) = joined else {
         stdout.abort();
         stderr.abort();
-        return Err(ProcessError::Wait(io::Error::other(
-            "output drains did not stop after process termination",
-        )));
+        return Err(ProcessError::Wait(io::Error::other("output drains did not stop after process termination")));
     };
     let finished = |result: Result<io::Result<FinishedStream>, tokio::task::JoinError>| {
-        result
-            .map_err(|error| ProcessError::Wait(io::Error::other(error)))?
-            .map_err(ProcessError::Wait)
+        result.map_err(|error| ProcessError::Wait(io::Error::other(error)))?.map_err(ProcessError::Wait)
     };
     Ok((finished(stdout_result)?, finished(stderr_result)?))
 }
@@ -1062,9 +1011,7 @@ async fn combine_logs(
     if stdout.is_none() && stderr.is_none() && !force {
         return Ok(None);
     }
-    let Some(dir) = spill_dir else {
-        return Ok(None);
-    };
+    let Some(dir) = spill_dir else { return Ok(None) };
     if tokio::fs::create_dir_all(dir).await.is_err() {
         discard_spills(stdout, stderr).await;
         return Ok(None);
@@ -1160,12 +1107,7 @@ async fn supervise_child(
     stuck_after: Option<Duration>,
     cancel: &CancelToken,
 ) -> Result<(Termination, Option<LeftRunning>), ProcessError> {
-    let stuck = async {
-        match (stuck_after, pid) {
-            (Some(after), Some(pid)) => watch_for_stuck(pid, after).await,
-            _ => std::future::pending().await,
-        }
-    };
+    let stuck = async { match (stuck_after, pid) { (Some(after), Some(pid)) => watch_for_stuck(pid, after).await, _ => std::future::pending().await } };
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
@@ -1195,110 +1137,44 @@ async fn supervise_child(
     }
 }
 
-/// How often [`watch_for_stuck`] samples the session's processes: a
-/// twelfth of the quiet spell it waits for, so a minute is sampled every
-/// five seconds.
-fn stuck_sample(after: Duration) -> Duration {
-    (after / 12).clamp(Duration::from_millis(50), Duration::from_secs(5))
-}
-
-/// Resolves once every process in the session `session` leads has used no
-/// CPU and read or written no bytes (pipes and files alike) for `after`,
-/// with no thread in a timed sleep, and returns how long they sat idle and
-/// the processes still running then. A `sleep 300` or a poll loop is a wait
-/// the command asked for, so a thread in `nanosleep` restarts the count.
-/// Processes that left the session with `setsid` are not watched: they
-/// outlive the call anyway. Never resolves off Linux or when `/proc` cannot
-/// be read, so the command keeps its timeout.
+/// Resolves once the processes of the session `session` leads have used no CPU, read or written nothing and had no thread in a
+/// timed sleep (`sleep 300` is a wait asked for) for `after`, sampled every twelfth of it; returns how long and what still ran.
 async fn watch_for_stuck(session: u32, after: Duration) -> (Duration, Vec<String>) {
-    let mut last: Option<SessionActivity> = None;
-    let mut idle = Duration::ZERO;
-    let sample = stuck_sample(after);
+    let (sample, mut last, mut idle) = ((after / 12).clamp(Duration::from_millis(50), Duration::from_secs(5)), None, Duration::ZERO);
     loop {
         tokio::time::sleep(sample).await;
-        let Ok(Some(now)) = tokio::task::spawn_blocking(move || session_activity(Path::new("/proc"), session)).await else {
-            last = None;
-            idle = Duration::ZERO;
-            continue;
-        };
-        let quiet = !now.timed_sleep && last.as_ref().is_some_and(|last| last.counters == now.counters);
-        idle = if quiet { idle + sample } else { Duration::ZERO };
-        if idle >= after {
-            return (idle, now.running);
-        }
-        last = Some(now);
+        let now = tokio::task::spawn_blocking(move || session_activity(session)).await.ok().flatten();
+        idle = match (&now, &last) { (Some((now, false, _)), Some((last, _, _))) if now == last => idle + sample, _ => Duration::ZERO };
+        if idle >= after { return (idle, now.map(|n| n.2).unwrap_or_default()) }
+        last = now;
     }
 }
 
-/// One sample of a session's processes for [`watch_for_stuck`].
-#[derive(Debug)]
-struct SessionActivity {
-    /// Per process, in pid order: pid, CPU time (ns from `schedstat`, else
-    /// clock ticks from `stat`) and bytes read and written (`io` rchar and
-    /// wchar). A process starting or ending changes it too.
-    counters: Vec<(u32, u64, u64, u64)>,
-    /// Some thread is in `nanosleep` or `clock_nanosleep`.
-    timed_sleep: bool,
-    /// `name (pid)` of each live process.
-    running: Vec<String>,
-}
-
+type Activity = Option<(Vec<(u32, u64, u64, u64)>, bool, Vec<String>)>;
+/// Per process of the session, in pid order: its threads' CPU time (`schedstat` ns, else `stat` ticks) and its `io` rchar and wchar;
+/// whether a thread is in `nanosleep` (by wait channel, else syscall number); and each one's `name (pid)`.
 #[cfg(target_os = "linux")]
-fn session_activity(proc: &Path, session: u32) -> Option<SessionActivity> {
-    let mut members: Vec<(u32, String)> = std::fs::read_dir(proc).ok()?.flatten().filter_map(|entry| {
-        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
-        let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-        let (_, of, exited) = stat_group(&stat)?;
-        (of == session && !exited).then(|| (pid, stat))
-    }).collect();
-    if members.is_empty() {
-        return None;
+fn session_activity(session: u32) -> Activity {
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let first = |text: String| text.split_whitespace().next().and_then(|n| n.parse::<u64>().ok());
+    let mut pids: Vec<(u32, String)> = std::fs::read_dir("/proc").ok()?.flatten().filter_map(|e| { let stat = read(&e.path().join("stat")); matches!(stat_group(&stat), Some((_, of, false)) if of == session).then_some((e.file_name().to_str()?.parse().ok()?, stat)) }).collect();
+    pids.sort_unstable_by_key(|p| p.0);
+    let sleeps: &[u64] = if cfg!(target_arch = "x86_64") { &[35, 230] } else if cfg!(target_arch = "aarch64") { &[101, 115] } else { &[] };
+    let (mut counters, mut slept, mut running) = (Vec::new(), false, Vec::new());
+    for (pid, stat) in pids {
+        let (dir, ticks) = (Path::new("/proc").join(pid.to_string()), |t: &str| t.rsplit_once(')').map(|(_, f)| f.split_whitespace().skip(11).take(2).filter_map(|n| n.parse::<u64>().ok()).sum::<u64>()));
+        let io = read(&dir.join("io"));
+        let field = |key| io.lines().find_map(|l| l.strip_prefix(key)?.trim().parse().ok()).unwrap_or(0u64);
+        let tasks: Vec<_> = std::fs::read_dir(dir.join("task")).into_iter().flatten().flatten().map(|t| t.path()).collect();
+        counters.push((pid, tasks.iter().filter_map(|t| first(read(&t.join("schedstat"))).or_else(|| ticks(&read(&t.join("stat"))))).sum(), field("rchar:"), field("wchar:")));
+        slept |= tasks.iter().any(|t| read(&t.join("wchan")).contains("nanosleep") || first(read(&t.join("syscall"))).is_some_and(|n| sleeps.contains(&n)));
+        running.push(format!("{} ({pid})", stat.split_once('(').and_then(|(_, r)| r.rsplit_once(')')).map_or("?", |n| n.0)));
     }
-    members.sort_unstable_by_key(|m| m.0);
-    let mut activity = SessionActivity { counters: Vec::new(), timed_sleep: false, running: Vec::new() };
-    for (pid, stat) in members {
-        let dir = proc.join(pid.to_string());
-        let io = std::fs::read_to_string(dir.join("io")).unwrap_or_default();
-        let field = |key: &str| io.lines().find_map(|l| l.strip_prefix(key)?.trim().parse::<u64>().ok()).unwrap_or(0);
-        let mut cpu = 0;
-        for task in std::fs::read_dir(dir.join("task")).into_iter().flatten().flatten() {
-            cpu += thread_cpu(&task.path()).unwrap_or(0);
-            activity.timed_sleep |= in_timed_sleep(&task.path());
-        }
-        activity.counters.push((pid, cpu, field("rchar:"), field("wchar:")));
-        let name = stat.split_once('(').and_then(|(_, rest)| rest.rsplit_once(')')).map_or("?", |(name, _)| name);
-        activity.running.push(format!("{name} ({pid})"));
-    }
-    Some(activity)
+    (!counters.is_empty()).then_some((counters, slept, running))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn session_activity(_: &Path, _: u32) -> Option<SessionActivity> {
-    None
-}
-
-/// A thread's CPU time: nanoseconds from `schedstat`, else user plus system
-/// clock ticks from `stat`.
-#[cfg(target_os = "linux")]
-fn thread_cpu(task: &Path) -> Option<u64> {
-    if let Some(ns) = std::fs::read_to_string(task.join("schedstat")).ok().and_then(|s| s.split_whitespace().next()?.parse().ok()) {
-        return Some(ns);
-    }
-    let stat = std::fs::read_to_string(task.join("stat")).ok()?;
-    let mut fields = stat.rsplit_once(')')?.1.split_whitespace().skip(11);
-    Some(fields.next()?.parse::<u64>().ok()? + fields.next()?.parse::<u64>().ok()?)
-}
-
-/// The thread is in `nanosleep` or `clock_nanosleep`: by its kernel wait
-/// channel, or where that is hidden, by the syscall it is blocked in.
-#[cfg(target_os = "linux")]
-fn in_timed_sleep(task: &Path) -> bool {
-    if std::fs::read_to_string(task.join("wchan")).is_ok_and(|w| w.contains("nanosleep")) {
-        return true;
-    }
-    const TIMED_SLEEPS: &[u64] = if cfg!(target_arch = "x86_64") { &[35, 230] } else if cfg!(target_arch = "aarch64") { &[101, 115] } else { &[] };
-    std::fs::read_to_string(task.join("syscall")).ok().and_then(|s| s.split_whitespace().next()?.parse::<u64>().ok()).is_some_and(|n| TIMED_SLEEPS.contains(&n))
-}
+fn session_activity(_: u32) -> Activity { None }
 
 async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<(), ProcessError> {
     stop_group(Some(child), pid, false);

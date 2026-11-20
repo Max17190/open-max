@@ -160,9 +160,7 @@ pub struct Settings {
     /// Bytes of `AGENTS.md` a new session carries; unset scales with the window (`prompt::agents_md_cap`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents_md_bytes: Option<usize>,
-    /// Seconds a bash command's processes may sit with no CPU time, no
-    /// bytes read and none written before the call stops it and says so.
-    /// Unset or 0 leaves a command to its timeout. Held to at least 30.
+    /// Seconds a bash command's processes may use no CPU and read or write nothing before it is stopped as stuck; unset or 0 is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stuck_command_secs: Option<u64>,
 }

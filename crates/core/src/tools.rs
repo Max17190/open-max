@@ -71,9 +71,7 @@ pub struct OutputCaps {
     /// read_file shows an image file to the model as an image, and an
     /// external tool's images reach it with the result (`image_input`).
     pub images: bool,
-    /// A bash command whose processes use no CPU and read or write nothing
-    /// for this long is stopped and reported as stuck. `None` waits out the
-    /// timeout. From `stuck_command_secs`.
+    /// From `stuck_command_secs`: see [`execution::ProcessRequest::stuck_after`].
     pub stuck_after: Option<std::time::Duration>,
 }
 
@@ -114,8 +112,7 @@ impl OutputCaps {
         self.command_bytes.clamp(MAX_READ_BYTES, MAX_WINDOW_OUTPUT_BYTES)
     }
 }
-/// The shortest quiet spell `stuck_command_secs` may set: below it a pause
-/// between a build's steps would read as a hang.
+/// The shortest spell `stuck_command_secs` may set, so a pause between build steps never reads as a hang.
 const MIN_STUCK_SECS: u64 = 30;
 const MAX_LINE_CHARS: usize = 500;
 const MAX_FILE_BYTES: u64 = 1_500_000;
@@ -2443,49 +2440,17 @@ impl BashDeadline {
     }
 }
 
-/// The first line of a result [`Termination::Stuck`] ended.
-fn stuck_heading(idle: std::time::Duration, running: &[String]) -> String {
-    let running = match running.len() {
-        0 => String::new(),
-        n if n > 8 => format!(" Still running then: {} and {} more.", running[..8].join(", "), n - 8),
-        _ => format!(" Still running then: {}.", running.join(", ")),
-    };
-    format!(
-        "command stopped: for {}s its processes used no CPU and read or wrote nothing, so it looked stuck.{running} Output until the stop:",
-        idle.as_secs()
-    )
-}
-
-async fn run_bash(
-    data_dir: &Path,
-    root: &Path,
-    args: &Value,
-    caps: OutputCaps,
-    cancel: Arc<CancelToken>,
-    background_noted: &AtomicBool,
-) -> ToolOutcome {
-    let Some(command) = args["command"].as_str() else {
-        return ToolOutcome::err("missing required argument: command");
-    };
+async fn run_bash(data_dir: &Path, root: &Path, args: &Value, caps: OutputCaps, cancel: Arc<CancelToken>, background_noted: &AtomicBool) -> ToolOutcome {
+    let Some(command) = args["command"].as_str() else { return ToolOutcome::err("missing required argument: command") };
     let deadline = bash_deadline(args);
     let request = ProcessRequest {
-        program: bash_shell().into(),
-        args: vec!["-c".into(), RUN_COMMAND.into()],
-        cwd: root.to_path_buf(),
-        stdin: StdinMode::Null,
-        timeout: execution::timeout_secs(deadline.secs),
-        stuck_after: caps.stuck_after,
+        program: bash_shell().into(), args: vec!["-c".into(), RUN_COMMAND.into()], cwd: root.to_path_buf(), stdin: StdinMode::Null,
+        timeout: execution::timeout_secs(deadline.secs), stuck_after: caps.stuck_after,
         capture: CaptureSpec {
-            head_bytes: caps.command_bytes / HEAD_SHARE_DIVISOR,
-            tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
-            spill_dir: Some(data_dir.join("cmd-logs")),
-            spill_bytes_per_stream: 16 * 1024 * 1024,
-            redraws: true,
+            head_bytes: caps.command_bytes / HEAD_SHARE_DIVISOR, tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
+            spill_dir: Some(data_dir.join("cmd-logs")), spill_bytes_per_stream: 16 * 1024 * 1024, redraws: true,
         },
-        sandbox: None,
-        env_allowlist: None,
-        self_link: true,
-        env: vec![(COMMAND_VAR.into(), command.into())],
+        sandbox: None, env_allowlist: None, self_link: true, env: vec![(COMMAND_VAR.into(), command.into())],
     };
     match execution::run_process(request, cancel).await {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),
@@ -2505,11 +2470,11 @@ async fn run_bash(
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 ToolOutcome::from_process(false, format!("{}\n{text}", deadline.timed_out_heading()), &output, truncated)
             }
-            // Stopped early: the same tail is the clue, and the heading says
-            // why the call ended before its timeout and what was still there.
             Termination::Stuck { idle, running } => {
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
-                ToolOutcome::from_process(false, format!("{}\n{text}", stuck_heading(*idle, running)), &output, truncated)
+                let running = if running.len() > 8 { format!("{} and {} more", running[..8].join(", "), running.len() - 8) } else { running.join(", ") };
+                let heading = format!("command stopped: for {}s its processes used no CPU and read or wrote nothing, so it looked stuck. Still running then: {running}. Output until the stop:", idle.as_secs());
+                ToolOutcome::from_process(false, format!("{heading}\n{text}"), &output, truncated)
             }
             Termination::Exited(status) => {
                 exited_outcome(&output, status, caps.command_bytes, background_noted)

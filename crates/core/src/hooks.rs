@@ -1582,7 +1582,6 @@ async fn run_hook(
         }
         Ok(output) => match output.termination {
             Termination::Cancelled => HookRun::Cancelled,
-            // A hook never asks for `stuck_after`, so it never stops early.
             Termination::TimedOut | Termination::Stuck { .. } => HookRun::Block(format!(
                 "hook '{}' timed out after {}s",
                 hook.source_path.display(),

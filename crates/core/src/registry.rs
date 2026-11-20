@@ -1450,7 +1450,6 @@ async fn spawn_external(
             ),
             // Same contract as bash: the tail is already captured when the
             // timeout fires, and it is the only clue to what the tool hung on.
-            // An external tool never asks for `stuck_after`.
             Termination::TimedOut | Termination::Stuck { .. } => {
                 let (text, truncated) = tools::render_process_output(&output, caps.command_bytes);
                 ToolOutcome::from_process(
