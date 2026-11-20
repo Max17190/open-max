@@ -1414,10 +1414,11 @@ mod tests {
 
     /// The path-free base rules and builtin schemas, the extension pointer
     /// among them in the bash description, must fit in 2,740 bytes, what
-    /// the macOS runner measured (2,737 on Linux, 138 bytes over the cap
-    /// before it) when the base rules began asking to follow what the
+    /// the macOS runner measured (2,737 on Linux, whose bash description is 3
+    /// bytes shorter) when the base rules began asking to follow what the
     /// request and files show and to add no step only because it is
-    /// conventional. Before that the cap was 2,599 bytes (594
+    /// conventional (141 bytes, 29 o200k tokens). Before that the cap was
+    /// 2,599 bytes (594
     /// o200k tokens), what they measured when the bash description began
     /// saying that background processes end with the call (56 bytes, 12
     /// tokens, over the 2,543 bytes and 582 tokens they measured just

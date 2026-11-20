@@ -1515,7 +1515,7 @@ fn built_on_a_runner(attributes: &[impl AsRef<str>]) -> bool {
 
 /// Every thesis test whose name states a bound prints what it measured
 /// beside that bound, and CI gates it. A name states a bound with a number
-/// after a comparator (`_under_700_`, `_at_least_ninety_five_`,
+/// after a comparator (`_under_735_`, `_at_least_ninety_five_`,
 /// `_in_five_seconds`, `_has_two_thousand_`), a number before `_percent`, or
 /// `zero_`, in digits or in words (stated_bound gives the grammar). Each
 /// such test prints, with `println!` or `eprintln!`, which CI's thesis job
@@ -1580,7 +1580,7 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
     // The grammar, on those names and names the thesis sources have.
     for (name, bound) in retired.iter().map(|&(name, bound)| (name, Some(bound))).chain([
         ("one_command_from_a_fresh_install_answers_locally_in_under_a_second", Some(1)),
-        ("frozen_prefix_is_under_700_tokens", Some(700)),
+        ("frozen_prefix_is_under_735_tokens", Some(735)),
         ("a_session_prompt_is_75_percent_cacheable", Some(75)),
         ("zero_orphans_after_kill_9", Some(0)),
         ("every_test_runs_under_a_checksummed_nextest_that_retries_none", None),
@@ -1699,7 +1699,7 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
     }
     println!("thesis gates whose names state a bound: {}", bounded.join(", "));
     assert!(
-        bounded.iter().any(|gate| gate == "frozen_prefix_is_under_700_tokens (700)"),
+        bounded.iter().any(|gate| gate == "frozen_prefix_is_under_735_tokens (735)"),
         "the frozen prompt's gate is not among the gates found to state a bound, so the parser finds less than it should: {bounded:?}"
     );
     assert!(problems.is_empty(), "a thesis gate's name states what it does not measure:\n{}", problems.join("\n"));

@@ -8,7 +8,7 @@
 <h3 align="center">Most powerful & token efficient harness for agents</h3>
 
 <p align="center">
-  A coding agent for your terminal. Its built-in prompt is under 700 tokens, and each<br>
+  A coding agent for your terminal. Its built-in prompt is under 735 tokens, and each<br>
   agent step in a session sends it as the same bytes, so providers can cache it.
 </p>
 

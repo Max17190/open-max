@@ -71,7 +71,7 @@ const REPOSITORY_TREE: [&str; 17] = [
     "scripts/release.sh",
 ];
 
-/// The frozen prefix stays under 700 tokens in a project with this
+/// The frozen prefix stays under 735 tokens in a project with this
 /// repository's top two levels as `REPOSITORY_TREE` records them, checked as a
 /// byte cap. The prefix is what every request of a session sends first:
 /// messages[0] (the base rules, the extension pointer, the project path, and
@@ -81,9 +81,14 @@ const REPOSITORY_TREE: [&str; 17] = [
 /// whose tree is `REPOSITORY_TREE`, without an `AGENTS.md` (in a checkout that
 /// file is the user's own, and git ignores it here); the gate takes the text of
 /// messages[0] less the fixture's project path, adds the `tools` array's raw
-/// wire bytes and the note's text, and holds that path-free payload to 3,036
-/// bytes: 700 tokens less a 10-token allowance for the checkout path, at 4.4
-/// bytes per token. The path is left out because the fixture's sits in a
+/// wire bytes and the note's text, and holds that path-free payload to 3,177
+/// bytes: 3,036, the cap of the 700-token target (700 tokens less a 10-token
+/// allowance for the checkout path, at 4.4 bytes per token), plus the 141
+/// bytes (29 tokens) of the base rule against unrequested steps. Counted with
+/// tiktoken's o200k_base per field and summed, with the Linux CI checkout path
+/// (/home/runner/work/open-max/open-max) in place of the fixture's, the
+/// payload measured 692 tokens at 6f73804, before that rule, and 721 after;
+/// the Responses payload measured 705 and 734, so the target is 735. The path is left out because the fixture's sits in a
 /// uuid-named temp dir, whose cost depends on the machine. A checkout of this
 /// repository costs 9 tokens in place, in the prompt's first sentence, on
 /// either CI runner (/home/runner/work/open-max/open-max,
@@ -113,17 +118,20 @@ const REPOSITORY_TREE: [&str; 17] = [
 /// style: how many calls share a response, how much of a file to read, how
 /// large a diff to make. The model judges those from the task in front of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn frozen_prefix_is_under_700_tokens() {
-    frozen_prefix_case("frozen_prefix_is_under_700_tokens", false).await;
+async fn frozen_prefix_is_under_735_tokens() {
+    frozen_prefix_case("frozen_prefix_is_under_735_tokens", false).await;
 }
 
 /// The Responses prefix includes its additional_tools envelope. With the same
-/// fixture and o200k_base calibration, 3,046 path-free bytes are 691 tokens,
-/// or 700 with the 9-token CI checkout path. This is the same token target;
-/// its JSON dialect has a different bytes-per-token ratio. No runtime tokenizer.
+/// fixture and o200k_base calibration, 3,046 path-free bytes were 691 tokens,
+/// or 700 with the 9-token CI checkout path, when that cap was set; the
+/// schemas have since moved it to 705. The cap is 3,187, those 3,046 bytes
+/// plus the 141-byte rule against unrequested steps, which measured 734 tokens
+/// with the CI checkout path. This is the same token target; its JSON dialect
+/// has a different bytes-per-token ratio. No runtime tokenizer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_frozen_prefix_is_under_700_tokens() {
-    frozen_prefix_case("responses_frozen_prefix_is_under_700_tokens", true).await;
+async fn responses_frozen_prefix_is_under_735_tokens() {
+    frozen_prefix_case("responses_frozen_prefix_is_under_735_tokens", true).await;
 }
 
 /// The frozen prefix gate `gate`, over the Responses API when `responses`.
@@ -198,10 +206,11 @@ async fn frozen_prefix_case(gate: &str, responses: bool) {
     assert_eq!(system.matches(&*root).count(), 1, "the allowance prices one project path:\n{system}");
     let system_path_free = system.len() - root.len();
     let bytes = system_path_free + tools.len() + note.len();
-    const TARGET_TOKENS: usize = 700;
-    const PATH_ALLOWANCE_TOKENS: usize = 10;
-    const BYTES_PER_TOKEN_TENTHS: usize = 44;
-    let cap = if responses { 3046 } else { (TARGET_TOKENS - PATH_ALLOWANCE_TOKENS) * BYTES_PER_TOKEN_TENTHS / 10 };
+    const TARGET_TOKENS: usize = 735;
+    // The 700-token calibration's caps plus the rule against unrequested
+    // steps, 141 bytes: see `frozen_prefix_is_under_735_tokens`.
+    const RULE_BYTES: usize = 141;
+    let cap = if responses { 3046 + RULE_BYTES } else { 3036 + RULE_BYTES };
     println!(
         "MEASURE {gate} {bytes} path-free bytes = {system_path_free} messages[0] without the {}-byte project path + {} \
          tools + {} execution policy note; cap {cap} bytes, the {TARGET_TOKENS}-token target's calibration",
