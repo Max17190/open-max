@@ -967,11 +967,8 @@ async fn finish_stdin_task(mut task: tokio::task::JoinHandle<io::Result<()>>) {
     }
 }
 
-async fn join_streams(
-    mut stdout: tokio::task::JoinHandle<io::Result<FinishedStream>>,
-    mut stderr: tokio::task::JoinHandle<io::Result<FinishedStream>>,
-    stop: Arc<CancelToken>,
-) -> Result<(FinishedStream, FinishedStream), ProcessError> {
+type Drain = tokio::task::JoinHandle<io::Result<FinishedStream>>;
+async fn join_streams(mut stdout: Drain, mut stderr: Drain, stop: Arc<CancelToken>) -> Result<(FinishedStream, FinishedStream), ProcessError> {
     // One join future carries both drains through both grace windows. A
     // `JoinHandle` yields its output once and panics when polled again, so a
     // drain that finished inside the first window must not be joined afresh
@@ -1000,14 +997,7 @@ async fn join_streams(
     Ok((finished(stdout_result)?, finished(stderr_result)?))
 }
 
-async fn combine_logs(
-    spill_dir: &Option<PathBuf>,
-    stdout: Option<PathBuf>,
-    stderr: Option<PathBuf>,
-    stdout_stream: &CapturedStream,
-    stderr_stream: &CapturedStream,
-    force: bool,
-) -> Result<Option<PathBuf>, ProcessError> {
+async fn combine_logs(spill_dir: &Option<PathBuf>, stdout: Option<PathBuf>, stderr: Option<PathBuf>, stdout_stream: &CapturedStream, stderr_stream: &CapturedStream, force: bool) -> Result<Option<PathBuf>, ProcessError> {
     if stdout.is_none() && stderr.is_none() && !force {
         return Ok(None);
     }
@@ -1138,7 +1128,7 @@ async fn supervise_child(
 }
 
 /// Resolves once the processes of the session `session` leads have used no CPU, read or written nothing and had no thread in a
-/// timed sleep (`sleep 300` is a wait asked for) for `after`, sampled every twelfth of it; returns how long and what still ran.
+/// wait with a deadline (`sleep 300` is a wait asked for) for `after`, sampled every twelfth of it; returns how long and what still ran.
 async fn watch_for_stuck(session: u32, after: Duration) -> (Duration, Vec<String>) {
     let (sample, mut last, mut idle) = ((after / 12).clamp(Duration::from_millis(50), Duration::from_secs(5)), None, Duration::ZERO);
     loop {
@@ -1151,26 +1141,37 @@ async fn watch_for_stuck(session: u32, after: Duration) -> (Duration, Vec<String
 }
 
 type Activity = Option<(Vec<(u32, u64, u64, u64)>, bool, Vec<String>)>;
-/// Per process of the session, in pid order: its threads' CPU time (`schedstat` ns, else `stat` ticks) and its `io` rchar and wchar;
-/// whether a thread is in `nanosleep` (by wait channel, else syscall number); and each one's `name (pid)`.
+/// Per process of the session, zombies too, in pid order: its threads' CPU ns (`schedstat`) and its `io` rchar and wchar; whether a
+/// thread is in a wait with a deadline ([`timed_wait`]); and each one's `name (pid)`. `None` when any of it cannot be read.
 #[cfg(target_os = "linux")]
 fn session_activity(session: u32) -> Activity {
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
-    let first = |text: String| text.split_whitespace().next().and_then(|n| n.parse::<u64>().ok());
-    let mut pids: Vec<(u32, String)> = std::fs::read_dir("/proc").ok()?.flatten().filter_map(|e| { let stat = read(&e.path().join("stat")); matches!(stat_group(&stat), Some((_, of, false)) if of == session).then_some((e.file_name().to_str()?.parse().ok()?, stat)) }).collect();
+    let read = |p: PathBuf| std::fs::read_to_string(p).ok();
+    let mut pids: Vec<(u32, String)> = std::fs::read_dir("/proc").ok()?.flatten().filter_map(|e| { let stat = read(e.path().join("stat"))?; matches!(stat_group(&stat), Some((_, of, _)) if of == session).then_some((e.file_name().to_str()?.parse().ok()?, stat)) }).collect();
     pids.sort_unstable_by_key(|p| p.0);
-    let sleeps: &[u64] = if cfg!(target_arch = "x86_64") { &[35, 230] } else if cfg!(target_arch = "aarch64") { &[101, 115] } else { &[] };
-    let (mut counters, mut slept, mut running) = (Vec::new(), false, Vec::new());
+    let (mut counters, mut timed, mut running) = (Vec::new(), false, Vec::new());
     for (pid, stat) in pids {
-        let (dir, ticks) = (Path::new("/proc").join(pid.to_string()), |t: &str| t.rsplit_once(')').map(|(_, f)| f.split_whitespace().skip(11).take(2).filter_map(|n| n.parse::<u64>().ok()).sum::<u64>()));
-        let io = read(&dir.join("io"));
-        let field = |key| io.lines().find_map(|l| l.strip_prefix(key)?.trim().parse().ok()).unwrap_or(0u64);
-        let tasks: Vec<_> = std::fs::read_dir(dir.join("task")).into_iter().flatten().flatten().map(|t| t.path()).collect();
-        counters.push((pid, tasks.iter().filter_map(|t| first(read(&t.join("schedstat"))).or_else(|| ticks(&read(&t.join("stat"))))).sum(), field("rchar:"), field("wchar:")));
-        slept |= tasks.iter().any(|t| read(&t.join("wchan")).contains("nanosleep") || first(read(&t.join("syscall"))).is_some_and(|n| sleeps.contains(&n)));
+        let (dir, mut cpu) = (Path::new("/proc").join(pid.to_string()), 0);
+        let io = read(dir.join("io"))?;
+        let field = |key| io.lines().find_map(|l| l.strip_prefix(key)?.trim().parse::<u64>().ok());
+        for task in std::fs::read_dir(dir.join("task")).ok()?.flatten().map(|t| t.path()) {
+            cpu += read(task.join("schedstat"))?.split_whitespace().next()?.parse::<u64>().ok()?;
+            timed |= timed_wait(&read(task.join("syscall"))?);
+        }
+        counters.push((pid, cpu, field("rchar:")?, field("wchar:")?));
         running.push(format!("{} ({pid})", stat.split_once('(').and_then(|(_, r)| r.rsplit_once(')')).map_or("?", |n| n.0)));
     }
-    (!counters.is_empty()).then_some((counters, slept, running))
+    (!counters.is_empty()).then_some((counters, timed, running))
+}
+
+/// A `/proc/<pid>/task/<tid>/syscall` line of a thread blocked in nanosleep, or in select, poll, epoll or futex given a timeout:
+/// (number, index of the timeout argument, whether it is a pointer rather than milliseconds where -1 waits forever).
+#[cfg(target_os = "linux")]
+fn timed_wait(line: &str) -> bool {
+    const WAITS: &[(u64, usize, bool)] = if cfg!(target_arch = "x86_64") { &[(35, 0, true), (230, 2, true), (23, 4, true), (7, 2, false), (271, 2, true), (270, 4, true), (232, 3, false), (281, 3, false), (441, 3, true), (202, 3, true)] }
+        else if cfg!(target_arch = "aarch64") { &[(101, 0, true), (115, 2, true), (73, 2, true), (72, 4, true), (22, 3, false), (441, 3, true), (98, 3, true)] } else { &[] };
+    let mut fields = line.split_whitespace();
+    let (Some(Ok(number)), args) = (fields.next().map(str::parse::<u64>), fields.map(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()).collect::<Vec<_>>()) else { return false };
+    WAITS.iter().any(|&(n, i, pointer)| n == number && args.get(i).copied().flatten().is_some_and(|a| if pointer { a != 0 } else { a as u32 as i32 >= 0 }))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2245,6 +2246,19 @@ mod tests {
             self_link: false,
             env: Vec::new(),
         }
+    }
+
+    /// A wait with a deadline is told from one without by the timeout argument of the syscall it is blocked in.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_timed_wait_is_read_from_the_syscall_line() {
+        assert!(timed_wait("230 0x0 0x0 0x7ffc0ef8c4d0 0x7ffc0ef8c4c0 0x0 0x0 0x7ffc 0x7f4d"), "clock_nanosleep");
+        assert!(timed_wait("7 0x55d0 0x1 0x3e8 0x0 0x0 0x0 0x7ffc 0x7f4d"), "poll for 1000 ms");
+        assert!(!timed_wait("7 0x55d0 0x1 0xffffffff 0x0 0x0 0x0 0x7ffc 0x7f4d"), "poll forever");
+        assert!(timed_wait("202 0x7f00 0x189 0x0 0x7ffc 0x0 0xffffffff 0x7ffc 0x7f4d"), "futex wait with a timeout");
+        assert!(!timed_wait("202 0x7f00 0x189 0x0 0x0 0x0 0xffffffff 0x7ffc 0x7f4d"), "futex wait without one");
+        assert!(!timed_wait("0 0x3 0x7ffc 0x1000 0x0 0x0 0x0 0x7ffc 0x7f4d"), "read");
+        assert!(!timed_wait("running") && !timed_wait("-1 0x7ffc 0x7f4d"));
     }
 
     /// One drain finished, the other outlived the grace: the shape of a

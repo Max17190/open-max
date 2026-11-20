@@ -4067,6 +4067,10 @@ mod tests {
 
         let out = run("sleep 2; echo slept").await;
         assert!(out.ok && out.output.contains("slept"), "a timed sleep is not stuck: {}", out.output);
+        if std::process::Command::new("python3").arg("-V").output().is_ok() {
+            let out = run("python3 -c 'import select; select.select([], [], [], 2)' && python3 -c 'import threading; threading.Event().wait(2)' && echo waited").await;
+            assert!(out.ok && out.output.contains("waited"), "select and an event wait with a timeout are not stuck: {}", out.output);
+        }
 
         let out = run("end=$((SECONDS + 2)); while [ $SECONDS -lt $end ]; do :; done; echo spun").await;
         assert!(out.ok && out.output.contains("spun"), "a command using CPU is not stuck: {}", out.output);
