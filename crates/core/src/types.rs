@@ -56,6 +56,10 @@ pub struct Image {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    /// The file it was read from, as the tool named it: what a line that
+    /// replaces it calls it. Never sent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 impl Image {
@@ -227,6 +231,9 @@ pub enum AgentEvent {
     /// or a server fault, or a reply the network cut after its text began,
     /// at most twice). Emitted before the wait; a cancel during it ends the
     /// turn and the attempt never goes out. What streamed for it is void.
+    /// Also sent, as attempt 2 of 2, when a host refused a request carrying
+    /// images a tool result just added and it goes once more with each
+    /// replaced by a line saying so.
     Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
@@ -408,7 +415,7 @@ mod tests {
     /// and one stored without a size at the flat 1,600.
     #[test]
     fn an_images_estimate_follows_its_dimensions() {
-        let image = |width, height| Image { mime: "image/png".into(), data: "AAAA".into(), width, height };
+        let image = |width, height| Image { mime: "image/png".into(), data: "AAAA".into(), width, height, name: String::new() };
         assert_eq!(image(100, 75).tokens(), 10);
         assert_eq!(image(1_000, 750).tokens(), 1_000);
         assert_eq!(image(2_000, 2_000).tokens(), 5_334);

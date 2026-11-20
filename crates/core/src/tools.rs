@@ -670,7 +670,7 @@ pub(crate) fn prepare_images(files: &[(String, PathBuf)]) -> (Vec<crate::types::
                     (Some(mime), Some((width, height))) => {
                         spent += bytes.len() as u64;
                         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        images.push(crate::types::Image { mime: mime.into(), data, width, height });
+                        images.push(crate::types::Image { mime: mime.into(), data, width, height, name: name.clone() });
                         continue;
                     }
                 },

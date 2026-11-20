@@ -21,7 +21,9 @@
 //! failure the server reports inside a 200 response (an `error` object on the chunk or reply
 //! or on its choice, or finish_reason `error`) is never a reply, whatever
 //! partial output came with it: unless it is retried, it is an error
-//! carrying the server's own message. So is a reply the server finished as
+//! carrying the server's own message. A stream that ends on a bare
+//! finish_reason `error`, with no error object, is resent as a stream the
+//! network cut. So is a reply the server finished as
 //! `tool_calls` with no call in it and no text: returned, it would end the
 //! turn with nothing done and nothing said. A cut after the server finished
 //! its reply leaves the reply finished. Reasoning deltas do not count: a
@@ -1200,9 +1202,14 @@ async fn read_sse(
             let error = chunk.error.or_else(|| choice.as_mut()?.error.take());
             // finish_reason `error` ends the stream, but not as a reply: it
             // is a failure even when the server sends no error to go with it.
+            // A bare finish_reason `error`, with no error to name a status or
+            // type, says nothing about the request: it is read as a stream the
+            // network cut, and resent on those terms.
             if error.is_some() || choice.as_ref().is_some_and(|c| c.finish_reason.as_deref() == Some("error")) {
-                let error = error.unwrap_or(Value::Null);
-                unfinished = Some(Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data))));
+                unfinished = Some(match error {
+                    Some(error) => Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data))),
+                    None => Unfinished::Interrupted("the server ended the stream with finish_reason error and no error".into()),
+                });
                 break 'outer;
             }
             // The usage-bearing final chunk has an empty choices array.
@@ -3602,16 +3609,35 @@ pub(crate) mod tests {
             assert_eq!(served, 1, "a refused request is not resent");
         }
 
-        // finish_reason `error` with no error beside it still fails the
-        // reply, and says what the server sent.
-        let (result, _, served) = try_stream_sequence(vec![
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n".into(),
-            FINISHED.into(),
-        ])
-        .await;
-        let err = result.err().expect("finish_reason error is an error");
-        assert!(err.contains(r#""finish_reason":"error""#), "{err}");
-        assert_eq!(served, 1);
+    }
+
+    /// finish_reason `error` with no error beside it names no status and no
+    /// type, so nothing says the request was refused: it is resent as a
+    /// stream the network cut. Before reply text that is the whole budget;
+    /// after it, CUT_RETRIES. An error that names a status keeps its rules: a
+    /// 400 inside a 200 is reported at once.
+    #[tokio::test]
+    async fn a_bare_finish_reason_error_is_resent_as_a_cut_stream() {
+        let bare = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n".to_string();
+        let (result, deltas, served) = try_stream_sequence(vec![bare.clone(), FINISHED.into()]).await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:the server ended the stream with finish_reason error and no error"));
+
+        let (result, _, served) = try_stream_sequence(vec![bare; MAX_ATTEMPTS as usize]).await;
+        assert_eq!(result.expect("a cut that persists is a truncation").finish_reason, TRUNCATED);
+        assert_eq!(served, MAX_ATTEMPTS as usize, "the full budget before any reply text");
+
+        let after_text = "data: {\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n".to_string();
+        let mut replies = vec![after_text; 1 + CUT_RETRIES as usize];
+        replies.push(FINISHED.into());
+        let (result, _, served) = try_stream_sequence(replies).await;
+        assert_eq!(result.expect("the last cut stands as a truncation").finish_reason, TRUNCATED);
+        assert_eq!(served, 1 + CUT_RETRIES as usize, "CUT_RETRIES once reply text began");
+
+        let (result, _, served) = try_stream_sequence(vec![gateway_error_chunk(json!(400), "invalid request"), FINISHED.into()]).await;
+        assert!(result.err().expect("a 400 inside a 200 is an error").contains("invalid request"));
+        assert_eq!(served, 1, "an error that names a status is not resent");
     }
 
     /// A server that ignores `stream` can put the same failure in its JSON
@@ -4129,7 +4155,7 @@ pub(crate) mod tests {
     #[test]
     fn an_image_the_endpoint_does_not_read_is_not_estimated() {
         let mut message = ChatMessage::tool("c1", "a.png");
-        message.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 750, height: 1 }]);
+        message.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 750, height: 1, name: String::new() }]);
         let mut client = chat_client("m", None, 64, false, true);
         let blind = client.message_estimator("o").1(&message);
         client.images = true;
@@ -4147,7 +4173,7 @@ pub(crate) mod tests {
         let call = ToolCall { id: "c1".into(), kind: "function".into(), function: crate::types::ToolCallFunction { name: "read_file".into(), arguments: "{}".into() }, extra_content: None };
         let text = "a.png: image/png, 3 bytes, shown to you as an image";
         let mut shown = ChatMessage::tool("c1", text);
-        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 1, height: 1 }]);
+        shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".into(), width: 1, height: 1, name: "a.png".into() }]);
         let messages = vec![ChatMessage::user("look"), ChatMessage::assistant(None, Some(vec![call])), shown, ChatMessage::tool("c2", "plain")];
         let mut bare = messages.clone();
         bare[2].images = None;
