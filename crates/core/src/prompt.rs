@@ -1417,9 +1417,8 @@ mod tests {
     /// among them in the bash description, must fit in 2,737 bytes, what
     /// they measured when the base rules began asking to follow what the
     /// request and files show and to add no step only because it is
-    /// conventional (138 bytes). Unrequested steps cost rounds on every
-    /// task, so the line pays for itself. Before that the cap was 2,599
-    /// bytes (594 o200k tokens), what they measured when the bash description began
+    /// conventional (138 bytes). Before that the cap was 2,599 bytes (594
+    /// o200k tokens), what they measured when the bash description began
     /// saying that background processes end with the call (56 bytes, 12
     /// tokens, over the 2,543 bytes and 582 tokens they measured just
     /// before; the cap had not come down with them). Until then the rule
