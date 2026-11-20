@@ -5494,8 +5494,8 @@ mod tests {
         let cases: [Case; 3] = [
             ("no longer reply declared: parts at once", vec![LOST], None, "length", &[4096, 16384, 4096, 4096, 4096],
                 &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while", SPLIT, SPLIT]),
-            ("a longer reply declared: the first doubling above the room", vec![LOST, LOST, &whole, STOP_SSE], Some(393_216), "stop", &[4096, 16384, 32768, 4096],
-                &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 32768 tokens"]),
+            ("a longer reply declared: asked for first, so a cut there gets no room", vec![LOST, &whole, STOP_SSE], Some(393_216), "stop", &[260_096, 260_096, 260_096],
+                &["[reply cut: it reached max_tokens (260096) before any tool call; continue from where it stopped"]),
             ("a thought cut in the room keeps the doubling", vec![LOST, CUT_SSE, STOP_SSE], None, "stop", &[4096, 16384, 8192],
                 &["The next reply alone may be up to 16384 tokens", "[reply cut: it reached max_tokens (16384) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]"]),
         ];
@@ -5531,8 +5531,10 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
+        // With the model's longest reply declared, every request asks for it (within the window), so a cut there gets no room.
         let (stop, sent, said) = cut_recovery_turn(&[&cut, LOST, &whole, STOP_SSE], Some(393_216)).await;
-        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[4096u64, 16384, 32768, 4096][..]), "{said:#?}");
+        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[260_096u64, 260_096, 260_096, 260_096][..]), "{said:#?}");
+        assert!(said.iter().all(|n| !n.contains("may be up to")), "no room above the longest reply: {said:#?}");
     }
 
     /// The bug this guards: a reply the output cap cut before any call ran
@@ -10180,6 +10182,44 @@ echo run >> {}
         let reply = core.sessions.lock().await[&id].messages.last().and_then(|m| m.content.clone());
         assert_eq!(reply.as_deref(), Some("done"), "the turn ends with the reply");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A model entry that declares its longest reply: the first request asks
+    /// for it whole when the prompt leaves the room, and a request that asks
+    /// for more than the reserve and is refused for length goes once more at
+    /// the reserve, which stays the default's 4096.
+    #[tokio::test]
+    async fn a_declared_longest_reply_is_the_first_ask_and_a_refusal_goes_again_at_the_reserve() {
+        for (longest, history, want_first_room) in [(8_192usize, 0usize, false), (65_536, 20_000, true)] {
+            let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+            let (core, mut rx) = Core::new(dir.clone()).unwrap();
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+            if history > 0 {
+                let mut data = build_session_data(&core, &id, &project).unwrap();
+                data.messages.push(ChatMessage::user("q ".repeat(history)));
+                sessions::save_messages(&core, &id, &data.messages, &mut 0, true);
+                sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+            }
+            let (base_url, bodies) = window_refusing_endpoint(65_536).await;
+            let entry = serde_json::json!({"providers": {"p": {"base_url": base_url, "models": [{"id": "m", "context_tokens": 65_536, "max_tokens": longest}]}}});
+            std::fs::write(crate::providers::providers_path(&core.data_dir), entry.to_string()).unwrap();
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.provider, s.model) = (Some("p".into()), "m".into());
+            }
+            start_turn(core.clone(), id.clone(), project, "first".into()).unwrap();
+            let (stop, budgets) = budgets_until_done(&mut rx).await;
+            assert_eq!(stop, "stop", "{longest}");
+            if want_first_room {
+                assert_eq!(turn_limits(&bodies), [65_536 - 1024 - budgets[0] as u64, 4096], "the room the prompt leaves, refused, then the reserve");
+            } else {
+                assert_eq!(turn_limits(&bodies), [longest as u64], "the declared longest reply, as the first ask");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// A session of exchanges past `history` estimated tokens on a

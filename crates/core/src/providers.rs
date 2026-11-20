@@ -178,10 +178,9 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
 }
 
 /// The reply limit a request starts at, the reserve, the room after a cut call or text, and the ceiling, for a
-/// `context`-token window. The model entry's `max_tokens` is the model's longest reply: a ceiling, not the first ask,
-/// so declaring it keeps the default limit. A `max_tokens` chosen in settings is both the ask and a ceiling. With
-/// neither, the ceiling is four times the default, which bounds thinking on a model whose longest reply is unknown.
-/// The room after a cut call or text is four times the ask, within the ceiling.
+/// `context`-token window. The model entry's `max_tokens` is the model's longest reply: the first ask and the ceiling,
+/// with the default's reserve. A `max_tokens` chosen in settings is both. With neither, the ask is the default and the
+/// ceiling four times it, bounding thought of unknown length. The room after a cut is four times the ask, within it.
 fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>) -> (usize, usize, usize, usize) {
     let default = Settings::default().max_tokens;
     let chosen = (settings.max_tokens != default).then_some(settings.max_tokens);
@@ -190,7 +189,8 @@ fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>) -> (usi
         (None, Some(entry)) => entry,
         (None, None) => default * 4,
     };
-    let (ask, reserve) = reply_limits(context, entry.map_or(settings.max_tokens, |entry| entry.min(settings.max_tokens)));
+    let reserve = reply_limits(context, entry.map_or(settings.max_tokens, |entry| entry.min(settings.max_tokens))).1;
+    let ask = reply_limits(context, if entry.is_some() { ceiling } else { settings.max_tokens }).0;
     let ceiling = reply_limits(context, ceiling).0.max(ask);
     (ask, reserve, ceiling.min(ask.saturating_mul(4)), ceiling)
 }
@@ -1605,13 +1605,25 @@ mod tests {
         write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":4096,"max_tokens":100000}]}}}"#);
         let entry = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
         assert_eq!((entry.max_tokens, entry.reply_reserve), (2048, 2048));
-        // A declared longest reply is the ceiling cut replies are raised to, not the first ask.
+        // A declared longest reply is the first ask and the ceiling; the reserve stays the default's.
         write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":1048576,"max_tokens":393216}]}}}"#);
         let entry = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
-        assert_eq!((entry.max_tokens, entry.reply_reserve, entry.reply_room, entry.reply_ceiling), (4096, 4096, 16_384, 393_216));
-        assert_eq!((1..=7).map(|raise| entry.raised_limit(1_000, raise)).collect::<Vec<_>>(), [8192, 16_384, 32_768, 65_536, 131_072, 262_144, 393_216]);
+        assert_eq!((entry.max_tokens, entry.reply_reserve, entry.reply_room, entry.reply_ceiling), (393_216, 4096, 393_216, 393_216));
+        assert_eq!(entry.reply_limit(1_000), 393_216, "the first request asks for the longest reply");
+        assert_eq!(entry.reply_limit(1_048_576 - 1024 - 100_000), 100_000, "within what the prompt leaves of the window");
+        assert_eq!(entry.reply_limit(1_048_576), 4096, "never under the reserve");
         let chosen = resolve(&Settings { provider: Some("p".into()), model: "m".into(), max_tokens: 8000, ..Default::default() }, &dir).unwrap();
         assert_eq!((chosen.max_tokens, chosen.reply_ceiling), (8000, 8000), "a limit chosen in settings is its own ceiling");
+        // A strict window: the entry's longest reply is clamped to leave 2048 tokens of input, and each request to the room its prompt leaves.
+        write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":32768,"max_tokens":32768}]}}}"#);
+        let strict = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
+        assert_eq!((strict.max_tokens, strict.reply_reserve, strict.reply_ceiling), (30_720, 4096, 30_720));
+        assert_eq!(strict.reply_limit(20_000), 32_768 - 1024 - 20_000);
+        // An entry that declares no longest reply keeps the default first ask and its doublings up to four times it.
+        write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":1048576}]}}}"#);
+        let unknown = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
+        assert_eq!((unknown.max_tokens, unknown.reply_reserve, unknown.reply_room, unknown.reply_ceiling), (4096, 4096, 16_384, 16_384));
+        assert_eq!((1..=3).map(|raise| unknown.raised_limit(1_000, raise)).collect::<Vec<_>>(), [8192, 16_384, 16_384]);
         let flat = |context_tokens: usize, max_tokens: usize| {
             let s = Settings { base_url: "http://t/v1".into(), model: "m".into(), context_tokens: Some(context_tokens), max_tokens, ..Default::default() };
             let ep = resolve(&s, &dir.join("none")).unwrap();
