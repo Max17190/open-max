@@ -5,50 +5,37 @@
 //! `stream_options`, and provider-specific headers. The request body is
 //! serialized once before the retry loop so a retry resends identical bytes.
 //!
-//! Retries cover what can end one request before the reply exists: a
-//! transport failure on send, a rate limit or transient server error (429,
-//! 500, 502, 503, 504, 520, 529), and a stream that died, went silent, or
-//! carried a data line this client cannot read, or a stream or reply the
-//! server failed with a rate limit, an overload, or a server fault, before
-//! any reply text arrived. Each attempt resends the same bytes after an
-//! exponential backoff, stretched to a server's Retry-After, and tells the
-//! caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
-//! a Retry-After longer than a minute, are reported at once: no wait the
-//! turn would take lets the request succeed. Once reply text has streamed,
-//! a stream the network cut or a retryable server fault ended is resent at most [`CUT_RETRIES`] times, the
-//! announcement saying the caller's partial text is void; a cut after that,
-//! or silence past the idle deadline, is reported as a truncation. A
-//! failure the server reports inside a 200 response (an `error` object on the chunk or reply
-//! or on its choice, or finish_reason `error`) is never a reply, whatever
-//! partial output came with it: unless it is retried, it is an error
-//! carrying the server's own message. So is a reply the server finished as
-//! `tool_calls` with no call in it and no text: returned, it would end the
-//! turn with nothing done and nothing said. A cut after the server finished
-//! its reply leaves the reply finished. Reasoning deltas do not count: a
-//! retried attempt's reasoning is void, and the result carries only the
-//! final attempt's. A stream this client ends on purpose (the size cap, an
-//! out-of-range tool index, cancellation) is never retried: the next attempt
-//! would end the same way. A reply carrying only tool calls has no reply
-//! text, so a server that never sends a completion signal costs the whole
-//! budget on such a reply before its truncation is reported.
+//! Retries cover what can end one request before the reply exists: a transport failure on send, a rate limit or
+//! transient server error (429, 500, 502, 503, 504, 520, 529), and a stream that died, went silent, or carried a data
+//! line this client cannot read, or a stream or reply the server failed with a rate limit, an overload, or a server
+//! fault, before any reply text arrived. Each attempt resends the same bytes after an exponential backoff, stretched
+//! to a server's Retry-After, and tells the caller through [`StreamDelta::Retry`]. A 429 for an exhausted quota, and
+//! a Retry-After longer than a minute, are reported at once: no wait the turn would take lets the request succeed.
+//! Once reply text has streamed, a stream the network cut or a retryable server fault ended is resent at most
+//! [`CUT_RETRIES`] times, the announcement saying the caller's partial text is void; a cut after that, or silence
+//! past the idle deadline, is reported as a truncation. A failure the server reports inside a 200 response (an
+//! `error` object on the chunk or reply or on its choice, or finish_reason `error`) is never a reply, whatever
+//! partial output came with it: unless it is retried, it is an error carrying the server's own message (a bare
+//! finish_reason `error`, with no error object, is resent as a network cut). So is a reply the server finished as
+//! `tool_calls` with no call in it and no text: returned, it would end the turn with nothing done and nothing said. A
+//! cut after the server finished its reply leaves the reply finished. Reasoning deltas do not count: a retried
+//! attempt's reasoning is void, and the result carries only the final attempt's. A stream this client ends on purpose
+//! (the size cap, an out-of-range tool index, cancellation) is never retried: the next attempt would end the same
+//! way. A reply carrying only tool calls has no reply text, so a server that never sends a completion signal costs
+//! the whole budget on such a reply before its truncation is reported.
 //!
-//! There is no overall request timeout. A local or slow endpoint can
-//! legitimately take minutes to generate, and a deadline here would look like
-//! a bug in the model rather than a policy in the client. Silence ends an
-//! attempt instead: an endpoint that sends nothing at all (no response
-//! headers, no reply bytes, not even an SSE keepalive comment) for
-//! [`IDLE_TIMEOUT`], or its provider's `idle_timeout_secs`, is a connection
-//! that failed, under the rules above. A one-shot JSON reply or a refusal
-//! whose body goes silent is an error, as a cut there is.
-//! A stream that ends without `[DONE]` and without a `finish_reason` is
-//! reported as truncated rather than treated as a complete reply.
+//! There is no overall request timeout. A local or slow endpoint can legitimately take minutes to generate, and a
+//! deadline here would look like a bug in the model rather than a policy in the client. Silence ends an attempt
+//! instead: an endpoint that sends nothing at all (no response headers, no reply bytes, not even an SSE keepalive
+//! comment) for [`IDLE_TIMEOUT`], or its provider's `idle_timeout_secs`, is a connection that failed, under the rules
+//! above. A one-shot JSON reply or a refusal whose body goes silent is an error, as a cut there is. A stream that
+//! ends without `[DONE]` and without a `finish_reason` is reported as truncated rather than treated as a complete
+//! reply.
 //!
-//! A credential never crosses plain http to another machine: a request that
-//! would carry the key, a credential header (Authorization, X-API-Key, or any
-//! header named as one, see `is_credential_header`), or user:password from
-//! the base_url that way is refused before it is sent. Nor does a request
-//! leave the server the base_url names: a redirect is followed only on the
-//! same scheme, host, and port, and one anywhere else fails the request.
+//! A credential never crosses plain http to another machine: a request that would carry the key, a credential header
+//! (Authorization, X-API-Key, or any header named as one, see `is_credential_header`), or user:password from the
+//! base_url that way is refused before it is sent. Nor does a request leave the server the base_url names: a redirect
+//! is followed only on the same scheme, host, and port, and one anywhere else fails the request.
 
 mod responses;
 mod anthropic;
@@ -1198,11 +1185,11 @@ async fn read_sse(
             }
             let mut choice = chunk.choices.unwrap_or_default().into_iter().next();
             let error = chunk.error.or_else(|| choice.as_mut()?.error.take());
-            // finish_reason `error` ends the stream, but not as a reply: it
-            // is a failure even when the server sends no error to go with it.
+            // finish_reason `error` ends the stream, but not as a reply. With no error beside it to name
+            // a status or type, it says nothing about the request: it is resent as a stream the network cut.
             if error.is_some() || choice.as_ref().is_some_and(|c| c.finish_reason.as_deref() == Some("error")) {
-                let error = error.unwrap_or(Value::Null);
-                unfinished = Some(Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data))));
+                let bare = || Unfinished::Interrupted("the server ended the stream with finish_reason error and no error".into());
+                unfinished = Some(error.map_or_else(bare, |error| Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data)))));
                 break 'outer;
             }
             // The usage-bearing final chunk has an empty choices array.
@@ -3602,16 +3589,35 @@ pub(crate) mod tests {
             assert_eq!(served, 1, "a refused request is not resent");
         }
 
-        // finish_reason `error` with no error beside it still fails the
-        // reply, and says what the server sent.
-        let (result, _, served) = try_stream_sequence(vec![
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n".into(),
-            FINISHED.into(),
-        ])
-        .await;
-        let err = result.err().expect("finish_reason error is an error");
-        assert!(err.contains(r#""finish_reason":"error""#), "{err}");
-        assert_eq!(served, 1);
+    }
+
+    /// finish_reason `error` with no error beside it names no status and no
+    /// type, so nothing says the request was refused: it is resent as a
+    /// stream the network cut. Before reply text that is the whole budget;
+    /// after it, CUT_RETRIES. An error that names a status keeps its rules: a
+    /// 400 inside a 200 is reported at once.
+    #[tokio::test]
+    async fn a_bare_finish_reason_error_is_resent_as_a_cut_stream() {
+        let bare = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n".to_string();
+        let (result, deltas, served) = try_stream_sequence(vec![bare.clone(), FINISHED.into()]).await;
+        assert_eq!(result.expect("the second attempt finished").content, "all of it");
+        assert_eq!(served, 2);
+        assert_eq!(deltas[0], format!("retry:2/{MAX_ATTEMPTS}:the server ended the stream with finish_reason error and no error"));
+
+        let (result, _, served) = try_stream_sequence(vec![bare; MAX_ATTEMPTS as usize]).await;
+        assert_eq!(result.expect("a cut that persists is a truncation").finish_reason, TRUNCATED);
+        assert_eq!(served, MAX_ATTEMPTS as usize, "the full budget before any reply text");
+
+        let after_text = "data: {\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n".to_string();
+        let mut replies = vec![after_text; 1 + CUT_RETRIES as usize];
+        replies.push(FINISHED.into());
+        let (result, _, served) = try_stream_sequence(replies).await;
+        assert_eq!(result.expect("the last cut stands as a truncation").finish_reason, TRUNCATED);
+        assert_eq!(served, 1 + CUT_RETRIES as usize, "CUT_RETRIES once reply text began");
+
+        let (result, _, served) = try_stream_sequence(vec![gateway_error_chunk(json!(400), "invalid request"), FINISHED.into()]).await;
+        assert!(result.err().expect("a 400 inside a 200 is an error").contains("invalid request"));
+        assert_eq!(served, 1, "an error that names a status is not resent");
     }
 
     /// A server that ignores `stream` can put the same failure in its JSON
