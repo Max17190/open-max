@@ -160,6 +160,11 @@ pub struct Settings {
     /// Bytes of `AGENTS.md` a new session carries; unset scales with the window (`prompt::agents_md_cap`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents_md_bytes: Option<usize>,
+    /// Seconds a bash command's processes may sit with no CPU time, no
+    /// bytes read and none written before the call stops it and says so.
+    /// Unset or 0 leaves a command to its timeout. Held to at least 30.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stuck_command_secs: Option<u64>,
 }
 
 /// A change across several files with its tests routinely takes more than
@@ -194,6 +199,7 @@ impl Default for Settings {
             max_parallel_tools: default_max_parallel_tools(),
             request_budget: None,
             agents_md_bytes: None,
+            stuck_command_secs: None,
         }
     }
 }

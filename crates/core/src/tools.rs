@@ -71,11 +71,15 @@ pub struct OutputCaps {
     /// read_file shows an image file to the model as an image, and an
     /// external tool's images reach it with the result (`image_input`).
     pub images: bool,
+    /// A bash command whose processes use no CPU and read or write nothing
+    /// for this long is stopped and reported as stuck. `None` waits out the
+    /// timeout. From `stuck_command_secs`.
+    pub stuck_after: Option<std::time::Duration>,
 }
 
 impl Default for OutputCaps {
     fn default() -> Self {
-        Self { command_bytes: MAX_OUTPUT_BYTES, images: false }
+        Self { command_bytes: MAX_OUTPUT_BYTES, images: false, stuck_after: None }
     }
 }
 
@@ -95,7 +99,8 @@ impl OutputCaps {
             (None, Some(tokens)) => (tokens.saturating_mul(3) / 8).clamp(MAX_OUTPUT_BYTES, MAX_WINDOW_OUTPUT_BYTES),
             (None, None) => MAX_OUTPUT_BYTES,
         };
-        Self { command_bytes, images: settings.image_input == Some(true) }
+        let stuck_after = settings.stuck_command_secs.filter(|&secs| secs > 0).map(|secs| std::time::Duration::from_secs(secs.max(MIN_STUCK_SECS)));
+        Self { command_bytes, images: settings.image_input == Some(true), stuck_after }
     }
 
     /// The bytes one read_file call may return: the command cap, held
@@ -109,6 +114,9 @@ impl OutputCaps {
         self.command_bytes.clamp(MAX_READ_BYTES, MAX_WINDOW_OUTPUT_BYTES)
     }
 }
+/// The shortest quiet spell `stuck_command_secs` may set: below it a pause
+/// between a build's steps would read as a hang.
+const MIN_STUCK_SECS: u64 = 30;
 const MAX_LINE_CHARS: usize = 500;
 const MAX_FILE_BYTES: u64 = 1_500_000;
 
@@ -2435,6 +2443,19 @@ impl BashDeadline {
     }
 }
 
+/// The first line of a result [`Termination::Stuck`] ended.
+fn stuck_heading(idle: std::time::Duration, running: &[String]) -> String {
+    let running = match running.len() {
+        0 => String::new(),
+        n if n > 8 => format!(" Still running then: {} and {} more.", running[..8].join(", "), n - 8),
+        _ => format!(" Still running then: {}.", running.join(", ")),
+    };
+    format!(
+        "command stopped: for {}s its processes used no CPU and read or wrote nothing, so it looked stuck.{running} Output until the stop:",
+        idle.as_secs()
+    )
+}
+
 async fn run_bash(
     data_dir: &Path,
     root: &Path,
@@ -2453,6 +2474,7 @@ async fn run_bash(
         cwd: root.to_path_buf(),
         stdin: StdinMode::Null,
         timeout: execution::timeout_secs(deadline.secs),
+        stuck_after: caps.stuck_after,
         capture: CaptureSpec {
             head_bytes: caps.command_bytes / HEAD_SHARE_DIVISOR,
             tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
@@ -2482,6 +2504,12 @@ async fn run_bash(
             Termination::TimedOut => {
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 ToolOutcome::from_process(false, format!("{}\n{text}", deadline.timed_out_heading()), &output, truncated)
+            }
+            // Stopped early: the same tail is the clue, and the heading says
+            // why the call ended before its timeout and what was still there.
+            Termination::Stuck { idle, running } => {
+                let (text, truncated) = render_process_output(&output, caps.command_bytes);
+                ToolOutcome::from_process(false, format!("{}\n{text}", stuck_heading(*idle, running)), &output, truncated)
             }
             Termination::Exited(status) => {
                 exited_outcome(&output, status, caps.command_bytes, background_noted)
@@ -4047,6 +4075,52 @@ mod tests {
         );
     }
 
+    /// With `stuck_command_secs` set, a command blocked on something that
+    /// never comes (here a FIFO no one opens) is stopped once it has sat
+    /// quiet that long, well before its timeout, and the result says so,
+    /// names what was still running and keeps the output so far. A timed
+    /// sleep is a wait the command asked for and runs to its end, and so
+    /// does a command that keeps using CPU.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_quiet_command_is_stopped_as_stuck_and_a_sleep_is_not() {
+        let root = temp_project();
+        let caps = OutputCaps { stuck_after: Some(std::time::Duration::from_millis(600)), ..OutputCaps::default() };
+        let data = root.join("data");
+        let run = |command: &'static str| {
+            let (data, root) = (data.clone(), root.clone());
+            async move { bash_tool(&data, &root, &json!({"command": command, "timeout_secs": 60}), caps, Arc::new(CancelToken::default())).await }
+        };
+
+        let started = std::time::Instant::now();
+        let out = run("echo before-the-hang; mkfifo never; cat never").await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "a stuck command waited out its timeout");
+        assert!(!out.ok);
+        assert!(out.output.starts_with("command stopped: for "), "{}", out.output);
+        assert!(out.output.contains("looked stuck") && out.output.contains("cat ("), "{}", out.output);
+        assert!(out.output.contains("before-the-hang"), "the output so far must survive the stop: {}", out.output);
+
+        let out = run("sleep 2; echo slept").await;
+        assert!(out.ok && out.output.contains("slept"), "a timed sleep is not stuck: {}", out.output);
+
+        let out = run("end=$((SECONDS + 2)); while [ $SECONDS -lt $end ]; do :; done; echo spun").await;
+        assert!(out.ok && out.output.contains("spun"), "a command using CPU is not stuck: {}", out.output);
+    }
+
+    /// The switch is off unless set, 0 is off, and a short spell is held to
+    /// the floor so a pause between a build's steps never reads as a hang.
+    #[test]
+    fn stuck_command_secs_reads_off_unless_set_and_has_a_floor() {
+        let after = |secs: Option<u64>| {
+            let settings = crate::config::Settings { stuck_command_secs: secs, ..Default::default() };
+            OutputCaps::from_settings(&settings, None).stuck_after.map(|d| d.as_secs())
+        };
+        assert_eq!(after(None), None);
+        assert_eq!(after(Some(0)), None);
+        assert_eq!(after(Some(5)), Some(MIN_STUCK_SECS));
+        assert_eq!(after(Some(60)), Some(60));
+    }
+
     /// `timeout` is the same wait as `timeout_secs`, in seconds and under the
     /// same ceiling, and a call that names both waits the longer of the two.
     #[test]
@@ -4141,6 +4215,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(30),
+            stuck_after: None,
             capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
@@ -4188,7 +4263,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 &"}),
-            OutputCaps { command_bytes: 1_000, images: false },
+            OutputCaps { command_bytes: 1_000, images: false, stuck_after: None },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4442,7 +4517,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "echo RESULT; for i in $(seq 1 3000); do echo warn-$i >&2; done"}),
-            OutputCaps { command_bytes: cap, images: false },
+            OutputCaps { command_bytes: cap, images: false, stuck_after: None },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4473,7 +4548,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap, images: false },
+            OutputCaps { command_bytes: cap, images: false, stuck_after: None },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4512,7 +4587,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap, images: false },
+            OutputCaps { command_bytes: cap, images: false, stuck_after: None },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -5676,7 +5751,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_over_the_cap_is_a_quarter_cap_preview_of_its_log() {
         let root = temp_project();
-        let caps = OutputCaps { command_bytes: 4_000, images: false };
+        let caps = OutputCaps { command_bytes: 4_000, images: false, stuck_after: None };
         let data = root.join("data");
         let fill = json!({"command": "head -c 4000 /dev/zero | tr '\\0' a"});
         let fits = bash_tool(&data, &root, &fill, caps, Arc::new(CancelToken::default())).await;

@@ -104,6 +104,10 @@ pub(crate) struct ProcessRequest {
     pub cwd: PathBuf,
     pub stdin: StdinMode,
     pub timeout: Duration,
+    /// Stop the command early once its session's processes have used no CPU
+    /// and read or written nothing for this long (Linux; see
+    /// [`watch_for_stuck`]). `None` waits for the exit or the timeout.
+    pub stuck_after: Option<Duration>,
     pub capture: CaptureSpec,
     /// OS-level containment for this one spawn. `None` is the default and
     /// preserves the module's stated posture exactly (host environment,
@@ -192,6 +196,9 @@ pub(crate) enum Termination {
     Exited(ExitStatus),
     Cancelled,
     TimedOut,
+    /// Stopped by [`ProcessRequest::stuck_after`]: the processes still
+    /// running at the stop, as `name (pid)`, and how long they sat idle.
+    Stuck { idle: Duration, running: Vec<String> },
 }
 
 pub(crate) struct CapturedStream {
@@ -953,7 +960,7 @@ pub(crate) async fn run_process(
     };
 
     let (termination, left_running) =
-        supervise_child(&mut child, pid, request.timeout, &cancel).await?;
+        supervise_child(&mut child, pid, request.timeout, request.stuck_after, &cancel).await?;
     group.settled();
 
     if let Some(task) = stdin_task {
@@ -1150,8 +1157,15 @@ async fn supervise_child(
     child: &mut Child,
     pid: Option<u32>,
     timeout: Duration,
+    stuck_after: Option<Duration>,
     cancel: &CancelToken,
 ) -> Result<(Termination, Option<LeftRunning>), ProcessError> {
+    let stuck = async {
+        match (stuck_after, pid) {
+            (Some(after), Some(pid)) => watch_for_stuck(pid, after).await,
+            _ => std::future::pending().await,
+        }
+    };
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
@@ -1174,7 +1188,116 @@ async fn supervise_child(
             terminate_process_group(child, pid).await?;
             Ok((Termination::TimedOut, None))
         }
+        (idle, running) = stuck => {
+            terminate_process_group(child, pid).await?;
+            Ok((Termination::Stuck { idle, running }, None))
+        }
     }
+}
+
+/// How often [`watch_for_stuck`] samples the session's processes: a
+/// twelfth of the quiet spell it waits for, so a minute is sampled every
+/// five seconds.
+fn stuck_sample(after: Duration) -> Duration {
+    (after / 12).clamp(Duration::from_millis(50), Duration::from_secs(5))
+}
+
+/// Resolves once every process in the session `session` leads has used no
+/// CPU and read or written no bytes (pipes and files alike) for `after`,
+/// with no thread in a timed sleep, and returns how long they sat idle and
+/// the processes still running then. A `sleep 300` or a poll loop is a wait
+/// the command asked for, so a thread in `nanosleep` restarts the count.
+/// Processes that left the session with `setsid` are not watched: they
+/// outlive the call anyway. Never resolves off Linux or when `/proc` cannot
+/// be read, so the command keeps its timeout.
+async fn watch_for_stuck(session: u32, after: Duration) -> (Duration, Vec<String>) {
+    let mut last: Option<SessionActivity> = None;
+    let mut idle = Duration::ZERO;
+    let sample = stuck_sample(after);
+    loop {
+        tokio::time::sleep(sample).await;
+        let Ok(Some(now)) = tokio::task::spawn_blocking(move || session_activity(Path::new("/proc"), session)).await else {
+            last = None;
+            idle = Duration::ZERO;
+            continue;
+        };
+        let quiet = !now.timed_sleep && last.as_ref().is_some_and(|last| last.counters == now.counters);
+        idle = if quiet { idle + sample } else { Duration::ZERO };
+        if idle >= after {
+            return (idle, now.running);
+        }
+        last = Some(now);
+    }
+}
+
+/// One sample of a session's processes for [`watch_for_stuck`].
+#[derive(Debug)]
+struct SessionActivity {
+    /// Per process, in pid order: pid, CPU time (ns from `schedstat`, else
+    /// clock ticks from `stat`) and bytes read and written (`io` rchar and
+    /// wchar). A process starting or ending changes it too.
+    counters: Vec<(u32, u64, u64, u64)>,
+    /// Some thread is in `nanosleep` or `clock_nanosleep`.
+    timed_sleep: bool,
+    /// `name (pid)` of each live process.
+    running: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn session_activity(proc: &Path, session: u32) -> Option<SessionActivity> {
+    let mut members: Vec<(u32, String)> = std::fs::read_dir(proc).ok()?.flatten().filter_map(|entry| {
+        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+        let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+        let (_, of, exited) = stat_group(&stat)?;
+        (of == session && !exited).then(|| (pid, stat))
+    }).collect();
+    if members.is_empty() {
+        return None;
+    }
+    members.sort_unstable_by_key(|m| m.0);
+    let mut activity = SessionActivity { counters: Vec::new(), timed_sleep: false, running: Vec::new() };
+    for (pid, stat) in members {
+        let dir = proc.join(pid.to_string());
+        let io = std::fs::read_to_string(dir.join("io")).unwrap_or_default();
+        let field = |key: &str| io.lines().find_map(|l| l.strip_prefix(key)?.trim().parse::<u64>().ok()).unwrap_or(0);
+        let mut cpu = 0;
+        for task in std::fs::read_dir(dir.join("task")).into_iter().flatten().flatten() {
+            cpu += thread_cpu(&task.path()).unwrap_or(0);
+            activity.timed_sleep |= in_timed_sleep(&task.path());
+        }
+        activity.counters.push((pid, cpu, field("rchar:"), field("wchar:")));
+        let name = stat.split_once('(').and_then(|(_, rest)| rest.rsplit_once(')')).map_or("?", |(name, _)| name);
+        activity.running.push(format!("{name} ({pid})"));
+    }
+    Some(activity)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn session_activity(_: &Path, _: u32) -> Option<SessionActivity> {
+    None
+}
+
+/// A thread's CPU time: nanoseconds from `schedstat`, else user plus system
+/// clock ticks from `stat`.
+#[cfg(target_os = "linux")]
+fn thread_cpu(task: &Path) -> Option<u64> {
+    if let Some(ns) = std::fs::read_to_string(task.join("schedstat")).ok().and_then(|s| s.split_whitespace().next()?.parse().ok()) {
+        return Some(ns);
+    }
+    let stat = std::fs::read_to_string(task.join("stat")).ok()?;
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace().skip(11);
+    Some(fields.next()?.parse::<u64>().ok()? + fields.next()?.parse::<u64>().ok()?)
+}
+
+/// The thread is in `nanosleep` or `clock_nanosleep`: by its kernel wait
+/// channel, or where that is hidden, by the syscall it is blocked in.
+#[cfg(target_os = "linux")]
+fn in_timed_sleep(task: &Path) -> bool {
+    if std::fs::read_to_string(task.join("wchan")).is_ok_and(|w| w.contains("nanosleep")) {
+        return true;
+    }
+    const TIMED_SLEEPS: &[u64] = if cfg!(target_arch = "x86_64") { &[35, 230] } else if cfg!(target_arch = "aarch64") { &[101, 115] } else { &[] };
+    std::fs::read_to_string(task.join("syscall")).ok().and_then(|s| s.split_whitespace().next()?.parse::<u64>().ok()).is_some_and(|n| TIMED_SLEEPS.contains(&n))
 }
 
 async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<(), ProcessError> {
@@ -2079,6 +2202,7 @@ impl PausedSpawn {
                 cwd: std::env::temp_dir(),
                 stdin: StdinMode::Null,
                 timeout: Duration::from_secs(30),
+                stuck_after: None,
                 capture: CaptureSpec { head_bytes: 64, tail_bytes: 64, spill_dir: None, spill_bytes_per_stream: 1024, redraws: false },
                 sandbox: None,
                 env_allowlist: None,
@@ -2232,6 +2356,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
+            stuck_after: None,
             capture: CaptureSpec {
                 head_bytes: 4,
                 tail_bytes: 4,
@@ -2277,6 +2402,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
+            stuck_after: None,
             capture: CaptureSpec {
                 head_bytes: 1024,
                 tail_bytes: 1024,
@@ -3101,6 +3227,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
+            stuck_after: None,
             capture: CaptureSpec { head_bytes: 64, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
@@ -3124,6 +3251,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
+            stuck_after: None,
             capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
@@ -3244,6 +3372,7 @@ mod tests {
             cwd: scratch.to_path_buf(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(10),
+            stuck_after: None,
             capture: CaptureSpec {
                 head_bytes: 4096,
                 tail_bytes: 4096,

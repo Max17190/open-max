@@ -342,6 +342,13 @@ and the run that writes a key already uses it.
   `--max-agent-iterations` and `--max-agent-tokens` set either cap for one
   `-p`, `--stdio` or `--subagent` run without writing it here (see
   [usage](usage.md#command-line)).
+- `stuck_command_secs` (unset: off; 0 is off; held to at least 30): on
+  Linux, a bash call whose processes have used no CPU and read or written
+  no bytes for this many seconds is stopped before its timeout, and the
+  result says it looked stuck, names the processes still running and keeps
+  the output so far. Every process in the call's session counts, and a
+  thread in a timed sleep (`sleep 300`, a poll loop) restarts the count. A
+  process started with `setsid` is not watched. Off Linux, nothing changes.
 
 The input budget for the transcript and frozen tool schemas is
 `context_tokens - (reply_reserve + 1024)`, leaving room for the reply and 1024
