@@ -21,9 +21,8 @@
 //! failure the server reports inside a 200 response (an `error` object on the chunk or reply
 //! or on its choice, or finish_reason `error`) is never a reply, whatever
 //! partial output came with it: unless it is retried, it is an error
-//! carrying the server's own message. A stream that ends on a bare
-//! finish_reason `error`, with no error object, is resent as a stream the
-//! network cut. So is a reply the server finished as
+//! carrying the server's own message (a bare finish_reason `error`, with no
+//! error object, is resent as a network cut). So is a reply the server finished as
 //! `tool_calls` with no call in it and no text: returned, it would end the
 //! turn with nothing done and nothing said. A cut after the server finished
 //! its reply leaves the reply finished. Reasoning deltas do not count: a
@@ -1200,16 +1199,11 @@ async fn read_sse(
             }
             let mut choice = chunk.choices.unwrap_or_default().into_iter().next();
             let error = chunk.error.or_else(|| choice.as_mut()?.error.take());
-            // finish_reason `error` ends the stream, but not as a reply: it
-            // is a failure even when the server sends no error to go with it.
-            // A bare finish_reason `error`, with no error to name a status or
-            // type, says nothing about the request: it is read as a stream the
-            // network cut, and resent on those terms.
+            // finish_reason `error` ends the stream, but not as a reply. With no error beside it to name
+            // a status or type, it says nothing about the request: it is resent as a stream the network cut.
             if error.is_some() || choice.as_ref().is_some_and(|c| c.finish_reason.as_deref() == Some("error")) {
-                unfinished = Some(match error {
-                    Some(error) => Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data))),
-                    None => Unfinished::Interrupted("the server ended the stream with finish_reason error and no error".into()),
-                });
+                let bare = || Unfinished::Interrupted("the server ended the stream with finish_reason error and no error".into());
+                unfinished = Some(error.map_or_else(bare, |error| Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data)))));
                 break 'outer;
             }
             // The usage-bearing final chunk has an empty choices array.

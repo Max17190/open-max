@@ -840,11 +840,7 @@ async fn run_loop(
         }
         let result = match result {
             Ok(r) => { image_refusal = None; r }
-            Err(_) if image_refusal.is_some() => {
-                core.send_agent(session_id, AgentEvent::Error { message: image_refusal.take().unwrap_or_default() });
-                stop_reason = "error".into();
-                break 'turns;
-            }
+            Err(_) if image_refusal.is_some() => { core.send_agent(session_id, AgentEvent::Error { message: image_refusal.take().unwrap_or_default() }); stop_reason = "error".into(); break 'turns; }
             Err(mut message) => {
                 // The room left was misjudged: the same request goes once more at the reserve, with no more room or raises.
                 if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some() || raise > 0; raise = 0; continue 'turns; }
@@ -857,20 +853,14 @@ async fn run_loop(
                     rewrite_saved(core, session_id, guard.messages()).await;
                     if iteration + 1 < max_iterations { continue 'turns; }
                 }
-                // A host can refuse an image no header check could fault (a truncated or badly written file).
-                // Each image a tool result added since the last reply becomes a line saying so, stored that way
-                // so a resume does not send it again, and the request goes once more. If that fails too, the
-                // turn ends on the first error.
-                if image_refusal.is_none() && refused_status(&message).is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && iteration + 1 < max_iterations {
-                    let dropped = drop_new_images(guard.messages(), &message);
-                    if dropped > 0 {
-                        rewrite_saved(core, session_id, guard.messages()).await;
-                        let images = if dropped == 1 { "an image" } else { "images" };
-                        let reason = format!("the provider refused a request carrying {images} ({message}); each is replaced by a line saying so and the request is sent again");
-                        core.send_agent(session_id, AgentEvent::Retry { attempt: 2, max_attempts: 2, reason });
-                        image_refusal = Some(message);
-                        continue 'turns;
-                    }
+                // A host can refuse an image no header check could fault: each image added since the last reply becomes a stored line saying so, and the request goes once more.
+                let status = message.strip_prefix("backend returned ").and_then(|m| m.get(..3)?.parse::<u16>().ok());
+                if status.is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && iteration + 1 < max_iterations && drop_new_images(guard.messages(), &message) {
+                    rewrite_saved(core, session_id, guard.messages()).await;
+                    let reason = format!("the provider refused a request carrying images a tool just returned ({message}); each is now a line saying so, and the request goes again");
+                    core.send_agent(session_id, AgentEvent::Retry { attempt: 2, max_attempts: 2, reason });
+                    image_refusal = Some(message);
+                    continue 'turns;
                 }
                 // A knowingly oversized request that then fails owes the user
                 // the local accounting, not just the provider's opaque error.
@@ -1566,25 +1556,17 @@ async fn rewrite_saved(core: &Arc<Core>, session_id: &str, messages: &[ChatMessa
     }
 }
 
-/// The status a backend refused a request with, read from the client's error for it.
-fn refused_status(message: &str) -> Option<u16> {
-    message.strip_prefix("backend returned ")?.get(..3)?.parse().ok()
-}
-
-/// Replace each image a tool result added since the last reply, the only
-/// ones the backend has not accepted, with the line an image left out
-/// carries, giving the refusal as the reason. Returns how many it replaced.
-fn drop_new_images(messages: &mut [ChatMessage], refusal: &str) -> usize {
+/// Replace each image a tool result added since the last reply (none the backend accepted) with the line an image
+/// left out carries, the refusal its reason. Whether there was one.
+fn drop_new_images(messages: &mut [ChatMessage], refusal: &str) -> bool {
     let start = messages.iter().rposition(|m| m.role == "assistant").map_or(0, |i| i + 1);
     let reason = crate::client::truncate(refusal.split_once(": ").map_or(refusal, |(_, said)| said), 200);
-    let mut dropped = 0;
+    let mut dropped = false;
     for message in messages[start..].iter_mut().filter(|m| m.role == "tool" && m.images.is_some()) {
-        let content = message.content.get_or_insert_with(String::new);
         for image in message.images.take().into_iter().flatten() {
-            let bytes = image.data.len() / 4 * 3 - image.data.bytes().rev().take_while(|&b| b == b'=').count();
-            let name = if image.name.is_empty() { String::new() } else { format!("{} ", image.name) };
-            content.push_str(&format!("\n[image {name}({bytes} bytes) not shown: the provider refused it: {reason}]"));
-            dropped += 1;
+            let (bytes, name) = (image.data.len() / 4 * 3 - image.data.bytes().rev().take_while(|&b| b == b'=').count(), image.name + " ");
+            message.content.get_or_insert_with(String::new).push_str(&format!("\n[image {}({bytes} bytes) not shown: the provider refused it: {reason}]", name.trim_start()));
+            dropped = true;
         }
     }
     dropped
@@ -5442,67 +5424,73 @@ mod tests {
     /// unused. Each image added since the last reply becomes a line naming the
     /// refusal, stored that way, and the request goes once more. A refusal
     /// with no new image, or one the resend meets again, ends the turn on the
-    /// first error, as before.
+    /// first error, as before. The image is seeded in the transcript: turning
+    /// image input on here would change the read_file schema other tests see.
     #[tokio::test]
     async fn a_refused_image_becomes_a_line_and_the_turn_goes_on() {
         use crate::state::Core;
         type Refuse = fn(usize, &str) -> Option<u16>;
         // Name, refusal rule; then the stop reason, the requests, and the error's start.
         let cases: [(&str, Refuse, &str, usize, Option<&str>); 4] = [
-            ("refused once", |_, body| body.contains("image_url").then_some(400), "stop", 3, None),
-            ("refused again", |n, _| (n >= 2).then_some(if n == 2 { 400 } else { 422 }), "error", 3, Some("backend returned 400")),
-            ("no new image", |n, _| (n == 3).then_some(400), "error", 3, Some("backend returned 400")),
-            ("not a refusal of content", |n, _| (n == 2).then_some(401), "error", 2, Some("backend returned 401")),
+            ("refused once", |n, _| (n == 1).then_some(400), "stop", 2, None),
+            ("refused again", |n, _| (n <= 2).then_some(if n == 1 { 400 } else { 422 }), "error", 2, Some("backend returned 400")),
+            ("no new image", |n, _| (n == 1).then_some(400), "error", 1, Some("backend returned 400")),
+            ("not a refusal of content", |n, _| (n == 1).then_some(401), "error", 1, Some("backend returned 401")),
         ];
+        let line = "[image a.png (24 bytes) not shown: the provider refused it: Provider returned error]";
         for (name, refuse, want_stop, want_requests, want_error) in cases {
             let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
             let (core, mut rx) = Core::new(dir.clone()).unwrap();
             let project = dir.join("project");
             std::fs::create_dir_all(&project).unwrap();
-            std::fs::write(project.join("a.png"), [&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13][..], b"IHDR", &[0, 0, 0, 9, 0, 0, 0, 9]].concat()).unwrap();
-            std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
             crate::trust::trust_project(&core.data_dir, &project).unwrap();
-            let read_png = raw_calls_sse(&[("c1", "read_file", r#"{"path":"a.png"}"#)], "tool_calls", None);
-            let read_txt = raw_calls_sse(&[("c2", "read_file", r#"{"path":"a.txt"}"#)], "tool_calls", None);
-            let streams: Vec<&str> = if name == "no new image" { vec![&read_png, &read_txt, STOP_SSE] } else { vec![&read_png, STOP_SSE] };
-            let (base_url, bodies) = refusing_endpoint(&streams, refuse).await;
+            let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+            {
+                let mut data = build_session_data(&core, &id, &project).unwrap();
+                let call = ToolCall { id: "c1".into(), kind: "function".into(), function: crate::types::ToolCallFunction { name: "read_file".into(), arguments: r#"{"path":"a.png"}"#.into() }, extra_content: None };
+                let mut shown = ChatMessage::tool("c1", "a.png: image/png, 9x9, 24 bytes, shown to you as an image");
+                shown.images = Some(vec![crate::types::Image { mime: "image/png".into(), data: "AAAA".repeat(8), width: 9, height: 9, name: "a.png".into() }]);
+                data.messages.extend([ChatMessage::user("look at a.png"), ChatMessage::assistant(None, Some(vec![call])), shown]);
+                if name == "no new image" { data.messages.push(ChatMessage::assistant(Some("seen".into()), None)); }
+                sessions::save_messages(&core, &id, &data.messages, &mut 0, true);
+                sessions::save_manifest(&core, &id, &data.registry.to_manifest());
+            }
+            let (base_url, bodies) = refusing_endpoint(&[STOP_SSE], refuse).await;
             let configure = |core: &Arc<Core>| {
                 let mut s = core.settings.lock().unwrap();
-                (s.base_url, s.model, s.context_tokens, s.image_input) = (base_url.clone(), "stub".into(), Some(16384), Some(true));
-                s.approval_mode = ApprovalMode::Auto;
+                (s.base_url, s.model, s.context_tokens, s.approval_mode) = (base_url.clone(), "stub".into(), Some(16384), ApprovalMode::Auto);
             };
             configure(&core);
-            let id = &crate::sessions::create(&core, project.display().to_string()).unwrap().id;
-            start_turn(core.clone(), id.into(), project.clone(), "look at a.png".into()).unwrap();
+            start_turn(core.clone(), id.clone(), project.clone(), "go on".into()).unwrap();
             let (stop, events) = drive_turn_events(&mut rx).await;
             assert_eq!(stop, want_stop, "{name}");
             let sent = bodies.lock().unwrap().clone();
             assert_eq!(sent.len(), want_requests, "{name}");
             let error = events.iter().find_map(|e| match e { AgentEvent::Error { message } => Some(message.clone()), _ => None });
             assert_eq!(error.as_deref().map(|e| want_error.is_some_and(|w| e.starts_with(w))), want_error.map(|_| true), "{name}: {error:?}");
-            let line = "[image a.png (24 bytes) not shown: the provider refused it: Provider returned error]";
-            let retried = events.iter().any(|e| matches!(e, AgentEvent::Retry { reason, .. } if reason.contains("refused a request carrying an image")));
+            let retried = events.iter().any(|e| matches!(e, AgentEvent::Retry { reason, .. } if reason.contains("refused a request carrying images")));
             assert_eq!(retried, matches!(name, "refused once" | "refused again"), "{name}");
+            assert!(!sent[0].contains("not shown"), "{name}: {}", sent[0]);
             if name != "refused once" {
                 let _ = std::fs::remove_dir_all(dir);
                 continue;
             }
-            assert!(sent[1].contains("image_url"), "{}", sent[1]);
-            assert!(!sent[2].contains("image_url") && sent[2].contains(line), "the model sees the line: {}", sent[2]);
-            assert!(transcript(&core, id).await.iter().all(|m| m.images.is_none()));
+            assert!(sent[1].contains(line), "the model sees the line: {}", sent[1]);
+            assert!(transcript(&core, &id).await.iter().all(|m| m.images.is_none()));
 
             // Reopened from disk, the session sends the line, not the image.
-            while crate::sessions::detach(&core, id).is_err() {
+            while crate::sessions::detach(&core, &id).is_err() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             drop(core);
             let (core, mut rx) = Core::new(dir.clone()).unwrap();
             configure(&core);
-            start_turn(core.clone(), id.into(), project.clone(), "again".into()).unwrap();
+            start_turn(core.clone(), id.clone(), project.clone(), "again".into()).unwrap();
             assert_eq!(drive_turn(&mut rx).await.0, "stop", "{name}");
             let sent = bodies.lock().unwrap().clone();
-            assert_eq!(sent.len(), 4, "{name}");
-            assert!(!sent[3].contains("image_url") && sent[3].contains(line), "{}", sent[3]);
+            assert_eq!(sent.len(), 3, "{name}");
+            assert!(sent[2].contains(line), "{}", sent[2]);
+            assert!(crate::sessions::load_messages(&core, &id).unwrap().unwrap().iter().all(|m| m.images.is_none()));
             let _ = std::fs::remove_dir_all(dir);
         }
     }

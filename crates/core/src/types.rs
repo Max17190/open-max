@@ -56,8 +56,7 @@ pub struct Image {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
-    /// The file it was read from, as the tool named it: what a line that
-    /// replaces it calls it. Never sent.
+    /// The file it was read from, named by a line that replaces it. Never sent.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
 }
@@ -231,9 +230,7 @@ pub enum AgentEvent {
     /// or a server fault, or a reply the network cut after its text began,
     /// at most twice). Emitted before the wait; a cancel during it ends the
     /// turn and the attempt never goes out. What streamed for it is void.
-    /// Also sent, as attempt 2 of 2, when a host refused a request carrying
-    /// images a tool result just added and it goes once more with each
-    /// replaced by a line saying so.
+    /// Also attempt 2 of 2 when a host refused new tool images, resent as lines.
     Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
