@@ -245,6 +245,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry, agents_md_cap: u
         Rules:\n\
         - Paths are project-relative.\n\
         - On a tool error, fix the call; never repeat it.\n\
+        - Follow what the request and the files show. Where they are silent, take the simplest reading; add no step only because it is conventional.\n\
         - Call tools via the API, never as JSON or XML text.\n\
         - Be concise. When done, stop calling tools; summarize briefly without repeating file contents."
     );
@@ -1413,8 +1414,12 @@ mod tests {
     }
 
     /// The path-free base rules and builtin schemas, the extension pointer
-    /// among them in the bash description, must fit in 2,599 bytes (594
-    /// o200k tokens), what they measured when the bash description began
+    /// among them in the bash description, must fit in 2,737 bytes, what
+    /// they measured when the base rules began asking to follow what the
+    /// request and files show and to add no step only because it is
+    /// conventional (138 bytes). Unrequested steps cost rounds on every
+    /// task, so the line pays for itself. Before that the cap was 2,599
+    /// bytes (594 o200k tokens), what they measured when the bash description began
     /// saying that background processes end with the call (56 bytes, 12
     /// tokens, over the 2,543 bytes and 582 tokens they measured just
     /// before; the cap had not come down with them). Until then the rule
@@ -1470,7 +1475,7 @@ mod tests {
             .collect();
         let tool_chars = serde_json::to_string(&builtins).expect("serialize").len();
         let total = path_free + tool_chars;
-        const CAP: usize = 2_599;
+        const CAP: usize = 2_737;
         assert!(
             total <= CAP,
             "frozen prompt budget exceeded by {} bytes: base rules + guide (path-free) \

@@ -9854,7 +9854,10 @@ echo run >> {}
             let line = sent["messages"][0]["content"].as_str().unwrap().lines().next().unwrap();
             let project = line.split_once(" working on the project at ").unwrap().1.strip_suffix('.').unwrap();
             let dir = project.strip_suffix("/project").unwrap();
-            assert_eq!(sent["messages"][0]["content"].as_str().unwrap().replace(dir, "<dir>"), before["system"].as_str().unwrap());
+            // The rule against unrequested steps came later, and is not what this test pins.
+            let rule = "- Follow what the request and the files show. Where they are silent, take the simplest reading; add no step only because it is conventional.\n";
+            let system = sent["messages"][0]["content"].as_str().unwrap().replace(dir, "<dir>").replacen(rule, "", 1);
+            assert_eq!(system, before["system"].as_str().unwrap());
             let tools = serde_json::to_string(&sent["tools"]).unwrap();
             assert!(!tools.contains("openmax --recall"), "{tools}");
             // The background-process sentence came later, and is not what this test pins.
