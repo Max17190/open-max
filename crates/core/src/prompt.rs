@@ -227,16 +227,14 @@ pub fn system_prompt_with_breakdown(project_root: &Path, registry: &Registry, ag
 pub fn session_prompt(project_root: &Path, registry: &Registry, agents_md_cap: usize) -> (String, PromptBreakdown, PromptIndex) {
     let root = project_root.to_string_lossy();
     let mut breakdown = PromptBreakdown::default();
-    // Tool-specific guidance lives in each tool's schema description (which
-    // rides in every request anyway). The prompt names what the four core
-    // tools are for, once, and its rules are only the cross-cutting ones. No
-    // rule asks for a read before every change or a build or test after it:
-    // a model reads such a rule as a per-step obligation, re-reading what it
-    // already holds and re-running checks after each small edit, and every
-    // one of those rounds resends the conversation. When to read and verify,
-    // how many calls share a response, how much of a file to read and how
-    // large a diff to make are left to the model. Both sides count against
-    // the frozen prompt budget in `frozen_prompt_fits_token_budget`.
+    // Tool-specific guidance lives in each tool's schema description (which rides in every request
+    // anyway). The prompt names what the four core tools are for, once, and its rules are only the
+    // cross-cutting ones. No rule asks for a read before every change or a build or test after it:
+    // a model reads such a rule as a per-step obligation, re-reading what it already holds and
+    // re-running checks after each small edit, and every one of those rounds resends the
+    // conversation. When to read and verify, how many calls share a response, how much of a file
+    // to read and how large a diff to make are left to the model. Both sides count against the
+    // frozen prompt budget in `frozen_prompt_fits_token_budget`.
     let mut prompt = format!(
         "You are Open Max, an expert coding agent working on the project at {root}.\n\
         \n\
