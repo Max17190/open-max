@@ -5480,6 +5480,11 @@ mod tests {
         }
     }
 
+    /// A reply the limit cut with nothing of it arrived: `limit - 1` output tokens, one of them reasoning.
+    fn lost_at(limit: u64) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":100,\"completion_tokens\":{},\"completion_tokens_details\":{{\"reasoning_tokens\":1}},\"total_tokens\":{}}}}}\n\ndata: [DONE]\n\n", limit - 1, limit + 99)
+    }
+
     #[tokio::test]
     async fn a_call_cut_at_its_room_is_never_offered_less_than_that_room() {
         const LOST: &str = concat!(
@@ -5488,14 +5493,15 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
+        let (lost16k, lost64k) = (lost_at(16_384), lost_at(65_536));
         const SPLIT: &str = "written again whole it will be cut the same way";
         // A case: the replies in order, the declared longest reply, the stop, the limits sent, and what each note says.
         type Case<'a> = (&'static str, Vec<&'a str>, Option<usize>, &'static str, &'static [u64], &'static [&'static str]);
         let cases: [Case; 3] = [
             ("no longer reply declared: parts at once", vec![LOST], None, "length", &[4096, 16384, 4096, 4096, 4096],
                 &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while", SPLIT, SPLIT]),
-            ("a longer reply declared: asked for first, so a cut there gets no room", vec![LOST, &whole, STOP_SSE], Some(393_216), "stop", &[260_096, 260_096, 260_096],
-                &["[reply cut: it reached max_tokens (260096) before any tool call; continue from where it stopped"]),
+            ("a longer reply declared: the first doubling above the room", vec![&lost16k, &lost64k, &whole, STOP_SSE], Some(393_216), "stop", &[16_384, 65_536, 131_072, 16_384],
+                &["(16384) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 65536 tokens", "(65536) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 131072 tokens"]),
             ("a thought cut in the room keeps the doubling", vec![LOST, CUT_SSE, STOP_SSE], None, "stop", &[4096, 16384, 8192],
                 &["The next reply alone may be up to 16384 tokens", "[reply cut: it reached max_tokens (16384) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]"]),
         ];
@@ -5524,17 +5530,10 @@ mod tests {
         assert_eq!((stop.as_str(), sent.as_slice()), ("length", &[4096u64, 16384, 4096, 4096, 4096][..]));
         assert_eq!(said.iter().filter(|n| n.contains("may be up to 16384 tokens")).count(), 1, "the room is offered once: {said:#?}");
         assert_eq!(said.iter().filter(|n| n.contains("Send large content in parts")).count(), 4, "{said:#?}");
-        // A streamed call cut, then nothing arriving at its room: the first doubling above the room, at once.
-        const LOST: &str = concat!(
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4095,\"completion_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":4196}}\n\n",
-            "data: [DONE]\n\n",
-        );
         let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
-        // With the model's longest reply declared, every request asks for it (within the window), so a cut there gets no room.
-        let (stop, sent, said) = cut_recovery_turn(&[&cut, LOST, &whole, STOP_SSE], Some(393_216)).await;
-        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[260_096u64, 260_096, 260_096, 260_096][..]), "{said:#?}");
-        assert!(said.iter().all(|n| !n.contains("may be up to")), "no room above the longest reply: {said:#?}");
+        // A streamed call cut with a longer reply declared: the first ask is 16,384, the room four times it, and nothing arriving at the room gets the first doubling above it, at once.
+        let (stop, sent, said) = cut_recovery_turn(&[&cut, &lost_at(65_536), &whole, STOP_SSE], Some(393_216)).await;
+        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[16_384u64, 65_536, 131_072, 16_384][..]), "{said:#?}");
     }
 
     /// The bug this guards: a reply the output cap cut before any call ran
@@ -10185,12 +10184,12 @@ echo run >> {}
     }
 
     /// A model entry that declares its longest reply: the first request asks
-    /// for it whole when the prompt leaves the room, and a request that asks
+    /// for it, up to 16,384, when the prompt leaves the room, and a request that asks
     /// for more than the reserve and is refused for length goes once more at
     /// the reserve, which stays the default's 4096.
     #[tokio::test]
     async fn a_declared_longest_reply_is_the_first_ask_and_a_refusal_goes_again_at_the_reserve() {
-        for (longest, history, want_first_room) in [(8_192usize, 0usize, false), (65_536, 20_000, true)] {
+        for (longest, history, want_first_room) in [(8_192usize, 0usize, false), (65_536, 105_000, true)] {
             let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
             let (core, mut rx) = Core::new(dir.clone()).unwrap();
             let project = dir.join("project");
