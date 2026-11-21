@@ -815,8 +815,8 @@ pub(crate) const SPLIT_ADVICE: &str = "Send large content in parts: for a file, 
 /// The reply for a call the output cap cut off partway through its
 /// arguments. A bare parse error reads as a typo to fix, and the model sends
 /// the same oversized call again. The advice spells out how edit_file
-/// appends, because its old_string has to be unique. With `room`, the limit
-/// the next request alone carries, the call is asked for whole.
+/// appends, because its old_string has to be unique. With `room`, the raised
+/// limit that holds for the rest of the turn, the call is asked for whole.
 pub(crate) fn cut_off_call_error(max_tokens: usize, room: Option<usize>) -> String {
     let advice = room.map_or(SPLIT_ADVICE.into(), |room| format!("Your replies may now be up to {room} tokens: send this call again now, whole."));
     format!("Not run: your reply reached the output limit (max_tokens = {max_tokens}) while writing this call, so its arguments were cut off. {advice}")
@@ -861,11 +861,10 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
 /// The note after a reply the output limit cut before any tool call. The
 /// limit bounds how long the model thinks before it acts, so a cut thought
 /// is told to act. A cut inside a call or text needed room, not brevity:
-/// with `room`, the limit the next request alone carries, the note says so
-/// and asks for the content whole. Without it (that request was cut too, or
-/// the limit leaves no more room) the note asks for the content in parts,
-/// and cut text gets the note a cut thought does, byte for byte. A cut
-/// thought with `room`, the raised limit after cuts in a row, is told it.
+/// with `room`, the raised limit that holds for the rest of the turn, the
+/// note says so and asks for the content whole. Without it (the limit cannot
+/// grow) the note asks for the content in parts, and cut text gets the note a
+/// cut thought does, byte for byte. A cut thought with `room` is told it.
 pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usize>) -> String {
     let next = |ask: &str| room.map(|room| format!("Replies may now be up to {room} tokens: {ask}"));
     match kind {
