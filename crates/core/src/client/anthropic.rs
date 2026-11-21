@@ -420,15 +420,14 @@ pub(super) async fn read(
                         }
                     }
                     Some("message_delta") => {
-                        if let Some(stop) = event["delta"]["stop_reason"].as_str() {
-                            reason = Some(stop.to_owned());
-                        }
-                        // The cap can stop a reply inside its last block, which never closes. A cut call keeps its partial
-                        // arguments (so it never runs) and goes back with empty input; an unsigned cut thought is dropped.
+                        if let Some(stop) = event["delta"]["stop_reason"].as_str() { reason = Some(stop.to_owned()); }
+                        // The cap can stop a reply inside its blocks, which never close. Only the last can be a cut call: it keeps its partial arguments
+                        // (so it never runs) and goes back with the input they make, or empty. Other open calls and an unsigned thought are dropped.
                         if matches!(reason.as_deref(), Some("max_tokens" | "model_context_window_exceeded")) {
-                            blocks.retain(|b| b.closed || matches!(b.value["type"].as_str(), Some("text" | "tool_use")));
+                            let last = blocks.len().saturating_sub(1);
+                            blocks = std::mem::take(&mut blocks).into_iter().enumerate().filter(|(i, b)| b.closed || b.value["type"] == "text" || b.value["type"] == "tool_use" && *i == last).map(|(_, b)| b).collect();
                             for block in blocks.iter_mut().filter(|b| !b.closed) {
-                                if block.value["type"] == "tool_use" { block.value["input"] = json!({}); cut = Some(std::mem::take(&mut block.arguments)); }
+                                if block.value["type"] == "tool_use" { block.value["input"] = serde_json::from_str::<Value>(&block.arguments).ok().filter(Value::is_object).unwrap_or_else(|| json!({})); cut = Some(std::mem::take(&mut block.arguments)); }
                                 block.closed = true;
                             }
                         }

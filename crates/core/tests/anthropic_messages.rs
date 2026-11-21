@@ -252,6 +252,19 @@ async fn native_reply_cut_inside_a_tool_call_returns_a_cut_reply_that_replays() 
     assert_eq!(serde_json::from_str::<Value>(&closed.tool_calls[0].function.arguments).unwrap(),json!({"path":"note.txt"}));
     let records=server.await.unwrap();let replay:Value=serde_json::from_slice(&records[1].body).unwrap();
     assert_eq!(replay["messages"][1]["content"],json!([{"type":"thinking","thinking":"inspect first","signature":"fixture-signature"},{"type":"tool_use","id":"call-fixture","name":"inspect","input":{}}]));
+    // Arguments already whole when the cap lands go back as written, so the signed thinking still replays with them;
+    // an earlier call left open beside the last one is dropped, never returned with empty arguments.
+    let whole_open=valid.replace(&(event(json!({"type":"content_block_stop","index":1})) + &end("tool_use")), &end("max_tokens"));
+    let two_open=valid.replace(&(event(json!({"type":"content_block_stop","index":1})) + &end("tool_use")),
+        &(event(json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-second","name":"inspect","input":{}}})) + &end("max_tokens")));
+    let scratch=Scratch::new();let(base,server)=serve(vec![(200,whole_open),(200,two_open)]).await;
+    let client=self::client(&scratch,&base,None);
+    let whole=run(&client,&messages[..2]).await.unwrap();
+    assert_eq!((whole.finish_reason.as_str(),whole.tool_calls[0].function.arguments.as_str()),("length","{\"path\":\"note.txt\"}"));
+    assert!(whole.reasoning_details.unwrap().get().contains(r#""input":{"path":"note.txt"}"#));
+    let two=run(&client,&messages[..2]).await.unwrap();
+    assert_eq!((two.tool_calls.len(),two.tool_calls[0].id.as_str(),two.tool_calls[0].function.arguments.as_str()),(1,"call-second",""));
+    server.await.unwrap();
 }
 
 /// A native reply cut after its text began is asked for again with the same
