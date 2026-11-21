@@ -728,8 +728,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // changed a file it was given, added 94, and
     // CEILING was raised for it by its owner. Stopping a bash command whose
     // processes sit idle (`stuck_command_secs`), with offsetting trims in
-    // run_process and run_bash, removed 1.
-    const BASELINE: usize = 45_132;
+    // run_process and run_bash, removed 1. Keeping the session going when the
+    // limit cuts a native reply inside a tool call, with offsetting joins, removed 1.
+    const BASELINE: usize = 45_131;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
