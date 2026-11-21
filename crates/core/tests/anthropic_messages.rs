@@ -203,14 +203,13 @@ async fn native_invalid_and_incomplete_streams_never_return_executable_tools() {
     let valid=tool_response();
     let truncated=valid.replace(&event(json!({"type":"message_stop"})),"");
     let malformed=valid.replace("note.txt","note\\\".txt");
-    let bad_stop=valid.replace("\"stop_reason\":\"tool_use\"","\"stop_reason\":\"max_tokens\"");
     let error=valid.replace(&end("tool_use"),&event(json!({"type":"error","error":{"type":"invalid_request_error","message":"fixture rejected"}})));
     let duplicate=valid.replace(&end("tool_use"),&(event(json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-fixture","name":"inspect","input":{}}}))+&end("tool_use")));
     let missing_signature=valid.replace("fixture-signature", "");
     let bad_name=valid.replace("\"name\":\"inspect\"", "\"name\":\"bad name\"");
     let unknown=valid.replace("\"type\":\"tool_use\"", "\"type\":\"unknown_tool\"");
     let duplicate_id=valid.replace(&end("tool_use"),&(event(json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-fixture","name":"inspect","input":{}}}))+&event(json!({"type":"content_block_stop","index":2}))+&end("tool_use")));
-    for response in [truncated,malformed,bad_stop,error,duplicate,missing_signature,bad_name,unknown,duplicate_id] {
+    for response in [truncated,malformed,error,duplicate,missing_signature,bad_name,unknown,duplicate_id] {
         let scratch=Scratch::new(); let(base,server)=serve(vec![(200,response)]).await;
         let client=client(&scratch,&base,None);let cancel=Arc::new(CancelToken::default());
         let result=tokio::time::timeout(Duration::from_secs(5),client.stream_chat(&[ChatMessage::user("inspect")], client.reply_reserve,&tools(),cancel.clone(),|delta| {
@@ -219,6 +218,40 @@ async fn native_invalid_and_incomplete_streams_never_return_executable_tools() {
         match result {Err(_)=>{},Ok(result)=>{assert!(result.tool_calls.is_empty());assert_ne!(result.finish_reason,"tool_calls");}}
         assert_eq!(server.await.unwrap().len(),1);
     }
+}
+
+/// The reply limit can stop a reply inside its tool call: the stream then ends
+/// with max_tokens and no content_block_stop for the call. The reply comes back
+/// as a cut one (finish "length") whose last call holds the partial arguments,
+/// which the loop never runs, instead of failing the session. The call goes
+/// back with empty input beside its signed thinking, as the loop records it.
+/// A thought left open by the cut has no signature and is dropped, and a call
+/// that closed before a max_tokens stop is a cut reply too.
+#[tokio::test]
+async fn native_reply_cut_inside_a_tool_call_returns_a_cut_reply_that_replays() {
+    let valid=tool_response();
+    let open_call=valid.replace(&(event(json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"note.txt\"}"}}))
+        + &event(json!({"type":"content_block_stop","index":1})) + &end("tool_use")), &end("max_tokens"));
+    let open_thought=start() + &event(json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}))
+        + &event(json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"still thinking"}})) + &end("max_tokens");
+    let closed_call=valid.replace(&end("tool_use"),&end("max_tokens"));
+    let scratch=Scratch::new();let(base,server)=serve(vec![(200,open_call),(200,text_response()),(200,open_thought),(200,closed_call)]).await;
+    let client=client(&scratch,&base,None);
+    let mut messages=vec![ChatMessage::system("instructions"),ChatMessage::user("inspect")];
+    let cut=run(&client,&messages).await.unwrap();
+    assert_eq!((cut.finish_reason.as_str(),cut.tool_calls.len()),("length",1));
+    assert_eq!((cut.tool_calls[0].id.as_str(),cut.tool_calls[0].function.arguments.as_str()),("call-fixture","{\"path\":"));
+    let mut recorded=cut.tool_calls.clone();recorded[0].function.arguments="{}".into();
+    let mut assistant=ChatMessage::assistant(None,Some(recorded));assistant.reasoning_details=cut.reasoning_details;assistant.reasoning_origin=Some(client.origin());
+    messages.push(assistant);messages.push(ChatMessage::tool("call-fixture","[cut: write it in parts]"));
+    assert_eq!(run(&client,&messages).await.unwrap().content,"verified");
+    let thought=run(&client,&messages[..2]).await.unwrap();
+    assert_eq!((thought.finish_reason.as_str(),thought.tool_calls.len(),thought.reasoning_details.is_some()),("length",0,false));
+    let closed=run(&client,&messages[..2]).await.unwrap();
+    assert_eq!((closed.finish_reason.as_str(),closed.tool_calls.len()),("length",1));
+    assert_eq!(serde_json::from_str::<Value>(&closed.tool_calls[0].function.arguments).unwrap(),json!({"path":"note.txt"}));
+    let records=server.await.unwrap();let replay:Value=serde_json::from_slice(&records[1].body).unwrap();
+    assert_eq!(replay["messages"][1]["content"],json!([{"type":"thinking","thinking":"inspect first","signature":"fixture-signature"},{"type":"tool_use","id":"call-fixture","name":"inspect","input":{}}]));
 }
 
 /// A native reply cut after its text began is asked for again with the same
