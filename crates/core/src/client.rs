@@ -4884,7 +4884,8 @@ pub(crate) mod tests {
     /// provider's own headers set.
     #[test]
     fn a_host_that_routes_by_conversation_gets_the_key_in_its_header() {
-        assert_eq!(crate::providers::CACHE_ROUTES, [("api.x.ai", "grok-", "x-grok-conv-id")]);
+        assert_eq!(crate::providers::CACHE_ROUTES,
+            [("api.x.ai", "grok-", "x-grok-conv-id"), ("", "deepseek-ai/deepseek-", "modal-routing-affinity-key")]);
         let serving = |url: &str, model: &str| ChatClient::new(url.into(), None, model.into(), None, 64).for_conversation("root");
         let routed = |url: &str, root: &str| ChatClient::new(url.into(), None, "m".into(), None, 64).for_conversation(root);
         let xai = routed("https://api.x.ai/v1", "root");
@@ -4910,23 +4911,58 @@ pub(crate) mod tests {
         assert_eq!(own.cache_route(), None);
     }
 
+    /// Modal's shared DeepSeek endpoints route a conversation by an affinity
+    /// key; its GLM NVFP4 endpoint caches without one and ran slower with it.
+    /// Modal names DeepSeek `deepseek-ai/...`, so that id carries the key at
+    /// Modal's host and behind the bench's meter alike; DeepSeek's own API,
+    /// OpenRouter's `deepseek/...` and every GLM id carry none.
+    #[test]
+    fn a_modal_deepseek_conversation_carries_its_affinity_key() {
+        const MODAL: &str = "https://ws--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1";
+        let serving = |url: &str, model: &str| ChatClient::new(url.into(), None, model.into(), None, 64).for_conversation("root");
+        let modal = serving(MODAL, "deepseek-ai/DeepSeek-V4.1-Flash");
+        let key = modal.cache_key.clone().unwrap();
+        assert_eq!(modal.cache_route(), Some(("modal-routing-affinity-key", key.as_str())));
+        assert_eq!(serving("http://127.0.0.1:18080/v1", "deepseek-ai/DeepSeek-V4.1-Flash").cache_route(),
+            Some(("modal-routing-affinity-key", key.as_str())), "behind the meter");
+        assert_ne!(serving(MODAL, "deepseek-ai/DeepSeek-V4.1-Flash").for_conversation("other").cache_route(), modal.cache_route());
+        for (url, model) in [
+            ("https://ws--ep-glm-5-3-flash-nvfp4-server.us-west.modal.direct/v1", "nvidia/GLM-5.3-Flash-NVFP4"),
+            ("https://ws--ep-glm-5-3-flash-server.us-west.modal.direct/v1", "zai-org/GLM-5.3-Flash"),
+            ("https://api.deepseek.com", "deepseek-v4.1-flash"),
+            ("https://api.deepseek.com", "deepseek-reasoner"),
+            ("https://openrouter.ai/api/v1", "deepseek/deepseek-v4.1-flash-1017"),
+            ("http://127.0.0.1:18080/v1", "nvidia/GLM-5.3-Flash-NVFP4"),
+            ("http://127.0.0.1:18080/v1", "deepseek-ai"),
+        ] {
+            assert_eq!(serving(url, model).cache_route(), None, "{model} at {url}");
+        }
+        let mut own = serving(MODAL, "deepseek-ai/DeepSeek-V4.1-Flash");
+        own.headers = vec![("Modal-Routing-Affinity-Key".into(), "configured".into())];
+        assert_eq!(own.cache_route(), None);
+    }
+
     /// The bug this guards: behind a proxy (a usage logger, a gateway, a
     /// local relay) the host was the proxy's, so a grok conversation's
     /// requests went out without the header, met whichever server the
     /// provider picked, and prefilled the history again wherever that server
     /// had not seen it. A request for a grok model to a local endpoint now
-    /// carries the conversation's key; one for another model carries none.
+    /// carries the conversation's key, one for Modal's DeepSeek its affinity
+    /// key, and one for another model neither.
     #[tokio::test]
     async fn a_grok_conversation_behind_a_proxy_carries_its_route() {
-        for (model, routed) in [("grok-4.7", true), ("m", false)] {
+        for (model, routed) in [("grok-4.7", Some("x-grok-conv-id")), ("deepseek-ai/DeepSeek-V4.1-Flash", Some("modal-routing-affinity-key")),
+            ("nvidia/GLM-5.3-Flash-NVFP4", None), ("m", None)] {
             let (url, requests) = spawn_recording_once(finished_response());
             let client = ChatClient::new(url, None, model.into(), None, 64).for_conversation("root");
             let reply = client.stream_chat(&[ChatMessage::user("hi")], client.reply_reserve, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await;
             assert_eq!(reply.unwrap().content, "all of it");
             let request = requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
             let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
-            let header = format!("x-grok-conv-id: {}", client.cache_key.as_deref().unwrap());
-            assert_eq!(head.contains(&header), routed, "{model}: {head}");
+            let key = client.cache_key.as_deref().unwrap();
+            for name in ["x-grok-conv-id", "modal-routing-affinity-key"] {
+                assert_eq!(head.contains(&format!("{name}: {key}")), routed == Some(name), "{model}: {head}");
+            }
         }
     }
 }
