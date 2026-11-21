@@ -820,7 +820,8 @@ fn check_requests(run: &Run, log: &str) {
         if let Some(previous) = previous {
             let (a, b) = (fields(previous), fields(first));
             assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>(), "{log}");
-            for (key, value) in a.iter().filter(|(key, _)| key.as_str() != "messages") {
+            // A cut reply doubles max_tokens for the rest of the turn; nothing else changes.
+            for (key, value) in a.iter().filter(|(key, _)| !matches!(key.as_str(), "messages" | "max_tokens")) {
                 assert_eq!(value.get(), b[key].get(), "{key} changed within a turn: {log}");
             }
             let (old, new) = (a["messages"].get(), b["messages"].get());

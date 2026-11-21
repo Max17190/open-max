@@ -818,7 +818,7 @@ pub(crate) const SPLIT_ADVICE: &str = "Send large content in parts: for a file, 
 /// appends, because its old_string has to be unique. With `room`, the limit
 /// the next request alone carries, the call is asked for whole.
 pub(crate) fn cut_off_call_error(max_tokens: usize, room: Option<usize>) -> String {
-    let advice = room.map_or(SPLIT_ADVICE.into(), |room| format!("Your next reply alone may be up to {room} tokens: send this call again now, whole."));
+    let advice = room.map_or(SPLIT_ADVICE.into(), |room| format!("Your replies may now be up to {room} tokens: send this call again now, whole."));
     format!("Not run: your reply reached the output limit (max_tokens = {max_tokens}) while writing this call, so its arguments were cut off. {advice}")
 }
 
@@ -867,7 +867,7 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
 /// and cut text gets the note a cut thought does, byte for byte. A cut
 /// thought with `room`, the raised limit after cuts in a row, is told it.
 pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usize>) -> String {
-    let next = |ask: &str| room.map(|room| format!("The next reply alone may be up to {room} tokens: {ask}"));
+    let next = |ask: &str| room.map(|room| format!("Replies may now be up to {room} tokens: {ask}"));
     match kind {
         CutKind::Lost => match next("send that call again now, whole.") {
             Some(next) => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. {next}]"),
@@ -879,7 +879,7 @@ pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usiz
         },
         CutKind::Text => format!("[reply cut: it reached max_tokens ({max_tokens}) while writing text. {}]", next("continue the text from exactly where it stopped, without repeating any of it.").unwrap_or_else(|| "Continue the text from exactly where it stopped, without repeating any of it.".into())),
         CutKind::Thought => match room {
-            Some(room) => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; the next reply may be up to {room} tokens: continue from where it stopped, then act.]"),
+            Some(room) => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; replies may now be up to {room} tokens: continue from where it stopped, then act.]"),
             None => format!("[reply cut: it reached max_tokens ({max_tokens}) before any tool call; continue from where it stopped: think briefly, then act.]"),
         },
     }
@@ -949,9 +949,9 @@ mod tests {
             // else is asked for whole, not in parts.
             let roomy = reply_cut_note(4_096, kind, Some(16_384));
             match kind {
-                CutKind::Thought => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]", "{case}"),
-                CutKind::Text => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) while writing text. The next reply alone may be up to 16384 tokens: continue the text from exactly where it stopped, without repeating any of it.]", "{case}"),
-                CutKind::Lost | CutKind::Unseen => assert!(roomy.contains("The next reply alone may be up to 16384 tokens") && roomy.ends_with("again now, whole.]") && !roomy.contains("in parts"), "{case}: {roomy}"),
+                CutKind::Thought => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) before any tool call; replies may now be up to 16384 tokens: continue from where it stopped, then act.]", "{case}"),
+                CutKind::Text => assert_eq!(roomy, "[reply cut: it reached max_tokens (4096) while writing text. Replies may now be up to 16384 tokens: continue the text from exactly where it stopped, without repeating any of it.]", "{case}"),
+                CutKind::Lost | CutKind::Unseen => assert!(roomy.contains("Replies may now be up to 16384 tokens") && roomy.ends_with("again now, whole.]") && !roomy.contains("in parts"), "{case}: {roomy}"),
             }
             assert_eq!(kind == CutKind::Text, want == "text", "{case}");
         }

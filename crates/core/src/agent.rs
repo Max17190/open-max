@@ -79,8 +79,8 @@ enum ApprovalOutcome {
 }
 
 /// A reply the output cap cut before its first tool call ran nothing and
-/// answered nothing, so the turn goes on after a note (`notes::reply_cut_note`), the limit doubling from the second
-/// in a row up to its ceiling; cut where it cannot grow, this many times more, and one more ends the turn `length`.
+/// answered nothing, so the turn goes on after a note (`notes::reply_cut_note`), every cut doubling the limit up to
+/// its ceiling; cut where it cannot grow, this many times more, and one more ends the turn `length`.
 const MAX_CUT_CONTINUATIONS: usize = 4;
 
 /// The one failure persisted without the `Error: ` prefix: the model must
@@ -740,13 +740,10 @@ async fn run_loop(
     }
     let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
-    // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
-    let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
+    // Cut replies in a row the limit could not grow after, its doublings, and a silent reply asked again. Every cut
+    // doubles the limit up to the ceiling and the raise holds for the turn, until a server refuses a raised limit.
+    let (mut stalled, mut raise, mut stops, mut asked, mut no_room) = (0usize, 0u32, Vec::new(), false, false);
     let mut at_reserve = false;
-    // The limit is how long a reasoning model thinks in one reply before it acts, not how much a call or an answer
-    // may carry: a reply it cut inside a call or its text is asked for once more with this room, and
-    // never again after a server refused a request that carried it, or a raised limit, or after it was spent: cut on a call or text.
-    let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
     // Set once a request goes out over the soft trigger: a cut without notes waits for the window; a cut clears it.
     let mut soft_spent = false;
     let mut image_refusal: Option<String> = None;
@@ -808,8 +805,7 @@ async fn run_loop(
         }
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
-        let roomy = room.take();
-        let limit = if std::mem::take(&mut at_reserve) { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, raise))) };
+        let limit = if std::mem::take(&mut at_reserve) { endpoint.reply_reserve } else { endpoint.raised_limit(used_real, raise) };
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
@@ -841,11 +837,11 @@ async fn run_loop(
             Ok(r) => { image_refusal = None; r }
             Err(_) if image_refusal.is_some() => { core.send_agent(session_id, AgentEvent::Error { message: image_refusal.take().unwrap_or_default() }); stop_reason = "error".into(); break 'turns; }
             Err(mut message) => {
-                // The room left was misjudged: the same request goes once more at the reserve, with no more room or raises.
-                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some() || raise > 0; raise = 0; continue 'turns; }
+                // The room left was misjudged: the same request goes once more at the reserve, with no more raises.
+                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= raise > 0; raise = 0; continue 'turns; }
                 let status = message.strip_prefix("backend returned ").and_then(|m| m.get(..3)?.parse::<u16>().ok());
-                // A server that refuses the room a cut reply was promised, or a raised limit, gets the request again at the usual limit.
-                if (roomy.is_some() || raise > 0) && limit > endpoint.reply_limit(used_real) && matches!(status, Some(400 | 422)) && iteration + 1 < max_iterations { no_room = true; raise = 0; continue 'turns; }
+                // A server that refuses a raised limit gets the request again at the usual limit.
+                if raise > 0 && limit > endpoint.reply_limit(used_real) && matches!(status, Some(400 | 422)) && iteration + 1 < max_iterations { no_room = true; raise = 0; continue 'turns; }
                 // A server can refuse a request that carries a reply of reasoning alone, or an image no header check could fault. Such replies lose
                 // their stamp, so no wire sends them, each image added since the last reply becomes a line naming the refusal, and it goes again.
                 let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
@@ -967,11 +963,12 @@ async fn run_loop(
         // calls it finished before the cut run as usual. Only the last call,
         // the one it was still writing, is refused with the cause, so the
         // model can split the work. The client keeps its raw arguments even
-        // when the cut lands before the first byte. Then the room the next request may carry, when this reply was cut and was not itself the one given room.
+        // when the cut lands before the first byte. Then a cut doubles the limit for the rest of the turn, the room the notes offer.
         let kind = if near { crate::notes::CutKind::Thought } else { crate::notes::cut_kind(limit, &result) };
-        if !capped { (cuts, stalled, raise, floor) = (0, 0, 0, 0) } else if roomy.is_some() && (!tool_calls.is_empty() || kind != crate::notes::CutKind::Thought) { (spent, floor) = (true, floor.max(limit)) }
-        let grant = (capped && roomy.is_none() && !no_room && !spent && iteration + 1 < max_iterations).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
-        if !tool_calls.is_empty() { room = grant; stalled += usize::from(capped && spent); }
+        let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
+        let up = (raise + 1..raise + 32).find(|&r| endpoint.raised_limit(next, r) > endpoint.raised_limit(next, raise)).filter(|_| capped && !no_room);
+        if !capped { stalled = 0 } else if let Some(up) = up { raise = up } else { stalled += 1 }
+        let room = up.map(|_| endpoint.raised_limit(next, raise));
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
@@ -980,17 +977,11 @@ async fn run_loop(
             // answer, so not an end and no turn_end consult. The reply stays
             // as recorded above, the note goes after it, on disk before the
             // next request, and the loop goes round. Never on the last
-            // iteration, which has no request left to carry the note. A second cut in a row doubles the limit, so the
-            // limit alone never ends a turn while it can grow; past a spent room, to the first doubling above it, but a cut thought plainly. A silent reply below the limit is asked again once per turn.
-            let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
-            cuts += usize::from(capped);
-            let up = (raise + 1..raise + 32).find(|&r| endpoint.raised_limit(next, r) > endpoint.raised_limit(next, raise).max(if kind == crate::notes::CutKind::Thought { 0 } else { floor })).filter(|_| capped && (cuts > 1 || floor > 0 && kind != crate::notes::CutKind::Thought) && !no_room);
-            if let Some(up) = up { raise = up } else if capped && cuts > 1 { stalled += 1 }
-            if (capped && stalled < MAX_CUT_CONTINUATIONS || silent && !capped && !asked) && iteration + 1 < max_iterations {
+            // iteration, which has no request left to carry the note. The limit alone never ends a turn while it can
+            // grow. A silent reply below the limit is asked again once per turn.
+            if (capped && stalled <= MAX_CUT_CONTINUATIONS || silent && !capped && !asked) && iteration + 1 < max_iterations {
                 let at = guard.messages().len();
-                room = grant.filter(|_| kind != crate::notes::CutKind::Thought);
-                let ask = room.into_iter().chain(up.map(|_| endpoint.raised_limit(next, raise))).max();
-                let note = if capped { crate::notes::reply_cut_note(limit, kind, ask) } else { asked = true; "[empty reply: it had no text and no tool call. Continue the task: call a tool, or give the final answer.]".into() };
+                let note = if capped { crate::notes::reply_cut_note(limit, kind, room) } else { asked = true; "[empty reply: it had no text and no tool call. Continue the task: call a tool, or give the final answer.]".into() };
                 insert_note(core, session_id, guard.messages(), at, note);
                 save_messages(core, session_id, guard.messages(), false).await; continue 'turns;
             }
@@ -1496,7 +1487,7 @@ async fn run_loop(
         // receipt's, before the save that writes that result.
         store_note(guard.messages(), note.as_deref());
         save_messages(core, session_id, guard.messages(), false).await;
-        if capped && spent && stalled >= MAX_CUT_CONTINUATIONS { stop_reason = "length".into(); break 'turns; }
+        if capped && stalled > MAX_CUT_CONTINUATIONS { stop_reason = "length".into(); break 'turns; }
     }
 
     // A turn can end with the last assistant's tool_calls persisted but never
@@ -5128,8 +5119,8 @@ mod tests {
     /// as an answer, so the run stopped mid-task with nothing changed. Such a
     /// reply, its reasoning (else its output) at 70% of the limit or more, is
     /// read as a cut thought: the cut-thought note follows it, and the same
-    /// ladder applies: from the second in a row the limit doubles where it can,
-    /// and where it cannot a fifth such reply ends the turn `length`. A short
+    /// ladder applies: each one doubles the limit where it can, and where it
+    /// cannot a fifth such reply ends the turn `length`. A short
     /// final answer, or one below the share, still ends the turn as it did.
     #[tokio::test]
     async fn a_reply_that_stops_near_the_limit_without_a_call_continues_as_a_cut_thought() {
@@ -5152,9 +5143,8 @@ mod tests {
             .collect::<String>()
                 + "data: [DONE]\n\n"
         }
-        const NOTE: &str = "[reply cut: it reached max_tokens (4096) before any tool call; continue from where it stopped: think briefly, then act.]";
-        const RAISED: &str = "[reply cut: it reached max_tokens (4096) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]";
-        const RAISED_AGAIN: &str = "[reply cut: it reached max_tokens (8192) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]";
+        const RAISED: &str = "[reply cut: it reached max_tokens (4096) before any tool call; replies may now be up to 8192 tokens: continue from where it stopped, then act.]";
+        const RAISED_AGAIN: &str = "[reply cut: it reached max_tokens (8192) before any tool call; replies may now be up to 16384 tokens: continue from where it stopped, then act.]";
         let gave_up = final_sse("I can't complete this task.", 3100, Some(3080));
         let at_share = final_sse("I can't complete this task.", 2868, Some(2868));
         let output_only = final_sse("Done.", 3000, None);
@@ -5168,13 +5158,13 @@ mod tests {
         // the cut notes.
         type Case<'a> = (&'a str, Vec<&'a str>, (usize, usize), &'a str, usize, Vec<&'a str>);
         let cases: [Case; 8] = [
-            ("near the limit, then a call and an answer", vec![&gave_up, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 3, vec![NOTE]),
-            ("exactly at 70% of the limit", vec![&at_share, STOP_SSE], (65_536, 4096), "stop", 2, vec![NOTE]),
-            ("the output counts when no reasoning count is reported", vec![&output_only, STOP_SSE], (65_536, 4096), "stop", 2, vec![NOTE]),
-            // The second in a row raises the limit, under which the same reply is below the share: an answer.
-            ("near the limit twice, then below it at the raised limit", vec![&gave_up], (65_536, 4096), "stop", 3, vec![NOTE, RAISED]),
+            ("near the limit, then a call and an answer", vec![&gave_up, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 3, vec![RAISED]),
+            ("exactly at 70% of the limit", vec![&at_share, STOP_SSE], (65_536, 4096), "stop", 2, vec![RAISED]),
+            ("the output counts when no reasoning count is reported", vec![&output_only, STOP_SSE], (65_536, 4096), "stop", 2, vec![RAISED]),
+            // The limit doubles, under which the same reply is below the share: an answer.
+            ("near the limit, then below it at the raised limit", vec![&gave_up], (65_536, 4096), "stop", 2, vec![RAISED]),
             // A budget stop at the raised limit too: the limit doubles again, and the turn goes on to its call.
-            ("near the limit, then near it again at each raised limit", vec![&gave_up, &gave_up, &gave_up_raised, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 5, vec![NOTE, RAISED, RAISED_AGAIN]),
+            ("near the limit, then near it again at the raised limit", vec![&gave_up, &gave_up_raised, TOOL_SSE, STOP_SSE], (65_536, 4096), "stop", 4, vec![RAISED, RAISED_AGAIN]),
             ("near a limit that cannot grow five times in a row", vec![&gave_up_small], (16_384, 1024), "length", 5, vec![CUT_NOTE; 4]),
             ("a short final answer", vec![&answer], (65_536, 4096), "stop", 1, vec![]),
             ("a final answer below 70% of the limit", vec![&below], (65_536, 4096), "stop", 1, vec![]),
@@ -5254,16 +5244,15 @@ mod tests {
     /// The bug this guards: the default reply limit bounds how long a
     /// reasoning model thinks in one reply before it acts, but it also cut
     /// every call and answer larger than what the thought left of it, and the
-    /// only way on was to write the content in parts. A reply the default
-    /// limit cut inside a call or its text is asked for once more with room
-    /// (four times the limit), then the limit returns. Nothing is sent again:
-    /// the calls finished before the cut ran once and keep their replies, and
-    /// the cut call never runs. A reply cut again at that room is asked for
-    /// in parts, a server that refuses the room gets the request at the usual
-    /// limit and is not asked again, a cut thought gets no room, and neither
-    /// does a limit someone chose.
+    /// only way on was to write the content in parts. Every cut reply, on a
+    /// call, its text, a call that never arrived or a thought, doubles the
+    /// limit for the rest of the turn. Nothing is sent again: the calls
+    /// finished before the cut ran once and keep their replies, and the cut
+    /// call never runs. A server that refuses a raised limit gets the request
+    /// at the usual limit and no more raises, and a limit someone chose is its
+    /// own ceiling, so a call cut there is asked for in parts.
     #[tokio::test]
-    async fn a_reply_the_default_limit_cut_inside_a_call_or_its_text_is_asked_for_once_more_with_room() {
+    async fn every_cut_reply_doubles_the_limit_for_the_rest_of_the_turn() {
         use crate::state::Core;
 
         const DONE: (&str, &str, &str) = ("c1", "write_file", r#"{"path":"done.txt","content":"whole\n"}"#);
@@ -5278,22 +5267,22 @@ mod tests {
             "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\ndata: [DONE]\n\n",
             serde_json::json!({ "choices": [{ "delta": { "content": "word ".repeat(600) }, "finish_reason": null }] })
         );
-        const WHOLE_ASK: &str = "(max_tokens = 4096) while writing this call, so its arguments were cut off. Your next reply alone may be up to 16384 tokens: send this call again now, whole.";
+        const WHOLE_ASK: &str = "(max_tokens = 4096) while writing this call, so its arguments were cut off. Your replies may now be up to 8192 tokens: send this call again now, whole.";
         // A case: the replies in order, the request a 400 refuses, a limit set in settings, the limit each
         // request carried, whether big.txt was written, and what the transcript says, each exactly once.
         type Case<'a> = (&'static str, Vec<&'a str>, Option<usize>, Option<usize>, &'static [u64], bool, &'static [&'static str]);
         let cases: [Case; 7] = [
-            ("a cut call lands whole with room", vec![&cut, &whole, STOP_SSE], None, None, &[4096, 16384, 4096], true, &[WHOLE_ASK]),
-            ("cut again at the room, then in parts", vec![&cut, &cut, &whole, STOP_SSE], None, None, &[4096, 16384, 4096, 4096], true,
-                &[WHOLE_ASK, "(max_tokens = 16384) while writing this call, so its arguments were cut off. Send large content in parts"]),
-            ("a refused room is not asked for again", vec![&cut, &whole, &cut, STOP_SSE], Some(2), None, &[4096, 16384, 4096, 4096], false,
+            ("a cut call lands whole at the doubled limit, which stays", vec![&cut, &whole, STOP_SSE], None, None, &[4096, 8192, 8192], true, &[WHOLE_ASK]),
+            ("cut again, doubled again", vec![&cut, &cut, &whole, STOP_SSE], None, None, &[4096, 8192, 16384, 16384], true,
+                &[WHOLE_ASK, "(max_tokens = 8192) while writing this call, so its arguments were cut off. Your replies may now be up to 16384 tokens"]),
+            ("a refused raise is not asked for again", vec![&cut, &whole, &cut, STOP_SSE], Some(2), None, &[4096, 8192, 4096, 4096], false,
                 &[WHOLE_ASK, "(max_tokens = 4096) while writing this call, so its arguments were cut off. Send large content in parts"]),
-            ("a call that never arrived gets room", vec![LOST, &whole, STOP_SSE], None, None, &[4096, 16384, 4096], true,
-                &["nothing of it ran. The next reply alone may be up to 16384 tokens: send that call again now, whole.]"]),
-            ("cut text continues with room", vec![&text, STOP_SSE], None, None, &[4096, 16384], false,
-                &["[reply cut: it reached max_tokens (4096) while writing text. The next reply alone may be up to 16384 tokens: continue the text from exactly where it stopped, without repeating any of it.]"]),
-            ("a cut thought gets none", vec![CUT_SSE, STOP_SSE], None, None, &[4096, 4096], false,
-                &["[reply cut: it reached max_tokens (4096) before any tool call; continue from where it stopped: think briefly, then act.]"]),
+            ("a call that never arrived doubles it", vec![LOST, &whole, STOP_SSE], None, None, &[4096, 8192, 8192], true,
+                &["nothing of it ran. Replies may now be up to 8192 tokens: send that call again now, whole.]"]),
+            ("cut text continues at the doubled limit", vec![&text, STOP_SSE], None, None, &[4096, 8192], false,
+                &["[reply cut: it reached max_tokens (4096) while writing text. Replies may now be up to 8192 tokens: continue the text from exactly where it stopped, without repeating any of it.]"]),
+            ("a cut thought doubles it too", vec![CUT_SSE, STOP_SSE], None, None, &[4096, 8192], false,
+                &["[reply cut: it reached max_tokens (4096) before any tool call; replies may now be up to 8192 tokens: continue from where it stopped, then act.]"]),
             ("a chosen limit is a ceiling", vec![&cut, &whole, STOP_SSE], None, Some(2048), &[2048, 2048, 2048], true,
                 &["(max_tokens = 2048) while writing this call, so its arguments were cut off. Send large content in parts"]),
         ];
@@ -5485,55 +5474,21 @@ mod tests {
         format!("data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":100,\"completion_tokens\":{},\"completion_tokens_details\":{{\"reasoning_tokens\":1}},\"total_tokens\":{}}}}}\n\ndata: [DONE]\n\n", limit - 1, limit + 99)
     }
 
-    #[tokio::test]
-    async fn a_call_cut_at_its_room_is_never_offered_less_than_that_room() {
-        const LOST: &str = concat!(
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4095,\"completion_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":4196}}\n\n",
-            "data: [DONE]\n\n",
-        );
-        let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
-        let (lost16k, lost64k) = (lost_at(16_384), lost_at(65_536));
-        const SPLIT: &str = "written again whole it will be cut the same way";
-        // A case: the replies in order, the declared longest reply, the stop, the limits sent, and what each note says.
-        type Case<'a> = (&'static str, Vec<&'a str>, Option<usize>, &'static str, &'static [u64], &'static [&'static str]);
-        let cases: [Case; 3] = [
-            ("no longer reply declared: parts at once", vec![LOST], None, "length", &[4096, 16384, 4096, 4096, 4096],
-                &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while", SPLIT, SPLIT]),
-            ("a longer reply declared: the first doubling above the room", vec![&lost16k, &lost64k, &whole, STOP_SSE], Some(393_216), "stop", &[16_384, 65_536, 131_072, 16_384],
-                &["(16384) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 65536 tokens", "(65536) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 131072 tokens"]),
-            ("a thought cut in the room keeps the doubling", vec![LOST, CUT_SSE, STOP_SSE], None, "stop", &[4096, 16384, 8192],
-                &["The next reply alone may be up to 16384 tokens", "[reply cut: it reached max_tokens (16384) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]"]),
-        ];
-        for (case, streams, ceiling, want, limits, says) in cases {
-            let (stop, sent, said) = cut_recovery_turn(&streams, ceiling).await;
-            assert_eq!((stop.as_str(), sent.as_slice()), (want, limits), "{case}");
-            assert_eq!(said.len(), says.len(), "{case}: {said:#?}");
-            for (note, say) in said.iter().zip(says) {
-                assert!(note.contains(say), "{case}: {say}\n{note}");
-            }
-            if case.starts_with("no longer") {
-                assert!(said[1].contains(SPLIT), "{case}: the call cut at the room is asked for in parts at once: {}", said[1]);
-            }
-        }
-    }
-
     /// The bug this guards: a call the route streams, cut at every size, was
-    /// offered the room again after each cut at the usual limit, so the limits
-    /// alternated 4096 and 16384 until the iteration cap, with no count to end
-    /// it. The room is offered once a turn, and the calls cut after it count
-    /// toward the cap of four a run of cut replies has.
+    /// offered room once and then cut at the usual limit until the turn
+    /// ended. Every cut doubles the limit up to the declared longest reply,
+    /// and the raise holds for the turn; cut where it cannot grow, four more
+    /// replies are asked for in parts and a fifth ends the turn.
     #[tokio::test]
-    async fn a_call_cut_again_after_its_room_ends_the_turn_within_four_cuts() {
+    async fn cut_calls_double_the_limit_to_the_ceiling_then_end_the_turn() {
         let cut = raw_calls_sse(&[("c2", "write_file", r#"{"path":"big.txt","content":"Big\nlorem ips"#)], "length", None);
-        let (stop, sent, said) = cut_recovery_turn(&[&cut], None).await;
-        assert_eq!((stop.as_str(), sent.as_slice()), ("length", &[4096u64, 16384, 4096, 4096, 4096][..]));
-        assert_eq!(said.iter().filter(|n| n.contains("may be up to 16384 tokens")).count(), 1, "the room is offered once: {said:#?}");
-        assert_eq!(said.iter().filter(|n| n.contains("Send large content in parts")).count(), 4, "{said:#?}");
+        let (stop, sent, said) = cut_recovery_turn(&[&cut], Some(65_536)).await;
+        assert_eq!((stop.as_str(), sent.as_slice()), ("length", &[16_384u64, 32_768, 65_536, 65_536, 65_536, 65_536, 65_536][..]));
+        assert_eq!(said.iter().filter(|n| n.contains("Your replies may now be up to")).count(), 2, "{said:#?}");
+        assert_eq!(said.iter().filter(|n| n.contains("Send large content in parts")).count(), 5, "{said:#?}");
         let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
-        // A streamed call cut with a longer reply declared: the first ask is 16,384, the room four times it, and nothing arriving at the room gets the first doubling above it, at once.
-        let (stop, sent, said) = cut_recovery_turn(&[&cut, &lost_at(65_536), &whole, STOP_SSE], Some(393_216)).await;
-        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[16_384u64, 65_536, 131_072, 16_384][..]), "{said:#?}");
+        let (stop, sent, _) = cut_recovery_turn(&[&cut, &lost_at(32_768), &whole, STOP_SSE], Some(393_216)).await;
+        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[16_384u64, 32_768, 65_536, 65_536][..]), "the raise holds after an uncut reply");
     }
 
     /// The bug this guards: a reply the output cap cut before any call ran

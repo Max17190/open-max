@@ -159,30 +159,19 @@ and the run that writes a key already uses it.
   `length`, or a usage count at the limit), the last tool call of that
   reply, the one the limit cut, never runs, even when the server closed its
   arguments so they parse, and the model is told why; the calls before it
-  run as usual, once. At the default limit the next request alone then
-  carries room, four times the limit (16384) within the ceiling (below) and
-  what the window leaves,
-  and the model is asked to send the call again whole; the limit returns
-  with the request after it. The same room follows a reply cut while
-  writing its text, which is asked to continue the text, and a reply whose
-  call never arrived (below). A reply cut again at that room is asked for
-  in parts, except that one with no call, where the ceiling allows, gets
-  the first doubled limit above the room: no note offers less than the
-  room just cut. A room cut on a call or its text is spent: no request in
-  that turn carries room again, and from then on each reply cut on a call
-  counts as a cut the limit could not grow past (below), so the fifth cut
-  in a row ends the turn with `length`. A server that refuses the room
-  (HTTP 400 or 422) gets the request again at the usual limit and no more
-  room in that turn. A cut thought gets no room of its own, and its raised
-  limit is the plain doubling. The ceiling is the most any request asks
-  for: the model entry's `max_tokens`, which is the model's longest reply,
-  is the ceiling, and each request first asks for it up to 16384 (a bound
-  on how long a model thinks before it acts, measured to solve more tasks
-  than asking for the whole longest reply); a `max_tokens` other than 4096
-  in settings.json is both the limit and a ceiling (within the entry's);
-  with neither, the first ask is the default and the ceiling four times it
-  (16384). A limit at its ceiling asks for no room, and a cut call is
-  asked for in parts. A
+  run as usual, once. Every cut reply, on a thought, its text or a call,
+  doubles the limit for the rest of the turn, up to the ceiling and what
+  the window leaves, and the note names the new limit and asks for the call
+  again whole (or the text continued); a reply the limit no longer cuts
+  keeps the raised limit until the next prompt. The ceiling is the most
+  any request asks for: the model entry's `max_tokens`, which is the
+  model's longest reply, is the ceiling, and each request first asks for
+  it up to 16384 (a bound on how long a model thinks before it acts,
+  measured to solve more tasks than asking for the whole longest reply); a
+  `max_tokens` other than 4096 in settings.json is both the limit and a
+  ceiling (within the entry's); with neither, the first ask is the default
+  and the ceiling the room the window leaves. A limit at its ceiling cannot
+  grow, and a cut call there is asked for in parts. A
   reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
   before any tool call does not end the turn: it stays in the transcript
@@ -198,12 +187,10 @@ and the run that writes a key already uses it.
   either thinking that is not shown or such a call. A server can refuse a request that carries a reply
   holding reasoning and nothing else (HTTP 400 or 422): that reasoning then
   stops going back, in this session and after a resume, and the request is
-  sent once more without it. From the second reply in a row cut before any
-  tool call, the limit doubles for each further one, up to the ceiling, and
-  the note names the next limit; the first reply it does not cut returns it
-  to its start. So a model that must think longer than the limit is not
-  stopped by the limit alone. A server that refuses a raised limit (HTTP 400
-  or 422) gets the request again at the usual limit and no more raises in
+  sent once more without it. So a model that must think longer than the
+  limit is not stopped by the limit alone. A server that refuses a raised
+  limit (HTTP 400 or 422) gets the request again at the usual limit and no
+  more raises in
   that turn. Once the limit cannot grow, after four such continuations a
   fifth cut reply ends the turn with `length` (so does a cut on the turn's
   last iteration), and the terminal UI and print mode say which
@@ -214,8 +201,7 @@ and the run that writes a key already uses it.
   server reports incomplete at its output limit is continued the same way;
   a call in it is not kept.
   For a reasoning model the limit is also a bound on how long it thinks
-  in one reply before it acts; the room after a cut call or text can be
-  spent on thinking too, for that one request. Setup leaves it at the default for a Chat Completions
+  in one reply before it acts. Setup leaves it at the default for a Chat Completions
   connection unless the catalog reports a lower output maximum, which it
   saves; for a Responses or native Messages connection it still writes the
   catalog's output maximum when one is reported, and `openmax --check`
