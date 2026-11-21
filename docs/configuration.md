@@ -589,8 +589,11 @@ protocol vary, and some refuse a field they do not know. A provider that keeps
 its prompt cache per server and routes a conversation to one server by a
 header gets the key in that header instead, known by its host or by its model
 id (after any `vendor/` prefix), so a request through a proxy or gateway in
-front of it carries the header too. One such provider is known: `api.x.ai`,
-whose models are `grok-*`, by `x-grok-conv-id`. Without it, a request can meet
+front of it carries the header too. Two such providers are known: `api.x.ai`,
+whose models are `grok-*`, by `x-grok-conv-id`, and Modal's shared DeepSeek
+endpoints, whose models are `deepseek-ai/deepseek-*` (the whole id, vendor
+included), by `modal-routing-affinity-key`. Modal's GLM endpoints get no key:
+the NVFP4 one reads its cache back without it. Without it, a request can meet
 a server that never saw the conversation and prefill the whole history again
 at the uncached price. A provider whose own `headers` set that header keeps
 its value. Native Messages does not define the key.
