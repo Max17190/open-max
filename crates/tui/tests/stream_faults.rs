@@ -820,9 +820,12 @@ fn check_requests(run: &Run, log: &str) {
         if let Some(previous) = previous {
             let (a, b) = (fields(previous), fields(first));
             assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>(), "{log}");
-            for (key, value) in a.iter().filter(|(key, _)| key.as_str() != "messages") {
+            // A cut reply doubles max_tokens for the rest of the turn, so it never falls back; nothing else changes.
+            for (key, value) in a.iter().filter(|(key, _)| !matches!(key.as_str(), "messages" | "max_tokens")) {
                 assert_eq!(value.get(), b[key].get(), "{key} changed within a turn: {log}");
             }
+            let limit = |raw: &str| raw.parse::<u64>().expect("a numeric max_tokens");
+            assert!(limit(b["max_tokens"].get()) >= limit(a["max_tokens"].get()), "max_tokens fell within a turn: {log}");
             let (old, new) = (a["messages"].get(), b["messages"].get());
             let stem = format!("{},", &old[..old.len() - 1]);
             assert!(new.starts_with(&stem) && new.len() > stem.len(), "a request only appends to the one before: {log}");

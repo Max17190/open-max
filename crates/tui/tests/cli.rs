@@ -1881,8 +1881,8 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
 
 /// A reasoning model can spend a reply's whole `max_tokens` thinking: the
 /// reply comes back with finish reason `length`, no text and no call. Cuts in
-/// a row raise the limit up to its ceiling (four times the default when
-/// nothing declares one, within the window); once it cannot grow, the fifth
+/// a row raise the limit up to its ceiling (the room the window leaves when
+/// nothing declares one); once it cannot grow, the fifth
 /// cut there ends the turn, and the stop line names the setting, its value,
 /// the ceiling and where it is set. `--check --all` states the active model's
 /// limit and where
@@ -1901,7 +1901,7 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     assert_eq!(out.status.code(), Some(4), "{stderr}");
     assert!(stderr.contains(
         "openmax: stopped (length): the reply reached its output limit before it finished; reasoning counts toward it. \
-         The limit is max_tokens (now 4096, raised up to 14336 while replies are cut in a row), on the model's providers.json entry, else in settings.json. \
+         The limit is max_tokens (now 4096, raised up to 14336 by cut replies), on the model's providers.json entry, else in settings.json. \
          Run openmax --continue -p \"<follow-up>\" to continue, after raising it if replies need more room"), "{stderr}");
     // The first request asks for 4096; later ones ask for more, within what the 16,384-token window leaves, and the
     // turn ends once the limit cannot grow, before the script runs out.
@@ -1916,7 +1916,7 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     assert_eq!(code, Some(0), "{report}");
     assert!(!report.contains("max_tokens"), "the default limit is not a warning:\n{report}");
     let (_, all) = check(&["--check", "--all"]);
-    assert!(all.lines().any(|l| l.starts_with("ok   settings") && l.contains("reply limit max_tokens = 4096 from the default, raised up to 14336 (four times the default) while replies are cut in a row;")), "{all}");
+    assert!(all.lines().any(|l| l.starts_with("ok   settings") && l.contains("reply limit max_tokens = 4096 from the default, raised up to 14336 (the window) by cut replies;")), "{all}");
 
     let dir = home.join(".openmax");
     std::fs::write(dir.join("settings.json"), format!(r#"{{"base_url":"{base_url}","model":"stub-model","approval_mode":"ask","context_tokens":16384,"max_tokens":8192}}"#)).unwrap();
@@ -1937,7 +1937,7 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     let (_, report) = check(&["--check"]);
     assert!(!report.contains("max_tokens"), "{report}");
     let (_, all) = check(&["--check", "--all"]);
-    assert!(all.contains("reply limit max_tokens = 4096 from the default, raised up to 14336 (four times the default)"), "{all}");
+    assert!(all.contains("reply limit max_tokens = 4096 from the default, raised up to 14336 (the window)"), "{all}");
     // A Responses connection keeps nothing of reasoning the limit cut, so
     // there the default still warns.
     std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","wire_api":"responses","models":[{{"id":"stub-model","context_tokens":16384}}]}}}}}}"#)).unwrap();
@@ -1956,8 +1956,8 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
 /// benchmark declares each model's, gets it as each request's first ask up
 /// to 16,384. A model that must think 6,000 and then 30,000 tokens before
 /// each call finishes its task: the first thought fits, and the second is
-/// cut twice before the limit doubles to fit it; the reply after a call
-/// starts again at 16,384.
+/// cut once, which doubles the limit to fit it; the raise holds for the
+/// rest of the turn.
 #[test]
 fn a_model_that_thinks_past_the_first_ask_finishes_with_its_longest_reply_declared() {
     let (project, home) = fresh_dirs("long-thought");
@@ -2006,7 +2006,7 @@ fn a_model_that_thinks_past_the_first_ask_finishes_with_its_longest_reply_declar
     for file in ["a.txt", "b.txt"] {
         assert_eq!(std::fs::read_to_string(project.join(file)).ok().as_deref(), Some("done\n"), "{file}: {stderr}");
     }
-    assert_eq!(*asked.lock().unwrap(), [16_384, 16_384, 16_384, 32_768, 16_384], "{stderr}");
+    assert_eq!(*asked.lock().unwrap(), [16_384, 16_384, 32_768, 32_768], "{stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

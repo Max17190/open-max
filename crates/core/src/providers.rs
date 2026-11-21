@@ -150,9 +150,7 @@ pub struct ActiveEndpoint {
     pub context_tokens: usize,
     pub max_tokens: usize,
     pub reply_reserve: usize,
-    /// The limit of the one request after a reply the limit cut inside a tool call or its text (see `reply_room`).
-    pub reply_room: usize,
-    /// The longest reply a request may ask for: the most that replies cut in a row raise the limit to (see `reply_asks`).
+    /// The longest reply a request may ask for: the most that cut replies raise the limit to (see `reply_asks`).
     pub reply_ceiling: usize,
     /// Compaction ceiling in real tokens, before the window cap and calibration.
     pub compaction_tokens: usize,
@@ -177,34 +175,31 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
-/// The first reply limit, the reserve, the room after a cut call or text (four times the ask) and the ceiling for a
-/// `context`-token window. A model entry's `max_tokens` (its longest reply) is the ceiling, first asked for up to
-/// `FIRST_ASK` to bound thought; one chosen in settings is both. With neither, the ask is 4096 and the ceiling 4x it.
-fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>) -> (usize, usize, usize, usize) {
+/// The first reply limit, the reserve and the ceiling for a `context`-token window. A model entry's `max_tokens` (its
+/// longest reply) is the ceiling, first asked for up to `FIRST_ASK` to bound thought; one chosen in settings is both.
+/// With neither, the ask is 4096 and the ceiling the window's room; a server that refuses a raised limit stops raises.
+fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>) -> (usize, usize, usize) {
     const FIRST_ASK: usize = 16_384;
     let default = Settings::default().max_tokens;
     let chosen = (settings.max_tokens != default).then_some(settings.max_tokens);
     let ceiling = match (chosen, entry) {
         (Some(chosen), entry) => entry.map_or(chosen, |entry| entry.min(chosen)),
         (None, Some(entry)) => entry,
-        (None, None) => default * 4,
+        (None, None) => context,
     };
     let reserve = reply_limits(context, entry.map_or(settings.max_tokens, |entry| entry.min(settings.max_tokens))).1;
     let ask = reply_limits(context, if entry.is_some() { ceiling.min(chosen.unwrap_or(FIRST_ASK)) } else { settings.max_tokens }).0;
-    let ceiling = reply_limits(context, ceiling).0.max(ask);
-    (ask, reserve, ceiling.min(ask.saturating_mul(4)), ceiling)
+    (ask, reserve, reply_limits(context, ceiling).0.max(ask))
 }
 
 impl ActiveEndpoint {
     /// The limit a request with a `prompt`-token prompt carries: the room it leaves, within the reserve and max_tokens.
     pub(crate) fn reply_limit(&self, prompt: usize) -> usize { self.raised_limit(prompt, 0) }
-    /// [`Self::reply_limit`] with max_tokens doubled `raise` times, within the ceiling: the limit after replies cut in a row.
+    /// [`Self::reply_limit`] with max_tokens doubled `raise` times, within the ceiling: the limit after `raise` cut replies.
     pub(crate) fn raised_limit(&self, prompt: usize, raise: u32) -> usize {
         let ask = self.max_tokens.saturating_mul(1usize.checked_shl(raise).unwrap_or(usize::MAX)).min(self.reply_ceiling).max(self.max_tokens);
         self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_reserve, ask)
     }
-    /// The limit of the one request after a reply the limit cut inside a tool call or its text: the room, within what a `prompt`-token prompt leaves.
-    pub(crate) fn reply_room(&self, prompt: usize) -> usize { self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_limit(prompt), self.reply_room.max(self.max_tokens)) }
 }
 
 pub fn providers_path(data_dir: &Path) -> PathBuf {
@@ -707,7 +702,7 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
             .or(settings.context_tokens)
             .ok_or(ResolveError::MissingContextTokens)?
             .max(1);
-        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens));
+        let (max_tokens, reply_reserve, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens));
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
         // Sent anywhere else, it hands one server's credential to another.
@@ -735,7 +730,6 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
             context_tokens,
             max_tokens,
             reply_reserve,
-            reply_room,
             reply_ceiling,
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
@@ -768,7 +762,7 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
         .context_tokens
         .ok_or(ResolveError::MissingContextTokens)?
         .max(1);
-    let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, None);
+    let (max_tokens, reply_reserve, reply_ceiling) = reply_asks(context_tokens, settings, None);
     Ok(ActiveEndpoint {
         wire_api: WireApi::ChatCompletions,
         chatgpt: None,
@@ -780,7 +774,6 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
         context_tokens,
         max_tokens,
         reply_reserve,
-        reply_room,
         reply_ceiling,
         compaction_tokens: settings
             .compaction_tokens
@@ -1201,7 +1194,7 @@ mod tests {
         assert_eq!(ep.api_key.as_deref(), Some("sk-test"));
         assert_eq!(ep.context_tokens, 64000);
         assert_eq!(ep.max_tokens, 2048);
-        assert_eq!((ep.reply_room, ep.reply_room(0)), (2048, 2048), "a limit the model's entry sets is a ceiling for the request after a cut too");
+        assert_eq!((ep.reply_ceiling, ep.raised_limit(0, 3)), (2048, 2048), "a limit the model's entry sets is a ceiling for raises too");
         assert!(ep.headers.iter().any(|(k, v)| k == "X-Title" && v == "Open Max"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1608,7 +1601,7 @@ mod tests {
         // A declared longest reply is the ceiling, first asked for up to 16,384; the reserve stays the default's.
         write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":1048576,"max_tokens":393216}]}}}"#);
         let entry = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
-        assert_eq!((entry.max_tokens, entry.reply_reserve, entry.reply_room, entry.reply_ceiling), (16_384, 4096, 65_536, 393_216));
+        assert_eq!((entry.max_tokens, entry.reply_reserve, entry.reply_ceiling), (16_384, 4096, 393_216));
         assert_eq!(entry.reply_limit(1_000), 16_384, "the first request asks for the capped longest reply");
         assert_eq!(entry.reply_limit(1_048_576 - 1024 - 10_000), 10_000, "within what the prompt leaves of the window");
         assert_eq!(entry.reply_limit(1_048_576), 4096, "never under the reserve");
@@ -1625,11 +1618,12 @@ mod tests {
         let strict = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
         assert_eq!((strict.max_tokens, strict.reply_reserve, strict.reply_ceiling), (16_384, 4096, 30_720));
         assert_eq!(strict.reply_limit(20_000), 32_768 - 1024 - 20_000);
-        // An entry that declares no longest reply keeps the default first ask and its doublings up to four times it.
+        // An entry that declares no longest reply keeps the default first ask, and its doublings reach the window's room.
         write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":1048576}]}}}"#);
         let unknown = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
-        assert_eq!((unknown.max_tokens, unknown.reply_reserve, unknown.reply_room, unknown.reply_ceiling), (4096, 4096, 16_384, 16_384));
-        assert_eq!((1..=3).map(|raise| unknown.raised_limit(1_000, raise)).collect::<Vec<_>>(), [8192, 16_384, 16_384]);
+        assert_eq!((unknown.max_tokens, unknown.reply_reserve, unknown.reply_ceiling), (4096, 4096, 1_048_576 - 2048));
+        assert_eq!((1..=3).map(|raise| unknown.raised_limit(1_000, raise)).collect::<Vec<_>>(), [8192, 16_384, 32_768]);
+        assert_eq!(unknown.raised_limit(1_048_576 - 1024 - 50_000, 30), 50_000, "within what the prompt leaves");
         let flat = |context_tokens: usize, max_tokens: usize| {
             let s = Settings { base_url: "http://t/v1".into(), model: "m".into(), context_tokens: Some(context_tokens), max_tokens, ..Default::default() };
             let ep = resolve(&s, &dir.join("none")).unwrap();
