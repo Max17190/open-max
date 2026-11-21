@@ -729,8 +729,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // CEILING was raised for it by its owner. Stopping a bash command whose
     // processes sit idle (`stuck_command_secs`), with offsetting trims in
     // run_process and run_bash, removed 1. Doubling the reply limit on every
-    // cut, in place of the one-request room after a cut call or text, removed 14.
-    const BASELINE: usize = 45_118;
+    // cut, in place of the one-request room after a cut call or text, removed 15.
+    const BASELINE: usize = 45_117;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
