@@ -795,13 +795,9 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
 }
 
 /// Chat Completions providers that keep a prompt cache per server and send a
-/// conversation's requests to one server by a header: host (empty for none),
-/// model id prefix (which names the provider behind a proxy or gateway too;
-/// see `serves`), header. Modal's shared endpoints name DeepSeek models
-/// `deepseek-ai/...` and route by an affinity key; its GLM NVFP4 endpoint
-/// reads its cache back without one, so only DeepSeek gets it.
-pub const CACHE_ROUTES: &[(&str, &str, &str)] =
-    &[("api.x.ai", "grok-", "x-grok-conv-id"), ("", "deepseek-ai/deepseek-", "modal-routing-affinity-key")];
+/// conversation's requests to one server by a header: host ("" for none), model
+/// id prefix (see `serves`), header. Modal's GLM NVFP4 caches without its key.
+pub const CACHE_ROUTES: &[(&str, &str, &str)] = &[("api.x.ai", "grok-", "x-grok-conv-id"), ("", "deepseek-ai/deepseek-", "modal-routing-affinity-key")];
 
 /// Chat Completions routes that cache a model's prompt only up to a
 /// `cache_control` marker, and so read nothing back from a request without
@@ -852,13 +848,11 @@ pub fn validate_reasoning_effort(base: &str, wire: WireApi, model: &str, effort:
 }
 
 /// Whether a request to `base` for `model` reaches the provider known by
-/// `host` (none when empty), or by a model id `prefix` (so behind a proxy or
-/// gateway too): after any `vendor/` prefix, or over the whole id when the
-/// prefix names a vendor itself.
+/// `host` (unless empty), or by a model id `prefix` (so behind a proxy or
+/// gateway too): over the whole id if it names a vendor, else after any `vendor/`.
 pub(crate) fn serves(base: &str, model: &str, host: &str, prefix: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    let id = if prefix.contains('/') { model.as_str() } else { model.rsplit('/').next().unwrap_or_default() };
-    (!host.is_empty() && reqwest::Url::parse(base.trim()).is_ok_and(|url| url.host_str() == Some(host))) || id.starts_with(prefix)
+    let (model, whole) = (model.to_ascii_lowercase(), prefix.contains('/'));
+    (!host.is_empty() && reqwest::Url::parse(base.trim()).is_ok_and(|url| url.host_str() == Some(host))) || (if whole { model.as_str() } else { model.rsplit('/').next().unwrap_or_default() }).starts_with(prefix)
 }
 
 fn validate_chatgpt(base: &str, wire: WireApi, extra_credentials: bool) -> Result<(), String> {
