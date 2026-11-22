@@ -1039,8 +1039,6 @@ impl App {
             .collect()
     }
 
-    // ---------- terminal events ----------
-
     /// Handles one input event and returns whether the next frame shows it,
     /// which paint pacing counts as input awaiting a paint. A focus report
     /// changes nothing on screen, even while an agent frame waits, and an
@@ -2151,8 +2149,6 @@ impl App {
         }
     }
 
-    // ---------- submission and slash commands ----------
-
     async fn handle_submit(&mut self, text: String) -> std::io::Result<()> {
         // A turn, /status, and /permissions all read the mode.
         self.refresh_project_root();
@@ -2348,6 +2344,7 @@ impl App {
                         self.project.join(given)
                     }
                 };
+                #[expect(clippy::disallowed_methods, reason = "writes where the user points, through links and keeping the file's mode; a failure is reported")]
                 match std::fs::write(&target, self.transcript.export_text()) {
                     Ok(()) => self.note(&format!("exported transcript to {}", target.display())),
                     Err(e) => self.error(&format!("export to {} failed: {e}", target.display())),
@@ -2616,8 +2613,6 @@ impl App {
             .await
             .unwrap_or_else(|_| registry::Registry::builtin_only())
     }
-
-    // ---------- core events ----------
 
     async fn on_core_event(&mut self, env: AgentEventEnvelope) {
         if self.session_id.as_deref() == Some(env.session_id.as_str()) {
@@ -3123,8 +3118,6 @@ impl App {
         }
     }
 
-    // ---------- blocks ----------
-
     fn insert_user_block(&mut self, text: &str) {
         let lines = text
             .lines()
@@ -3171,8 +3164,6 @@ impl App {
         self.transcript.push(lines);
         self.dirty.mark_chat();
     }
-
-    // ---------- drawing ----------
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();

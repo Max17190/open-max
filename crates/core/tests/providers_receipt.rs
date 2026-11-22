@@ -5,6 +5,7 @@
 //! agent cannot tell when it applies) and a malformed edit is worse than
 //! silent: the runtime parses it to an EMPTY catalog, surfacing turns later
 //! as "unknown provider" - an error pointed at the wrong problem.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
 

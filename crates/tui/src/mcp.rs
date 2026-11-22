@@ -683,7 +683,7 @@ fn handed_image(data: &str) -> Option<String> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim_end()).ok()?;
     open_max_core::tools::image_mime(&bytes)?;
     let name = format!("{:04}", HANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    std::fs::write(std::path::Path::new(&dir).join(&name), bytes).ok().map(|_| name)
+    open_max_core::sessions::write_atomic(&std::path::Path::new(&dir).join(&name), bytes).ok().map(|_| name)
 }
 
 /// The decoded size of base64 text, without decoding it.

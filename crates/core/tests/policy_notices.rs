@@ -7,6 +7,7 @@
 //! the model never sees. Each distinct notice lands in the transcript once
 //! per session - repetition there is token spend, and the condition holds
 //! every turn once it holds at all.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
 

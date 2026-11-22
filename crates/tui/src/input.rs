@@ -619,11 +619,10 @@ impl Composer {
             if let Some(dir) = self.history_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
+            #[expect(clippy::disallowed_methods, reason = "saved on every Enter, where a sync would stall the screen; the history is a convenience")]
             let _ = std::fs::write(&self.history_path, json);
         }
     }
-
-    // ---------- display layout ----------
 
     /// Cache the wrap for `text_width`, reusing it while the text and width
     /// hold. Wrapping is O(draft), and a frame asks for it twice; a 100 KB
@@ -769,8 +768,6 @@ impl Composer {
         (out, cursor_x.min(width.saturating_sub(1)), cursor_y)
     }
 
-    // ---------- mouse ----------
-
     /// Move the cursor to a click at `(cell, row)` relative to the render
     /// area, and start a selection there.
     pub fn click_at(&mut self, width: u16, max_h: u16, cell: u16, row: u16) {
@@ -881,8 +878,6 @@ impl Composer {
         };
         (target.line, col.min(end))
     }
-
-    // ---------- selection ----------
 
     pub fn has_selection(&self) -> bool {
         self.selection_bounds().is_some()

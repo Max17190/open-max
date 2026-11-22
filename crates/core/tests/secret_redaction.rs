@@ -5,6 +5,7 @@
 //! started from bash needs, so one `env` prints every key there. The values
 //! are redacted where the result enters the transcript: this drives a real
 //! turn whose bash call runs `env` and checks what the next request sends.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

@@ -1,6 +1,7 @@
 //! A host that refuses a request for an image a tool just returned. Its own
 //! test binary: turning image input on changes the read_file schema every
 //! registry built in the process reads, which other tests would see.
+#![allow(clippy::disallowed_methods)]
 mod common;
 
 use std::path::PathBuf;

@@ -80,9 +80,7 @@ impl Cache {
     }
 
     #[cold] fn write(&self, data_dir: &Path) {
-        let tmp = data_dir.join(format!("update-check.json.{}", std::process::id()));
-        let _ = std::fs::create_dir_all(data_dir).and_then(|_| std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default()))
-            .and_then(|_| std::fs::rename(&tmp, data_dir.join("update-check.json")));
+        let _ = std::fs::create_dir_all(data_dir).map(|_| open_max_core::sessions::write_atomic(&data_dir.join("update-check.json"), serde_json::to_vec(self).unwrap_or_default()));
     }
 
     /// A day old, never checked, or stamped ahead by a clock that moved back.

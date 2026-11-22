@@ -6,6 +6,7 @@
 //! every merge group, well before a tag would find out. Those builds also
 //! hold each binary to its size budget, which a tag does not read: there,
 //! main's run of the merge that grew a binary is the only check.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

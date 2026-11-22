@@ -16,6 +16,7 @@
 //! connection does. Any request past the script gets a 400 the client does
 //! not resend, so a wrong expectation, or a regression that adds attempts,
 //! fails at once instead of spending the retry budget.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read, Write};

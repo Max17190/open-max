@@ -7,6 +7,7 @@
 //! stdout before any test runs, and stdout is the server's protocol channel,
 //! so this target has no libtest harness (`harness = false`): `main` either
 //! serves or runs the tests listed in `TESTS`.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;

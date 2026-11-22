@@ -10,6 +10,7 @@
 //! gate whose script refuses everything locked the session the same way, and
 //! two gates that cannot start each blocked the other's repair. Each case is
 //! driven end to end here, turn by turn, in one session.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

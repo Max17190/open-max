@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "std::fs::write", reason = "a crash or full disk mid-write leaves the file cut short; use open_max_core::sessions::write_atomic" },
+    { path = "std::fs::File::create", reason = "it truncates in place, so a failed write loses the old bytes; use open_max_core::sessions::write_atomic" },
+    { path = "std::fs::File::set_len", reason = "cutting a file in place loses its bytes if the write after fails; use open_max_core::sessions::write_atomic, or #[expect] it with the reason it is safe" },
+]

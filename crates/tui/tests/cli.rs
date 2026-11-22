@@ -2,6 +2,7 @@
 //! the --stdio handshake, and a full print-mode turn against a stub
 //! OpenAI-compatible server. These are the contracts scripts and frontends
 //! build on, exercised exactly as a user's shell would.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
