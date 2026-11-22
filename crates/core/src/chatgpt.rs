@@ -595,6 +595,13 @@ async fn login_at(
     Ok(Login { message, plan_enabled: enabled })
 }
 
+/// Every stored token, labelled by account, as read without a refresh.
+pub(crate) fn stored_tokens(dir: &Path) -> Vec<(String, String)> {
+    let accounts = load(dir).map(|store| store.accounts).unwrap_or_default();
+    let tokens = accounts.into_iter().filter_map(|(name, account)| Some((format!("ChatGPT {name} token"), account.tokens?)));
+    tokens.flat_map(|(label, t)| [t.access, t.refresh, t.id].map(|token| (label.clone(), token))).collect()
+}
+
 pub fn status(dir: &Path) -> Result<Vec<String>, String> {
     Ok(load(dir)?
         .accounts

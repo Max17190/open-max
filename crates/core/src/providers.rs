@@ -891,11 +891,13 @@ fn settings_key(key: Option<&str>) -> Option<String> {
 
 /// Every credential value, labelled by where it is set: each variable whose
 /// name marks one, settings' key, and each provider's `api_key`, `api_key_env`
-/// variables and headers (a `Bearer <token>` one by its token too).
+/// variables and headers (a `Bearer <token>` one by its token too), and the
+/// stored ChatGPT tokens.
 pub(crate) fn credentials(settings_api_key: Option<&str>, data_dir: &Path) -> Vec<(String, String)> {
     let env = std::env::vars_os().filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
     let mut found: Vec<_> = env.filter(|(name, _)| secret_name(name)).collect();
     found.extend(settings_key(settings_api_key).map(|key| ("settings api_key".into(), key)));
+    found.extend(crate::chatgpt::stored_tokens(data_dir));
     for (name, p) in load_snapshot(data_dir).0 {
         found.extend(p.api_key.as_deref().and_then(expand_secret).map(|key| (format!("provider {name} api_key"), key)));
         found.extend(p.api_key_env.iter().filter_map(|var| Some((var.clone(), std::env::var(var).ok()?))));
@@ -917,13 +919,13 @@ fn secret_name(name: &str) -> bool {
 /// `text` with each credential value replaced by `[redacted <label>]`,
 /// longest first. A value under 12 bytes is left: too short for a key, and
 /// likely ordinary text. Exact matches only, a guard against accidents.
-pub(crate) fn redact(text: &str, found: Vec<(String, String)>) -> std::borrow::Cow<'_, str> {
-    let mut found: Vec<_> = found.into_iter().map(|(label, value)| (label, value.trim().to_string())).filter(|(_, v)| v.len() >= 12).collect();
+pub(crate) fn redact<'a>(text: &'a str, found: &[(String, String)]) -> std::borrow::Cow<'a, str> {
+    let mut found: Vec<_> = found.iter().map(|(label, value)| (label, value.trim())).filter(|(_, v)| v.len() >= 12).collect();
     found.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
     let mut text = std::borrow::Cow::Borrowed(text);
-    for (label, value) in &found {
-        if text.contains(value.as_str()) {
-            text = text.replace(value.as_str(), &format!("[redacted {}]", crate::text::one_line(label))).into();
+    for (label, value) in found {
+        if text.contains(value) {
+            text = text.replace(value, &format!("[redacted {}]", crate::text::one_line(label))).into();
         }
     }
     text
@@ -1796,8 +1798,8 @@ mod tests {
         let found: Vec<_> = found.iter().map(|(label, value)| (label.to_string(), value.to_string())).collect();
         let text = "A_API_KEY=sk-abcdef123456\nB_API_KEY=sk-abcdef123456-longer\nSHORT_TOKEN=true\n";
         let expected = "A_API_KEY=[redacted A_API_KEY]\nB_API_KEY=[redacted B_API_KEY]\nSHORT_TOKEN=true\n";
-        assert_eq!(redact(text, found.clone()), expected);
-        assert!(matches!(redact("nothing here", found), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(redact(text, &found), expected);
+        assert!(matches!(redact("nothing here", &found), std::borrow::Cow::Borrowed(_)));
     }
 
     /// Every key the configuration names is collected, wherever its value

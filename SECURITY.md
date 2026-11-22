@@ -19,7 +19,7 @@ Include:
 
 `bash`, external TOML tools and hooks are native processes. They run with your user's access, and the harness does not confine them to the project root. Permissions, approvals and `mutating` metadata decide whether Open Max dispatches a tool call; they are not operating-system isolation. So a model running a command you allowed, under the approval mode and permission rules you chose, is not a vulnerability.
 
-`bash` and hooks inherit your environment, which a sub-agent started from bash needs for its provider key. What a tool returns to the model has each credential value replaced by `[redacted <name>]`: the value of every variable whose name ends like a credential (`_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `ACCESS_KEY`, `SECRET_KEY`, `PRIVATE_KEY`), and every key and header the settings and providers name, at 12 bytes or more. It matches values exactly, so it stops an `env` or a `cat .env` from sending a key to the provider, not a command that encodes one first.
+`bash` and hooks inherit your environment, which a sub-agent started from bash needs for its provider key. What a tool returns to the model, and the diff it shows you, has each credential value replaced by `[redacted <name>]`: the value of every variable whose name ends like a credential (`_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `ACCESS_KEY`, `SECRET_KEY`, `PRIVATE_KEY`), every key and header the settings and providers name, and the stored ChatGPT tokens, at 12 bytes or more. It matches values exactly, so it stops an `env` or a `cat .env` from sending a key to the provider, not a command that encodes one first.
 
 These are:
 

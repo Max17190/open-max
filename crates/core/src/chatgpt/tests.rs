@@ -856,3 +856,15 @@ async fn catalog_and_provider_resolution_keep_credentials_and_defaults_separate(
         assert!(providers::resolve(&settings, &scratch.0).is_err(), "{field}");
     }
 }
+
+/// What a tool result redacts after a ChatGPT login: each stored token,
+/// read without a refresh; nothing when no one is signed in.
+#[test]
+fn stored_tokens_are_listed_for_redaction() {
+    let scratch = Scratch::new();
+    assert!(stored_tokens(&scratch.0).is_empty());
+    seeded(&scratch.0);
+    let label = "ChatGPT main token".to_string();
+    let expected: Vec<_> = ["old-access", "old-refresh", "old-id"].map(|token| (label.clone(), token.to_string())).into();
+    assert_eq!(stored_tokens(&scratch.0), expected);
+}

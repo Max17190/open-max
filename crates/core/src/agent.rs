@@ -108,15 +108,16 @@ fn tool_message_content(ok: bool, output: &str) -> String {
 /// End a call: its diff and `ToolEnd` on the wire, then its reply in the
 /// transcript. Approval timeouts are not model errors, so that reply carries
 /// no "Error:" prefix, which would push small models into pointless retries.
-/// Both carry the output with credential values redacted: the shell keeps
+/// All carry credential values redacted: the shell keeps
 /// the user's environment (a sub-agent needs the key), and `env` prints it.
 pub(crate) fn end_call(core: &Core, session_id: &str, call_id: &str, outcome: &tools::ToolOutcome, messages: &mut Vec<ChatMessage>) {
+    let key = core.settings.lock().unwrap_or_else(|e| e.into_inner()).api_key.clone();
+    let found = crate::providers::credentials(key.as_deref(), &core.data_dir);
     if let Some(d) = &outcome.diff {
-        let (path, diff, added, removed) = (d.path.clone(), d.diff.clone(), d.added, d.removed);
+        let (path, diff, added, removed) = (d.path.clone(), crate::providers::redact(&d.diff, &found).into_owned(), d.added, d.removed);
         core.send_agent(session_id, AgentEvent::Diff { call_id: call_id.into(), path, diff, added, removed });
     }
-    let key = core.settings.lock().unwrap_or_else(|e| e.into_inner()).api_key.clone();
-    let output = crate::providers::redact(&outcome.output, crate::providers::credentials(key.as_deref(), &core.data_dir));
+    let output = crate::providers::redact(&outcome.output, &found);
     core.send_agent(session_id, AgentEvent::ToolEnd { call_id: call_id.into(), ok: outcome.ok, output: output.to_string(), duration_ms: None });
     let mut message = ChatMessage::tool(call_id, tool_message_content(outcome.ok, &output));
     message.images = Some(outcome.images.clone()).filter(|images| !images.is_empty());
