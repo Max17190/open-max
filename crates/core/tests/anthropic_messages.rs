@@ -221,6 +221,29 @@ async fn native_invalid_and_incomplete_streams_never_return_executable_tools() {
     }
 }
 
+/// A reply cut at its limit inside a call, with no content_block_stop for
+/// it (as Haiku 5.5 streams it), ends as a cut reply: its text and signed
+/// thinking are kept, and no call from it runs.
+#[tokio::test]
+async fn native_reply_cut_inside_a_call_ends_as_length_without_the_call() {
+    let open_call=tool_response().replace(&event(json!({"type":"content_block_stop","index":1})),"")
+        .replace("\"stop_reason\":\"tool_use\"","\"stop_reason\":\"max_tokens\"");
+    let late_stop=open_call.replace(&event(json!({"type":"message_stop"})),&(event(json!({"type":"content_block_stop","index":1}))+&event(json!({"type":"message_stop"}))));
+    let mid_json=open_call.replace(&event(json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"note.txt\"}"}})),"");
+    let open_text=text_response().replace(&event(json!({"type":"content_block_stop","index":0})),"").replace("\"end_turn\"","\"max_tokens\"");
+    let open_thinking=start()+&event(json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}))
+        +&event(json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"still thinking"}}))+&end("max_tokens");
+    for (response,content,thinking) in [(open_call,"",true),(late_stop,"",true),(mid_json,"",true),(open_text,"verified",false),(open_thinking,"",false)] {
+        let scratch=Scratch::new();let(base,server)=serve(vec![(200,response)]).await;
+        let client=client(&scratch,&base,None);
+        let result=run(&client,&[ChatMessage::user("inspect")]).await.unwrap();
+        assert_eq!((result.finish_reason.as_str(),result.content.as_str(),result.tool_calls.len()),("length",content,0));
+        let stored=result.reasoning_details.map(|raw|raw.get().to_string()).unwrap_or_default();
+        assert_eq!((stored.contains("fixture-signature"),stored.contains("still thinking"),stored.contains("tool_use")),(thinking,false,false));
+        assert_eq!(server.await.unwrap().len(),1);
+    }
+}
+
 /// A native reply cut after its text began is asked for again with the same
 /// body, and what the server counted for the cut reply reaches the caller
 /// before the resend, apart from the finished reply's own usage.
