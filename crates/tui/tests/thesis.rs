@@ -728,13 +728,15 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // changed a file it was given, added 94, and
     // CEILING was raised for it by its owner. Stopping a bash command whose
     // processes sit idle (`stuck_command_secs`), with offsetting trims in
-    // run_process and run_bash, removed 1.
-    const BASELINE: usize = 45_132;
+    // run_process and run_bash, removed 1. Keeping credential values out of
+    // tool results and diffs added 54, and CEILING was raised for it by its
+    // owner.
+    const BASELINE: usize = 45_186;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 45_133;
+    const CEILING: usize = 45_186;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 
@@ -4795,8 +4797,10 @@ fn headless_turn_peak_rss_stays_under_its_ratchet() {
     const TARGET: u64 = 4_000_000;
     // The pinned turn's memory beyond the pinned floor, measured above, plus
     // 128 KiB, plus 32 KiB (two code pages) for the update notice and
-    // /update, which CI's runner measured at 4,032 KiB against main's 4,000.
-    const RATCHET: u64 = (3888 + 128 + 32) * KIB;
+    // /update, which CI's runner measured at 4,032 KiB against main's 4,000,
+    // plus 96 KiB for redacting credentials in tool results, measured at
+    // 4,080 and 4,112 KiB against main's 3,968, raised for by its owner.
+    const RATCHET: u64 = (3888 + 128 + 32 + 96) * KIB;
     const RUNS: usize = 11;
     // Where the ratchet was measured: macOS on Apple silicon, in a release
     // build.
