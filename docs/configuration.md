@@ -176,10 +176,12 @@ and the run that writes a key already uses it.
   room in that turn. A cut thought gets no room of its own, and its raised
   limit is the plain doubling. The ceiling is the most any request asks
   for: the model entry's `max_tokens`, which is the model's longest reply,
-  so declaring it keeps the default limit as each request's first ask; a
-  `max_tokens` other than 4096 in settings.json is both the limit and a
-  ceiling (within the entry's); with neither, the ceiling is four times the
-  default (16384). A limit at its ceiling asks for no room, and a cut call is
+  is the ceiling, and each request first asks for it up to 16384 (a bound
+  on how long a model thinks before it acts, measured to solve more tasks
+  than asking for the whole longest reply); a `max_tokens` other than 4096
+  in settings.json is both the limit and a ceiling (within the entry's);
+  with neither, the first ask is the default and the ceiling four times it
+  (16384). A limit at its ceiling asks for no room, and a cut call is
   asked for in parts. A
   reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
@@ -217,12 +219,13 @@ and the run that writes a key already uses it.
   connection unless the catalog reports a lower output maximum, which it
   saves; for a Responses or native Messages connection it still writes the
   catalog's output maximum when one is reported, and `openmax --check`
-  warns while such a connection runs at the default. To let cut replies be
-  raised up to the model's longest reply, set `max_tokens` on the model's
-  providers.json entry to it; to raise every request's first ask, set it in
-  settings.json: the input budget holds back at most the
-  larger of 4096 and an eighth of the window for it, and a request asks for
-  more only when its prompt leaves the room. A 4096 counts as chosen only on
+  warns while such a connection runs at the default. To have each request
+  first ask for the model's longest reply up to 16384, and let cut replies
+  be raised up to all of it, set `max_tokens` on the model's providers.json
+  entry to it: the input budget still holds back only the default's 4096
+  for it, and a request asks for more only when its prompt leaves the room. Set in settings.json, it is the limit for every model,
+  and the input budget holds back at most the larger of 4096 and an eighth
+  of the window for it. A 4096 counts as chosen only on
   the model's entry: every settings save writes 4096 to settings.json when
   the limit is unset. `openmax --check --all` states the active model's
   limit and where it is set.
@@ -358,7 +361,9 @@ tokens of headroom, where
 
     reply_reserve = min(max_tokens, max(4096, context_tokens / 8))
 
-with `max_tokens` after its clamp above. Each request carries the reply limit
+with `max_tokens` after its clamp above, and the settings limit within the
+model entry's (so 4096 at most when only the entry declares one). Each
+request carries the reply limit
 
     limit = clamp(context_tokens - 1024 - prompt, reply_reserve, max_tokens)
 
