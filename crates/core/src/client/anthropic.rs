@@ -380,6 +380,7 @@ pub(super) async fn read(
                             closed: false,
                         });
                     }
+                    Some("content_block_delta" | "content_block_stop") if matches!(reason.as_deref(), Some("max_tokens" | "model_context_window_exceeded")) => {}
                     Some("content_block_delta" | "content_block_stop") => {
                         let index = event["index"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or("invalid Messages block index")?;
                         let block = blocks.get_mut(index).filter(|b| !b.closed).ok_or("Messages delta for absent or closed block")?;
@@ -426,16 +427,17 @@ pub(super) async fn read(
                         }
                     }
                     Some("message_delta") => {
+                        let stop = event["delta"]["stop_reason"].as_str();
+                        // A cut can end inside a block with no content_block_stop: keep its text; no call from a cut reply runs.
+                        if started && matches!(stop, Some("max_tokens" | "model_context_window_exceeded")) {
+                            blocks.retain_mut(|b| { b.closed |= b.value["type"] == "text"; b.closed && b.value["type"] != "tool_use" });
+                        }
                         if !started || blocks.iter().any(|b| !b.closed) {
                             return Err("Messages ended with an open block".into());
                         }
-                        if let Some(stop) = event["delta"]["stop_reason"].as_str() {
-                            reason = Some(stop.to_owned());
-                        }
+                        if let Some(stop) = stop { reason = Some(stop.to_owned()); }
                         if let Some(counts) = event["usage"].as_object() {
-                            if !usage.is_object() {
-                                usage = json!({});
-                            }
+                            if !usage.is_object() { usage = json!({}); }
                             usage.as_object_mut().unwrap().extend(counts.clone());
                         }
                     }
@@ -455,10 +457,7 @@ pub(super) async fn read(
             }
             if event["type"] == "message_stop" {
                 if !started || blocks.iter().any(|b| !b.closed) {
-                    return (
-                        reply,
-                        failed("Messages stopped before blocks completed".into()),
-                    );
+                    return (reply, failed("Messages stopped before blocks completed".into()));
                 }
                 return match complete(
                     blocks.into_iter().map(|b| b.value).collect(),
