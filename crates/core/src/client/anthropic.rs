@@ -216,7 +216,7 @@ fn complete(blocks: Vec<Value>, reason: &str, usage: Value) -> Result<Completion
     if reason == "tool_use" && reply.tool_calls.is_empty() {
         return Err("Messages stopped for tool use without a call".into());
     }
-    if reason != "tool_use" && !reply.tool_calls.is_empty() {
+    if !matches!(reason, "tool_use" | "max_tokens" | "model_context_window_exceeded") && !reply.tool_calls.is_empty() {
         return Err("Messages returned tool calls without a tool-use stop".into());
     }
     if blocks.iter().any(|b| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking"))) {
@@ -292,6 +292,7 @@ pub(super) async fn read(
     let mut started = false;
     let mut blocks: Vec<Block> = Vec::new();
     let mut reason = None;
+    let mut cut = None;
     let mut usage = json!({});
     loop {
         let next = tokio::select! {
@@ -366,19 +367,12 @@ pub(super) async fn read(
                                     on_delta(StreamDelta::Content(text.into()));
                                 }
                             }
-                            Some("thinking") => {
-                                if !block["thinking"].is_string() {
-                                    return Err("invalid Messages thinking".into());
-                                }
-                            }
+                            Some("thinking") if !block["thinking"].is_string() => return Err("invalid Messages thinking".into()),
+                            Some("thinking") => {}
                             Some("redacted_thinking" | "tool_use") => {}
                             _ => return Err("unsupported Messages content block".into()),
                         }
-                        blocks.push(Block {
-                            value: block,
-                            arguments: String::new(),
-                            closed: false,
-                        });
+                        blocks.push(Block { value: block, arguments: String::new(), closed: false });
                     }
                     Some("content_block_delta" | "content_block_stop") => {
                         let index = event["index"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or("invalid Messages block index")?;
@@ -426,11 +420,19 @@ pub(super) async fn read(
                         }
                     }
                     Some("message_delta") => {
+                        if let Some(stop) = event["delta"]["stop_reason"].as_str() { reason = Some(stop.to_owned()); }
+                        // The cap can stop a reply inside its blocks, which never close. Only the last can be a cut call: it keeps its partial arguments
+                        // (so it never runs) and goes back with the input they make, or empty. Other open calls and an unsigned thought are dropped.
+                        if matches!(reason.as_deref(), Some("max_tokens" | "model_context_window_exceeded")) {
+                            let last = blocks.len().saturating_sub(1);
+                            blocks = std::mem::take(&mut blocks).into_iter().enumerate().filter(|(i, b)| b.closed || b.value["type"] == "text" || b.value["type"] == "tool_use" && *i == last).map(|(_, b)| b).collect();
+                            for block in blocks.iter_mut().filter(|b| !b.closed) {
+                                if block.value["type"] == "tool_use" { block.value["input"] = serde_json::from_str::<Value>(&block.arguments).ok().filter(Value::is_object).unwrap_or_else(|| json!({})); cut = Some(std::mem::take(&mut block.arguments)); }
+                                block.closed = true;
+                            }
+                        }
                         if !started || blocks.iter().any(|b| !b.closed) {
                             return Err("Messages ended with an open block".into());
-                        }
-                        if let Some(stop) = event["delta"]["stop_reason"].as_str() {
-                            reason = Some(stop.to_owned());
                         }
                         if let Some(counts) = event["usage"].as_object() {
                             if !usage.is_object() {
@@ -455,17 +457,13 @@ pub(super) async fn read(
             }
             if event["type"] == "message_stop" {
                 if !started || blocks.iter().any(|b| !b.closed) {
-                    return (
-                        reply,
-                        failed("Messages stopped before blocks completed".into()),
-                    );
+                    return (reply, failed("Messages stopped before blocks completed".into()));
                 }
-                return match complete(
-                    blocks.into_iter().map(|b| b.value).collect(),
-                    reason.as_deref().unwrap_or(""),
-                    usage,
-                ) {
-                    Ok(done) => (done, None),
+                return match complete(blocks.into_iter().map(|b| b.value).collect(), reason.as_deref().unwrap_or(""), usage) {
+                    Ok(mut done) => {
+                        if let (Some(arguments), Some(call)) = (cut, done.tool_calls.last_mut()) { call.function.arguments = arguments; }
+                        (done, None)
+                    }
                     Err(error) => (reply, failed(error)),
                 };
             }
