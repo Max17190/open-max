@@ -541,8 +541,10 @@ fn proxy_tool_from_the_spec() {
         .as_str()
         .unwrap()
         .to_string();
+    // The server echoed the granted value, which the result names instead of
+    // showing: a credential's value never goes back to the model.
     assert!(
-        result.contains("echo: hello from the model; NOTES_TOKEN=granted-token; NOT_GRANTED=unset"),
+        result.contains("echo: hello from the model; NOTES_TOKEN=[redacted NOTES_TOKEN]; NOT_GRANTED=unset"),
         "the call reaches the server with exactly the granted credentials: {result}"
     );
     assert!(result.contains("[image image/png, 2 bytes]"), "{result}");

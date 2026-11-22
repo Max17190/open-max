@@ -889,6 +889,48 @@ fn settings_key(key: Option<&str>) -> Option<String> {
     provider_key(key, &["OPENMAX_API_KEY".into()])
 }
 
+/// Every credential value, labelled by where it is set: each variable whose
+/// name marks one, settings' key, and each provider's `api_key`, `api_key_env`
+/// variables and headers (a `Bearer <token>` one by its token too), and the
+/// stored ChatGPT tokens.
+pub(crate) fn credentials(settings_api_key: Option<&str>, data_dir: &Path) -> Vec<(String, String)> {
+    let env = std::env::vars_os().filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
+    let mut found: Vec<_> = env.filter(|(name, _)| secret_name(name)).collect();
+    found.extend(settings_key(settings_api_key).map(|key| ("settings api_key".into(), key)));
+    found.extend(crate::chatgpt::stored_tokens(data_dir));
+    for (name, p) in load_snapshot(data_dir).0 {
+        found.extend(p.api_key.as_deref().and_then(expand_secret).map(|key| (format!("provider {name} api_key"), key)));
+        found.extend(p.api_key_env.iter().filter_map(|var| Some((var.clone(), std::env::var(var).ok()?))));
+        for (header, value) in expand_headers(&p.headers) {
+            found.extend(value.split_once(' ').map(|(_, token)| (format!("provider {name} header {header}"), token.into())));
+            found.push((format!("provider {name} header {header}"), value));
+        }
+    }
+    found
+}
+
+/// Whether a variable's name marks its value as a credential, by its end
+/// only: `GITHUB_TOKEN` does, `GITHUB_TOKEN_PATH` and `CONTEXT_TOKENS` do not.
+fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["API_KEY", "APIKEY", "ACCESS_KEY", "SECRET_KEY", "PRIVATE_KEY", "_TOKEN", "_SECRET", "_PASSWORD"].iter().any(|end| name.ends_with(end))
+}
+
+/// `text` with each credential value replaced by `[redacted <label>]`,
+/// longest first. A value under 12 bytes is left: too short for a key, and
+/// likely ordinary text. Exact matches only, a guard against accidents.
+pub(crate) fn redact<'a>(text: &'a str, found: &[(String, String)]) -> std::borrow::Cow<'a, str> {
+    let mut found: Vec<_> = found.iter().map(|(label, value)| (label, value.trim())).filter(|(_, v)| v.len() >= 12).collect();
+    found.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
+    let mut text = std::borrow::Cow::Borrowed(text);
+    for (label, value) in found {
+        if text.contains(value) {
+            text = text.replace(value, &format!("[redacted {}]", crate::text::one_line(label))).into();
+        }
+    }
+    text
+}
+
 /// Whether two base URLs name the same server: scheme, host, and port
 /// (explicit or the scheme's default) all match. The path does not count.
 /// A URL that does not parse matches nothing.
@@ -1738,5 +1780,52 @@ mod tests {
         assert!(validate_reasoning_effort(compat, WireApi::ChatCompletions, "model", Some(E::Low)).unwrap_err().contains("ignores reasoning effort"));
         assert_eq!(effort_levels(local, WireApi::Responses, "grok-3-mini"), crate::config::ReasoningEffort::LEVELS);
         assert!(validate_reasoning_effort(local, WireApi::ChatCompletions, "grok-3-mini", Some(E::None)).is_ok());
+    }
+
+    #[test]
+    fn credential_names_are_told_by_their_end() {
+        for name in ["OPENAI_API_KEY", "OPENMAX_API_KEY", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "client_secret", "DB_PASSWORD"] {
+            assert!(secret_name(name), "{name}");
+        }
+        for name in ["PATH", "OPENMAX_CONTEXT_TOKENS", "GITHUB_TOKEN_PATH", "KEYBOARD", "SSH_AUTH_SOCK"] {
+            assert!(!secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn redaction_replaces_values_whole_and_leaves_short_ones() {
+        let found = [("SHORT_TOKEN", "true"), ("A_API_KEY", "sk-abcdef123456"), ("B_API_KEY", "sk-abcdef123456-longer\n"), ("C_API_KEY", "sk-abcdef123456")];
+        let found: Vec<_> = found.iter().map(|(label, value)| (label.to_string(), value.to_string())).collect();
+        let text = "A_API_KEY=sk-abcdef123456\nB_API_KEY=sk-abcdef123456-longer\nSHORT_TOKEN=true\n";
+        let expected = "A_API_KEY=[redacted A_API_KEY]\nB_API_KEY=[redacted B_API_KEY]\nSHORT_TOKEN=true\n";
+        assert_eq!(redact(text, &found), expected);
+        assert!(matches!(redact("nothing here", &found), std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// Every key the configuration names is collected, wherever its value
+    /// comes from, and a header's bearer token also on its own.
+    #[test]
+    fn credentials_cover_settings_and_every_provider() {
+        let dir = std::env::temp_dir().join(format!("omx-credentials-{}", uuid::Uuid::new_v4()));
+        let var = format!("OMX_CREDENTIALS_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&var, "key-from-api-key-env");
+        let providers = serde_json::json!({ "providers": { "p": {
+            "base_url": "https://example.invalid/v1",
+            "api_key": "literal-provider-key",
+            "api_key_env": [var],
+            "headers": { "Authorization": "Bearer header-bearer-token" },
+        } } });
+        write_providers(&dir, &providers.to_string());
+        let found = credentials(Some("literal-settings-key"), &dir);
+        for (label, value) in [
+            ("settings api_key", "literal-settings-key"),
+            ("provider p api_key", "literal-provider-key"),
+            (var.as_str(), "key-from-api-key-env"),
+            ("provider p header Authorization", "header-bearer-token"),
+            ("provider p header Authorization", "Bearer header-bearer-token"),
+        ] {
+            assert!(found.contains(&(label.to_string(), value.to_string())), "{label}={value} missing from {found:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
