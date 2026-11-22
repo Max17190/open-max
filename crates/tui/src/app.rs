@@ -2344,7 +2344,8 @@ impl App {
                         self.project.join(given)
                     }
                 };
-                match open_max_core::sessions::write_atomic(&target, self.transcript.export_text()) {
+                #[expect(clippy::disallowed_methods, reason = "writes where the user points, through links and keeping the file's mode; a failure is reported")]
+                match std::fs::write(&target, self.transcript.export_text()) {
                     Ok(()) => self.note(&format!("exported transcript to {}", target.display())),
                     Err(e) => self.error(&format!("export to {} failed: {e}", target.display())),
                 }

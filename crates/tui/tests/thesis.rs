@@ -732,8 +732,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // run_process and run_bash, removed 1. Keeping credential values out of
     // tool results and diffs added 54, and CEILING was raised for it by its
     // owner. A lint refusing in-place writes of files, with its reasoned
-    // exceptions and the section banners dropped, removed 14.
-    const BASELINE: usize = 45_172;
+    // exceptions and the section banners dropped, removed 12.
+    const BASELINE: usize = 45_174;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

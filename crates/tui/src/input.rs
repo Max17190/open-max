@@ -619,7 +619,8 @@ impl Composer {
             if let Some(dir) = self.history_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = open_max_core::sessions::write_atomic(&self.history_path, json);
+            #[expect(clippy::disallowed_methods, reason = "saved on every Enter, where a sync would stall the screen; the history is a convenience")]
+            let _ = std::fs::write(&self.history_path, json);
         }
     }
 
