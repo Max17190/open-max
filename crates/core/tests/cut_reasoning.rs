@@ -1,6 +1,7 @@
 //! A reply the output limit cut while the model was still reasoning, on the
 //! native Messages and Responses wires: what the continuation sends, and
 //! what an endpoint the reasoning does not belong to receives instead.
+#![allow(clippy::disallowed_methods)]
 mod common;
 
 use open_max_core::{config::ApprovalMode, state::Core, types::AgentEvent};

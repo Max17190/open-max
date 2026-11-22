@@ -1503,6 +1503,7 @@ impl GroupRecord {
             use std::io::Seek;
             let first_line = self.first_len;
             if let Some(mut file) = self.file.as_ref() {
+                #[expect(clippy::disallowed_methods, reason = "cuts back to the first line only while no group is listed")]
                 if file.set_len(first_line).and_then(|()| file.seek(io::SeekFrom::Start(first_line))).is_ok() {
                     self.len = first_line;
                     return;
@@ -1531,6 +1532,7 @@ impl GroupRecord {
         for (pid, start) in &self.live {
             text.push_str(&format!("{pid} {start}\n"));
         }
+        #[expect(clippy::disallowed_methods, reason = "rewrites the record whole after a failed append and keeps this handle to append to")]
         let create = || std::fs::File::create(&self.path);
         let created = create().or_else(|_| {
             std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")))?;

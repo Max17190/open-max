@@ -11,6 +11,7 @@
 //!
 //! `first_frame` then runs the real binary on a pseudo-terminal: the first
 //! frame, its colors, and what a turn or `/reload` leaves on screen.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{LineWriter, Write};
 

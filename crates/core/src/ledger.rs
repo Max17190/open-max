@@ -507,6 +507,7 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .to_string();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(format!("{name}.writing"));
+    #[expect(clippy::disallowed_methods, reason = "a temp file, renamed over the ledger once flushed")]
     let mut file = std::fs::File::create(&tmp)
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     file.write_all(bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
@@ -1188,8 +1189,6 @@ pub fn is_approved(data_dir: &Path, project_root: &Path, sha: &str) -> bool {
         .unwrap_or(false)
 }
 
-// ---------- what a manifest actually executes ----------
-
 /// One file a capability manifest hands to the host: its resolved `command`,
 /// or an `args` entry naming a file. Only project-local files are listed -
 /// those are the ones the agent can rewrite after a human approved the
@@ -1489,8 +1488,6 @@ fn inside_project(path: &Path, project_root: &Path, root: &std::cell::OnceCell<P
     let root = root.get_or_init(|| canonical_or(project_root));
     path.starts_with(root) || canonical_or(path).starts_with(root)
 }
-
-// ---------- usage accounting ----------
 
 /// Lifetime usage counters for one extension.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

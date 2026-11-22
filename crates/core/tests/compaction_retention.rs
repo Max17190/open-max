@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 mod common;
 
 use common::{drive_turn, recording_endpoint};

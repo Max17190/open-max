@@ -1,4 +1,5 @@
 //! The Responses adapter drives the same trusted loop, approvals, and local sessions.
+#![allow(clippy::disallowed_methods)]
 mod common;
 
 use open_max_core::{config::ApprovalMode, state::Core, types::AgentEvent};

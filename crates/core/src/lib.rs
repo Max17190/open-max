@@ -1,6 +1,7 @@
 //! Open Max core: a deliberately small, high-performance agent harness.
 //! Talks to any OpenAI-compatible endpoint. UI-free; frontends consume a
 //! single event channel.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod agent;
 mod batch;

@@ -7,6 +7,7 @@
 //! refreezes fired, and the model ran the script by hand instead of calling
 //! the tool. The receipt must land where the model reads: in the transcript
 //! the next request carries.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

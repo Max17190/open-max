@@ -6,6 +6,7 @@
 //! discovery the proof runs unguarded - the eval's weak-model runs deleted
 //! the directory they had just written a deny rule for, four times in one
 //! turn, because the rule was never going to be live until the turn ended.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -5,6 +5,7 @@
 //! by this, which leaves out what the machine spends starting any release
 //! binary and hearing from it: see `first_frame_holds_its_ratio_to_a_baseline_binary`
 //! in crates/tui/tests/thesis.rs.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::Write;
 

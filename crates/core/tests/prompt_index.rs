@@ -2,6 +2,7 @@
 //! built, the tools array carries the tool files present then, and the
 //! trailing note carries only what changed since: these drive all three
 //! through the public surface, the agent loop included.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

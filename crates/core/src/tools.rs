@@ -1145,6 +1145,7 @@ fn write_in_place(
         ));
     };
     let overwrite = |file: &mut std::fs::File, bytes: &[u8]| {
+        #[expect(clippy::disallowed_methods, reason = "a failed write in place puts back the bytes read above")]
         file.set_len(0)?;
         file.rewind()?;
         file.write_all(bytes)?;

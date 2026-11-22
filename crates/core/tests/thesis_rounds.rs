@@ -13,6 +13,7 @@
 //! sanity bound in debug; the prefix test asserts a ratchet the tree meets
 //! today, which tightens toward its target as the loop gets there. The two
 //! take one lock, so neither runs while the other loads the CPU.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

@@ -7,6 +7,7 @@
 //! runs), and a malformed edit bricks the NEXT launch (exit 2), which must
 //! be said while the author can still repair the file. The TUI's own saves
 //! go through Core::save_settings and must never read as drift.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Mutex};
 

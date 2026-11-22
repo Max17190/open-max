@@ -1043,7 +1043,7 @@ pub(crate) fn commit_compaction(
 /// between the two leaves an empty or partial file under the final name with
 /// the old contents already gone. Synced, the bytes land first, so a power
 /// cut leaves the old file or the new one, never a mix.
-pub(crate) fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+pub fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     replace_atomic(path, bytes.as_ref(), 0o666, |_| Ok(())).map_err(|e| e.to_string())?;
     // The rename lives in the directory, so syncing the directory puts it on
     // the disk ahead of whatever is written next. Best effort, and after the
@@ -1255,6 +1255,7 @@ fn append_records(path: &Path, opening: &str, text: &str, ordered: bool) -> Resu
             .and_then(|_| file.read_to_end(&mut line))
             .map_err(|e| e.to_string())?;
         if is_torn(&line) {
+            #[expect(clippy::disallowed_methods, reason = "cuts only a torn last line, which holds no record")]
             file.set_len(start).map_err(|e| e.to_string())?;
             keep = start;
         } else {
@@ -1266,6 +1267,7 @@ fn append_records(path: &Path, opening: &str, text: &str, ordered: bool) -> Resu
     }
     buf.push_str(text);
     if let Err(e) = file.write_all(buf.as_bytes()) {
+        #[expect(clippy::disallowed_methods, reason = "rolls a failed append back to the bytes before it")]
         let _ = file.set_len(keep);
         return Err(e.to_string());
     }

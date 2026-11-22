@@ -2,6 +2,7 @@
 //!
 //! Byte and count gates assert unconditionally. Each test's doc comment
 //! states what it measures and how.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

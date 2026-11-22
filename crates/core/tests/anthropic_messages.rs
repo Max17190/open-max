@@ -1,4 +1,5 @@
 //! Native provider translation through the real HTTP client and stream reader.
+#![allow(clippy::disallowed_methods)]
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use open_max_core::{client::{ChatClient, StreamDelta}, config::{ReasoningEffort, Settings}, providers, state::CancelToken, types::ChatMessage};
 use serde_json::{json, Value};

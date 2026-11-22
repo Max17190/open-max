@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 mod app;
 mod clipboard;
 mod chatgpt;
