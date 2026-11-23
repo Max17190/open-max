@@ -163,6 +163,10 @@ pub struct Settings {
     /// Seconds a bash command's processes may use no CPU and read or write nothing before it is stopped as stuck; unset or 0 is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stuck_command_secs: Option<u64>,
+    /// The route's cached input price over its fresh input price. At or above 0.1, requests leave out reasoning and
+    /// stub tool results older than 8 replies, in blocks of 8 (`trim::view`). Unset is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_price_ratio: Option<f64>,
 }
 
 /// A change across several files with its tests routinely takes more than
@@ -198,6 +202,7 @@ impl Default for Settings {
             request_budget: None,
             agents_md_bytes: None,
             stuck_command_secs: None,
+            cache_price_ratio: None,
         }
     }
 }

@@ -897,6 +897,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `max_parallel_tools`: concurrent read-only tool cap, clamped 1..=32.
 - `request_budget`: optional soft model-request budget per turn, said in notes
   at the start and at 50, 75, 90 and 100 percent; never ends a turn.
+- `cache_price_ratio`: cached over fresh input price; at 0.1 or above, reasoning and
+  tool results older than 8 replies are trimmed from requests, in steps of 8.
 - `agents_md_bytes`: AGENTS.md bytes a new prompt carries; unset 2% of window, 2,000 to 20,000.
 
 ```json

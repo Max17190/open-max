@@ -30,5 +30,6 @@ pub mod templates;
 pub mod text;
 pub mod tools;
 mod transcript;
+mod trim;
 pub mod trust;
 pub mod types;

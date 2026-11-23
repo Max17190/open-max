@@ -342,6 +342,14 @@ and the run that writes a key already uses it.
   `--max-agent-iterations` and `--max-agent-tokens` set either cap for one
   `-p`, `--stdio` or `--subagent` run without writing it here (see
   [usage](usage.md#command-line)).
+- `cache_price_ratio` (unset: off): the route's cached input price divided
+  by its fresh input price. At 0.1 or above, each request leaves out the
+  reasoning of replies older than the newest 8 and sends each of their tool
+  results of 400 bytes or more as a one-line stub naming the tool and its
+  path or command, which the model can run again. The trim point moves in
+  steps of 8 replies, so the cached prefix holds between steps. The saved
+  session keeps everything. Not for a route that refuses a request without
+  every earlier reply's reasoning.
 - `stuck_command_secs` (unset: off; 0 is off; held to at least 30): on
   Linux, a bash call whose processes have used no CPU and read or written
   no bytes for this many seconds is stopped before its timeout, and the

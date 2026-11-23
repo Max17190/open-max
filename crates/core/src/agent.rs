@@ -819,7 +819,7 @@ async fn run_loop(
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
         let result = client
-            .stream_chat(guard.messages(), limit, &schemas_wire, cancelled.clone(), move |delta| {
+            .stream_chat(&crate::trim::view(settings.cache_price_ratio, guard.messages()), limit, &schemas_wire, cancelled.clone(), move |delta| {
                 batcher_in.lock().unwrap().push(delta);
             })
             .await;
@@ -4746,6 +4746,43 @@ mod tests {
         assert!(at.is_some_and(|at| at < start.len() - 1 && start[at]["role"] == "user"), "the budget precedes the prompt: {start:?}");
         assert!(on[4]["messages"].to_string().contains("4 of 4 requests used (100%), 0 left"), "{}", on[4]);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// With `cache_price_ratio` at or above the trim ratio, the 17th request is the first to leave out the
+    /// output of the first 8 rounds, and every request until the next trim point extends the one before it.
+    #[tokio::test]
+    async fn a_cache_price_ratio_trims_old_output_in_blocks() {
+        use crate::state::Core;
+        const LONG_SSE: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf %0600d 7\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut runs: Vec<Vec<Value>> = Vec::new();
+        for (n, ratio) in [None, Some(0.2)].into_iter().enumerate() {
+            let (core, mut rx) = Core::new(root.join(format!("data-{n}"))).unwrap();
+            crate::trust::trust_project(&core.data_dir, &project).unwrap();
+            let (base_url, bodies) = capturing_endpoint_times(LONG_SSE, 18).await;
+            {
+                let mut s = core.settings.lock().unwrap();
+                (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(200_000));
+                (s.approval_mode, s.cache_price_ratio) = (ApprovalMode::Auto, ratio);
+            }
+            start_turn(core.clone(), format!("sess-trim-{n}"), project.clone(), "run it".into()).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop");
+            runs.push(bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect());
+        }
+        let stubs = |body: &Value| body["messages"].to_string().matches("[Old output trimmed: bash").count();
+        assert_eq!(runs[0].iter().map(stubs).sum::<usize>(), 0, "unset, nothing is trimmed");
+        assert_eq!(runs[1].iter().map(stubs).collect::<Vec<_>>(), [vec![0; 16], vec![8; 3]].concat());
+        for pair in runs[1][16..].windows(2) {
+            let (before, after) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
+            assert_eq!(before[..], after[..before.len()], "the prefix holds between trim points");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
