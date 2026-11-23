@@ -858,6 +858,16 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
     unseen.unwrap_or(if estimate_tokens(reply.content.len()) as u64 > margin { CutKind::Text } else { CutKind::Thought })
 }
 
+/// The note after a reply with no text and no tool call, the `asked`th in a
+/// row. The first is the plain ask; a later one says how many came in a row
+/// and asks for one small step, which a model that froze on the whole task
+/// can still take.
+pub(crate) fn empty_reply_note(asked: usize) -> String {
+    let ask = "Continue the task: call a tool, or give the final answer.";
+    if asked <= 1 { return format!("[empty reply: it had no text and no tool call. {ask}]") }
+    format!("[empty reply: {asked} replies in a row had no text and no tool call. {ask} If unsure what to do next, take one small step, such as reading a file or running a command.]")
+}
+
 /// The note after a reply the output limit cut before any tool call. The
 /// limit bounds how long the model thinks before it acts, so a cut thought
 /// is told to act. A cut inside a call or text needed room, not brevity:

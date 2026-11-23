@@ -83,6 +83,11 @@ enum ApprovalOutcome {
 /// in a row up to its ceiling; cut where it cannot grow, this many times more, and one more ends the turn `length`.
 const MAX_CUT_CONTINUATIONS: usize = 4;
 
+/// A reply with no text and no call, below the limit, answered nothing, so
+/// it is asked for again with a note this many times in a row; one more ends
+/// the turn `empty`. A reply with text or a call resets the count.
+const MAX_EMPTY_ASKS: usize = 3;
+
 /// The one failure persisted without the `Error: ` prefix: the model must
 /// read the timeout as an instruction to stop, not as tool noise. Everything
 /// that classifies persisted results (tool_message_content here, the TUI's
@@ -745,8 +750,8 @@ async fn run_loop(
     }
     let mut budget_noted = 0;
     let mut repeats = RepeatTracker::default();
-    // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
-    let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
+    // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and the silent replies in a row asked again.
+    let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), 0usize);
     let mut at_reserve = false;
     // The limit is how long a reasoning model thinks in one reply before it acts, not how much a call or an answer
     // may carry: a reply it cut inside a call or its text is asked for once more with this room, and
@@ -905,6 +910,7 @@ async fn run_loop(
         // not go back (another endpoint, a path that does not replay it).
         // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). One with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not).
         let (silent, repeated) = (content.trim().is_empty() && tool_calls.is_empty(), result.repeats_a_stop(&mut stops, limit));
+        if !silent { asked = 0 }
         let near = endpoint.chatgpt.is_none() && tool_calls.is_empty() && !result.hit_output_cap(limit) && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED) && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
         let capped = result.hit_output_cap(limit) || (silent && repeated) || near;
         let cut_thought = capped
@@ -986,16 +992,16 @@ async fn run_loop(
             // as recorded above, the note goes after it, on disk before the
             // next request, and the loop goes round. Never on the last
             // iteration, which has no request left to carry the note. A second cut in a row doubles the limit, so the
-            // limit alone never ends a turn while it can grow; past a spent room, to the first doubling above it, but a cut thought plainly. A silent reply below the limit is asked again once per turn.
+            // limit alone never ends a turn while it can grow; past a spent room, to the first doubling above it, but a cut thought plainly. A silent reply below the limit is asked again up to MAX_EMPTY_ASKS times in a row.
             let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
             cuts += usize::from(capped);
             let up = (raise + 1..raise + 32).find(|&r| endpoint.raised_limit(next, r) > endpoint.raised_limit(next, raise).max(if kind == crate::notes::CutKind::Thought { 0 } else { floor })).filter(|_| capped && (cuts > 1 || floor > 0 && kind != crate::notes::CutKind::Thought) && !no_room);
             if let Some(up) = up { raise = up } else if capped && cuts > 1 { stalled += 1 }
-            if (capped && stalled < MAX_CUT_CONTINUATIONS || silent && !capped && !asked) && iteration + 1 < max_iterations {
+            if (capped && stalled < MAX_CUT_CONTINUATIONS || silent && !capped && asked < MAX_EMPTY_ASKS) && iteration + 1 < max_iterations {
                 let at = guard.messages().len();
                 room = grant.filter(|_| kind != crate::notes::CutKind::Thought);
                 let ask = room.into_iter().chain(up.map(|_| endpoint.raised_limit(next, raise))).max();
-                let note = if capped { crate::notes::reply_cut_note(limit, kind, ask) } else { asked = true; "[empty reply: it had no text and no tool call. Continue the task: call a tool, or give the final answer.]".into() };
+                let note = if capped { crate::notes::reply_cut_note(limit, kind, ask) } else { asked += 1; crate::notes::empty_reply_note(asked) };
                 insert_note(core, session_id, guard.messages(), at, note);
                 save_messages(core, session_id, guard.messages(), false).await; continue 'turns;
             }
@@ -5055,9 +5061,10 @@ mod tests {
     /// route ends thinking below the limit and delivers nothing, at the same
     /// count each time: a silent reply that stops where an earlier reply of
     /// the turn did is that cap, so it continues as a cut thought. Any other
-    /// silent reply is asked for once more, with a note, when an iteration
-    /// is left: a model that then answers or acts carries on, and a second
-    /// silent reply ends the turn `empty` behind an error.
+    /// silent reply is asked for again, with a note, while an iteration is
+    /// left, up to `MAX_EMPTY_ASKS` times in a row: a model that then answers
+    /// or acts carries on, one silent reply past that ends the turn `empty`
+    /// behind an error, and a reply with text or a call resets the count.
     #[tokio::test]
     async fn a_reply_with_nothing_in_it_is_an_error_unless_it_stopped_at_a_repeated_count() {
         use crate::state::Core;
@@ -5079,20 +5086,24 @@ mod tests {
         let silent_again = thought_sse(2601, None, "stop");
         let short = thought_sse(40, None, "stop");
         let elsewhere = thought_sse(2200, None, "stop");
-        // A case: the replies in order, the iteration cap, the stop reason, and the note that went in: a cut note or an empty-reply note.
-        type Case<'a> = (&'a str, Vec<&'a str>, usize, &'a str, Option<&'a str>);
-        let cases: [Case; 8] = [
-            ("silent twice", vec![&silent, &short], 50, "empty", Some("[empty reply:")),
-            ("short silent twice", vec![&short, &silent], 50, "empty", Some("[empty reply:")),
-            ("silent, then an answer once asked again", vec![&silent, STOP_SSE], 50, "stop", Some("[empty reply:")),
-            ("silent, then a call once asked again", vec![&short, &read, STOP_SSE], 50, "stop", Some("[empty reply:")),
-            ("silent on the last iteration is not asked again", vec![&silent], 1, "empty", None),
-            ("silent at the count a call stopped at", vec![&read, &silent_again, STOP_SSE], 50, "stop", Some("[reply cut:")),
-            ("silent at another count", vec![&read, &elsewhere, &short], 50, "empty", Some("[empty reply:")),
+        // A case: the replies in order, the iteration cap, the stop reason, and the notes that went in: cut notes and empty-reply notes.
+        type Case<'a> = (&'a str, Vec<&'a str>, usize, &'a str, (usize, usize));
+        let cases: [Case; 11] = [
+            ("silent twice is asked again twice", vec![&silent, &short, STOP_SSE], 50, "stop", (0, 2)),
+            ("silent three times is asked again three times", vec![&short, &silent, &short, STOP_SSE], 50, "stop", (0, 3)),
+            ("silent past the asks", vec![&silent, &short, &short, &short], 50, "empty", (0, 3)),
+            ("silent, then an answer once asked again", vec![&silent, STOP_SSE], 50, "stop", (0, 1)),
+            ("silent, then a call once asked again", vec![&short, &read, STOP_SSE], 50, "stop", (0, 1)),
+            // A call between them starts the count over, so each run of silent replies gets its asks.
+            ("a call resets the count", vec![&short, &short, &read, &short, &short, &short, STOP_SSE], 50, "stop", (0, 5)),
+            ("silent on the last iteration is not asked again", vec![&silent], 1, "empty", (0, 0)),
+            ("silent until the iterations run out", vec![&short, &short], 2, "empty", (0, 1)),
+            ("silent at the count a call stopped at", vec![&read, &silent_again, STOP_SSE], 50, "stop", (1, 0)),
+            ("silent at another count", vec![&read, &elsewhere, &short, STOP_SSE], 50, "stop", (0, 2)),
             // On the last iteration nothing is left to continue the cut, so the turn stopped short.
-            ("silent at a repeated count on the last iteration", vec![&read, &silent_again], 2, "length", None),
+            ("silent at a repeated count on the last iteration", vec![&read, &silent_again], 2, "length", (0, 0)),
         ];
-        for (case, streams, iterations, stop, note) in cases {
+        for (case, streams, iterations, stop, (cut_notes, empty_notes)) in cases {
             let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
             let (core, mut rx) = Core::new(dir.clone()).unwrap();
             let project = dir.join("project");
@@ -5118,10 +5129,14 @@ mod tests {
                 assert!(errors.is_empty(), "{case}: {errors:?}");
             }
             let messages = transcript(&core, id).await;
-            // A cut note follows only the repeated stop; an empty-reply note, once, any other silent reply with an iteration left.
-            for kind in ["[reply cut:", "[empty reply:"] {
-                let count = messages.iter().filter(|m| m.content.as_deref().is_some_and(|c| c.contains(kind))).count();
-                assert_eq!(count, usize::from(note == Some(kind)), "{case}: {kind}");
+            // A cut note follows only the repeated stop; an empty-reply note any other silent reply with an iteration left and an ask to spare.
+            let said = |kind: &str| messages.iter().filter_map(|m| m.content.as_deref()).filter(|c| c.contains(kind)).map(String::from).collect::<Vec<_>>();
+            assert_eq!(said("[reply cut:").len(), cut_notes, "{case}: cut notes");
+            let empty = said("[empty reply:");
+            assert_eq!(empty.len(), empty_notes, "{case}: empty-reply notes");
+            // The first of a run is the plain ask; a later one counts the run.
+            for note in &empty {
+                assert_eq!(note.contains("replies in a row"), note != &crate::notes::empty_reply_note(1), "{case}: {note}");
             }
             let _ = std::fs::remove_dir_all(dir);
         }
