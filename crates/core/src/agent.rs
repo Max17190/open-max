@@ -4750,7 +4750,8 @@ mod tests {
     }
 
     /// With `cache_price_ratio` at or above the trim ratio, the 17th request is the first to leave out the
-    /// output of the first 8 rounds, and every request until the next trim point extends the one before it.
+    /// output of the first 8 rounds, and every request until the next trim point extends the one before it. The request
+    /// budget's notes, carried on those results, stay.
     #[tokio::test]
     async fn a_cache_price_ratio_trims_old_output_in_blocks() {
         use crate::state::Core;
@@ -4770,7 +4771,7 @@ mod tests {
             {
                 let mut s = core.settings.lock().unwrap();
                 (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(200_000));
-                (s.approval_mode, s.cache_price_ratio) = (ApprovalMode::Auto, ratio);
+                (s.approval_mode, s.cache_price_ratio, s.request_budget) = (ApprovalMode::Auto, ratio, Some(4));
             }
             start_turn(core.clone(), format!("sess-trim-{n}"), project.clone(), "run it".into()).unwrap();
             assert_eq!(drive_turn(&mut rx).await.0, "stop");
@@ -4779,6 +4780,8 @@ mod tests {
         let stubs = |body: &Value| body["messages"].to_string().matches("[Old output trimmed: bash").count();
         assert_eq!(runs[0].iter().map(stubs).sum::<usize>(), 0, "unset, nothing is trimmed");
         assert_eq!(runs[1].iter().map(stubs).collect::<Vec<_>>(), [vec![0; 16], vec![8; 3]].concat());
+        let marks = |body: &Value| body["messages"].to_string().matches(crate::notes::BUDGET_NOTE_MARK).count();
+        assert_eq!(runs[1].iter().map(marks).collect::<Vec<_>>(), runs[0].iter().map(marks).collect::<Vec<_>>(), "budget notes on trimmed results stay");
         for pair in runs[1][16..].windows(2) {
             let (before, after) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
             assert_eq!(before[..], after[..before.len()], "the prefix holds between trim points");

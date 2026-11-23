@@ -346,7 +346,8 @@ and the run that writes a key already uses it.
   by its fresh input price. At 0.1 or above, each request leaves out the
   reasoning of replies older than the newest 8 and sends each of their tool
   results of 400 bytes or more as a one-line stub naming the tool and its
-  path or command, which the model can run again. The trim point moves in
+  path or command, which the model can run again, followed verbatim by any
+  harness notes the result carried. The trim point moves in
   steps of 8 replies, so the cached prefix holds between steps. The saved
   session keeps everything. Not for a route that refuses a request without
   every earlier reply's reasoning.

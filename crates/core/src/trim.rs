@@ -4,7 +4,8 @@ use crate::types::ChatMessage;
 use std::borrow::Cow;
 
 /// At a cached-to-fresh price ratio of 0.1 or more, replies older than the newest 8 lose their reasoning and their
-/// tool results of 400 bytes or more become a one-line stub naming the tool and its path or command. The trim point
+/// tool results of 400 bytes or more become a one-line stub naming the tool and its path or command, followed by any
+/// harness notes the result carried. The trim point
 /// moves in steps of 8 replies, so the cached prefix holds between steps.
 pub(crate) fn view(ratio: Option<f64>, messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
     let cut = messages.iter().filter(|m| m.role == "assistant").count().saturating_sub(8) / 8 * 8;
@@ -18,10 +19,21 @@ pub(crate) fn view(ratio: Option<f64>, messages: &[ChatMessage]) -> Cow<'_, [Cha
         let Some(call) = calls.filter(|_| len >= 400).and_then(|calls| calls.iter().find(|call| message.tool_call_id.as_deref() == Some(&call.id))) else { continue };
         let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
         let key: String = ["path", "command", "pattern"].iter().find_map(|key| args[key].as_str()).unwrap_or_default().chars().take(160).collect();
-        sent.content = Some(format!("[Old output trimmed: {} {key:?}, {len} bytes. Call it again if you need it.]", call.function.name));
+        let notes = notes(message.content.as_deref().unwrap_or_default());
+        sent.content = Some(format!("[Old output trimmed: {} {key:?}, {} bytes. Call it again if you need it.]{notes}", call.function.name, len - notes.len()));
         sent.images = None;
     }
     Cow::Owned(out)
+}
+
+/// The harness notes a tool result ends with, kept verbatim through a trim: one-line `[...]` notes after a newline
+/// (`notes::append_and_emit_note`), and the changes note after `NOTE_SEPARATOR` (`notes::store_note`).
+fn notes(content: &str) -> &str {
+    let mut cut = content.find(crate::prompt::NOTE_HEADER).map_or(content.len(), |at| content[..at].trim_end_matches('\n').len());
+    while let Some(line) = content[..cut].rfind('\n').filter(|&nl| content[nl + 1..cut].starts_with('[') && content[..cut].ends_with(']')) {
+        cut = line;
+    }
+    &content[cut..]
 }
 
 #[cfg(test)]
@@ -81,5 +93,19 @@ mod tests {
         let reasoning: Vec<bool> = sent.iter().filter(|m| m.role == "assistant").map(|m| m.reasoning_content.is_some()).collect();
         assert_eq!(reasoning, [vec![false; 8], vec![true; 8]].concat());
         assert_eq!(sent.last().unwrap().content.as_deref().map(str::len), Some(500));
+    }
+
+    #[test]
+    fn notes_on_a_trimmed_result_survive_verbatim() {
+        let mut messages = history(16);
+        let budget = "[harness: request budget: 30 of 60 requests used (50%), 30 left. Prioritize finishing and verifying the task.]";
+        let changes = format!("{}{}\n- mode: auto", crate::prompt::NOTE_SEPARATOR, crate::prompt::NOTE_HEADER);
+        let tail = format!("\n{budget}\n[harness: identical call, identical output, 3 times in a row.]{changes}");
+        messages[5].content = Some(format!("{}\n[not a note, the last line of output]\nend{tail}", "x".repeat(500)));
+        messages[7].content = Some(format!("{}{tail}", "y".repeat(500)));
+        let sent = view(Some(0.2), &messages);
+        let len = messages[5].content.as_ref().unwrap().len() - tail.len();
+        assert_eq!(sent[5].content.as_deref(), Some(format!("[Old output trimmed: bash \"cat f1\", {len} bytes. Call it again if you need it.]{tail}").as_str()));
+        assert!(sent[7].content.as_deref().unwrap().ends_with(&tail) && !sent[7].content.as_deref().unwrap().contains("yyy"));
     }
 }
