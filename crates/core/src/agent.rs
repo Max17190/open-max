@@ -83,9 +83,7 @@ enum ApprovalOutcome {
 /// in a row up to its ceiling; cut where it cannot grow, this many times more, and one more ends the turn `length`.
 const MAX_CUT_CONTINUATIONS: usize = 4;
 
-/// A reply with no text and no call, below the limit, answered nothing, so
-/// it is asked for again with a note this many times in a row; one more ends
-/// the turn `empty`. A reply with text or a call resets the count.
+/// Silent replies in a row asked again with a note (`notes::empty_reply_note`); one more ends the turn `empty`.
 const MAX_EMPTY_ASKS: usize = 3;
 
 /// The one failure persisted without the `Error: ` prefix: the model must
