@@ -1395,10 +1395,14 @@ mod first_frame {
     /// A completions endpoint on its own thread: each request, read whole,
     /// gets the next reply as one JSON body. Returns the base URL.
     fn endpoint(replies: Vec<String>) -> String {
+        endpoint_with_status(replies.into_iter().map(|body| ("200 OK", body)).collect())
+    }
+
+    fn endpoint_with_status(replies: Vec<(&'static str, String)>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         std::thread::spawn(move || {
-            for reply in replies {
+            for (status, reply) in replies {
                 let Ok((mut stream, _)) = listener.accept() else { return };
                 let mut head = Vec::new();
                 let mut byte = [0u8; 1];
@@ -1416,7 +1420,7 @@ mod first_frame {
                 let _ = stream.read_exact(&mut body);
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                     reply.len()
                 );
             }
@@ -1447,6 +1451,58 @@ mod first_frame {
             }
             s.pump(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn a_context_refusal_keeps_the_server_error_and_names_the_next_step() {
+        let refusal = r#"{"error":{"message":"Request rejected:\nmaximum context length exceeded"}}"#;
+        let base = endpoint_with_status(vec![
+            ("400 Bad Request", refusal.into()),
+            ("200 OK", LOGIN_REPLY.into()),
+        ]);
+        let mut s = Session::spawn_with("context-refusal", 120, 26, &serde_json::json!({
+            "base_url": base, "model": "stub-model", "context_tokens": 32768,
+        }).to_string());
+        let wait = Duration::from_secs(5);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        s.write(b"ctx\r");
+        let shown = screen_when(&mut s, 120, 26, wait, |shown| {
+            shown.contains("use /new") && !shown.contains("esc to cancel")
+        });
+        assert!(shown.contains("backend returned 400 Bad Request: Request rejected:"), "{shown}");
+        assert!(shown.contains("maximum context length exceeded"), "{shown}");
+        assert!(shown.contains("Check that context_tokens matches the served model."), "{shown}");
+        assert!(shown.contains("If the session is too long, use /new."), "{shown}");
+        s.write(b"/new\r");
+        let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("new session"));
+        assert!(shown.contains("new session") && !shown.contains("maximum context length"), "{shown}");
+        s.write(b"hello\r");
+        let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("fixture reply"));
+        assert!(shown.contains("fixture reply"), "{shown}");
+    }
+
+    #[test]
+    fn help_starts_at_its_heading_and_names_the_scroll_keys() {
+        let mut s = Session::spawn("help-at-top", 60, 20);
+        let wait = Duration::from_secs(5);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        s.write(b"/help\r");
+        let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Key bindings"));
+        assert!(shown.contains("Key bindings") && shown.contains("send"), "{shown}");
+        assert!(shown.contains("pgup/pgdn scroll"), "{shown}");
+        s.write(b"\x1b[6~");
+        let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("ctrl+f") && !shown.contains("Key bindings"));
+        assert!(shown.contains("ctrl+f") && !shown.contains("Key bindings"), "{shown}");
+        s.write(b"\x1b[6~\x1b[6~");
+        let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Commands"));
+        assert!(shown.contains("Commands"), "{shown}");
+        s.write(b"\x1b[5~\x1b[5~\x1b[5~");
+        let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Key bindings"));
+        assert!(shown.contains("Key bindings"), "{shown}");
     }
 
     #[test]

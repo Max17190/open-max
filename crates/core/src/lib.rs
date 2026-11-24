@@ -32,3 +32,5 @@ pub mod tools;
 mod transcript;
 pub mod trust;
 pub mod types;
+
+pub use compaction::refused_for_length;

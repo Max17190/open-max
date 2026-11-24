@@ -2319,11 +2319,10 @@ impl App {
         let rest: Vec<&str> = raw_rest.split_whitespace().collect();
         match head {
             "help" => {
-                let mut block: Vec<Line<'static>> = HELP_KEYS
-                    .iter()
-                    .map(|(key, description)| help_line(key, description))
-                    .collect();
-                block.push(Line::default());
+                let heading = |text| Line::from(Span::styled(text, theme::WARN_BOLD));
+                let mut block = vec![heading("Key bindings")];
+                block.extend(HELP_KEYS.iter().map(|(key, description)| help_line(key, description)));
+                block.extend([Line::default(), heading("Commands")]);
                 block.extend(
                     completion::COMMANDS
                         .iter()
@@ -2345,7 +2344,9 @@ impl App {
                     block.extend(templates);
                 }
                 self.transcript.push(block);
+                self.transcript.show_latest_from_start();
                 self.dirty.mark_chat();
+                self.dirty.mark_chrome();
             }
             "effort" => {
                 use open_max_core::config::ReasoningEffort;
@@ -3152,7 +3153,12 @@ impl App {
                 }
                 self.pending_approval = None;
                 self.dirty.mark_chrome();
-                self.error(&message);
+                let provider_error = message.starts_with("backend returned ") || message.starts_with("backend reported an error");
+                if provider_error && open_max_core::refused_for_length(&message) {
+                    self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /new."));
+                } else {
+                    self.error(&message);
+                }
             }
         }
     }
@@ -3882,7 +3888,7 @@ impl App {
             if unread > 0 {
                 return format!("↓ {unread} new · esc follow · pgup/pgdn scroll").into();
             }
-            "esc follow · pgup/pgdn scroll"
+            "pgup/pgdn scroll · esc follow"
         } else if self.running && !self.compacting && self.steered == self.queued.len() {
             // `handle_submit` steers only when no entry waits ahead.
             "enter steer · esc cancel"
@@ -4354,7 +4360,7 @@ fn paint_text_selection(
 }
 
 const APPROVAL_LABELS: [&str; 3] =
-    ["▸ [y] Allow once", " [a] Auto for project", " [n] Deny"];
+    ["[y] Allow once", " [a] Auto for project", " [n] Deny"];
 
 fn approval_choice_line() -> Line<'static> {
     Line::from(vec![
@@ -5582,7 +5588,7 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].spans[0].content.as_ref(), "Shell");
         assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(lines[2].spans[0].content.as_ref(), "▸ [y] Allow once");
+        assert_eq!(lines[2].spans[0].content.as_ref(), "[y] Allow once");
         let detail: String = lines[1]
             .spans
             .iter()
@@ -8317,7 +8323,7 @@ mod tests {
         render_app(&mut app, 40, 10);
         app.running = true;
         app.transcript.scroll_up(5);
-        assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
+        assert_eq!(app.status_hint(), "pgup/pgdn scroll · esc follow");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8419,7 +8425,7 @@ mod tests {
         }
         render_app(&mut app, 40, 10);
         app.transcript.scroll_up(5);
-        assert_eq!(app.status_hint(), "esc follow · pgup/pgdn scroll");
+        assert_eq!(app.status_hint(), "pgup/pgdn scroll · esc follow");
         app.note("a note landing below the scrolled view");
         app.note("and another");
         assert_eq!(app.status_hint(), "↓ 2 new · esc follow · pgup/pgdn scroll");
@@ -8433,7 +8439,7 @@ mod tests {
         app.transcript.scroll_up(3);
         assert_eq!(
             app.status_hint(),
-            "esc follow · pgup/pgdn scroll",
+            "pgup/pgdn scroll · esc follow",
             "the count never resurrects for content already seen"
         );
         fs::remove_dir_all(dir).unwrap();
@@ -8673,7 +8679,7 @@ mod tests {
             ("new".to_string(), "never invocable".to_string()),
         ];
         app.slash("help").await;
-        let text = buffer_text(&render_app(&mut app, 100, 30));
+        let text = buffer_text(&render_app(&mut app, 100, 90));
         assert!(text.contains("/deploy"));
         assert!(text.contains("ship it"));
         assert!(!text.contains("never invocable"));

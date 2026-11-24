@@ -1074,7 +1074,12 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let request = cli.login.as_ref().map(|target| (setup::Action::Login, target.as_deref(), "--login"))
         .or_else(|| cli.logout.as_ref().map(|target| (setup::Action::Logout, target.as_deref(), "--logout")));
     if let Some((action, target, flag)) = request {
-        if let Err(error) = require_human("changing provider authentication", &format!("openmax {flag}")) {
+        let allowed = if std::env::var_os("OPENMAX_SESSION").is_none() && !setup::has_terminal() {
+            Err(format!("no terminal for provider setup. Run `openmax {flag}` in a terminal.\nFor unattended setup with files or flags, see docs/unattended.md: Set up state and the model."))
+        } else {
+            require_human("changing provider authentication", &format!("openmax {flag}"))
+        };
+        if let Err(error) = allowed {
             eprintln!("openmax: {error}");
             return Ok(std::process::ExitCode::from(3));
         }

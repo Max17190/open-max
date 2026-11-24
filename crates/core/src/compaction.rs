@@ -839,7 +839,7 @@ pub(crate) fn refusal_ratio(message: &str, estimated: usize, fits: usize, factor
 
 /// Whether the provider names a length refusal in the error text. Servers use
 /// different phrases; an HTTP status does not tell us how they count input.
-pub(crate) fn refused_for_length(message: &str) -> bool {
+pub fn refused_for_length(message: &str) -> bool {
     const PHRASES: [&str; 10] = [
         "context length",
         "context_length",

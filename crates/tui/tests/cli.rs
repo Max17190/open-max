@@ -413,12 +413,27 @@ fn provider_setup_commands_refuse_session_authority_before_loading_a_project() {
         .env_remove("OPENMAX_HUMAN_ATTEST")
         .stdin(terminal).stdout(Stdio::piped()).stderr(Stdio::piped())
         .args(["--login", "fixture"]).spawn().unwrap());
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("provider setup needs an interactive terminal"));
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("docs/unattended.md: Set up state and the model."));
     let output = cmd(&project, &home).args(["--login", "--logout"]).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(!home.join(".openmax").exists());
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn provider_setup_without_a_terminal_points_to_unattended_setup_even_when_attested() {
+    let (project, home) = fresh_dirs("login-needs-terminal");
+    for flag in ["--login", "--logout"] {
+        for attest in ["0", "1"] {
+            let output = cmd(&project, &home).env("OPENMAX_HUMAN_ATTEST", attest)
+                .stdin(Stdio::null()).arg(flag).output().unwrap();
+            assert_eq!(output.status.code(), Some(3));
+            assert_eq!(String::from_utf8_lossy(&output.stderr), format!(
+                "openmax: no terminal for provider setup. Run `openmax {flag}` in a terminal.\nFor unattended setup with files or flags, see docs/unattended.md: Set up state and the model.\n"));
+        }
+    }
+    std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
 }
 
 /// The authority-granting commands refuse a caller with no terminal and no
