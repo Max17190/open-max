@@ -804,11 +804,25 @@ pub(crate) fn updated_prompt_ratio(
 /// from bytes/4), so it teaches nothing, and neither does a refusal that
 /// does not read as one for length.
 pub(crate) fn refusal_ratio(message: &str, estimated: usize, fits: usize, factor: f64) -> Option<f64> {
-    if estimated == 0 || !refused_for_length(message) {
-        return None;
-    }
-    let floor = fits as f64 / estimated as f64;
-    (floor > factor && floor <= MAX_TOKEN_FACTOR).then_some(floor)
+    refused_for_length(message).then(|| counted_prompt_ratio(estimated, fits, factor)).flatten()
+}
+
+pub(crate) fn counted_prompt_ratio(estimated: usize, input: usize, factor: f64) -> Option<f64> {
+    let ratio = input as f64 / estimated as f64;
+    (ratio > factor && ratio <= MAX_TOKEN_FACTOR).then_some(ratio)
+}
+
+/// Use only a refusal that explicitly counts the window, input and the ask.
+pub(crate) fn counted_reply_room(message: &str, limit: usize, sends_limit: bool) -> Option<(usize, usize)> {
+    if !sends_limit { return None; }
+    let (_, counts) = message.strip_prefix("backend returned 400 ")?.split_once("maximum context length of ")?;
+    let (window, counts) = counts.split_once(" tokens. You requested a total of ")?;
+    let (total, counts) = counts.split_once(" tokens: ")?;
+    let (input, counts) = counts.split_once(" tokens from the input messages and ")?;
+    let (ask, _) = counts.split_once(" tokens for the completion")?;
+    let (window, total, input, ask): (usize, usize, usize, usize) = (window.parse().ok()?, total.parse().ok()?, input.parse().ok()?, ask.parse().ok()?);
+    let room = window.checked_sub(input)?.checked_sub(256)?;
+    (ask == limit && input.checked_add(ask) == Some(total) && total > window && (1024..limit).contains(&room)).then_some((input, room))
 }
 
 /// Whether the provider names a length refusal in the error text. Servers use

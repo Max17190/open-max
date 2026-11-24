@@ -240,8 +240,8 @@ and the run that writes a key already uses it.
   again if there is room, or asks for the content in parts;
   when nothing arrived and no reasoning count is reported, it says it was
   either thinking that is not shown or such a call. A server can refuse a request that carries a reply
-  holding reasoning and nothing else (HTTP 400 or 422): that reasoning then
-  stops going back, in this session and after a resume, and the request is
+  holding reasoning and nothing else. If the server explicitly says the
+  thought requires text (HTTP 400 or 422), that reasoning stops going back, in this session and after a resume, and the request is
   sent once more without it.
 
   From the second reply in a row cut before any
@@ -453,7 +453,10 @@ and any reasoning or image repair follows them at the reduced limit if an
 iteration is left. If a status-only retry succeeds at the reserve, later
 requests in the same turn stay there. If recovery from a status-only refusal
 fails, Open Max reports the original error. A status alone does not change
-the input estimate. The subscription route sends no reply limit and does
+the input estimate. At the reserve, a 400 that explicitly counts the input,
+reply and context window can trigger one smaller ask on the same request.
+The retry leaves 256 tokens of margin and needs at least 1,024 reply tokens.
+The subscription route sends no reply limit and does
 not use these limit retries.
 
 Open Max estimates the input at about four bytes per token and scales the

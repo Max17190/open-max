@@ -676,6 +676,9 @@ mod tests {
             "prompt_cache_retention", "user"] {
             assert!(body.get(key).is_none(), "{key}");
         }
+        let refusal = "backend returned 400 Bad Request: Requested token count exceeds the model's maximum context length of 262144 tokens. You requested a total of 263096 tokens: 259000 tokens from the input messages and 4096 tokens for the completion.";
+        assert_eq!(crate::compaction::counted_reply_room(refusal, client.reply_reserve, client.chatgpt.is_none()), None);
+        assert_eq!(crate::compaction::counted_reply_room(refusal, client.reply_reserve, true), Some((259_000, 2888)));
         let cache_key = body["prompt_cache_key"].as_str().expect("the subscription route takes prompt_cache_key").to_owned();
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(body["store"], false);
