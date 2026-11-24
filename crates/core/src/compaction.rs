@@ -282,7 +282,7 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 /// text and no call, its reasoning. A call in it never runs, nothing of this
 /// exchange is stored or shown, and an empty reply, an error, a cancel, a
 /// cut stream or a request the spend ceiling refuses gives no notes: the
-/// error says which, and the cut then lands on the digest instead.
+/// error says which, so a soft cut can report why it did not run.
 ///
 /// Like every turn request it has no overall deadline, only the client's
 /// silence timeout: the notes are a full reply at the reply limit, which a
@@ -455,44 +455,6 @@ pub(crate) struct CompactionCtx<'a> {
     pub(crate) keep: usize,
 }
 
-/// Ask for the notes and settle the candidate's digest note: the archive material and the record, which are emitted
-/// only after the candidate transcript has been persisted. Without notes the cut lands on the digest a forced cut
-/// leaves, so a failed notes request never turns the ceiling off; a cancelled turn's unforced cut says why instead.
-async fn prepare_compaction_digest(
-    ctx: &CompactionCtx<'_>,
-    messages: &mut [ChatMessage],
-    mut digest: CompactionDigest,
-    forced: bool,
-    spend: &mut RequestSpend,
-) -> Result<(Vec<ChatMessage>, sessions::CompactionRecord), String> {
-    let CompactionCtx { core, session_id, .. } = *ctx;
-    // The cut's note sits right after the pinned head and ends the opening
-    // run, so the head of the cut candidate is its slot.
-    let slot = pinned_head(messages);
-    let summary = summarize_compaction(ctx, &messages[..slot], &digest, spend).await;
-    let summary = match summary {
-        Err(why) if !forced && ctx.cancelled.is_cancelled() => return Err(why),
-        summary => summary.ok(),
-    };
-    // Structured fields from the previous record carry forward by
-    // code: the cut may have dropped the old digest note, whose
-    // prose is lossy about the paths and tools it condensed.
-    if let Some(prior) = sessions::last_compaction(core, session_id) {
-        digest.absorb_prior(&prior);
-    }
-    // The later prompts the note carries come out of the notes' cap.
-    let summary = summary.map(|(notes, cut)| cap_notes(&notes, cut, MAX_SUMMARY_BYTES.saturating_sub(digest.prompts_room())));
-    let path = sessions::archive_display(core, session_id);
-    // The note in the slot was just inserted by the cut, so replacing it
-    // here keeps one digest message.
-    let note = digest.format(summary.as_deref(), Some(&path));
-    if messages.len() > slot && is_digest_message(&messages[slot]) {
-        messages[slot] = ChatMessage::note(note.clone());
-    }
-    let record = digest.to_record(note);
-    Ok((digest.dropped, record))
-}
-
 /// A failed archive or transcript write must not discard the live history.
 /// Clone only when a prune is needed; ordinary requests keep their owned vec.
 pub(crate) async fn compact_messages(
@@ -539,7 +501,7 @@ pub(crate) async fn compact_messages(
     } else {
         enforce_budget(&mut candidate, trigger, ctx.keep, schema_tokens + room, growth, ctx.estimate)
     };
-    let Some(digest) = digest else { return Ok(0) };
+    let Some(mut digest) = digest else { return Ok(0) };
     // A hydration repair still waiting for a save lands first, with its
     // boundary edits: the commit moves the boundaries as if they already
     // measured this transcript, and once it lands the edits no longer fit.
@@ -554,17 +516,29 @@ pub(crate) async fn compact_messages(
     {
         return Err("compaction refused: the session transcript or its replay boundaries could not be saved".into());
     }
-    let dropped = digest.message_count;
-    // A cut without notes is made only when the window forces it or the
-    // user asked for it; it then leaves the deterministic digest.
-    let forced = force || total > budget;
-    let (archive, record) = match prepare_compaction_digest(ctx, &mut candidate, digest, forced, spend).await {
-        Ok(cut) => cut,
-        // Only a cancelled turn's unforced cut fails here; the cancel is the human's, so no skip is reported.
-        Err(_) => return Ok(0),
+    let slot = pinned_head(&candidate);
+    let summary = match summarize_compaction(ctx, &candidate[..slot], &digest, spend).await {
+        Ok((notes, cut)) => Some((notes, cut)),
+        Err(reason) if !force && total <= budget => {
+            if !ctx.cancelled.is_cancelled() {
+                ctx.core.send_agent(ctx.session_id, AgentEvent::CompactionSkipped { reason });
+            }
+            return Ok(0);
+        }
+        Err(_) => None, // A hard limit or manual cut still needs the deterministic digest.
     };
+    if let Some(prior) = sessions::last_compaction(ctx.core, ctx.session_id) {
+        digest.absorb_prior(&prior);
+    }
+    let summary = summary.map(|(notes, cut)| cap_notes(&notes, cut, MAX_SUMMARY_BYTES.saturating_sub(digest.prompts_room())));
+    let text = digest.format(summary.as_deref(), Some(&sessions::archive_display(ctx.core, ctx.session_id)));
+    if candidate.get(slot).is_some_and(is_digest_message) {
+        candidate[slot] = ChatMessage::note(text.clone());
+    }
     crate::notes::store_note(&mut candidate, note.as_deref());
-    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &archive, Some(&record), messages.len(), head)?;
+    let dropped = digest.message_count;
+    let record = digest.to_record(text);
+    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &digest.dropped, Some(&record), messages.len(), head)?;
     if let Some(data) = ctx.core.sessions.lock().await.get_mut(ctx.session_id) {
         data.persisted_count = candidate.len();
     }
@@ -2204,14 +2178,11 @@ pub(crate) mod tests {
         assert!(!messages.iter().chain(&archive).any(leaked), "the notes exchange was stored");
     }
 
-    /// The bug this guards: a notes request that came back without notes
-    /// skipped the cut, and the ceiling then stayed off for the rest of the
-    /// session. Without notes the cut lands anyway on the digest a forced cut
-    /// leaves (tools, paths, the archive), and no skip is reported.
+    /// A hard cut lands on its deterministic digest even without notes.
     async fn assert_digest_cut_without_notes(url: &str, spend: &mut RequestSpend) {
         let fixture = Fixture::new(url);
         let mut messages = session(60, 2_000);
-        assert!(fixture.cut(&mut messages, 20_000, 100_000, spend).await > 0, "the cut lands");
+        assert!(fixture.cut(&mut messages, 20_000, 20_000, spend).await > 0, "the hard limit forces the cut");
         let note = messages[pinned_head(&messages)].content.clone().unwrap();
         assert!(note.contains("Tools used: read_file.") && !note.contains("Summary:"), "{note}");
         assert!(fixture.committed() && fixture.skipped().is_empty(), "the archive, the record and the hook, and no skip");
@@ -2310,7 +2281,7 @@ pub(crate) mod tests {
             let mut fixture = Fixture::new(&url);
             fixture.client.reply_bounds = bounds;
             let mut messages = session(60, 2_000);
-            assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0, "{bounds:?}");
+            assert!(fixture.cut(&mut messages, 20_000, 20_000, &mut RequestSpend::new(None)).await > 0, "{bounds:?}");
             assert_eq!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."), notes, "{bounds:?}");
             assert_eq!(requests.try_iter().map(|b| b["max_tokens"].as_u64().unwrap()).collect::<Vec<_>>(), sent, "{bounds:?}");
         }
@@ -2351,7 +2322,7 @@ pub(crate) mod tests {
         assert!(sessions::save_messages(&fixture.core, &fixture.id, &messages, &mut 0, true));
         let mut spend = RequestSpend::new(Some(estimated * 3 / 2));
         let ctx = CompactionCtx { factor: 2.0, ..fixture.ctx() };
-        assert!(compact_messages(&ctx, &mut messages, 20_000, 100_000, 0, false, &mut spend).await.unwrap() > 0, "the cut lands on the digest");
+        assert!(compact_messages(&ctx, &mut messages, 20_000, 20_000, 0, false, &mut spend).await.unwrap() > 0, "the hard limit forces the cut");
         assert!(!messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary:"));
         assert_eq!(spend.tokens, 0, "the refused request is never sent, so nothing is charged");
     }

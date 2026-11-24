@@ -504,9 +504,10 @@ A call in that reply never runs, and nothing else of the exchange is kept.
 The notes request has no overall deadline, as no request does: only a
 connection that falls silent ends it. When no notes come back (an error, an
 empty reply, a call, a silent connection, or a request `max_agent_tokens`
-refuses), the cut is made anyway, as a cut the window forces or a `/compact`
-is, and its note lists the tools used, the files touched and the earlier goals
-instead. Only a cancelled turn makes no cut it was not forced to.
+refuses), an automatic cut below the input budget leaves the history intact
+and reports why it skipped the cut. For the rest of that turn, it waits until
+the input budget forces a cut. A forced cut or `/compact` still makes the cut;
+its note lists the tools used, the files touched and the earlier goals.
 
 Everything a cut removes is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note names that

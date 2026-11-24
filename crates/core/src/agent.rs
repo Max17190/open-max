@@ -9547,11 +9547,10 @@ echo run >> {}
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A turn whose endpoint never writes notes asks for them once, and the
-    /// cut still lands on the digest: a missing note costs one request and
-    /// never turns the ceiling off.
+    /// After a failed soft cut, the turn does not ask for notes again until
+    /// it needs to make room.
     #[tokio::test]
-    async fn a_turn_without_notes_asks_for_them_once_and_still_cuts() {
+    async fn a_turn_without_notes_skips_the_soft_cut_until_the_window_forces_it() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -9583,7 +9582,7 @@ echo run >> {}
         start_turn(core.clone(), id.clone(), project, "keep reading".into()).unwrap();
         assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
         assert_eq!(*requests.lock().unwrap(), 6 + 1, "six turn requests and one notes request");
-        assert!(transcript(&core, &id).await.iter().any(is_digest_message), "the cut lands on the digest without notes");
+        assert!(!transcript(&core, &id).await.iter().any(is_digest_message), "history stays live without notes");
         let _ = std::fs::remove_dir_all(dir);
     }
 
