@@ -70,6 +70,12 @@ pub enum WireApi {
     Anthropic,
 }
 
+impl WireApi {
+    pub(crate) fn reports_cuts(self) -> bool {
+        matches!(self, Self::Responses | Self::Anthropic)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderModel {
     pub id: String,
@@ -177,21 +183,13 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
-/// The reply limit a request starts at, the reserve, the room after a cut call or text, and the ceiling, for a
-/// `context`-token window. The model entry's `max_tokens` is the model's longest reply: a ceiling, not the first ask,
-/// so declaring it keeps the default limit. A `max_tokens` chosen in settings is both the ask and a ceiling. With
-/// neither, the ceiling is four times the default, which bounds thinking on a model whose longest reply is unknown.
-/// The room after a cut call or text is four times the ask, within the ceiling.
-fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>) -> (usize, usize, usize, usize) {
+/// First ask, reserve, room after a cut call or text, and ceiling. A model maximum never raises the first ask.
+/// Without a known maximum, only wires that report cuts and validate the limit may raise it to the window.
+fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>, validated: bool) -> (usize, usize, usize, usize) {
     let default = Settings::default().max_tokens;
-    let chosen = (settings.max_tokens != default).then_some(settings.max_tokens);
-    let ceiling = match (chosen, entry) {
-        (Some(chosen), entry) => entry.map_or(chosen, |entry| entry.min(chosen)),
-        (None, Some(entry)) => entry,
-        (None, None) => default * 4,
-    };
-    let (ask, reserve) = reply_limits(context, entry.map_or(settings.max_tokens, |entry| entry.min(settings.max_tokens)));
-    let ceiling = reply_limits(context, ceiling).0.max(ask);
+    let unknown = if validated { context } else { default * 4 };
+    let (ask, reserve) = reply_limits(context, settings.max_tokens.min(entry.unwrap_or(settings.max_tokens)));
+    let ceiling = if settings.max_tokens == default { reply_limits(context, entry.unwrap_or(unknown)).0 } else { ask };
     (ask, reserve, ceiling.min(ask.saturating_mul(4)), ceiling)
 }
 
@@ -678,7 +676,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
             .or(settings.context_tokens)
             .ok_or(ResolveError::MissingContextTokens)?
             .max(1);
-        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens));
+        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens), p.wire_api.reports_cuts() && chatgpt.is_none());
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
         // Sent anywhere else, it hands one server's credential to another.
@@ -739,7 +737,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
         .context_tokens
         .ok_or(ResolveError::MissingContextTokens)?
         .max(1);
-    let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, None);
+    let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, None, false);
     Ok(ActiveEndpoint {
         wire_api: WireApi::ChatCompletions,
         chatgpt: None,

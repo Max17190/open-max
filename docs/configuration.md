@@ -220,8 +220,10 @@ and the run that writes a key already uses it.
   `max_tokens`, which is the model's longest reply. Declaring it keeps the
   default limit as each request's first ask. A `max_tokens` other than 4096 in
   settings.json is both the limit and a ceiling (within the entry's). With
-  neither, the ceiling is four times the default (16384). A limit at its
-  ceiling asks for no room, and a cut call is asked for in parts.
+  neither, Chat Completions caps raises at four times the default (16384).
+  API-key Responses and native Messages can keep doubling after reported
+  cuts while the window has room. Their servers validate the requested limit.
+  A limit at its ceiling asks for no room, and a cut call is asked for in parts.
 
   A reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
@@ -260,7 +262,10 @@ and the run that writes a key already uses it.
   A reply cut while writing its text gets a note that asks for the text to
   be continued from where it stopped. On a Responses connection a reply the
   server reports incomplete at its output limit is continued the same way;
-  a call in it is not kept.
+  a call in it is not kept. On Chat Completions, a reply with no call that
+  spends at least 70% of the limit on reasoning (or output, if reasoning is
+  not counted separately) can indicate a silent cut. On API-key Responses
+  and native Messages, a completed answer stands even at the limit.
 
   When a complete reply looks like a tool call written as text, Open Max
   keeps the reply and asks the model to use the API only if the task requires
@@ -916,8 +921,9 @@ catalog reports the model's output maximum (`max_completion_tokens`,
 setup writes the model entry's `max_tokens`: that maximum, capped at a
 quarter of the window (the cap is never under the 4096 default, so a model
 whose own maximum is lower gets that maximum). A catalog that reports no maximum gets no guess,
-and `openmax --check` then warns that the model runs at the default. Setup
-never replaces a `max_tokens` the entry already has. An endpoint without a
+and `openmax --check` then warns if requests start at the default. This
+missing maximum does not cap raises at 16384 on API-key Responses or native
+Messages. Setup never replaces a `max_tokens` the entry already has. An endpoint without a
 model-list route can be configured with an exact model ID; setup reports
 that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.

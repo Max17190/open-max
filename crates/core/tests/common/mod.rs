@@ -35,12 +35,17 @@ async fn recording_http(responses: Vec<serde_json::Value>, sse: bool) -> (String
 }
 
 pub async fn recording_http_script(responses: Vec<(u16, &'static str, String)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let mut replies = responses.into_iter();
+    recording_http_with(replies.len(), move |_| replies.next().unwrap()).await
+}
+
+pub async fn recording_http_with(count: usize, mut reply: impl FnMut(&str) -> (u16, &'static str, String) + Send + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let record = bodies.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        for (status, content_type, payload) in responses {
+        for _ in 0..count {
             let Ok((mut sock, _)) = listener.accept().await else { return };
             let mut buf = Vec::new();
             let mut chunk = [0u8; 8192];
@@ -67,9 +72,10 @@ pub async fn recording_http_script(responses: Vec<(u16, &'static str, String)>) 
                     break;
                 }
             }
-            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                record.lock().unwrap().push(String::from_utf8_lossy(&buf[end + 4..]).to_string());
-            }
+            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let body = String::from_utf8_lossy(&buf[end + 4..]).into_owned();
+            let (status, content_type, payload) = reply(&body);
+            record.lock().unwrap().push(body);
             let response = format!(
                 "HTTP/1.1 {status} Fixture\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 payload.len(),
