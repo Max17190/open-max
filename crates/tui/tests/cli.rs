@@ -2003,6 +2003,48 @@ fn a_refused_reply_limit_gets_one_retry_at_the_reserve() {
     }
 }
 
+#[test]
+fn a_model_reply_ceiling_does_not_raise_the_first_request_on_any_wire() {
+    use serde_json::{Value, json};
+
+    let messages = json!({"id":"m","type":"message","role":"assistant","model":"stub-model",
+        "content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}});
+    let messages = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{messages}", messages.to_string().len());
+    let responses = sse(&[json!({"type":"response.completed","response":{"status":"completed",
+        "output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}],
+        "usage":{"input_tokens":10,"output_tokens":5}}})]);
+    let sse_response = |body: &str| format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let mut limits = Vec::new();
+    for (wire, key, response) in [
+        ("chat_completions", "max_tokens", sse_response(HELLO_SSE)),
+        ("anthropic", "max_tokens", messages),
+        ("responses", "max_output_tokens", sse_response(&responses)),
+    ] {
+        let (project, home) = fresh_dirs("reply-ceiling");
+        let (base_url, requests, server) = spawn_http_script(vec![response.clone(), response]);
+        let dir = home.join(".openmax");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("providers.json"), json!({"providers":{"stub":{"base_url":base_url,"wire_api":wire,
+            "models":[{"id":"stub-model","context_tokens":131_072,"max_tokens":65_536}]}}}).to_string()).unwrap();
+        for chosen in [None, Some(8000)] {
+            let mut settings = json!({"provider":"stub","model":"stub-model"});
+            if let Some(max_tokens) = chosen { settings["max_tokens"] = json!(max_tokens); }
+            std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+            let (code, _, stdout) = json_turn(&project, &home, "say hi");
+            assert_eq!(code, Some(0), "{wire}, {chosen:?}: {stdout}");
+        }
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{wire}");
+        let actual: Vec<_> = requests.iter().map(|body| serde_json::from_str::<Value>(body).unwrap()[key].as_u64().unwrap()).collect();
+        limits.push((wire, actual));
+        std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
+    }
+    assert_eq!(limits, [
+        ("chat_completions", vec![4096, 8000]), ("anthropic", vec![4096, 8000]), ("responses", vec![4096, 8000]),
+    ]);
+}
+
 /// A reasoning model can spend a reply's whole `max_tokens` thinking: the
 /// reply comes back with finish reason `length`, no text and no call. Cuts in
 /// a row raise the limit up to its ceiling (four times the default when
