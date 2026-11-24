@@ -904,9 +904,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     const TARGET: usize = 2_000;
-    const BASELINE: usize = 1_766;
-    // About 1% of the loop: room for a small fix, not for a feature.
-    const MARGIN: usize = 50;
+    const BASELINE: usize = 1_793;
+    // Keep the 1,816-line ratchet after counting earlier growth.
+    const MARGIN: usize = 23;
     const RATCHET: usize = BASELINE + MARGIN;
     const LOOP: &str = "crates/core/src/agent.rs";
     let report = repo_lines()?;

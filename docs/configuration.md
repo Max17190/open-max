@@ -206,8 +206,8 @@ and the run that writes a key already uses it.
   the note names the next limit; the first reply it does not cut returns it
   to its start. So a model that must think longer than the limit is not
   stopped by the limit alone. A server that refuses a raised limit (HTTP 400
-  or 422) gets the request again at the usual limit and no more raises in
-  that turn. Once the limit cannot grow, after four such continuations a
+  or 422) gets the request again at the usual limit, then at the reserve if
+  refused again above it, with no more raises in that turn. Once the limit cannot grow, after four such continuations a
   fifth cut reply ends the turn with `length` (so does a cut on the turn's
   last iteration), and the terminal UI and print mode say which
   `max_tokens` cut it and where it is set (the cut note and the refused
@@ -373,9 +373,18 @@ input budget are two numbers: set to a model's longest reply, `max_tokens`
 no longer holds that much input back, and a model whose longest reply is as
 large as its window keeps seven eighths of it for input instead of about a
 thousand tokens. A reply that reaches the limit its request carried is cut
-as at any limit. A request that asked for more than the reserve and is
-refused for length goes once more in the same turn at the reserve, and each
-refusal for length calibrates against the limit its request carried.
+as at any limit. If a request carries a limit above the reserve and the
+server returns HTTP 400 or 422, Open Max tries once more at the reserve,
+regardless of the error text. A refusal that names a length problem can
+trigger the same retry with another status. A request that carried room
+after a cut call or text, or a raised limit, first goes again at the usual
+limit if that is lower. These retries count toward `max_agent_iterations`,
+and any reasoning or image repair follows them at the reduced limit if an
+iteration is left. If a status-only retry succeeds at the reserve, later
+requests in the same turn stay there. If recovery from a status-only refusal
+fails, Open Max reports the original error. A status alone does not change
+the input estimate. The subscription route sends no reply limit and does
+not use these limit retries.
 Open Max estimates the input at about four bytes per token and scales the
 estimate up when the server reports more prompt tokens than estimated or
 refuses a request for length that the estimate said fit.

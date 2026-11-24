@@ -870,6 +870,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   max(4096, window/8). A per-model `max_tokens` in providers.json is the
   model's longest reply: a ceiling the limit doubles up to while replies are
   cut in a row before any call, and the limit itself only when lower.
+  HTTP 400 or 422 on a request with a limit above the reserve can trigger
+  a retry at the reserve. If a status-only retry fails, keep the first error.
 - `temperature`: sent only when set. Unset (the default) leaves it to the
   server's own default; OpenAI reasoning models reject any value but 1.
 - `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,
