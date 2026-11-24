@@ -186,7 +186,7 @@ example reports the event as `gates_passed` and lets its own run decide
 ## Bounding a run
 
 - `--max-agent-iterations <n>`: the tool-call rounds one turn may take
-  (the settings default is 1,000). A turn that reaches it ends
+  (the settings default is 300). A turn that reaches it ends
   `max_iterations`.
 - `--max-agent-tokens <n>`: the tokens one turn may spend, checked before each
   request. A request that would take the turn past it is not sent, and the
