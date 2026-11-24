@@ -957,16 +957,14 @@ async fn run_loop(
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
-            let written_call = (!capped && tool_calls.is_empty() && matches!(result.finish_reason.as_str(), "stop" | "tool_calls"))
-                .then(|| crate::notes::written_call_json(&content, registry.tool_schemas_json())).flatten();
-            text_calls = written_call.map_or(0, |_| text_calls + 1);
-            if let Some(valid) = written_call {
-                if text_calls <= 2 && iteration + 1 < max_iterations {
-                    let at = guard.messages().len();
-                    insert_note(core, session_id, guard.messages(), at, crate::notes::written_call_note(valid));
-                    save_messages(core, session_id, guard.messages(), false).await;
-                    continue 'turns;
-                }
+            let mut written_call = (!capped && matches!(result.finish_reason.as_str(), "stop" | "tool_calls"))
+                .then(|| crate::notes::written_call_recovery(&content, registry.tool_schemas_json())).flatten();
+            text_calls = written_call.as_ref().map_or(0, |_| text_calls + 1);
+            if let Some(note) = written_call.take_if(|_| text_calls <= 2 && iteration + 1 < max_iterations) {
+                let at = guard.messages().len();
+                insert_note(core, session_id, guard.messages(), at, note);
+                save_messages(core, session_id, guard.messages(), false).await;
+                continue 'turns;
             }
             // Cut while still thinking or writing, before any call: not an
             // answer, so not an end and no turn_end consult. The reply stays

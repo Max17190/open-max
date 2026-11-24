@@ -263,13 +263,15 @@ and the run that writes a key already uses it.
   When a complete reply looks like a tool call written as text, Open Max
   keeps the reply and asks the model to use the API only if the task requires
   running the tool. Otherwise it asks for the answer without running anything.
-  A `<tool_call>` block must start with an object whose first field is the
-  name of an offered tool, but its arguments need not parse. The closing tag
-  must end the reply. The block can follow prose if its opening tag has its own
-  line. An introduction ending in `example:` or prose around a fenced
-  example stays an answer. An unfenced tutorial or transcript ending with a
+  A `<tool_call>` block must start with an object whose first field is `name`
+  with a string value. Its arguments need not parse. If the tool was not
+  offered, the note says so without repeating the name and lists the tools
+  in request order. The closing tag must end the reply. The block can follow
+  prose if its opening tag has its own line. An introduction ending in
+  `example:` or prose around a fenced example stays an answer. An unfenced tutorial or transcript ending with a
   matching tagged block can trigger a retry, even if its prose describes an
-  example. So can a bare or fenced call object that is the entire reply.
+  example. A bare or fenced call can trigger a retry only if it is a valid
+  JSON call object occupying the entire reply and names an offered tool.
   Open Max never runs a call from reply text. It sends at most two recovery
   notes in a row, within the turn's round cap. A real API call breaks that
   streak and follows the ordinary approval rules.
