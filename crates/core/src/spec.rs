@@ -897,7 +897,7 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `max_agent_tokens`: per-turn spend ceiling, admission-enforced, including
   compaction notes. Unaffordable notes leave the history uncut unless the
   window forces a prune.
-- `max_agent_iterations`: tool/model iteration cap per turn (default 1,000).
+- `max_agent_iterations`: tool/model iteration cap per turn (default 300).
 - `max_parallel_tools`: concurrent read-only tool cap, clamped 1..=32.
 - `request_budget`: optional soft model-request budget per turn, said in notes
   at the start and at 50, 75, 90 and 100 percent; never ends a turn.

@@ -404,7 +404,7 @@ and the run that writes a key already uses it.
   which nothing resizes, so a provider that scales it down costs less. Set it only for a model that takes images: one that does not
   refuses the request. Off, no request changes.
 
-- `max_agent_iterations` (default 1,000): tool-call rounds one turn may take.
+- `max_agent_iterations` (default 300): tool-call rounds one turn may take.
   A turn that reaches it stops and says so; a follow-up message (or
   `openmax --continue -p "<follow-up>"`) carries on from there. Settings are
   read at start, so a raised cap applies from the next `openmax` run.
