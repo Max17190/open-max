@@ -736,7 +736,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Resolving HOME at entry points and passing it to the doctor removed 4.
     // Selecting the saved approval mode with `--permissions`, with
     // offsetting trims in ensure_project_trust
-    // and the declined-approval end line, removed 2.
+    // and the declined-approval end line, removed 2. A request budget set
+    // from the turn's own pace (`request_budget_cycles`), with offsetting
+    // trims in the tool call path and the budget notes, added none.
     const BASELINE: usize = 45_168;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
@@ -907,8 +909,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     const TARGET: usize = 2_000;
-    const BASELINE: usize = 1_793;
-    // Keep the 1,816-line ratchet after counting earlier growth.
+    const BASELINE: usize = 1_780;
+    // The margin kept from earlier growth; the paced request budget's trims lowered BASELINE by 13.
     const MARGIN: usize = 23;
     const RATCHET: usize = BASELINE + MARGIN;
     const LOOP: &str = "crates/core/src/agent.rs";

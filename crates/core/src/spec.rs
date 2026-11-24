@@ -901,6 +901,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
 - `max_parallel_tools`: concurrent read-only tool cap, clamped 1..=32.
 - `request_budget`: optional soft model-request budget per turn, said in notes
   at the start and at 50, 75, 90 and 100 percent; never ends a turn.
+- `request_budget_cycles` (2, 2.5): with request_budget unset (0 keeps it off), sets one
+  when a command first runs after a file change: this many times the requests so far.
 - `agents_md_bytes`: AGENTS.md bytes a new prompt carries; unset 2% of window, 2,000 to 20,000.
 
 ```json

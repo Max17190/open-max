@@ -50,6 +50,36 @@ compaction summary do not. It is guidance only: it never ends a turn and
 changes no limit, and its notes ride the history, so the system prompt and
 tools are the same bytes with or without it.
 
+`request_budget_cycles` sets that budget from the turn's own pace instead of
+a fixed count, since one task can need ten times the requests of another. It
+is a positive number, whole or fractional (`2` or `2.5`), unset by default,
+and ignored whenever `request_budget` is set, 0 included, so a 0 there keeps
+the budget off. A turn starts with no budget and no note. The first time a
+`bash` command runs after the turn has changed a file with `edit_file` or
+`write_file` (earlier in the same round or in an earlier one; an edit that
+failed does not count, a command that exits nonzero does), the budget is
+fixed at this multiple of the model requests the turn has sent so far,
+counted as the marks count them (a retry of one request is not another),
+rounded up and at least one more than that count. That round's tool result
+says so, with the mark the turn has reached, and from then on it behaves as
+a `request_budget` of that size: the same notes at 50, 75, 90 and 100
+percent, guidance only, never ending a turn. A mark owed with no new tool
+result to carry it goes in a note of its own, so no result a request already
+carried changes. A turn that runs no command after a file change gets no
+budget, and each turn measures its own pace. Like `request_budget`, its notes
+ride the history, so the system prompt and tools are the same bytes with or
+without it.
+
+For example, with `"request_budget_cycles": 2`, a turn whose first three
+requests read two files and edit one, and whose fourth runs a command, has a
+budget of 8 from then on. The result of that command ends with this note,
+and the notes at 75 and 100 percent follow on the results of requests 6 and
+8:
+
+```text
+[harness: request budget: this task has a soft budget of 8 model requests, set from your own pace: 4 to your first file change and command. 4 of 8 requests used (50%), 4 left. It is guidance, not a limit: plan to finish and verify the task within it.]
+```
+
 `agents_md_bytes` is how much of the project's `AGENTS.md` a new session's
 prompt carries. Unset, it scales with the context window: 2% of it at 4 bytes
 a token, at least 2,000 bytes and at most 20,000, so a 16k window carries

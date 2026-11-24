@@ -511,11 +511,7 @@ impl RepeatTracker {
 /// for longer than one call may run), so it offers the polling exit and the
 /// finished exit and lets the model pick.
 pub(crate) fn repeated_result_note(n: usize) -> String {
-    format!(
-        "{REPEAT_NOTE_MARK}, {n} times in a row. If you are waiting on something, \
-         keep waiting. If the task is complete, stop calling tools and reply with \
-         a short plain-text summary now.]"
-    )
+    format!("{REPEAT_NOTE_MARK}, {n} times in a row. If you are waiting on something, keep waiting. If the task is complete, stop calling tools and reply with a short plain-text summary now.]")
 }
 
 /// The opening of every request budget note (`Settings::request_budget`).
@@ -524,19 +520,40 @@ pub(crate) const BUDGET_NOTE_MARK: &str = "[harness: request budget:";
 /// The percentages of the request budget whose crossing earns a note.
 const BUDGET_MARKS: [usize; 4] = [50, 75, 90, 100];
 
-/// The note that states the turn's soft request budget before its prompt.
-pub(crate) fn request_budget_start_note(budget: usize) -> String {
-    format!("{BUDGET_NOTE_MARK} this task has a soft budget of {budget} model requests. It is guidance, not a limit: plan to finish and verify the task within it.]")
+/// The note that states the turn's soft request budget: before its prompt, or
+/// on the round that set it from the `used` requests to the turn's first file
+/// change and command (`Settings::request_budget_cycles`), with their mark.
+#[inline(never)]
+pub(crate) fn request_budget_start_note(budget: usize, used: usize, noted: &mut usize) -> String {
+    let pace = if used == 0 { ".".into() } else { format!(", set from your own pace: {used} to your first file change and command.{}", budget_used(budget, used, noted).map_or(String::new(), |mark| format!(" {mark}"))) };
+    format!("{BUDGET_NOTE_MARK} this task has a soft budget of {budget} model requests{pace} It is guidance, not a limit: plan to finish and verify the task within it.]")
 }
 
-/// The note owed once `used` of `budget` requests are spent, when they reach
-/// a mark past `noted`, the highest one already said, which it then records.
-/// Marks passed together earn one note, for the highest.
+/// The note a round of calls owes the budget after `used` requests: the
+/// start of a budget set now at `paced` times them, at least one more, when
+/// none is set yet, else a mark it reached. Kept out of line, so the loop's
+/// frame does not grow with the formatting.
+#[inline(never)]
+pub(crate) fn round_budget_note(budget: &mut Option<usize>, paced: Option<f64>, used: usize, noted: &mut usize) -> Option<String> {
+    if let Some(set) = paced.filter(|_| budget.is_none()).map(|cycles| ((cycles * used as f64).ceil() as usize).max(used + 1)) {
+        *budget = Some(set);
+        return Some(request_budget_start_note(set, used, noted));
+    }
+    request_budget_note((*budget)?, used, noted)
+}
+
+/// The note owed once `used` of `budget` requests reach a mark (`budget_used`).
 pub(crate) fn request_budget_note(budget: usize, used: usize, noted: &mut usize) -> Option<String> {
+    Some(format!("{BUDGET_NOTE_MARK} {} Prioritize finishing and verifying the task.]", budget_used(budget, used, noted)?))
+}
+
+/// The requests used and left once `used` of `budget` reach a mark past
+/// `noted`, the highest one already said, which it then records. Marks
+/// passed together earn one note, for the highest.
+fn budget_used(budget: usize, used: usize, noted: &mut usize) -> Option<String> {
     let mark = BUDGET_MARKS.into_iter().rev().find(|&mark| used.saturating_mul(100) >= mark.saturating_mul(budget)).filter(|&mark| mark > *noted)?;
     *noted = mark;
-    let (percent, left) = (used.saturating_mul(100) / budget.max(1), budget.saturating_sub(used));
-    Some(format!("{BUDGET_NOTE_MARK} {used} of {budget} requests used ({percent}%), {left} left. Prioritize finishing and verifying the task.]"))
+    Some(format!("{used} of {budget} requests used ({}%), {} left.", used.saturating_mul(100) / budget.max(1), budget.saturating_sub(used)))
 }
 
 /// The budget mark owed before request `used + 1`: one the last request
@@ -544,24 +561,14 @@ pub(crate) fn request_budget_note(budget: usize, used: usize, noted: &mut usize)
 /// end, a retried request), so no tool result carried its note. It goes on
 /// the last tool result when the history ends with one, else as a note after
 /// the last message, on disk before the request. After a round of calls the
-/// mark was already said, so this says nothing.
-pub(crate) async fn say_owed_budget_mark(
-    core: &Arc<Core>,
-    session_id: &str,
-    messages: &mut Vec<ChatMessage>,
-    budget: Option<usize>,
-    used: usize,
-    noted: &mut usize,
-) {
+/// mark was already said, so this says nothing. A paced budget's mark is
+/// always a new note, since a request may already have carried that result.
+pub(crate) async fn say_owed_budget_mark(core: &Arc<Core>, session_id: &str, messages: &mut Vec<ChatMessage>, budget: Option<usize>, used: usize, noted: &mut usize, paced: bool) {
     let Some(text) = budget.filter(|_| used > 0).and_then(|budget| request_budget_note(budget, used, noted)) else { return };
     // A tool result last was saved before the request that failed, so a
     // note added to it needs a rewrite to reach the disk.
-    let rewrite = messages.last().is_some_and(|m| m.role == "tool");
-    if rewrite {
-        append_and_emit_note(core, session_id, messages, &text);
-    } else {
-        insert_note(core, session_id, messages, messages.len(), text);
-    }
+    let rewrite = !paced && messages.last().is_some_and(|m| m.role == "tool");
+    if rewrite { append_and_emit_note(core, session_id, messages, &text) } else { insert_note(core, session_id, messages, messages.len(), text) }
     crate::transcript::save_messages(core, session_id, messages, rewrite).await;
 }
 

@@ -738,12 +738,9 @@ async fn run_loop(
         &ratio_origin,
     );
     let max_iterations = settings.max_agent_iterations.max(1);
-    // The soft request budget: said before the prompt, then at its marks on a tool result. It ends nothing.
-    let request_budget = settings.request_budget.filter(|&budget| budget > 0);
-    if let Some(budget) = request_budget {
-        insert_startup_note(core, session_id, guard.messages(), crate::notes::request_budget_start_note(budget));
-    }
-    let mut budget_noted = 0;
+    // The soft request budget: said before the prompt, or set from the turn's pace (`request_budget_cycles`, unless `request_budget` is set, 0 included) on the first round that runs a command after a file change, then at its marks. Both count the loop's requests, as the marks always have: a retry of one request is not another. It ends nothing.
+    let (mut request_budget, mut budget_noted, mut edited, mut ran) = (settings.request_budget.filter(|&budget| budget > 0), 0, false, false);
+    if let Some(budget) = request_budget { insert_startup_note(core, session_id, guard.messages(), crate::notes::request_budget_start_note(budget, 0, &mut budget_noted)); }
     let mut repeats = RepeatTracker::default();
     // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
     let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
@@ -765,7 +762,7 @@ async fn run_loop(
         accept_steers(core, session_id, project_root, &hooks, &cancelled, guard.messages()).await;
         narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
         // A mark the last request reached without a round of calls to carry its note is said now.
-        crate::notes::say_owed_budget_mark(core, session_id, guard.messages(), request_budget, iteration, &mut budget_noted).await;
+        crate::notes::say_owed_budget_mark(core, session_id, guard.messages(), request_budget, iteration, &mut budget_noted, settings.request_budget.is_none()).await;
         // The tool schemas are re-sent whole on every request, so they are
         // as real as the transcript: the overhead every request carries
         // besides the history, the note stored in it included.
@@ -1395,12 +1392,7 @@ async fn run_loop(
                     }
                 } else {
                     executed = true;
-                    (
-                                registry
-                                    .execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone())
-                                    .await,
-                                false,
-                            )
+                    (registry.execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone()).await, false)
                 };
 
                 if turn_cancelled {
@@ -1410,22 +1402,16 @@ async fn run_loop(
                 }
 
                 if executed {
-                    let failures = hooks
-                        .post_tool_use(
-                            session_id,
-                            name,
-                            &args,
-                            project_root,
-                            &outcome,
-                            &cancelled,
-                        )
-                        .await;
+                    let failures = hooks.post_tool_use(session_id, name, &args, project_root, &outcome, &cancelled).await;
                     report_hook_failures(core, session_id, failures);
                 }
 
                 end_call(core, session_id, &call.id, &outcome, guard.messages());
                 if executed {
                     count_usage(&turn_usage, &registry, project_root, name, &args, outcome.ok);
+                    // A command that ran after a file change, whatever its exit, sets a paced budget.
+                    ran |= edited && name == "bash" && args["command"].is_string();
+                    edited |= outcome.ok && matches!(name, "edit_file" | "write_file");
                 }
                 if executed && registry.is_mutating(name) {
                     // Any executed mutating call may have changed extension
@@ -1472,7 +1458,8 @@ async fn run_loop(
         if streak >= REPEAT_NOTE_AT {
             append_and_emit_note(core, session_id, guard.messages(), &repeated_result_note(streak));
         }
-        if let Some(text) = request_budget.and_then(|budget| crate::notes::request_budget_note(budget, iteration + 1, &mut budget_noted)) {
+        let paced = settings.request_budget_cycles.filter(|&cycles| cycles > 0.0 && settings.request_budget.is_none() && ran);
+        if let Some(text) = crate::notes::round_budget_note(&mut request_budget, paced, iteration + 1, &mut budget_noted) {
             append_and_emit_note(core, session_id, guard.messages(), &text);
         }
 
@@ -4707,7 +4694,8 @@ mod tests {
     /// prefix: one before the prompt, then one at each of its marks on the
     /// tool result the next request carries, each stored once and never
     /// moved. Every request sends the system prompt and tools a turn without
-    /// it sends, byte for byte, and without it no request carries a note.
+    /// it sends, byte for byte, and without it no request carries a note. A
+    /// paced budget (`request_budget_cycles`) that nothing sets changes no byte.
     #[tokio::test]
     async fn a_request_budget_rides_notes_and_leaves_the_prefix_alone() {
         use crate::notes::BUDGET_NOTE_MARK;
@@ -4717,14 +4705,14 @@ mod tests {
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let mut runs: Vec<Vec<Value>> = Vec::new();
-        for (n, budget) in [None, Some(4)].into_iter().enumerate() {
+        for (n, (budget, cycles)) in [(None, None), (Some(4), None), (None, Some(2.0))].into_iter().enumerate() {
             let (core, mut rx) = Core::new(root.join(format!("data-{n}"))).unwrap();
             crate::trust::trust_project(&core.data_dir, &project).unwrap();
             let (base_url, bodies) = capturing_endpoint_times(POLL_SSE, 4).await;
             {
                 let mut s = core.settings.lock().unwrap();
                 (s.base_url, s.model, s.context_tokens) = (base_url, "stub".into(), Some(16384));
-                (s.approval_mode, s.request_budget) = (ApprovalMode::Auto, budget);
+                (s.approval_mode, s.request_budget, s.request_budget_cycles) = (ApprovalMode::Auto, budget, cycles);
             }
             start_turn(core.clone(), format!("sess-budget-{n}"), project.clone(), "poll until done".into()).unwrap();
             assert_eq!(drive_turn(&mut rx).await.0, "stop", "the budget never ends the turn");
@@ -4732,6 +4720,7 @@ mod tests {
         }
         let (off, on) = (&runs[0], &runs[1]);
         assert_eq!((off.len(), on.len()), (5, 5), "four tool rounds and the answer, with or without a budget");
+        assert_eq!(runs[2], *off, "commands with no file change before them set no paced budget, so every byte is the same");
         for body in off.iter().chain(on) {
             assert_eq!(body["messages"][0], off[0]["messages"][0], "the system prompt never moves");
             assert_eq!(body["tools"], off[0]["tools"], "the tools never move");
@@ -4830,6 +4819,198 @@ mod tests {
         assert!(tool.contains("1 of 2 requests used (50%)") && tool.contains("2 of 2 requests used (100%)"), "{tool}");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every request body of `prompts`, run as turns of one session against
+    /// a provider that answers the nth request with `streams[n]`, under the
+    /// settings `set` chooses, in a fresh project at `root`'s `project`, so
+    /// runs on one root send the same project path and layout.
+    async fn budget_turns(root: &Path, streams: &[String], set: impl FnOnce(&mut crate::config::Settings), prompts: &[&str]) -> Vec<Value> {
+        use crate::state::Core;
+
+        let (core, mut rx) = Core::new(root.join(format!("data-{}", uuid::Uuid::new_v4()))).unwrap();
+        let project = root.join("project");
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "alpha\n").unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let streams: Vec<&str> = streams.iter().map(String::as_str).collect();
+        let (base_url, bodies) = refusing_endpoint(&streams, |_, _| None).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.approval_mode) = (base_url, "stub".into(), Some(16384), ApprovalMode::Auto);
+            set(&mut s);
+        }
+        for prompt in prompts {
+            start_turn(core.clone(), "sess-paced".into(), project.clone(), (*prompt).into()).unwrap();
+            assert_eq!(drive_turn(&mut rx).await.0, "stop", "a budget never ends a turn");
+        }
+        let bodies = bodies.lock().unwrap().clone();
+        bodies.iter().map(|body| serde_json::from_str(body).unwrap()).collect()
+    }
+
+    /// A reply that writes `path`, and one that writes it and runs a command in the same round.
+    fn write_sse(path: &str) -> String {
+        tool_calls_sse(&[("w1", "write_file", serde_json::json!({ "path": path, "content": "x\n" }))])
+    }
+    fn write_and_run_sse() -> String {
+        tool_calls_sse(&[("w1", "write_file", serde_json::json!({ "path": "b.txt", "content": "x\n" })), ("b1", "bash", serde_json::json!({ "command": "cat b.txt" }))])
+    }
+
+    /// The budget notes one request body carries, in order.
+    fn budget_notes(body: &Value) -> Vec<String> {
+        let text = body["messages"].as_array().unwrap().iter().filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n");
+        text.match_indices(crate::notes::BUDGET_NOTE_MARK).map(|(at, _)| text[at..].split_inclusive(']').next().unwrap().to_string()).collect()
+    }
+
+    /// With `request_budget_cycles` the turn starts with no budget, and a
+    /// command before any file change sets none. The first round that runs a
+    /// command after one sets it to twice the requests sent so far, said on
+    /// that round's tool result with the mark it reached, as one note; the
+    /// marks then follow as a fixed budget's do. Every request before that
+    /// round is the bytes a turn without the key sends, and no request moves
+    /// the system prompt, the tools or an earlier byte.
+    #[tokio::test]
+    async fn a_paced_request_budget_is_set_on_the_first_command_after_a_file_change() {
+        let mut streams = vec![TOOL_SSE.to_string(), POLL_SSE.to_string(), write_sse("b.txt")];
+        streams.extend(std::iter::repeat_n(POLL_SSE.to_string(), 5));
+        streams.push(STOP_SSE.to_string());
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let off = budget_turns(&root, &streams, |_| {}, &["fix it"]).await;
+        let on = budget_turns(&root, &streams, |s| s.request_budget_cycles = Some(2.0), &["fix it"]).await;
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!((off.len(), on.len()), (9, 9));
+        assert!(off.iter().all(|body| budget_notes(body).is_empty()), "no key, no note");
+        assert_eq!(off[..4], on[..4], "a turn sends what it sends without the key until the budget is set");
+        for body in off.iter().chain(&on) {
+            assert_eq!((&body["messages"][0], &body["tools"]), (&off[0]["messages"][0], &off[0]["tools"]), "the prefix never moves");
+        }
+        for pair in on.windows(2) {
+            let (before, after) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
+            assert_eq!(before[..], after[..before.len()], "a note is stored once and never moved");
+        }
+        let start = "[harness: request budget: this task has a soft budget of 8 model requests, set from your own pace: 4 to your first file change and command. 4 of 8 requests used (50%), 4 left. It is guidance, not a limit: plan to finish and verify the task within it.]";
+        let fifth = on[4]["messages"].as_array().unwrap();
+        let carrier = fifth.last().unwrap();
+        assert!(carrier["role"] == "tool" && carrier["content"].as_str().unwrap().ends_with(start), "the round's own tool result carries it: {carrier}");
+        let said: Vec<Vec<String>> = on.iter().map(budget_notes).collect();
+        assert_eq!(said[8], [start, "[harness: request budget: 6 of 8 requests used (75%), 2 left. Prioritize finishing and verifying the task.]", "[harness: request budget: 8 of 8 requests used (100%), 0 left. Prioritize finishing and verifying the task.]"]);
+        assert_eq!(said.iter().map(Vec::len).collect::<Vec<_>>(), [0, 0, 0, 0, 1, 1, 2, 2, 3], "set at request 4, then 75% at 6 and 100% at 8");
+    }
+
+    /// No budget without a file change before the command: a command alone,
+    /// or after an edit that failed, sets none. A fractional multiple rounds
+    /// up, and a budget the mark does not reach yet is said without one. A
+    /// set `request_budget` wins, and the key is then ignored.
+    #[tokio::test]
+    async fn a_paced_request_budget_needs_a_file_change_and_yields_to_a_fixed_one() {
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let failed_edit = tool_calls_sse(&[("e1", "edit_file", serde_json::json!({ "path": "a.txt", "edits": [{ "old_string": "absent", "new_string": "x" }] }))]);
+        let streams = [POLL_SSE.to_string(), failed_edit, POLL_SSE.to_string(), STOP_SSE.to_string()];
+        let bodies = budget_turns(&root, &streams, |s| s.request_budget_cycles = Some(2.0), &["look"]).await;
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies.iter().all(|body| budget_notes(body).is_empty()), "no file change, no budget");
+
+        let streams = [TOOL_SSE.to_string(), TOOL_SSE.to_string(), write_and_run_sse(), STOP_SSE.to_string()];
+        let bodies = budget_turns(&root, &streams, |s| s.request_budget_cycles = Some(2.5), &["fix it"]).await;
+        assert_eq!(budget_notes(&bodies[3]), ["[harness: request budget: this task has a soft budget of 8 model requests, set from your own pace: 3 to your first file change and command. It is guidance, not a limit: plan to finish and verify the task within it.]"], "2.5 times 3, rounded up, and no mark at 37%");
+
+        let streams = [write_sse("b.txt"), POLL_SSE.to_string(), POLL_SSE.to_string(), STOP_SSE.to_string()];
+        let bodies = budget_turns(&root, &streams, |s| (s.request_budget, s.request_budget_cycles) = (Some(4), Some(2.0)), &["fix it"]).await;
+        let _ = std::fs::remove_dir_all(root);
+        let said = budget_notes(bodies.last().unwrap());
+        assert_eq!(said[0], "[harness: request budget: this task has a soft budget of 4 model requests. It is guidance, not a limit: plan to finish and verify the task within it.]");
+        assert_eq!(said[1..].iter().map(|n| n.split(" requests used").next().unwrap().rsplit(": ").next().unwrap()).collect::<Vec<_>>(), ["2 of 4", "3 of 4"], "the fixed budget's marks, at 50% and 75%");
+    }
+
+    /// Only a command that runs after a file change sets the budget: not one
+    /// before the change in the same round, not a `bash` call with no
+    /// command, not a call the output limit cut and the loop never ran. One
+    /// that exits nonzero still ran, and sets it.
+    #[tokio::test]
+    async fn a_paced_request_budget_waits_for_a_command_that_ran_after_the_change() {
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let paced = |s: &mut crate::config::Settings| s.request_budget_cycles = Some(2.0);
+        let run_then_write = tool_calls_sse(&[("b1", "bash", serde_json::json!({ "command": "true" })), ("w1", "write_file", serde_json::json!({ "path": "b.txt", "content": "x\n" }))]);
+        let streams = [run_then_write, POLL_SSE.to_string(), STOP_SSE.to_string()];
+        let bodies = budget_turns(&root, &streams, paced, &["fix it"]).await;
+        assert!(budget_notes(&bodies[1]).is_empty(), "a command before the change sets nothing: {:?}", budget_notes(&bodies[1]));
+        assert_eq!(budget_notes(&bodies[2]).len(), 1, "the next command, after it, sets the budget");
+
+        let no_command = tool_calls_sse(&[("b1", "bash", serde_json::json!({}))]);
+        let cut = raw_calls_sse(&[("w2", "write_file", r#"{"path":"c.txt","content":"x\n"}"#), ("b2", "bash", r#"{"command":"ec"#)], "length", None);
+        for streams in [[write_sse("b.txt"), no_command, STOP_SSE.to_string()], [cut, STOP_SSE.to_string(), STOP_SSE.to_string()]] {
+            let bodies = budget_turns(&root, &streams, paced, &["fix it"]).await;
+            assert!(bodies.iter().all(|body| budget_notes(body).is_empty()), "no command ran after the change: {:?}", bodies.iter().map(budget_notes).collect::<Vec<_>>());
+        }
+
+        let failing = tool_calls_sse(&[("b1", "bash", serde_json::json!({ "command": "exit 3" }))]);
+        let bodies = budget_turns(&root, &[write_sse("b.txt"), failing, STOP_SSE.to_string()], paced, &["fix it"]).await;
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(budget_notes(&bodies[2]).len(), 1, "a command that exits nonzero still ran");
+    }
+
+    /// An explicit `request_budget` of 0 keeps the budget off even with
+    /// `request_budget_cycles` set: the fixed key wins whenever it is set.
+    #[tokio::test]
+    async fn a_zero_request_budget_keeps_a_paced_one_off() {
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let streams = [write_and_run_sse(), POLL_SSE.to_string(), STOP_SSE.to_string()];
+        let bodies = budget_turns(&root, &streams, |s| (s.request_budget, s.request_budget_cycles) = (Some(0), Some(2.0)), &["fix it"]).await;
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies.iter().all(|body| budget_notes(body).is_empty()), "{:?}", bodies.iter().map(budget_notes).collect::<Vec<_>>());
+    }
+
+    /// A paced mark owed after a refused request goes in a note of its own:
+    /// the tool result that carried the budget's start was already sent, so
+    /// it keeps its bytes.
+    #[tokio::test]
+    async fn a_paced_mark_owed_after_a_refusal_is_a_note_of_its_own() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::trust::trust_project(&core.data_dir, &project).unwrap();
+        let refusal = r#"{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}"#;
+        let refused = format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{refusal}", refusal.len());
+        // The first round writes and runs a command, which sets a budget of 2; request 2 is refused and sent again.
+        let (base_url, requests) = scripted_endpoint(&[&write_and_run_sse(), &refused, STOP_SSE]).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            (s.base_url, s.model, s.context_tokens, s.max_tokens) = (base_url, "stub".into(), Some(65_536), 65_536);
+            (s.approval_mode, s.request_budget_cycles) = (ApprovalMode::Auto, Some(2.0));
+        }
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        start_turn(core.clone(), id.clone(), project.clone(), "fix it".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        assert_eq!(*requests.lock().unwrap(), 3);
+        let saved = sessions::load_messages(&core, &id).unwrap().expect("the saved transcript");
+        let tool = saved.iter().rposition(|m| m.role == "tool").unwrap();
+        let text = |at: usize| saved[at].content.clone().unwrap_or_default();
+        assert!(text(tool).contains("soft budget of 2 model requests") && !text(tool).contains("2 of 2"), "{}", text(tool));
+        assert_eq!(saved[tool + 1].role, "user");
+        assert!(text(tool + 1).contains("2 of 2 requests used (100%)"), "{}", text(tool + 1));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Each turn measures its own pace: a file change in an earlier turn does
+    /// not count, so the next turn's command before its own change sets
+    /// nothing, and the budget it sets counts only its own requests.
+    #[tokio::test]
+    async fn each_turn_sets_its_own_paced_request_budget() {
+        let streams = [write_and_run_sse(), STOP_SSE.to_string(), POLL_SSE.to_string(), write_sse("c.txt"), POLL_SSE.to_string(), STOP_SSE.to_string()];
+        let root = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let bodies = budget_turns(&root, &streams, |s| s.request_budget_cycles = Some(2.0), &["fix it", "fix the next"]).await;
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(bodies.len(), 6);
+        let pace = |used: usize, budget: usize| format!("[harness: request budget: this task has a soft budget of {budget} model requests, set from your own pace: {used} to your first file change and command. {used} of {budget} requests used (50%), {} left. It is guidance, not a limit: plan to finish and verify the task within it.]", budget - used);
+        assert_eq!(budget_notes(&bodies[1]), [pace(1, 2)], "at least one request more than the turn has sent");
+        assert_eq!(budget_notes(&bodies[3]), [pace(1, 2)], "the second turn's command before its change sets nothing");
+        assert_eq!(budget_notes(&bodies[5]), [pace(1, 2), pace(3, 6)]);
     }
 
     /// One finished reply of calls given as (id, tool, raw arguments), ending
