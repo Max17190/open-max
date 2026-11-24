@@ -155,9 +155,23 @@ execution policy notice) stays in the transcript and is written to neither
 stream, so a parent agent reading a child run's stderr does not receive it.
 With `--json`, each `AgentEvent` is one JSON line on stdout, `harness_note`
 included. Mutating tools honor the project's approval mode, and a print run
-declines every approval request, so unattended runs need `auto`: the mode a
-trust grant records unless you pick another. For a project in `ask`, select
-`/permissions auto` once.
+cannot ask, so it declines every approval request: unattended runs need
+`auto`, the mode a trust grant records unless you pick another. A turn that
+declined a request ends the run with exit 3, unless it failed (1) or stopped
+short (4), and its last stderr line counts the requests and says how to allow
+the work. For a project in `ask`, select
+`auto` once, from a terminal session with `/permissions auto` or from a shell
+in the project's directory:
+
+```sh
+echo '{"cmd":"approval_mode","mode":"auto"}' | openmax --stdio
+```
+
+A request for an agent-written tool no human has approved names its
+`openmax --approve` command instead. With `--json`, each decline is the
+`approval_settled` line with `outcome` `declined` that the stream already
+carries, and the exit code is the same. A run in `ask` that asked for nothing,
+such as a question, exits 0.
 
 A print run has no overall deadline, like a TUI or stdio session. A turn keeps
 going while the endpoint sends anything, keepalives and tool call arguments
@@ -187,9 +201,9 @@ the prompts after it.
 | Code | Meaning |
 | --- | --- |
 | 0 | Every turn finished |
-| 1 | An operational failure: a turn failed or could not start, or the session could not be opened |
+| 1 | An operational failure: a turn failed or could not start, ended on any other stop reason (`truncated`, `empty`, `blocked`, or a provider's own, such as `content_filter`), or the session could not be opened |
 | 2 | A usage or configuration error before any turn, `--continue` found no prior session here, or `--session` named one this directory cannot continue |
-| 3 | The project is not trusted, or trust cannot be granted from this process |
+| 3 | The project is not trusted, or trust cannot be granted from this process, or a turn that otherwise finished declined an approval request, as a print run does in `ask` (see above) |
 | 4 | A turn stopped short (`length` when replies in a row kept reaching their `max_tokens` before any tool call once it was raised to its ceiling, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
 
 [examples/run-task](../examples/run-task/README.md) is a caller built on these
@@ -404,7 +418,7 @@ longer tasks in a tmux session instead.
   at a terminal. Approval mode: the child runs in the project's mode, or in a
   stricter one saved for a path inside `.worktrees`, never in a looser one.
   Like any print run it declines every approval, so in `ask` its mutating
-  calls are declined.
+  calls are declined and it exits 3.
 - When the turn ends, or a signal stops it as it stops a print run (SIGINT,
   SIGTERM, SIGHUP, SIGQUIT, SIGUSR1 or SIGUSR2), the child's tool processes
   are stopped and everything it changed is committed to its branch:
@@ -422,7 +436,7 @@ longer tasks in a tmux session instead.
   `openmax: the sub-agent's changes are on branch subagent/<name>: 1 file changed, 2 insertions(+)`,
   or says the child changed nothing, and then no branch is kept.
 - The exit status is 128 plus the signal's number after a signal, and
-  otherwise the turn's, as for `-p` (0, 1 or 4), except that a finished turn
+  otherwise the turn's, as for `-p` (0, 1, 3 or 4), except that a finished turn
   exits 1 when its work cannot all be put on its branch (git has no identity
   configured, the branch is locked, or the child changed files inside a
   nested repository or a submodule, or committed there what no

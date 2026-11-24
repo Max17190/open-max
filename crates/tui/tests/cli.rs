@@ -2325,7 +2325,7 @@ fn two_calls_to_an_unapproved_tool_cannot_batch_past_the_gate() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(out.status.code(), Some(3), "stdout: {stdout}\nstderr: {stderr}");
     assert!(
         !project.join("peeked.txt").exists(),
         "batching must not run unapproved host code\nstdout: {stdout}\nstderr: {stderr}"
@@ -2382,7 +2382,7 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(out.status.code(), Some(3), "stdout: {stdout}\nstderr: {stderr}");
     assert!(
         !project.join("peeked.txt").exists(),
         "unapproved host code must not have run\nstdout: {stdout}\nstderr: {stderr}"
@@ -2444,6 +2444,72 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
         "approved content must not ask again: {stdout}"
     );
     assert!(project.join("peeked.txt").exists(), "the approved tool must run: {stdout}");
+}
+
+/// A print run cannot ask, so in `ask` it declines every approval request.
+/// A script must not read success from a run that was not allowed to do its
+/// work: such a run exits 3, says once how many requests it declined, and
+/// names a command that allows the work with no terminal session, which the
+/// test then runs as printed. A run that needed no approval still exits 0.
+#[test]
+fn a_print_run_that_declined_an_approval_exits_3_and_names_the_fix() {
+    let (project, home) = fresh_dirs("declined-approval");
+    let write = || sse_tool_call("write_file", serde_json::json!({"path": "out.txt", "content": "done"}));
+    let (base_url, _server) = spawn_recording_server(
+        vec![sse_text("an answer"), write(), sse_text("not written"), write(), sse_text("not written"), write(), sse_text("written")],
+        project.parent().unwrap().join("requests.jsonl"),
+    );
+    write_settings_with_mode(&home, &base_url, "ask");
+    trust_in_ask(&project, &home);
+
+    let asked = cmd(&project, &home).args(["-p", "a question"]).output().unwrap();
+    assert_eq!(asked.status.code(), Some(0), "{}", String::from_utf8_lossy(&asked.stderr));
+
+    let out = cmd(&project, &home).args(["-p", "write out.txt"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(!project.join("out.txt").exists(), "{stderr}");
+    assert_eq!(stderr.matches("openmax: declined 1 approval request: ").count(), 1, "{stderr}");
+    assert!(!stderr.contains("/approvals"), "no slash command a script cannot type: {stderr}");
+
+    // `--json` keeps its event stream as it was: the decline is the
+    // `approval_settled` line the stream already carries, and the exit code.
+    let json = cmd(&project, &home).args(["--json", "-p", "write out.txt"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    assert_eq!(json.status.code(), Some(3), "{stdout}");
+    let events: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(events.iter().any(|e| e["type"] == "approval_settled" && e["outcome"] == "declined"), "{stdout}");
+    assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{stdout}");
+
+    // The fix as printed, run from a shell in the project, then the same run.
+    let (_, fix) = stderr.lines().find_map(|l| l.split_once("from this directory: ")).expect("a command to run");
+    let bin = Path::new(openmax_bin()).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let ran = Command::new("sh").args(["-c", fix]).current_dir(&project).env("HOME", &home)
+        .env("PATH", path).env_remove("OPENMAX_SESSION").output().unwrap();
+    assert!(ran.status.success(), "{fix}: {}", String::from_utf8_lossy(&ran.stderr));
+    let out = cmd(&project, &home).args(["-p", "write out.txt"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(project.join("out.txt")).unwrap(), "done");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A reply the provider ended on its own terms (here its content filter)
+/// is no finished turn: print mode exits 1 for it, as for a truncated one.
+#[test]
+fn a_print_turn_a_provider_filter_ended_exits_1() {
+    let (project, home) = fresh_dirs("content-filter");
+    let filtered = sse(&[
+        serde_json::json!({"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"content_filter"}]}),
+    ]);
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![(filtered, true)]);
+    write_settings(&home, &base_url);
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "say hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("openmax: stopped (content_filter)"), "{stderr}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
 #[test]

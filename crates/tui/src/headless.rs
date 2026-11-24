@@ -108,8 +108,8 @@ pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEven
 }
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in
-/// `ask` mode are declined so unattended runs never hang; set `approval_mode`
-/// to `auto` for unattended mutations. Multiple prompts reuse one session_id.
+/// `ask` mode are declined so unattended runs never hang, and a turn that
+/// declined one exits 3 (`SELECT_AUTO`). Multiple prompts reuse one session_id.
 async fn run_session(
     core: &Arc<Core>,
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
@@ -270,6 +270,7 @@ async fn run_turn_events(
     // its done, which arrives once the tools are stopped; returning at once
     // would exit with them running.
     let mut stopping: Option<i32> = None;
+    let mut declined = (0usize, false); // requests declined, and whether the mode's gate made one
     let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
     let quit = args.quit.notified();
     tokio::pin!(quit);
@@ -330,13 +331,10 @@ async fn run_turn_events(
                 env: _,
             } => {
                 // The core never asks in auto. An unattended frontend must
-                // decline every request that does reach it.
-                let hint = if reason == "unapproved_source" {
-                    approve_hint(source_path, source_sha)
-                } else {
-                    "select /approvals auto in this project for unattended work".to_string()
-                };
-                let _ = writeln!(stderr, "openmax: declining {}; {hint}", call_line(name, summary));
+                // decline every request that does reach it; the turn's end says how to allow the work.
+                declined = (declined.0 + 1, declined.1 || reason != "unapproved_source");
+                let hint = if reason == "unapproved_source" { format!("; {}", approve_hint(source_path, source_sha)) } else { String::new() };
+                let _ = writeln!(stderr, "openmax: declining {}{hint}", call_line(name, summary));
                 core.respond_approval(approval_id, false);
             }
             AgentEvent::Error { message } => {
@@ -367,16 +365,18 @@ async fn run_turn_events(
                         let _ = writeln!(stderr, "openmax: stopped ({stop_reason})");
                     }
                 }
-                if stop_reason == "error" {
-                    exit_code = 1;
-                } else if matches!(
-                    stop_reason.as_str(),
-                    "length" | "max_iterations" | "budget_exhausted" | "unverified"
-                ) {
-                    // The turn stopped short. Resubmitting continues the
-                    // work, except when a completion gate could not start.
-                    exit_code = 4;
+                if declined.0 > 0 {
+                    let how = if declined.1 { SELECT_AUTO } else { "a human must approve each tool named above with its openmax --approve line, then run again" };
+                    let _ = writeln!(stderr, "openmax: declined {} approval request{}: {how}", declined.0, if declined.0 == 1 { "" } else { "s" });
                 }
+                // Stopped short (4: resubmitting continues, unless a completion gate could not start); kept from its work by
+                // the approval setup (3, as an untrusted project is); or any other end, content_filter included (1).
+                exit_code = match stop_reason.as_str() {
+                    "length" | "max_iterations" | "budget_exhausted" | "unverified" => 4,
+                    "stop" | "tool_calls" | "cancelled" if exit_code == 0 && declined.0 > 0 => 3,
+                    "stop" | "tool_calls" | "cancelled" => exit_code,
+                    _ => 1,
+                };
                 return stopping.unwrap_or(exit_code);
             }
             AgentEvent::Usage { completion_tokens, .. } => {
@@ -504,11 +504,11 @@ fn truncate_line(s: &str, max: usize) -> String {
 /// gate. The path is the whole point of the line, and it is a file the agent
 /// named, so it must survive a paste into a shell unchanged.
 fn approve_hint(source_path: &str, source_sha: &str) -> String {
-    format!(
-        "a human must approve this tool's content first: openmax --approve {} ({source_sha})",
-        open_max_core::doctor::shell_quote(std::path::Path::new(source_path))
-    )
+    format!("a human must approve this tool's content first: openmax --approve {} ({source_sha})", open_max_core::doctor::shell_quote(Path::new(source_path)))
 }
+
+/// How to allow what a print run in ask declined, with no terminal session: a mode only a human saves.
+const SELECT_AUTO: &str = "this project's approval mode is ask, and a print run cannot ask. To let unattended runs do this work, select auto once, from this directory: echo '{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}' | openmax --stdio";
 
 /// What a person reads when a turn stops at its iteration cap: the cap it
 /// reached, then `how_to_continue`, which differs by frontend. Settings are
@@ -561,13 +561,17 @@ mod tests {
         };
 
         // Every stop reason a Done event can carry, and what a caller gets.
-        // `truncated`, `blocked` and `empty` reach 0 here on purpose: both emit an
-        // Error event first, which is what sets their 1 in a real run.
+        // Any end but a finished or cancelled one exits nonzero, an
+        // unlisted provider reason too, with no Error event before it.
         let cases = [
             ("stop", 0),
             ("tool_calls", 0),
             ("cancelled", 0),
             ("error", 1),
+            ("truncated", 1),
+            ("blocked", 1),
+            ("empty", 1),
+            ("content_filter", 1),
             ("max_iterations", 4),
             ("budget_exhausted", 4),
             ("unverified", 4),
