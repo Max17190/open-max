@@ -36,8 +36,9 @@ fn ci_job(name: &str) -> Vec<String> {
     workflow_job("ci.yml", name)
 }
 
-/// The test job's step that runs every test of the workspace, under nextest.
-const NEXTEST_RUN: &str = "cargo nextest run --workspace --locked --profile ci";
+/// The test job's step that runs every test of the workspace, under nextest,
+/// each job of a runner the part of them its matrix entry's partition names.
+const NEXTEST_RUN: &str = "cargo nextest run --workspace --locked --profile ci --partition hash:${{ matrix.partition }}";
 /// The test job's step that runs the doc tests, which nextest does not run.
 const DOC_TESTS: &str = "cargo test --workspace --locked --doc";
 
@@ -2362,7 +2363,9 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
 
 /// Every test of the workspace runs under cargo-nextest in CI's test job:
 /// each test in a process of its own, as many at once as the runner has
-/// cores, where `cargo test` runs the test binaries one after another. The
+/// cores, where `cargo test` runs the test binaries one after another. A
+/// runner's tests may be split across its jobs by nextest's hash partition,
+/// whose parts, 1/N to N/N, run each test exactly once. The
 /// job installs nextest's release binary for its runner, pinned to a version
 /// and checked against the sha256 its release publishes before it is
 /// unpacked, for each runner of its matrix, and fails on a runner it pinned
@@ -2418,6 +2421,38 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
     );
     let runners = job.iter().find_map(|line| line.trim().strip_prefix("os: [")?.strip_suffix(']')).expect("the test job names no runners");
     assert_eq!(runners, "ubuntu-latest, macos-latest", "the test job runs on a runner whose nextest is not pinned");
+    // Each runner's jobs split its tests by nextest's hash of their names:
+    // its partitions, the matrix's less the ones excluded for it, are 1/N
+    // to N/N for one N, so every test runs on each runner, in one job.
+    let partitions: Vec<String> = job
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("partition: [")?.strip_suffix(']').map(str::to_string))
+        .expect("the test job's matrix names no partitions")
+        .split(", ")
+        .map(str::to_string)
+        .collect();
+    let exclude = at("matrix exclusion", &|line| line == "exclude:");
+    let excluded: Vec<(String, String)> = job[exclude + 1..]
+        .iter()
+        .map(|line| line.trim())
+        .take_while(|line| line.starts_with("- os: ") || line.starts_with("partition: "))
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .map(|pair| {
+            let os = pair[0].strip_prefix("- os: ").expect("an exclusion names no runner");
+            let partition = pair.get(1).and_then(|line| line.strip_prefix("partition: ")).expect("an exclusion names no partition");
+            (os.to_string(), partition.to_string())
+        })
+        .collect();
+    for runner in runners.split(", ") {
+        let kept: Vec<&str> = partitions
+            .iter()
+            .map(String::as_str)
+            .filter(|partition| !excluded.contains(&(runner.to_string(), partition.to_string())))
+            .collect();
+        let whole = (1..=kept.len()).map(|k| format!("{k}/{}", kept.len())).collect::<Vec<_>>();
+        assert_eq!(kept, whole, "{runner}'s test jobs do not run each of its tests exactly once");
+    }
     for (runner, _, sha256) in &pins {
         assert!(
             sha256.len() == 64 && sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
