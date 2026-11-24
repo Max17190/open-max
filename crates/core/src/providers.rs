@@ -183,7 +183,7 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
-/// First ask, reserve, room after a cut call or text (four times the ask, within the ceiling) and ceiling for a `context`-token window. The entry's `max_tokens`, the model's longest reply, is a ceiling and never the first ask; one chosen in settings is both.
+/// First ask, reserve, room after a cut call or text (four times the ask, within the ceiling) and ceiling, each within what a `context`-token window leaves (`reply_limits`). The entry's `max_tokens`, the model's longest reply, is the ceiling, and the first ask only where under settings'; one chosen in settings is both, within the entry's.
 /// With neither, the ceiling bounds a thought that never ends: four times the default, or on a vendor's own server a quarter of the window if larger (setup's cap on a maximum a catalog reports).
 fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>, validated: bool) -> (usize, usize, usize, usize) {
     let default = Settings::default().max_tokens;

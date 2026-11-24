@@ -573,7 +573,8 @@ async fn run_loop(
         return "error".into();
     }
 
-    // Self-modification: pick up extension files written since the last freeze before this turn's schemas and prompt are locked in.
+    // Self-modification: pick up extension files written since the last
+    // freeze before this turn's schemas and prompt are locked in.
     let turn_start_receipt = refreeze_if_extensions_changed(core, session_id, project_root).await;
 
     // Take ownership of the in-memory transcript for this turn (no full clone).
@@ -658,8 +659,8 @@ async fn run_loop(
             return "error".into();
         }
     };
-    let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
-    #[cfg(test)] let client = reply_limit_tests::to_fixture(client);
+    let mut client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    #[cfg(test)] reply_limit_tests::to_fixture(&mut client);
     // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
     if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(client.effort_stamp()); }
     // Frozen wire form: every request of the session injects the same tool
@@ -832,7 +833,7 @@ async fn run_loop(
                     // Spend room and raises before trying the reserve, but a vendor's own server that refused a raise keeps the last limit it accepted; content repairs keep the smaller limit.
                     if endpoint.chatgpt.is_none() && limit > endpoint.reply_reserve && (length || matches!(status, Some(400 | 422))) && iteration + 1 < max_iterations {
                         if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
-                        if endpoint.reports_cuts && raise > 0 && (endpoint.max_tokens..limit).contains(&accepted) { (endpoint.reply_ceiling, no_room) = (accepted, true); continue 'turns; }
+                        if endpoint.reports_cuts && raise > 0 && (endpoint.max_tokens..limit).contains(&accepted) { (endpoint.reply_ceiling, client.reply_bounds.0, no_room) = (accepted, accepted, true); continue 'turns; }
                         let usual = endpoint.reply_limit(used_real);
                         at_reserve = !(endpoint.reply_reserve < usual && usual < limit && (roomy.is_some() || raise > 0));
                         (no_room, raise) = (true, 0); continue 'turns;
@@ -892,10 +893,9 @@ async fn run_loop(
         // reasoning, so the continuation resumes the thought instead of
         // starting it over; the wire skips it wherever the reasoning does
         // not go back (another endpoint, a path that does not replay it).
-        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). A vendor's own server reports each cut, so its finished answer may spend the whole limit. Elsewhere, one with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not). A refusal is its own end, never a cut.
+        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). A vendor's own server reports each cut, so a reply it finished, calls and all, may spend the whole limit. Elsewhere, one with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not). A refusal is its own end, never a cut.
         let (silent, repeated) = (content.trim().is_empty() && tool_calls.is_empty(), result.repeats_a_stop(&mut stops, limit));
-        let answered = endpoint.reports_cuts && !silent && tool_calls.is_empty();
-        let hit = if answered { result.finish_reason == "length" } else { result.hit_output_cap(limit) };
+        let hit = result.hit_output_cap(if endpoint.reports_cuts && !silent { usize::MAX } else { limit });
         let near = !endpoint.reports_cuts && endpoint.chatgpt.is_none() && tool_calls.is_empty() && !hit && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED) && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
         let capped = result.finish_reason != "refusal" && (hit || (silent && repeated) || near);
         let cut_thought = capped

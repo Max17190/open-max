@@ -227,7 +227,11 @@ and the run that writes a key already uses it.
   model's own maximum, so their ceiling is the larger of 16384 and a quarter
   of the window (the cap setup puts on a maximum a catalog reports), still
   within the room the prompt leaves. Another server on the same protocol
-  keeps 16384.
+  keeps 16384. So with no `max_tokens` on the entry, a thought there that
+  never ends can bill up to about one and a half times the window in output
+  before the turn ends `length` (531,072 tokens in a 400,000-token window),
+  unless the server refuses a raise first; the entry's `max_tokens` bounds it
+  by the model's own maximum instead.
   A limit at its ceiling asks for no room, and a cut call is asked for in parts.
 
   A reasoning model's reasoning counts toward the limit, so at 4096 a reply
@@ -262,8 +266,10 @@ and the run that writes a key already uses it.
   last limit that server accepted, and the rest of the turn stays there,
   raised no further. Any other server that refuses a raise gets the request
   again at the usual limit, then at the reserve if refused again above it,
-  with no more raises in that turn. Once the limit cannot grow, after four such continuations a
-  fifth cut reply ends the turn with `length` (so does a cut on the turn's
+  with no more raises in that turn. Once the limit cannot grow, the fourth
+  cut reply in a row after that ends the turn with `length`: the fifth reply
+  cut at a limit that starts at its ceiling, the fourth at one a raise took
+  there (so does a cut on the turn's
   last iteration), and the terminal UI and print mode say which
   `max_tokens` cut it and where it is set (the cut note and the refused
   call name the limit that request carried). Send a follow-up to continue.
@@ -275,7 +281,11 @@ and the run that writes a key already uses it.
   subscription route, a reply with no call that spends at least 70% of the
   limit on reasoning (or output, if reasoning is not counted separately) is
   read as a cut thought. On the two direct APIs, a reply the server reports
-  complete is the answer, even at the limit.
+  complete stands even at the limit, its calls included. One with no text
+  and no call is no answer however long its thought: it is asked for once
+  more, and the turn ends `empty` unless the replies after it stop past half
+  the limit within a token of where an earlier one did, which is read as a
+  cut the server did not report.
 
   When a complete reply looks like a tool call written as text, Open Max
   keeps the reply and asks the model to use the API only if the task requires

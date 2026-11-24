@@ -14,37 +14,75 @@ mod recording;
 thread_local! { static FIXTURE: RefCell<Option<String>> = const { RefCell::new(None) }; }
 
 /// Sends a turn's requests to the loopback server this test thread set, if any.
-pub(super) fn to_fixture(mut client: ChatClient) -> ChatClient {
+pub(super) fn to_fixture(client: &mut ChatClient) {
     if let Some(url) = FIXTURE.with(|f| f.borrow().clone()) { client.base_url = url; }
-    client
 }
 
 struct Turn { limits: Vec<u64>, notes: Vec<String>, stop: String, billed: u64, refused_raises: usize }
+
+/// What the model sends besides its thought.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// Only the thought, then the answer "finished" once it fits.
+    Thought,
+    /// First a whole call, reported complete, that spends exactly the limit.
+    Call,
+    /// Every reply reported complete with its thought and no text or call.
+    Silent,
+    /// Native Messages only: the thoughts it is cut in fill the window past
+    /// the compaction trigger right after a refused raise, and a notes
+    /// request is cut at its limit before any text.
+    Compacting,
+}
 
 /// One turn against a model that needs `needed` output tokens in one reply and
 /// keeps needing them after a cut or a refusal (a thought that does not end
 /// sooner because the harness asked again). The server refuses a limit over
 /// `maximum`, bills what it writes, and reports each cut.
 async fn turn(wire: &'static str, window: u64, needed: u64, maximum: u64) -> Turn {
+    turn_as(Shape::Thought, wire, window, needed, maximum).await
+}
+
+async fn turn_as(shape: Shape, wire: &'static str, window: u64, needed: u64, maximum: u64) -> Turn {
     let field = if wire == "responses" { "max_output_tokens" } else { "max_tokens" };
+    let served = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let (serve, mut turns) = (served.clone(), 0);
     let (url, bodies) = recording::recording_http_with(16, move |body| {
-        let limit = serde_json::from_str::<Value>(body).unwrap()[field].as_u64().unwrap();
+        let sent = serde_json::from_str::<Value>(body).unwrap();
+        let limit = sent[field].as_u64().unwrap();
+        let notes = sent["tool_choice"] == "none" || sent["tool_choice"]["type"] == "none";
+        turns += usize::from(!notes);
         if limit > maximum {
             return (400, "application/json", json!({"error":{"message":"max_output_tokens is too large for this model"}}).to_string());
         }
-        let (used, cut) = (needed.min(limit), needed > limit);
-        let usage = json!({"input_tokens":10,"output_tokens":used,"output_tokens_details":{"reasoning_tokens":used-1}});
+        let call = shape == Shape::Call && turns == 1;
+        let (used, cut) = if call { (limit, false) } else if notes { (limit, true) } else { (needed.min(limit), needed > limit) };
+        *serve.lock().unwrap() += used;
+        // Input is not reported, so the estimate stays uncalibrated and the window the thoughts fill is the estimator's.
+        let usage = json!({"input_tokens":0,"output_tokens":used,"output_tokens_details":{"reasoning_tokens":used-1}});
         if wire == "responses" {
+            let output = match () {
+                _ if cut || shape == Shape::Silent => json!([]),
+                _ if call => json!([{"type":"function_call","call_id":"call_1","name":"list_dir","arguments":"{\"path\":\".\"}"}]),
+                _ => json!([{"type":"message","content":[{"type":"output_text","text":"finished"}]}]),
+            };
             let event = if cut {
-                json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":usage}})
+                json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":output,"usage":usage}})
             } else {
-                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"finished"}]}],"usage":usage}})
+                json!({"type":"response.completed","response":{"status":"completed","output":output,"usage":usage}})
             };
             return (200, "text/event-stream", format!("data: {event}\n\n"));
         }
-        (200, "application/json", json!({"type":"message","role":"assistant","stop_reason":if cut { "max_tokens" } else { "end_turn" },
-            "content":if cut { json!([{ "type":"thinking","thinking":"partial","signature":"fixture" }]) } else { json!([{ "type":"text","text":"finished" }]) },
-            "usage":{"input_tokens":10,"output_tokens":used}}).to_string())
+        // In bytes, the estimator's four to a token: about 46,000 tokens sent with the raise the server refuses, and 3,300 more after it.
+        let thought = match (shape, turns) { (Shape::Compacting, 2) => "x".repeat(184_000usize.saturating_sub(body.len())), (Shape::Compacting, 4) => "x".repeat(13_200), _ => "partial".into() };
+        let thinking = json!({ "type":"thinking","thinking":thought,"signature":"fixture" });
+        let (stop, content) = match () {
+            _ if cut => ("max_tokens", json!([thinking])),
+            _ if call => ("tool_use", json!([{"type":"tool_use","id":"call_1","name":"list_dir","input":{"path":"."}}])),
+            _ if shape == Shape::Silent => ("end_turn", json!([thinking])),
+            _ => ("end_turn", json!([{ "type":"text","text":"finished" }])),
+        };
+        (200, "application/json", json!({"type":"message","role":"assistant","stop_reason":stop,"content":content,"usage":{"input_tokens":0,"output_tokens":used}}).to_string())
     }).await;
     let base = if wire == "responses" { "https://api.openai.com/v1" } else { "https://api.anthropic.com/v1" };
     let dir = std::env::temp_dir().join(format!("openmax-limits-{}", uuid::Uuid::new_v4()));
@@ -66,7 +104,7 @@ async fn turn(wire: &'static str, window: u64, needed: u64, maximum: u64) -> Tur
     // the turn's `usage` events, and a request the server refused is a `budget`
     // with no `usage` (nor `retry` or `error`) before the next `budget`.
     let billed = events.iter().filter_map(|e| match e { AgentEvent::Usage { completion_tokens, .. } => Some(*completion_tokens), _ => None }).sum();
-    assert_eq!(billed, limits.iter().filter(|&&n| n <= maximum).map(|&n| n.min(needed)).sum::<u64>());
+    assert_eq!(billed, *served.lock().unwrap());
     let refused_raises = events.iter().enumerate().filter(|(i, e)| matches!(e, AgentEvent::Budget { .. })
         && events[i + 1..].iter().take_while(|e| !matches!(e, AgentEvent::Budget { .. } | AgentEvent::Done { .. }))
             .all(|e| !matches!(e, AgentEvent::Usage { .. } | AgentEvent::Retry { .. } | AgentEvent::Error { .. }))).count();
@@ -88,6 +126,15 @@ async fn a_vendor_servers_completed_answer_stands_after_a_long_thought() {
             let t = turn(wire, 131_072, used, u64::MAX).await;
             assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), (vec![4096], 0, "stop"), "{wire} at {used}");
         }
+        // So is a whole call at the limit: it runs, with no room asked for it.
+        let t = turn_as(Shape::Call, wire, 131_072, 100, u64::MAX).await;
+        assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), (vec![4096, 4096], 0, "stop"), "{wire}");
+        // A completed reply with no text and no call is no answer, however long
+        // its thought: asked again once. Its next two stop where it did, past
+        // half the limit, a cap no server reported, so they are cut (the limit
+        // doubles), and a fourth that stops below half of that ends the turn.
+        let t = turn_as(Shape::Silent, wire, 131_072, 2869, u64::MAX).await;
+        assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), (vec![4096, 4096, 4096, 8192], 2, "empty"), "{wire}");
     }
 }
 
@@ -124,7 +171,16 @@ async fn a_refused_raise_keeps_the_last_accepted_limit_for_the_rest_of_the_turn(
         let t = turn(wire, 400_000, u64::MAX / 4, 64_000).await;
         assert_eq!(t.limits, [4096, 4096, 8192, 16384, 32768, 65536, 32768, 32768, 32768, 32768], "{wire}");
         assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 196_608, "length"));
+        // Refused at the first raise: the last accepted limit is the first ask.
+        let t = turn(wire, 131_072, u64::MAX / 4, 6_000).await;
+        assert_eq!(t.limits, [4096, 4096, 8192, 4096, 4096, 4096, 4096], "{wire}");
+        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 24_576, "length"));
     }
+    // A notes request in that turn, cut before any text, is not asked again
+    // above the limit the server refused (the turn helper counts each refusal).
+    // The fifth request is the notes request.
+    let t = turn_as(Shape::Compacting, "anthropic", 60_000, u64::MAX / 4, 6_000).await;
+    assert_eq!((t.limits.as_slice(), t.refused_raises, t.stop.as_str()), (&[4096, 4096, 8192, 4096, 4096, 4096, 4096, 4096][..], 1, "length"));
 }
 
 /// The subscription route sends no limit and is not a server this module's rules

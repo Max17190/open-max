@@ -2400,7 +2400,7 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
         std::fs::write(dir.join("providers.json"), catalog.to_string()).unwrap();
         let (code, report) = check(&["--check"]);
         assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");
-        assert!(report.lines().any(|l| l.starts_with("warn settings") && l.contains(&format!("max_tokens = 4096, the default, raised up to {ceiling}")) && l.contains("once the limit can grow no further, four continuations later")), "{report}");
+        assert!(report.lines().any(|l| l.starts_with("warn settings") && l.contains(&format!("max_tokens = 4096, the default, raised up to {ceiling}")) && l.contains("once the limit can grow no further, four more cuts in a row before any tool call end the turn")), "{report}");
     }
     std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384,"max_tokens":4096}}]}}}}}}"#)).unwrap();
     let (_, report) = check(&["--check"]);
