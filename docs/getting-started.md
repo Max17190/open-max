@@ -28,10 +28,11 @@ yet is written there before the turn. Or edit the file yourself:
 Trusting a project records its approval mode: `auto` unless you pick `ask` or
 `readonly` at the trust prompt. Auto covers extension creation and repair
 without further confirmation; validation, deny rules, and execution reports
-remain active. `/permissions auto|ask|readonly` and the approval
-card's Auto for project choice change the saved mode for the current trusted
-project. `approval_mode` in settings.json applies only to a project with no
-saved mode, such as one trusted by an earlier version. See
+remain active. `/permissions auto|ask|readonly`, the approval card's Auto
+for project choice and, from a shell, `openmax --permissions auto|ask|readonly`
+change the saved mode for the current trusted project. `approval_mode` in
+settings.json applies only to a project with no saved mode, such as one
+trusted by an earlier version. See
 [approval modes](configuration.md#approvals).
 
 Shift+Tab cycles requested model reasoning effort. `/effort` opens a picker,

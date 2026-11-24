@@ -281,7 +281,7 @@ impl Core {
         mode: crate::config::ApprovalMode,
     ) -> Result<(), String> {
         let mut modes = self.project_approval_modes.lock().unwrap_or_else(|e| e.into_inner());
-        let canonical = crate::trust::set_approval_mode(&self.data_dir, project_root, mode)?;
+        let (canonical, _) = crate::trust::set_approval_mode(&self.data_dir, project_root, mode)?;
         modes.live.insert(canonical, mode);
         Ok(())
     }

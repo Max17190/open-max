@@ -461,24 +461,31 @@ archive is the lossless record. The `compaction` hook observes each cut.
 Each trusted project's mode is saved in `~/.openmax/trust.json` for its exact
 canonical path, and the trust grant records it in the same write: `auto`,
 unless you answer `a` (`ask`) or `r` (`readonly`) at the interactive trust
-prompt. `--trust-project` records `auto`. A project that is already trusted
-keeps its mode when trust is granted again, and a grant or mode selection that
-would leave `trust.json` as it is writes nothing. `/permissions` opens a picker;
-`/permissions auto|ask|readonly` selects directly. The approval card also offers
-**Auto for project**. Every selector saves the same choice. It survives new
-sessions and restarts, including headless and stdio runs, and does not change
-other projects. The `settings.json` `approval_mode` (default `ask`) applies
-only where neither the project nor an enclosing one has a saved mode, such as
-a project trusted by an earlier version; select a mode there once to save
-one. Symlink aliases share the choice. A subdirectory of the project,
-including a worktree placed under it (such as `.worktrees/`) where a
-delegated `openmax -p` child starts, follows the nearest enclosing project's
-choice unless it has a saved choice of its own. A `--subagent` child's
-worktree there runs in the project's choice or a stricter one, never a looser
-one (see [sub-agents](usage.md#sub-agents)). Inheritance follows the path,
-not the Git repository: a worktree outside the root, such as one made with
-`git worktree add ../feature`, gets neither the project's trust nor its
-choice and needs its own.
+prompt. `--trust-project` records `auto`, or the mode a `--permissions` beside
+it names. A project that is already trusted keeps its mode when trust is
+granted again, and a grant or mode selection that would leave `trust.json` as
+it is writes nothing. `/permissions` opens a picker; `/permissions
+auto|ask|readonly` selects directly. The approval card also offers **Auto for
+project**. From a shell, `openmax --permissions auto|ask|readonly` selects for
+the project it runs in, and says what it saved or that the mode was already
+saved. With `-p`, `--stdio` or `--subagent` the run goes on under the new mode;
+alone it ends once the mode is saved. It combines with the flags
+`--trust-project` does. In a project that is not trusted it saves nothing and
+names the grant to run, `--trust-project`, which records `auto`;
+`--trust-project --permissions ask` trusts it in `ask` in one run. Every
+selector saves the same choice. It survives new sessions and restarts,
+including headless and stdio runs, and does not change other projects. The
+`settings.json` `approval_mode` (default `ask`) applies only where neither the
+project nor an enclosing one has a saved mode, such as a project trusted by an
+earlier version; select a mode there once to save one. Symlink aliases share
+the choice. A subdirectory of the project, including a worktree placed under it
+(such as `.worktrees/`) where a delegated `openmax -p` child starts, follows
+the nearest enclosing project's choice unless it has a saved choice of its own.
+A `--subagent` child's worktree there runs in the project's choice or a
+stricter one, never a looser one (see [sub-agents](usage.md#sub-agents)).
+Inheritance follows the path, not the Git repository: a worktree outside the
+root, such as one made with `git worktree add ../feature`, gets neither the
+project's trust nor its choice and needs its own.
 
 - `auto` runs authorized work without confirmation, including newly created
   or repaired tools, hooks, and permission `allow` rules. It ignores
@@ -508,7 +515,10 @@ outside auto to `openmax --spec tools.approval` and `hooks.approval`, which
 they name, so a session in auto never re-sends it.
 
 Only a human can select a saved mode: at the trust grant, or with the
-selectors above in a human-controlled frontend. Agent-spawned processes can
+selectors above in a human-controlled frontend. `--permissions`, in every
+mode, stands behind the walls of `--trust-project` (see
+[project trust](#project-trust)): it refuses under `OPENMAX_SESSION`, and needs
+a terminal on stdin or `OPENMAX_HUMAN_ATTEST=1`. Agent-spawned processes can
 use an existing choice but can neither grant trust nor change the choice
 through the mode command. Settings are read at process launch, so editing
 `settings.json` from a tool does not change a running session's mode.

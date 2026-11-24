@@ -490,7 +490,7 @@ fn approve_hint(source_path: &str, source_sha: &str) -> String {
     format!("a human must approve this tool's content first: openmax --approve {} ({source_sha})", open_max_core::doctor::shell_quote(Path::new(source_path)))
 }
 
-/// How to allow what a print run in ask declined with no terminal session: save auto (a mode only a human
+/// How to allow what a print run in ask declined: `openmax --permissions auto` (a mode only a human
 /// selects) here, and, for a sub-agent held to a stricter mode saved inside the project, on the directory
 /// whose saved choice governs its `project`, which a sub-agent's next worktree is made under.
 fn select_auto(core: &Core, project: &Path) -> String {
@@ -500,12 +500,11 @@ fn select_auto(core: &Core, project: &Path) -> String {
     let inner = open_max_core::state::canonical_root(project).ancestors().take_while(|dir| *dir != here)
         .find(|dir| store["approval_modes"].get(dir.to_string_lossy().as_ref()).is_some()).filter(|dir| ask(dir)).map(Path::to_path_buf);
     let dirs: Vec<PathBuf> = (ask(&here) || inner.is_none()).then(|| here.clone()).into_iter().chain(inner).collect();
-    let cmd = "echo '{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}' | openmax --stdio";
-    let cmds = dirs.iter().map(|dir| match *dir == here { true => cmd.to_string(),
-        false => format!("(mkdir -p {q} && cd {q} && {cmd})", q = open_max_core::doctor::shell_quote(dir)) }).collect::<Vec<_>>().join(" && ");
+    let cmds = dirs.iter().map(|dir| { let q = open_max_core::doctor::shell_quote(dir);
+        if *dir == here { format!("cd {q} && openmax --permissions auto") } else { format!("(mkdir -p {q} && cd {q} && openmax --permissions auto)") } });
     let named = match dirs[..] { [ref only] if *only == here => String::new(),
-        _ => format!(" for {}, whose saved mode governs this run,", dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(" and ")) };
-    format!("this run's approval mode is ask, and a print run cannot ask. To let unattended runs do this work, select auto once{named} from this directory: {cmds}")
+        _ => format!(" for {}, whose saved {} this run", dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(" and "), if dirs.len() > 1 { "modes govern" } else { "mode governs" }) };
+    format!("this run's approval mode is ask, and a print run cannot ask. To let unattended runs do this work, select auto once{named}: {}", cmds.collect::<Vec<_>>().join(" && "))
 }
 
 /// What a person reads when a turn stops at its iteration cap: the cap it

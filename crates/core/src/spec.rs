@@ -229,7 +229,7 @@ in auto. Validation, output limits, and execution reports still apply.
 
 const TOOLS_APPROVAL: &str = r#"# External tools: content approval outside auto (ask, readonly)
 
-Select /permissions auto|ask|readonly in a human-controlled frontend.
+Select /permissions or openmax --permissions auto|ask|readonly as a human.
 The choice persists for this exact trusted project across launches, including
 headless/stdio. A subdirectory, including a worktree placed under the project,
 without its own choice follows the nearest enclosing project's. A worktree
@@ -855,13 +855,13 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   neither this project nor an enclosing one has a saved choice, such as a
   project trusted by an earlier version. The trust grant saves the choice:
   auto, unless the human picks ask or readonly at the trust prompt
-  (`--trust-project` saves auto; an already trusted project keeps its mode).
-  /permissions, its /approvals alias, and the card's Auto for project choice change it.
-  All of these persist in trust.json under the canonical root, not in
-  settings.json, and do not change other projects. Auto includes extension
-  execution without content approvals; deny rules and validation still
-  apply. Agent-spawned clients can neither grant trust nor change the saved
-  mode.
+  (`--trust-project` saves auto, or the mode a `--permissions` beside it names;
+  an already trusted project keeps its mode unless `--permissions` names one).
+  /permissions (alias /approvals), the card's Auto for project, and `openmax --permissions <mode>` change it.
+  All of these persist in trust.json under the canonical root, not in settings.json,
+  and do not change other projects. Auto includes extension execution without
+  content approvals; deny rules and validation still apply. Agent-spawned
+  clients can neither grant trust nor change the saved mode.
 - `context_tokens`: the model's context window in tokens. REQUIRED here or
   in the model's providers.json entry (which wins); no default, nothing is
   queried from the server, and a guessed window is wrong in one direction or

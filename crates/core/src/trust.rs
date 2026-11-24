@@ -165,24 +165,22 @@ pub(crate) fn approval_mode(data_dir: &Path, project_root: &Path, default: Appro
 
 /// Save an explicit choice for one canonical project, which its
 /// subdirectories without a choice of their own follow, without changing the
-/// default for other projects or granting any content approvals.
-pub(crate) fn set_approval_mode(
-    data_dir: &Path,
-    project_root: &Path,
-    mode: ApprovalMode,
-) -> Result<PathBuf, String> {
+/// default for other projects or granting any content approvals. Returns the
+/// canonical root and whether the choice is new: the one saved writes nothing.
+pub fn set_approval_mode(data_dir: &Path, project_root: &Path, mode: ApprovalMode) -> Result<(PathBuf, bool), String> {
     if std::env::var_os("OPENMAX_SESSION").is_some() {
         return Err("approval mode changes require a human-controlled frontend; this process was started by an agent".into());
     }
     let canonical = canonical_project(project_root)?;
+    let mut saved = false;
     update(data_dir, |file| {
         if !file.projects.iter().any(|root| canonical.starts_with(root)) {
             return Err(format!("project {} is not trusted", canonical.display()));
         }
-        file.approval_modes.insert(canonical.clone(), mode);
+        saved = file.approval_modes.insert(canonical.clone(), mode) != Some(mode);
         Ok(())
     })?;
-    Ok(canonical)
+    Ok((canonical, saved))
 }
 
 fn update(data_dir: &Path, change: impl FnOnce(&mut TrustFile) -> Result<(), String>) -> Result<(), String> {

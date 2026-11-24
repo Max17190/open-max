@@ -2552,8 +2552,9 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
 /// A print run cannot ask, so in `ask` it declines every approval request.
 /// A script must not read success from a run that was not allowed to do its
 /// work: such a run exits 3, says once how many requests it declined, and
-/// names a command that allows the work with no terminal session, which the
-/// test then runs as printed. A run that needed no approval still exits 0.
+/// names the command that allows the work, `openmax --permissions auto` in
+/// the project, which the test then runs as printed from another directory.
+/// A run that needed no approval still exits 0.
 #[test]
 fn a_print_run_that_declined_an_approval_exits_3_and_names_the_fix() {
     let (project, home) = fresh_dirs("declined-approval");
@@ -2574,6 +2575,9 @@ fn a_print_run_that_declined_an_approval_exits_3_and_names_the_fix() {
     assert!(!project.join("out.txt").exists(), "{stderr}");
     assert_eq!(stderr.matches("openmax: declined 1 approval request: ").count(), 1, "{stderr}");
     assert!(!stderr.contains("/approvals"), "no slash command a script cannot type: {stderr}");
+    let quoted = open_max_core::doctor::shell_quote(&std::fs::canonicalize(&project).unwrap());
+    let fix = format!("select auto once: cd {quoted} && openmax --permissions auto\n");
+    assert!(stderr.contains(&fix), "the fix is the flag, run in the project: {stderr}");
 
     // `--json` keeps its event stream as it was: the decline is the
     // `approval_settled` line the stream already carries, and the exit code.
@@ -2585,7 +2589,7 @@ fn a_print_run_that_declined_an_approval_exits_3_and_names_the_fix() {
     assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{stdout}");
 
     // The fix as printed, run from a shell in the project, then the same run.
-    run_printed_fix(&project, &home, &stderr, "from this directory: ");
+    run_printed_fix(&home, &project, &home, &stderr, "select auto once: ");
     let out = cmd(&project, &home).args(["-p", "write out.txt"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read_to_string(project.join("out.txt")).unwrap(), "done");
@@ -2593,14 +2597,161 @@ fn a_print_run_that_declined_an_approval_exits_3_and_names_the_fix() {
 }
 
 /// Run the command a declined print run printed after `marker`, from a shell
-/// in `project` that finds this build's openmax first.
-fn run_printed_fix(project: &Path, home: &Path, stderr: &str, marker: &str) {
+/// in `start` that finds this build's openmax first, and check that the shell
+/// is left in `project`, where the same run is tried again. A person pastes it
+/// at a terminal; this shell has none, so it attests, as automation a human
+/// runs does, and the line itself does not.
+fn run_printed_fix(start: &Path, project: &Path, home: &Path, stderr: &str, marker: &str) {
     let (_, fix) = stderr.lines().find_map(|l| l.split_once(marker)).unwrap_or_else(|| panic!("no fix after {marker:?}: {stderr}"));
+    assert!(!fix.contains("OPENMAX_HUMAN_ATTEST"), "{fix}");
     let bin = Path::new(openmax_bin()).parent().unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let ran = Command::new("sh").args(["-c", fix]).current_dir(project).env("HOME", home)
-        .env("PATH", path).env_remove("OPENMAX_SESSION").output().unwrap();
+    let ran = Command::new("sh").args(["-c", &format!("{fix} && pwd -P")]).current_dir(start).env("HOME", home).env("PATH", path)
+        .env_remove("OPENMAX_SESSION").env("OPENMAX_HUMAN_ATTEST", "1").output().unwrap();
     assert!(ran.status.success(), "{fix}: {}", String::from_utf8_lossy(&ran.stderr));
+    let left_in = String::from_utf8_lossy(&ran.stdout).lines().last().unwrap_or_default().to_string();
+    assert_eq!(Path::new(&left_in), std::fs::canonicalize(project).unwrap(), "{fix} must leave the shell in the project");
+}
+
+/// `--permissions` saves the project's approval mode, the choice every
+/// selector saves, and later runs follow it over settings.json's: in ask a
+/// print run declines its write (exit 3), in readonly the write is refused,
+/// and with `-p` the flag saves auto and that same run writes. Selecting the
+/// mode already saved writes nothing and says so, with `--trust-project` too
+/// in a subdirectory its parent's trust covers. A second `--permissions` is
+/// refused before anything is saved, so no later value replaces the first.
+#[test]
+fn the_permissions_flag_saves_each_mode_and_later_runs_honour_it() {
+    use std::os::unix::fs::MetadataExt;
+    let (project, home) = fresh_dirs("permissions-flag");
+    let write = || sse_tool_call("write_file", serde_json::json!({"path": "out.txt", "content": "done"}));
+    let (base_url, _server) = spawn_recording_server(
+        vec![write(), sse_text("not written"), write(), sse_text("not written"), write(), sse_text("written")],
+        project.parent().unwrap().join("requests.jsonl"),
+    );
+    write_settings_with_mode(&home, &base_url, "auto");
+    open_max_core::trust::grant_trust(&home.join(".openmax"), &project, ApprovalMode::Auto).unwrap();
+    let root = std::fs::canonicalize(&project).unwrap();
+    let select = |args: &[&str]| {
+        let out = cmd(&project, &home).arg("--permissions").args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        stderr
+    };
+    for (mode, saved, code) in [("ask", ApprovalMode::Ask, 3), ("readonly", ApprovalMode::Readonly, 0)] {
+        let stderr = select(&[mode]);
+        assert!(stderr.contains(&format!("openmax: saved {mode} mode for project {}\n", root.display())), "{stderr}");
+        assert!(stderr.contains("no session was started"), "{stderr}");
+        assert_eq!(approval_mode(&home, &project), saved);
+        let out = cmd(&project, &home).args(["-p", "write out.txt"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(code), "{mode}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!project.join("out.txt").exists(), "{mode}");
+    }
+    let stderr = select(&["auto", "-p", "write out.txt"]);
+    assert!(stderr.contains(&format!("openmax: saved auto mode for project {}\n", root.display())), "{stderr}");
+    assert_eq!(std::fs::read_to_string(project.join("out.txt")).unwrap(), "done", "{stderr}");
+
+    let trust_file = home.join(".openmax/trust.json");
+    let store = || (std::fs::metadata(&trust_file).unwrap().ino(), std::fs::read(&trust_file).unwrap());
+    let before = store();
+    let stderr = select(&["auto"]);
+    assert!(stderr.contains(&format!("openmax: project {} was already in auto mode; nothing changed\n", root.display())), "{stderr}");
+    assert_eq!(store(), before, "selecting the saved mode must not rewrite trust.json");
+
+    let out = cmd(&project, &home).args(["--permissions", "ask", "--permissions", "auto"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.starts_with("openmax: --permissions given twice; run one at a time"), "{stderr}");
+    assert_eq!(store(), before, "a refused command line must save nothing");
+
+    let sub = project.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    open_max_core::trust::set_approval_mode(&home.join(".openmax"), &sub, ApprovalMode::Auto).unwrap();
+    let before = store();
+    let out = cmd(&sub, &home).args(["--trust-project", "--permissions", "auto"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let sub = std::fs::canonicalize(&sub).unwrap();
+    assert!(stderr.starts_with(&format!("openmax: project {} was already in auto mode; nothing changed\n", sub.display())), "{stderr}");
+    assert_eq!(store(), before, "a covered subdirectory already in the mode must not rewrite trust.json");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Selecting a mode is a human act, as a trust grant is, and every mode is
+/// held to the same walls: `--permissions` refuses a process an agent
+/// started, attested or not, and one with no terminal on stdin and no
+/// attestation, each with exit 3 and the exact command to run in the
+/// project, and leaves the saved mode as it was. A terminal on stdin is
+/// enough, and with one on stdout too the run ends once the mode is saved.
+#[test]
+fn the_permissions_flag_refuses_an_agent_and_a_caller_with_no_terminal() {
+    let (project, home) = fresh_dirs("permissions-human");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    trust_in_ask(&project, &home);
+    let quoted = open_max_core::doctor::shell_quote(&std::fs::canonicalize(&project).unwrap());
+    for mode in ["auto", "readonly"] {
+        let repair = format!("`cd {quoted} && openmax --permissions {mode}`");
+        for (mut command, why) in [
+            (cmd(&project, &home), "agent session; ask the user to run "),
+            (plain_cmd(&project, &home), "has no terminal; run "),
+        ] {
+            if why.starts_with("agent") {
+                command.env("OPENMAX_SESSION", "parent");
+            }
+            let out = command.args(["--permissions", mode]).output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(3), "{stderr}");
+            assert!(stderr.starts_with("openmax: selecting an approval mode is a human action"), "{stderr}");
+            assert!(stderr.contains(&format!("{why}{repair}")), "{stderr}");
+            assert_eq!(approval_mode(&home, &project), ApprovalMode::Ask, "{stderr}");
+        }
+    }
+    // A terminal at both ends, as a person who pastes the end line's repair
+    // has: the mode is saved and the run ends there, with no session to quit
+    // before a second directory's command in the same line can run.
+    let (controller, terminal) = pseudo_terminal();
+    let mut command = plain_cmd(&project, &home);
+    command.args(["--permissions", "auto"]).stdin(terminal.try_clone().unwrap()).stdout(terminal).stderr(Stdio::piped());
+    let out = finish_with_deadline(without_controlling_terminal(&mut command).spawn().unwrap());
+    drop(controller);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.starts_with("openmax: saved auto mode for project ") && !stderr.contains("session"), "{stderr}");
+    assert_eq!(approval_mode(&home, &project), ApprovalMode::Auto);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A project that is not trusted has no approval mode to select:
+/// `--permissions` there exits 3, records nothing, and names the grant to run
+/// in the project, `--trust-project`, which records auto, with the mode
+/// asked for when it is another. Given together, the two trust a new project
+/// in the mode named, and select it on a project trusted already, in one run.
+#[test]
+fn the_permissions_flag_names_trust_project_for_an_untrusted_project() {
+    let (project, home) = fresh_dirs("permissions-untrusted");
+    write_settings(&home, "http://127.0.0.1:9/v1");
+    let root = std::fs::canonicalize(&project).unwrap();
+    let grant = format!("cd {} && openmax --trust-project", open_max_core::doctor::shell_quote(&root));
+    for (args, named) in [(&["auto"][..], format!("`{grant}`")), (&["ask", "-p", "hi"], format!("`{grant} --permissions ask`"))] {
+        let out = cmd(&project, &home).arg("--permissions").args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        let says = format!("openmax: project {} is not trusted; inspect it, then trust it once from a terminal with {named}\n", root.display());
+        assert_eq!(stderr, says);
+        assert_eq!(open_max_core::trust::is_trusted(&home.join(".openmax"), &project), Ok(false));
+    }
+    let both = |mode: &str| {
+        let out = cmd(&project, &home).args(["--trust-project", "--permissions", mode]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let stderr = both("ask");
+    assert!(stderr.starts_with(&format!("openmax: trusted project {} in ask mode", root.display())), "{stderr}");
+    assert_eq!(approval_mode(&home, &project), ApprovalMode::Ask);
+    let stderr = both("readonly");
+    assert!(stderr.starts_with(&format!("openmax: saved readonly mode for project {}\n", root.display())), "{stderr}");
+    assert_eq!(approval_mode(&home, &project), ApprovalMode::Readonly);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
 /// A reply the provider ended on its own terms (here its content filter)
@@ -4567,11 +4718,11 @@ fn a_sub_agent_declined_under_a_stricter_worktrees_mode_names_where_it_is_saved(
         let (code, stderr) = sub_agent();
         assert_eq!(code, Some(3), "{project_mode}: {stderr}");
         let named = match project_mode {
-            "auto" => format!("select auto once for {}, whose saved mode governs this run, from this directory: (mkdir -p ", worktrees.display()),
-            _ => format!("select auto once for {} and {}, whose saved mode governs this run, from this directory: echo ", root.display(), worktrees.display()),
+            "auto" => format!("select auto once for {}, whose saved mode governs this run: (mkdir -p ", worktrees.display()),
+            _ => format!("select auto once for {} and {}, whose saved modes govern this run: cd ", root.display(), worktrees.display()),
         };
         assert!(stderr.contains(&named), "{project_mode}: {stderr}");
-        run_printed_fix(&project, &home, &stderr, "from this directory: ");
+        run_printed_fix(&project, &project, &home, &stderr, " this run: ");
         let (code, stderr) = sub_agent();
         assert_eq!(code, Some(0), "{project_mode}: {stderr}");
         assert!(stderr.contains("openmax: the sub-agent's changes are on branch subagent/"), "{project_mode}: {stderr}");
