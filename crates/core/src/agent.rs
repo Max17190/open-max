@@ -747,13 +747,10 @@ async fn run_loop(
     let mut repeats = RepeatTracker::default();
     // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
     let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
-    let mut at_reserve = false;
-    // The limit is how long a reasoning model thinks in one reply before it acts, not how much a call or an answer
-    // may carry: a reply it cut inside a call or its text is asked for once more with this room, and
-    // never again after a server refused a request that carried it, or a raised limit, or after it was spent: cut on a call or text.
+    let (mut at_reserve, mut reserve_only, mut reserve_refusal) = (false, false, None);
+    // A reply cut inside a call or its text gets room once. A refusal or spent room means asking for the rest in parts.
     let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
-    // Set once a request goes out over the soft trigger: a cut without notes waits for the window; a cut clears it.
-    let mut soft_spent = false;
+    let mut soft_spent = false; // A cut without notes waits for the window; a cut clears it.
     let mut image_refusal: Option<String> = None;
 
     'turns: for iteration in 0..max_iterations {
@@ -814,7 +811,7 @@ async fn run_loop(
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
         let roomy = room.take();
-        let limit = if std::mem::take(&mut at_reserve) { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, raise))) };
+        let limit = if at_reserve || reserve_only { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, raise))) };
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let batcher_in = batcher.clone();
         let flusher = spawn_stale_flusher(&batcher);
@@ -843,29 +840,34 @@ async fn run_loop(
             }
         }
         let result = match result {
-            Ok(r) => { image_refusal = None; r }
-            Err(_) if image_refusal.is_some() => { core.send_agent(session_id, AgentEvent::Error { message: image_refusal.take().unwrap_or_default() }); stop_reason = "error".into(); break 'turns; }
+            Ok(r) => { reserve_only |= limit == endpoint.reply_reserve && reserve_refusal.is_some(); (image_refusal, at_reserve, reserve_refusal) = (None, false, None); r }
             Err(mut message) => {
-                // The room left was misjudged: the same request goes once more at the reserve, with no more room or raises.
-                if limit > endpoint.reply_reserve && crate::compaction::refused_for_length(&message) && iteration + 1 < max_iterations { at_reserve = true; no_room |= roomy.is_some() || raise > 0; raise = 0; continue 'turns; }
-                let status = message.strip_prefix("backend returned ").and_then(|m| m.get(..3)?.parse::<u16>().ok());
-                // A server that refuses the room a cut reply was promised, or a raised limit, gets the request again at the usual limit.
-                if (roomy.is_some() || raise > 0) && limit > endpoint.reply_limit(used_real) && matches!(status, Some(400 | 422)) && iteration + 1 < max_iterations { no_room = true; raise = 0; continue 'turns; }
-                // A server can refuse a request that carries a reply of reasoning alone, or an image no header check could fault. Such replies lose
-                // their stamp, so no wire sends them, each image added since the last reply becomes a line naming the refusal, and it goes again.
-                let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
-                let lone = matches!(status, Some(400 | 422)) && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0;
-                let images = status.is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && drop_new_images(guard.messages(), &message);
-                if lone || images {
-                    // A rewrite that fails leaves the file stale, so the next save writes it whole.
-                    if !save_messages(core, session_id, guard.messages(), true).await {
-                        if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
-                            data.persisted_count = sessions::PERSISTED_STALE;
-                        }
+                if image_refusal.is_none() {
+                    let status = message.strip_prefix("backend returned ").and_then(|m| m.get(..3)?.parse::<u16>().ok());
+                    let length = crate::compaction::refused_for_length(&message);
+                    // Spend room and raises before trying the reserve; content repairs keep the smaller limit.
+                    if endpoint.chatgpt.is_none() && limit > endpoint.reply_reserve && (length || matches!(status, Some(400 | 422))) && iteration + 1 < max_iterations {
+                        let usual = endpoint.reply_limit(used_real);
+                        at_reserve = !(endpoint.reply_reserve < usual && usual < limit && (roomy.is_some() || raise > 0));
+                        if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
+                        (no_room, raise) = (true, 0); continue 'turns;
                     }
-                    if images { core.send_agent(session_id, AgentEvent::Retry { attempt: 2, max_attempts: 2, reason: format!("the provider refused images a tool just returned ({message}); each is now a line saying so") }); image_refusal = Some(message.clone()); }
-                    if iteration + 1 < max_iterations { continue 'turns; }
+                    // Withhold reasoning sent alone and replace newly sent images with text after a refusal.
+                    let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
+                    let lone = matches!(status, Some(400 | 422)) && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0;
+                    let images = status.is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && drop_new_images(guard.messages(), &message);
+                    if lone || images {
+                        // A failed rewrite leaves the file stale, so the next save writes it whole.
+                        if !save_messages(core, session_id, guard.messages(), true).await {
+                            if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
+                                data.persisted_count = sessions::PERSISTED_STALE;
+                            }
+                        }
+                        if images { core.send_agent(session_id, AgentEvent::Retry { attempt: 2, max_attempts: 2, reason: format!("the provider refused images a tool just returned ({message}); each is now a line saying so") }); image_refusal = Some(message.clone()); }
+                        if iteration + 1 < max_iterations { continue 'turns; }
+                    }
                 }
+                message = reserve_refusal.or(image_refusal).unwrap_or(message);
                 // A knowingly oversized request that then fails owes the user
                 // the local accounting, not just the provider's opaque error.
                 if used > budget {

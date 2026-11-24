@@ -837,12 +837,8 @@ pub(crate) fn refusal_ratio(message: &str, estimated: usize, fits: usize, factor
     (floor > factor && floor <= MAX_TOKEN_FACTOR).then_some(floor)
 }
 
-/// Whether a provider error reads as a refusal for length: the prompt, or
-/// the prompt plus the reply reserve, is more than the model's window. The
-/// wording differs by server, so this matches the phrases the common ones
-/// use; one it misses keeps today's behavior. An error status keeps only the
-/// body's message, not its code, so a message that names no window still
-/// needs a phrase of its own.
+/// Whether the provider names a length refusal in the error text. Servers use
+/// different phrases; an HTTP status does not tell us how they count input.
 pub(crate) fn refused_for_length(message: &str) -> bool {
     const PHRASES: [&str; 10] = [
         "context length",

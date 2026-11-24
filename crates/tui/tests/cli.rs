@@ -1810,25 +1810,33 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
 fn spawn_scripted_server(
     script: Vec<(String, bool)>,
 ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let responses = script.into_iter().map(|(sse, finished)| {
+        if finished {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                sse.len(),
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+            )
+        }
+    }).collect();
+    spawn_http_script(responses)
+}
+
+fn spawn_http_script(
+    responses: Vec<String>,
+) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let seen = requests.clone();
     let handle = std::thread::spawn(move || {
-        for (sse, finished) in script {
+        for response in responses {
             let Ok((mut stream, _)) = listener.accept() else { return };
             let Some(body) = read_request(&mut stream) else { return };
             seen.lock().unwrap().push(body);
-            let response = if finished {
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
-                    sse.len(),
-                )
-            } else {
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
-                )
-            };
             let _ = stream.write_all(response.as_bytes());
         }
     });
@@ -1942,6 +1950,57 @@ fn a_print_turn_against_a_stub_server_reaches_stdout() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("stub says hi"), "stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// The reserve retry is about the limit the request carried, not the
+/// server's wording. If the smaller request also fails, keep the first error.
+#[test]
+fn a_refused_reply_limit_gets_one_retry_at_the_reserve() {
+    let refusal = |status: &str, message: &str| {
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        )
+    };
+    let stream = |sse: &str| format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}");
+    let ok = stream(HELLO_SSE);
+    let cut = stream(&sse(&[serde_json::json!({"choices":[{"delta":{"reasoning_content":"half a thought"},"finish_reason":"length"}]})]));
+    let too_large = refusal("400 Bad Request", "input plus max_tokens exceeds the window");
+    let still_invalid = refusal("422 Unprocessable Entity", "request still invalid");
+    let invalid = "backend returned 400 Bad Request: invalid request field";
+    for (name, max_tokens, script, expected, error) in [
+        ("400", 8192, vec![too_large.clone(), ok.clone()], &[8192, 4096][..], None),
+        ("422", 8192, vec![refusal("422 Unprocessable Entity", "input plus max_tokens exceeds the window"), ok.clone()], &[8192, 4096], None),
+        ("length wording", 8192, vec![refusal("413 Payload Too Large", "maximum context length exceeded"), ok.clone()], &[8192, 4096], None),
+        ("both fail", 8192, vec![refusal("400 Bad Request", "invalid request field"), still_invalid.clone(), ok.clone()], &[8192, 4096], Some(invalid)),
+        ("already at reserve", 4096, vec![refusal("400 Bad Request", "invalid request field"), ok.clone()], &[4096], Some(invalid)),
+        ("raised", 4096, vec![cut.clone(), cut.clone(), too_large.clone(), ok.clone()], &[4096, 4096, 8192, 4096], None),
+        ("repair then continue at reserve", 8192, vec![cut.clone(), too_large, still_invalid, cut, ok], &[8192, 8192, 4096, 4096, 4096], None),
+    ] {
+        let (project, home) = fresh_dirs("reserve-retry");
+        let (base_url, requests, _server) = spawn_http_script(script);
+        std::fs::create_dir_all(home.join(".openmax")).unwrap();
+        std::fs::write(home.join(".openmax/settings.json"), serde_json::json!({
+            "base_url": base_url, "model": "stub-model", "context_tokens": 32_768,
+            "max_tokens": max_tokens, "max_agent_iterations": 5,
+        }).to_string()).unwrap();
+        let (code, events, stdout) = json_turn(&project, &home, "say hi");
+        let bodies = requests.lock().unwrap();
+        let limits: Vec<_> = bodies.iter().map(|body| {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["max_tokens"].as_u64().unwrap()
+        }).collect();
+        assert_eq!(limits, expected, "{name}: {stdout}");
+        let errors: Vec<_> = events.iter().filter(|e| e["type"] == "error").map(|e| e["message"].as_str().unwrap()).collect();
+        assert_eq!(errors.first().copied(), error, "{name}: {stdout}");
+        assert_eq!(errors.len(), usize::from(error.is_some()), "{name}: {stdout}");
+        assert_eq!(code, Some(i32::from(error.is_some())), "{name}: {stdout}");
+        if error.is_none() { assert!(stdout.contains("stub says hi"), "{name}: {stdout}"); }
+        if name == "repair then continue at reserve" {
+            assert!(bodies[2].contains("half a thought") && !bodies[3].contains("half a thought"), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
 }
 
 /// A reasoning model can spend a reply's whole `max_tokens` thinking: the
