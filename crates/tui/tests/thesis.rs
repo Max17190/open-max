@@ -733,7 +733,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // tool results and diffs added 54, and CEILING was raised for it by its
     // owner. A lint refusing in-place writes of files, with its reasoned
     // exceptions and the section banners dropped, removed 12.
-    const BASELINE: usize = 45_174;
+    // Resolving HOME at entry points and passing it to the doctor removed 4.
+    const BASELINE: usize = 45_170;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -5109,20 +5110,16 @@ fn watchers_of(record: &Path) -> Vec<i32> {
 /// A print run (`-p`) on a fresh project whose endpoint asks for one `bash`
 /// call running `script`, then answers; with the path of the run's record
 /// of its tool groups. The run leads a process group of its own, as a job a
-/// shell starts does. With `home`, HOME is a fresh directory, which holds
-/// the record (`~/.openmax/run/<pid>.groups`). Without it, the run has no
-/// HOME, so its data directory is the relative `.openmax`, which names one
-/// in the project, the directory the run runs in; the record's path then
-/// names the project as the run reads its working directory, with every
-/// symbolic link resolved (macOS's temporary directory is under one), as
-/// the run's watcher is given it. With `removed`, the run starts from a hard
+/// shell starts does. HOME is a fresh directory, named relative to the
+/// project when `relative_home` is set. The watcher gets an absolute path
+/// to its record. With `removed`, the run starts from a hard
 /// link to the binary under the target directory's `tmp`, removed as soon as
 /// the spawn returns, as an upgrade that replaced the file leaves a run:
 /// before its first tool, which waits on its start and its endpoint.
 #[cfg(unix)]
 fn run_one_bash_call(
     tag: &str,
-    home: bool,
+    relative_home: bool,
     removed: bool,
     script: impl Fn(&Path) -> String,
 ) -> (std::process::Child, PathBuf, PathBuf) {
@@ -5142,12 +5139,11 @@ fn run_one_bash_call(
     }
     let mut run = Command::new(if removed { link.as_path() } else { Path::new(env!("CARGO_BIN_EXE_openmax")) });
     run.process_group(0).current_dir(&project).env_remove("OPENMAX_SESSION").env_remove("OPENMAX_API_KEY");
-    let data = if home {
-        run.env("HOME", &home_dir);
-        home_dir.join(".openmax")
+    run.env("HOME", if relative_home { Path::new("../home") } else { &home_dir });
+    let data = if relative_home {
+        std::fs::canonicalize(&project).unwrap().join("../home/.openmax")
     } else {
-        run.env_remove("HOME");
-        std::fs::canonicalize(&project).unwrap().join(".openmax")
+        home_dir.join(".openmax")
     };
     // Test automation is a human act with no terminal; the grant needs it
     // said.
@@ -5203,9 +5199,8 @@ const ORPHANS_GONE_WITHIN: Duration = Duration::from_millis(100);
 /// How `assert_no_orphans_after_kill_9` starts and kills its run.
 #[cfg(unix)]
 struct Kill9 {
-    /// HOME holds the run's data directory; without it, that is the relative
-    /// `.openmax` (`run_one_bash_call`).
-    home: bool,
+    /// HOME names the run's home relative to the project directory.
+    relative_home: bool,
     /// SIGKILL goes to the run's whole process group, as a shell's
     /// `kill -9 %1` sends it to a job, not to its pid alone: a watcher in
     /// that group would die with the run.
@@ -5226,7 +5221,7 @@ struct Kill9 {
 #[cfg(unix)]
 #[test]
 fn zero_orphans_after_kill_9() {
-    let kill = Kill9 { home: true, group: true, removed: false };
+    let kill = Kill9 { relative_home: false, group: true, removed: false };
     assert_no_orphans_after_kill_9("zero_orphans_after_kill_9", kill, Some(ORPHANS_LISTING));
     let (grace, bound) = (open_max_core::execution::LEFT_BEHIND_GRACE.as_millis(), ORPHANS_GONE_WITHIN.as_millis());
     let stated = std::fs::read_to_string(repo().join("docs/execution.md")).unwrap();
@@ -5238,15 +5233,13 @@ fn zero_orphans_after_kill_9() {
     }
 }
 
-/// The same for `kill -9 <pid>` of a run with no HOME, whose data directory
-/// is therefore the relative `.openmax`, in the directory it runs in, while
-/// its watcher runs in `/`: the watcher must be given the record's absolute
-/// path to find it.
+/// The same for `kill -9 <pid>` of a run with a relative HOME. Its watcher
+/// runs in `/`, so it needs the record's absolute path to find it.
 #[cfg(unix)]
 #[test]
-fn zero_orphans_after_kill_9_with_no_home() {
-    let kill = Kill9 { home: false, group: false, removed: false };
-    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_with_no_home", kill, None);
+fn zero_orphans_after_kill_9_with_relative_home() {
+    let kill = Kill9 { relative_home: true, group: false, removed: false };
+    assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_with_relative_home", kill, None);
 }
 
 /// The same for a run whose binary an upgrade replaced before its first
@@ -5256,7 +5249,7 @@ fn zero_orphans_after_kill_9_with_no_home() {
 #[cfg(target_os = "linux")]
 #[test]
 fn zero_orphans_after_kill_9_once_its_binary_is_replaced() {
-    let kill = Kill9 { home: true, group: false, removed: true };
+    let kill = Kill9 { relative_home: false, group: false, removed: true };
     assert_no_orphans_after_kill_9("zero_orphans_after_kill_9_once_its_binary_is_replaced", kill, None);
 }
 
@@ -5323,7 +5316,7 @@ fn gone_after(pids: &[i32], file: Option<&Path>, since: Instant, wait: Duration)
 #[cfg(unix)]
 fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<&str>) {
     use open_max_core::execution::LEFT_BEHIND_GRACE;
-    let (mut run, base, record) = run_one_bash_call(name, kill.home, kill.removed, |base| {
+    let (mut run, base, record) = run_one_bash_call(name, kill.relative_home, kill.removed, |base| {
         let p = base.join("pids");
         let p = p.display();
         format!("trap '' TERM; echo $$ >> '{p}'; (sleep 6845 & echo $! >> '{p}'; wait) & echo $! >> '{p}'; wait")
@@ -5426,7 +5419,7 @@ fn assert_no_orphans_after_kill_9(name: &str, kill: Kill9, listing_file: Option<
 #[test]
 fn a_runs_watcher_ends_with_the_run() {
     use open_max_core::execution::LEFT_BEHIND_GRACE;
-    let (mut run, base, record) = run_one_bash_call("watcher", true, false, |base| {
+    let (mut run, base, record) = run_one_bash_call("watcher", false, false, |base| {
         let (shell, go) = (base.join("shell"), base.join("go"));
         format!("echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.01; done", shell.display(), go.display())
     });

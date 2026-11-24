@@ -552,11 +552,12 @@ pub const MAX_WAITING_STEER_BYTES: usize = 8 * 1024 * 1024;
 
 /// `~/.openmax`, the single place Open Max keeps its state (settings, sessions,
 /// logs).
-pub fn default_data_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".openmax"),
-        None => PathBuf::from(".openmax"),
-    }
+pub fn default_data_dir() -> Result<PathBuf, &'static str> {
+    // Newer Rust versions fall back to the account home for empty HOME too.
+    std::env::var_os("HOME").map(PathBuf::from).or_else(std::env::home_dir)
+        .filter(|home| !home.as_os_str().is_empty())
+        .map(|home| home.join(".openmax"))
+        .ok_or("no home directory found; set HOME to your home directory")
 }
 
 #[cfg(test)]

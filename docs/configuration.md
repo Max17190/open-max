@@ -3,6 +3,11 @@
 Open Max reads `~/.openmax/settings.json` for the active endpoint and an
 optional `~/.openmax/providers.json` for a catalog of named endpoints.
 
+State lives in `$HOME/.openmax`. If `HOME` is unset, Open Max uses the home
+directory from the system's user database. If `HOME` is empty or no home
+directory is found, commands that need state exit 2 before using any state.
+Set `HOME` to your home directory and try again.
+
 ## Settings
 
 ```json

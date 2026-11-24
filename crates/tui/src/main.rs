@@ -864,6 +864,7 @@ fn runtime(granted: Option<&str>, workers: Option<usize>) -> tokio::runtime::Run
 /// question, as they did when it came first, and otherwise wait for the
 /// session.
 fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
+    let data_dir = data_dir();
     QUIT_UNREAD.store(true, Ordering::SeqCst);
     // Held back from before the terminal changes, for the reason `run`
     // gives, until their watcher has started behind the first frame.
@@ -878,7 +879,6 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     });
     signal_keys(true);
 
-    let data_dir = default_data_dir();
     // Behind the first frame, as every file read is, and before anything
     // can start a tool: as `run` does, stop the tool groups a harness killed
     // outright left running, then record this session's own for a watcher.
@@ -1025,8 +1025,8 @@ async fn setup_on_shell(
 async fn authenticate<F: std::future::Future<Output = Result<(), String>>>(
     run: impl FnOnce(std::path::PathBuf) -> F,
 ) -> std::process::ExitCode {
+    let dir = data_dir();
     let quit = watch_quit_signals(false);
-    let dir = default_data_dir();
     let result = tokio::select! {
         result = run(dir) => Some(result),
         _ = quit.notified() => None,
@@ -1038,6 +1038,10 @@ async fn authenticate<F: std::future::Future<Output = Result<(), String>>>(
         Some(Err(error)) => { eprintln!("openmax: {error}"); std::process::ExitCode::from(1) }
         None => std::process::ExitCode::from(quit_status() as u8),
     }
+}
+
+fn data_dir() -> std::path::PathBuf {
+    default_data_dir().unwrap_or_else(|reason| refuse(2, reason, None))
 }
 
 /// The run of everything but a session painted first (see `main`).
@@ -1052,7 +1056,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         return Ok(authenticate(|dir| async move { Box::pin(setup::run(&dir, action, target, None)).await }).await);
     }
     if cli.update {
-        return Ok(std::process::ExitCode::from(u8::try_from(Box::pin(update::run(&default_data_dir())).await).unwrap_or(1)));
+        return Ok(std::process::ExitCode::from(u8::try_from(Box::pin(update::run(&data_dir())).await).unwrap_or(1)));
     }
     if let Some(action) = &cli.chatgpt {
         if matches!(action.as_str(), "login" | "logout") {
@@ -1070,7 +1074,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         // so the agent can see which of its own creations are pure tax and
         // prune them - the deletion roadmap applied to the agent's toolbox.
         if surface == "usage" {
-            print_usage_economics();
+            print_usage_economics(&data_dir());
             std::process::exit(0);
         }
         // Pure print: no session, no endpoint, no state dir, no trust. The
@@ -1105,6 +1109,12 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         std::process::exit(code);
     }
 
+    if cli.check && cli.stdio {
+        // Protocol conformance reads stdin, not project or user files.
+        std::process::exit(stdio::run_conformance());
+    }
+
+    let data_dir = data_dir();
     if let Some(query) = &cli.recall {
         // Read-only introspection: no session, no endpoint, no trust gate.
         // Recall only ever surfaces this project's own history (the session
@@ -1117,7 +1127,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         // on must not be able to hide the project's own history. Reported on
         // stderr, so a `--json` consumer still gets clean output on stdout.
         let (core, _rx, unreadable_settings) =
-            open_max_core::state::Core::read_only(default_data_dir());
+            open_max_core::state::Core::read_only(data_dir);
         if let Some(reason) = unreadable_settings {
             eprintln!(
                 "openmax: {reason}\n  searching history anyway: recall never reads settings, \
@@ -1146,7 +1156,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         // working, and says where this project's records and the object
         // copies earlier builds made are kept: as they are, never deleted.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let dir = open_max_core::ledger::project_dir(&default_data_dir(), &project);
+        let dir = open_max_core::ledger::project_dir(&data_dir, &project);
         println!(
             "--ledger is deprecated: capability-file history is no longer recorded; this project's existing records and objects are kept, unchanged, in {}",
             dir.display()
@@ -1168,7 +1178,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             std::process::exit(3);
         }
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let plan = open_max_core::ledger::repair_plan(&default_data_dir(), &project);
+        let plan = open_max_core::ledger::repair_plan(&data_dir, &project);
         // The word the human must type is the operation they just read, so a
         // confirmation proves they saw which repair this is.
         let word = match &plan {
@@ -1226,7 +1236,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 std::process::exit(1);
             }
         }
-        match open_max_core::ledger::repair(&default_data_dir(), &project) {
+        match open_max_core::ledger::repair(&data_dir, &project) {
             Ok(outcome) => {
                 match outcome.quarantined {
                     Some(path) => {
@@ -1295,7 +1305,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             };
             shas.push(code_sha.clone());
         }
-        match open_max_core::ledger::approve_capability(&default_data_dir(), &project, file, &shas) {
+        match open_max_core::ledger::approve_capability(&data_dir, &project, file, &shas) {
             Ok(()) => {
                 // The one screen a human reads before vouching for bytes, so
                 // no path it lists may forge a line and claim a file the
@@ -1324,7 +1334,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 let shape_path =
                     if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
                 if let Some(line) =
-                    open_max_core::hooks::approved_shape_line(&shape_path, &project, &default_data_dir(), &bytes)
+                    open_max_core::hooks::approved_shape_line(&shape_path, &project, &data_dir, &bytes)
                 {
                     println!("{line}");
                 }
@@ -1392,7 +1402,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             eprintln!("openmax: confirmation did not match; nothing was changed");
             std::process::exit(1);
         }
-        match open_max_core::ledger::forget_capability(&default_data_dir(), &project, &target) {
+        match open_max_core::ledger::forget_capability(&data_dir, &project, &target) {
             Ok(true) => {
                 println!("forgot {path}; the harness no longer expects a capability file there");
                 if target.exists() {
@@ -1415,20 +1425,15 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
 
     // Every launch that can start a turn or a tool first stops the groups a
     // harness killed outright left running, then records its own for a watcher.
-    open_max_core::execution::reap_left_behind_groups(&default_data_dir(), true);
+    open_max_core::execution::reap_left_behind_groups(&data_dir, true);
 
     if cli.check {
-        // With --stdio, validate a JSONL protocol stream on stdin instead of
-        // the filesystem: no session, no endpoint either.
-        if cli.stdio {
-            std::process::exit(stdio::run_conformance());
-        }
         // Pure filesystem validation: no session, no endpoint.
         let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // The text face's repair commands name files relative to the project.
         let findings = match cli.json {
-            true => open_max_core::doctor::check(&project),
-            false => open_max_core::doctor::check_for_report(&project),
+            true => open_max_core::doctor::check(&project, &data_dir),
+            false => open_max_core::doctor::check_for_report(&project, &data_dir),
         };
         if cli.json {
             // Machine face of the full report (every finding, as --all
@@ -1449,7 +1454,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 // Examples belong in the machine report too: the consumer most
                 // likely to gate on it is an agent verifying a tool it just
                 // wrote, and all-green for a proof that never ran is a lie.
-                let (rows, failures) = tool_example_rows(&project).await;
+                let (rows, failures) = tool_example_rows(&project, &data_dir).await;
                 array.extend(rows);
                 failed = failed || failures > 0;
             }
@@ -1476,7 +1481,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         }
         let mut example_failures = 0usize;
         if cli.run_examples {
-            example_failures = run_tool_examples(&project, &findings).await;
+            example_failures = run_tool_examples(&project, &data_dir, &findings).await;
         }
         // Warnings do not fail the run: a shadowed global default and a rule
         // written before its tool are both normal.
@@ -1490,7 +1495,6 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         std::process::exit(if failed { 1 } else { 0 });
     }
 
-    let data_dir = default_data_dir();
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // Refused before the trust grant, like a usage error, so a refused flag
     // writes nothing.
@@ -2286,6 +2290,7 @@ impl<W: Write> Drop for FrameWriter<W> {
 /// Print `openmax --check --run-examples` results; returns the failure count.
 async fn run_tool_examples(
     project: &std::path::Path,
+    data_dir: &std::path::Path,
     findings: &[open_max_core::doctor::Finding],
 ) -> usize {
     use open_max_core::doctor::Status;
@@ -2293,7 +2298,7 @@ async fn run_tool_examples(
     let mut ran = 0usize;
     // Each verdict prints as it lands: examples run serially with per-tool
     // timeouts, so batching the report would look like a hang.
-    let result = open_max_core::doctor::run_examples(project, true, |verdict| {
+    let result = open_max_core::doctor::run_examples(project, data_dir, true, |verdict| {
         ran += 1;
         if !verdict.sandboxed && verdict.result.is_err() {
             failures += 1;
@@ -2332,10 +2337,10 @@ async fn run_tool_examples(
 
 /// The same example verdicts as JSON rows, for `--check --json`. Returns the
 /// rows and the failure count.
-async fn tool_example_rows(project: &std::path::Path) -> (Vec<serde_json::Value>, usize) {
+async fn tool_example_rows(project: &std::path::Path, data_dir: &std::path::Path) -> (Vec<serde_json::Value>, usize) {
     let mut rows = Vec::new();
     let mut failures = 0usize;
-    match open_max_core::doctor::run_examples(project, false, |_| {}).await {
+    match open_max_core::doctor::run_examples(project, data_dir, false, |_| {}).await {
         Ok(verdicts) => {
             for verdict in verdicts {
                 let (status, message) = match &verdict.result {
@@ -2399,12 +2404,11 @@ fn forget_confirmed(answer: &str, given: &str, resolved: &std::path::Path) -> bo
 
 /// `openmax --spec usage`: per-extension prompt cost joined with lifetime
 /// usage and approval state. Read-only; requires no trust or endpoint.
-fn print_usage_economics() {
+fn print_usage_economics(data_dir: &std::path::Path) {
     use open_max_core::registry::ToolKind;
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let data_dir = default_data_dir();
-    let registry = open_max_core::registry::Registry::build(&data_dir, &project);
-    let usage = open_max_core::ledger::load_usage(&data_dir, &project).unwrap_or_default();
+    let registry = open_max_core::registry::Registry::build(data_dir, &project);
+    let usage = open_max_core::ledger::load_usage(data_dir, &project).unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2434,7 +2438,7 @@ fn print_usage_economics() {
     // real breakdown here so "what does my prompt cost" is answered truthfully
     // and never as a false zero - a project with only an AGENTS.md or a memory
     // note pays real bytes the old "zero extension cost" line hid.
-    let cap = open_max_core::config::load(&data_dir).map_or(open_max_core::prompt::MIN_AGENTS_MD_BYTES, |s| open_max_core::prompt::agents_md_cap(&s, &data_dir));
+    let cap = open_max_core::config::load(data_dir).map_or(open_max_core::prompt::MIN_AGENTS_MD_BYTES, |s| open_max_core::prompt::agents_md_cap(&s, data_dir));
     let (_, breakdown) = open_max_core::prompt::system_prompt_with_breakdown(&project, &registry, cap);
     // The whole serialized array is what rides every request, including the
     // brackets and commas between schemas, so measure the wire bytes rather
@@ -2480,7 +2484,7 @@ fn print_usage_economics() {
         // runs. A tool whose script was rewritten after approval is not
         // approved, and must not read as if it were.
         let approvals =
-            open_max_core::ledger::approvals(&data_dir, &project).unwrap_or_default();
+            open_max_core::ledger::approvals(data_dir, &project).unwrap_or_default();
         let approved = if approvals.contains(&ext.source_sha256)
             && approvals.covers_code(&open_max_core::ledger::bound_code(
                 &ext.command,
