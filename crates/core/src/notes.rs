@@ -869,15 +869,20 @@ pub(crate) fn written_call_json(text: &str, schemas: &serde_json::Value) -> Opti
     use serde_json::Value;
     use std::sync::LazyLock;
     let text = text.trim();
-    let tagged = text.ends_with("</tool_call>");
-    let json = if tagged {
-        let (prefix, body) = text.strip_suffix("</tool_call>")?.split_once("<tool_call>")?;
+    let offered = |name: &str| schemas.as_array().is_some_and(|entries| entries.iter().any(|e| crate::registry::entry_name(e) == name));
+    if let Some(tagged) = text.strip_suffix("</tool_call>") {
+        let (prefix, body) = tagged.split_once("<tool_call>")?;
         if !prefix.is_empty() && (!prefix.ends_with('\n') || !prefix.starts_with(char::is_alphanumeric) || !body.starts_with(['\n', '\r']) || prefix.contains("```") || prefix.contains("~~~")
             || prefix.split_whitespace().last().is_some_and(|word| word.eq_ignore_ascii_case("example:"))) {
             return None;
         }
-        body.trim()
-    } else if let Some(fence) = text.strip_prefix("```") {
+        // The frame identifies the call. Parsing the body only selects the note.
+        static CALLEE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"^\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")"#).unwrap());
+        let body = body.trim();
+        let name: String = serde_json::from_str(CALLEE.captures(body)?.get(1)?.as_str()).ok()?;
+        return offered(&name).then(|| serde_json::from_str::<Value>(body).is_ok());
+    }
+    let json = if let Some(fence) = text.strip_prefix("```") {
         let (info, body) = fence.split_once('\n')?;
         if !matches!(info.trim(), "" | "json") {
             return None;
@@ -888,20 +893,10 @@ pub(crate) fn written_call_json(text: &str, schemas: &serde_json::Value) -> Opti
     } else {
         return None;
     };
-    let offered = |name: &str| schemas.as_array().is_some_and(|entries| entries.iter().any(|e| crate::registry::entry_name(e) == name));
-    let mut values = serde_json::Deserializer::from_str(json).into_iter::<Value>();
-    if let Ok(object) = values.next()? {
-        if !json[values.byte_offset()..].trim().is_empty() {
-            return None;
-        }
-        let fields = object.as_object()?;
-        let args = fields.get("arguments").or_else(|| fields.get("parameters"))?;
-        return (fields.len() == 2 && offered(fields.get("name")?.as_str()?) && args.is_object()).then_some(true);
-    }
-    // Only explicit tags delimit a malformed object. Require the callee and
-    // the start of its arguments before accepting JSON-like broken syntax.
-    static BROKEN: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"^\{\s*"name"\s*:\s*"([^"\\]+)"\s*,\s*"(?:arguments|parameters)"\s*:\s*\{(?:[\x20\t\r\n{}\[\]:,0-9+eE.\-]|true|false|null|"(?:[^"\\]|\\.)*")*$"#).unwrap());
-    (tagged && offered(BROKEN.captures(json)?.get(1)?.as_str())).then_some(false)
+    let object: Value = serde_json::from_str(json).ok()?;
+    let fields = object.as_object()?;
+    let args = fields.get("arguments").or_else(|| fields.get("parameters"))?;
+    (fields.len() == 2 && offered(fields.get("name")?.as_str()?) && args.is_object()).then_some(true)
 }
 
 #[cold]
@@ -975,7 +970,6 @@ mod tests {
             (format!("<tool_call>{call}"), None),
             (format!("<call>{call}</call>"), None),
             (format!("{call}\n{wrapped}"), None),
-            (format!("{wrapped}\n{wrapped}"), None),
             (format!("[{call}]"), None),
             (r#"{"name":"other","arguments":{"name":"bash","arguments":{}}}"#.into(), None),
             (r#"{"name":"bash","options":{}}"#.into(), None),
@@ -984,8 +978,29 @@ mod tests {
             (r#"{"name":"bash","arguments":{},}"#.into(), None),
             (r#"<tool_call>{"arguments":{},"name":"bash",}</tool_call>"#.into(), None),
             (r#"<tool_call>{"name":"other","arguments":{,}}</tool_call>"#.into(), None),
-            (r#"<tool_call>{"name":"bash","arguments":{missing quotes}}</tool_call>"#.into(), None),
             ("   ".into(), None),
+        ] {
+            assert_eq!(written_call_json(&reply, registry.tool_schemas_json()), expected, "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn tagged_calls_do_not_require_well_formed_arguments() {
+        let registry = Registry::builtin_only();
+        let garbage = r#"{"name":"bash","arguments":{missing quotes <fragment> } " { </fragment>}}"#;
+        let string_args = r#"{"name":"bash","arguments":"echo hello"}"#;
+        let tag = |body: &str| format!("<tool_call>\n{body}\n</tool_call>");
+        let valid = tag(r#"{"name":"bash","arguments":{}}"#);
+        for (reply, expected) in [
+            (tag(garbage), Some(false)),
+            (format!("Example:\n{}", tag(garbage)), None),
+            (format!("```json\n{garbage}\n```"), None),
+            (garbage.into(), None),
+            (tag(string_args), Some(true)),
+            (tag(r#"{"name":"b\u0061sh","arguments":{}}"#), Some(true)),
+            (tag(r#"{"name":"bash" anything goes"#), Some(false)),
+            (format!("```json\n{string_args}\n```"), None),
+            (format!("{valid}\n{valid}"), Some(false)),
         ] {
             assert_eq!(written_call_json(&reply, registry.tool_schemas_json()), expected, "{reply:?}");
         }

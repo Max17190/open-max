@@ -263,8 +263,10 @@ and the run that writes a key already uses it.
   When a complete reply looks like a tool call written as text, Open Max
   keeps the reply and asks the model to use the API only if the task requires
   running the tool. Otherwise it asks for the answer without running anything.
-  A `<tool_call>` block can follow prose if the opening tag has its own line
-  and the block ends the reply. An introduction ending in `example:` or prose
+  A `<tool_call>` block must start with an object whose first field is the
+  name of an offered tool, but its arguments need not parse. The closing tag
+  must end the reply. The block can follow prose if its opening tag has its own
+  line. An introduction ending in `example:` or prose
   around a fenced example stays an answer. A bare or fenced object that is
   the entire reply can still look like a call, even when the user requested
   it as an example. Open Max never runs a call from reply text. It sends at

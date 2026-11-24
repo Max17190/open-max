@@ -251,6 +251,9 @@ const MALFORMED: &str = " <tool_call>\n{\"name\":\"edit_file\",\"arguments\":{\"
 const PROSE_MALFORMED: &str = "First, write the line below:\n<tool_call>\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"ghost.txt\",\"content\":\"one\ntwo\"}}\n</tool_call>";
 const MISSING_DELIMITER: &str = r#"<tool_call>{"name":"write_file","arguments":{"path":"ghost.txt" "content":"text"}}</tool_call>"#;
 const OPEN_ARRAY: &str = "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"paths\":[\"a.txt\"\n</tool_call>";
+const BROKEN_FIRST_ARGUMENT: &str = r#"<tool_call>
+{"name":"read_file","arguments":{"offset":  first","path":"evidence.txt"}}
+</tool_call>"#;
 const TEXT_CALL_NOTE: &str = "[tool call written as text: nothing ran. Only call the tool through the API with valid JSON arguments if the user's task requires running it. Otherwise return the requested answer without running anything.]";
 const BAD_JSON_NOTE: &str = "[tool call written as text: nothing ran. The arguments were not valid JSON. Only call the tool through the API with valid JSON arguments if the user's task requires running it. Otherwise return the requested answer without running anything.]";
 
@@ -285,6 +288,7 @@ fn call_text_notes(turn: &Turn) -> Vec<&str> {
 #[tokio::test]
 async fn written_calls_are_replayed_as_text_then_retried_through_the_api() {
     for (text, note) in [
+        (BROKEN_FIRST_ARGUMENT.to_string(), BAD_JSON_NOTE),
         (MALFORMED.to_string(), BAD_JSON_NOTE),
         (PROSE_MALFORMED.to_string(), BAD_JSON_NOTE),
         (MISSING_DELIMITER.to_string(), BAD_JSON_NOTE),
@@ -386,6 +390,7 @@ async fn answers_with_tool_names_or_examples_stay_answers() {
         "The API accepts a `name` string and an `arguments` object in each request.".to_string(),
         "To inspect a file, call `read_file` with its path. Then use its result to decide what to edit.".to_string(),
         format!("Example: `<tool_call>{CALL_AS_TEXT}</tool_call>`"),
+        format!("<tool_call>\n{CALL_AS_TEXT}"),
         format!("{CALL_AS_TEXT}\nThis example is not a request to run it."),
     ] {
         let turn = run(vec![answer(&text)]).await;
