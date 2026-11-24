@@ -119,26 +119,24 @@ struct ReasoningTextBlock<'a> {
     text: std::borrow::Cow<'a, str>,
 }
 
-fn details_repeat_plaintext(message: &ChatMessage) -> bool {
-    let mut plaintext = [message.reasoning_content.as_deref(), message.reasoning.as_deref()]
-        .into_iter().flatten();
-    let Some(text) = plaintext.next().filter(|text| !text.is_empty()) else { return false };
-    let Some(details) = message.reasoning_details.as_deref() else { return false };
-    let raw = details.get();
-    if plaintext.any(|other| other != text) || raw.len() > MAX_RESPONSE_BYTES {
+pub(crate) fn details_repeat_plaintext(raw: &RawValue, mut remaining: &str, allow_other_blocks: bool) -> bool {
+    let raw = raw.get();
+    if remaining.is_empty() || raw.len() > MAX_RESPONSE_BYTES {
         return false;
     }
-    // Borrow unescaped text and skip opaque fields. Compare blocks in order
-    // without assembling another copy of the reasoning or rewriting the JSON.
+    // Compare blocks in order without assembling another copy of the text.
     let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(raw) else { return false };
-    let mut remaining = text;
     for block in blocks {
         // A named Rust struct can deserialize from a JSON array, but a
         // reasoning block has to be an object on this wire.
         let raw = block.get().trim_start();
         if !raw.starts_with('{') { return false; }
         let Ok(block) = serde_json::from_str::<ReasoningTextBlock<'_>>(raw) else { return false };
-        if block.kind != "reasoning.text" { continue; }
+        match block.kind.as_ref() {
+            "reasoning.text" if allow_other_blocks || !block.text.is_empty() => {}
+            _ if allow_other_blocks => continue,
+            _ => return false,
+        }
         let Some(tail) = remaining.strip_prefix(block.text.as_ref()) else { return false };
         remaining = tail;
     }
@@ -147,8 +145,12 @@ fn details_repeat_plaintext(message: &ChatMessage) -> bool {
 
 fn chat_replay(message: &ChatMessage, origin: &str, prefer_details: bool) -> (bool, bool) {
     let replay = message.reasoning_origin.as_deref() == Some(origin);
-    let plain = replay && !(prefer_details && details_repeat_plaintext(message));
-    (replay, plain)
+    let mut plaintext = [message.reasoning_content.as_deref(), message.reasoning.as_deref()].into_iter().flatten();
+    let repeated = replay && prefer_details && plaintext.next().is_some_and(|text| {
+        plaintext.all(|other| other == text)
+            && message.reasoning_details.as_deref().is_some_and(|raw| details_repeat_plaintext(raw, text, true))
+    });
+    (replay, replay && !repeated)
 }
 
 /// An assistant message that would go out with no text, no call and no
