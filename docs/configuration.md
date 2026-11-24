@@ -234,6 +234,7 @@ and the run that writes a key already uses it.
   call larger than the limit. Without a reasoning count, a reply with some
   readable output and no opaque reasoning gets that note only if less than a
   quarter of the billed output arrived and the gap exceeds the usual margin.
+  Plain text blocks that repeat the readable reasoning do not count twice.
   A provider that hides most of its
   reasoning can still look like a dropped call. The note asks for the call
   again if there is room, or asks for the content in parts;

@@ -14,7 +14,7 @@ use crate::hooks::Hooks;
 use crate::permissions::TurnPermissions;
 use crate::registry::Registry;
 use crate::state::Core;
-use crate::types::{AgentEvent, ChatMessage, ToolCall};
+use crate::types::{estimate_tokens, AgentEvent, ChatMessage, ToolCall};
 
 /// Forward observe-only hook failures to the frontend. The turn proceeds
 /// (observe hooks are fail-open) but a broken observer is never silent.
@@ -849,17 +849,15 @@ pub(crate) fn cut_off_call_error(max_tokens: usize, room: Option<usize>) -> Stri
 pub(crate) enum CutKind { Thought, Text, Lost, Unseen }
 
 pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResult) -> CutKind {
-    use crate::types::estimate_tokens;
-    // Readable reasoning only: `reasoning_details` can hold encrypted data and
-    // signatures, whose bytes say nothing of the tokens behind them.
-    let thought = reply.reasoning_content.as_ref().map_or(0, String::len).max(reply.reasoning.as_ref().map_or(0, String::len));
+    let thought = [reply.reasoning_content.as_deref(), reply.reasoning.as_deref()].into_iter().flatten().max_by_key(|text| text.len()).unwrap_or_default();
+    let no_unread_reasoning = || reply.reasoning_details.as_deref().is_none_or(|raw| crate::client::details_repeat_plaintext(raw, thought, false));
     let margin = (max_tokens as u64 / 8).max(256);
     let text = estimate_tokens(reply.content.len()) as u64;
-    let arrived = |reasoning: u64| reasoning.max(estimate_tokens(thought) as u64).saturating_add(2 * text);
+    let arrived = |reasoning: u64| reasoning.max(estimate_tokens(thought.len()) as u64).saturating_add(2 * text);
     match reply.usage.map(|u| (u.output_tokens, u.reasoning_tokens)) {
         Some((output, Some(reasoning))) if output.saturating_sub(arrived(reasoning)) > margin => CutKind::Lost,
-        Some((output, None)) if (thought > 0 || !reply.content.is_empty()) && reply.reasoning_details.is_none() && arrived(0).saturating_mul(4) < output && output.saturating_sub(arrived(0)) > margin => CutKind::Lost,
-        None | Some((_, None)) if reply.content.is_empty() && thought == 0 && reply.reasoning_details.is_none() => CutKind::Unseen,
+        Some((output, None)) if (!thought.is_empty() || !reply.content.is_empty()) && arrived(0).saturating_mul(4) < output && output.saturating_sub(arrived(0)) > margin && no_unread_reasoning() => CutKind::Lost,
+        None | Some((_, None)) if reply.content.is_empty() && thought.is_empty() && reply.reasoning_details.is_none() => CutKind::Unseen,
         _ if text > margin => CutKind::Text,
         _ => CutKind::Thought,
     }

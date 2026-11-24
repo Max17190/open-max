@@ -5531,6 +5531,35 @@ mod tests {
         assert!(notes[1].contains(crate::notes::SPLIT_ADVICE));
     }
 
+    #[tokio::test]
+    async fn duplicated_plain_reasoning_does_not_hide_a_likely_dropped_call() {
+        let thought = "I will write the file.";
+        let reply = |details: serde_json::Value| {
+            let chunk = serde_json::json!({"choices":[{"delta":{
+                "reasoning_content": thought, "reasoning_details": details,
+            }, "finish_reason":"length"}], "usage":{"prompt_tokens":100,"completion_tokens":4096}});
+            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+        };
+        let text = serde_json::json!({"type":"reasoning.text","text":thought});
+        let cut = reply(serde_json::json!([text]));
+        let (stop, limits, notes) = cut_recovery_turn(&[&cut, STOP_SSE], None).await;
+        assert_eq!(stop, "stop");
+        assert_eq!(limits, [4096, 16384], "{notes:?}");
+        assert!(notes[0].contains("The next reply alone may be up to 16384 tokens: send that call again now, whole."));
+        for details in [
+            serde_json::json!([{"type":"reasoning.text","text":"different"}]),
+            serde_json::json!([{"type":"reasoning.summary","summary":thought}]),
+            serde_json::json!([{"type":"reasoning.encrypted","data":"opaque"}]),
+            serde_json::json!([text, {"type":"reasoning.encrypted","data":"opaque"}]),
+            serde_json::json!([text, {"type":"other","text":thought}]),
+        ] {
+            let cut = reply(details);
+            let (_, limits, notes) = cut_recovery_turn(&[&cut, STOP_SSE], None).await;
+            assert_eq!(limits, [4096, 4096], "{notes:?}");
+            assert!(notes[0].contains("think briefly, then act"));
+        }
+    }
+
     /// One turn of "write big.txt" on a 262,144-token window against replies
     /// in order (the last repeats), with the model's longest reply declared
     /// when `ceiling` is set. Returns the stop reason, the limit each request
