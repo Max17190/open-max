@@ -1036,7 +1036,9 @@ async fn setup_on_shell(
 ) -> std::io::Result<Result<(), String>> {
     restore_terminal();
     let keys = futures_util::stream::poll_fn(|cx| keys.poll_recv(cx).map(|key| key.map(Ok)));
-    let result = setup::run(dir, action, target, Some(Box::new(keys))).await;
+    let result = setup::run(dir, action, target, Some(Box::new(keys)))
+        .await
+        .map(|_| ());
     enter_terminal()?;
     *terminal = frame_terminal()?;
     start_input();
@@ -1078,7 +1080,13 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
             eprintln!("openmax: {error}");
             return Ok(std::process::ExitCode::from(3));
         }
-        return Ok(authenticate(|dir| async move { Box::pin(setup::run(&dir, action, target, None)).await }).await);
+        return Ok(authenticate(|dir| async move {
+            match Box::pin(setup::run(&dir, action, target, None)).await? {
+                Some((provider, model)) => setup::select_unless_chosen(&dir, &provider, &model),
+                None => Ok(()),
+            }
+        })
+        .await);
     }
     if cli.update {
         return Ok(std::process::ExitCode::from(u8::try_from(Box::pin(update::run(&data_dir())).await).unwrap_or(1)));

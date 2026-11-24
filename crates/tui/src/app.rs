@@ -445,6 +445,7 @@ pub struct App {
     header_width: u16,
     status_line: Line<'static>,
     chatgpt_account: Option<String>,
+    connection_started: bool,
     status_width: u16,
     /// Cached approval mode. A turn can adopt a stricter saved mode without
     /// marking chrome, so each draw compares this with the live mode.
@@ -626,10 +627,10 @@ async fn event_loop(
                     _ = &mut quit => None,
                 };
                 let Some(result) = result else { break; };
-                app.refresh_billing();
+                app.refresh_connection();
                 match result {
                     Ok(()) if action == crate::setup::Action::Login => app.open_model_picker(),
-                    Ok(()) => app.note("provider credentials removed"),
+                    Ok(()) => app.note("provider disconnected"),
                     Err(error) => app.error(&error),
                 }
                 app.dirty = Dirty::all();
@@ -801,13 +802,15 @@ impl App {
             header_width: u16::MAX,
             status_line: Line::default(),
             chatgpt_account: None,
+            connection_started: false,
             status_width: u16::MAX,
             status_mode: None,
         }
     }
 
     async fn startup(&mut self, args: &Args) {
-        self.refresh_billing();
+        self.connection_started = true;
+        self.refresh_connection();
         if let Some(notice) = crate::update::on_session_start(&self.core.data_dir) {
             self.note(&notice);
         }
@@ -860,7 +863,11 @@ impl App {
             match m.role.as_str() {
                 "user" => {
                     if let Some(text) = &m.content {
-                        self.insert_user_block(text);
+                        if m.harness_note {
+                            self.note(note_body(text));
+                        } else {
+                            self.insert_user_block(text);
+                        }
                     }
                 }
                 "assistant" => {
@@ -964,6 +971,8 @@ impl App {
                 return false;
             }
         }
+        self.core.reset_session_effort();
+        self.refresh_connection();
         let left = self.session_id.take().filter(|_| self.created_session);
         self.created_session = false;
         self.resumed_awaiting_hydration = false;
@@ -1379,12 +1388,24 @@ impl App {
             }
         }
 
-        // Open surfaces own the key; otherwise cycle the requested effort.
+        // Open surfaces own the key; otherwise step the requested effort up
+        // for this session alone: a press by habit must not change later
+        // sessions, and the model's default counts as medium, so the first
+        // press is high, never none. After the highest it wraps to default.
         if is_shift_tab(&key) {
-            let current = self.core.settings.lock().unwrap().reasoning_effort.map_or("default", config::ReasoningEffort::as_str);
+            self.refresh_project_root();
+            let current = self.core.settings.lock().unwrap().reasoning_effort;
             let levels = self.effort_levels();
-            let next = levels.iter().position(|level| *level == current).map_or(0, |at| (at + 1) % levels.len());
-            self.handle_submit(format!("/effort {}", levels[next])).await?;
+            let from = current.map_or("medium", config::ReasoningEffort::as_str);
+            let next = levels.iter().position(|level| *level == from)
+                .map_or(0, |at| (at + 1) % levels.len());
+            let next = levels[next];
+            let effort = config::ReasoningEffort::parse(next).unwrap_or_default();
+            match self.core.set_reasoning_effort(effort, false) {
+                Ok(_) => self.note(&format!("reasoning effort {next} for this session")),
+                Err(error) => self.error(&error),
+            }
+            self.refresh_connection();
             return Ok(());
         }
 
@@ -1724,11 +1745,44 @@ impl App {
         self.dirty.mark_chrome();
     }
 
-    fn refresh_billing(&mut self) {
-        let provider = self.core.settings.lock().unwrap().provider.clone();
-        self.chatgpt_account = provider.and_then(|p| open_max_core::providers::load_providers(&self.core.data_dir)
-            .get(&p).and_then(|p| p.chatgpt_account.as_deref().map(open_max_core::text::one_line)));
+    /// Re-read what the settings connect: the plan an account bills, and
+    /// whether any endpoint resolves at all.
+    fn refresh_connection(&mut self) {
+        use open_max_core::providers;
+        let settings = self.core.settings.lock().unwrap().clone();
+        let catalog = providers::load_providers(&self.core.data_dir);
+        self.chatgpt_account = settings.provider.as_ref().and_then(|p| catalog.get(p))
+            .and_then(|p| p.chatgpt_account.as_deref().map(open_max_core::text::one_line));
         self.dirty.mark_chrome();
+    }
+
+    // The catalog is hot. Resolve on empty paints only, not on streaming or
+    // scrollback frames. Do not claim the picker can fix an empty catalog.
+    fn empty_connection_hint(&self) -> String {
+        use open_max_core::providers::{self, ResolveError};
+        let dir = &self.core.data_dir;
+        let mut settings = self.core.settings.lock().unwrap().clone();
+        match providers::resolve_endpoint(&settings, dir) {
+            Ok(_) => "READY".into(),
+            Err(error @ (ResolveError::MissingEndpoint | ResolveError::MissingModel | ResolveError::Unconfigured { .. })) => {
+                for (name, provider) in providers::load_providers(dir) {
+                    settings.provider = Some(name);
+                    for model in provider.models {
+                        settings.model = model.id;
+                        if providers::resolve_endpoint(&settings, dir).is_ok() {
+                            return "no model connected: type /model to choose one".into();
+                        }
+                    }
+                }
+                match error {
+                    ResolveError::MissingEndpoint | ResolveError::Unconfigured { endpoint: true, .. } => {
+                        "no model connected: type /login to connect a provider".into()
+                    }
+                    _ => error.to_string(),
+                }
+            }
+            Err(error) => error.to_string(),
+        }
     }
 
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
@@ -1739,7 +1793,7 @@ impl App {
         match self.core.save_settings(&next) {
             Ok(()) => {
                 *self.core.settings.lock().unwrap() = next;
-                self.refresh_billing();
+                self.refresh_connection();
                 let source = provider
                     .map(|name| format!(" from {name}"))
                     .unwrap_or_default();
@@ -2056,6 +2110,7 @@ impl App {
                         panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
                         if self.session_id.as_deref() == Some(id.as_str()) {
                             self.session_id = None;
+                            self.core.reset_session_effort();
                             self.created_session = false;
                             self.resumed_awaiting_hydration = false;
                         }
@@ -2138,7 +2193,7 @@ impl App {
         let at = match turn.map(str::parse) {
             None => sessions::ForkAt::End,
             Some(Ok(n)) => sessions::ForkAt::Turn(n),
-            Some(Err(_)) => return self.note("usage: /rewind <turn>"),
+            Some(Err(_)) => return self.note("/rewind takes a turn number; /rewind alone lists the turns"),
         };
         match sessions::fork(&self.core, &parent, at) {
             Ok(child) => {
@@ -2205,7 +2260,7 @@ impl App {
             return;
         }
 
-        self.refresh_billing();
+        self.refresh_connection();
         let session_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
@@ -2313,9 +2368,9 @@ impl App {
                     Ok(effort) => effort,
                     Err(error) => { self.error(&error); return; }
                 };
-                match self.core.set_reasoning_effort(effort) {
+                match self.core.set_reasoning_effort(effort, true) {
                     Ok(persisted) => {
-                        self.dirty.mark_chrome();
+                        self.refresh_connection();
                         let scope = if persisted { "saved" } else { "for this run only (temporary endpoint)" };
                         self.note(&format!("reasoning effort requested: {raw_rest}; {scope}; applies to the next turn (model support varies)"));
                     }
@@ -2385,7 +2440,7 @@ impl App {
                             }
                             let _ = self.core.save_settings(&s);
                         }
-                        self.refresh_billing();
+                        self.refresh_connection();
                         let ep = {
                             let s = self.core.settings.lock().unwrap();
                             open_max_core::providers::resolve(&s, &self.core.data_dir)
@@ -2469,13 +2524,15 @@ impl App {
                     }
                 }
             },
-            "new" => {
-                if self.reset_for_new_session() { self.note("new session"); }
+            "new" | "clear" => {
+                if self.reset_for_new_session() {
+                    self.note("new session");
+                }
             }
             "fork" => self.fork_current(None),
             "rewind" => match rest.first() {
                 Some(turn) => self.fork_current(Some(turn)),
-                None => self.note("usage: /rewind <turn>"),
+                None => self.list_turns(),
             },
             "context" => {
                 // A hydrated session shows its frozen breakdown; before any
@@ -2608,10 +2665,43 @@ impl App {
                 Err(why) => self.note(&why),
             },
             "quit" | "exit" => self.should_quit = true,
-            other => self.note(&format!(
-                "unknown command: /{other} (see /help; prompt templates live in .agents/prompts/)"
-            )),
+            other => match HABITS.iter().find(|(names, _)| names.contains(&other)) {
+                Some((_, pointer)) => self.note(&format!("/{other} is not a command here; {pointer}")),
+                None => self.note(&format!("unknown command: /{other} (see /help; prompt templates live in .agents/prompts/)")),
+            },
         }
+    }
+
+    /// /rewind with no turn: each turn of this session it can return to,
+    /// numbered as /rewind counts them, with the start of its prompt.
+    fn list_turns(&mut self) {
+        let Some(id) = self.session_id.as_deref() else {
+            return self.note("no turn to rewind to yet");
+        };
+        let (messages, ends) = match sessions::rewind_history(&self.core, id) {
+            Ok(history) => history,
+            Err(error) => {
+                let error = sessions::refusal_with_repair(&self.core, error);
+                return self.error(&format!("could not read the session history: {error}"));
+            }
+        };
+        let (mut start, mut block) = (0, Vec::new());
+        for (n, end) in ends.into_iter().enumerate() {
+            let prompt = messages[start..end]
+                .iter()
+                .filter(|m| m.role == "user" && !m.harness_note)
+                .find_map(|m| m.content.as_deref())
+                .unwrap_or_default();
+            let preview: String = open_max_core::text::one_line(prompt).chars().take(72).collect();
+            block.push(help_line(&format!("/rewind {}", n + 1), &preview));
+            start = end;
+        }
+        if block.is_empty() {
+            return self.note("no turn to rewind to yet");
+        }
+        self.note("/rewind <turn> returns the conversation to the end of that turn; files stay as they are");
+        self.transcript.push(block);
+        self.dirty.mark_chat();
     }
 
     /// The registry the next new session would freeze from today's config,
@@ -2911,8 +3001,7 @@ impl App {
                 // reason), so ignoring it dropped harness corrections a
                 // stdio client would see. The bracket prefix is
                 // stripped for a cleaner line; the text is already the model's.
-                let shown = text.trim().trim_start_matches('[').trim_end_matches(']');
-                self.note(shown);
+                self.note(note_body(&text));
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if self.compacting {
@@ -3154,10 +3243,14 @@ impl App {
     }
 
     fn note(&mut self, text: &str) {
-        self.transcript.push(vec![Line::from(vec![
-            Span::styled("• ", Style::default().fg(theme::ACCENT)),
-            Span::styled(text.to_string(), theme::DIM_ITALIC),
-        ])]);
+        let lines = text.split('\n').enumerate().map(|(i, line)| {
+            let mark = if i == 0 { "• " } else { "  " };
+            Line::from(vec![
+                Span::styled(mark, Style::default().fg(theme::ACCENT)),
+                Span::styled(line.to_string(), theme::DIM_ITALIC),
+            ])
+        }).collect();
+        self.transcript.push(lines);
         self.dirty.mark_chat();
     }
 
@@ -3466,7 +3559,8 @@ impl App {
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
             if self.composer.is_empty() {
-                render_ready(Rect { width: content_w, ..area }, frame.buffer_mut());
+                let hint = if self.connection_started { self.empty_connection_hint() } else { "READY".into() };
+                render_ready(&hint, Rect { width: content_w, ..area }, frame.buffer_mut());
             }
             return;
         }
@@ -3824,32 +3918,53 @@ fn command_parts(command: &str) -> (&str, &str) {
     (head, rest)
 }
 
-/// Restrained orientation for an empty chat session: one dim word. Transient
+/// Restrained orientation for an empty chat session: one dim word, or the
+/// line that says no model is connected and how to connect one. Transient
 /// chrome, never transcript content, so it never reaches saved sessions or
-/// the model; hidden when the area cannot hold it.
-fn render_ready(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+/// the model; hidden when the area cannot hold a word of it.
+fn render_ready(text: &str, area: Rect, buf: &mut ratatui::buffer::Buffer) {
     if area.width < 5 || area.height == 0 {
         return;
     }
-    Paragraph::new(Line::from(Span::styled("READY", Style::default().fg(theme::DIM))))
-        .render(Rect { height: 1, ..area }, buf);
+    Paragraph::new(Line::from(Span::styled(text.to_string(), Style::default().fg(theme::DIM))))
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .render(area, buf);
 }
 
 /// The settings a model selection produces; pure, so the caller decides how
 /// and whether to persist them.
-fn model_selection(current: &config::Settings, provider: Option<String>, model: String) -> config::Settings {
+fn model_selection(
+    current: &config::Settings,
+    provider: Option<String>,
+    model: String,
+) -> config::Settings {
     let mut next = current.clone();
     next.provider = provider;
     next.model = model;
     next
 }
 
+fn note_body(text: &str) -> &str {
+    let text = text.trim();
+    text.strip_prefix('[').and_then(|body| body.strip_suffix(']')).unwrap_or(text)
+}
+
+/// Commands habit from other terminal agents suggests, each with where the
+/// same thing lives here, so typing one gets a pointer, not "unknown command".
+const HABITS: &[(&[&str], &str)] = &[
+    (&["undo"], "/rewind <turn> rewinds the conversation, not files, to the end of a turn; /rewind alone lists the turns"),
+    (&["cost", "usage"], "/status shows this session's context and prompt cache use"),
+    (&["sessions", "history"], "/resume lists this project's sessions"),
+    (&["config", "settings"], "settings live in ~/.openmax/settings.json, and openmax --spec settings describes each one"),
+    (&["diff"], "run git diff in a shell to see what changed"),
+];
+
 /// Single source of truth for `/help` and onboarding copy.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
     ("enter while working", "steer the turn: the message joins it before its next request"),
     ("tab", "focus conversation ↔ composer"),
-    ("shift+tab", "cycle requested reasoning effort"),
+    ("shift+tab", "raise reasoning effort for this session · /effort saves"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
     ("[ ] in history", "jump to previous or next user turn (shift+↑↓ too)"),
     ("g / G in history", "top of scrollback · follow latest"),
@@ -4125,9 +4240,6 @@ fn shell(frame: &mut Frame, project: &std::path::Path) {
     let layout = conversation_layout(area, true, input_h, 0, 0);
     if layout.header.height > 0 {
         header_path_line(project, layout.header.width as usize).render(layout.header, frame.buffer_mut());
-    }
-    if layout.chat.height > 0 {
-        render_ready(layout.chat, frame.buffer_mut());
     }
     draw_composer(frame, layout.input, &mut composer, true, true);
 }
@@ -4577,6 +4689,134 @@ mod tests {
         .expect("the turn never settled");
     }
 
+    /// /rewind alone lists the turns it can return to, numbered as it counts
+    /// them, each with its prompt. A harness note stored ahead of a prompt
+    /// is drawn as the note it was, after a rewind or a resume, never as a
+    /// prompt of its own, and lists no turn.
+    #[tokio::test]
+    async fn rewind_lists_the_turns_and_a_reloaded_harness_note_keeps_its_mark() {
+        use open_max_core::sessions;
+        use open_max_core::types::ChatMessage;
+        let (mut app, dir) = app_fixture();
+        let core = app.core.clone();
+        let id = sessions::create(&core, dir.display().to_string()).unwrap().id;
+        sessions::attach(&core, &id).unwrap();
+        // An unstamped user message is what a steer (or an older transcript)
+        // saves. It may be byte-for-byte identical to a harness note.
+        let text = "[execution policy: auto; fixture.]";
+        let history = vec![
+            ChatMessage::system("rules"),
+            ChatMessage { harness_note: true, ..ChatMessage::user(text) },
+            ChatMessage { harness_note: true, ..ChatMessage::user("[Earlier messages were compacted.\nOpen: check the remaining file.]") },
+            ChatMessage::user(text),
+            ChatMessage::assistant(Some("first answer".into()), None),
+            ChatMessage::user("second question"),
+            ChatMessage::assistant(Some("second answer".into()), None),
+        ];
+        assert!(sessions::save_messages(&core, &id, &history, &mut 0, true));
+        sessions::end_turn(&core, &id, &history[..5]);
+        sessions::end_turn(&core, &id, &history);
+        sessions::detach(&core, &id).unwrap();
+        assert!(app.switch_to_session(id.clone()));
+        let check_replay = |app: &App, turns| {
+            let shown = app.transcript.export_text();
+            assert!(shown.contains("> • execution policy: auto; fixture."), "{shown}");
+            assert!(shown.contains("> • Earlier messages were compacted.\n>   Open: check the remaining file."), "{shown}");
+            assert_eq!(shown.matches("## user").count(), turns, "{shown}");
+            assert!(shown.contains(&format!("## user\n\n{text}\n")), "{shown}");
+        };
+        check_replay(&app, 2);
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("/rewind <turn> returns the conversation to the end of that turn; files stay as they are"), "{shown}");
+        for line in [format!("/rewind 1                        {text}"), "/rewind 2                        second question".into()] {
+            assert!(shown.contains(&line), "{line}: {shown}");
+        }
+        app.handle_submit("/rewind 1".into()).await.unwrap();
+        assert_ne!(app.session_id.as_deref(), Some(id.as_str()));
+        check_replay(&app, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_distinguishes_an_unreadable_transcript_from_a_missing_one() {
+        use open_max_core::sessions;
+        let (mut app, dir) = app_fixture();
+        let id = sessions::create(&app.core, dir.display().to_string()).unwrap().id;
+        app.session_id = Some(id.clone());
+        let path = sessions::messages_display(&app.core, &id);
+        app.handle_submit("/rewind".into()).await.unwrap();
+        assert!(app.transcript.export_text().contains("no turn to rewind to yet"));
+        app.transcript = Transcript::new();
+        fs::create_dir_all(&path).unwrap();
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("could not read the session history:") && shown.contains(&path), "{shown}");
+        assert!(!shown.contains("no turn to rewind to yet"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_refuses_to_list_turns_without_a_readable_index_entry() {
+        use open_max_core::{sessions, types::ChatMessage};
+        let (mut app, dir) = app_fixture();
+        let id = sessions::create(&app.core, dir.display().to_string()).unwrap().id;
+        sessions::attach(&app.core, &id).unwrap();
+        let messages = [ChatMessage::user("a saved prompt")];
+        assert!(sessions::save_messages(&app.core, &id, &messages, &mut 0, true));
+        app.session_id = Some(id.clone());
+        let index = damage_session_index(&dir);
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("does not parse") && shown.contains(REPAIR_POINTER), "{shown}");
+        assert!(!shown.contains("/rewind 1"), "{shown}");
+        fs::write(index, "[]").unwrap();
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains(&format!("no session {id} to rewind")), "{shown}");
+        assert!(!shown.contains("/rewind 1"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_the_active_session_restores_saved_effort() {
+        use open_max_core::sessions;
+        let (mut app, dir) = app_fixture();
+        let id = sessions::create(&app.core, dir.display().to_string()).unwrap().id;
+        assert!(app.switch_to_session(id.clone()));
+        app.handle_submit("/effort low".into()).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        app.handle_submit("/resume".into()).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.session_id, None);
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Low));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Commands habit suggests get the equivalent here: /clear is /new, and
+    /// the others name the command or the place that does the same.
+    #[tokio::test]
+    async fn habitual_commands_point_to_their_equivalent() {
+        let (mut app, dir) = app_fixture();
+        app.session_id = Some(open_max_core::sessions::create(&app.core, dir.display().to_string()).unwrap().id);
+        app.handle_submit("/clear".into()).await.unwrap();
+        assert_eq!(app.session_id, None, "/clear starts a fresh session");
+        for (typed, pointer) in [
+            ("undo", "/rewind <turn> rewinds the conversation, not files"),
+            ("usage", "/status shows this session's context"),
+            ("sessions", "/resume lists"),
+            ("settings", "settings live in ~/.openmax/settings.json"),
+            ("diff", "run git diff in a shell"),
+        ] {
+            app.handle_submit(format!("/{typed}")).await.unwrap();
+            let shown = app.transcript.export_text();
+            assert!(shown.contains(&format!("/{typed} is not a command here; {pointer}")), "{typed}: {shown}");
+        }
+        assert!(!app.transcript.export_text().contains("unknown command"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// /rewind <n> and /fork branch the current session into a new one and
     /// switch to it: the branch replays only the history it was cut at, the
     /// original keeps every turn and stays resumable, and a turn that does
@@ -4607,7 +4847,7 @@ mod tests {
         assert!(app.transcript.export_text().contains("no turn 3 to rewind to; the session has 2"));
         app.handle_submit("/rewind one".into()).await.unwrap();
         assert_eq!(app.session_id.as_deref(), Some(parent.as_str()));
-        assert!(app.transcript.export_text().contains("usage: /rewind <turn>"));
+        assert!(app.transcript.export_text().contains("/rewind takes a turn number; /rewind alone lists the turns"));
 
         app.handle_submit("/rewind 1".into()).await.unwrap();
         let child = app.session_id.clone().unwrap();
@@ -4904,18 +5144,18 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The effort shortcut persists each level and wraps to Default without
-    /// changing the trusted project's permission mode.
+    /// The effort shortcut steps up from the model's default, counted as
+    /// medium, and wraps to Default without saving a level or changing the
+    /// trusted project's permission mode.
     #[tokio::test]
     async fn shift_tab_cycles_effort_without_changing_saved_project_permissions() {
         let (mut app, dir) = app_fixture();
         app.core.set_project_approval_mode(&app.project, config::ApprovalMode::Auto).unwrap();
-        for level in config::ReasoningEffort::LEVELS.iter().skip(1).chain(config::ReasoningEffort::LEVELS.iter().take(1)) {
+        for level in ["high", "xhigh", "max", "default"] {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
-            let selected = config::ReasoningEffort::parse(level).unwrap();
-            assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, selected);
+            assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, config::ReasoningEffort::parse(level).unwrap());
             let next = Core::new(dir.clone()).unwrap().0;
-            assert_eq!(next.settings.lock().unwrap().reasoning_effort, selected);
+            assert_eq!(next.settings.lock().unwrap().reasoning_effort, None);
             assert_eq!(next.approval_mode(&app.project), config::ApprovalMode::Auto);
         }
         fs::write(dir.join("providers.json"), r#"{"providers":{"native":{"base_url":"https://api.anthropic.com/v1","wire_api":"anthropic"}}}"#).unwrap();
@@ -4924,11 +5164,37 @@ mod tests {
         let choices: Vec<_> = app.completion.as_ref().unwrap().items.iter().map(|item| item.insert.as_str()).collect();
         assert_eq!(choices, ["/effort default", "/effort low", "/effort medium", "/effort high", "/effort xhigh", "/effort max"]);
         app.completion = None;
-        for level in ["low", "medium", "high", "xhigh", "max", "default"] {
+        for level in ["high", "xhigh", "max", "default"] {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
             assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, config::ReasoningEffort::parse(level).unwrap());
             assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Shift+Tab changes the requested effort for this session alone and says
+    /// so: settings.json keeps the saved effort through a later save, such as
+    /// a model selection, so the next session and print run start at it.
+    /// `/effort` is the deliberate way to save one.
+    #[tokio::test]
+    async fn shift_tab_changes_effort_for_this_session_and_saves_nothing() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/effort low".into()).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("reasoning effort medium for this session"), "{shown}");
+        app.handle_submit("/model other-model".into()).await.unwrap();
+        let saved = config::load(&dir).unwrap();
+        assert_eq!((saved.model.as_str(), saved.reasoning_effort), ("other-model", Some(config::ReasoningEffort::Low)));
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
+        app.handle_submit("/new".into()).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Low));
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        app.handle_submit("/effort medium".into()).await.unwrap();
+        app.handle_submit("/clear".into()).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
+        assert_eq!(config::load(&dir).unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5071,7 +5337,7 @@ mod tests {
         for _ in 0..2 {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
-        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::XHigh));
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
         assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Readonly);
         fs::remove_dir_all(dir).unwrap();
@@ -5085,7 +5351,7 @@ mod tests {
         for _ in 0..2 {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
-        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::XHigh));
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
         assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Readonly);
         fs::remove_dir_all(dir).unwrap();
@@ -5499,9 +5765,9 @@ mod tests {
                 let draft = "keep this draft\nand its second line";
                 app.composer.load(draft);
                 app.on_key(key).await.unwrap();
-                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::None));
+                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::High));
                 app.on_key(key).await.unwrap();
-                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::XHigh));
                 assert_eq!(app.core.approval_mode(&app.project), mode);
                 assert_eq!(app.composer.text(), draft, "effort shortcuts must preserve a multiline draft");
                 fs::remove_dir_all(dir).unwrap();
@@ -6323,6 +6589,37 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// While no endpoint resolves, the empty conversation says no model is
+    /// connected and names the command that connects one: /login with no
+    /// provider configured, /model once one is. A model selected clears it.
+    #[tokio::test]
+    async fn an_empty_chat_with_no_model_connected_names_the_command_that_connects_one() {
+        let (mut app, dir) = app_fixture();
+        let args = super::Args { continue_session: false, session: None, prompt: None, quit: Default::default() };
+        app.startup(&args).await;
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /login to connect a provider") && !text.contains("READY"), "{text}");
+        fs::write(dir.join("providers.json"), r#"{"providers":{"local":{"base_url":"http://127.0.0.1:9/v1"}}}"#).unwrap();
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /login to connect a provider"), "{text}");
+        fs::write(dir.join("providers.json"), r#"{"providers":{"local":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"m","context_tokens":8192}]}}}"#).unwrap();
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /model to choose one"), "{text}");
+        app.core.settings.lock().unwrap().provider = Some("local".into());
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /model to choose one") && !text.contains("READY"), "{text}");
+        app.core.settings.lock().unwrap().model = "unknown-model".into();
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no context window configured:") && !text.contains("READY"), "{text}");
+        app.core.settings.lock().unwrap().model = "m".into();
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("READY"), "{text}");
+        fs::remove_file(dir.join("providers.json")).unwrap();
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("unknown provider 'local'") && !text.contains("READY"), "{text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn idle_layout_is_restrained_and_has_bordered_composer() {
         let (mut app, dir) = app_fixture();
@@ -6345,13 +6642,10 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The first frame (`shell`) is an empty session's own first frame but
-    /// for the status row, which it leaves blank: every other cell with its
-    /// style, and the cursor, match at every size, the heights that drop the
-    /// header, the status row or the composer's box included. So the
-    /// session's first frame, drawn over it, changes only that row.
+    /// Before settings are read, the shell leaves chat and status blank.
+    /// Its header, composer and cursor match the session at every size.
     #[test]
-    fn the_shell_is_an_empty_sessions_first_frame_but_its_status_row() {
+    fn the_shell_does_not_show_connection_state_before_settings_are_read() {
         fn painted(width: u16, height: u16, paint: impl FnOnce(&mut ratatui::Frame)) -> (Buffer, ratatui::layout::Position) {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(paint).unwrap();
@@ -6367,10 +6661,11 @@ mod tests {
             let size = format!("{width}x{height}");
             assert_eq!(first_cursor, session_cursor, "{size}");
             let input_h = crate::input::Composer::blank().height(width.saturating_sub(2)).saturating_add(2).max(3);
-            let status = conversation_layout(Rect::new(0, 0, width, height), true, input_h, 0, 0).status;
+            let layout = conversation_layout(Rect::new(0, 0, width, height), true, input_h, 0, 0);
+            let status = layout.status;
             for y in 0..height {
                 for x in 0..width {
-                    if status.height > 0 && y == status.y {
+                    if (status.height > 0 && y == status.y) || (layout.chat.y..layout.chat.bottom()).contains(&y) {
                         assert_eq!(first[(x, y)], ratatui::buffer::Cell::default(), "{size} status row");
                     } else {
                         assert_eq!(first[(x, y)], session[(x, y)], "{size} at ({x}, {y})");
@@ -6723,7 +7018,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             // File content that happens to look like an edit summary.
             open_max_core::types::ChatMessage {
@@ -6734,7 +7029,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
         ];
         let mut persisted = 0usize;
@@ -6813,7 +7108,7 @@ mod tests {
                     reasoning_content: None,
                     reasoning: None,
                     reasoning_details: None,
-                    reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                    reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
                 });
                 messages.push(open_max_core::types::ChatMessage {
                     role: "tool".into(),
@@ -6823,7 +7118,7 @@ mod tests {
                     reasoning_content: None,
                     reasoning: None,
                     reasoning_details: None,
-                    reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                    reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
                 });
             }
             let mut persisted = 0usize;
@@ -6943,7 +7238,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
@@ -6953,7 +7248,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             // A SUCCESSFUL command whose output merely opens with the same
             // sentence: equality, not a prefix, decides, so this replays ok
@@ -6966,7 +7261,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
         ];
         let mut persisted = 0usize;
@@ -7027,7 +7322,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
@@ -7037,7 +7332,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             open_max_core::types::ChatMessage {
                 role: "assistant".into(),
@@ -7047,7 +7342,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
         ];
         let mut persisted = 0usize;

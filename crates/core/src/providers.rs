@@ -531,13 +531,17 @@ pub enum ResolveError {
     ReasoningEffort(String),
 }
 
+/// How a session or a shell connects a model: what a refusal for a missing
+/// endpoint names first.
+const CONNECT: &str = "connect a provider with /login in a session or openmax --login from a shell, or choose a connected one with /model";
+
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ResolveError::Authentication(message) | ResolveError::ReasoningEffort(message) => f.write_str(message),
             ResolveError::MissingEndpoint => write!(
                 f,
-                "no model endpoint configured: pass --base-url or set base_url in ~/.openmax/settings.json, or define one in ~/.openmax/providers.json and select it with --provider or settings.provider"
+                "no model endpoint configured: {CONNECT}; or pass --base-url or set base_url in ~/.openmax/settings.json"
             ),
             ResolveError::MissingModel => write!(
                 f,
@@ -549,72 +553,38 @@ impl std::fmt::Display for ResolveError {
             ),
             ResolveError::Unconfigured { endpoint, model, context_tokens, provider } => {
                 let mut what = Vec::new();
-                let mut flags = Vec::new();
-                let mut keys = Vec::new();
                 let mut command = vec!["openmax"];
-                let mut example = Vec::new();
                 if *endpoint {
                     what.push("endpoint");
-                    flags.push("--base-url");
-                    keys.push("base_url");
                     command.push("--base-url URL");
-                    example.push("  \"base_url\": \"http://localhost:8080/v1\"");
                 }
                 if *model {
                     what.push("model");
-                    flags.push("--model");
-                    keys.push("model");
                     command.push("--model MODEL");
-                    example.push("  \"model\": \"the model id the server expects\"");
                 }
                 if *endpoint {
                     command.push("--api-key '$MY_API_KEY'");
                 }
                 if *context_tokens {
                     what.push("context window");
-                    flags.push("--context-tokens");
-                    keys.push("context_tokens");
                     command.push("--context-tokens TOKENS");
-                    example.push("  \"context_tokens\": 128000");
-                }
-                if *endpoint {
-                    example.push("  \"api_key\": \"$MY_API_KEY\"");
                 }
                 // The first line stands on its own: /status and --check show
-                // only it, and a one-line renderer drops the newlines below.
-                // The flags come first because they are the whole repair: a
-                // flag whose key settings.json leaves unset is written there
-                // (config::KeyFlags), so nothing is edited by hand.
-                write!(
-                    f,
-                    "no {} configured: start openmax with {}, which write {} to ~/.openmax/settings.json where it leaves them unset, or set them in that file, which is read at launch",
-                    join_list(&what, "or"),
-                    join_list(&flags, "and"),
-                    join_list(&keys, "and"),
-                )?;
-                if *provider {
-                    write!(f, "; context_tokens can instead go in the model's entry in ~/.openmax/providers.json, which is read hot")?;
-                }
-                writeln!(f, ".")?;
-                // Placeholders the flag parser refuses (the key's while
-                // MY_API_KEY is unset), so a command pasted unchanged writes
-                // nothing.
-                writeln!(f, "For example, with your server's values for the capitals:\n  {}", command.join(" "))?;
-                writeln!(f, "or in ~/.openmax/settings.json:\n{{\n{}\n}}", example.join(",\n"))?;
-                if *context_tokens {
-                    write!(f, "Set context_tokens to the window the server actually serves for that model; nothing is queried from the server. ")?;
-                }
+                // only it, and a one-line renderer drops the lines below. The
+                // commands that connect a model come first; the flags, which
+                // write each key settings.json leaves unset (config::KeyFlags),
+                // are the manual route. Their placeholders are ones the flag
+                // parser refuses (the key's while MY_API_KEY is unset), so a
+                // command pasted unchanged writes nothing.
+                writeln!(f, "no {} configured: {CONNECT}.", join_list(&what, "or"))?;
+                write!(f, "To set it by hand, start openmax with your server's values for the capitals, which are written to ~/.openmax/settings.json where it leaves them unset:\n  {}", command.join(" "))?;
                 if *endpoint {
-                    write!(f, "api_key is needed only when the server checks one; $NAME reads that environment variable when a request is sent, so the key stays out of the file (single quotes keep the shell from expanding it). ")?;
+                    write!(f, "\nPass --api-key only for a server that checks one; '$NAME' reads that environment variable when a request is sent.")?;
                 }
                 if *provider {
-                    write!(f, "In the TUI, /model <id> sets the model id without a restart.")
-                } else {
-                    write!(
-                        f,
-                        "For several servers, define them in ~/.openmax/providers.json and select one with settings.provider."
-                    )
+                    write!(f, "\nA model's context_tokens can instead go in its entry in ~/.openmax/providers.json, which is read hot.")?;
                 }
+                Ok(())
             }
             ResolveError::UnknownProvider(name) => write!(
                 f,
@@ -659,7 +629,8 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     Ok(endpoint)
 }
 
-fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
+/// Resolve without changing the tool registry's image-input default.
+pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
     let (providers, parse_error) = load_snapshot(data_dir);
     let provider_name = settings
         .provider
@@ -1498,10 +1469,10 @@ mod tests {
 
     /// A fresh install is missing all three settings. Settings are read at
     /// launch, so an error that named one field at a time cost an edit and a
-    /// restart per field; one error names them all, with an example that
-    /// holds the missing keys, plus api_key when the endpoint is missing, and
-    /// that loads as a settings file. A single missing field keeps its own
-    /// error. A provider whose catalog sizes its models only lacks the model
+    /// restart per field; one error names them all in a few lines: the
+    /// commands that connect a model first, then an example command with the
+    /// flag of each missing key, plus --api-key when the endpoint is missing.
+    /// A single missing field keeps its own error. A provider whose catalog sizes its models only lacks the model
     /// choice; one that sizes nothing lacks the window too.
     #[test]
     fn a_fresh_install_gets_one_error_naming_every_missing_setting() {
@@ -1531,19 +1502,15 @@ mod tests {
                     );
                     let text = err.to_string();
                     let first = text.lines().next().unwrap();
-                    assert!(first.ends_with("which is read at launch."), "the first line stands alone: {first}");
-                    // The error is the first run's documentation: each missing
-                    // key is named with the flag that writes it, in the first
-                    // line and in an example command.
+                    assert!(first.ends_with("or choose a connected one with /model."), "the first line stands alone: {first}");
+                    assert!(first.contains("/login") && first.contains("openmax --login"), "{first}");
+                    // The manual route second: an example command holding
+                    // each missing key's flag.
                     let command = text
                         .lines()
                         .find(|l| l.starts_with("  openmax "))
                         .unwrap_or_else(|| panic!("no example command: {text}"));
-                    for (missing, flag, key) in
-                        [(endpoint, "--base-url", "base_url"), (model, "--model", "model"), (window, "--context-tokens", "context_tokens")]
-                    {
-                        assert_eq!(first.contains(flag), missing, "{flag}: {first}");
-                        assert_eq!(first.contains(key), missing, "{key}: {first}");
+                    for (missing, flag) in [(endpoint, "--base-url"), (model, "--model"), (window, "--context-tokens")] {
                         assert_eq!(command.contains(&format!("{flag} ")), missing, "{flag}: {command}");
                     }
                     assert_eq!(command.contains("--api-key '$MY_API_KEY'"), endpoint, "{command}");
@@ -1565,39 +1532,14 @@ mod tests {
                         };
                         assert!(flags.problem().is_some(), "{flag} {value} pasted unchanged is written: {command}");
                     }
-                    let block = text
-                        .lines()
-                        .skip_while(|l| *l != "{")
-                        .take_while(|l| *l != "}")
-                        .chain(std::iter::once("}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let parsed: serde_json::Value = serde_json::from_str(&block).expect(&block);
-                    let _: Settings = serde_json::from_str(&block).expect("the example loads as a settings file");
-                    let mut expected = Vec::new();
-                    if endpoint {
-                        expected.push("base_url");
-                        expected.push("api_key");
-                    }
-                    if model {
-                        expected.push("model");
-                    }
-                    if window {
-                        expected.push("context_tokens");
-                    }
-                    expected.sort_unstable();
-                    let mut keys: Vec<&str> = parsed.as_object().unwrap().keys().map(String::as_str).collect();
-                    keys.sort_unstable();
-                    assert_eq!(keys, expected, "{text}");
-                    assert_eq!(text.contains("nothing is queried"), window, "{text}");
-                    assert_eq!(text.contains("api_key is needed only"), endpoint, "{text}");
-                    assert!(text.contains("For several servers"), "{text}");
+                    assert_eq!(text.contains("--api-key only for a server that checks one"), endpoint, "{text}");
+                    assert!(text.lines().count() <= 4, "{text}");
                 }
             }
         }
         let text = resolve(&Settings::default(), &dir).unwrap_err().to_string();
         assert!(
-            text.starts_with("no endpoint, model or context window configured: start openmax with --base-url, --model and --context-tokens, which write base_url, model and context_tokens to ~/.openmax/settings.json where it leaves them unset, or set them in that file, which is read at launch.\nFor example, with your server's values for the capitals:\n  openmax --base-url URL --model MODEL --api-key '$MY_API_KEY' --context-tokens TOKENS\n"),
+            text.starts_with("no endpoint, model or context window configured: connect a provider with /login in a session or openmax --login from a shell, or choose a connected one with /model.\nTo set it by hand, start openmax with your server's values for the capitals, which are written to ~/.openmax/settings.json where it leaves them unset:\n  openmax --base-url URL --model MODEL --api-key '$MY_API_KEY' --context-tokens TOKENS\n"),
             "{text}"
         );
 
@@ -1614,9 +1556,9 @@ mod tests {
             "{err:?}"
         );
         let text = err.to_string();
-        assert!(text.starts_with("no model or context window configured: start openmax with --model and --context-tokens, which write model and context_tokens to ~/.openmax/settings.json"), "{text}");
-        assert!(text.contains("providers.json, which is read hot") && text.contains("/model <id>"), "{text}");
-        assert!(!text.contains("base_url") && !text.contains("For several servers"), "{text}");
+        assert!(text.starts_with("no model or context window configured: connect a provider with /login"), "{text}");
+        assert!(text.contains("providers.json, which is read hot") && text.contains("  openmax --model MODEL --context-tokens TOKENS\n"), "{text}");
+        assert!(!text.contains("--base-url") && !text.contains("--api-key"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

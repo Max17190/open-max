@@ -117,6 +117,10 @@ pub struct ChatMessage {
     /// (`ChatClient::origin`) it ran at, for `ChatClient::effort_plan`. Never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Transcript metadata only. Notes keep the user role on every model wire.
+    /// Older, unmarked messages are replayed verbatim; their origin is unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub harness_note: bool,
     /// Digest of a tool result an earlier release shortened in place, kept so
     /// saved transcripts load as written. Nothing sets or reads it now, and
     /// it is never sent.
@@ -134,6 +138,9 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self::plain("user", Some(content.into()), None, None)
     }
+    pub(crate) fn note(content: impl Into<String>) -> Self {
+        Self { harness_note: true, ..Self::user(content) }
+    }
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
         Self::plain("assistant", content, tool_calls, None)
     }
@@ -144,7 +151,7 @@ impl ChatMessage {
     /// Every constructor starts without reasoning: only the agent loop
     /// attaches it, from a reply, together with its origin.
     fn plain(role: &str, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String>) -> Self {
-        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None, images: None }
+        Self { role: role.into(), content, tool_calls, tool_call_id, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None }
     }
 
     /// Rough size estimate of the stored message, including reasoning.

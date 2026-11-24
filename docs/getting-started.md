@@ -20,9 +20,13 @@ cd ~/code/my-app
 openmax
 ```
 
-Inspect the project before answering the trust prompt. Pick a model with
-`/model`, then describe a task. See [Install](install.md) for other ways to
-install, or [Unattended runs](unattended.md) if no one will be at the terminal.
+Inspect the project before answering the trust prompt. On first setup, API
+login saves the model you choose as the default. After browser sign-in, choose
+a model with `/model`. You can use `/model` to change your selection later.
+Once a model is selected, describe a task.
+
+See [Install](install.md) for other ways to install, or
+[Unattended runs](unattended.md) if no one will be at the terminal.
 
 ## Configure
 
@@ -43,7 +47,7 @@ yet is written there before the turn. Or edit the file yourself:
 }
 ```
 
-`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. Set `context_tokens` to the context window the server actually serves for that model; nothing is queried, and a guessed window is wrong in one direction or the other. There is no default endpoint, model, or window: until all three are configured (here or through a named provider), Open Max refuses to start a turn with an error that names each missing key and the flag that writes it.
+`base_url` is the root of your model's HTTP API (the harness calls `chat/completions` on it). Set `model` to the id that server expects. Set `api_key` to a literal or `$ENV_VAR`, or export `OPENMAX_API_KEY`. Set `context_tokens` to the context window the server actually serves for that model; nothing is queried, and a guessed window is wrong in one direction or the other. There is no default endpoint, model, or window: until all three are configured (here or through a named provider), Open Max refuses to start a turn with an error that explains what is missing and how to set it. An empty interactive session shows setup guidance or the configuration error instead of READY when its model cannot be resolved.
 
 `--base-url`, `--model`, `--api-key` and `--context-tokens` set the key of the same name. A flag whose key settings.json leaves unset (no file yet, an empty `base_url` or `model`, no `api_key` or `context_tokens`) is written to the file before the run, on a run that uses the endpoint the file selects, and the run says which keys it wrote. A key the file already sets is overridden for that run only: the file keeps its value, a `/model` or `/provider` save during the run keeps it too until the session changes that key or switches provider, and the run says which keys the command line overrode. A `--base-url` for another server than the file's is not sent the file's `api_key`. A flag equal to the file's value changes nothing. The full rule, with `--provider`, is in [configuration](configuration.md#settings-from-the-command-line).
 
@@ -57,8 +61,10 @@ settings.json applies only to a project with no saved mode, such as one
 trusted by an earlier version. See
 [approval modes](configuration.md#approvals).
 
-Shift+Tab cycles requested model reasoning effort. `/effort` opens a picker,
-and `/effort high` or `--effort high` selects a level directly. Supported
+Shift+Tab steps the requested model reasoning effort up for the running
+session only, starting at `high` from the model's default; it saves nothing.
+`/effort` opens a picker that saves the level you choose, and `/effort high`
+or `--effort high` selects a level directly. Supported
 levels depend on the provider and model; Default leaves its request unset. A
 level the route is known to refuse, such as `max` on xAI's grok-4.x, is
 refused before any request is spent, naming the levels it takes.
@@ -71,7 +77,8 @@ Named endpoints in `providers.json` and `compat` flags for picky gateways are co
 
 Run `openmax --login` to connect a provider. The picker offers ChatGPT browser
 sign-in, OpenAI and Anthropic API keys, and other compatible APIs. API keys
-are entered in a hidden prompt. Inside a session, use `/login`, `/logout`,
+are entered in a hidden prompt. A shell login leaves any existing default
+selected. Inside a session, use `/login`, `/logout`,
 and `/provider` to connect, disconnect, and select a provider/model pair.
 See [provider connections](configuration.md#connecting-and-disconnecting-providers).
 

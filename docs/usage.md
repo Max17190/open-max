@@ -8,14 +8,15 @@ openmax
 ```
 
 If you have not connected a model, start with [getting started](getting-started.md).
-For scripts and CI, see [unattended runs](unattended.md).
+On first setup, API login saves the model you choose as the default. After
+browser sign-in, choose a model with `/model`. You can use `/model` to change
+your selection later. For scripts and CI, see [unattended runs](unattended.md).
 
 On the first interactive run, inspect the project and answer the trust
 prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
 Change the mode later with `/permissions`, or `openmax --permissions <mode>`
-from a shell; **Shift+Tab** cycles reasoning effort. See
-[configuration](configuration.md#project-trust) for headless and stdio
-trust.
+from a shell. See [configuration](configuration.md#project-trust) for
+headless and stdio trust.
 
 ## Keys
 
@@ -29,7 +30,7 @@ trust.
 | **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Cycle requested reasoning effort; inside a picker, select the previous row |
+| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved, and switching sessions restores the previous setting. `/effort` saves a level unless the endpoint is a temporary launch override. Inside a picker, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
 
@@ -47,8 +48,8 @@ trust.
 | `/logout [provider]` | Disconnect a provider |
 | `/permissions [auto\|ask\|readonly]` | Pick or save this project's permission mode. New trust grants default to `auto`; explicit `ask` and `readonly` choices are preserved |
 | `/approvals auto\|ask\|readonly` | Alias for `/permissions` |
-| `/new` · `/resume` | Fresh session · pick an earlier one |
-| `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
+| `/new` · `/resume` | Fresh session (`/clear` does the same) · pick an earlier one |
+| `/fork` · `/rewind [n]` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch; `/rewind` alone lists the turns with their numbers. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
 | `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
@@ -64,6 +65,12 @@ other notes the harness writes during a turn stay in that turn. The full
 counting rule, including compaction and sessions saved by an earlier
 version, is in [the stdio protocol](stdio-protocol.md), whose `rewind`
 counts the same way.
+
+Some common command names print a pointer instead of running an action:
+`/undo` points to `/rewind`, `/cost` and `/usage` to `/status`, `/sessions`
+and `/history` to `/resume`, `/config` and `/settings` to
+`openmax --spec settings`, and `/diff` to `git diff`. A prompt template with one
+of those names runs instead.
 
 ## Command line
 
@@ -111,7 +118,8 @@ session or trust flags. `--account` defaults to `main`. See
 context-window configuration, and billing behavior.
 
 `--effort high` requests a reasoning effort level at launch. **Shift+Tab**
-cycles the levels the active endpoint and model take. Choose `default`,
+steps up through the levels the active endpoint and model take, for the
+running session only. Choose `default`,
 `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Levels depend on
 model support; a level the route is known to refuse (for example `max` on
 xAI's grok-4.x) is refused before any request, and provider errors are preserved. The setting follows the same
@@ -458,6 +466,8 @@ watcher nor a later launch stops them.
 At a terminal, the first frame (the project path, an empty conversation and
 the prompt) is painted before Open Max reads trust, settings or the session,
 and the status line fills in the model and approval mode once they are read.
+An empty conversation shows READY only once the model configuration resolves.
+Otherwise it shows a setup hint or the configuration error.
 The trust question, and a refusal to start (a trust or settings file that does
 not parse, a trust grant asked for from an agent session), then show on your
 shell, which the interface hands back for them.

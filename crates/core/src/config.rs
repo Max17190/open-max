@@ -399,20 +399,44 @@ pub struct RunOnly {
     file: Settings,
     run: Settings,
     pub(crate) keys: Vec<&'static str>,
+    /// The run's effort before the first session-only change, including CLI overrides.
+    session_effort: Option<Option<ReasoningEffort>>,
 }
 
 impl RunOnly {
     /// The overrides [`KeyFlags::apply`] reported, or None when there are none.
     pub fn new(file: Settings, run: Settings, applied: &Applied) -> Option<Self> {
-        (!applied.overridden.is_empty()).then(|| RunOnly { file, run, keys: applied.overridden.clone() })
+        (!applied.overridden.is_empty()).then(|| RunOnly {
+            file,
+            run,
+            keys: applied.overridden.clone(),
+            session_effort: None,
+        })
     }
 
     pub(crate) fn holds_endpoint(&self, settings: &Settings) -> bool {
         self.keys.contains(&"provider") || (selected(&settings.provider).is_none() && self.keys.contains(&"base_url"))
     }
 
+    pub(crate) fn hold_session_effort(held: &mut Option<RunOnly>, live: &Settings) {
+        let run_only = held.get_or_insert_with(|| RunOnly {
+            file: live.clone(),
+            run: live.clone(),
+            keys: Vec::new(),
+            session_effort: None,
+        });
+        run_only.session_effort.get_or_insert(live.reasoning_effort);
+    }
+
+    pub(crate) fn reset_session_effort(&mut self, live: &mut Settings) {
+        if let Some(effort) = self.session_effort.take() {
+            live.reasoning_effort = effort;
+        }
+    }
+
     pub(crate) fn select_effort(&self, settings: &Settings) -> (Settings, RunOnly) {
         let mut selected = self.clone();
+        selected.session_effort = None;
         selected.keys.retain(|key| *key != "reasoning_effort");
         let (saved, mut next) = selected.save(settings);
         if next.holds_endpoint(settings) {
@@ -442,7 +466,14 @@ impl RunOnly {
                 }
             )*};
         }
-        keep!(provider, base_url, api_key, model, context_tokens, reasoning_effort, max_agent_tokens, max_agent_iterations);
+        keep!(provider, base_url, api_key, model, context_tokens, max_agent_tokens, max_agent_iterations);
+        let effort = self.session_effort.unwrap_or(settings.reasoning_effort);
+        if self.keys.contains(&"reasoning_effort") && effort == self.run.reasoning_effort {
+            saved.reasoning_effort = self.file.reasoning_effort;
+            next.keys.push("reasoning_effort");
+        } else {
+            saved.reasoning_effort = effort;
+        }
         if next.holds_endpoint(settings) {
             saved.model = self.file.model.clone();
             saved.reasoning_effort = self.file.reasoning_effort;
@@ -474,8 +505,13 @@ pub fn load(data_dir: &Path) -> Result<Settings, String> {
     Ok(settings)
 }
 
-/// Write settings.json and return the exact bytes written. The one caller
-/// is `Core::save_settings`, which fingerprints what it wrote rather than
+/// Save settings outside a running session, without loading project trust.
+pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
+    save_bytes(data_dir, settings).map(|_| ())
+}
+
+/// Write settings.json and return the exact bytes written. In a session,
+/// `Core::save_settings` fingerprints what it wrote rather than
 /// re-reading a path something else may have replaced in the meantime, so a
 /// session's own save is never mistaken for external drift. Nothing outside
 /// the core writes settings.json.

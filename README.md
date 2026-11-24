@@ -41,8 +41,12 @@ The script adds `openmax` to your `PATH` for new shells; open one, or run `sourc
 ```sh
 openmax --login     # ChatGPT, an OpenAI or Anthropic key, or any compatible API
 cd ~/code/my-app
-openmax             # pick the model with /model, then describe a task
+openmax
 ```
+
+On first setup, API login saves the model you choose as the default. After
+browser sign-in, choose a model with `/model`. You can use `/model` to change
+your selection later. Once a model is selected, describe a task.
 
 Open Max asks before it works in a new project. Its shell commands, tools and hooks run with your user's access, and it has no telemetry. For your own model server, see [getting started](docs/getting-started.md). For scripts and CI, see [unattended runs](docs/unattended.md). Setting up with a coding agent? Point it at [useopenmax.dev/setup.md](https://useopenmax.dev/setup.md).
 

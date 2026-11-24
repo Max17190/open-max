@@ -1055,7 +1055,7 @@ async fn run_loop(
                 // the discipline a prune already follows (#172). The stop
                 // reason is deliberately left alone: a refused end is not
                 // an end, so a loop that runs out here says so.
-                guard.messages().push(ChatMessage::user(refusal.reason.clone()));
+                guard.messages().push(ChatMessage::note(refusal.reason.clone()));
                 if save_messages(core, session_id, guard.messages(), false).await {
                     // Disk first, then the wire: the frontend hears about
                     // the continuation only once the transcript a resume
@@ -9752,8 +9752,8 @@ echo run >> {}
         assert!(
             opened[1..at]
                 .iter()
-                .any(|m| m.content.as_deref().is_some_and(|c| c.starts_with("[execution policy:"))),
-            "the fixture must open with the policy note ahead of the request: {opened:?}"
+                .any(|m| m.harness_note && m.content.as_deref().is_some_and(|c| c.starts_with("[execution policy:"))),
+            "the persisted policy note is marked as a harness note: {opened:?}"
         );
         for step in 0..6 {
             let prompt = format!("step {step}: {}", "more detail ".repeat(200));

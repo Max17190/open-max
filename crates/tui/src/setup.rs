@@ -24,7 +24,13 @@ const LIMIT: usize = 1024 * 1024;
 /// Setup's keys: a session's reader (`app::TerminalInput`), else its own stream.
 pub(crate) type Keys<'a> = Box<dyn futures_util::Stream<Item = std::io::Result<Event>> + Unpin + 'a>;
 
-pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<Keys<'_>>) -> Result<(), String> {
+/// Ok with the connection and model an API-key login saved, else Ok(None).
+pub async fn run(
+    dir: &Path,
+    action: Action,
+    target: Option<&str>,
+    keys: Option<Keys<'_>>,
+) -> Result<Option<(String, String)>, String> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Err("provider setup needs an interactive terminal".into());
     }
@@ -94,69 +100,65 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
             },
             account,
         )
-        .await;
+        .await
+        .map(|()| None);
     }
     if action == Action::Logout {
         let previous = snapshot
             .get(&name)
             .ok_or("provider is not configured")?
             .clone();
-        prompts
-            .pick(
-                &format!(
-                    "Disconnect {}? Its local connection and catalog will be removed.",
-                    one_line(&name)
-                ),
-                &[
-                    ("cancel".into(), "Cancel".into()),
-                    ("disconnect".into(), "Disconnect".into()),
-                ],
-            )
-            .await
-            .and_then(|choice| {
-                if choice == "disconnect" {
-                    Ok(())
-                } else {
-                    Err("Cancelled".into())
-                }
-            })?;
+        let question = format!(
+            "Disconnect {}? Its local connection and catalog will be removed.",
+            one_line(&name)
+        );
+        let choices = [
+            ("cancel".into(), "Cancel".into()),
+            ("disconnect".into(), "Disconnect".into()),
+        ];
+        if prompts.pick(&question, &choices).await? != "disconnect" {
+            return Err("Cancelled".into());
+        }
         providers::edit_catalog(dir, |entries| {
             unchanged(entries.get(&name), Some(&previous))?;
             entries.remove(&name);
             Ok(())
         })
         .await?;
-        eprintln!("Disconnected {} locally. The API key remains valid at the provider; revoke it there if needed.", one_line(&name));
-        return Ok(());
+        eprintln!("Disconnected {} locally.", one_line(&name));
+        let nonempty = |value: &Value| value.as_str().is_some_and(|s| !s.trim().is_empty());
+        let env = &previous["api_key_env"];
+        if nonempty(&previous["api_key"])
+            || nonempty(env)
+            || env.as_array().is_some_and(|names| names.iter().any(nonempty))
+            || previous["headers"].as_object().is_some_and(|headers| {
+                headers.iter().any(|(name, value)| open_max_core::client::is_credential_header(name) && nonempty(value))
+            })
+        {
+            eprintln!("The credentials remain valid at the provider; revoke them there if needed.");
+        }
+        return Ok(None);
     }
-    let custom = name == "custom";
-    let name = if custom {
+    let name = if name == "custom" {
         prompts
-            .ask(
-                "Connection name (letters, digits, hyphens or underscores)",
-                false,
-            )
+            .ask_until("Connection name (letters, digits, hyphens or underscores)", false, |name| {
+                if matches!(name.as_str(), "chatgpt" | "openai" | "anthropic" | "custom") {
+                    Err("choose a connection name other than chatgpt, openai, anthropic, or custom")
+                } else if snapshot.contains_key(&name)
+                    || (!name.is_empty()
+                        && name.len() <= 64
+                        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+                {
+                    Ok(name)
+                } else {
+                    Err("a connection name is 1 to 64 letters, digits, hyphens or underscores")
+                }
+            })
             .await?
     } else {
         name
     };
-    if custom && matches!(name.as_str(), "chatgpt" | "openai" | "anthropic" | "custom") {
-        return Err(
-            "choose a connection name other than chatgpt, openai, anthropic, or custom".into(),
-        );
-    }
     let previous = snapshot.get(&name).cloned();
-    if previous.is_none()
-        && (name.is_empty()
-            || name.len() > 64
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-    {
-        return Err(
-            "connection name must be 1 to 64 letters, digits, hyphens or underscores".into(),
-        );
-    }
     let preset = match name.as_str() {
         "openai" => Some(OPENAI),
         "anthropic" => Some(ANTHROPIC),
@@ -178,17 +180,20 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         }
     }
     let base = match preset.or_else(|| entry["base_url"].as_str()) {
-        Some(base) => base.to_owned(),
+        Some(base) => base.trim_end_matches('/').to_owned(),
         None => {
             prompts
-                .ask("API base URL (including /v1 when required)", false)
+                .ask_until("API base URL (including /v1 when required)", false, |base| {
+                    let base = base.trim_end_matches('/').to_owned();
+                    validate_url(&base).map(|_| base)
+                })
                 .await?
         }
     };
-    let base = base.trim_end_matches('/').to_owned();
-    validate_url(&base)?;
+    let local = validate_url(&base)?;
+    let billed = if local { "" } else { " API usage is billed by this provider." };
     eprintln!(
-        "Connecting {} to {}. API usage is billed by this provider.",
+        "Connecting {} to {}.{billed}",
         one_line(&name),
         one_line(&base)
     );
@@ -207,18 +212,10 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
     };
     let prompt = match env.filter(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty())) {
         Some(key) => format!("API key (hidden; Enter copies {key} into this connection)"),
+        None if local => "API key (hidden; leave empty if the server does not require one)".into(),
         None => "API key (hidden)".into(),
     };
-    let typed = prompts.ask(&prompt, true).await?;
-    let key = if typed.is_empty() {
-        env.and_then(|key| std::env::var(key).ok())
-            .unwrap_or_default()
-    } else {
-        typed
-    };
-    if key.is_empty() || reqwest::header::HeaderValue::from_str(&key).is_err() {
-        return Err("a non-empty valid API key is required".into());
-    }
+    let mut key = prompts.ask_key(&prompt, env, local).await?;
     let headers = entry
         .as_object_mut()
         .unwrap()
@@ -250,11 +247,28 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
             headers.insert("anthropic-workspace-id".into(), json!(workspace));
         }
     }
-    eprintln!("Checking access and loading available models...");
-    let models = discover(&base, &key, headers, base == OPENAI, native).await?;
+    let models = loop {
+        eprintln!("Checking access and loading available models...");
+        match discover(&base, &key, headers, base == OPENAI, native).await {
+            Ok(models) => break models,
+            Err(DiscoveryError::Rejected(status)) => {
+                eprintln!("The provider rejected access (HTTP {status}). Enter the API key again, or press Esc to cancel.");
+                key = prompts.ask_key("API key (hidden)", None, local).await?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
     let model = if models.is_empty() {
         eprintln!("This endpoint does not expose a model catalog, so access could not be verified. Enter its exact model ID.");
-        prompts.ask("Model ID", false).await?
+        prompts
+            .ask_until("Model ID", false, |id| {
+                if id.is_empty() || id.len() > 256 {
+                    Err("a model ID is 1 to 256 characters")
+                } else {
+                    Ok(id)
+                }
+            })
+            .await?
     } else {
         let choices = models
             .iter()
@@ -264,9 +278,6 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
             .pick("Choose a model (type to filter)", &choices)
             .await?
     };
-    if model.is_empty() || model.len() > 256 {
-        return Err("a model ID is required".into());
-    }
     let metadata = models
         .iter()
         .find(|m| m["id"] == model)
@@ -281,12 +292,10 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         None => {
             eprintln!("The API did not report this model's context window. Use the value from its documentation.");
             prompts
-                .ask("Context window in tokens", false)
+                .ask_until("Context window in tokens (such as 128000 or 128k)", false, |text| {
+                    context_window(&text).ok_or("a context window is a positive number of tokens, such as 128000 or 128k")
+                })
                 .await?
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or("context window must be a positive number of tokens")? as u64
         }
     };
     api_defaults(&mut entry, &name, previous.is_none())?;
@@ -301,11 +310,16 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         .ok_or("provider models must be an array")?;
     record_model(catalog, &model, window, metadata, inherited);
     entry["base_url"] = json!(base);
-    entry["api_key"] = json!(if key.starts_with('$') {
-        format!("${key}")
+    let keyless = key.is_empty();
+    if keyless {
+        entry.as_object_mut().unwrap().remove("api_key");
     } else {
-        key
-    });
+        entry["api_key"] = json!(if key.starts_with('$') {
+            format!("${key}")
+        } else {
+            key
+        });
+    }
     entry.as_object_mut().unwrap().remove("api_key_env");
     providers::edit_catalog(dir, |entries| {
         unchanged(entries.get(&name), previous.as_ref())?;
@@ -313,16 +327,50 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         Ok(())
     })
     .await?;
-    eprintln!(
-        "Saved connection {}. Credentials are stored locally with owner-only permissions.",
-        one_line(&name)
-    );
-    eprintln!(
-        "Choose it with /model, or run openmax --provider {} --model {}",
-        open_max_core::doctor::shell_quote(Path::new(&name)),
-        open_max_core::doctor::shell_quote(Path::new(&model))
-    );
+    if keyless {
+        eprintln!("Saved connection {} without an API key.", one_line(&name));
+    } else {
+        eprintln!(
+            "Saved connection {}. Credentials are stored locally with owner-only permissions.",
+            one_line(&name)
+        );
+    }
+    Ok(Some((name, model)))
+}
+
+/// After a login from the shell: when settings select no endpoint, the
+/// connection just made becomes the default through the save `/model`
+/// makes, so the next `openmax` runs on it; otherwise the selection stays.
+pub fn select_unless_chosen(dir: &Path, provider: &str, model: &str) -> Result<(), String> {
+    let mut settings = open_max_core::config::load(dir)?;
+    if settings.provider.as_deref().is_some_and(|p| !p.trim().is_empty()) || !settings.base_url.trim().is_empty() {
+        eprintln!(
+            "Choose it with /model, or run openmax --provider {} --model {}",
+            open_max_core::doctor::shell_quote(Path::new(provider)),
+            open_max_core::doctor::shell_quote(Path::new(model))
+        );
+        return Ok(());
+    }
+    settings.provider = Some(provider.into());
+    settings.model = model.into();
+    open_max_core::config::save(dir, &settings)?;
+    eprintln!("{} from {} is now the default model; change it with /model.", one_line(model), one_line(provider));
     Ok(())
+}
+
+/// A context window as typed: a number of tokens, or thousands or millions
+/// of them with a k or m after it (128k is 128,000).
+fn context_window(text: &str) -> Option<u64> {
+    let text = text.to_ascii_lowercase();
+    let (digits, scale) = if let Some(digits) = text.strip_suffix('k') {
+        (digits, 1_000)
+    } else if let Some(digits) = text.strip_suffix('m') {
+        (digits, 1_000_000)
+    } else {
+        (text.as_str(), 1)
+    };
+    digits.trim().parse::<u64>().ok()?.checked_mul(scale)
+        .filter(|n| *n > 0 && usize::try_from(*n).is_ok())
 }
 
 /// Saves the model's window and the output maximum a catalog reports as the reply
@@ -370,7 +418,8 @@ fn unchanged(current: Option<&Value>, previous: Option<&Value>) -> Result<(), St
     }
 }
 
-fn validate_url(base: &str) -> Result<(), String> {
+/// Whether `base` is on this machine, once it is a URL setup may save.
+fn validate_url(base: &str) -> Result<bool, String> {
     let url = reqwest::Url::parse(base).map_err(|_| "invalid API base URL")?;
     let local = url.host_str().is_some_and(|h| {
         h == "localhost"
@@ -388,7 +437,28 @@ fn validate_url(base: &str) -> Result<(), String> {
     {
         return Err("use an HTTPS API URL without credentials, query, or fragment; plain HTTP is allowed only on loopback".into());
     }
-    Ok(())
+    Ok(local)
+}
+
+#[derive(Debug)]
+enum DiscoveryError {
+    Rejected(u16),
+    Other(String),
+}
+
+impl From<&str> for DiscoveryError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.into())
+    }
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(status) => write!(f, "model discovery returned HTTP {status}; connection was not saved"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
 }
 
 async fn discover(
@@ -397,15 +467,19 @@ async fn discover(
     headers: &serde_json::Map<String, Value>,
     openai: bool,
     native: bool,
-) -> Result<Vec<Value>, String> {
-    validate_url(base)?;
+) -> Result<Vec<Value>, DiscoveryError> {
+    validate_url(base).map_err(DiscoveryError::Other)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| "cannot initialize model discovery")?;
     let request = client.get(format!("{base}/models"));
-    let mut request = if native { request.header("x-api-key", key) } else { request.bearer_auth(key) };
+    let mut request = match (key.is_empty(), native) {
+        (true, _) => request,
+        (false, true) => request.header("x-api-key", key),
+        (false, false) => request.bearer_auth(key),
+    };
     if native && !headers.keys().any(|name| name.eq_ignore_ascii_case("anthropic-version")) {
         request = request.header("anthropic-version", "2023-06-01");
     }
@@ -428,11 +502,14 @@ async fn discover(
     if matches!(response.status().as_u16(), 404 | 405) {
         return Ok(Vec::new());
     }
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return Err(DiscoveryError::Rejected(response.status().as_u16()));
+    }
     if !response.status().is_success() {
-        return Err(format!(
+        return Err(DiscoveryError::Other(format!(
             "model discovery returned HTTP {}; connection was not saved",
             response.status().as_u16()
-        ));
+        )));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -445,7 +522,7 @@ async fn discover(
         }
         bytes.extend_from_slice(&chunk);
     }
-    parse_catalog(&bytes, openai)
+    parse_catalog(&bytes, openai).map_err(DiscoveryError::Other)
 }
 
 fn parse_catalog(bytes: &[u8], openai: bool) -> Result<Vec<Value>, String> {
@@ -528,6 +605,35 @@ impl Prompts<'_> {
     async fn ask(&mut self, title: &str, secret: bool) -> Result<String, String> {
         self.input(title, secret, None).await
     }
+    /// Ask until `check` takes the answer, printing why it refused each
+    /// one before asking again; Esc or the end of input still cancels.
+    async fn ask_until<T, E: std::fmt::Display>(
+        &mut self,
+        title: &str,
+        secret: bool,
+        check: impl Fn(String) -> Result<T, E>,
+    ) -> Result<T, String> {
+        loop {
+            match check(self.ask(title, secret).await?) {
+                Ok(answer) => return Ok(answer),
+                Err(why) => eprintln!("{why}"),
+            }
+        }
+    }
+    async fn ask_key(&mut self, prompt: &str, env: Option<&str>, local: bool) -> Result<String, String> {
+        self.ask_until(prompt, true, |typed| {
+            let key = if typed.is_empty() {
+                env.and_then(|key| std::env::var(key).ok()).unwrap_or_default()
+            } else {
+                typed
+            };
+            match reqwest::header::HeaderValue::from_str(&key) {
+                Ok(_) if !key.is_empty() || local => Ok(key),
+                _ => Err("enter a valid API key; only a server on this machine may take none"),
+            }
+        }).await
+    }
+
     async fn pick(&mut self, title: &str, choices: &[(String, String)]) -> Result<String, String> {
         if choices.is_empty() {
             return Err("no configured providers; use /login or openmax --login first".into());

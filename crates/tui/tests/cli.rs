@@ -513,6 +513,223 @@ fn pseudo_terminal() -> (std::fs::File, std::fs::File) {
     (controller, terminal)
 }
 
+/// Run `openmax <args>` with a terminal on stdin and stderr, as a person at
+/// a shell does, answering each prompt: for each `(shown, typed)`, wait
+/// until the output after the last answer shows `shown`, then type `typed`
+/// (Enter is `\r`, Esc `\x1b`). Returns the exit code and all it printed.
+fn at_a_terminal(project: &Path, home: &Path, args: &[&str], answers: &[(&str, &str)]) -> (Option<i32>, String) {
+    let (mut controller, terminal) = pseudo_terminal();
+    let mut reader = controller.try_clone().unwrap();
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let sink = shown.clone();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = [0u8; 4096];
+        while let Ok(n @ 1..) = reader.read(&mut bytes) {
+            sink.lock().unwrap().extend_from_slice(&bytes[..n]);
+        }
+    });
+    let mut child = cmd(project, home)
+        .args(args)
+        .stdin(terminal.try_clone().unwrap())
+        .stderr(terminal)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // What a person reads: control sequences (CSI, a final byte in @ to ~) dropped.
+    let text = || {
+        let raw = String::from_utf8_lossy(&shown.lock().unwrap()).replace("\r\n", "\n");
+        let mut plain = String::new();
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.next() == Some('[') {
+                chars.by_ref().find(|c| ('@'..='~').contains(c));
+            } else if c != '\x1b' {
+                plain.push(c);
+            }
+        }
+        plain
+    };
+    let mut from = 0;
+    for (prompt, typed) in answers {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(at) = text().get(from..).and_then(|rest| rest.find(prompt)) {
+                from += at + prompt.len();
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                child.wait().unwrap();
+                reader.join().unwrap();
+                panic!("no {prompt:?} after answer {from}: {}", text());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        controller.write_all(typed.as_bytes()).unwrap();
+    }
+    let status = finish_with_deadline(child).status.code();
+    reader.join().unwrap();
+    (status, text())
+}
+
+/// A model catalog endpoint's reply, one model with `extra` fields.
+fn catalog_reply(extra: &str) -> String {
+    let body = format!(r#"{{"data":[{{"id":"fixture-model"{extra}}}]}}"#);
+    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+}
+
+/// The README's first run: `openmax --login`, then `openmax`. A login from
+/// the shell while settings select no endpoint makes the connection it saved
+/// the default, as `/model` would, so the next run uses it with nothing else
+/// to type. With an endpoint selected, a second login leaves it selected and
+/// says how to choose the new connection.
+#[test]
+fn a_login_from_the_shell_selects_what_it_connected_when_nothing_is_selected() {
+    let (project, home) = fresh_dirs("login-selects");
+    let hello = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{HELLO_SSE}",
+        HELLO_SSE.len()
+    );
+    let catalog = catalog_reply(r#","context_window":32768"#);
+    let (base_url, bodies, _server) = spawn_http_script(vec![catalog.clone(), hello, catalog]);
+    let login = |name: &str| {
+        at_a_terminal(&project, &home, &["--login", "custom"], &[
+            ("Connection name", &format!("{name}\r")),
+            ("API base URL", &format!("{base_url}\r")),
+            ("API key", "fixture-key\r"),
+            ("Choose a model", "\r"),
+        ])
+    };
+    let (status, shown) = login("fixture");
+    assert_eq!(status, Some(0), "{shown}");
+    assert!(shown.contains("fixture-model from fixture is now the default model; change it with /model.\n"), "{shown}");
+    let run = cmd(&project, &home).args(["--trust-project", "-p", "say hi"]).output().unwrap();
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(String::from_utf8_lossy(&run.stdout).contains("stub says hi"));
+    assert!(bodies.lock().unwrap()[1].contains(r#""model":"fixture-model""#));
+
+    let settings = std::fs::read_to_string(home.join(".openmax/settings.json")).unwrap();
+    let (status, shown) = login("second");
+    assert_eq!(status, Some(0), "{shown}");
+    assert!(shown.contains("Choose it with /model, or run openmax --provider 'second' --model 'fixture-model'"), "{shown}");
+    assert!(!shown.contains("is now the default"), "{shown}");
+    assert_eq!(std::fs::read_to_string(home.join(".openmax/settings.json")).unwrap(), settings, "a default already chosen stays");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// The login wizard asks again after an answer it cannot take, and Esc still
+/// cancels with nothing saved. A server elsewhere is billed and needs a key;
+/// one on this machine is not said to bill and may take none, which saves
+/// none. A context window takes the usual k suffix.
+#[test]
+fn login_asks_again_and_connects_a_server_on_this_machine_without_a_key() {
+    let (project, home) = fresh_dirs("login-asks-again");
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "bad name\r"),
+        ("a connection name is 1 to 64 letters, digits, hyphens or underscores\nConnection name", "remote\r"),
+        ("API base URL", "https://example.invalid/v1\r"),
+        ("Connecting remote to https://example.invalid/v1. API usage is billed by this provider.\nAPI key", "\r"),
+        ("enter a valid API key; only a server on this machine may take none\nAPI key", "\x1b"),
+    ]);
+    assert_eq!(status, Some(1), "{shown}");
+    assert!(shown.ends_with("openmax: Cancelled\n"), "{shown}");
+    assert!(!home.join(".openmax/providers.json").exists(), "{shown}");
+
+    let (base_url, _, _server) = spawn_http_script(vec![catalog_reply("")]);
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "local\r"),
+        ("API base URL", "http://127.0.0.1:9/v1?bad\r"),
+        ("plain HTTP is allowed only on loopback\nAPI base URL", &format!("{base_url}\r")),
+        (&format!("Connecting local to {base_url}.\nAPI key"), "\r"),
+        ("Choose a model", "\r"),
+        ("Context window in tokens", "12x\r"),
+        ("a context window is a positive number of tokens, such as 128000 or 128k\nContext window", "128k\r"),
+    ]);
+    assert_eq!(status, Some(0), "{shown}");
+    assert!(shown.contains("Saved connection local without an API key."), "{shown}");
+    assert!(!shown.contains("Credentials are stored locally"), "{shown}");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(".openmax/providers.json")).unwrap()).unwrap();
+    let local = &saved["providers"]["local"];
+    assert_eq!(local["api_key"], serde_json::Value::Null, "{saved}");
+    assert_eq!(local["models"], serde_json::json!([{"id": "fixture-model", "context_tokens": 128000}]), "{saved}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn login_retries_a_server_rejected_key_without_losing_the_connection() {
+    let (project, home) = fresh_dirs("login-rejected-key");
+    let rejected = |status| format!("HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let (base_url, _, server) = spawn_http_script(vec![
+        rejected(401),
+        rejected(403),
+        catalog_reply(r#","context_window":32768"#),
+    ]);
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "retry-fixture\r"),
+        ("API base URL", &format!("{base_url}\r")),
+        ("API key", "first-bad-key\r"),
+        ("The provider rejected access (HTTP 401). Enter the API key again, or press Esc to cancel.\nAPI key", "second-bad-key\r"),
+        ("The provider rejected access (HTTP 403). Enter the API key again, or press Esc to cancel.\nAPI key", "accepted-key\r"),
+        ("Choose a model", "\r"),
+    ]);
+    assert_eq!(status, Some(0), "{shown}");
+    assert_eq!(shown.matches("Connection name").count(), 1, "{shown}");
+    assert_eq!(shown.matches("API base URL").count(), 1, "{shown}");
+    for key in ["first-bad-key", "second-bad-key", "accepted-key"] {
+        assert!(!shown.contains(key), "{shown}");
+    }
+    let saved = open_max_core::providers::read_catalog(&home.join(".openmax")).unwrap();
+    assert_eq!(saved["retry-fixture"]["api_key"], "accepted-key");
+    assert_eq!(saved["retry-fixture"]["base_url"], base_url);
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn shell_login_selects_a_default_without_reading_project_trust() {
+    let (project, home) = fresh_dirs("login-independent-of-trust");
+    let data = home.join(".openmax");
+    std::fs::create_dir_all(&data).unwrap();
+    let trust = data.join("trust.json");
+    std::fs::write(&trust, "not valid JSON").unwrap();
+    let (base_url, _, server) = spawn_http_script(vec![catalog_reply(r#","context_window":32768"#)]);
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "local\r"),
+        ("API base URL", &format!("{base_url}\r")),
+        ("API key", "\r"),
+        ("Choose a model", "\r"),
+    ]);
+    assert_eq!(status, Some(0), "{shown}");
+    let settings = open_max_core::config::load(&data).unwrap();
+    assert_eq!(settings.provider.as_deref(), Some("local"));
+    assert_eq!(settings.model, "fixture-model");
+    assert_eq!(std::fs::read_to_string(trust).unwrap(), "not valid JSON");
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn shell_logout_warns_for_configured_credentials_only() {
+    let (project, home) = fresh_dirs("logout-credential-warning");
+    let data = home.join(".openmax");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("providers.json"), r#"{"providers":{
+        "env-list":{"base_url":"https://example.invalid/v1","api_key_env":["FIXTURE_KEY"]},
+        "header":{"base_url":"https://example.invalid/v1","headers":{"Authorization":"$FIXTURE_KEY"}},
+        "local":{"base_url":"http://127.0.0.1:9/v1","api_key_env":[]}
+    }}"#).unwrap();
+    for (name, warned) in [("env-list", true), ("header", true), ("local", false)] {
+        let (status, shown) = at_a_terminal(&project, &home, &["--logout", name], &[
+            ("Enter confirms; Esc cancels", "\x1b[B\r"),
+        ]);
+        assert_eq!(status, Some(0), "{shown}");
+        assert!(shown.contains(&format!("Disconnected {name} locally.")), "{shown}");
+        assert_eq!(shown.contains("The credentials remain valid at the provider; revoke them there if needed."), warned, "{shown}");
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Every line of a ```sh block that runs `--trust-project`.
 fn documented_trust_commands(markdown: &str) -> Vec<String> {
     let mut shell_block = None;
@@ -6769,24 +6986,23 @@ fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
 }
 
 /// A fresh install has no endpoint, model or window. One run must name all
-/// three with an example, because settings are read at launch: reported one
-/// at a time, each field costs an edit and a restart.
+/// three, because settings are read at launch: reported one at a time, each
+/// field costs an edit and a restart. It names the commands that connect a
+/// model first and the flags that set each key second, in a few lines.
 #[test]
 fn a_fresh_install_is_told_every_missing_setting_at_once() {
     let (project, home) = fresh_dirs("fresh-install");
     let out = cmd(&project, &home).args(["--trust-project", "-p", "hi"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("no endpoint, model or context window configured"), "{stderr}");
-    for key in ["\"base_url\"", "\"model\"", "\"context_tokens\"", "\"api_key\""] {
-        assert!(stderr.contains(key), "{key} missing from {stderr}");
-    }
-    assert!(stderr.contains("read at launch"), "{stderr}");
-    // The error is the documentation of the first run: it names the flags
-    // that set each key as well as the keys.
+    let refusal = stderr.split_once("openmax: no endpoint").map(|(_, rest)| rest).unwrap_or_else(|| panic!("{stderr}"));
+    let first = refusal.lines().next().unwrap();
+    assert!(first.contains(", model or context window configured: connect a provider with /login"), "{first}");
+    assert!(first.contains("openmax --login") && first.contains("/model"), "{first}");
     for flag in ["--base-url", "--model", "--context-tokens", "--api-key"] {
-        assert!(stderr.contains(flag), "{flag} missing from {stderr}");
+        assert!(refusal.contains(flag) && !first.contains(flag), "{flag} is not the manual route after the commands: {stderr}");
     }
+    assert!(refusal.lines().count() <= 4, "{stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

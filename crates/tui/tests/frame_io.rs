@@ -567,7 +567,7 @@ mod first_frame {
             panic!("no first frame while trust.json and settings.json are unread: {}", s.context())
         });
         let shown = screen(&s.out[..frame + FRAME_END.len()], 80, 24).join("\n");
-        assert!(shown.contains("project") && shown.contains("READY") && shown.contains("❯"), "{shown}");
+        assert!(shown.contains("project") && !shown.contains("READY") && shown.contains("❯"), "{shown}");
 
         let dir = s.dir.join("home/.openmax");
         let root = std::fs::canonicalize(s.dir.join("project")).unwrap();
@@ -743,7 +743,7 @@ mod first_frame {
         let start = s.out.len();
         s.write(b"/login fixture\r");
         let restored = s.wait_for(LEAVE_ALT_SCREEN, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not restore terminal: {}", s.context()));
-        s.wait_for_prompt(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
+        s.wait_for_prompt(b"API key (hidden; leave empty if the server does not require one)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
         // Ordinary c/d are text, not cancellation. Other modified or invalid input is inert.
         s.write(b"cd\x7f\x7f\x1b[120;1:3u\x01\x1bqX");
         s.write_bounded(format!("\x1b[200~{key}\x1b[201~\x7f\x1b[200~bad\npaste\x1b[201~\x1b[200~{key}\x1b[201~z\r").as_bytes());
@@ -798,17 +798,24 @@ mod first_frame {
         s.write(b"/login custom\r");
         let question = s.wait_for_prompt(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
         s.write(b"openai\r");
-        let push = s.wait_for(KEYBOARD_PUSH, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
+        // A name setup cannot take is refused with the reason and asked for
+        // again; Esc still cancels with nothing saved.
+        let refused = s.wait_for(b"choose a connection name other than", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
+        s.wait_for_prompt(b"Connection name", refused, Duration::from_secs(5)).unwrap_or_else(|| panic!("the name was not asked again: {}", s.context()));
+        s.write(b"\x1b");
+        let push = s.wait_for(KEYBOARD_PUSH, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("Esc did not cancel setup: {}", s.context()));
         assert!(!String::from_utf8_lossy(&s.out[question..push]).contains("API key (hidden)"));
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         for (name, valid) in [(String::new(), false), ("x".repeat(64), true), ("x".repeat(65), false),
             ("x".repeat(66), false), ("dash-name".into(), true), ("under_score".into(), true), ("bad name".into(), false)] {
             let question = begin(&mut s, "/login custom", b"Connection name");
             s.write(format!("\x1b[200~{name}\x1b[201~\r").as_bytes());
-            if valid {
-                s.wait_for_prompt(b"API base URL", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("valid connection name was refused: {}", s.context()));
-                s.write(b"\x1b");
-            }
+            // A valid name moves on to the URL; any other is refused, and the
+            // prompt drawn after the reason asks for it again.
+            let next: &[u8] = if valid { b"API base URL" } else { b"a connection name is 1 to 64" };
+            s.wait_for_prompt(next, question, Duration::from_secs(5))
+                .unwrap_or_else(|| panic!("{name:?} got no {}: {}", String::from_utf8_lossy(next), s.context()));
+            s.write(b"\x1b");
             resume(&mut s, question);
             assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         }
@@ -857,7 +864,7 @@ mod first_frame {
         entries["providers"]["manual"] = serde_json::json!({"base_url":format!("http://{}", manual.local_addr().unwrap())});
         std::fs::write(dir.join("providers.json"), entries.to_string()).unwrap();
         let manual_server = std::thread::spawn(move || {
-            for request in 0..6 {
+            for request in 0..7 {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut socket = loop {
                     match manual.accept() {
@@ -878,19 +885,23 @@ mod first_frame {
                     assert!(n > 0);
                     header.extend_from_slice(&buffer[..n]);
                 }
-                let (status, body) = if request < 5 { (404, "") } else {
+                let (status, body) = if request < 6 { (404, "") } else {
                     (200, r#"{"data":[{"id":"reported-zero","context_window":0}]}"#)
                 };
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        let question = begin(&mut s, "/login manual", b"API key (hidden)");
+        // A server on this machine may check no key: an empty one goes on to
+        // discovery.
+        let question = begin(&mut s, "/login manual", b"API key (hidden; leave empty if the server does not require one)");
         s.write(b"\r");
+        s.wait_for_prompt(b"Model ID", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("an empty key on loopback was refused: {}", s.context()));
+        s.write(b"\x1b");
         resume(&mut s, question);
         for (model, window, success) in [("m".repeat(257), None, false), ("m".repeat(258), None, false),
             (String::new(), None, false), ("m".repeat(256), Some("1"), true),
             ("zero-window".into(), Some("0"), false), ("reported-zero".into(), Some("1"), true)] {
-            let question = begin(&mut s, "/login manual", b"API key (hidden)");
+            let question = begin(&mut s, "/login manual", b"API key (hidden; leave empty if the server does not require one)");
             s.write(b"fixture-manual-key\r");
             if model == "reported-zero" {
                 s.wait_for_prompt(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
@@ -904,11 +915,14 @@ mod first_frame {
                 s.wait_for_prompt(b"Context window in tokens", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("context window prompt missing: {}", s.context()));
                 s.write(format!("{window}\r").as_bytes());
             }
-            let error_from = s.out.len();
-            resume(&mut s, question);
-            if window == Some("0") {
-                assert!(screen(&s.out[error_from..], 80, 24).join("\n").contains("positive number of tokens"), "context-window refusal was not shown");
+            // An answer setup cannot take is refused with the reason and asked
+            // for again; Esc then cancels with nothing saved.
+            if !success {
+                let reason: &[u8] = if window.is_some() { b"a context window is a positive number of tokens" } else { b"a model ID is 1 to 256 characters" };
+                s.wait_for_prompt(reason, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("{} was not asked again: {}", String::from_utf8_lossy(reason), s.context()));
+                s.write(b"\x1b");
             }
+            resume(&mut s, question);
             if success {
                 close_picker(&mut s);
                 let entries: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
@@ -925,7 +939,7 @@ mod first_frame {
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("OpenAI API"));
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("Anthropic API"));
         s.write(b"manual\r");
-        let key_prompt = s.wait_for_prompt(b"API key (hidden)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
+        let key_prompt = s.wait_for_prompt(b"API key (hidden; leave empty if the server does not require one)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
         s.write(b"\x04");
         resume(&mut s, key_prompt);
         let question = begin(&mut s, "/login", b"Connect a provider");
@@ -1356,8 +1370,8 @@ mod first_frame {
         assert!(shown.contains("stub-model"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto, "new trust grants already default to Auto");
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· none"));
-        assert!(shown.contains("· none"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· high"));
+        assert!(shown.contains("· high"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
         s.write(b"/permissions\r");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("new project default"));
@@ -1366,10 +1380,10 @@ mod first_frame {
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: readonly"));
         assert!(shown.contains("permissions: readonly"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
-        assert_eq!(open_max_core::config::load(&data).unwrap().reasoning_effort, Some(open_max_core::config::ReasoningEffort::None));
+        assert_eq!(open_max_core::config::load(&data).unwrap().reasoning_effort, None, "the key saves no effort");
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· minimal"));
-        assert!(shown.contains("· minimal"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· xhigh"));
+        assert!(shown.contains("· xhigh"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
         s.write(b"/permissions ask\r");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: ask"));
@@ -1500,8 +1514,8 @@ mod first_frame {
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: xhigh"));
         assert!(shown.contains("requested: xhigh"), "{shown}");
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default"));
-        assert!(shown.contains("requested: default") && !shown.contains("requested: max"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("effort default for this session"));
+        assert!(shown.contains("effort default for this session") && !shown.contains("effort max"), "{shown}");
         s.write(CTRL_C_TWICE);
         assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
 

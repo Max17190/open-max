@@ -836,16 +836,16 @@ fn check_requests(run: &Run, log: &str) {
     }
 }
 
-/// The wire never carries `reasoning_origin`, the stamp the transcript keeps
-/// on a message with reasoning, nor `effort`, the last field of a prompt's
-/// record, which says the effort and route its turn ran at.
-fn without_origin(line: &str) -> String {
+/// The wire never carries the transcript's reasoning origin, prompt effort,
+/// or harness note marker.
+fn without_transcript_metadata(line: &str) -> String {
     const KEY: &str = ",\"reasoning_origin\":\"";
     let line = match line.find(KEY) {
         Some(at) => format!("{}{}", &line[..at], &line[at + KEY.len() + 17..]),
         None => line.to_string(),
     };
-    line.find(",\"effort\":\"").map_or(line.clone(), |at| format!("{}}}", &line[..at]))
+    let line = line.find(",\"effort\":\"").map_or(line.clone(), |at| format!("{}}}", &line[..at]));
+    line.replace(",\"harness_note\":true", "")
 }
 
 /// A line with its prompt record's route (the space and 16 hex digits after
@@ -877,14 +877,14 @@ fn user_line(prompt: &str) -> String {
     format!("{{\"role\":\"user\",\"content\":{}}}", serde_json::to_string(prompt).unwrap())
 }
 
-/// A resumed session sends the records on disk exactly as stored, then the
+/// A resumed session sends the records on disk in wire form, then the
 /// new prompt with nothing between, and the same tools byte for byte; and
 /// the file grows by the prompt and the reply alone.
 fn check_resume(first: &Run, resumed: &Run) {
     let log = resumed.log();
     assert_eq!(resumed.sid, first.sid, "{log}");
     let kept = complete_prefix(&resumed.before);
-    let lines: Vec<String> = std::str::from_utf8(kept).unwrap().lines().map(without_origin).map(|line| as_sent(&line)).collect();
+    let lines: Vec<String> = std::str::from_utf8(kept).unwrap().lines().map(without_transcript_metadata).map(|line| as_sent(&line)).collect();
     let expected = format!("[{},{}]", lines.join(","), user_line(&resumed.prompt));
     let body = fields(&resumed.requests[0]);
     assert_eq!(body["messages"].get(), expected, "the resume sends the transcript as stored: {log}");

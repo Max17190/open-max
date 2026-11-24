@@ -398,18 +398,34 @@ impl Core {
         self.save_selected_settings(settings, false).map(|_| ())
     }
 
-    /// Persist an explicit session choice, unless the endpoint is a launch override.
+    /// Request `effort` from the next turn on. With `save`, an explicit
+    /// session choice is persisted unless the endpoint is a launch override;
+    /// without, it holds until the frontend changes sessions, and saves keep
+    /// the file's effort.
     /// Returns whether the selection was persisted, rather than kept for this run.
-    pub fn set_reasoning_effort(&self, effort: Option<crate::config::ReasoningEffort>) -> Result<bool, String> {
+    pub fn set_reasoning_effort(&self, effort: Option<crate::config::ReasoningEffort>, save: bool) -> Result<bool, String> {
         let mut live = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = live.clone();
         next.reasoning_effort = effort;
         if let Err(crate::providers::ResolveError::ReasoningEffort(error)) = crate::providers::resolve(&next, &self.data_dir) {
             return Err(error);
         }
-        let persisted = self.save_selected_settings(&next, true)?;
+        let persisted = if save {
+            self.save_selected_settings(&next, true)?
+        } else {
+            let mut held = self.run_only.lock().unwrap_or_else(|e| e.into_inner());
+            crate::config::RunOnly::hold_session_effort(&mut held, &live);
+            false
+        };
         *live = next;
         Ok(persisted)
+    }
+
+    pub fn reset_session_effort(&self) {
+        let mut live = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = self.run_only.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            held.reset_session_effort(&mut live);
+        }
     }
 
     fn save_selected_settings(&self, settings: &Settings, effort_selected: bool) -> Result<bool, String> {

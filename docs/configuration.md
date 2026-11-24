@@ -307,10 +307,11 @@ and the run that writes a key already uses it.
 
 - `reasoning_effort` (default unset): an explicit requested level: `none`,
   `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Use `/effort` for a
-  keyboard picker, Shift+Tab to cycle the active protocol's levels,
-  `/effort high` to select directly, or `--effort high` at launch. Session
-  choices persist, including selecting the current CLI level,
-  unless the endpoint is a temporary CLI override. In that case the saved
+  keyboard picker, Shift+Tab to step up through the active protocol's levels
+  for the running session only. It saves nothing and switching sessions
+  restores the previous setting. Use `/effort high` to select directly or
+  `--effort high` at launch. `/effort` choices persist, including selecting
+  the current CLI level, unless the endpoint is a temporary CLI override. In that case the saved
   endpoint keeps its own effort setting. `/effort default` removes the setting
   in that same scope; `--effort default` clears it for the run when the file
   already sets it.
@@ -797,15 +798,19 @@ gateways (OpenRouter and similar), and private proxies.
 ## Connecting and disconnecting providers
 
 Run `openmax --login` from a terminal, or `/login` inside a session. Choose a
-provider with the arrow keys, type to filter, and press Enter. Esc cancels
-a setup prompt before its changes are saved. The choices are:
+provider with the arrow keys, type to filter, and press Enter. An answer setup
+cannot use (a connection name, URL, key, model ID or context window) is asked
+for again with the reason. If model discovery rejects access with HTTP 401
+or 403, setup asks for the key again without losing earlier answers. Esc
+cancels a setup prompt before its changes are saved. The choices are:
 
 - **OpenAI: ChatGPT plan:** browser sign-in using the account's plan. The
   command target is `chatgpt`; the default saved connection is `chatgpt-main`.
 - **OpenAI API:** an API key with separate API billing. Target `openai`.
 - **Anthropic API:** an API key with separate API billing. Target `anthropic`.
 - **Other compatible API:** an HTTPS API URL and a Bearer API key. Target
-  `custom`. Plain HTTP is accepted only for a server on loopback.
+  `custom`. Plain HTTP is accepted only for a server on loopback, and a
+  server on loopback may take no key: leave the key empty and none is saved.
 - Existing named connections, for updating their API key or selected model.
 
 For example, `openmax --login anthropic` skips the provider menu. Keys are
@@ -820,7 +825,8 @@ API setup loads the endpoint's model catalog and lets you choose an exact
 model. OpenAI setup omits known dedicated embedding, image, speech, realtime,
 and moderation model families; other providers retain their own catalogs.
 When the API does not report its context window, enter the value from
-the model's documentation. For a Chat Completions connection setup writes
+the model's documentation, as tokens or with a k or m suffix (`128k` is
+128,000). For a Chat Completions connection setup writes
 no `max_tokens`, so the model runs at the reply limit settings.json gives
 (4096 by default), unless the catalog reports an output maximum under that
 limit, which it saves as the model's limit. For a Responses or native Messages connection, when the
@@ -834,9 +840,12 @@ never replaces a `max_tokens` the entry already has. An endpoint without a
 model-list route can be configured with an exact model ID; setup reports
 that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.
-Run login again to add another. Choose the connection with `/model` afterward,
-or use the printed `openmax --provider ... --model ...` command. Login does not
-silently change the default provider or project trust.
+Run login again to add another. When `settings.json` has no `provider` or
+`base_url`, API login from the shell makes the model you chose the default.
+With an endpoint already selected, login leaves it selected. Choose the new
+connection with `/model` or use the printed `openmax --provider ... --model ...`
+command. After browser sign-in, select a model with `/model`. Login never
+changes project trust.
 
 New Anthropic preset connections use the native Messages API, including
 streaming, tools, usage accounting, and effort controls. Existing compatibility
