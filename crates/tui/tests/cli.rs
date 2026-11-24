@@ -4438,36 +4438,42 @@ fn a_sub_agent_runs_in_its_projects_approval_mode_or_a_stricter_one() {
     }
 }
 
-/// A sub-agent held to a stricter mode saved for `.worktrees` than its
-/// project's auto declines its write and exits 3, and its line names the
-/// directory whose saved mode governs it, not the project: selecting auto
-/// there as printed lets the next sub-agent write.
+/// A sub-agent held to `ask` saved for `.worktrees` declines its write and
+/// exits 3, and its line names the directory whose saved mode governs it,
+/// beside the project when the project is in `ask` too: selecting auto as
+/// printed lets the next sub-agent write, whatever the project's mode was.
 #[test]
 fn a_sub_agent_declined_under_a_stricter_worktrees_mode_names_where_it_is_saved() {
-    let (project, home) = sub_agent_repo("sub-agent-declined");
-    let write = || (sse_tool_call("write_file", serde_json::json!({"path": "notes.txt", "content": "edited\n"})), true);
-    let (base_url, _requests, _server) =
-        spawn_scripted_server(vec![write(), (sse_text("not written"), true), write(), (sse_text("written"), true)]);
-    write_settings_with_mode(&home, &base_url, "auto");
-    let root = std::fs::canonicalize(&project).unwrap();
-    let modes = serde_json::json!({ root.display().to_string(): "auto", root.join(".worktrees").display().to_string(): "ask" });
-    let store = serde_json::json!({ "version": 1, "projects": [root.display().to_string()], "approval_modes": modes });
-    std::fs::write(home.join(".openmax/trust.json"), store.to_string()).unwrap();
-    let sub_agent = || {
-        let child = cmd(&project, &home).envs(SUB_AGENT_GIT).args(["--subagent", "edit the notes", "--worktree"])
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let out = finish_with_deadline(child);
-        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
-    };
-    let (code, stderr) = sub_agent();
-    assert_eq!(code, Some(3), "{stderr}");
-    let named = format!("select auto once for {}, whose saved mode governs this run: (mkdir -p ", root.join(".worktrees").display());
-    assert!(stderr.contains(&named), "{stderr}");
-    run_printed_fix(&project, &home, &stderr, "whose saved mode governs this run: ");
-    let (code, stderr) = sub_agent();
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains("openmax: the sub-agent's changes are on branch subagent/"), "{stderr}");
-    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    for project_mode in ["auto", "ask"] {
+        let (project, home) = sub_agent_repo(&format!("sub-agent-declined-{project_mode}"));
+        let write = || (sse_tool_call("write_file", serde_json::json!({"path": "notes.txt", "content": "edited\n"})), true);
+        let (base_url, _requests, _server) =
+            spawn_scripted_server(vec![write(), (sse_text("not written"), true), write(), (sse_text("written"), true)]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let root = std::fs::canonicalize(&project).unwrap();
+        let worktrees = root.join(".worktrees");
+        let modes = serde_json::json!({ root.display().to_string(): project_mode, worktrees.display().to_string(): "ask" });
+        let store = serde_json::json!({ "version": 1, "projects": [root.display().to_string()], "approval_modes": modes });
+        std::fs::write(home.join(".openmax/trust.json"), store.to_string()).unwrap();
+        let sub_agent = || {
+            let child = cmd(&project, &home).envs(SUB_AGENT_GIT).args(["--subagent", "edit the notes", "--worktree"])
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let out = finish_with_deadline(child);
+            (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let (code, stderr) = sub_agent();
+        assert_eq!(code, Some(3), "{project_mode}: {stderr}");
+        let named = match project_mode {
+            "auto" => format!("select auto once for {}, whose saved mode governs this run, from this directory: (mkdir -p ", worktrees.display()),
+            _ => format!("select auto once for {} and {}, whose saved mode governs this run, from this directory: echo ", root.display(), worktrees.display()),
+        };
+        assert!(stderr.contains(&named), "{project_mode}: {stderr}");
+        run_printed_fix(&project, &home, &stderr, "from this directory: ");
+        let (code, stderr) = sub_agent();
+        assert_eq!(code, Some(0), "{project_mode}: {stderr}");
+        assert!(stderr.contains("openmax: the sub-agent's changes are on branch subagent/"), "{project_mode}: {stderr}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
 }
 
 /// A child that detaches HEAD in its worktree, or switches to a branch of

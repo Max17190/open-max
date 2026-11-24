@@ -168,8 +168,8 @@ echo '{"cmd":"approval_mode","mode":"auto"}' | openmax --stdio
 ```
 
 A sub-agent held to a stricter mode saved inside the project, such as `ask`
-for `.worktrees` under a project in `auto`, names that directory and the
-command that selects `auto` there instead. A `--second-look` session that
+saved for `.worktrees`, names that directory too, and its command selects
+`auto` there as well as in the project when the project is in `ask`. A `--second-look` session that
 declines a request ends the run with exit 3 too.
 
 A request for an agent-written tool no human has approved names its

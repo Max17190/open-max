@@ -128,10 +128,7 @@ async fn run_session(
     let Some(opened) = crate::until_stopped(args.quit.notified(), &mut stop_by, setup).await else {
         return crate::quit_status();
     };
-    let session_id = match opened {
-        Ok(session_id) => session_id,
-        Err(code) => return code,
-    };
+    let session_id = match opened { Ok(session_id) => session_id, Err(code) => return code };
 
     // A signal that landed while the session opened leaves no turn to run.
     let code = if stop_by.is_some() {
@@ -220,10 +217,7 @@ async fn run_prompts(
         // A turn started under a signal is stopped by `run_turn_events`.
         match crate::until_stopped(args.quit.notified(), stop_by, start).await {
             Some(Ok(())) => {}
-            Some(Err(e)) => {
-                eprintln!("openmax: {e}");
-                return 1;
-            }
+            Some(Err(e)) => { eprintln!("openmax: {e}"); return 1 }
             None => return crate::quit_status(),
         }
 
@@ -497,15 +491,21 @@ fn approve_hint(source_path: &str, source_sha: &str) -> String {
 }
 
 /// How to allow what a print run in ask declined with no terminal session: save auto (a mode only a human
-/// selects) here, or, for a sub-agent held to a stricter mode saved inside the project, on the highest
-/// trusted directory above its `project` still in ask, which a sub-agent's next worktree is made under.
+/// selects) here, and, for a sub-agent held to a stricter mode saved inside the project, on the directory
+/// whose saved choice governs its `project`, which a sub-agent's next worktree is made under.
 fn select_auto(core: &Core, project: &Path) -> String {
     let ask = |dir: &Path| core.approval_mode(dir) == open_max_core::config::ApprovalMode::Ask && open_max_core::trust::is_trusted(&core.data_dir, dir) == Ok(true);
-    let (cmd, here) = ("echo '{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}' | openmax --stdio", std::env::current_dir().ok().filter(|here| !ask(here)));
-    let saved = here.and_then(|_| open_max_core::state::canonical_root(project).ancestors().take_while(|dir| ask(dir)).last().map(Path::to_path_buf));
-    let fix = saved.map_or(format!("from this directory: {cmd}"), |dir| format!("for {}, whose saved mode governs this run: (mkdir -p {q} && cd {q} && {cmd})",
-        dir.display(), q = open_max_core::doctor::shell_quote(&dir)));
-    format!("this run's approval mode is ask, and a print run cannot ask. To let unattended runs do this work, select auto once {fix}")
+    let here = open_max_core::state::canonical_root(&std::env::current_dir().unwrap_or_default());
+    let store: serde_json::Value = std::fs::read(core.data_dir.join("trust.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let inner = open_max_core::state::canonical_root(project).ancestors().take_while(|dir| *dir != here)
+        .find(|dir| store["approval_modes"].get(dir.to_string_lossy().as_ref()).is_some()).filter(|dir| ask(dir)).map(Path::to_path_buf);
+    let dirs: Vec<PathBuf> = (ask(&here) || inner.is_none()).then(|| here.clone()).into_iter().chain(inner).collect();
+    let cmd = "echo '{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}' | openmax --stdio";
+    let cmds = dirs.iter().map(|dir| match *dir == here { true => cmd.to_string(),
+        false => format!("(mkdir -p {q} && cd {q} && {cmd})", q = open_max_core::doctor::shell_quote(dir)) }).collect::<Vec<_>>().join(" && ");
+    let named = match dirs[..] { [ref only] if *only == here => String::new(),
+        _ => format!(" for {}, whose saved mode governs this run,", dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(" and ")) };
+    format!("this run's approval mode is ask, and a print run cannot ask. To let unattended runs do this work, select auto once{named} from this directory: {cmds}")
 }
 
 /// What a person reads when a turn stops at its iteration cap: the cap it
