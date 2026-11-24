@@ -2244,6 +2244,7 @@ fn a_refused_reply_limit_gets_one_retry_at_the_reserve() {
     let cut = stream(&sse(&[serde_json::json!({"choices":[{"delta":{"reasoning_content":"half a thought"},"finish_reason":"length"}]})]));
     let too_large = refusal("400 Bad Request", "input plus max_tokens exceeds the window");
     let still_invalid = refusal("422 Unprocessable Entity", "request still invalid");
+    let thought_requires_text = refusal("422 Unprocessable Entity", "content items of type 'thinking' must be followed by content items of type 'text'");
     let invalid = "backend returned 400 Bad Request: invalid request field";
     for (name, max_tokens, script, expected, error) in [
         ("400", 8192, vec![too_large.clone(), ok.clone()], &[8192, 4096][..], None),
@@ -2252,7 +2253,7 @@ fn a_refused_reply_limit_gets_one_retry_at_the_reserve() {
         ("both fail", 8192, vec![refusal("400 Bad Request", "invalid request field"), still_invalid.clone(), ok.clone()], &[8192, 4096], Some(invalid)),
         ("already at reserve", 4096, vec![refusal("400 Bad Request", "invalid request field"), ok.clone()], &[4096], Some(invalid)),
         ("raised", 4096, vec![cut.clone(), cut.clone(), too_large.clone(), ok.clone()], &[4096, 4096, 8192, 4096], None),
-        ("repair then continue at reserve", 8192, vec![cut.clone(), too_large, still_invalid, cut, ok], &[8192, 8192, 4096, 4096, 4096], None),
+        ("repair then continue at reserve", 8192, vec![cut.clone(), too_large, thought_requires_text, cut, ok], &[8192, 8192, 4096, 4096, 4096], None),
     ] {
         let (project, home) = fresh_dirs("reserve-retry");
         let (base_url, requests, _server) = spawn_http_script(script);

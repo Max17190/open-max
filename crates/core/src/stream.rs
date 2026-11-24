@@ -27,6 +27,7 @@ pub(crate) struct TokenBatcher {
     /// Wakes the stale flusher when a batch starts buffering.
     buffering: Option<tokio::sync::mpsc::Sender<()>>,
     /// What replies the client asked for again cost, for the caller to charge.
+    pub(crate) thought_refused: bool,
     pub(crate) resent: Vec<crate::client::Usage>,
 }
 
@@ -39,6 +40,7 @@ impl TokenBatcher {
             thinking: String::new(),
             last_flush: tokio::time::Instant::now(),
             buffering: None,
+            thought_refused: false,
             resent: Vec::new(),
         }
     }
@@ -48,6 +50,7 @@ impl TokenBatcher {
         match delta {
             StreamDelta::Content(t) => self.content.push_str(&t),
             StreamDelta::Reasoning(t) => self.thinking.push_str(&t),
+            StreamDelta::ThoughtRepresentationRefused => { self.thought_refused = true; return; }
             StreamDelta::Usage(usage) => return self.resent.push(usage),
             // Flush first so the wire keeps the order the client saw: the
             // reasoning already streamed, then the notice that it is void.

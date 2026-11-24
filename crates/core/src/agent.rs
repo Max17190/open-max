@@ -455,35 +455,22 @@ async fn run_compact(
                 .into(),
         );
     }
-    if tokens_before <= cut_target(trigger, keep, schema_tokens, guard.messages(), &estimate) {
-        // Nothing above the target: say so through the same receipt rather
-        // than pruning history that already fits.
-        guard.commit().await;
-        return Ok(CompactReceipt {
-            tokens_before: to_real(tokens_before, factor),
-            tokens_after: to_real(tokens_before, factor),
-            compacted_messages: 0,
-            context_tokens: endpoint.context_tokens,
-        });
-    }
-    let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-    let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor, keep };
-    let mut spend = RequestSpend::new(settings.max_agent_tokens);
-    let compacted_messages = match compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, true, &mut spend).await {
-        Ok(count) => count,
-        Err(reason) => {
-            guard.commit().await;
-            return Err(reason);
-        }
+    let should_cut = tokens_before > cut_target(trigger, keep, schema_tokens, guard.messages(), &estimate);
+    let compacted_messages = if should_cut {
+        let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
+        let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor, keep };
+        compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, true, &mut RequestSpend::new(settings.max_agent_tokens)).await
+    } else {
+        Ok(0)
     };
     let tokens_after =
         schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>();
-    sessions::touch(core, session_id);
+    if should_cut && compacted_messages.is_ok() { sessions::touch(core, session_id); }
     guard.commit().await;
     Ok(CompactReceipt {
         tokens_before: to_real(tokens_before, factor),
         tokens_after: to_real(tokens_after, factor),
-        compacted_messages,
+        compacted_messages: compacted_messages?,
         context_tokens: endpoint.context_tokens,
     })
 }
@@ -808,33 +795,44 @@ async fn run_loop(
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
         let roomy = room.take();
-        let limit = if at_reserve || reserve_only { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, raise))) };
+        let mut limit = if at_reserve || reserve_only { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, raise))) };
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
-        let batcher_in = batcher.clone();
+        let messages = guard.messages().as_slice();
+        let stream = |limit| {
+            let batcher = batcher.clone();
+            client.stream_chat(messages, limit, &schemas_wire, cancelled.clone(), move |delta| batcher.lock().unwrap().push(delta))
+        };
         let flusher = spawn_stale_flusher(&batcher);
-        let result = client
-            .stream_chat(guard.messages(), limit, &schemas_wire, cancelled.clone(), move |delta| {
-                batcher_in.lock().unwrap().push(delta);
-            })
-            .await;
+        let mut result = stream(limit).await;
+        let retry = result.as_ref().err().filter(|_| limit == endpoint.reply_reserve)
+            .and_then(|message| crate::compaction::counted_reply_room(message, limit, endpoint.chatgpt.is_none()));
+        let charge_resends = |spend: &mut RequestSpend| {
+            for usage in std::mem::take(&mut batcher.lock().unwrap().resent) { spend.charge(core, session_id, usage); }
+        };
+        charge_resends(&mut spend);
+        let admitted = retry.is_none_or(|(input, _)| spend.admits(input));
+        if let Some((_, smaller)) = retry.filter(|_| admitted) {
+            limit = smaller;
+            result = stream(limit).await;
+            charge_resends(&mut spend);
+        }
         flusher.abort();
         batcher.lock().unwrap().flush();
-        // A reply the client asked for again was paid for, however this request ended.
-        for usage in std::mem::take(&mut batcher.lock().unwrap().resent) { spend.charge(core, session_id, usage); }
 
-        // Learned from turn requests only: the compaction summary is another
-        // shape (no tool schemas, a different prompt) and would teach a ratio
-        // no turn request has. A failed request keeps a stronger refusal floor
-        // or an earlier ratio that tightens the window: it cannot relax it.
+        let counted = retry.and_then(|(input, _)| crate::compaction::counted_prompt_ratio(used, input, factor));
         let next_ratio = match &result {
-            Ok(result) => updated_prompt_ratio(prompt_ratio, result, used),
-            Err(message) => refusal_ratio(message, used, context_tokens.saturating_sub(limit), factor).or(prompt_ratio.filter(|&ratio| ratio >= 1.0)),
+            Ok(result) => updated_prompt_ratio(counted.or(prompt_ratio), result, used),
+            Err(message) => counted.or_else(|| refusal_ratio(message, used, context_tokens.saturating_sub(limit), factor)).or(prompt_ratio.filter(|&ratio| ratio >= 1.0)),
         };
         if next_ratio != prompt_ratio {
             prompt_ratio = next_ratio;
             if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
                 data.prompt_ratio = next_ratio.map(|ratio| (ratio_origin.clone(), ratio));
             }
+        }
+        if !admitted {
+            stop_reason = "budget_exhausted".into();
+            break 'turns;
         }
         let result = match result {
             Ok(r) => { reserve_only |= limit == endpoint.reply_reserve && reserve_refusal.is_some(); (image_refusal, at_reserve, reserve_refusal) = (None, false, None); r }
@@ -849,9 +847,9 @@ async fn run_loop(
                         if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
                         (no_room, raise) = (true, 0); continue 'turns;
                     }
-                    // Withhold reasoning sent alone and replace newly sent images with text after a refusal.
+                    // Only an explicit representation error authorizes withholding a saved thought.
                     let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
-                    let lone = matches!(status, Some(400 | 422)) && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0;
+                    let lone = batcher.lock().unwrap().thought_refused && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0;
                     let images = status.is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && drop_new_images(guard.messages(), &message);
                     if lone || images {
                         // A failed rewrite leaves the file stale, so the next save writes it whole.
@@ -882,7 +880,7 @@ async fn run_loop(
         refresh_approval_policy_canonical(core, session_id, project_root, &canonical_root, &mut policy_mode, &mut hooks, &mut permissions, guard.messages()).await;
         // Charged in the units admission used, so a reply without usage pays
         // the calibrated estimate rather than a raw one that undercounts it.
-        spend.record(core, session_id, used_real, &result);
+        spend.record(core, session_id, retry.map_or(used_real, |(input, _)| input), &result);
 
         // Only the API tool_calls field carries executable calls.
         let mut content = result.content.clone();

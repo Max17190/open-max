@@ -352,6 +352,7 @@ pub enum StreamDelta {
     /// What the server reported for an attempt about to be sent again: paid
     /// for, so the caller charges it, but never the size of this reply.
     Usage(Usage),
+    ThoughtRepresentationRefused,
 }
 
 /// `finish_reason` for a stream the server never terminated: no `[DONE]` line
@@ -921,6 +922,13 @@ impl ChatClient {
                 let message = if self.wire_api == crate::providers::WireApi::Responses {
                     responses::http_failure(&text, request_id.as_deref())
                 } else { describe_backend(&text) };
+                if matches!(code, 400 | 422) && (thought_requires_text(&message)
+                    || serde_json::from_str::<Value>(&text).ok().is_some_and(|body| body["error"]["metadata"]["raw"].as_str().is_some_and(thought_requires_text))) {
+                    let origin = self.origin();
+                    if messages.iter().any(|m| m.reasoning_origin.as_deref() == Some(&origin) && blank_on_wire(m, false) && !blank_on_wire(m, true)) {
+                        on_delta(StreamDelta::ThoughtRepresentationRefused);
+                    }
+                }
                 let mut err = format!("backend returned {status}: {message}");
                 if let Some(hint) = temperature_hint(self.temperature, &message) {
                     err.push_str(&hint);
@@ -1686,15 +1694,14 @@ fn through_proxy(url: &reqwest::Url) -> bool {
 /// OpenAI-compatible servers wrap failures in `{"error": {"message": ...}}`.
 /// Show that message; fall back to the raw body for servers that do not.
 fn describe_backend(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.get("message").or(Some(e)))
-                .and_then(|m| m.as_str().map(str::to_string))
-        })
-        .map(|m| truncate(&m, 600))
-        .unwrap_or_else(|| truncate(body, 600))
+    let parsed = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let error = &parsed["error"];
+    let message = error.get("message").unwrap_or(error).as_str();
+    truncate(message.unwrap_or(body), 600)
+}
+
+fn thought_requires_text(message: &str) -> bool {
+    message.contains("content items of type 'thinking' must be followed by content items of type 'text'")
 }
 
 /// What to do when a server refuses the temperature it was sent. Versions
@@ -1941,8 +1948,8 @@ pub(crate) mod tests {
 
     #[test]
     fn backend_errors_surface_the_message_not_the_envelope() {
-        let body = r#"{"error":{"message":"model \"qwen\" not found","type":"not_found"}}"#;
-        assert_eq!(describe_backend(body), "model \"qwen\" not found");
+        let body = r#"{"error":{"message":"model \"fixture-model\" not found","type":"not_found"}}"#;
+        assert_eq!(describe_backend(body), "model \"fixture-model\" not found");
         // Servers that answer with plain text or HTML still show something.
         assert_eq!(describe_backend("upstream timeout"), "upstream timeout");
         assert_eq!(describe_backend(""), "");
@@ -2719,6 +2726,7 @@ pub(crate) mod tests {
                     StreamDelta::Reasoning(t) => format!("reasoning:{t}"),
                     StreamDelta::Retry { attempt, max_attempts, reason } => format!("retry:{attempt}/{max_attempts}:{reason}"),
                     StreamDelta::Usage(usage) => format!("usage:{}", usage.completion_tokens),
+                    StreamDelta::ThoughtRepresentationRefused => "thought refused".into(),
                 })
             })
             .await;
