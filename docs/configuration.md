@@ -155,6 +155,7 @@ and the run that writes a key already uses it.
   small model's requests fail for length), so a turn refuses with a message
   naming this field until it is set. Set it to what the server actually
   serves for the model. `openmax --check` warns while it is missing.
+
 - `max_tokens` (default 4096): the reply's length limit, clamped so it never
   eats the window (at most `context_tokens - 2048`). A request asks for the
   room its prompt leaves, never less than the reply reserve and never more
@@ -164,7 +165,9 @@ and the run that writes a key already uses it.
   `length`, or a usage count at the limit), the last tool call of that
   reply, the one the limit cut, never runs, even when the server closed its
   arguments so they parse, and the model is told why; the calls before it
-  run as usual, once. At the default limit the next request alone then
+  run as usual, once.
+
+  At the default limit the next request alone then
   carries room, four times the limit (16384) within the ceiling (below) and
   what the window leaves,
   and the model is asked to send the call again whole; the limit returns
@@ -179,14 +182,16 @@ and the run that writes a key already uses it.
   in a row ends the turn with `length`. A server that refuses the room
   (HTTP 400 or 422) gets the request again at the usual limit and no more
   room in that turn. A cut thought gets no room of its own, and its raised
-  limit is the plain doubling. The ceiling is the most any request asks
-  for: the model entry's `max_tokens`, which is the model's longest reply,
-  so declaring it keeps the default limit as each request's first ask; a
-  `max_tokens` other than 4096 in settings.json is both the limit and a
-  ceiling (within the entry's); with neither, the ceiling is four times the
-  default (16384). A limit at its ceiling asks for no room, and a cut call is
-  asked for in parts. A
-  reasoning model's reasoning counts toward the limit, so at 4096 a reply
+  limit is the plain doubling.
+
+  The ceiling is the most any request asks for: the model entry's
+  `max_tokens`, which is the model's longest reply. Declaring it keeps the
+  default limit as each request's first ask. A `max_tokens` other than 4096 in
+  settings.json is both the limit and a ceiling (within the entry's). With
+  neither, the ceiling is four times the default (16384). A limit at its
+  ceiling asks for no room, and a cut call is asked for in parts.
+
+  A reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
   before any tool call does not end the turn: it stays in the transcript
   (its reasoning too, which goes back only to the endpoint that wrote it),
@@ -201,7 +206,9 @@ and the run that writes a key already uses it.
   either thinking that is not shown or such a call. A server can refuse a request that carries a reply
   holding reasoning and nothing else (HTTP 400 or 422): that reasoning then
   stops going back, in this session and after a resume, and the request is
-  sent once more without it. From the second reply in a row cut before any
+  sent once more without it.
+
+  From the second reply in a row cut before any
   tool call, the limit doubles for each further one, up to the ceiling, and
   the note names the next limit; the first reply it does not cut returns it
   to its start. So a model that must think longer than the limit is not
@@ -216,9 +223,12 @@ and the run that writes a key already uses it.
   be continued from where it stopped. On a Responses connection a reply the
   server reports incomplete at its output limit is continued the same way;
   a call in it is not kept.
+
   For a reasoning model the limit is also a bound on how long it thinks
   in one reply before it acts; the room after a cut call or text can be
-  spent on thinking too, for that one request. Setup leaves it at the default for a Chat Completions
+  spent on thinking too, for that one request.
+
+  Setup leaves it at the default for a Chat Completions
   connection unless the catalog reports a lower output maximum, which it
   saves; for a Responses or native Messages connection it still writes the
   catalog's output maximum when one is reported, and `openmax --check`
@@ -231,6 +241,7 @@ and the run that writes a key already uses it.
   the model's entry: every settings save writes 4096 to settings.json when
   the limit is unset. `openmax --check --all` states the active model's
   limit and where it is set.
+
 - `compaction_tokens` sets a soft input ceiling for automatic compaction. Open
   Max uses the explicit value in `settings.json` first, then the selected
   model's value in `providers.json`, then a default of four fifths of the
@@ -244,18 +255,21 @@ and the run that writes a key already uses it.
   request while no cut fires. To keep more or less
   history on a model, set the cap in that model's entry and leave the
   global setting unset.
+
 - `compaction_keep_tokens` (default unset) sets the most an automatic cut or
   `/compact` keeps of the newest exchanges, its context note included. Unset
   keeps 20,000 tokens. The value is floored at 4,000 and calibrated like
   `compaction_tokens`, and a cut still keeps at most a quarter of its trigger.
   A smaller value makes the requests after a cut cheaper and leaves the model
   less of its recent work to continue from.
+
 - `temperature` (default unset): sent only when set, so otherwise the
   server's own default applies. Leave it unset for OpenAI reasoning models,
   which reject any value but 1. Server defaults differ: Ollama's
   OpenAI-compatible endpoint uses 1.0, not the Modelfile's value. Earlier
   versions wrote `"temperature": 0.2` on every settings save; if you never
   chose it, delete the key.
+
 - `reasoning_effort` (default unset): an explicit requested level: `none`,
   `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Use `/effort` for a
   keyboard picker, Shift+Tab to cycle the active protocol's levels,
@@ -264,7 +278,9 @@ and the run that writes a key already uses it.
   unless the endpoint is a temporary CLI override. In that case the saved
   endpoint keeps its own effort setting. `/effort default` removes the setting
   in that same scope; `--effort default` clears it for the run when the file
-  already sets it. Default omits the wire field,
+  already sets it.
+
+  Default omits the wire field,
   unlike explicit `none`. Responses sends `reasoning.effort`; Chat Completions
   sends `reasoning_effort`. Native Anthropic Messages sends
   `output_config.effort` and offers `low`, `medium`, `high`, `xhigh`, and `max`
@@ -279,7 +295,9 @@ and the run that writes a key already uses it.
   the server validates explicit selections. A rejection is reported without
   retrying at another level. Sampling and protocol settings are unchanged.
   The Anthropic compatibility endpoint ignores effort, so explicit selections
-  there are refused before saving or sending. Responses and native Messages
+  there are refused before saving or sending.
+
+  Responses and native Messages
   render that field ahead of the conversation, so changing it mid-session
   makes the whole history a prompt cache miss once. Where the model takes an
   effort change inside the conversation (GPT-6 and later over Responses, not
@@ -295,13 +313,16 @@ and the run that writes a key already uses it.
   never sent again. A return to Default, which no such change can name,
   sends the field as before. See the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
   and [compatibility documentation](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk).
+
 - `max_output_bytes` (default 16384 with no known window, floor 1000): per
   tool-result cap. Unset, it follows the model's window: three eighths of a
   byte per token of `context_tokens`, between 16384 and 49152, so 16384 up
   to a window of about 43,700 tokens and 49152 from 131,072 tokens up. A
   value set here is the cap at any window, past 49152 too. `read_file`
   returns up to this cap held between 24,000 and 49152 bytes, and ends a
-  read it cuts with the offset to continue from. A result that fits the
+  read it cuts with the offset to continue from.
+
+  A result that fits the
   cap is sent whole. One over it spills up to 16 MiB of each
   stream to a log in `~/.openmax/cmd-logs` that the result names, and is
   sent as a preview a quarter of the cap's size when the log holds all the
@@ -309,7 +330,9 @@ and the run that writes a key already uses it.
   a quarter of each stream's share from its start and the rest from its
   end, and marks the cut with the bytes it dropped. Every later request
   re-sends a result, and the next call after a flood narrows it, so the
-  preview is sized to steer that call. Before any of that, bash keeps only
+  preview is sized to steer that call.
+
+  Before any of that, bash keeps only
   the final text of a line redrawn with carriage returns
   (a progress bar): text that follows a `\r` on the same line replaces the
   whole line so far, so only its final text counts against the cap and
@@ -322,6 +345,7 @@ and the run that writes a key already uses it.
   frame starts after it instead of running on from their last byte. A file
   with lone-`\r` line endings printed through bash shows only its last
   record the same way; `tr '\r' '\n' < file` shows every record.
+
 - `image_input` (unset: on for a model whose providers.json entry declares
   `"image_input": true`, off otherwise; `true` or `false` overrides the
   entry): `read_file` on a PNG, JPEG, GIF or WebP
@@ -332,7 +356,9 @@ and the run that writes a key already uses it.
   is handed a fresh folder in `OPENMAX_IMAGE_DIR`, and each image file it
   leaves there, in name order, is sent with that call's result, with no file
   for the model to read back. The MCP bridge puts a server's image results
-  there. Both paths share one step: the type comes from the file's first
+  there.
+
+  Both paths share one step: the type comes from the file's first
   bytes, the size from its header, and one call shows at most 8 images and
   5 MiB of them in all, counted before base64. An image left out (over that
   budget, past the eighth, not an image, or with no size in its header) gets
@@ -340,6 +366,7 @@ and the run that writes a key already uses it.
   toward the context estimate as one token per 750 pixels of its header size,
   which nothing resizes, so a provider that scales it down costs less. Set it only for a model that takes images: one that does not
   refuses the request. Off, no request changes.
+
 - `max_agent_iterations` (default 300): tool-call rounds one turn may take.
   A turn that reaches it stops and says so; a follow-up message (or
   `openmax --continue -p "<follow-up>"`) carries on from there. Settings are
@@ -347,6 +374,7 @@ and the run that writes a key already uses it.
   `--max-agent-iterations` and `--max-agent-tokens` set either cap for one
   `-p`, `--stdio` or `--subagent` run without writing it here (see
   [usage](usage.md#command-line)).
+
 - `stuck_command_secs` (unset: off; 0 is off; held to at least 30): on
   Linux, a bash call whose processes have used no CPU and read or written
   no bytes for this many seconds is stopped before its timeout, and the
@@ -372,8 +400,9 @@ tokens. So the limit each request carries and the room held back from the
 input budget are two numbers: set to a model's longest reply, `max_tokens`
 no longer holds that much input back, and a model whose longest reply is as
 large as its window keeps seven eighths of it for input instead of about a
-thousand tokens. A reply that reaches the limit its request carried is cut
-as at any limit. If a request carries a limit above the reserve and the
+thousand tokens. A reply that reaches the limit its request carried is cut as at any limit.
+
+If a request carries a limit above the reserve and the
 server returns HTTP 400 or 422, Open Max tries once more at the reserve,
 regardless of the error text. A refusal that names a length problem can
 trigger the same retry with another status. A request that carried room
@@ -385,6 +414,7 @@ requests in the same turn stay there. If recovery from a status-only refusal
 fails, Open Max reports the original error. A status alone does not change
 the input estimate. The subscription route sends no reply limit and does
 not use these limit retries.
+
 Open Max estimates the input at about four bytes per token and scales the
 estimate up when the server reports more prompt tokens than estimated or
 refuses a request for length that the estimate said fit.
@@ -416,7 +446,9 @@ prompt and the newest exchanges in a quarter of the trigger, at most 20,000
 tokens or `compaction_keep_tokens`, and never aims past the input budget,
 even where the frozen schemas and the opening crowd it. It removes everything
 between, and never shortens a kept message, so between cuts the history stays
-byte-stable and the server can reuse its prompt cache. Before the cut, the
+byte-stable and the server can reuse its prompt cache.
+
+Before the cut, the
 session's own model writes the notes it will continue from: one extra
 request whose prompt is the conversation up to the cut, as earlier requests
 already sent it, with the same tools and `tool_choice` set to `none`, plus one
@@ -427,12 +459,15 @@ no text that ended on its own and made no call gives its reasoning as the
 notes, since some models write them there. Notes over the cap end at their
 last whole line, and notes the reply limit cut end with a line that says so.
 A call in that reply never runs, and nothing else of the exchange is kept.
+
 The notes request has no overall deadline, as no request does: only a
 connection that falls silent ends it. When no notes come back (an error, an
 empty reply, a call, a silent connection, or a request `max_agent_tokens`
 refuses), the cut is made anyway, as a cut the window forces or a `/compact`
 is, and its note lists the tools used, the files touched and the earlier goals
-instead. Only a cancelled turn makes no cut it was not forced to. Everything a cut removes is appended verbatim to
+instead. Only a cancelled turn makes no cut it was not forced to.
+
+Everything a cut removes is appended verbatim to
 `~/.openmax/sessions/<id>.archive.jsonl`, and the context note names that
 path, so compaction stays reversible: the notes are the bounded view, the
 archive is the lossless record. The `compaction` hook observes each cut.
@@ -445,7 +480,9 @@ unless you answer `a` (`ask`) or `r` (`readonly`) at the interactive trust
 prompt. `--trust-project` records `auto`, or the mode a `--permissions` beside
 it names. A project that is already trusted keeps its mode when trust is
 granted again, and a grant or mode selection that would leave `trust.json` as
-it is writes nothing. `/permissions` opens a picker; `/permissions
+it is writes nothing.
+
+`/permissions` opens a picker; `/permissions
 auto|ask|readonly` selects directly. The approval card also offers **Auto for
 project**. From a shell, `openmax --permissions auto|ask|readonly` selects for
 the project it runs in, and says what it saved or that the mode was already
@@ -453,14 +490,16 @@ saved. With `-p`, `--stdio` or `--subagent` the run goes on under the new mode;
 alone it ends once the mode is saved. It combines with the flags
 `--trust-project` does. In a project that is not trusted it saves nothing and
 names the grant to run, `--trust-project`, which records `auto`;
-`--trust-project --permissions ask` trusts it in `ask` in one run. Every
-selector saves the same choice. It survives new sessions and restarts,
+`--trust-project --permissions ask` trusts it in `ask` in one run.
+
+Every selector saves the same choice. It survives new sessions and restarts,
 including headless and stdio runs, and does not change other projects. The
 `settings.json` `approval_mode` (default `ask`) applies only where neither the
 project nor an enclosing one has a saved mode, such as a project trusted by an
 earlier version; select a mode there once to save one. Symlink aliases share
-the choice. A subdirectory of the project, including a worktree placed under it
-(such as `.worktrees/`) where a delegated `openmax -p` child starts, follows
+the choice.
+
+A subdirectory of the project, including a worktree placed under it (such as `.worktrees/`) where a delegated `openmax -p` child starts, follows
 the nearest enclosing project's choice unless it has a saved choice of its own.
 A `--subagent` child's worktree there runs in the project's choice or a
 stricter one, never a looser one (see [sub-agents](usage.md#sub-agents)).

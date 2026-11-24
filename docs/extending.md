@@ -369,8 +369,8 @@ inconclusive, not proof the tool is broken (a passing probe approves nothing,
 so a failing one condemns nothing). Plain `--check` runs no command; running
 examples is opt-in per invocation. Like the TUI, `-p`, `--stdio` and
 `--subagent`, it first stops the tools a killed openmax left running and
-removes that openmax's record of them (see [usage](usage.md#command-line)). Fuller
-regression suites stay agent-authored files - the example is the smallest
+removes that openmax's record of them (see [process records](execution.md#process-records)).
+Fuller regression suites stay agent-authored files - the example is the smallest
 honest proof that a freshly written tool actually runs.
 
 Running an approved example is running the tool: an unsandboxed host process

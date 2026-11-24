@@ -1,9 +1,14 @@
 # Usage
 
+## Run it
+
 ```sh
 cd ~/code/my-app
 openmax
 ```
+
+If you have not connected a model, start with [getting started](getting-started.md).
+For scripts and CI, see [unattended runs](unattended.md).
 
 On the first interactive run, inspect the project and answer the trust
 prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
@@ -12,17 +17,53 @@ from a shell; **Shift+Tab** cycles reasoning effort. See
 [configuration](configuration.md#project-trust) for headless and stdio
 trust.
 
-At a terminal, the first frame (the project path, an empty conversation and
-the prompt) is painted before Open Max reads trust, settings or the session,
-and the status line fills in the model and approval mode once they are read.
-The trust question, and a refusal to start (a trust or settings file that does
-not parse, a trust grant asked for from an agent session), then show on your
-shell, which the interface hands back for them.
+## Keys
 
-The interface uses your terminal's own foreground and background colors. The
-palette's gray (color 8) marks secondary text, selection, and every border
-except the focused prompt's and the approval card's. There is no color
-setting.
+| Input | Action |
+| --- | --- |
+| **Enter** | Send; while a turn runs, steer it: the message joins the turn as a user message before its next request, which carries it, or the next turn's first request when the turn ends first (during a compaction it queues for after); one a `user_prompt_submit` hook blocks comes back to the composer |
+| **/** | Slash commands · **Tab** or **Enter** completes |
+| **@** | Mention a project file |
+| Mouse drag | Select transcript or prompt text |
+| Double / triple click | Select the word under the pointer · the whole logical line |
+| **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
+| Click in the prompt | Put the cursor there in a wrapped draft |
+| Wheel | Scroll the conversation · over the prompt, a long draft |
+| **Shift+Tab** | Cycle requested reasoning effort; inside a picker, select the previous row |
+| **Esc** | Clear selection · close menu · cancel turn · return to composer |
+| **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
+
+## Slash commands
+
+| Slash command | Action |
+| --- | --- |
+| `/help` | Keybindings and commands |
+| `/model` | Search configured providers and select a model |
+| `/model <id>` | Set an exact model id on the active endpoint |
+| `/effort [level]` | Pick reasoning effort with arrow keys and Enter, or request an exact level for the next turn. `default` omits the setting; `none` is explicit. Model support varies |
+| `/copy` | Copy the latest assistant response |
+| `/provider [name]` | Pick a provider/model pair, or switch to a named provider |
+| `/login [provider]` | Connect a provider through browser sign-in or hidden API-key entry |
+| `/logout [provider]` | Disconnect a provider |
+| `/permissions [auto\|ask\|readonly]` | Pick or save this project's permission mode. New trust grants default to `auto`; explicit `ask` and `readonly` choices are preserved |
+| `/approvals auto\|ask\|readonly` | Alias for `/permissions` |
+| `/new` · `/resume` | Fresh session · pick an earlier one |
+| `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
+| `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
+| `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
+| `/compact` | Compact the context now instead of waiting for the budget to force it |
+| `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
+| `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
+| `/status` | Endpoint, cache, performance, privacy, and network details |
+| `/update` | Update to the latest release, then resume this session in it |
+| `/quit` | Exit |
+
+Turn `n` of `/rewind` is the `n`th prompt you sent that ran and stayed in
+the transcript, cut where it finished: a completion gate's refusal and
+other notes the harness writes during a turn stay in that turn. The full
+counting rule, including compaction and sessions saved by an earlier
+version, is in [the stdio protocol](stdio-protocol.md), whose `rewind`
+counts the same way.
 
 ## Command line
 
@@ -98,42 +139,6 @@ is a usage error (exit 2), and so is either flag on an interactive session.
 There is no ceiling in money: Open Max counts tokens and does not know their
 price.
 
-`openmax --mcp-list` and `openmax --mcp-call` are a one-shot MCP stdio
-client, used by the proxy tool an MCP server is adopted through; see
-[extending](extending.md#mcp-servers) and `openmax --spec mcp`.
-
-`openmax --check` prints the rows of each file that needs attention (`warn` or
-`err`) and of each hook, then one line counting, per surface, the files that
-loaded with nothing to report (and how many memories are not in the index).
-The report names files under the current directory relative to it, in each
-row's path and in the paths and repair commands it writes into a message
-(`openmax --approve '.openmax/tools/x.toml'`); text a message quotes, such as
-a manifest line in a parse error, prints as written.
-`openmax --check --all` prints every row.
-
-`--check` needs no trust, but no session runs in a project until it is
-trusted, so in an untrusted project the rows are graded in the settings
-default mode (ask when unset). When any row is a `warn` or `err` there, the
-report opens with one `warn trust` row that says so and names the command
-that trusts the project. A hook that is inert in ask, for one, loads without
-approval once `--trust-project` trusts the project in auto. The row never
-changes the exit code.
-
-`openmax --check --json` prints every finding as one JSON array of
-`{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),
-with absolute paths and the same exit code, so the agent can parse its own
-verification.
-
-`openmax --check --run-examples` adds one `example` surface row per declared
-`[example]`, in text and in JSON, and fails the check when one fails. It is
-the only `--check` mode that runs a command, so it needs a trusted project
-and follows the saved project mode. Like the TUI, `-p`, `--stdio` and
-`--subagent`, plain `--check` first stops the tools a killed openmax left
-running and removes that openmax's record of them (see the signals below). Auto runs valid examples
-without content approval; ask uses the documented approval and sandbox rules.
-It honors permission rules, `pre_tool_use` hooks, and `approval_mode` exactly
-as a turn does. See [extending](extending.md#proof-of-life).
-
 `--session <id>` continues that session instead of the latest one, in a
 session or with `-p` or `--stdio`, and implies `--continue`; it is a separate option because
 `--continue` takes no value, so a word after it stays prompt text. The id is
@@ -142,6 +147,10 @@ directory has, one of another project's sessions, and one whose transcript is
 missing or does not load are each refused with exit 2 and a line that says
 which; a session at a terminal says which and starts fresh instead. Trust,
 approvals and permissions are those of `--continue`.
+
+### Print mode
+
+Pass the task with `-p`, or pipe it into `openmax -p` with no prompt argument.
 
 A print prompt that starts with `-` parses as options, not text. Put it
 last, after `--`, which ends the options: `openmax -p -- '- list the files'`.
@@ -155,7 +164,9 @@ note the harness writes for the model (a `harness_note` event, such as the
 execution policy notice) stays in the transcript and is written to neither
 stream, so a parent agent reading a child run's stderr does not receive it.
 With `--json`, each `AgentEvent` is one JSON line on stdout, `harness_note`
-included. Mutating tools honor the project's approval mode, and a print run
+included.
+
+Mutating tools honor the project's approval mode, and a print run
 cannot ask, so it declines every approval request: unattended runs need
 `auto`, the mode a trust grant records unless you pick another. A turn that
 declined a request ends the run with exit 3, unless it failed (1) or stopped
@@ -197,23 +208,26 @@ included; silence for the provider's idle timeout ends the attempt (see
 response, or a stream that went silent before any reply text, is resent until
 the client's attempts are spent, so a server that takes requests and never
 answers holds the turn for about 80 minutes at the default interval, sooner
-with a lower `idle_timeout_secs`. Any other silence fails the turn after one
-interval: a stream that stops partway through a reply ends it as truncated,
-and a server that stalls while sending a reply as one JSON body is not
+with a lower `idle_timeout_secs`.
+
+Any other silence fails the turn after one interval: a stream that stops
+partway through a reply ends it as truncated, and a server that stalls while sending a reply as one JSON body is not
 resent. A connection that drops partway through a reply is asked for the
 whole reply again, at most twice in a row; nothing from the cut reply runs,
-and the fresh reply prints from the start of a new line. An address with nothing listening fails within seconds. A tool that
-runs past its own timeout is stopped and the turn goes on; a `bash` call is
-stopped after 120 seconds unless it sets `timeout_secs` (1 to 600; a wait
-named `timeout` is read the same way, and a call that names both gets the
-longer); a larger
-request is held to 600, and if that command times out, its result names the
-ceiling and the number requested. A caller that
-needs a deadline sets one, for example the `timeout_secs` of the bash call
-that runs a child `openmax -p`. A run stopped by a signal ends with that
-signal's status (a shell reports 128 plus its number); otherwise the exit
-code says how the run ended, and a turn that ends with any code but 0 skips
-the prompts after it.
+and the fresh reply prints from the start of a new line. An address with
+nothing listening fails within seconds.
+
+A tool that runs past its own timeout is stopped and the turn goes on. A
+`bash` call is stopped after 120 seconds unless it sets `timeout_secs` (1 to
+600; a wait named `timeout` is read the same way, and a call that names both gets the
+longer). A larger request is held to 600, and if that command times out, its
+result names the ceiling and the number requested. A caller that needs a
+deadline sets one, for example the `timeout_secs` of the bash call that runs
+a child `openmax -p`.
+
+A run stopped by a signal ends with that signal's status (a shell reports
+128 plus its number). Otherwise the exit code says how the run ended, and a
+turn that ends with any code but 0 skips the prompts after it.
 
 | Code | Meaning |
 | --- | --- |
@@ -229,117 +243,55 @@ refuses the turn's end while a check fails, and it returns one JSON result
 with the checks, the changes and the replay command.
 [Hold a run to your own checks](verified-execution.md) walks a caller through it.
 
-Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches
-openmax and not them. SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 to a
-print or stdio run cancels the running turn, which stops each tool's process
-group (SIGTERM, then SIGKILL), and exits 128 plus the signal number (130, 143,
-129, 131; for SIGUSR1 and SIGUSR2, 158 and 159 on macOS and 138 and 140 on
-Linux) once the turn has ended, waiting at most 3 seconds for it; a `turn_end`
-hook still running then is killed. A SIGQUIT therefore writes no core dump.
-Removing a new session that nothing was saved to takes its share of the same 3
-seconds: while another openmax process holds the session index past them, the
-session stays indexed and the run says so on stderr. Once they are used up, the
-run still takes up to 100 ms to check that the session is empty before it says
-so; a check that takes longer is reported as a session that may be empty. A
-signal while the run waits on that index to open its session or to start a turn
-ends it the same way. A second signal exits without waiting for the turn, with
-128 plus its own number, and kills the tools outright. Either exit first waits up
-to 250 ms for a tool command still being started, so one that starts within that
-wait is killed with the rest. Neither stops a process that leaves its tool's
-session (as `setsid` does), on macOS one that leaves its tool's group, or a tool
-command whose start outlasts that wait: it runs on after openmax has exited. On
-Linux a process that only moves to another group of its tool's session, as GNU
-`timeout` moves its command, is stopped with the rest. SIGKILL,
-or a crash that runs no handler, runs none of openmax's code, so its watcher
-stops its tools instead: each `bash` call, external tool and hook it started,
-with every process each started that is still in its group. A sub-agent's
-own git commands are not tools, and run on ([sub-agents](#sub-agents)). On
-macOS and Linux, once a run's record of its tool groups (below) is first
-written, the run starts `openmax --lifeline <record> <start>`: its own
-binary again (on Linux `/proc/self/exe`, the binary it runs; on macOS the
-file at its path), in a session of its own, whose stdin is the read
-end of a pipe the run alone holds the write end of (close-on-exec, so no tool
-inherits it). Its stdout and stderr are `/dev/null`, its environment is
-empty and its directory is `/`, and it is given the record's absolute path:
-a data directory that is relative (HOME unset, empty or relative) is made
-absolute from the run's working directory. Like every tool, it inherits each
-descriptor the run holds without close-on-exec, such as one the run was
-itself started with open across exec. Its start holds the lock that every
-tool and hook spawn takes, so once in a run, a tool or hook that starts in
-that moment waits for the watcher's fork and exec. Once the run has exited, by
-any cause, the pipe reads end of file. The watcher then waits up to 250 ms
-for the run to read as exited and does with the `run` directory what a launch
-does (below): stops the groups that each record a gone openmax left there
-lists, the run's among them, with 50 ms between SIGTERM and SIGKILL, so that
-each is gone within 100 ms of the kill; removes those records, and the
-directory once no record is left there; and exits. Its polls, for the run's
-exit and through the grace, wait on a timer that a QoS clamp the run was
-started under (`taskpolicy -c`, a background launchd job) does not stretch:
-on macOS a kevent timer marked critical, where a plain 2 ms sleep took a mean
-11 ms under a utility clamp and 98 ms under background. After a run that
-stopped its own tools, it finds no record of the run's and exits at once. A
-record whose owner still runs, such as one that a process which took the run's
-pid since wrote, is left alone. It reads no settings, trust or permissions and
-opens no connection. A watcher that is itself killed, or a run killed in
-the moment between its record's first write and its watcher's start, leaves
-the tools to the next openmax launch (the TUI, `-p`, `--stdio`,
-`--subagent`, or `--check`), as does a run whose watcher cannot start. On
-Linux the watcher starts even once an upgrade has replaced or removed the
-run's binary, whose path then reads `<path> (deleted)`. On macOS none starts
-once the file was removed before the run's first tool, and once it was
-replaced, the binary that replaced it starts, and watches only if it serves
-`--lifeline`.
-On macOS and Linux, openmax records the process groups of its running tools,
-each leader with its start time, in `~/.openmax/run/<pid>.groups`: one line
-when a group starts and one when it ends. Once the file has passed 4 KiB, it
-is cut back to its first line the next time a group ends with no other
-running. An exit that leaves no tool running removes it, and the `run`
-directory once no other record is left there. A launch reads every record
-whose owner pid no process of the same user holds (none does, or another
-user's does), or names a process that has exited or started at another time,
-and sends each group the record still lists whose leader still has its
-recorded start time SIGTERM, then SIGKILL if the group is still there 50 ms
-later, before it starts anything. Neither signal goes to a group whose leader
-pid has since been taken by a process started at another time, and none goes
-to a group once it has been seen gone, since its id can then name another. It
-then removes those records, and the `run` directory once no record is left
-there. On Linux, where start times count from boot, a record's first line also
-carries the boot's id, and a record from an earlier boot is removed with
-nothing signalled. A record a running openmax owns is left alone. A killed
-openmax holds its pid until its parent waits for it, and a launch stops its
-tools before that wait too. A launch never signals the group it runs in: an
-openmax that a left-behind tool's script starts leaves that tool's group
-running and, while the group's leader runs, its record in place, so the next
-launch outside that group stops it. A group is recorded just after its spawn
-has returned, when its command has already started, so a SIGKILL in that
-moment leaves it unrecorded, and a home where the record cannot be written
-(read-only, or on a full disk) records nothing while it stays so. No tool and
-no exit waits on the record's file, as a home whose file server stopped
-answering would make them: one thread, started by the first tool or hook a
-launch runs, makes every write to it and starts the watcher, and an exit
-waits at most 100 ms for that thread to remove it. The watcher, or failing
-that the next launch, removes a record so left. A sub-agent openmax among
-the tools that a stop kills before it has stopped its own tools leaves them
-to its own watcher. A group whose leader had exited and been waited for
-before the watch or the launch, and a process that left its tool's group, are
-not stopped.
-Nor are the tools of an openmax in another pid namespace that shares the home
-directory, as a container with the home mounted does: a launch or a watcher
-outside it takes its records for a dead openmax's and removes them, and its
-own watcher then finds none. While a
-consumer that stopped reading holds stdout full, the run cannot act on the first
-signal, and only a second one ends it. A signal the run inherited as ignored, as
-under `nohup`, stays ignored. The TUI, where Ctrl+C is a key, ends the session on
-one of these signals as `/quit` does, then exits with the same status, unless its
-terminal has already gone away. Until the session's loop starts (while its
-first frame waits on trust, settings, the prompt history or the session
-`--continue` resumes, or the trust question waits on the shell), the first
-signal ends the run at once with that status, and Ctrl+C at the terminal is
-SIGINT.
+See [signals and cancellation](execution.md#signals-and-cancellation) for signal
+handling and [watcher and cleanup](execution.md#watcher-and-cleanup) for what
+happens to tool processes.
+
+### Checks and MCP
+
+`openmax --mcp-list` and `openmax --mcp-call` are a one-shot MCP stdio
+client, used by the proxy tool an MCP server is adopted through; see
+[extending](extending.md#mcp-servers) and `openmax --spec mcp`.
+
+`openmax --check` prints the rows of each file that needs attention (`warn` or
+`err`) and of each hook, then one line counting, per surface, the files that
+loaded with nothing to report (and how many memories are not in the index).
+The report names files under the current directory relative to it, in each
+row's path and in the paths and repair commands it writes into a message
+(`openmax --approve '.openmax/tools/x.toml'`); text a message quotes, such as
+a manifest line in a parse error, prints as written.
+`openmax --check --all` prints every row.
+
+`--check` needs no trust, but no session runs in a project until it is
+trusted, so in an untrusted project the rows are graded in the settings
+default mode (ask when unset). When any row is a `warn` or `err` there, the
+report opens with one `warn trust` row that says so and names the command
+that trusts the project. A hook that is inert in ask, for one, loads without
+approval once `--trust-project` trusts the project in auto. The row never
+changes the exit code.
+
+`openmax --check --json` prints every finding as one JSON array of
+`{surface, path, status, message}` objects (status `ok`, `warn`, or `err`),
+with absolute paths and the same exit code, so the agent can parse its own
+verification.
+
+`openmax --check --run-examples` adds one `example` surface row per declared
+`[example]`, in text and in JSON, and fails the check when one fails. It is
+the only `--check` mode that runs a command, so it needs a trusted project
+and follows the saved project mode. Like the TUI, `-p`, `--stdio` and
+`--subagent`, plain `--check` first stops the tools a killed openmax left
+running and removes that openmax's [process records](execution.md#process-records).
+Auto runs valid examples without content approval; ask uses the documented approval and sandbox rules.
+It honors permission rules, `pre_tool_use` hooks, and `approval_mode` exactly
+as a turn does. See [extending](extending.md#proof-of-life).
+
+### Stdio
 
 `openmax --stdio` is the contract for custom frontends, editor integrations,
 and one openmax driving another. It is specified in
 [stdio protocol](stdio-protocol.md).
+
+## Sessions and replay
 
 A writable session can be open in only one process at a time, including while
 it is idle. Close it in the other process or start a new session to continue
@@ -353,14 +305,17 @@ openmax held it, each as the line `-p --json` prints for it.
 `openmax --replay <file> --json` prints those lines from that one file and
 reads nothing else, so a log copied to another machine replays there with no
 endpoint, settings, trust or data dir, and no tool runs; for a `-p --json` run
-it prints that run's stdout byte for byte, for every turn that finished. The
-log is written when a turn or a `/compact` ends, before the events that close
+it prints that run's stdout byte for byte, for every turn that finished.
+
+The log is written when a turn or a `/compact` ends, before the events that close
 it are sent; while a turn runs, each time 64 KiB of lines wait; and when the
 session is released. A turn that ends with its process (a crash, or a TUI quit
 while it runs) leaves out what it had not yet written, often all of it, and a
 final line a crash cut off is passed over. The transcript is saved apart from
 the log, so `openmax -c` still continues such a session, and the log goes on
-from the continued turn. A continued session appends to its log, a `/fork` or
+from the continued turn.
+
+A continued session appends to its log, a `/fork` or
 `/rewind` branch's log starts at the branch, a session saved before logs
 existed starts one when it is next continued, and deleting a session deletes
 its log. A file that is not an event log, a log in another format, or a damaged
@@ -412,6 +367,7 @@ longer tasks in a tmux session instead.
   `git rev-parse --local-env-vars` lists) are cleared first, for the run's
   own git commands and for the child's tools, so a caller's (a git hook's,
   say) cannot point either at another repository.
+
 - The worktree is a checkout of HEAD at `.worktrees/<name>` under the
   directory the command runs in, on a new branch `subagent/<name>`, where
   `<name>` is the task's first words (up to 32 characters) and eight hex
@@ -424,11 +380,13 @@ longer tasks in a tmux session instead.
   never committed) when it is not there yet, which keeps the worktrees out
   of the tree's `git status`, glob and grep, and it removes `.worktrees`
   once that is empty.
+
 - The child runs in the same process, at the command's directory inside the
   worktree, as one print-mode turn: text on stdout and tool progress on
   stderr, or with `--json` the event lines `-p --json` prints, as they arrive,
   with the final answer last. Its session is recorded under the worktree's
   path.
+
 - Trust: the worktree lies inside the project, so the trust a human granted
   the project covers it, as it covers any subdirectory. The flag grants
   nothing: an untrusted project is refused, and a sub-agent never asks, even
@@ -436,6 +394,7 @@ longer tasks in a tmux session instead.
   stricter one saved for a path inside `.worktrees`, never in a looser one.
   Like any print run it declines every approval, so in `ask` its mutating
   calls are declined and it exits 3.
+
 - When the turn ends, or a signal stops it as it stops a print run (SIGINT,
   SIGTERM, SIGHUP, SIGQUIT, SIGUSR1 or SIGUSR2), the child's tool processes
   are stopped and everything it changed is committed to its branch:
@@ -452,6 +411,7 @@ longer tasks in a tmux session instead.
   The last line on stderr names the branch and its diffstat, as in
   `openmax: the sub-agent's changes are on branch subagent/<name>: 1 file changed, 2 insertions(+)`,
   or says the child changed nothing, and then no branch is kept.
+
 - The exit status is 128 plus the signal's number after a signal, and
   otherwise the turn's, as for `-p` (0, 1, 3 or 4), except that a finished turn
   exits 1 when its work cannot all be put on its branch (git has no identity
@@ -470,7 +430,8 @@ can still be writing in the worktree, so the run leaves the worktree as it
 is, uncommitted, and names it on stderr. SIGKILL, or a crash, runs no
 cleanup. The child's tool processes are recorded as the tools of the openmax
 process that ran it, so its watcher, or failing that the next launch, stops
-them (see the signals above).
+them (see [watcher and cleanup](execution.md#watcher-and-cleanup)).
+
 Nothing cleans up the worktree, the changes it holds or its branch:
 `git worktree list` names the worktree, and
 `git worktree remove --force <path>` removes it once its changes are saved. A
@@ -479,54 +440,20 @@ checkout hook, the commit, or the removal) runs to its end on its own: the
 run's git commands are not tools, so no record lists them, and neither its
 watcher nor a later launch stops them.
 
-## Keys
+## Terminal display
 
-| Input | Action |
-| --- | --- |
-| **Enter** | Send; while a turn runs, steer it: the message joins the turn as a user message before its next request, which carries it, or the next turn's first request when the turn ends first (during a compaction it queues for after); one a `user_prompt_submit` hook blocks comes back to the composer |
-| **/** | Slash commands · **Tab** or **Enter** completes |
-| **@** | Mention a project file |
-| Mouse drag | Select transcript or prompt text |
-| Double / triple click | Select the word under the pointer · the whole logical line |
-| **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
-| Click in the prompt | Put the cursor there in a wrapped draft |
-| Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Cycle requested reasoning effort; inside a picker, select the previous row |
-| **Esc** | Clear selection · close menu · cancel turn · return to composer |
-| **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
+At a terminal, the first frame (the project path, an empty conversation and
+the prompt) is painted before Open Max reads trust, settings or the session,
+and the status line fills in the model and approval mode once they are read.
+The trust question, and a refusal to start (a trust or settings file that does
+not parse, a trust grant asked for from an agent session), then show on your
+shell, which the interface hands back for them.
 
-## Slash commands
-
-| Slash command | Action |
-| --- | --- |
-| `/help` | Keybindings and commands |
-| `/model` | Search configured providers and select a model |
-| `/model <id>` | Set an exact model id on the active endpoint |
-| `/effort [level]` | Pick reasoning effort with arrow keys and Enter, or request an exact level for the next turn. `default` omits the setting; `none` is explicit. Model support varies |
-| `/copy` | Copy the latest assistant response |
-| `/provider [name]` | Pick a provider/model pair, or switch to a named provider |
-| `/login [provider]` | Connect a provider through browser sign-in or hidden API-key entry |
-| `/logout [provider]` | Disconnect a provider |
-| `/permissions [auto\|ask\|readonly]` | Pick or save this project's permission mode. New trust grants default to `auto`; explicit `ask` and `readonly` choices are preserved |
-| `/approvals auto\|ask\|readonly` | Alias for `/permissions` |
-| `/new` · `/resume` | Fresh session · pick an earlier one |
-| `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
-| `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
-| `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
-| `/compact` | Compact the context now instead of waiting for the budget to force it |
-| `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
-| `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
-| `/status` | Endpoint, cache, performance, privacy, and network details |
-| `/update` | Update to the latest release, then resume this session in it |
-| `/quit` | Exit |
+The interface uses your terminal's own foreground and background colors. The
+palette's gray (color 8) marks secondary text, selection, and every border
+except the focused prompt's and the approval card's. There is no color
+setting.
 
 The persistent status line stays limited to model, context use, and approval
 mode so the transcript remains readable; `/status` is where the full runtime
 detail lives.
-
-Turn `n` of `/rewind` is the `n`th prompt you sent that ran and stayed in
-the transcript, cut where it finished: a completion gate's refusal and
-other notes the harness writes during a turn stay in that turn. The full
-counting rule, including compaction and sessions saved by an earlier
-version, is in [the stdio protocol](stdio-protocol.md), whose `rewind`
-counts the same way.

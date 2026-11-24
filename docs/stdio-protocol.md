@@ -273,7 +273,7 @@ names one this directory cannot continue, 3 when the project is
 not trusted or trust cannot be granted from this process, and 0
 otherwise, including `length`, `max_iterations`, `budget_exhausted`, and
 `unverified`. The client reads `done` and decides for itself. See the
-[print mode exit codes](usage.md#command-line) for `-p`.
+[print mode exit codes](usage.md#print-mode) for `-p`.
 
 SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, or SIGUSR2 cancels the running turn
 instead of draining it, declines pending approvals, and exits 128 plus the
@@ -287,7 +287,7 @@ outlasts those 250 ms is not stopped, and runs on after the exit.
 A signal while the session waits on the session index to open, to start a
 turn, or to reload, or on the trust store to save an approval mode, ends it
 the same way, and a `reload` or `approval_mode` it cuts short gets no answer;
-see [usage](usage.md#command-line).
+see [signals and cancellation](execution.md#signals-and-cancellation).
 
 Bad input leaves the session unharmed. A line that is not valid UTF-8, or one
 longer than 8 MiB, is reported as a `protocol_error` and skipped; the reader
