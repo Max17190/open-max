@@ -123,6 +123,12 @@ async fn a_responses_reply_cut_while_reasoning_goes_back_as_its_reasoning_item_a
 /// when it cut a reply; without, it stops at the limit and calls the reply done.
 /// Returns each request's limit, the cut notes and the turn's stop reason.
 async fn other_server_turn(wire: &'static str, needed: u64, reports: bool) -> (Vec<u64>, usize, String) {
+    server_turn(wire, needed, reports, false).await
+}
+
+/// [`other_server_turn`], with the provider entry's `compat.reports_cuts` set
+/// to `declared`: the user's word that the server reports every cut.
+async fn server_turn(wire: &'static str, needed: u64, reports: bool, declared: bool) -> (Vec<u64>, usize, String) {
     let field = if wire == "responses" { "max_output_tokens" } else { "max_tokens" };
     let (url, bodies) = common::recording_http_with(10, move |body| {
         let limit = serde_json::from_str::<Value>(body).unwrap()[field].as_u64().unwrap();
@@ -140,6 +146,10 @@ async fn other_server_turn(wire: &'static str, needed: u64, reports: bool) -> (V
     .await;
     let scratch = Scratch::new(&url, wire);
     std::fs::write(scratch.0.join("data/settings.json"), r#"{"provider":"test","model":"thinker","context_tokens":131072}"#).unwrap();
+    if declared {
+        let providers = json!({"providers":{"test":{"base_url":url,"api_key":"fixture-key","wire_api":wire,"compat":{"reports_cuts":true}}}});
+        std::fs::write(scratch.0.join("data/providers.json"), providers.to_string()).unwrap();
+    }
     let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
     let events = common::drive_turn(&core, &mut rx, "limits", &scratch.0.join("project"), "go").await;
     let limits = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()[field].as_u64().unwrap()).collect();
@@ -169,4 +179,36 @@ async fn another_vendors_server_keeps_the_silent_cut_rules_on_every_wire() {
         finished.clone(), ceiling.clone(), ceiling,
         finished, long(&[4096, 16384, 4096, 4096, 4096], 4), long(&[4096, 16384, 4096, 4096, 4096], 4),
     ]);
+}
+
+/// A provider entry that declares `compat.reports_cuts`, such as a pass-through
+/// proxy in front of a vendor's own server, gets that server's rules on
+/// Responses and native Messages: a completed reply is the answer however much
+/// of the limit its thought spent, and reported cuts raise an unknown limit up
+/// to a quarter of the window. The same server undeclared keeps the silent cut
+/// rules. On Chat Completions the declaration changes nothing.
+#[tokio::test]
+async fn a_server_declared_to_report_cuts_gets_the_vendor_rules_on_responses_and_messages() {
+    let mut got = Vec::new();
+    for wire in ["responses", "anthropic", "chat_completions"] {
+        for declared in [false, true] {
+            for needed in [2869, 4096] { got.push(server_turn(wire, needed, true, declared).await); }
+            got.push(server_turn(wire, u64::MAX / 4, true, declared).await);
+        }
+    }
+    let row = |limits: &[u64], notes, stop: &str| (limits.to_vec(), notes, stop.to_string());
+    let finished = row(&[4096, 4096, 8192], 2, "stop");
+    // Undeclared, every wire: a reply that spent 70% of the limit or all of it
+    // is read as cut, and the limit grows to four times the default.
+    let silent = [finished.clone(), finished.clone(), row(&[4096, 4096, 8192, 16384, 16384, 16384, 16384], 6, "length")];
+    // Declared: both completed replies stand, and a thought that never ends is
+    // raised to a quarter of the window, as on the vendor's own server.
+    let declared = |never_ends| vec![row(&[4096], 0, "stop"), row(&[4096], 0, "stop"), never_ends];
+    // The Messages-shaped server cuts inside its text, which gets room once.
+    let messages = [finished.clone(), row(&[4096, 16384], 1, "stop"), row(&[4096, 16384, 4096, 4096, 4096], 4, "length")];
+    assert_eq!(got, [
+        silent.to_vec(), declared(row(&[4096, 4096, 8192, 16384, 32768, 32768, 32768, 32768], 7, "length")),
+        messages.to_vec(), declared(row(&[4096, 16384, 32768, 32768, 32768, 32768], 5, "length")),
+        silent.to_vec(), silent.to_vec(),
+    ].concat());
 }

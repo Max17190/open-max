@@ -184,17 +184,18 @@ async fn a_refused_raise_keeps_the_last_accepted_limit_for_the_rest_of_the_turn(
 }
 
 /// The subscription route sends no limit and is not a server this module's rules
-/// key on: its ceiling stays four times the default however large the window.
+/// key on, even when its entry declares `compat.reports_cuts`: its ceiling stays
+/// four times the default however large the window.
 #[test]
 fn the_subscription_route_keeps_four_times_the_default() {
     let dir = std::env::temp_dir().join(format!("openmax-limits-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     crate::chatgpt::tests::seeded(&dir);
-    let route = json!({"base_url":crate::chatgpt::API,"wire_api":"responses","chatgpt_account":"main","models":[{"id":"m","context_tokens":400_000}]});
+    let route = json!({"base_url":crate::chatgpt::API,"wire_api":"responses","chatgpt_account":"main","compat":{"reports_cuts":true},"models":[{"id":"m","context_tokens":400_000}]});
     std::fs::write(crate::providers::providers_path(&dir), json!({"providers":{"sub":route}}).to_string()).unwrap();
     let settings = Settings { provider: Some("sub".into()), model: "m".into(), ..Settings::default() };
     let endpoint = crate::providers::resolve(&settings, &dir).unwrap();
-    assert!(endpoint.chatgpt.is_some());
+    assert!(endpoint.chatgpt.is_some() && !endpoint.reports_cuts);
     assert_eq!((endpoint.max_tokens, endpoint.reply_ceiling), (4096, 16384));
     std::fs::remove_dir_all(dir).unwrap();
 }

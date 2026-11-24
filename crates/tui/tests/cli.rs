@@ -2388,15 +2388,18 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");
     assert!(report.lines().any(|l| l.starts_with("warn settings") && l.contains("max_tokens = 4096, the default")), "{report}");
     // The ceiling it names is the one the route gets: a quarter of the window
-    // only on the vendor's own server for the wire, over https.
-    for (base, wire, ceiling) in [
-        ("https://api.openai.com/v1", "responses", "32768 (a quarter of the window)"),
-        ("https://api.anthropic.com/v1", "anthropic", "32768 (a quarter of the window)"),
-        ("https://api.openai.com.example.invalid/v1", "responses", "16384 (four times the default)"),
-        ("https://api.anthropic.com/v1", "responses", "16384 (four times the default)"),
-        ("http://api.openai.com/v1", "responses", "16384 (four times the default)"),
+    // only on the vendor's own server for the wire, over https, or on a server
+    // whose entry declares that it reports every cut.
+    for (base, wire, declared, ceiling) in [
+        ("https://api.openai.com/v1", "responses", false, "32768 (a quarter of the window)"),
+        ("https://api.anthropic.com/v1", "anthropic", false, "32768 (a quarter of the window)"),
+        ("https://api.openai.com.example.invalid/v1", "responses", false, "16384 (four times the default)"),
+        ("https://api.anthropic.com/v1", "responses", false, "16384 (four times the default)"),
+        ("http://api.openai.com/v1", "responses", false, "16384 (four times the default)"),
+        ("https://gateway.example.invalid/v1", "responses", true, "32768 (a quarter of the window)"),
+        ("https://gateway.example.invalid/v1", "anthropic", true, "32768 (a quarter of the window)"),
     ] {
-        let catalog = serde_json::json!({"providers":{"stub":{"base_url":base,"wire_api":wire,"models":[{"id":"stub-model","context_tokens":131072}]}}});
+        let catalog = serde_json::json!({"providers":{"stub":{"base_url":base,"wire_api":wire,"compat":{"reports_cuts":declared},"models":[{"id":"stub-model","context_tokens":131072}]}}});
         std::fs::write(dir.join("providers.json"), catalog.to_string()).unwrap();
         let (code, report) = check(&["--check"]);
         assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");

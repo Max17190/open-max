@@ -227,7 +227,9 @@ and the run that writes a key already uses it.
   model's own maximum, so their ceiling is the larger of 16384 and a quarter
   of the window (the cap setup puts on a maximum a catalog reports), still
   within the room the prompt leaves. Another server on the same protocol
-  keeps 16384. So with no `max_tokens` on the entry, a thought there that
+  keeps 16384, unless its provider entry declares
+  `"compat": { "reports_cuts": true }` (below), which gives it every rule this
+  page states for the two direct APIs. So with no `max_tokens` on the entry, a thought there that
   never ends can bill up to about one and a half times the window in output
   before the turn ends `length` (531,072 tokens in a 400,000-token window),
   unless the server refuses a raise first; the entry's `max_tokens` bounds it
@@ -759,6 +761,33 @@ it defaults to false and leaves other providers' settings unchanged.
 unchanged structured reasoning blocks contain the same text. OpenRouter's Chat
 Completions endpoint uses this format automatically. Enable it for a proxy
 only if it accepts structured reasoning blocks on their own.
+
+`compat.reports_cuts: true` declares that a Responses or native Messages
+server behaves as the two direct APIs do: it reports every reply it cuts at
+the output limit (`response.incomplete` for `max_output_tokens`, or
+`stop_reason` `max_tokens`) and refuses a limit over the model's own maximum.
+A pass-through proxy in front of one of them does, such as a company gateway
+or a metering proxy that hands on the vendor's replies and errors unchanged.
+The entry then gets the reply limit rules of the two direct APIs: a reply the
+server reports complete is the answer however much of the limit it spent, the
+ceiling with no `max_tokens` on the model entry is a quarter of the window,
+and a refused raise keeps the last limit the server accepted. It defaults to
+false, which leaves each server the rule its host gives it: on only for
+`https://api.openai.com` (Responses with an API key) and
+`https://api.anthropic.com` (native Messages). Declare it only for a server
+you know reports its cuts: one that stops at the limit and calls the reply
+complete would have its cut text taken as the final answer. It has no effect
+on the subscription route, which sends no limit, or on Chat Completions.
+That protocol can report a cut (`finish_reason` `length`), but servers that
+implement it differ, and some stop at the limit and say `stop`, which is why
+a reply there with no call that spends 70% of the limit or more on its
+thought is read as cut. No server on that protocol is trusted by its host
+either, so the declaration has no host rule to extend there. `openmax --check`
+names the ceiling the declaration gives. For example:
+
+```json
+"compat": { "reports_cuts": true }
+```
 
 `wire_api` defaults to `chat_completions`, preserving existing requests.
 An explicit `responses` selects the Responses protocol. The ChatGPT setup

@@ -36,6 +36,8 @@ pub struct CompatFlags {
     pub omit_temperature: bool,
     /// Omit duplicate plaintext reasoning on compatible Chat Completions routes.
     pub prefer_reasoning_details: bool,
+    /// Declares that this Responses or native Messages server, such as a pass-through proxy, reports every cut like the vendor's own.
+    pub reports_cuts: bool,
 }
 
 // serde default for send_stream_options is false via Default; we want true when
@@ -47,6 +49,7 @@ struct CompatFlagsFile {
     send_stream_options: Option<bool>,
     omit_temperature: Option<bool>,
     prefer_reasoning_details: Option<bool>,
+    reports_cuts: Option<bool>,
 }
 
 impl From<CompatFlagsFile> for CompatFlags {
@@ -56,6 +59,7 @@ impl From<CompatFlagsFile> for CompatFlags {
             send_stream_options: f.send_stream_options.unwrap_or(true),
             omit_temperature: f.omit_temperature.unwrap_or(false),
             prefer_reasoning_details: f.prefer_reasoning_details.unwrap_or(false),
+            reports_cuts: f.reports_cuts.unwrap_or(false),
         }
     }
 }
@@ -71,8 +75,8 @@ pub enum WireApi {
 }
 
 impl WireApi {
-    /// Whether `base` is this wire's vendor's own server, which reports every reply it cuts and refuses a limit over the model's.
-    fn reports_cuts(self, base: &str) -> bool { same_server(base, match self { Self::Responses => crate::chatgpt::API, Self::Anthropic => "https://api.anthropic.com", Self::ChatCompletions => return false }) }
+    /// Whether `base` is this wire's vendor's own server, which reports every reply it cuts and refuses a limit over the model's, or one `declared` to behave so; never on Chat Completions, where some servers stop at the limit silently.
+    fn reports_cuts(self, base: &str, declared: bool) -> bool { (declared && self != Self::ChatCompletions) || same_server(base, match self { Self::Responses => crate::chatgpt::API, Self::Anthropic => "https://api.anthropic.com", Self::ChatCompletions => return false }) }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -405,7 +409,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
         if let Some(compat) = provider.get("compat").and_then(|v| v.as_object()) {
             unknown_keys(
                 compat,
-                &["use_max_completion_tokens", "send_stream_options", "omit_temperature", "prefer_reasoning_details"],
+                &["use_max_completion_tokens", "send_stream_options", "omit_temperature", "prefer_reasoning_details", "reports_cuts"],
                 &format!("in provider '{name}' compat"),
                 &mut out,
             );
@@ -675,7 +679,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
             .or(settings.context_tokens)
             .ok_or(ResolveError::MissingContextTokens)?
             .max(1);
-        let reports_cuts = chatgpt.is_none() && p.wire_api.reports_cuts(base_url);
+        let reports_cuts = chatgpt.is_none() && p.wire_api.reports_cuts(base_url, p.compat.reports_cuts);
         let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens), reports_cuts);
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
