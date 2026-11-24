@@ -108,12 +108,17 @@ Use `auto` for work that needs to run without a person approving calls.
 [Approvals](configuration.md#approvals) before running project code.
 
 In text mode, read the answer on stdout and progress and errors on stderr.
-With `--json`, read one event per line from stdout. If `-p` has no prompt
-argument, it reads a prompt from piped stdin:
+With `--json`, read one event per line from stdout and warnings and errors
+from stderr. To take a prompt from a file, redirect it to `-p`:
 
 ```sh
 openmax -p --json < task.txt > events.jsonl
 ```
+
+Piped or redirected stdin also follows the first prompt when you provide one
+on the command line. Pass `</dev/null` in a script that needs stdin for other
+work or when the parent leaves its pipe open. See [print mode](usage.md#print-mode)
+for the input limit and end-of-input rules.
 
 Repeat `-p` with a prompt for each turn to run them in one session. A nonzero
 turn status skips the remaining prompts.
@@ -127,7 +132,7 @@ error or interrupted run may have no `done` event.
 
 | Code | Meaning and next step |
 | --- | --- |
-| 0 | Every turn finished. Read the answer and check the work. |
+| 0 | Every turn finished. A warning such as a failed session save does not change this status. Read the answer and check the work. |
 | 1 | A run failed or could not start, could not open the session, or ended on a different stop reason such as `truncated`, `empty`, `blocked` or a provider's `content_filter`. Read the reported error or stop reason. |
 | 2 | A usage or configuration error before any turn, or `--continue` or `--session` could not find a session this directory can continue. Correct the command or settings. |
 | 3 | The project is untrusted, the process cannot grant trust or select `--permissions`, or a turn that otherwise finished declined an approval. Follow the trust or approval instruction on stderr. |

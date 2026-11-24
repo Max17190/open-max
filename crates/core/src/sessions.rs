@@ -1806,14 +1806,14 @@ pub const PERSISTED_STALE: usize = usize::MAX;
 /// continuation) must not.
 pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted: &mut usize, rewrite: bool) -> bool {
     if let Err(message) = ensure_owned(core, id) {
-        core.send_agent(id, AgentEvent::Error { message });
+        core.send_agent(id, AgentEvent::Error { message: format!("warning: failed to persist session to disk: {message}") });
         return false;
     }
     let path = messages_path(core, id);
     let (mut memo, _flock) = match lock_store(core) {
         Ok(store) => store,
         Err(reason) => {
-            core.send_agent(id, AgentEvent::Error { message: format!("failed to persist session: {reason}") });
+            core.send_agent(id, AgentEvent::Error { message: format!("warning: failed to persist session to disk: {reason}") });
             return false;
         }
     };
@@ -1850,7 +1850,7 @@ pub fn save_messages(core: &Core, id: &str, messages: &[ChatMessage], persisted:
             } else { Ok(()) }
         });
         if let Err(message) = checked {
-            core.send_agent(id, AgentEvent::Error { message });
+            core.send_agent(id, AgentEvent::Error { message: format!("warning: failed to persist session to disk: {message}") });
             return false;
         }
     }

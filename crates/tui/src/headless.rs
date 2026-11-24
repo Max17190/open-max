@@ -234,6 +234,17 @@ async fn run_prompts(
     exit_code
 }
 
+#[cold]
+fn print_error(stderr: &mut io::Stderr, message: &str) -> bool {
+    let message = one_line(message);
+    if message.starts_with("warning:") {
+        let _ = writeln!(stderr, "openmax: {message}");
+        return false;
+    }
+    let _ = writeln!(stderr, "openmax: error: {message}");
+    true
+}
+
 /// `stop_by` holds the stop's deadline once a signal lands, here or while
 /// a turn starts; the empty-session cleanup after the run is held to it too.
 #[allow(clippy::too_many_arguments)]
@@ -248,7 +259,6 @@ async fn run_turn_events(
     stop_by: &mut Option<Instant>,
 ) -> i32 {
     let json = args.json;
-    let mut exit_code = 0i32;
     // Whether this turn's error line is already on stderr.
     let mut error_printed = false;
     // Once a signal has stopped the run: the status it exits with, and when
@@ -325,11 +335,7 @@ async fn run_turn_events(
                 core.respond_approval(approval_id, false);
             }
             AgentEvent::Error { message } => {
-                if !json {
-                    let _ = writeln!(stderr, "openmax: error: {message}");
-                    error_printed = true;
-                }
-                exit_code = 1;
+                error_printed |= print_error(stderr, message);
             }
             AgentEvent::Done { stop_reason } => {
                 if !json {
@@ -358,10 +364,10 @@ async fn run_turn_events(
                 }
                 // Stopped short (4: resubmitting continues, unless a completion gate could not start); kept from its work by
                 // the approval setup (3, as an untrusted project is); or any other end, content_filter included (1).
-                exit_code = match stop_reason.as_str() {
+                let exit_code = match stop_reason.as_str() {
                     "length" | "max_iterations" | "budget_exhausted" | "unverified" => 4,
-                    "stop" | "tool_calls" | "cancelled" if exit_code == 0 && declined.0 > 0 => 3,
-                    "stop" | "tool_calls" | "cancelled" => exit_code,
+                    "stop" | "tool_calls" | "cancelled" if declined.0 > 0 => 3,
+                    "stop" | "tool_calls" | "cancelled" => 0,
                     _ => 1,
                 };
                 return stopping.unwrap_or(exit_code);

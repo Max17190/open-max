@@ -264,6 +264,7 @@ fn conversation_layout(
 pub struct Args {
     pub continue_session: bool,
     pub session: Option<String>, // `--session`: resumed instead of the latest
+    pub prompt: Option<String>,
     /// Notified when a signal asks the session to end. The loop treats it
     /// as /quit, so the normal exit path restores the terminal. The signal
     /// watcher holds it weakly: once the loop drops it, a signal exits at
@@ -458,13 +459,17 @@ pub async fn run(
     mut terminal: Term,
     core: Arc<Core>,
     mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
-    args: Args,
+    mut args: Args,
 ) -> (std::io::Result<()>, Vec<String>) {
     let (files_tx, mut files_rx) = mpsc::unbounded_channel();
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut app = App::new(core.clone(), project, files_tx);
 
     app.startup(&args).await;
+    if let Some(prompt) = args.prompt.take() {
+        let text = open_max_core::templates::expand_user_input(&app.core.data_dir, &app.project, &prompt);
+        app.submit_prompt(text);
+    }
     let result =
         event_loop(&mut terminal, &mut app, &mut core_rx, &mut files_rx, &args.quit).await;
     // The quit's last strong handle goes with the loop, so a signal during
@@ -2175,6 +2180,11 @@ impl App {
         } else {
             text
         };
+        self.submit_prompt(text);
+        Ok(())
+    }
+
+    fn submit_prompt(&mut self, text: String) {
         if self.running {
             // A running turn takes the message at its next iteration
             // boundary, where SteerAccepted paints it; until then it waits
@@ -2192,7 +2202,7 @@ impl App {
             self.transcript.follow();
             self.dirty.mark_chat();
             self.dirty.mark_chrome();
-            return Ok(());
+            return;
         }
 
         self.refresh_billing();
@@ -2206,7 +2216,7 @@ impl App {
                     Ok(meta) => meta,
                     Err(e) => {
                         self.error(&sessions::refusal_with_repair(&self.core, e));
-                        return Ok(());
+                        return;
                     }
                 };
                 self.session_id = Some(meta.id.clone());
@@ -2245,7 +2255,6 @@ impl App {
                 self.error(&e);
             }
         }
-        Ok(())
     }
 
     async fn slash(&mut self, cmd: &str) {
@@ -4668,7 +4677,7 @@ mod tests {
         // A resumed session was not this app's to create, so it stays even
         // though nothing was ever saved to it.
         let resumed = open_max_core::sessions::create(&core, key.clone()).unwrap().id;
-        app.startup(&super::Args { continue_session: true, session: None, quit: Default::default() }).await;
+        app.startup(&super::Args { continue_session: true, session: None, prompt: None, quit: Default::default() }).await;
         assert_eq!(app.session_id.as_deref(), Some(resumed.as_str()));
         app.handle_submit("/new".into()).await.unwrap();
         assert_eq!(ids(&core), vec![resumed.clone()], "a resumed session was discarded");
@@ -5732,7 +5741,7 @@ mod tests {
         let index = damage_session_index(&dir);
         let path = index.display().to_string();
 
-        app.startup(&super::Args { continue_session: true, session: None, quit: Default::default() }).await;
+        app.startup(&super::Args { continue_session: true, session: None, prompt: None, quit: Default::default() }).await;
         let continued = app.transcript.export_text();
         assert!(
             continued.contains(&path)

@@ -26,6 +26,7 @@ use open_max_core::state::{default_data_dir, Core};
 const HELP: &str = "openmax: a barebones high-performance agent harness
 
 usage: openmax [options] [prompt...]
+At a terminal, a prompt without -p starts an interactive session.
 
 options:
       --login [provider] sign in to a provider or configure its API key
@@ -59,8 +60,10 @@ options:
       --provider <name>  use a named provider from ~/.openmax/providers.json
                          for this run; --base-url and --api-key are refused
                          beside it
-  -p, --print            headless: run one turn and exit (prompt required, read
-                         from piped stdin when -p has none; repeat -p for multi-turn)
+  -p, --print            run the prompt, print the reply and exit; repeat -p
+                         for more turns. Piped or redirected stdin supplies the
+                         first prompt or follows it after a blank line. Use
+                         </dev/null to skip stdin.
       --second-look      with --print and one prompt: a run that ends with status 0 within
                          10,000 output tokens is checked by a new session; status unchanged
                          unless that session declines an approval (3)
@@ -364,24 +367,21 @@ where
                     current.push(word);
                 }
             }
-            _ if out.mcp_list || out.mcp_call => {
-                return Err(lexopt::Error::from(format!(
-                    "{}; an MCP server's command and its options go after --",
-                    arg.unexpected()
-                )));
+            _ => {
+                let hint = if out.mcp_list || out.mcp_call {
+                    Some("an MCP server's command and its options go after --")
+                } else {
+                    spelling_hint(&arg).or(out.print.then_some("a prompt that starts with '-' goes last, after --"))
+                };
+                let error = arg.unexpected();
+                return Err(match hint {
+                    Some(hint) => lexopt::Error::from(format!("{error}; {hint}")),
+                    None => error,
+                });
             }
-            // A prompt word that starts with a dash parses as an option; `--`
-            // ends the options, so every word after it is prompt text.
-            _ if out.print => {
-                return Err(lexopt::Error::from(format!(
-                    "{}; a prompt that starts with '-' goes last, after --",
-                    arg.unexpected()
-                )));
-            }
-            _ => return Err(arg.unexpected()),
         }
     }
-    // Freeform args without --print are rejected in main. A lone -p with no text is read from standard input there.
+    // A lone -p with no text reads its prompt from standard input.
     if !current.is_empty() || (out.print && !out.prompts.is_empty()) {
         flush_prompt_tokens(&mut out.prompts, &mut current)?;
     }
@@ -603,27 +603,17 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     if operation == Some("--replay") && !*json {
         return Err("--replay prints the recorded JSON lines; add --json".into());
     }
-    if !prompts.is_empty() && operation != Some("--print") {
-        // With no operation named, a stray word is most likely a prompt
-        // missing its -p, so that refusal points at --print; beside a named
-        // operation it was most likely meant for that operation (a path
-        // after --check), so the refusal names the word instead. The word may
-        // be a filename a glob expanded, so it is flattened to one line.
+    if let Some(operation) = operation.filter(|op| *op != "--print" && !prompts.is_empty()) {
         let words = open_max_core::text::one_line(&prompts.join(" "));
-        return Err(match operation {
-            None => "unexpected arguments (use --print for headless)".to_string(),
-            Some(operation) => {
-                let hint = match operation {
-                    "--stdio" => "; it reads commands on stdin",
-                    "--check --stdio" => "; it reads the stream on stdin",
-                    "--mcp-list" => "; the server's command goes after --",
-                    "--mcp-call" => "; the server's command goes after --, and the call on stdin",
-                    "--subagent" => "; the task is the one quoted argument after --subagent",
-                    _ => "",
-                };
-                format!("{operation} takes no other arguments (got '{words}'){hint}")
-            }
-        });
+        let hint = match operation {
+            "--stdio" => "; it reads commands on stdin",
+            "--check --stdio" => "; it reads the stream on stdin",
+            "--mcp-list" => "; the server's command goes after --",
+            "--mcp-call" => "; the server's command goes after --, and the call on stdin",
+            "--subagent" => "; the task is the one quoted argument after --subagent",
+            _ => "",
+        };
+        return Err(format!("{operation} takes no other arguments (got '{words}'){hint}"));
     }
     if let Some(operation @ ("--mcp-list" | "--mcp-call")) = operation {
         if mcp_server.as_ref().is_none_or(|words| words.is_empty()) {
@@ -707,6 +697,23 @@ fn settings_conflict(cli: &CliArgs, data_dir: &std::path::Path) -> Option<String
     open_max_core::config::load(data_dir).ok().and_then(|file| key_flags(cli).conflict(&file))
 }
 
+fn spelling_hint(arg: &lexopt::Arg<'_>) -> Option<&'static str> {
+    use lexopt::prelude::*;
+    match arg {
+        Long("resume") | Short('r') => Some("use --continue for the latest session or --session <id> for a named session"),
+        Value(word) if word == "help" => Some("'help' is not a command"),
+        Value(word) if word == "version" => Some("'version' is not a command; use --version to see the version"),
+        _ => None,
+    }
+}
+
+#[cold]
+fn usage_error(reason: impl std::fmt::Display) -> ! {
+    let reason = open_max_core::text::one_line(&reason.to_string());
+    eprintln!("openmax: {reason}\nRun openmax --help to see the options.");
+    std::process::exit(2);
+}
+
 fn main() -> std::io::Result<std::process::ExitCode> {
     let cli = match parse_args() {
         Ok(a) => a,
@@ -714,18 +721,12 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         Err(_) if open_max_core::execution::lifeline(&std::env::args_os().skip(1).collect::<Vec<_>>()) => {
             return Ok(std::process::ExitCode::SUCCESS);
         }
-        Err(e) => {
-            eprintln!("openmax: {e}\n\n{HELP}");
-            std::process::exit(2);
-        }
+        Err(e) => usage_error(e),
     };
 
     let operation = match operation(&cli) {
         Ok(operation) => operation,
-        Err(reason) => {
-            eprintln!("openmax: {reason}\n\n{HELP}");
-            std::process::exit(2);
-        }
+        Err(reason) => usage_error(reason),
     };
 
     // While this is the only thread, and before any tool or hook can run.
@@ -743,8 +744,18 @@ fn main() -> std::io::Result<std::process::ExitCode> {
     // The interactive session at a terminal paints its first frame before
     // the runtime exists. Every other run, a session without a terminal at
     // both ends included, starts on the runtime.
-    if operation.is_none() && exit_after_grant(&cli, true).is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return session(cli);
+    if operation.is_none() {
+        if let [word] = cli.prompt_words.as_slice() {
+            if let Some(hint) = spelling_hint(&lexopt::Arg::Value(word.into())) {
+                usage_error(hint);
+            }
+        }
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && exit_after_grant(&cli, true).is_none() {
+            return session(cli);
+        }
+        if !cli.prompts.is_empty() {
+            usage_error("an interactive prompt needs a terminal on stdin and stdout; use -p to run without one");
+        }
     }
     runtime(None, runtime_workers(&cli)).block_on(run(cli))
 }
@@ -909,7 +920,10 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     let granted = granted.into_iter().chain(notes).reduce(|lines, line| format!("{lines}\n{line}"));
     start_input();
     let runtime = runtime(granted.as_deref(), None);
-    let args = app::Args { continue_session: cli.continue_session, session: cli.session, quit: quit.clone() };
+    let args = app::Args {
+        continue_session: cli.continue_session, session: cli.session,
+        prompt: cli.prompts.into_iter().next(), quit: quit.clone(),
+    };
     let (result, warnings) = runtime.block_on(app::run(terminal, core.clone(), core_rx, args));
     restore_terminal();
     runtime.block_on(open_max_core::chatgpt::finish_refreshes());
@@ -1561,11 +1575,8 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         }
     }
 
-    // The prompt on standard input keeps the task text off every command line, where `pkill -f` matches it.
-    if cli.print && cli.prompts.is_empty() && !std::io::stdin().is_terminal() { cli.prompts.push(std::io::read_to_string(std::io::stdin()).unwrap_or_else(|e| { eprintln!("openmax: reading the --print prompt from stdin: {e}"); std::process::exit(2) })) }
-    if cli.print && (cli.prompts.is_empty() || cli.prompts.iter().all(|p| p.trim().is_empty())) {
-        eprintln!("openmax: --print requires a prompt\n\n{HELP}");
-        std::process::exit(2);
+    if cli.print {
+        prepare_print_prompts(&mut cli.prompts);
     }
 
     // Signals are routed before the first turn can start a tool and before
@@ -1623,12 +1634,62 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         terminal,
         core,
         core_rx,
-        app::Args { continue_session: cli.continue_session, session: cli.session, quit: quit.clone() },
+        app::Args { continue_session: cli.continue_session, session: cli.session, prompt: None, quit: quit.clone() },
     )
     .await;
     restore_terminal();
     open_max_core::chatgpt::finish_refreshes().await;
     end_session(result, warnings, None)
+}
+
+// Keep input assembly and its errors out of the session runner's stack frame.
+#[inline(never)]
+fn prepare_print_prompts(prompts: &mut Vec<String>) {
+    read_print_input(prompts).unwrap_or_else(print_input_error);
+    if prompts.iter().all(|p| p.trim().is_empty()) {
+        usage_error("--print requires a prompt; pass one after -p or pipe it on stdin");
+    }
+}
+
+#[cold]
+fn print_input_error(e: std::io::Error) {
+    eprintln!("openmax: reading the --print prompt from stdin: {e}");
+    std::process::exit(2);
+}
+
+fn read_print_input(prompts: &mut Vec<String>) -> std::io::Result<()> {
+    use std::io::{self, Read};
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes stat on success. Nothing takes ownership of stdin.
+    if unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
+        let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        // SAFETY: poll borrows this single initialized descriptor entry.
+        if unsafe { libc::poll(&mut fd, 1, 3000) } == 0 {
+            eprintln!("openmax: waiting for piped input; close the pipe or rerun with </dev/null to skip stdin");
+        }
+    } else if kind != libc::S_IFREG {
+        return Ok(());
+    }
+    let mut input = Vec::new();
+    io::stdin().take(MAX_BYTES + 1).read_to_end(&mut input)?;
+    if input.len() as u64 > MAX_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "input exceeds 8 MiB; send less data"));
+    }
+    if !input.is_empty() {
+        let input = String::from_utf8(input).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"))?;
+        if let Some(first) = prompts.first_mut() {
+            first.push_str("\n\n");
+            first.push_str(&input);
+        } else {
+            prompts.push(input);
+        }
+    }
+    Ok(())
 }
 
 /// Apply the settings flags to the settings this run uses, before the
@@ -2569,7 +2630,7 @@ fn print_usage_economics(data_dir: &std::path::Path) {
 /// them the run exits 1 rather than as if that session had run (see
 /// `operation`), and writes no settings.
 fn exit_after_grant(cli: &CliArgs, stdout_is_terminal: bool) -> Option<i32> {
-    let asks_for_a_session = cli.continue_session || key_flags(cli) != Default::default();
+    let asks_for_a_session = cli.continue_session || !cli.prompts.is_empty() || key_flags(cli) != Default::default();
     let ends = (cli.trust_project || cli.permissions.is_some()) && !(cli.print || cli.stdio || cli.subagent.is_some())
         && !(stdout_is_terminal && (cli.trust_project || asks_for_a_session));
     ends.then_some(if asks_for_a_session { 1 } else { 0 })
@@ -3809,8 +3870,8 @@ mod tests {
             (&["--all"], "--all", &["--check"]),
             (&["--mcp-timeout", "5"], "--mcp-timeout", &["--mcp-list", "--mcp-call"]),
             (&["--worktree"], "--worktree", &["--subagent"]),
-            // A bare word is a prompt, which only --print reads.
-            (&["extra"], "", &["--print"]),
+            // A bare word is a prompt in a terminal session or with --print.
+            (&["extra"], "", &["", "--print"]),
         ];
         for (option, flag, readers) in options {
             for (operation, name) in OPERATIONS {
@@ -3985,12 +4046,7 @@ mod tests {
         assert!(shown >= 4, "the recipe's three commands and the help's example: {shown}");
     }
 
-    /// With no operation named, a stray word is most likely a prompt missing
-    /// its -p, so that refusal points at --print. Beside a named operation it
-    /// is most likely meant for that operation (`--check x.toml`,
-    /// `--check --stdio stream.jsonl`), so pointing at --print sends the user
-    /// the wrong way: the refusal names the word instead, and an operation
-    /// that reads stdin says so.
+    /// A named operation refuses extra words with its own advice, not -p.
     #[test]
     fn a_stray_word_beside_an_operation_is_named_not_sent_to_print() {
         for (operation, name) in OPERATIONS {
@@ -4008,8 +4064,6 @@ mod tests {
             let reason = refusal_of(args).unwrap();
             assert!(reason.contains("stdin"), "{args:?}: {reason}");
         }
-        let reason = refusal_of(&["stray"]).unwrap();
-        assert!(reason.contains("--print"), "a stray word alone is likely a prompt: {reason}");
     }
 
     /// The refused word is often a filename a glob expanded (`--check *` in a
