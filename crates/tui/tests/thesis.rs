@@ -4825,8 +4825,7 @@ fn headless_turn_peak_rss_stays_under_its_ratchet() {
     // plus 96 KiB for redacting credentials in tool results, measured at
     // 4,080 and 4,112 KiB against main's 3,968, raised for by its owner,
     // plus 80 KiB for setting the request budget from the turn's pace,
-    // measured at 4,224 and 4,208 KiB against main's 4,128, raised for by
-    // its owner.
+    // measured at 4,224 and 4,208 KiB against main's 4,128.
     const RATCHET: u64 = (3888 + 128 + 32 + 96 + 80) * KIB;
     const RUNS: usize = 11;
     // Where the ratchet was measured: macOS on Apple silicon, in a release
