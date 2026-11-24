@@ -179,10 +179,19 @@ been written when the run was interrupted. See
 
 Shell commands and hooks inherit the environment and get
 `GIT_TERMINAL_PROMPT=0`. External tools get `PATH`, `HOME`, `LANG` and `TERM`,
-plus the variables their manifests name. When unset, `EMAIL=openmax@localhost`
-gives Git a fallback email and `CARGO_CACHE_AUTO_CLEAN_FREQUENCY=never` keeps
-Cargo's download cache intact. Tools have no controlling terminal, so provide
-any needed credentials or Git identity before they run, not through a prompt.
+plus the variables their manifests name. When `EMAIL` is unset, commands the
+agent runs get `EMAIL=openmax@localhost` as a fallback email only. If the OS
+account has no display name, set Git's `user.name` or supply the author and
+committer names explicitly. Open Max does not supply a name.
+
+When `CARGO_CACHE_AUTO_CLEAN_FREQUENCY` is unset in the environment that
+launches Open Max, commands the agent runs get `CARGO_CACHE_AUTO_CLEAN_FREQUENCY=never`.
+Cargo gives the variable precedence over `cache.auto-clean-frequency` in its
+configuration files. If you rely on that file setting, export the variable
+with the same value before launching Open Max.
+
+Tools have no controlling terminal, so provide any needed credentials or Git
+identity before they run, not through a prompt.
 See [Native execution and privacy](execution.md) for what commands can access.
 
 ## Checklist
