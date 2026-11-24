@@ -13,7 +13,7 @@ For scripts and CI, see [unattended runs](unattended.md).
 On the first interactive run, inspect the project and answer the trust
 prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
 Change the mode later with `/permissions`, or `openmax --permissions <mode>`
-from a shell; **Shift+Tab** cycles reasoning effort. See
+from a shell; **Shift+Tab** raises reasoning effort for this session. See
 [configuration](configuration.md#project-trust) for headless and stdio
 trust.
 
@@ -29,7 +29,7 @@ trust.
 | **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Cycle requested reasoning effort; inside a picker, select the previous row |
+| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved; `/effort` saves a level. Inside a picker, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
 
@@ -111,7 +111,8 @@ session or trust flags. `--account` defaults to `main`. See
 context-window configuration, and billing behavior.
 
 `--effort high` requests a reasoning effort level at launch. **Shift+Tab**
-cycles the levels the active endpoint and model take. Choose `default`,
+steps up through the levels the active endpoint and model take, for the
+running session only. Choose `default`,
 `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Levels depend on
 model support; a level the route is known to refuse (for example `max` on
 xAI's grok-4.x) is refused before any request, and provider errors are preserved. The setting follows the same

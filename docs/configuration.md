@@ -307,9 +307,9 @@ and the run that writes a key already uses it.
 
 - `reasoning_effort` (default unset): an explicit requested level: `none`,
   `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Use `/effort` for a
-  keyboard picker, Shift+Tab to cycle the active protocol's levels,
-  `/effort high` to select directly, or `--effort high` at launch. Session
-  choices persist, including selecting the current CLI level,
+  keyboard picker, Shift+Tab to step up through the active protocol's levels
+  for the running session only (it saves nothing), `/effort high` to select
+  directly, or `--effort high` at launch. `/effort` choices persist, including selecting the current CLI level,
   unless the endpoint is a temporary CLI override. In that case the saved
   endpoint keeps its own effort setting. `/effort default` removes the setting
   in that same scope; `--effort default` clears it for the run when the file

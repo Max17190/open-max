@@ -1370,8 +1370,8 @@ mod first_frame {
         assert!(shown.contains("stub-model"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto, "new trust grants already default to Auto");
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· none"));
-        assert!(shown.contains("· none"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· high"));
+        assert!(shown.contains("· high"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Auto);
         s.write(b"/permissions\r");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("new project default"));
@@ -1380,10 +1380,10 @@ mod first_frame {
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: readonly"));
         assert!(shown.contains("permissions: readonly"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
-        assert_eq!(open_max_core::config::load(&data).unwrap().reasoning_effort, Some(open_max_core::config::ReasoningEffort::None));
+        assert_eq!(open_max_core::config::load(&data).unwrap().reasoning_effort, None, "the key saves no effort");
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· minimal"));
-        assert!(shown.contains("· minimal"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("· xhigh"));
+        assert!(shown.contains("· xhigh"), "{shown}");
         assert_eq!(mode(), open_max_core::config::ApprovalMode::Readonly);
         s.write(b"/permissions ask\r");
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("permissions: ask"));
@@ -1514,8 +1514,8 @@ mod first_frame {
         let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: xhigh"));
         assert!(shown.contains("requested: xhigh"), "{shown}");
         s.write(b"\x1b[Z");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("requested: default"));
-        assert!(shown.contains("requested: default") && !shown.contains("requested: max"), "{shown}");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(5), |shown| shown.contains("effort default for this session"));
+        assert!(shown.contains("effort default for this session") && !shown.contains("effort max"), "{shown}");
         s.write(CTRL_C_TWICE);
         assert!(s.wait_exit(Duration::from_secs(5)).is_some_and(|status| status.success()), "{}", s.context());
 

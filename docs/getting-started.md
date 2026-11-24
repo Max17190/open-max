@@ -58,8 +58,10 @@ settings.json applies only to a project with no saved mode, such as one
 trusted by an earlier version. See
 [approval modes](configuration.md#approvals).
 
-Shift+Tab cycles requested model reasoning effort. `/effort` opens a picker,
-and `/effort high` or `--effort high` selects a level directly. Supported
+Shift+Tab steps the requested model reasoning effort up for the running
+session only, starting at `high` from the model's default; it saves nothing.
+`/effort` opens a picker that saves the level you choose, and `/effort high`
+or `--effort high` selects a level directly. Supported
 levels depend on the provider and model; Default leaves its request unset. A
 level the route is known to refuse, such as `max` on xAI's grok-4.x, is
 refused before any request is spent, naming the levels it takes.

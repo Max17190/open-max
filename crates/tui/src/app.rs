@@ -1383,12 +1383,21 @@ impl App {
             }
         }
 
-        // Open surfaces own the key; otherwise cycle the requested effort.
+        // Open surfaces own the key; otherwise step the requested effort up
+        // for this session alone: a press by habit must not change later
+        // sessions, and the model's default counts as medium, so the first
+        // press is high, never none. After the highest it wraps to default.
         if is_shift_tab(&key) {
+            self.refresh_project_root();
             let current = self.core.settings.lock().unwrap().reasoning_effort.map_or("default", config::ReasoningEffort::as_str);
             let levels = self.effort_levels();
-            let next = levels.iter().position(|level| *level == current).map_or(0, |at| (at + 1) % levels.len());
-            self.handle_submit(format!("/effort {}", levels[next])).await?;
+            let from = if current == "default" { "medium" } else { current };
+            let next = levels[levels.iter().position(|level| *level == from).map_or(0, |at| (at + 1) % levels.len())];
+            match self.core.set_reasoning_effort(config::ReasoningEffort::parse(next).unwrap_or_default(), false) {
+                Ok(_) => self.note(&format!("reasoning effort {next} for this session; /effort {next} saves it")),
+                Err(error) => self.error(&error),
+            }
+            self.dirty.mark_chrome();
             return Ok(());
         }
 
@@ -2324,7 +2333,7 @@ impl App {
                     Ok(effort) => effort,
                     Err(error) => { self.error(&error); return; }
                 };
-                match self.core.set_reasoning_effort(effort) {
+                match self.core.set_reasoning_effort(effort, true) {
                     Ok(persisted) => {
                         self.dirty.mark_chrome();
                         let scope = if persisted { "saved" } else { "for this run only (temporary endpoint)" };
@@ -3862,7 +3871,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
     ("enter while working", "steer the turn: the message joins it before its next request"),
     ("tab", "focus conversation ↔ composer"),
-    ("shift+tab", "cycle requested reasoning effort"),
+    ("shift+tab", "raise reasoning effort for this session · /effort saves"),
     ("↑↓ / j k in history", "select a block · enter fold · y copy"),
     ("[ ] in history", "jump to previous or next user turn (shift+↑↓ too)"),
     ("g / G in history", "top of scrollback · follow latest"),
@@ -4917,18 +4926,18 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The effort shortcut persists each level and wraps to Default without
-    /// changing the trusted project's permission mode.
+    /// The effort shortcut steps up from the model's default, counted as
+    /// medium, and wraps to Default without saving a level or changing the
+    /// trusted project's permission mode.
     #[tokio::test]
     async fn shift_tab_cycles_effort_without_changing_saved_project_permissions() {
         let (mut app, dir) = app_fixture();
         app.core.set_project_approval_mode(&app.project, config::ApprovalMode::Auto).unwrap();
-        for level in config::ReasoningEffort::LEVELS.iter().skip(1).chain(config::ReasoningEffort::LEVELS.iter().take(1)) {
+        for level in ["high", "xhigh", "max", "default"] {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
-            let selected = config::ReasoningEffort::parse(level).unwrap();
-            assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, selected);
+            assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, config::ReasoningEffort::parse(level).unwrap());
             let next = Core::new(dir.clone()).unwrap().0;
-            assert_eq!(next.settings.lock().unwrap().reasoning_effort, selected);
+            assert_eq!(next.settings.lock().unwrap().reasoning_effort, None);
             assert_eq!(next.approval_mode(&app.project), config::ApprovalMode::Auto);
         }
         fs::write(dir.join("providers.json"), r#"{"providers":{"native":{"base_url":"https://api.anthropic.com/v1","wire_api":"anthropic"}}}"#).unwrap();
@@ -4937,11 +4946,32 @@ mod tests {
         let choices: Vec<_> = app.completion.as_ref().unwrap().items.iter().map(|item| item.insert.as_str()).collect();
         assert_eq!(choices, ["/effort default", "/effort low", "/effort medium", "/effort high", "/effort xhigh", "/effort max"]);
         app.completion = None;
-        for level in ["low", "medium", "high", "xhigh", "max", "default"] {
+        for level in ["high", "xhigh", "max", "default"] {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
             assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, config::ReasoningEffort::parse(level).unwrap());
             assert_eq!(app.core.approval_mode(&app.project), config::ApprovalMode::Auto);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Shift+Tab changes the requested effort for this session alone and says
+    /// so: settings.json keeps the saved effort through a later save, such as
+    /// a model selection, so the next session and print run start at it.
+    /// `/effort` is the deliberate way to save one.
+    #[tokio::test]
+    async fn shift_tab_changes_effort_for_this_session_and_saves_nothing() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/effort low".into()).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("reasoning effort medium for this session; /effort medium saves it"), "{shown}");
+        app.handle_submit("/model other-model".into()).await.unwrap();
+        let saved = config::load(&dir).unwrap();
+        assert_eq!((saved.model.as_str(), saved.reasoning_effort), ("other-model", Some(config::ReasoningEffort::Low)));
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
+        app.handle_submit("/effort medium".into()).await.unwrap();
+        assert_eq!(config::load(&dir).unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5084,7 +5114,7 @@ mod tests {
         for _ in 0..2 {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
-        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::XHigh));
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
         assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Readonly);
         fs::remove_dir_all(dir).unwrap();
@@ -5098,7 +5128,7 @@ mod tests {
         for _ in 0..2 {
             app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         }
-        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::XHigh));
         assert_eq!(app.core.approval_mode(&project), config::ApprovalMode::Readonly);
         assert_eq!(Core::new(dir.clone()).unwrap().0.approval_mode(&project), config::ApprovalMode::Readonly);
         fs::remove_dir_all(dir).unwrap();
@@ -5512,9 +5542,9 @@ mod tests {
                 let draft = "keep this draft\nand its second line";
                 app.composer.load(draft);
                 app.on_key(key).await.unwrap();
-                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::None));
+                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::High));
                 app.on_key(key).await.unwrap();
-                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Minimal));
+                assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::XHigh));
                 assert_eq!(app.core.approval_mode(&app.project), mode);
                 assert_eq!(app.composer.text(), draft, "effort shortcuts must preserve a multiline draft");
                 fs::remove_dir_all(dir).unwrap();
