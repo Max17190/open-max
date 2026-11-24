@@ -198,6 +198,21 @@ async fn page_keys_scroll_the_transcript_one_page() {
 }
 
 #[tokio::test]
+async fn the_approval_card_shows_explicit_actions_not_an_enter_selection() {
+    let (mut app, dir) = app_fixture();
+    let mut turn = waiting_turn(&app, "ap");
+    app.on_agent_event(approval("ap", "bash"));
+    let (rows, _) = frame(&mut app, 60, 20);
+    let actions = rows.iter().find(|row| row.contains("[y] Allow once")).unwrap();
+    press(&mut app, key(KeyCode::Enter)).await;
+    assert!(matches!(turn.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+    press(&mut app, key(KeyCode::Char('y'))).await;
+    assert_eq!(turn.try_recv(), Ok(true));
+    assert!(!actions.contains('▸'), "{actions}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn approval_keys_and_clicks_answer_the_waiting_turn() {
     for (answer, approved) in [
         (key(KeyCode::Char('y')), true),
@@ -889,8 +904,8 @@ fn the_approval_body_gives_the_env_grant_the_width_first() {
 fn a_two_row_approval_card_shows_the_grant_before_the_call() {
     let env = vec!["TOKEN".to_string()];
     let lines = |env: &[String], height| lines_text(&compact_approval_lines("bash", "ls", "", env, 60, height));
-    assert_eq!(lines(&env, 2), ["receives env: TOKEN  ls", "▸ [y] Allow once [a] Auto for project [n] Deny"]);
-    assert_eq!(lines(&[], 2)[1], "▸ [y] Allow once [a] Auto for project [n] Deny");
+    assert_eq!(lines(&env, 2), ["receives env: TOKEN  ls", "[y] Allow once [a] Auto for project [n] Deny"]);
+    assert_eq!(lines(&[], 2)[1], "[y] Allow once [a] Auto for project [n] Deny");
     assert!(lines(&[], 2)[0].ends_with("ls"));
     assert!(!lines(&[], 2)[0].contains("receives env"));
     let three = lines(&env, 3);
@@ -1292,7 +1307,7 @@ fn a_scrolled_view_pins_its_prompt_and_places_the_marker_by_position() {
     assert!(rows[1].starts_with("answer line 7 "), "{rows:#?}");
     assert!(rows[8].starts_with("answer line 14 "), "{rows:#?}");
     let border = all.iter().position(|row| row.starts_with('╭')).unwrap();
-    assert!(all[border - 1].contains("esc follow"), "the status row is intact: {all:#?}");
+    assert!(all[border - 1].contains("pgup/pgdn scroll"), "the status row is intact: {all:#?}");
     // Six of twelve rows from the top: the marker is mid-track.
     app.transcript.scroll_up(2);
     let rows = chat_rows(&mut app);

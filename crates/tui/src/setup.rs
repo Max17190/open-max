@@ -26,6 +26,10 @@ pub(crate) type Keys<'a> = Box<dyn futures_util::Stream<Item = std::io::Result<E
 
 pub(crate) type Selection = (String, String);
 
+pub(crate) fn has_terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 /// Ok with the connection and model an API login saved, else Ok(None).
 pub async fn run(
     dir: &Path,
@@ -33,7 +37,7 @@ pub async fn run(
     target: Option<&str>,
     keys: Option<Keys<'_>>,
 ) -> Result<Option<Selection>, String> {
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    if !has_terminal() {
         return Err("provider setup needs an interactive terminal".into());
     }
     let snapshot = providers::read_catalog(dir)?;

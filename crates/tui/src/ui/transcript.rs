@@ -441,6 +441,7 @@ pub struct Transcript {
     total: usize,
     width: u16,
     offset: usize,
+    start_at_block: Option<usize>,
     /// Blocks appended while the view was scrolled up, so the chrome can
     /// offer "N new" next to the re-arm hint. Cleared whenever the view
     /// reaches the bottom again; a later scroll-up must start from zero, not
@@ -474,6 +475,12 @@ impl Transcript {
     /// Append styled lines as a system/notice block.
     pub fn push(&mut self, lines: Vec<Line<'static>>) {
         self.push_kind(BlockKind::System, lines);
+    }
+
+    /// Open an appended block at its first line if it does not fit.
+    pub fn show_latest_from_start(&mut self) {
+        self.follow();
+        self.start_at_block = self.blocks.len().checked_sub(1);
     }
 
     pub fn push_kind(&mut self, kind: BlockKind, mut lines: Vec<Line<'static>>) {
@@ -728,6 +735,10 @@ impl Transcript {
     /// wrapped.
     pub fn settle_view(&mut self, rows: usize, tail_len: usize) {
         self.view = (rows, tail_len);
+        if let Some(block) = self.start_at_block.take().filter(|&block| block < self.blocks.len()) {
+            self.wrap_block(block);
+            self.offset = (self.total - self.index.start(block) + tail_len).saturating_sub(rows);
+        }
         self.settle(0, 0);
         let view = self.window(0, 0);
         let budget = WRAP_BUDGET;
@@ -1071,6 +1082,7 @@ impl Transcript {
     }
 
     pub fn follow(&mut self) {
+        self.start_at_block = None;
         self.offset = 0;
         self.unread = 0;
         self.selected = None;
