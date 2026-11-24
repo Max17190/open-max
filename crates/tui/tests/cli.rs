@@ -4492,7 +4492,7 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
 
 #[test]
 fn assistant_text_never_dispatches_a_tool() {
-    let call = r#"<tool_call>{"name":"write_file","arguments":{"path":"side-effect.txt","content":"written"}}</tool_call>"#;
+    let call = r#"<tool_call>{"name":"write_file","arguments":{"path":"side-effect.txt","content":"written",}}</tool_call>"#;
     for (text, tries) in [(call.to_string(), 3), (format!("Document `{call}`; do not run it."), 1),
         ("```tool_call\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"side-effect.txt\",\"content\":\"written\"}}\n```".into(), 1)] {
         let (project, home) = fresh_dirs("text-is-not-a-call");
@@ -4504,7 +4504,7 @@ fn assistant_text_never_dispatches_a_tool() {
         assert_eq!(out.status.code(), Some(0), "{stderr}");
         assert_eq!(requests.lock().unwrap().len(), tries);
         assert!(!project.join("side-effect.txt").exists(), "prose executed: {stderr}");
-        assert_eq!(stderr.lines().any(|line| line == "openmax: error: A tool call kept arriving as text. Nothing from it ran."), tries == 3, "{stderr}");
+        assert_eq!(stderr.lines().any(|line| line == "openmax: error: The reply wrote a tool call as text. Nothing from it ran."), tries == 3, "{stderr}");
         let sessions = home.join(".openmax/sessions");
         let path = sessions.read_dir().unwrap().flatten().map(|e| e.path())
             .find(|path| path.to_string_lossy().ends_with(".messages.json")).unwrap();

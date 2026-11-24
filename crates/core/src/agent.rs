@@ -218,8 +218,7 @@ pub fn start_turn(
     // Titling here would fail-open secret/PII gates into the session index.
 
     let turn = {
-        let (core, session_id, project_root) =
-            (core.clone(), session_id.clone(), project_root.clone());
+        let (core, session_id) = (core.clone(), session_id.clone());
         async move {
             run_loop(&core, &session_id, &project_root, user_text, settings, cancelled).await
         }
@@ -228,32 +227,31 @@ pub fn start_turn(
     Ok(())
 }
 
-/// Run one turn to completion and guarantee it ends observably.
-///
-/// A turn owns the only terminator its clients get. A panic inside the loop
-/// would unwind past both the `Done` event and the bookkeeping below, leaving
-/// the session marked running forever: the TUI spinner never stops, a
-/// `--stdio` frontend blocks on a `done` that can no longer arrive, and every
-/// later prompt is refused because the session still looks busy. Isolating the
-/// loop in its own task turns that unwind into an ordinary error report.
-fn spawn_guarded_turn<F>(core: Arc<Core>, session_id: String, turn: F)
-where
-    F: std::future::Future<Output = String> + Send + 'static,
-{
+/// A turn owns the only terminator its clients get, even if the loop panics.
+fn spawn_guarded_turn(core: Arc<Core>, session_id: String, turn: impl std::future::Future<Output = String> + Send + 'static) {
+    spawn_session_work(core, session_id, "the turn", turn, |core, id, result| {
+        let stop_reason = result.unwrap_or_else(|message| {
+            core.send_agent(id, AgentEvent::Error { message });
+            "error".into()
+        });
+        vec![AgentEvent::Done { stop_reason }]
+    });
+}
+
+/// Isolate panics in session work, then settle before publishing its receipt.
+fn spawn_session_work<T: Send + 'static>(
+    core: Arc<Core>,
+    session_id: String,
+    subject: &'static str,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+    receipts: impl FnOnce(&Core, &str, Result<T, String>) -> Vec<AgentEvent> + Send + 'static,
+) {
     tokio::spawn(async move {
-        let stop_reason = match tokio::spawn(turn).await {
-            Ok(reason) => reason,
-            Err(join) => {
-                let detail = join_failure(join, "turn");
-                core.send_agent(&session_id, AgentEvent::Error {
-                    message: format!("the turn ended unexpectedly: {detail}"),
-                });
-                "error".into()
-            }
-        };
-        // Settle and publish under the admission lock. A consumer can start
-        // immediately on Done without a late cleanup deleting its new token.
-        finish_session_work(&core, &session_id, vec![AgentEvent::Done { stop_reason }]).await;
+        let result = tokio::spawn(work).await.map_err(|join| {
+            let detail = join_failure(join, subject.trim_start_matches("the "));
+            format!("{subject} ended unexpectedly: {detail}")
+        });
+        finish_session_work(&core, &session_id, receipts(&core, &session_id, result)).await;
     });
 }
 
@@ -362,36 +360,16 @@ pub fn compact_session(
     project_root: &Path,
 ) -> Result<(), String> {
     let cancelled = claim_session(core, session_id, project_root, "compacting", false)?;
-    let core = core.clone();
-    let session_id = session_id.to_string();
-    let project_root = project_root.to_path_buf();
-    tokio::spawn(async move {
-        let work = {
-            let core = core.clone();
-            let session_id = session_id.clone();
-            let project_root = project_root.clone();
-            let cancelled = cancelled.clone();
-            tokio::spawn(async move {
-                run_compact(&core, &session_id, &project_root, &cancelled).await
-            })
-        };
-        // Guarded like a turn: a panic inside must still release the claim
-        // and say something, or the session looks busy forever.
-        let outcome = match work.await {
-            Ok(outcome) => outcome,
-            Err(join) => {
-                let detail = join_failure(join, "compaction");
-                Err(format!("compaction ended unexpectedly: {detail}"))
-            }
-        };
-        let events = match outcome {
-            Ok(receipt) => vec![
-                AgentEvent::Budget { used_tokens: receipt.tokens_after, context_tokens: receipt.context_tokens },
-                AgentEvent::Compacted { tokens_before: receipt.tokens_before, tokens_after: receipt.tokens_after, compacted_messages: receipt.compacted_messages },
-            ],
-            Err(message) => vec![AgentEvent::Error { message }],
-        };
-        finish_session_work(&core, &session_id, events).await;
+    let work = {
+        let (core, session_id, project_root) = (core.clone(), session_id.to_string(), project_root.to_path_buf());
+        async move { run_compact(&core, &session_id, &project_root, &cancelled).await }
+    };
+    spawn_session_work(core.clone(), session_id.to_string(), "compaction", work, |_, _, result| match result.and_then(std::convert::identity) {
+        Ok(receipt) => vec![
+            AgentEvent::Budget { used_tokens: receipt.tokens_after, context_tokens: receipt.context_tokens },
+            AgentEvent::Compacted { tokens_before: receipt.tokens_before, tokens_after: receipt.tokens_after, compacted_messages: receipt.compacted_messages },
+        ],
+        Err(message) => vec![AgentEvent::Error { message }],
     });
     Ok(())
 }
@@ -728,7 +706,8 @@ async fn run_loop(
     // The soft request budget: said before the prompt, or set from the turn's pace (`request_budget_cycles`, unless `request_budget` is set, 0 included) on the first round that runs a command after a file change, then at its marks. Both count the loop's requests, as the marks always have: a retry of one request is not another. It ends nothing.
     let (mut request_budget, mut budget_noted, mut edited, mut ran) = (settings.request_budget.filter(|&budget| budget > 0), 0, false, false);
     if let Some(budget) = request_budget { insert_startup_note(core, session_id, guard.messages(), crate::notes::request_budget_start_note(budget, 0, &mut budget_noted)); }
-    let (mut repeats, mut text_calls) = (RepeatTracker::default(), 0);
+    let mut repeats = RepeatTracker::default();
+    let mut text_calls = 0;
     // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
     let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
     let (mut at_reserve, mut reserve_only, mut reserve_refusal) = (false, false, None);
@@ -965,9 +944,9 @@ async fn run_loop(
             stop_reason = TRUNCATED.into();
             break 'turns;
         }
-        let written_call = if !capped && tool_calls.is_empty() && result.content.trim_start().starts_with(['{', '<', '`']) && matches!(result.finish_reason.as_str(), "stop" | "tool_calls") {
-            crate::notes::written_call_json(&result.content, registry.tool_schemas_json())
-        } else { None };
+        let written_call = (!capped && tool_calls.is_empty() && matches!(result.finish_reason.as_str(), "stop" | "tool_calls")
+            && (content.trim_start().starts_with(['{', '`']) || content.trim_end().ends_with("</tool_call>")))
+            .then(|| crate::notes::written_call_json(&content, registry.tool_schemas_json())).flatten();
         text_calls = written_call.map_or(0, |_| text_calls + 1);
         // The output cap is different: the reply is the model's own, and the
         // calls it finished before the cut run as usual. Only the last call,
@@ -983,15 +962,12 @@ async fn run_loop(
             // when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
             if let Some(valid) = written_call {
-                if text_calls > 2 || iteration + 1 == max_iterations {
-                    crate::notes::report_written_call_end(core, session_id, text_calls);
-                    stop_reason = result.finish_reason;
-                    break 'turns;
+                if text_calls <= 2 && iteration + 1 < max_iterations {
+                    let at = guard.messages().len();
+                    insert_note(core, session_id, guard.messages(), at, crate::notes::written_call_note(valid));
+                    save_messages(core, session_id, guard.messages(), false).await;
+                    continue 'turns;
                 }
-                let at = guard.messages().len();
-                insert_note(core, session_id, guard.messages(), at, crate::notes::written_call_note(valid));
-                save_messages(core, session_id, guard.messages(), false).await;
-                continue 'turns;
             }
             // Cut while still thinking or writing, before any call: not an
             // answer, so not an end and no turn_end consult. The reply stays
@@ -1115,6 +1091,9 @@ async fn run_loop(
             // turn_end run, so the late site stays quiet: one end, one fire.
             turn_end_fired = true;
             stop_reason = if refused || outcome.unverified { "unverified".into() } else if capped { "length".into() } else { result.finish_reason };
+            if written_call.is_some() {
+                core.send_agent(session_id, AgentEvent::Error { message: "The reply wrote a tool call as text. Nothing from it ran.".into() });
+            }
             // An end that stands with every gate passing names them, so it reads apart from one no gate judged.
             if !refused && !outcome.unverified && !outcome.passed.is_empty() {
                 core.send_agent(session_id, AgentEvent::TurnVerified { hooks: outcome.passed });
@@ -1275,55 +1254,144 @@ async fn run_loop(
                 // Read live so selecting auto on an approval card takes effect
                 // for the rest of this turn, not just the next one.
                 let approval_mode = core.approval_mode_canonical(&canonical_root);
-                let mutating = registry.is_mutating(name);
-                let unapproved = (approval_mode != ApprovalMode::Auto)
+                let force_allow = matches!(perm, PermissionDecision::Allow);
+                let force_ask = matches!(perm, PermissionDecision::Ask);
+                let unapproved_source = (approval_mode != ApprovalMode::Auto)
                     .then(|| unapproved_capability(&registry, &core.data_dir, project_root, name))
                     .flatten();
-                let mut grant = None;
-                let refusal = match approval_mode {
-                    ApprovalMode::Readonly if mutating => Some("This session is read-only; mutating tools are disabled. Explain what you would do instead.".into()),
-                    ApprovalMode::Readonly if unapproved.is_some() || perm == PermissionDecision::Ask => Some("This session is read-only; calls requiring approval are disabled.".into()),
-                    ApprovalMode::Ask if unapproved.is_some() || perm == PermissionDecision::Ask || (mutating && perm != PermissionDecision::Allow) => {
-                        let source = unapproved.as_ref();
-                        let reason = if source.is_some() { "unapproved_source" } else { "gate" };
-                        let answer = request_approval(core, session_id, name, &args, reason, source, &cancelled).await;
-                        // A card may wait for minutes. Honor a saved mode change before running or recording a grant.
-                        core.refresh_saved_approval_modes();
-                        match answer {
-                            ApprovalOutcome::Approved => match core.approval_mode_canonical(&canonical_root) {
-                                ApprovalMode::Readonly => Some("This session is now read-only; the pending action was not executed.".into()),
-                                mode => {
-                                    grant = source.filter(|_| mode != ApprovalMode::Auto);
-                                    None
-                                }
-                            },
-                            ApprovalOutcome::Declined => Some(match source {
-                                Some(source) if agent_spawned() => nested_session_declined_message(source),
-                                _ => declined_message(source),
-                            }),
-                            ApprovalOutcome::TimedOut => Some(APPROVAL_TIMEOUT_MESSAGE.into()),
-                            ApprovalOutcome::Cancelled => {
-                                end_cancelled(core, session_id, &call.id, guard.messages());
-                                stop_reason = "cancelled".into();
-                                break 'turns;
-                            }
+                let mut executed = false;
+                let (outcome, turn_cancelled) = if registry.is_mutating(name) && approval_mode == ApprovalMode::Readonly {
+                    (tools::ToolOutcome::err("This session is read-only; mutating tools are disabled. Explain what you would do instead."), false)
+                } else if approval_mode == ApprovalMode::Readonly
+                    && (unapproved_source.is_some() || force_ask)
+                {
+                    (tools::ToolOutcome::err("This session is read-only; calls requiring approval are disabled."), false)
+                } else if approval_mode == ApprovalMode::Ask
+                    && (unapproved_source.is_some() || (!force_allow && (force_ask || registry.is_mutating(name))))
+                {
+                    let source = unapproved_source.as_ref();
+                    let approval_reason =
+                        if source.is_some() { "unapproved_source" } else { "gate" };
+                    let answer = request_approval(core, session_id, name, &args, approval_reason, source, &cancelled).await;
+                    // A card can wait for minutes. Read the store back so
+                    // readonly saved in another frontend meanwhile refuses
+                    // the action, as readonly selected here does.
+                    core.refresh_saved_approval_modes();
+                    match answer {
+                        ApprovalOutcome::Approved if core.approval_mode_canonical(&canonical_root) == ApprovalMode::Readonly => {
+                            (tools::ToolOutcome::err("This session is now read-only; the pending action was not executed."), false)
                         }
+                        ApprovalOutcome::Approved => {
+                            let source = source.filter(|_| core.approval_mode_canonical(&canonical_root) != ApprovalMode::Auto);
+                            executed = true;
+                            // Approving the first run of an unapproved tool
+                            // approves this exact content - the manifest and
+                            // the code it runs: later runs of the same bytes
+                            // need no prompt, any edit to either revokes.
+                            // Whether the grant is now recorded: only then does
+                            // the receipt below promise cardless future calls.
+                            // If recording failed (e.g. the manifest changed
+                            // while the card was open), the NEXT call asks
+                            // again, so a "runs without a card" receipt would
+                            // lie.
+                            let recorded = match source {
+                                None => false,
+                                Some(source) => match crate::ledger::approve_capability_in_session(
+                                    &core.data_dir,
+                                    project_root,
+                                    &source.source_path,
+                                    &source.shas,
+                                    session_id,
+                                ) {
+                                    // approve() records the manifest hash and
+                                    // every bound file it could READ. When the
+                                    // manifest points at code that is missing
+                                    // or unreadable, that entry hashes to
+                                    // nothing, so `covers_code` stays false and
+                                    // the NEXT call still stops for a card - a
+                                    // "runs without a card" receipt would lie.
+                                    // "Recorded" therefore means
+                                    // the grant now covers the exact bytes the
+                                    // gate re-reads, not merely that a record
+                                    // was written: re-run that gate and believe
+                                    // its answer.
+                                    Ok(()) => unapproved_capability(
+                                        &registry,
+                                        &core.data_dir,
+                                        project_root,
+                                        name,
+                                    )
+                                    .is_none(),
+                                    Err(e) => {
+                                        core.send_agent(session_id, AgentEvent::Error {
+                                            message: format!(
+                                                "approval was granted but could not be recorded (the tool will ask again): {e}"
+                                            ),
+                                        });
+                                        false
+                                    }
+                                },
+                            };
+                            let mut outcome = registry
+                                .execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone())
+                                .await;
+                            // The decline path speaks; the approve path was
+                            // silent, so an approved call looked identical to
+                            // one that never stopped - and a model that saw
+                            // its edited tool re-prompt (correctly) and then
+                            // run concluded that revocation does not work,
+                            // and taught the human so. Say what just happened -
+                            // but only claim cardless future calls when the
+                            // grant actually landed.
+                            if let Some(source) = source {
+                                // Rides outcome.output, which is both the tool
+                                // message the model reads AND the ToolEnd
+                                // event's output on the wire - so no separate
+                                // HarnessNote here, or a v5 frontend renders
+                                // the receipt twice. The notes that
+                                // DO emit HarnessNote are appended after ToolEnd
+                                // has already gone out, so the wire needs them.
+                                let note = if recorded {
+                                    format!(
+                                        "[approved by the user: {} ({}) — later calls of these exact \
+                                         bytes run without a card; any edit to the manifest or its \
+                                         code asks again]",
+                                        source.path,
+                                        short_sha(&source.sha256)
+                                    )
+                                } else {
+                                    format!(
+                                        "[the user approved this call, but the approval could not be \
+                                         recorded, so the NEXT call of {} stops for a card again]",
+                                        source.path
+                                    )
+                                };
+                                // The one note that does NOT go through
+                                // `append_and_emit_note`, so it flattens here:
+                                // `source.path` is the manifest's own filename.
+                                outcome
+                                    .output
+                                    .push_str(&format!("\n{}", crate::text::one_line(&note)));
+                            }
+                            (outcome, false)
+                        }
+                        ApprovalOutcome::Declined => (tools::ToolOutcome::err(match source {
+                            Some(source) if agent_spawned() => nested_session_declined_message(source),
+                            _ => declined_message(source),
+                        }), false),
+                        ApprovalOutcome::TimedOut => (tools::ToolOutcome::err(APPROVAL_TIMEOUT_MESSAGE), false),
+                        ApprovalOutcome::Cancelled => (tools::ToolOutcome::err(USER_CANCELLED), true),
                     }
-                    _ => None,
-                };
-                let executed = refusal.is_none();
-                let outcome = if let Some(reason) = refusal {
-                    tools::ToolOutcome::err(reason)
                 } else {
-                    // Record before running; the receipt rides both the result on disk and its ToolEnd event.
-                    let receipt = grant.map(|source| approval_receipt(core, session_id, project_root, &registry, name, source));
-                    let mut outcome = registry.execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone()).await;
-                    if let Some(receipt) = receipt {
-                        outcome.output.push('\n');
-                        outcome.output.push_str(&receipt);
-                    }
-                    outcome
+                    executed = true;
+                    (registry.execute(name, &args, &core.data_dir, project_root, caps, cancelled.clone()).await, false)
                 };
+
+                if turn_cancelled {
+                    end_cancelled(core, session_id, &call.id, guard.messages());
+                    stop_reason = "cancelled".into();
+                    break 'turns;
+                }
 
                 if executed {
                     let failures = hooks.post_tool_use(session_id, name, &args, project_root, &outcome, &cancelled).await;
@@ -1360,7 +1428,17 @@ async fn run_loop(
                     // but never widen it; `deny`/`ask` need no approval,
                     // and unapproved `allow` rules are dropped at load.
                     let current = Permissions::discover_for_mode(project_root, &core.data_dir, core.approval_mode_canonical(&canonical_root));
-                    narrate_permissions_reload(core, session_id, project_root, &mut permissions, current, guard.messages()).await;
+                    let inert: Vec<String> = current.notices().to_vec();
+                    // A mutation that leaves permissions.toml malformed
+                    // bricks EVERY tool call for the rest of this turn
+                    // (the snapshot floors it), and only the notices path
+                    // spoke - a wall of denies with no cause, and the
+                    // prescribed `openmax --check` needs bash, which is
+                    // now denied. Say it on the writing call, once, with
+                    // the parse reason and the turn-scoped rule.
+                    let fail_closed_now = current.fail_closed_reason().map(str::to_string);
+                    permissions.reload(current);
+                    narrate_permissions_reload(core, session_id, project_root, &permissions, fail_closed_now, inert, guard.messages()).await;
                     changes.after_mutation(core, session_id, project_root, &canonical_root, &registry, guard.messages());
                 }
             }
@@ -1538,23 +1616,6 @@ pub(crate) fn unapproved_capability(
         env: ext.env.clone(),
         source_path: ext.source_path.clone(),
         shas,
-    })
-}
-
-#[cold]
-fn approval_receipt(core: &Core, session_id: &str, root: &Path, registry: &Registry, name: &str, source: &UnapprovedCapability) -> String {
-    // A record may still not cover missing or changed code. Recheck the same gate before promising no card.
-    let recorded = match crate::ledger::approve_capability_in_session(&core.data_dir, root, &source.source_path, &source.shas, session_id) {
-        Ok(()) => unapproved_capability(registry, &core.data_dir, root, name).is_none(),
-        Err(e) => {
-            core.send_agent(session_id, AgentEvent::Error { message: format!("approval was granted but could not be recorded (the tool will ask again): {e}") });
-            false
-        }
-    };
-    crate::text::one_line(&if recorded {
-        format!("[approved by the user: {} ({}) \u{2014} later calls of these exact bytes run without a card; any edit to the manifest or its code asks again]", source.path, short_sha(&source.sha256))
-    } else {
-        format!("[the user approved this call, but the approval could not be recorded, so the NEXT call of {} stops for a card again]", source.path)
     })
 }
 

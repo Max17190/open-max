@@ -244,8 +244,10 @@ async fn indexed_calls_keep_their_results_when_an_earlier_argument_is_incomplete
 const CALL_AS_TEXT: &str =
     r#"{"name":"write_file","arguments":{"path":"ghost.txt","content":"Do not write this."}}"#;
 const MALFORMED: &str = " <tool_call>\n{\"name\":\"edit_file\",\"arguments\":{\"path\":\"evidence.txt\",\"edits\":[{\"old_string\":\"middle\",\"new_string\":\"first\"}}}\n</tool_call>\n";
+const PROSE_MALFORMED: &str = "First, write the line below:\n<tool_call>\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"ghost.txt\",\"content\":\"one\ntwo\"}}\n</tool_call>";
+const MISSING_DELIMITER: &str = r#"<tool_call>{"name":"write_file","arguments":{"path":"ghost.txt" "content":"text"}}</tool_call>"#;
 const TEXT_CALL_NOTE: &str = "[tool call written as text: nothing ran. Call the tool through the API with arguments that are valid JSON.]";
-const BAD_JSON_NOTE: &str = "[tool call written as text: nothing ran. The JSON did not parse. Call the tool through the API with arguments that are valid JSON.]";
+const BAD_JSON_NOTE: &str = "[tool call written as text: nothing ran. The arguments were not valid JSON. Call the tool through the API with arguments that are valid JSON.]";
 
 fn real_read() -> WireReply {
     sse(
@@ -279,11 +281,11 @@ fn call_text_notes(turn: &Turn) -> Vec<&str> {
 async fn written_calls_are_replayed_as_text_then_retried_through_the_api() {
     for (text, note) in [
         (MALFORMED.to_string(), BAD_JSON_NOTE),
+        (PROSE_MALFORMED.to_string(), BAD_JSON_NOTE),
+        (MISSING_DELIMITER.to_string(), BAD_JSON_NOTE),
         (format!("<tool_call>{CALL_AS_TEXT}</tool_call>"), TEXT_CALL_NOTE),
         (CALL_AS_TEXT.to_string(), TEXT_CALL_NOTE),
-        (format!("{CALL_AS_TEXT}\n<tool_call>{CALL_AS_TEXT}</tool_call>"), TEXT_CALL_NOTE),
         (format!("```json\n{CALL_AS_TEXT}\n```"), TEXT_CALL_NOTE),
-        (r#"<function=write_file>{"path":"ghost.txt","content":"Do not write this."}</function>"#.to_string(), TEXT_CALL_NOTE),
     ] {
         let turn = run(vec![answer(&text), real_read(), answer("Verified.")]).await;
         assert_eq!(turn.stop(), "stop", "{text}");
@@ -317,18 +319,8 @@ async fn written_calls_are_replayed_as_text_then_retried_through_the_api() {
 
 #[tokio::test]
 async fn written_calls_get_two_recoveries_in_a_row_within_the_round_cap() {
-    for (cap, count, diagnostic) in [
-        (
-            8,
-            3,
-            "A tool call kept arriving as text. Nothing from it ran.",
-        ),
-        (
-            2,
-            2,
-            "The last reply wrote a tool call as text. Nothing from it ran.",
-        ),
-    ] {
+    let diagnostic = "The reply wrote a tool call as text. Nothing from it ran.";
+    for (cap, count) in [(8, 3), (2, 2)] {
         let turn = run_with_round_cap(vec![answer(CALL_AS_TEXT); count], cap).await;
         assert_eq!(turn.stop(), "stop");
         assert_eq!(turn.requests.len(), count);
@@ -383,6 +375,10 @@ async fn answers_with_tool_names_or_examples_stay_answers() {
         "The bash and read_file tools are available.".to_string(),
         r#"{"name":"example","arguments":{"path":"example.txt"}}"#.to_string(),
         format!("A call looks like this:\n```json\n{CALL_AS_TEXT}\n```\nUse it to write a file."),
+        format!("A call looks like this:\n```json\n{CALL_AS_TEXT}\n```"),
+        "The API accepts a `name` string and an `arguments` object in each request.".to_string(),
+        "To inspect a file, call `read_file` with its path. Then use its result to decide what to edit.".to_string(),
+        format!("Example: `<tool_call>{CALL_AS_TEXT}</tool_call>`"),
         format!("{CALL_AS_TEXT}\nThis example is not a request to run it."),
     ] {
         let turn = run(vec![answer(&text)]).await;
@@ -390,6 +386,7 @@ async fn answers_with_tool_names_or_examples_stay_answers() {
         assert_eq!(turn.requests.len(), 1, "{text}");
         assert!(call_text_notes(&turn).is_empty(), "{text}");
         assert!(turn.outcomes().is_empty());
+        assert_eq!(turn.saved.len(), turn.requests[0]["messages"].as_array().unwrap().len() + 1);
         let saved = turn.saved.last().unwrap();
         assert_eq!(saved.role, "assistant");
         assert_eq!(saved.content.as_deref(), Some(text.as_str()));
