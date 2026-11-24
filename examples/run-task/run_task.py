@@ -215,8 +215,10 @@ def main():
         replay = shlex.join([openmax, "--replay", str(out / "events.jsonl"), "--json"])
 
     # The verdict: the checks as this process runs them, on the tree the run
-    # left. A run stopped by a signal, or one that never started, gets none.
-    ran = code in (0, 1, NOT_VERIFIED)
+    # left. A run stopped by a signal, or one that never started, gets none: an
+    # exit 3 after a turn's `done` is a run that declined an approval, not an
+    # untrusted repository.
+    ran = code in (0, 1, NOT_VERIFIED) or (code == NOT_TRUSTED and stop_reason is not None)
     after = (run_task_checks.run_checks(args.check, repo, run_task_checks.GATE_SECONDS)
              + run_task_checks.run_checks(args.final_check, repo)) if ran else []
     checks = []

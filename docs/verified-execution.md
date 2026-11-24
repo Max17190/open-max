@@ -111,7 +111,7 @@ and `after` exit codes, `refusals`, `gates_passed`, `changes` (the patch) and
 | 0 | The run ended and every check passed when the script ran it afterwards |
 | 1 | Open Max failed, for example the endpoint could not be reached |
 | 2 | The call could not start: a usage error, a gate that is not installed, does not load or is not the shipped file, or a `--check` too slow for the gate |
-| 3 | The repository is not trusted |
+| 3 | The repository is not trusted, or Open Max declined an approval request, as it does for a project not in `auto` mode |
 | 4 | The turn ended `unverified`, `length`, `max_iterations` or `budget_exhausted`, or a check failed afterwards |
 | 128 + N | Signal N stopped the run |
 

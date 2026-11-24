@@ -1362,7 +1362,7 @@ tail -n 1 /tmp/flaky.log
   grants nothing itself. The child runs in this project's approval mode, or in
   a stricter one saved for a path inside `.worktrees`, never in a looser one.
   A print-mode turn declines every approval, so in `ask` its mutating calls
-  are declined.
+  are declined and the run exits 3.
 - When the child ends, finished, failed, or stopped by SIGINT, SIGTERM, SIGHUP
   or SIGQUIT, its tool processes are stopped, everything it changed is
   committed to its branch (`git add --all`, then a commit with signing off,
@@ -1375,7 +1375,7 @@ tail -n 1 /tmp/flaky.log
   A child that changed nothing leaves no branch. Take the work with
   `git merge` or `git cherry-pick`, or delete the branch.
 - Exit status: 128 plus the signal's number after a signal; otherwise the
-  turn's, as print mode's (0, 1, 4), except that a finished turn exits 1 when
+  turn's, as print mode's (0, 1, 3, 4), except that a finished turn exits 1 when
   its work cannot all be put on its branch (changes inside a nested
   repository or a submodule included, and commits there that no
   remote-tracking branch holds, which a commit here records only by their

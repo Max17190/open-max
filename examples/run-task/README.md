@@ -171,7 +171,7 @@ gives. The log can be copied to another machine and replayed there.
 | 0 | The run ended and every check passed afterwards |
 | 1 | Open Max failed: the endpoint could not be reached or a reply was cut off. `reason` carries the error |
 | 2 | The call could not start: a usage error, a repository that is not a git work tree's root, a gate that is not installed, does not load or is not the shipped file, or a `--check` too slow for the gate |
-| 3 | The repository is not trusted |
+| 3 | The repository is not trusted, or Open Max declined an approval request, as it does for a project not in `auto` mode; the checks still run after a turn that declined |
 | 4 | Not verified. The turn ended `unverified`, `length`, `max_iterations` or `budget_exhausted`, or it ended normally and a check failed afterwards |
 | 128 + N | Signal N stopped the run: 143 when `--timeout` expired, or 137 when the run had to be killed 10 seconds after that |
 

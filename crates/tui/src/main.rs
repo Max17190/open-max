@@ -63,6 +63,7 @@ options:
                          from piped stdin when -p has none; repeat -p for multi-turn)
       --second-look      with --print and one prompt: a run that ends with status 0 within
                          10,000 output tokens is checked by a new session; status unchanged
+                         unless that session declines an approval (3)
       --json             with --print, --replay or --subagent, emit AgentEvent envelopes
                          as JSONL; with --check, emit every finding as one JSON array
       --replay <file> --json

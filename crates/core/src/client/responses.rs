@@ -146,7 +146,7 @@ fn complete(value: &Value) -> Result<CompletionResult, String> {
         match item["type"].as_str() {
             Some("message") => {
                 for part in item["content"].as_array().ok_or("invalid Responses message")? {
-                    let key = match part["type"].as_str() { Some("output_text") => "text", Some("refusal") => "refusal", _ => continue };
+                    let key = match part["type"].as_str() { Some("output_text") => "text", Some("refusal") => { result.finish_reason = "refusal".into(); "refusal" } _ => continue };
                     result.content.push_str(part[key].as_str().unwrap_or_default());
                 }
             }

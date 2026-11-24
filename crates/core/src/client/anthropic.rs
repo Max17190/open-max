@@ -192,7 +192,8 @@ fn complete(blocks: Vec<Value>, reason: &str, usage: Value) -> Result<Completion
     validate_blocks(&blocks)?;
     let mut reply = cancelled_response();
     reply.finish_reason = match reason {
-        "end_turn" | "stop_sequence" | "refusal" => "stop",
+        "end_turn" | "stop_sequence" => "stop",
+        "refusal" => "refusal",
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
         _ => return Err("Messages returned an unsupported stop reason".into()),

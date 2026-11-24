@@ -2325,7 +2325,7 @@ fn two_calls_to_an_unapproved_tool_cannot_batch_past_the_gate() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(out.status.code(), Some(3), "stdout: {stdout}\nstderr: {stderr}");
     assert!(
         !project.join("peeked.txt").exists(),
         "batching must not run unapproved host code\nstdout: {stdout}\nstderr: {stderr}"
@@ -2382,7 +2382,7 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(out.status.code(), Some(3), "stdout: {stdout}\nstderr: {stderr}");
     assert!(
         !project.join("peeked.txt").exists(),
         "unapproved host code must not have run\nstdout: {stdout}\nstderr: {stderr}"
@@ -2444,6 +2444,111 @@ fn a_read_only_agent_written_tool_is_gated_until_a_human_approves_it() {
         "approved content must not ask again: {stdout}"
     );
     assert!(project.join("peeked.txt").exists(), "the approved tool must run: {stdout}");
+}
+
+/// A print run cannot ask, so in `ask` it declines every approval request.
+/// A script must not read success from a run that was not allowed to do its
+/// work: such a run exits 3, says once how many requests it declined, and
+/// names a command that allows the work with no terminal session, which the
+/// test then runs as printed. A run that needed no approval still exits 0.
+#[test]
+fn a_print_run_that_declined_an_approval_exits_3_and_names_the_fix() {
+    let (project, home) = fresh_dirs("declined-approval");
+    let write = || sse_tool_call("write_file", serde_json::json!({"path": "out.txt", "content": "done"}));
+    let (base_url, _server) = spawn_recording_server(
+        vec![sse_text("an answer"), write(), sse_text("not written"), write(), sse_text("not written"), write(), sse_text("written")],
+        project.parent().unwrap().join("requests.jsonl"),
+    );
+    write_settings_with_mode(&home, &base_url, "ask");
+    trust_in_ask(&project, &home);
+
+    let asked = cmd(&project, &home).args(["-p", "a question"]).output().unwrap();
+    assert_eq!(asked.status.code(), Some(0), "{}", String::from_utf8_lossy(&asked.stderr));
+
+    let out = cmd(&project, &home).args(["-p", "write out.txt"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(!project.join("out.txt").exists(), "{stderr}");
+    assert_eq!(stderr.matches("openmax: declined 1 approval request: ").count(), 1, "{stderr}");
+    assert!(!stderr.contains("/approvals"), "no slash command a script cannot type: {stderr}");
+
+    // `--json` keeps its event stream as it was: the decline is the
+    // `approval_settled` line the stream already carries, and the exit code.
+    let json = cmd(&project, &home).args(["--json", "-p", "write out.txt"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    assert_eq!(json.status.code(), Some(3), "{stdout}");
+    let events: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(events.iter().any(|e| e["type"] == "approval_settled" && e["outcome"] == "declined"), "{stdout}");
+    assert_eq!(events.last().unwrap()["stop_reason"], "stop", "{stdout}");
+
+    // The fix as printed, run from a shell in the project, then the same run.
+    run_printed_fix(&project, &home, &stderr, "from this directory: ");
+    let out = cmd(&project, &home).args(["-p", "write out.txt"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(project.join("out.txt")).unwrap(), "done");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Run the command a declined print run printed after `marker`, from a shell
+/// in `project` that finds this build's openmax first.
+fn run_printed_fix(project: &Path, home: &Path, stderr: &str, marker: &str) {
+    let (_, fix) = stderr.lines().find_map(|l| l.split_once(marker)).unwrap_or_else(|| panic!("no fix after {marker:?}: {stderr}"));
+    let bin = Path::new(openmax_bin()).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let ran = Command::new("sh").args(["-c", fix]).current_dir(project).env("HOME", home)
+        .env("PATH", path).env_remove("OPENMAX_SESSION").output().unwrap();
+    assert!(ran.status.success(), "{fix}: {}", String::from_utf8_lossy(&ran.stderr));
+}
+
+/// A reply the provider ended on its own terms (here its content filter)
+/// is no finished turn: print mode exits 1 for it, as for a truncated one.
+#[test]
+fn a_print_turn_a_provider_filter_ended_exits_1() {
+    let (project, home) = fresh_dirs("content-filter");
+    let filtered = sse(&[
+        serde_json::json!({"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"content_filter"}]}),
+    ]);
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![(filtered, true)]);
+    write_settings(&home, &base_url);
+    let out = cmd(&project, &home).args(["--trust-project", "-p", "say hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("openmax: stopped (content_filter)"), "{stderr}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A reply the model refused is no finished turn either, on each protocol
+/// that reports one: native Messages' `refusal` stop reason and a Responses
+/// refusal part each end the turn `refusal`, and print mode exits 1.
+#[test]
+fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
+    let event = |value: serde_json::Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+    let native = [
+        serde_json::json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"stub-model","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I can't help with that"}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":7}}),
+        serde_json::json!({"type":"message_stop"}),
+    ].into_iter().map(event).collect::<String>();
+    let responses = event(serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message",
+        "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":7}}}));
+    for (wire, reply) in [("anthropic", native), ("responses", responses)] {
+        let (project, home) = fresh_dirs(&format!("refusal-{wire}"));
+        let (base_url, _requests, _server) = spawn_scripted_server(vec![(reply, true)]);
+        let dir = home.join(".openmax");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"auto"}"#).unwrap();
+        std::fs::write(dir.join("providers.json"), serde_json::json!({"providers":{"stub":{"base_url":base_url,"wire_api":wire,
+            "models":[{"id":"stub-model","context_tokens":16384}]}}}).to_string()).unwrap();
+        let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "say hi"]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{wire}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+        let done: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        assert_eq!(done["stop_reason"], "refusal", "{wire}: {stdout}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
 }
 
 #[test]
@@ -3288,6 +3393,20 @@ fn a_second_look_keeps_the_first_runs_exit_status() {
     let (code, sent, _, stderr) = second_look_run("second-look-fails", vec![answer_writing("done", 5), STREAM_ERROR_SSE.to_string()]);
     assert_eq!((code, sent.len()), (Some(0), 2), "{stderr}");
     assert!(stderr.contains("openmax: second look ended with status 1; the run's status 0 stands"), "{stderr}");
+
+    // A second look in ask that declines an approval was kept from its work as
+    // a first run would be: the run exits 3.
+    let (project, home) = fresh_dirs("second-look-declined");
+    let write = sse_tool_call("write_file", serde_json::json!({"path": "out.txt", "content": "x"}));
+    let (base_url, _requests, _server) =
+        spawn_scripted_server([answer_writing("done", 5), write, sse_text("not written")].into_iter().map(|b| (b, true)).collect());
+    write_settings_with_mode(&home, &base_url, "ask");
+    trust_in_ask(&project, &home);
+    let out = cmd(&project, &home).args(["--second-look", "-p", "list the files"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("openmax: declined 1 approval request: "), "{stderr}");
+    assert!(!stderr.contains("stands"), "{stderr}");
 }
 
 /// The second look checks only runs that left every file they were given as
@@ -4315,6 +4434,44 @@ fn a_sub_agent_runs_in_its_projects_approval_mode_or_a_stricter_one() {
         assert_eq!(left, users, "only the user's own .worktrees is left: {stderr}");
         let told = stderr.contains("uncommitted changes in this tree are not in its worktree");
         assert_eq!(told, dirty, "{stderr}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+/// A sub-agent held to `ask` saved for `.worktrees` declines its write and
+/// exits 3, and its line names the directory whose saved mode governs it,
+/// beside the project when the project is in `ask` too: selecting auto as
+/// printed lets the next sub-agent write, whatever the project's mode was.
+#[test]
+fn a_sub_agent_declined_under_a_stricter_worktrees_mode_names_where_it_is_saved() {
+    for project_mode in ["auto", "ask"] {
+        let (project, home) = sub_agent_repo(&format!("sub-agent-declined-{project_mode}"));
+        let write = || (sse_tool_call("write_file", serde_json::json!({"path": "notes.txt", "content": "edited\n"})), true);
+        let (base_url, _requests, _server) =
+            spawn_scripted_server(vec![write(), (sse_text("not written"), true), write(), (sse_text("written"), true)]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let root = std::fs::canonicalize(&project).unwrap();
+        let worktrees = root.join(".worktrees");
+        let modes = serde_json::json!({ root.display().to_string(): project_mode, worktrees.display().to_string(): "ask" });
+        let store = serde_json::json!({ "version": 1, "projects": [root.display().to_string()], "approval_modes": modes });
+        std::fs::write(home.join(".openmax/trust.json"), store.to_string()).unwrap();
+        let sub_agent = || {
+            let child = cmd(&project, &home).envs(SUB_AGENT_GIT).args(["--subagent", "edit the notes", "--worktree"])
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let out = finish_with_deadline(child);
+            (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let (code, stderr) = sub_agent();
+        assert_eq!(code, Some(3), "{project_mode}: {stderr}");
+        let named = match project_mode {
+            "auto" => format!("select auto once for {}, whose saved mode governs this run, from this directory: (mkdir -p ", worktrees.display()),
+            _ => format!("select auto once for {} and {}, whose saved mode governs this run, from this directory: echo ", root.display(), worktrees.display()),
+        };
+        assert!(stderr.contains(&named), "{project_mode}: {stderr}");
+        run_printed_fix(&project, &home, &stderr, "from this directory: ");
+        let (code, stderr) = sub_agent();
+        assert_eq!(code, Some(0), "{project_mode}: {stderr}");
+        assert!(stderr.contains("openmax: the sub-agent's changes are on branch subagent/"), "{project_mode}: {stderr}");
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 }
