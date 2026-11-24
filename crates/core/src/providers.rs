@@ -629,7 +629,8 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
     Ok(endpoint)
 }
 
-fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
+/// Resolve without changing the tool registry's image-input default.
+pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
     let (providers, parse_error) = load_snapshot(data_dir);
     let provider_name = settings
         .provider

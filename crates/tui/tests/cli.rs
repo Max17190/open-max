@@ -686,6 +686,50 @@ fn login_retries_a_server_rejected_key_without_losing_the_connection() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+#[test]
+fn shell_login_selects_a_default_without_reading_project_trust() {
+    let (project, home) = fresh_dirs("login-independent-of-trust");
+    let data = home.join(".openmax");
+    std::fs::create_dir_all(&data).unwrap();
+    let trust = data.join("trust.json");
+    std::fs::write(&trust, "not valid JSON").unwrap();
+    let (base_url, _, server) = spawn_http_script(vec![catalog_reply(r#","context_window":32768"#)]);
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "local\r"),
+        ("API base URL", &format!("{base_url}\r")),
+        ("API key", "\r"),
+        ("Choose a model", "\r"),
+    ]);
+    assert_eq!(status, Some(0), "{shown}");
+    let settings = open_max_core::config::load(&data).unwrap();
+    assert_eq!(settings.provider.as_deref(), Some("local"));
+    assert_eq!(settings.model, "fixture-model");
+    assert_eq!(std::fs::read_to_string(trust).unwrap(), "not valid JSON");
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn shell_logout_warns_for_configured_credentials_only() {
+    let (project, home) = fresh_dirs("logout-credential-warning");
+    let data = home.join(".openmax");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("providers.json"), r#"{"providers":{
+        "env-list":{"api_key_env":["FIXTURE_KEY"]},
+        "header":{"headers":{"Authorization":"$FIXTURE_KEY"}},
+        "local":{"base_url":"http://127.0.0.1:9/v1","api_key_env":[]}
+    }}"#).unwrap();
+    for (name, warned) in [("env-list", true), ("header", true), ("local", false)] {
+        let (status, shown) = at_a_terminal(&project, &home, &["--logout", name], &[
+            ("Enter confirms; Esc cancels", "\x1b[B\r"),
+        ]);
+        assert_eq!(status, Some(0), "{shown}");
+        assert!(shown.contains(&format!("Disconnected {name} locally.")), "{shown}");
+        assert_eq!(shown.contains("The credentials remain valid at the provider; revoke them there if needed."), warned, "{shown}");
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Every line of a ```sh block that runs `--trust-project`.
 fn documented_trust_commands(markdown: &str) -> Vec<String> {
     let mut shell_block = None;

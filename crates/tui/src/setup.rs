@@ -126,8 +126,16 @@ pub async fn run(
         })
         .await?;
         eprintln!("Disconnected {} locally.", one_line(&name));
-        if previous["api_key"].is_string() || previous["api_key_env"].is_string() {
-            eprintln!("The API key remains valid at the provider; revoke it there if needed.");
+        let nonempty = |value: &Value| value.as_str().is_some_and(|s| !s.trim().is_empty());
+        let env = &previous["api_key_env"];
+        if nonempty(&previous["api_key"])
+            || nonempty(env)
+            || env.as_array().is_some_and(|names| names.iter().any(nonempty))
+            || previous["headers"].as_object().is_some_and(|headers| {
+                headers.iter().any(|(name, value)| open_max_core::client::is_credential_header(name) && nonempty(value))
+            })
+        {
+            eprintln!("The credentials remain valid at the provider; revoke them there if needed.");
         }
         return Ok(None);
     }
@@ -334,8 +342,7 @@ pub async fn run(
 /// connection just made becomes the default through the save `/model`
 /// makes, so the next `openmax` runs on it; otherwise the selection stays.
 pub fn select_unless_chosen(dir: &Path, provider: &str, model: &str) -> Result<(), String> {
-    let (core, _events) = open_max_core::state::Core::new(dir.to_path_buf())?;
-    let settings = core.settings.lock().unwrap().clone();
+    let mut settings = open_max_core::config::load(dir)?;
     if settings.provider.as_deref().is_some_and(|p| !p.trim().is_empty()) || !settings.base_url.trim().is_empty() {
         eprintln!(
             "Choose it with /model, or run openmax --provider {} --model {}",
@@ -344,7 +351,9 @@ pub fn select_unless_chosen(dir: &Path, provider: &str, model: &str) -> Result<(
         );
         return Ok(());
     }
-    core.save_settings(&crate::app::model_selection(&settings, Some(provider.into()), model.into()))?;
+    settings.provider = Some(provider.into());
+    settings.model = model.into();
+    open_max_core::config::save(dir, &settings)?;
     eprintln!("{} from {} is now the default model; change it with /model.", one_line(model), one_line(provider));
     Ok(())
 }

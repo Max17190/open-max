@@ -1373,6 +1373,29 @@ pub fn create(core: &Core, project: String) -> Result<SessionMeta, String> {
     Ok(meta)
 }
 
+/// Read a session's transcript and turn boundaries under the store lock,
+/// using the same checked index and cut calculation as a rewind.
+pub fn rewind_history(core: &Core, id: &str) -> Result<(Vec<ChatMessage>, Vec<usize>), String> {
+    let (_memo, _flock) = lock_store(core)?;
+    let metas = read_fork_index(core)?;
+    let parent = metas.iter().find(|m| m.id == id).ok_or_else(|| format!("no session {id} to rewind"))?;
+    fork_history(core, parent)
+}
+
+fn read_fork_index(core: &Core) -> Result<Vec<SessionMeta>, String> {
+    match read_index(core) {
+        IndexRead::Loaded(metas) => Ok(metas),
+        IndexRead::Missing => Ok(Vec::new()),
+        IndexRead::Damaged(reason) => Err(reason),
+    }
+}
+
+fn fork_history(core: &Core, parent: &SessionMeta) -> Result<(Vec<ChatMessage>, Vec<usize>), String> {
+    let messages = load_messages_locked(core, &parent.id)?.unwrap_or_default();
+    let ends = turn_ends(parent.turn_ends.as_deref(), &messages);
+    Ok((messages, ends))
+}
+
 /// Where a fork cuts its parent: after its last persisted message, or at
 /// the end of turn `n` (1-based, counted as [`turn_ends`] counts them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1394,17 +1417,12 @@ pub enum ForkAt {
 /// before it is refused, since that branch would have no history at all.
 pub fn fork(core: &Core, parent_id: &str, at: ForkAt) -> Result<SessionMeta, String> {
     let (_memo, _flock) = lock_store(core)?;
-    let metas = match read_index(core) {
-        IndexRead::Loaded(metas) => metas,
-        IndexRead::Missing => Vec::new(),
-        IndexRead::Damaged(reason) => return Err(reason),
-    };
+    let metas = read_fork_index(core)?;
     let parent = metas
         .iter()
         .find(|m| m.id == parent_id)
         .ok_or_else(|| format!("no session {parent_id} to fork"))?;
-    let messages = load_messages_locked(core, parent_id)?.unwrap_or_default();
-    let ends = turn_ends(parent.turn_ends.as_deref(), &messages);
+    let (messages, ends) = fork_history(core, parent)?;
     let cut = match at {
         ForkAt::End => messages.len(),
         ForkAt::Turn(n) => match n.checked_sub(1).and_then(|i| ends.get(i)) {

@@ -445,8 +445,7 @@ pub struct App {
     header_width: u16,
     status_line: Line<'static>,
     chatgpt_account: Option<String>,
-    /// Setup guidance or a resolution error, shown instead of READY.
-    unconnected: Option<String>,
+    connection_started: bool,
     status_width: u16,
     /// Cached approval mode. A turn can adopt a stricter saved mode without
     /// marking chrome, so each draw compares this with the live mode.
@@ -803,13 +802,14 @@ impl App {
             header_width: u16::MAX,
             status_line: Line::default(),
             chatgpt_account: None,
-            unconnected: None,
+            connection_started: false,
             status_width: u16::MAX,
             status_mode: None,
         }
     }
 
     async fn startup(&mut self, args: &Args) {
+        self.connection_started = true;
         self.refresh_connection();
         if let Some(notice) = crate::update::on_session_start(&self.core.data_dir) {
             self.note(&notice);
@@ -1748,26 +1748,41 @@ impl App {
     /// Re-read what the settings connect: the plan an account bills, and
     /// whether any endpoint resolves at all.
     fn refresh_connection(&mut self) {
-        use open_max_core::providers::{self, ResolveError};
+        use open_max_core::providers;
         let settings = self.core.settings.lock().unwrap().clone();
         let catalog = providers::load_providers(&self.core.data_dir);
         self.chatgpt_account = settings.provider.as_ref().and_then(|p| catalog.get(p))
             .and_then(|p| p.chatgpt_account.as_deref().map(open_max_core::text::one_line));
-        self.unconnected = match providers::resolve(&settings, &self.core.data_dir) {
-            Ok(_) => None,
-            Err(ResolveError::MissingModel | ResolveError::Unconfigured { endpoint: false, .. }) if !catalog.is_empty() => {
-                Some("no model connected: type /model to choose one".into())
-            }
-            Err(ResolveError::MissingEndpoint | ResolveError::Unconfigured { endpoint: true, .. }) => {
-                Some(if catalog.is_empty() {
-                    "no model connected: type /login to connect a provider".into()
-                } else {
-                    "no model connected: type /model to choose one".into()
-                })
-            }
-            Err(error) => Some(error.to_string()),
-        };
         self.dirty.mark_chrome();
+    }
+
+    // The catalog is hot. Resolve on empty paints only, not on streaming or
+    // scrollback frames. Do not claim the picker can fix an empty catalog.
+    fn empty_connection_hint(&self) -> String {
+        use open_max_core::providers::{self, ResolveError};
+        let dir = &self.core.data_dir;
+        let mut settings = self.core.settings.lock().unwrap().clone();
+        match providers::resolve_endpoint(&settings, dir) {
+            Ok(_) => "READY".into(),
+            Err(error @ (ResolveError::MissingEndpoint | ResolveError::MissingModel | ResolveError::Unconfigured { .. })) => {
+                for (name, provider) in providers::load_providers(dir) {
+                    settings.provider = Some(name);
+                    for model in provider.models {
+                        settings.model = model.id;
+                        if providers::resolve_endpoint(&settings, dir).is_ok() {
+                            return "no model connected: type /model to choose one".into();
+                        }
+                    }
+                }
+                match error {
+                    ResolveError::MissingEndpoint | ResolveError::Unconfigured { endpoint: true, .. } => {
+                        "no model connected: type /login to connect a provider".into()
+                    }
+                    _ => error.to_string(),
+                }
+            }
+            Err(error) => error.to_string(),
+        }
     }
 
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
@@ -2662,14 +2677,15 @@ impl App {
         let Some(id) = self.session_id.as_deref() else {
             return self.note("no turn to rewind to yet");
         };
-        let messages = match sessions::load_messages(&self.core, id) {
-            Ok(Some(messages)) => messages,
-            Ok(None) => return self.note("no turn to rewind to yet"),
-            Err(error) => return self.error(&format!("could not read the session transcript: {error}")),
+        let (messages, ends) = match sessions::rewind_history(&self.core, id) {
+            Ok(history) => history,
+            Err(error) => {
+                let error = sessions::refusal_with_repair(&self.core, error);
+                return self.error(&format!("could not read the session history: {error}"));
+            }
         };
-        let recorded = sessions::meta(&self.core, id).and_then(|meta| meta.turn_ends);
         let (mut start, mut block) = (0, Vec::new());
-        for (n, end) in sessions::turn_ends(recorded.as_deref(), &messages).into_iter().enumerate() {
+        for (n, end) in ends.into_iter().enumerate() {
             let prompt = messages[start..end]
                 .iter()
                 .filter(|m| m.role == "user" && !m.harness_note)
@@ -3538,7 +3554,8 @@ impl App {
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
             if self.composer.is_empty() {
-                render_ready(self.unconnected.as_deref().unwrap_or("READY"), Rect { width: content_w, ..area }, frame.buffer_mut());
+                let hint = if self.connection_started { self.empty_connection_hint() } else { "READY".into() };
+                render_ready(&hint, Rect { width: content_w, ..area }, frame.buffer_mut());
             }
             return;
         }
@@ -3911,7 +3928,7 @@ fn render_ready(text: &str, area: Rect, buf: &mut ratatui::buffer::Buffer) {
 
 /// The settings a model selection produces; pure, so the caller decides how
 /// and whether to persist them.
-pub(crate) fn model_selection(
+fn model_selection(
     current: &config::Settings,
     provider: Option<String>,
     model: String,
@@ -4727,8 +4744,30 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         app.handle_submit("/rewind".into()).await.unwrap();
         let shown = app.transcript.export_text();
-        assert!(shown.contains("could not read the session transcript:") && shown.contains(&path), "{shown}");
+        assert!(shown.contains("could not read the session history:") && shown.contains(&path), "{shown}");
         assert!(!shown.contains("no turn to rewind to yet"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_refuses_to_list_turns_without_a_readable_index_entry() {
+        use open_max_core::{sessions, types::ChatMessage};
+        let (mut app, dir) = app_fixture();
+        let id = sessions::create(&app.core, dir.display().to_string()).unwrap().id;
+        sessions::attach(&app.core, &id).unwrap();
+        let messages = [ChatMessage::user("a saved prompt")];
+        assert!(sessions::save_messages(&app.core, &id, &messages, &mut 0, true));
+        app.session_id = Some(id.clone());
+        let index = damage_session_index(&dir);
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("does not parse") && shown.contains(REPAIR_POINTER), "{shown}");
+        assert!(!shown.contains("/rewind 1"), "{shown}");
+        fs::write(index, "[]").unwrap();
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains(&format!("no session {id} to rewind")), "{shown}");
+        assert!(!shown.contains("/rewind 1"), "{shown}");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6537,22 +6576,24 @@ mod tests {
         app.startup(&args).await;
         let text = buffer_text(&render_app(&mut app, 96, 12));
         assert!(text.contains("no model connected: type /login to connect a provider") && !text.contains("READY"), "{text}");
+        fs::write(dir.join("providers.json"), r#"{"providers":{"local":{"base_url":"http://127.0.0.1:9/v1"}}}"#).unwrap();
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /login to connect a provider"), "{text}");
         fs::write(dir.join("providers.json"), r#"{"providers":{"local":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"m","context_tokens":8192}]}}}"#).unwrap();
-        app.startup(&args).await;
         let text = buffer_text(&render_app(&mut app, 96, 12));
         assert!(text.contains("no model connected: type /model to choose one"), "{text}");
         app.core.settings.lock().unwrap().provider = Some("local".into());
-        app.startup(&args).await;
         let text = buffer_text(&render_app(&mut app, 96, 12));
         assert!(text.contains("no model connected: type /model to choose one") && !text.contains("READY"), "{text}");
         app.core.settings.lock().unwrap().model = "unknown-model".into();
-        app.startup(&args).await;
         let text = buffer_text(&render_app(&mut app, 96, 12));
         assert!(text.contains("no context window configured:") && !text.contains("READY"), "{text}");
         app.core.settings.lock().unwrap().model = "m".into();
-        app.startup(&args).await;
         let text = buffer_text(&render_app(&mut app, 96, 12));
         assert!(text.contains("READY"), "{text}");
+        fs::remove_file(dir.join("providers.json")).unwrap();
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("unknown provider 'local'") && !text.contains("READY"), "{text}");
         fs::remove_dir_all(dir).unwrap();
     }
 

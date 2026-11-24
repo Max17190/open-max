@@ -505,8 +505,13 @@ pub fn load(data_dir: &Path) -> Result<Settings, String> {
     Ok(settings)
 }
 
-/// Write settings.json and return the exact bytes written. The one caller
-/// is `Core::save_settings`, which fingerprints what it wrote rather than
+/// Save settings outside a running session, without loading project trust.
+pub fn save(data_dir: &Path, settings: &Settings) -> Result<(), String> {
+    save_bytes(data_dir, settings).map(|_| ())
+}
+
+/// Write settings.json and return the exact bytes written. In a session,
+/// `Core::save_settings` fingerprints what it wrote rather than
 /// re-reading a path something else may have replaced in the meantime, so a
 /// session's own save is never mistaken for external drift. Nothing outside
 /// the core writes settings.json.
