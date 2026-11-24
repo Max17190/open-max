@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::execution::{
-    self, CaptureSpec, ProcessError, ProcessOutput, ProcessRequest, StdinMode, Termination,
+    self, CaptureSpec, IdleWatch, ProcessError, ProcessOutput, ProcessRequest, StdinMode, Termination,
 };
 use crate::state::CancelToken;
 
@@ -71,13 +71,12 @@ pub struct OutputCaps {
     /// read_file shows an image file to the model as an image, and an
     /// external tool's images reach it with the result (`image_input`).
     pub images: bool,
-    /// From `stuck_command_secs`: see [`execution::ProcessRequest::stuck_after`].
-    pub stuck_after: Option<std::time::Duration>,
+    pub idle_watch: IdleWatch,
 }
 
 impl Default for OutputCaps {
     fn default() -> Self {
-        Self { command_bytes: MAX_OUTPUT_BYTES, images: false, stuck_after: None }
+        Self { command_bytes: MAX_OUTPUT_BYTES, images: false, idle_watch: IdleWatch::AfterMemoryKill }
     }
 }
 
@@ -97,8 +96,12 @@ impl OutputCaps {
             (None, Some(tokens)) => (tokens.saturating_mul(3) / 8).clamp(MAX_OUTPUT_BYTES, MAX_WINDOW_OUTPUT_BYTES),
             (None, None) => MAX_OUTPUT_BYTES,
         };
-        let stuck_after = settings.stuck_command_secs.filter(|&secs| secs > 0).map(|secs| std::time::Duration::from_secs(secs.max(MIN_STUCK_SECS)));
-        Self { command_bytes, images: settings.image_input == Some(true), stuck_after }
+        let idle_watch = match settings.stuck_command_secs {
+            None => IdleWatch::AfterMemoryKill,
+            Some(0) => IdleWatch::Off,
+            Some(secs) => IdleWatch::AfterIdle(std::time::Duration::from_secs(secs.max(MIN_STUCK_SECS))),
+        };
+        Self { command_bytes, images: settings.image_input == Some(true), idle_watch }
     }
 
     /// The bytes one read_file call may return: the command cap, held
@@ -476,15 +479,7 @@ pub async fn execute(
 
 /// One more than the OOM-kill count the last bash result saw (only rising, across sessions); 0 before the first bash call.
 static OOM_KILLS: AtomicU64 = AtomicU64::new(0);
-/// The kernel's OOM-kill count for this process's memory cgroup and those under it: v2 `memory.events` (at /sys/fs/cgroup or, hybrid, /unified)
-/// or v1 `memory.oom_control` in the hierarchy listing `memory`, at the cgroup's path or else the root, where a container shows its own.
-fn oom_kills() -> Option<u64> {
-    let read = |f: String| std::fs::read_to_string(f).ok()?.lines().find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok());
-    std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().filter_map(|l| l.split_once(':')?.1.split_once(':')).flat_map(|(c, path)| {
-        let (dirs, file) = if c.is_empty() { (vec![String::new(), "/unified".into()], "memory.events") } else if c.split(',').any(|c| c == "memory") { (vec!["/memory".into(), format!("/{c}")], "memory.oom_control") } else { (vec![], "") };
-        dirs.into_iter().flat_map(move |d| [format!("/sys/fs/cgroup{d}{}/{file}", path.trim_end_matches('/')), format!("/sys/fs/cgroup{d}/{file}")])
-    }).find_map(read)
-}
+fn oom_kills() -> Option<u64> { execution::memory_kill_counter().map(|(_, count)| count) }
 
 /// [`execute`] for one call of a session. `background_noted` is the
 /// session's record that a result has already explained why background
@@ -499,12 +494,7 @@ pub(crate) async fn execute_in_session(
     background_noted: &AtomicBool,
 ) -> ToolOutcome {
     if name == "bash" {
-        if let Some(n) = oom_kills() { let _ = OOM_KILLS.compare_exchange(0, n + 1, Relaxed, Relaxed); }
-        let mut outcome = run_bash(data_dir, root, args, caps, cancel, background_noted).await;
-        if let Some((before, now)) = oom_kills().map(|n| (OOM_KILLS.fetch_max(n + 1, Relaxed), n + 1)).filter(|&(before, now)| before != 0 && before < now) {
-            outcome.output.push_str(&format!("\n[openmax: since the last result, the kernel killed {} process(es) in this cgroup for running out of memory.]", now - before));
-        }
-        return outcome;
+        return run_bash(data_dir, root, args, caps, cancel, background_noted).await;
     }
     if cancel.is_cancelled() {
         return ToolOutcome::err("tool cancelled by user");
@@ -2446,14 +2436,17 @@ async fn run_bash(data_dir: &Path, root: &Path, args: &Value, caps: OutputCaps, 
     let deadline = bash_deadline(args);
     let request = ProcessRequest {
         program: bash_shell().into(), args: vec!["-c".into(), RUN_COMMAND.into()], cwd: root.to_path_buf(), stdin: StdinMode::Null,
-        timeout: execution::timeout_secs(deadline.secs), stuck_after: caps.stuck_after,
+        timeout: execution::timeout_secs(deadline.secs), idle_watch: caps.idle_watch,
         capture: CaptureSpec {
             head_bytes: caps.command_bytes / HEAD_SHARE_DIVISOR, tail_bytes: caps.command_bytes - caps.command_bytes / HEAD_SHARE_DIVISOR,
             spill_dir: Some(data_dir.join("cmd-logs")), spill_bytes_per_stream: 16 * 1024 * 1024, redraws: true,
         },
         sandbox: None, env_allowlist: None, self_link: true, env: vec![(COMMAND_VAR.into(), command.into())],
     };
-    match execution::run_process(request, cancel).await {
+    if let Some(n) = oom_kills() { let _ = OOM_KILLS.compare_exchange(0, n + 1, Relaxed, Relaxed); }
+    let result = execution::run_process(request, cancel).await;
+    let memory_stop = result.as_ref().is_ok_and(|p| matches!(p.termination, Termination::Stuck { after_memory_kill: true, .. }));
+    let mut outcome = match result {
         Err(ProcessError::Spawn(e)) => ToolOutcome::err(format!("failed to spawn shell: {e}")),
         Err(ProcessError::Wait(e)) => ToolOutcome::err(format!("command failed: {e}")),
         // bash never runs sandboxed (request.sandbox is None above); keep
@@ -2471,17 +2464,25 @@ async fn run_bash(data_dir: &Path, root: &Path, args: &Value, caps: OutputCaps, 
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 ToolOutcome::from_process(false, format!("{}\n{text}", deadline.timed_out_heading()), &output, truncated)
             }
-            Termination::Stuck { idle, running } => {
+            Termination::Stuck { idle, running, after_memory_kill } => {
                 let (text, truncated) = render_process_output(&output, caps.command_bytes);
                 let running = if running.len() > 8 { format!("{} and {} more", running[..8].join(", "), running.len() - 8) } else { running.join(", ") };
-                let heading = format!("command stopped: for {}s its processes used no CPU and read or wrote nothing, so it looked stuck. Still running then: {running}. Output until the stop:", idle.as_secs());
-                ToolOutcome::from_process(false, format!("{heading}\n{text}"), &output, truncated)
+                let heading = if *after_memory_kill {
+                    format!("command stopped after {}s of inactivity following a kernel memory kill in its cgroup. Retry with less parallelism or a smaller workload.", idle.as_secs())
+                } else {
+                    format!("command stopped: for {}s its processes used no CPU and read or wrote nothing, so it looked stuck.", idle.as_secs())
+                };
+                ToolOutcome::from_process(false, format!("{heading} Still running then: {running}. Output until the stop:\n{text}"), &output, truncated)
             }
             Termination::Exited(status) => {
                 exited_outcome(&output, status, caps.command_bytes, background_noted)
             }
         },
+    };
+    if let Some((before, now)) = oom_kills().map(|n| (OOM_KILLS.fetch_max(n + 1, Relaxed), n + 1)).filter(|&(before, now)| !memory_stop && before != 0 && before < now) {
+        outcome.output.push_str(&format!("\n[openmax: since the last result, the kernel killed {} process(es) in this cgroup for running out of memory.]", now - before));
     }
+    outcome
 }
 
 /// The result of a bash or external tool process that exited on its own.
@@ -4051,7 +4052,7 @@ mod tests {
     #[tokio::test]
     async fn a_quiet_command_is_stopped_as_stuck_and_a_sleep_is_not() {
         let root = temp_project();
-        let caps = OutputCaps { stuck_after: Some(std::time::Duration::from_millis(600)), ..OutputCaps::default() };
+        let caps = OutputCaps { idle_watch: IdleWatch::AfterIdle(std::time::Duration::from_millis(600)), ..OutputCaps::default() };
         let data = root.join("data");
         let run = |command: &'static str| {
             let (data, root) = (data.clone(), root.clone());
@@ -4077,18 +4078,18 @@ mod tests {
         assert!(out.ok && out.output.contains("spun"), "a command using CPU is not stuck: {}", out.output);
     }
 
-    /// The switch is off unless set, 0 is off, and a short spell is held to
+    /// The default only watches after a memory kill, 0 is off, and a short spell is held to
     /// the floor so a pause between a build's steps never reads as a hang.
     #[test]
-    fn stuck_command_secs_reads_off_unless_set_and_has_a_floor() {
+    fn stuck_command_secs_defaults_to_memory_kills_and_has_a_floor() {
         let after = |secs: Option<u64>| {
             let settings = crate::config::Settings { stuck_command_secs: secs, ..Default::default() };
-            OutputCaps::from_settings(&settings, None).stuck_after.map(|d| d.as_secs())
+            OutputCaps::from_settings(&settings, None).idle_watch
         };
-        assert_eq!(after(None), None);
-        assert_eq!(after(Some(0)), None);
-        assert_eq!(after(Some(5)), Some(MIN_STUCK_SECS));
-        assert_eq!(after(Some(60)), Some(60));
+        assert_eq!(after(None), IdleWatch::AfterMemoryKill);
+        assert_eq!(after(Some(0)), IdleWatch::Off);
+        assert_eq!(after(Some(5)), IdleWatch::AfterIdle(std::time::Duration::from_secs(MIN_STUCK_SECS)));
+        assert_eq!(after(Some(60)), IdleWatch::AfterIdle(std::time::Duration::from_secs(60)));
     }
 
     /// `timeout` is the same wait as `timeout_secs`, in seconds and under the
@@ -4185,7 +4186,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(30),
-            stuck_after: None,
+            idle_watch: IdleWatch::Off,
             capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
@@ -4233,7 +4234,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "for i in $(seq 1 500); do echo padding-line-$i; done; sleep 30 &"}),
-            OutputCaps { command_bytes: 1_000, images: false, stuck_after: None },
+            OutputCaps { command_bytes: 1_000, images: false, idle_watch: IdleWatch::Off },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4487,7 +4488,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": "echo RESULT; for i in $(seq 1 3000); do echo warn-$i >&2; done"}),
-            OutputCaps { command_bytes: cap, images: false, stuck_after: None },
+            OutputCaps { command_bytes: cap, images: false, idle_watch: IdleWatch::Off },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4518,7 +4519,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap, images: false, stuck_after: None },
+            OutputCaps { command_bytes: cap, images: false, idle_watch: IdleWatch::Off },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -4557,7 +4558,7 @@ mod tests {
             &root.join("data"),
             &root,
             &json!({"command": cmd}),
-            OutputCaps { command_bytes: cap, images: false, stuck_after: None },
+            OutputCaps { command_bytes: cap, images: false, idle_watch: IdleWatch::Off },
             Arc::new(CancelToken::default()),
         )
         .await;
@@ -5721,7 +5722,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_over_the_cap_is_a_quarter_cap_preview_of_its_log() {
         let root = temp_project();
-        let caps = OutputCaps { command_bytes: 4_000, images: false, stuck_after: None };
+        let caps = OutputCaps { command_bytes: 4_000, images: false, idle_watch: IdleWatch::Off };
         let data = root.join("data");
         let fill = json!({"command": "head -c 4000 /dev/zero | tr '\\0' a"});
         let fits = bash_tool(&data, &root, &fill, caps, Arc::new(CancelToken::default())).await;

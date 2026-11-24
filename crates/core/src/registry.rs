@@ -1417,7 +1417,7 @@ async fn spawn_external(
         cwd: root.to_path_buf(),
         stdin: StdinMode::json_line(args),
         timeout: execution::timeout_secs(tool.timeout_secs),
-        stuck_after: None,
+        idle_watch: crate::execution::IdleWatch::Off,
         capture: CaptureSpec {
             head_bytes: 0,
             tail_bytes: caps.command_bytes,
@@ -2707,7 +2707,7 @@ mutatng = true
         // A session's first note is the full one, and it is the one the cap
         // has to make room for.
         registry.background_noted.store(false, std::sync::atomic::Ordering::Relaxed);
-        let tight = tools::OutputCaps { command_bytes: 1_000, images: false, stuck_after: None };
+        let tight = tools::OutputCaps { command_bytes: 1_000, images: false, idle_watch: crate::execution::IdleWatch::Off };
         let plain = run("tight_plain", tight).await;
         assert!(plain.output.contains("[start of output truncated"), "{}", plain.output);
         assert!(!plain.output.contains(tools::BACKGROUND_TERMINATED_NOTE), "{}", plain.output);

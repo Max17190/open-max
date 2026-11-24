@@ -411,7 +411,7 @@ and the run that writes a key already uses it.
   `-p`, `--stdio` or `--subagent` run without writing it here (see
   [usage](usage.md#command-line)).
 
-- `stuck_command_secs` (unset: off; 0 is off; held to at least 30): on
+- `stuck_command_secs` (unset: watch only after a memory kill; 0 is off; otherwise at least 30): on
   Linux, a bash call whose processes have used no CPU and read or written
   no bytes for this many seconds is stopped before its timeout, and the
   result says it looked stuck, names the processes still running and keeps
@@ -419,7 +419,10 @@ and the run that writes a key already uses it.
   thread blocked in a wait with a deadline (`sleep 300`, or select, poll,
   epoll or a futex given a timeout) restarts the count. A sample that cannot
   read every counter restarts it too. A process started with `setsid` is not
-  watched. Off Linux, nothing changes.
+  watched. When unset, Open Max watches for 60 seconds of inactivity only
+  after the kernel reports a new out-of-memory kill in the command's launch
+  cgroup. A kill elsewhere in a shared cgroup can also arm the watch. Off
+  Linux, nothing changes.
 
 The input budget for the transcript and frozen tool schemas is
 `context_tokens - (reply_reserve + 1024)`, leaving room for the reply and 1024

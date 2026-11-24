@@ -1545,7 +1545,7 @@ async fn run_hook(
         cwd: cwd.to_path_buf(),
         stdin: StdinMode::json_line(&payload),
         timeout: Duration::from_secs(hook.timeout_secs),
-        stuck_after: None,
+        idle_watch: crate::execution::IdleWatch::Off,
         capture: CaptureSpec {
             // Hook block reasons keep their beginning and are character-capped
             // below. Four bytes per character covers valid UTF-8.
