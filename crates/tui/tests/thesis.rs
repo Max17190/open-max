@@ -743,12 +743,14 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Saying what to do next on the command line and in print mode adds 77
     // production lines over the 45,178 measured before it, and the 45,186
     // ceiling was raised for it.
-    const BASELINE: usize = 45_255;
+    // Fixing provider setup and session controls adds 275 production lines
+    // over the 45,255 measured before it, and the 45,255 ceiling was raised for it.
+    const BASELINE: usize = 45_530;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 45_255;
+    const CEILING: usize = 45_530;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 
