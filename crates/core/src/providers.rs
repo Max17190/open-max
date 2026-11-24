@@ -418,7 +418,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
             let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("?");
             unknown_keys(
                 model,
-                &["id", "name", "context_tokens", "max_tokens", "compaction_tokens"],
+                &["id", "name", "context_tokens", "max_tokens", "compaction_tokens", "image_input"],
                 &format!("in provider '{name}' model '{id}'"),
                 &mut out,
             );
