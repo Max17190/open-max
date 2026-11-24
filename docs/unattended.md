@@ -142,7 +142,7 @@ error or interrupted run may have no `done` event.
 ## Bound the run
 
 - Set `--max-agent-iterations <n>` to cap the rounds per turn for this run.
-  The default is 300. Reaching the cap ends the turn with `max_iterations`.
+  The default is 1,000. Reaching the cap ends the turn with `max_iterations`.
 - Set `--max-agent-tokens <n>` to limit token spend per turn. It is off by
   default. If the next prompt would not fit in the tokens left, the turn
   stops with `budget_exhausted`. Replies count toward spend, so this is not
