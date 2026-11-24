@@ -863,13 +863,13 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
     }
 }
 
-/// Recognize intent only. The JSON and any arguments never leave this function.
+/// Recognize intent and return a recovery note, never a tool call.
 #[cold]
-pub(crate) fn written_call_json(text: &str, schemas: &serde_json::Value) -> Option<bool> {
+pub(crate) fn written_call_recovery(text: &str, schemas: &serde_json::Value) -> Option<String> {
     use serde_json::Value;
     use std::sync::LazyLock;
     let text = text.trim();
-    let offered = |name: &str| schemas.as_array().is_some_and(|entries| entries.iter().any(|e| crate::registry::entry_name(e) == name));
+    let mut names = schemas.as_array()?.iter().map(crate::registry::entry_name);
     if let Some(tagged) = text.strip_suffix("</tool_call>") {
         let (prefix, body) = tagged.split_once("<tool_call>")?;
         if !prefix.is_empty() && (!prefix.ends_with('\n') || !prefix.starts_with(char::is_alphanumeric) || !body.starts_with(['\n', '\r']) || prefix.contains("```") || prefix.contains("~~~")
@@ -882,7 +882,11 @@ pub(crate) fn written_call_json(text: &str, schemas: &serde_json::Value) -> Opti
         let (_, [key, name]) = CALLEE.captures(body)?.extract();
         if serde_json::from_str::<String>(key).ok()? != "name" { return None; }
         let name: String = serde_json::from_str(name).ok()?;
-        return offered(&name).then(|| serde_json::from_str::<Value>(body).is_ok());
+        if names.clone().any(|offered| offered == name) {
+            return Some(written_call_note(serde_json::from_str::<Value>(body).is_ok()));
+        }
+        let available = names.collect::<Vec<_>>().join(", ");
+        return Some(format!("[tool call written as text: nothing ran; that tool was not offered, and the available tools are {available}. Use the API if the task requires a tool.]"));
     }
     let json = if let Some(fence) = text.strip_prefix("```") {
         let (info, body) = fence.split_once('\n')?;
@@ -898,11 +902,12 @@ pub(crate) fn written_call_json(text: &str, schemas: &serde_json::Value) -> Opti
     let object: Value = serde_json::from_str(json).ok()?;
     let fields = object.as_object()?;
     let args = fields.get("arguments").or_else(|| fields.get("parameters"))?;
-    (fields.len() == 2 && offered(fields.get("name")?.as_str()?) && args.is_object()).then_some(true)
+    let name = fields.get("name")?.as_str()?;
+    (fields.len() == 2 && args.is_object() && names.any(|offered| offered == name)).then(|| written_call_note(true))
 }
 
 #[cold]
-pub(crate) fn written_call_note(valid: bool) -> String {
+fn written_call_note(valid: bool) -> String {
     let issue = if valid { "" } else { " The arguments were not valid JSON." };
     format!("[tool call written as text: nothing ran.{issue} Only call the tool through the API with valid JSON arguments if the user's task requires running it. Otherwise return the requested answer without running anything.]")
 }
@@ -940,7 +945,7 @@ mod tests {
     use crate::prompt::{NOTE_HEADER, NOTE_SEPARATOR};
 
     #[test]
-    fn recognizes_only_call_shaped_replies_to_offered_tools() {
+    fn recognizes_only_call_shaped_replies() {
         let registry = Registry::builtin_only();
         let call = r#"{"name":"bash","arguments":{"command":"echo hello"}}"#;
         let wrapped = format!("<tool_call>\n{call}\n</tool_call>");
@@ -979,10 +984,9 @@ mod tests {
             (r#"{"name":"bash","arguments":{},"example":true}"#.into(), None),
             (r#"{"name":"bash","arguments":{},}"#.into(), None),
             (r#"<tool_call>{"arguments":{},"name":"bash",}</tool_call>"#.into(), None),
-            (r#"<tool_call>{"name":"other","arguments":{,}}</tool_call>"#.into(), None),
             ("   ".into(), None),
         ] {
-            assert_eq!(written_call_json(&reply, registry.tool_schemas_json()), expected, "{reply:?}");
+            assert_eq!(written_call_recovery(&reply, registry.tool_schemas_json()), expected.map(written_call_note), "{reply:?}");
         }
     }
 
@@ -1008,7 +1012,7 @@ mod tests {
             (format!("```json\n{string_args}\n```"), None),
             (format!("{valid}\n{valid}"), Some(false)),
         ] {
-            assert_eq!(written_call_json(&reply, registry.tool_schemas_json()), expected, "{reply:?}");
+            assert_eq!(written_call_recovery(&reply, registry.tool_schemas_json()), expected.map(written_call_note), "{reply:?}");
         }
     }
 

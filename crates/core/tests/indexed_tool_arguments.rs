@@ -91,9 +91,19 @@ async fn run_with_round_cap(replies: Vec<WireReply>, max_rounds: usize) -> Turn 
 }
 
 async fn run_with_prompt(replies: Vec<WireReply>, max_rounds: usize, prompt: &str) -> Turn {
+    run_with_project(replies, max_rounds, prompt, |_| {}).await
+}
+
+async fn run_with_project(
+    replies: Vec<WireReply>,
+    max_rounds: usize,
+    prompt: &str,
+    setup: impl FnOnce(&std::path::Path),
+) -> Turn {
     let (url, requests) = common::recording_http_script(replies).await;
     let scratch = Scratch::new(&url, max_rounds);
     let project = scratch.0.join("project");
+    setup(&project);
     let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
     let id = sessions::create(&core, project.display().to_string())
         .unwrap()
@@ -329,6 +339,37 @@ async fn written_calls_are_replayed_as_text_then_retried_through_the_api() {
 }
 
 #[tokio::test]
+async fn tagged_calls_to_unoffered_tools_retry_with_the_request_tool_names() {
+    let malformed = r#"<tool_call>
+{"name":"sort_samples","arguments":{"samples":[{"id":"birch","rank":1},{"id":"maple","rank":2},{"id":"cedar" "rank":3},{"id":"elm","rank":4}]}}
+</tool_call>"#;
+    let valid = r#"<tool_call>{"name":"sort_samples","arguments":{"samples":[]}}</tool_call>"#;
+    let sentence = r#"<tool_call>{"name":"Please summarize the archived records in the next reply.","arguments":{}}</tool_call>"#;
+    for text in [malformed, valid, sentence] {
+        let turn = run_with_project(vec![answer(text), real_read(), answer("Verified.")], 8, "Check the result.", |project| {
+            let dir = project.join(".openmax/tools");
+            std::fs::create_dir_all(&dir).unwrap();
+            sessions::write_atomic(&dir.join("count_samples.toml"),
+                "name = \"count_samples\"\ndescription = \"Count samples\"\ncommand = \"/bin/echo\"\nmutating = false\n").unwrap();
+        }).await;
+        assert_eq!(turn.stop(), "stop");
+        assert_eq!(turn.requests.len(), 3);
+        let names = turn.requests[0]["tools"].as_array().unwrap().iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap()).collect::<Vec<_>>();
+        assert!(names.contains(&"count_samples"));
+        let note = format!("[tool call written as text: nothing ran; that tool was not offered, and the available tools are {}. Use the API if the task requires a tool.]", names.join(", "));
+        assert_eq!(call_text_notes(&turn), [note.as_str()]);
+        let replayed = turn.requests[1]["messages"].as_array().unwrap();
+        assert_eq!(replayed[replayed.len() - 2], json!({"role":"assistant","content":text}));
+        assert_eq!(replayed.last().unwrap(), &json!({"role":"user","content":note}));
+        assert!(turn.saved.iter().any(|message| message.harness_note && message.content.as_deref() == Some(note.as_str())));
+        assert!(matches!(turn.outcomes().as_slice(), [("actual", true, output)] if output.contains(FACT)));
+        assert!(!turn.events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+        assert_eq!(turn.saved.last().unwrap().content.as_deref(), Some("Verified."));
+    }
+}
+
+#[tokio::test]
 async fn written_calls_get_two_recoveries_in_a_row_within_the_round_cap() {
     let diagnostic = "The reply wrote a tool call as text. Nothing from it ran.";
     for (cap, count) in [(8, 3), (2, 2)] {
@@ -391,6 +432,7 @@ async fn answers_with_tool_names_or_examples_stay_answers() {
         "To inspect a file, call `read_file` with its path. Then use its result to decide what to edit.".to_string(),
         format!("Example: `<tool_call>{CALL_AS_TEXT}</tool_call>`"),
         format!("<tool_call>\n{CALL_AS_TEXT}"),
+        r#"<tool_call>{"arguments":{},"name":"read_file"}</tool_call>"#.to_string(),
         format!("{CALL_AS_TEXT}\nThis example is not a request to run it."),
     ] {
         let turn = run(vec![answer(&text)]).await;
