@@ -445,6 +445,9 @@ pub struct App {
     header_width: u16,
     status_line: Line<'static>,
     chatgpt_account: Option<String>,
+    /// What the empty conversation says in place of READY while no
+    /// endpoint resolves: the command that connects a model.
+    unconnected: Option<&'static str>,
     status_width: u16,
     /// Cached approval mode. A turn can adopt a stricter saved mode without
     /// marking chrome, so each draw compares this with the live mode.
@@ -626,10 +629,10 @@ async fn event_loop(
                     _ = &mut quit => None,
                 };
                 let Some(result) = result else { break; };
-                app.refresh_billing();
+                app.refresh_connection();
                 match result {
-                    Ok(()) if action == crate::setup::Action::Login => app.open_model_picker(),
-                    Ok(()) => app.note("provider credentials removed"),
+                    Ok(_) if action == crate::setup::Action::Login => app.open_model_picker(),
+                    Ok(_) => app.note("provider credentials removed"),
                     Err(error) => app.error(&error),
                 }
                 app.dirty = Dirty::all();
@@ -801,13 +804,14 @@ impl App {
             header_width: u16::MAX,
             status_line: Line::default(),
             chatgpt_account: None,
+            unconnected: None,
             status_width: u16::MAX,
             status_mode: None,
         }
     }
 
     async fn startup(&mut self, args: &Args) {
-        self.refresh_billing();
+        self.refresh_connection();
         if let Some(notice) = crate::update::on_session_start(&self.core.data_dir) {
             self.note(&notice);
         }
@@ -1724,10 +1728,17 @@ impl App {
         self.dirty.mark_chrome();
     }
 
-    fn refresh_billing(&mut self) {
-        let provider = self.core.settings.lock().unwrap().provider.clone();
-        self.chatgpt_account = provider.and_then(|p| open_max_core::providers::load_providers(&self.core.data_dir)
-            .get(&p).and_then(|p| p.chatgpt_account.as_deref().map(open_max_core::text::one_line)));
+    /// Re-read what the settings connect: the plan an account bills, and
+    /// whether any endpoint resolves at all.
+    fn refresh_connection(&mut self) {
+        use open_max_core::providers::{self, ResolveError};
+        let settings = self.core.settings.lock().unwrap().clone();
+        let catalog = providers::load_providers(&self.core.data_dir);
+        self.chatgpt_account = settings.provider.as_ref().and_then(|p| catalog.get(p))
+            .and_then(|p| p.chatgpt_account.as_deref().map(open_max_core::text::one_line));
+        let resolved = providers::resolve(&settings, &self.core.data_dir);
+        self.unconnected = matches!(resolved, Err(ResolveError::MissingEndpoint | ResolveError::Unconfigured { endpoint: true, .. }))
+            .then_some(if catalog.is_empty() { "no model connected: type /login to connect a provider" } else { "no model connected: type /model to choose one" });
         self.dirty.mark_chrome();
     }
 
@@ -1739,7 +1750,7 @@ impl App {
         match self.core.save_settings(&next) {
             Ok(()) => {
                 *self.core.settings.lock().unwrap() = next;
-                self.refresh_billing();
+                self.refresh_connection();
                 let source = provider
                     .map(|name| format!(" from {name}"))
                     .unwrap_or_default();
@@ -2205,7 +2216,7 @@ impl App {
             return;
         }
 
-        self.refresh_billing();
+        self.refresh_connection();
         let session_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
@@ -2385,7 +2396,7 @@ impl App {
                             }
                             let _ = self.core.save_settings(&s);
                         }
-                        self.refresh_billing();
+                        self.refresh_connection();
                         let ep = {
                             let s = self.core.settings.lock().unwrap();
                             open_max_core::providers::resolve(&s, &self.core.data_dir)
@@ -3466,7 +3477,7 @@ impl App {
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
             if self.composer.is_empty() {
-                render_ready(Rect { width: content_w, ..area }, frame.buffer_mut());
+                render_ready(self.unconnected.unwrap_or("READY"), Rect { width: content_w, ..area }, frame.buffer_mut());
             }
             return;
         }
@@ -3824,20 +3835,22 @@ fn command_parts(command: &str) -> (&str, &str) {
     (head, rest)
 }
 
-/// Restrained orientation for an empty chat session: one dim word. Transient
+/// Restrained orientation for an empty chat session: one dim word, or the
+/// line that says no model is connected and how to connect one. Transient
 /// chrome, never transcript content, so it never reaches saved sessions or
-/// the model; hidden when the area cannot hold it.
-fn render_ready(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+/// the model; hidden when the area cannot hold a word of it.
+fn render_ready(text: &str, area: Rect, buf: &mut ratatui::buffer::Buffer) {
     if area.width < 5 || area.height == 0 {
         return;
     }
-    Paragraph::new(Line::from(Span::styled("READY", Style::default().fg(theme::DIM))))
-        .render(Rect { height: 1, ..area }, buf);
+    Paragraph::new(Line::from(Span::styled(text.to_string(), Style::default().fg(theme::DIM))))
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .render(area, buf);
 }
 
 /// The settings a model selection produces; pure, so the caller decides how
 /// and whether to persist them.
-fn model_selection(current: &config::Settings, provider: Option<String>, model: String) -> config::Settings {
+pub(crate) fn model_selection(current: &config::Settings, provider: Option<String>, model: String) -> config::Settings {
     let mut next = current.clone();
     next.provider = provider;
     next.model = model;
@@ -4127,7 +4140,7 @@ fn shell(frame: &mut Frame, project: &std::path::Path) {
         header_path_line(project, layout.header.width as usize).render(layout.header, frame.buffer_mut());
     }
     if layout.chat.height > 0 {
-        render_ready(layout.chat, frame.buffer_mut());
+        render_ready("READY", layout.chat, frame.buffer_mut());
     }
     draw_composer(frame, layout.input, &mut composer, true, true);
 }
@@ -6320,6 +6333,25 @@ mod tests {
 
         assert!(app.pending_approval.is_some());
         assert!(app.history_search.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// While no endpoint resolves, the empty conversation says no model is
+    /// connected and names the command that connects one: /login with no
+    /// provider configured, /model once one is. A model selected clears it.
+    #[tokio::test]
+    async fn an_empty_chat_with_no_model_connected_names_the_command_that_connects_one() {
+        let (mut app, dir) = app_fixture();
+        let args = super::Args { continue_session: false, session: None, quit: Default::default() };
+        app.startup(&args).await;
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /login to connect a provider") && !text.contains("READY"), "{text}");
+        fs::write(dir.join("providers.json"), r#"{"providers":{"local":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"m","context_tokens":8192}]}}}"#).unwrap();
+        app.startup(&args).await;
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /model to choose one"), "{text}");
+        app.handle_submit("/provider local".into()).await.unwrap();
+        assert_eq!(app.unconnected, None);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -24,7 +24,8 @@ const LIMIT: usize = 1024 * 1024;
 /// Setup's keys: a session's reader (`app::TerminalInput`), else its own stream.
 pub(crate) type Keys<'a> = Box<dyn futures_util::Stream<Item = std::io::Result<Event>> + Unpin + 'a>;
 
-pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<Keys<'_>>) -> Result<(), String> {
+/// Ok with the connection and model an API-key login saved, else Ok(None).
+pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<Keys<'_>>) -> Result<Option<(String, String)>, String> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Err("provider setup needs an interactive terminal".into());
     }
@@ -94,7 +95,8 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
             },
             account,
         )
-        .await;
+        .await
+        .map(|()| None);
     }
     if action == Action::Logout {
         let previous = snapshot
@@ -127,7 +129,7 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         })
         .await?;
         eprintln!("Disconnected {} locally. The API key remains valid at the provider; revoke it there if needed.", one_line(&name));
-        return Ok(());
+        return Ok(None);
     }
     let custom = name == "custom";
     let name = if custom {
@@ -317,11 +319,25 @@ pub async fn run(dir: &Path, action: Action, target: Option<&str>, keys: Option<
         "Saved connection {}. Credentials are stored locally with owner-only permissions.",
         one_line(&name)
     );
-    eprintln!(
-        "Choose it with /model, or run openmax --provider {} --model {}",
-        open_max_core::doctor::shell_quote(Path::new(&name)),
-        open_max_core::doctor::shell_quote(Path::new(&model))
-    );
+    Ok(Some((name, model)))
+}
+
+/// After a login from the shell: when settings select no endpoint, the
+/// connection just made becomes the default through the save `/model`
+/// makes, so the next `openmax` runs on it; otherwise the selection stays.
+pub fn select_unless_chosen(dir: &Path, provider: &str, model: &str) -> Result<(), String> {
+    let (core, _events) = open_max_core::state::Core::new(dir.to_path_buf())?;
+    let settings = core.settings.lock().unwrap().clone();
+    if settings.provider.as_deref().is_some_and(|p| !p.trim().is_empty()) || !settings.base_url.trim().is_empty() {
+        eprintln!(
+            "Choose it with /model, or run openmax --provider {} --model {}",
+            open_max_core::doctor::shell_quote(Path::new(provider)),
+            open_max_core::doctor::shell_quote(Path::new(model))
+        );
+        return Ok(());
+    }
+    core.save_settings(&crate::app::model_selection(&settings, Some(provider.into()), model.into()))?;
+    eprintln!("{} from {} is now the default model; change it with /model.", one_line(model), one_line(provider));
     Ok(())
 }
 

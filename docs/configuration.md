@@ -834,9 +834,13 @@ never replaces a `max_tokens` the entry already has. An endpoint without a
 model-list route can be configured with an exact model ID; setup reports
 that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.
-Run login again to add another. Choose the connection with `/model` afterward,
-or use the printed `openmax --provider ... --model ...` command. Login does not
-silently change the default provider or project trust.
+Run login again to add another. A login from the shell while settings.json
+selects no endpoint (no `provider` and no `base_url`) makes the connection and
+model it saved the default, through the same save `/model` makes, and says so;
+the next `openmax` runs on it. With an endpoint already selected, login leaves
+it selected: choose the new connection with `/model` afterward, or use the
+printed `openmax --provider ... --model ...` command. Login never changes
+project trust.
 
 New Anthropic preset connections use the native Messages API, including
 streaming, tools, usage accounting, and effort controls. Existing compatibility
