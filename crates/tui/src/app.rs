@@ -6572,7 +6572,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_chat_with_no_model_connected_names_the_command_that_connects_one() {
         let (mut app, dir) = app_fixture();
-        let args = super::Args { continue_session: false, session: None, quit: Default::default() };
+        let args = super::Args { continue_session: false, session: None, prompt: None, quit: Default::default() };
         app.startup(&args).await;
         let text = buffer_text(&render_app(&mut app, 96, 12));
         assert!(text.contains("no model connected: type /login to connect a provider") && !text.contains("READY"), "{text}");

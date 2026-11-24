@@ -715,8 +715,8 @@ fn shell_logout_warns_for_configured_credentials_only() {
     let data = home.join(".openmax");
     std::fs::create_dir_all(&data).unwrap();
     std::fs::write(data.join("providers.json"), r#"{"providers":{
-        "env-list":{"api_key_env":["FIXTURE_KEY"]},
-        "header":{"headers":{"Authorization":"$FIXTURE_KEY"}},
+        "env-list":{"base_url":"https://example.invalid/v1","api_key_env":["FIXTURE_KEY"]},
+        "header":{"base_url":"https://example.invalid/v1","headers":{"Authorization":"$FIXTURE_KEY"}},
         "local":{"base_url":"http://127.0.0.1:9/v1","api_key_env":[]}
     }}"#).unwrap();
     for (name, warned) in [("env-list", true), ("header", true), ("local", false)] {
