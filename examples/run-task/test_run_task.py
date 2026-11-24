@@ -201,6 +201,20 @@ def a_project_in_ask_mode_says_why_nothing_was_written(root, binary):
     assert result["reason"].endswith("(approval requests declined: 1, so the project is not in auto mode)"), result
 
 
+def a_run_that_declined_a_write_exits_3_with_its_checks_run(root, binary):
+    with endpoint([FIX, DONE]) as (url, requests):
+        repo, env, out = fixture(root, "declined", binary, url)
+        subprocess.run([binary, "--stdio"], cwd=repo, env=env, capture_output=True, check=True,
+                       input=b'{"cmd":"approval_mode","mode":"ask"}\n{"cmd":"quit"}\n')
+        hook = Path(env["HOME"]) / ".openmax" / "hooks" / "run-task-checks.toml"
+        run([binary, "--approve", hook], repo, {**env, "OPENMAX_HUMAN_ATTEST": "1"})
+        result = call(binary, repo, env, out, "--check", "true", code=3)
+    assert result["stop_reason"] == "stop" and result["files_changed"] == [] and len(requests) == 2, result
+    assert result["checks"][0]["after"] == 0 and not result["verified"], result
+    assert "openmax: declined 1 approval request: " in result["reason"], result
+    assert result["reason"].endswith("(approval requests declined: 1, so the project is not in auto mode)"), result
+
+
 def a_run_open_max_could_not_finish_reports_its_error(root, binary):
     with endpoint([DONE]) as (url, _):
         repo, env, out = fixture(root, "down", binary, url)
@@ -255,6 +269,7 @@ if __name__ == "__main__":
         a_timeout_or_a_signal_stops_the_run(root, binary)
         a_call_that_cannot_be_held_to_its_checks_does_not_start(root, binary)
         a_project_in_ask_mode_says_why_nothing_was_written(root, binary)
+        a_run_that_declined_a_write_exits_3_with_its_checks_run(root, binary)
         a_run_open_max_could_not_finish_reports_its_error(root, binary)
         the_demo_shows_a_refused_end_and_a_replay_and_leaves_nothing_behind(root, binary)
     print("The run-task example passed against Open Max")

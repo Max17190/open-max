@@ -244,7 +244,7 @@ followed by `done` with `stop_reason` `refused`, so a client that blocks on
 
 | `stop_reason` | Meaning |
 | --- | --- |
-| provider `finish_reason` | Passed through verbatim on a normal turn, commonly `stop` or `length`. Any other, such as `content_filter`, is the provider ending the reply on its own terms: the turn is over, and print mode exits 1 on it |
+| provider `finish_reason` | How the reply ended, on a normal turn: a Chat Completions server's own value verbatim, commonly `stop`, `tool_calls` or `length`; the Responses and native Messages protocols' values are mapped to those, and to `refusal` for a reply the model refused. Any value but `stop`, `tool_calls` and `length`, such as `content_filter` or `refusal`, is the provider ending the reply on its own terms: the turn is over, and print mode exits 1 on it |
 | `truncated` | The provider stream ended with no completion signal, or at a data line the client cannot read (after reply text had streamed, on the third such cut in a row or the last retry, or by going silent), or exceeded a client limit; the reply is incomplete, any tool calls it carried were refused, and an `error` line precedes it |
 | `empty` | The model's reply had no text and no tool call and was not a cut the harness recognized, and it was asked for once more in the turn (where an iteration was left) with the same result, so there is no answer; an `error` line precedes it |
 | `max_iterations` | The turn hit the tool-call ceiling |

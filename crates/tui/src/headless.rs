@@ -63,7 +63,7 @@ fn file_states(root: &Path) -> Option<HashMap<PathBuf, (u64, Option<SystemTime>)
 /// reasoning. Working the request out again is only sound while the problem
 /// it states is still there: on a tree the run already changed, the second
 /// session can undo a correct repair. The exit status stays the first's
-/// unless a signal lands.
+/// unless a signal lands or the second session declines an approval (3).
 pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
     // Both scans run off this thread so a signal still ends the run in time.
     let project = args.project.clone();
@@ -100,6 +100,8 @@ pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEven
     match run_session(&core, &mut core_rx, &look).await {
         _ if crate::signalled() => crate::quit_status(),
         0 => code,
+        // A declined approval: the setup, not the look, kept the work from being done.
+        3 => 3,
         failed => {
             eprintln!("openmax: second look ended with status {failed}; the run's status {code} stands");
             code
@@ -109,7 +111,7 @@ pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEven
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in
 /// `ask` mode are declined so unattended runs never hang, and a turn that
-/// declined one exits 3 (`SELECT_AUTO`). Multiple prompts reuse one session_id.
+/// declined one exits 3 (`select_auto`). Multiple prompts reuse one session_id.
 async fn run_session(
     core: &Arc<Core>,
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
@@ -226,17 +228,7 @@ async fn run_prompts(
         }
 
         let mut saw_tokens = false;
-        let turn_exit = run_turn_events(
-            core,
-            core_rx,
-            session_id,
-            args,
-            &mut saw_tokens,
-            &mut stdout,
-            &mut stderr,
-            stop_by,
-        )
-        .await;
+        let turn_exit = run_turn_events(core, core_rx, session_id, args, &mut saw_tokens, &mut stdout, &mut stderr, stop_by).await;
         if turn_exit != 0 {
             exit_code = turn_exit;
             // Stop the multi-turn chain on hard failure so later prompts do not
@@ -270,7 +262,8 @@ async fn run_turn_events(
     // its done, which arrives once the tools are stopped; returning at once
     // would exit with them running.
     let mut stopping: Option<i32> = None;
-    let mut declined = (0usize, false); // requests declined, and whether the mode's gate made one
+    // Approval requests declined, and whether the mode's gate made one.
+    let mut declined = (0usize, false);
     let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
     let quit = args.quit.notified();
     tokio::pin!(quit);
@@ -366,7 +359,7 @@ async fn run_turn_events(
                     }
                 }
                 if declined.0 > 0 {
-                    let how = if declined.1 { SELECT_AUTO } else { "a human must approve each tool named above with its openmax --approve line, then run again" };
+                    let how = if declined.1 { select_auto(core, &args.project) } else { "a human must approve each tool named above with its openmax --approve line, then run again".into() };
                     let _ = writeln!(stderr, "openmax: declined {} approval request{}: {how}", declined.0, if declined.0 == 1 { "" } else { "s" });
                 }
                 // Stopped short (4: resubmitting continues, unless a completion gate could not start); kept from its work by
@@ -477,11 +470,7 @@ async fn run_turn_events(
 /// `name summary`, collapsed to just the name when the summary is the name
 /// again (an external call whose arguments held no string to describe).
 fn call_line(name: &str, summary: &str) -> String {
-    if summary.is_empty() || summary == name {
-        name.to_string()
-    } else {
-        format!("{name} {summary}")
-    }
+    if summary.is_empty() || summary == name { name.to_string() } else { format!("{name} {summary}") }
 }
 
 fn truncate_line(s: &str, max: usize) -> String {
@@ -507,8 +496,17 @@ fn approve_hint(source_path: &str, source_sha: &str) -> String {
     format!("a human must approve this tool's content first: openmax --approve {} ({source_sha})", open_max_core::doctor::shell_quote(Path::new(source_path)))
 }
 
-/// How to allow what a print run in ask declined, with no terminal session: a mode only a human saves.
-const SELECT_AUTO: &str = "this project's approval mode is ask, and a print run cannot ask. To let unattended runs do this work, select auto once, from this directory: echo '{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}' | openmax --stdio";
+/// How to allow what a print run in ask declined with no terminal session: save auto (a mode only a human
+/// selects) here, or, for a sub-agent held to a stricter mode saved inside the project, on the highest
+/// trusted directory above its `project` still in ask, which a sub-agent's next worktree is made under.
+fn select_auto(core: &Core, project: &Path) -> String {
+    let ask = |dir: &Path| core.approval_mode(dir) == open_max_core::config::ApprovalMode::Ask && open_max_core::trust::is_trusted(&core.data_dir, dir) == Ok(true);
+    let (cmd, here) = ("echo '{\"cmd\":\"approval_mode\",\"mode\":\"auto\"}' | openmax --stdio", std::env::current_dir().ok().filter(|here| !ask(here)));
+    let saved = here.and_then(|_| open_max_core::state::canonical_root(project).ancestors().take_while(|dir| ask(dir)).last().map(Path::to_path_buf));
+    let fix = saved.map_or(format!("from this directory: {cmd}"), |dir| format!("for {}, whose saved mode governs this run: (mkdir -p {q} && cd {q} && {cmd})",
+        dir.display(), q = open_max_core::doctor::shell_quote(&dir)));
+    format!("this run's approval mode is ask, and a print run cannot ask. To let unattended runs do this work, select auto once {fix}")
+}
 
 /// What a person reads when a turn stops at its iteration cap: the cap it
 /// reached, then `how_to_continue`, which differs by frontend. Settings are

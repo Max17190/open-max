@@ -167,8 +167,16 @@ in the project's directory:
 echo '{"cmd":"approval_mode","mode":"auto"}' | openmax --stdio
 ```
 
+A sub-agent held to a stricter mode saved inside the project, such as `ask`
+for `.worktrees` under a project in `auto`, names that directory and the
+command that selects `auto` there instead. A `--second-look` session that
+declines a request ends the run with exit 3 too.
+
 A request for an agent-written tool no human has approved names its
-`openmax --approve` command instead. With `--json`, each decline is the
+`openmax --approve` command instead. A print run an agent started (one whose
+environment carries `OPENMAX_SESSION`) declines such a tool without a request
+at all, as no human could answer one: the model's tool result names the
+command, and the run's exit code does not change. With `--json`, each decline is the
 `approval_settled` line with `outcome` `declined` that the stream already
 carries, and the exit code is the same. A run in `ask` that asked for nothing,
 such as a question, exits 0.
