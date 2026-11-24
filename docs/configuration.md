@@ -180,23 +180,11 @@ and the run that writes a key already uses it.
   (HTTP 400 or 422) gets the request again at the usual limit and no more
   room in that turn. A cut thought gets no room of its own, and its raised
   limit is the plain doubling. The ceiling is the most any request asks
-  for: the model entry's `max_tokens`, which is the model's longest reply.
-  Each request's first ask depends on whether the connection can replay a
-  reply cut inside its reasoning. Chat Completions sends that reasoning
-  back and the model continues the thought, so declaring the longest reply
-  keeps the default limit as the first ask. Responses and native Messages
-  send back only reasoning that finished, so a cut thought is lost and the
-  model starts it again under the same limit; there each request first asks
-  for the longest reply, up to 16384. A server that refuses that first ask
-  (HTTP 400 or 422, or a refusal for length) gets the request again at the
-  reserve, as any refused limit above it does (see the input budget below),
-  and once that succeeds the rest of the turn stays at the reserve, whatever
-  the refusal said. The ChatGPT subscription route sends no output limit, so
-  there the first ask stays the default, a local reserve.
-  A `max_tokens` other than 4096 in settings.json is both the limit and a
-  ceiling (within the entry's) on every connection, and wins over the
-  entry's first ask; with neither, the ceiling is four times the default
-  (16384). A limit at its ceiling asks for no room, and a cut call is
+  for: the model entry's `max_tokens`, which is the model's longest reply,
+  so declaring it keeps the default limit as each request's first ask; a
+  `max_tokens` other than 4096 in settings.json is both the limit and a
+  ceiling (within the entry's); with neither, the ceiling is four times the
+  default (16384). A limit at its ceiling asks for no room, and a cut call is
   asked for in parts. A
   reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
@@ -236,11 +224,9 @@ and the run that writes a key already uses it.
   catalog's output maximum when one is reported, and `openmax --check`
   warns while such a connection runs at the default. To let cut replies be
   raised up to the model's longest reply, set `max_tokens` on the model's
-  providers.json entry to it (on a Responses or native Messages connection
-  that sends the limit it is then also each request's first ask, up to
-  16384); to choose every
-  request's first ask, set it in settings.json: the input budget holds back
-  at most the larger of 4096 and an eighth of the window for it, and a request asks for
+  providers.json entry to it; to raise every request's first ask, set it in
+  settings.json: the input budget holds back at most the
+  larger of 4096 and an eighth of the window for it, and a request asks for
   more only when its prompt leaves the room. A 4096 counts as chosen only on
   the model's entry: every settings save writes 4096 to settings.json when
   the limit is unset. `openmax --check --all` states the active model's
@@ -377,15 +363,12 @@ tokens of headroom, where
 
     reply_reserve = min(max_tokens, max(4096, context_tokens / 8))
 
-with `max_tokens` the settings limit after its clamp above, within the
-model entry's (so at most 4096 when only the entry declares one, whatever
-the first ask). Each request carries the reply limit
+with `max_tokens` after its clamp above. Each request carries the reply limit
 
-    limit = clamp(context_tokens - 1024 - prompt, reply_reserve, ask)
+    limit = clamp(context_tokens - 1024 - prompt, reply_reserve, max_tokens)
 
-where `ask` is the first ask (above, after the same clamp) or the limit
-replies cut in a row raised it to, and `prompt` is the calibrated estimate
-of that request in the server's tokens. So the limit each request carries and the room held back from the
+where `prompt` is the calibrated estimate of that request in the server's
+tokens. So the limit each request carries and the room held back from the
 input budget are two numbers: set to a model's longest reply, `max_tokens`
 no longer holds that much input back, and a model whose longest reply is as
 large as its window keeps seven eighths of it for input instead of about a
@@ -398,10 +381,8 @@ after a cut call or text, or a raised limit, first goes again at the usual
 limit if that is lower. These retries count toward `max_agent_iterations`,
 and any reasoning or image repair follows them at the reduced limit if an
 iteration is left. If a status-only retry succeeds at the reserve, later
-requests in the same turn stay there, as they do after a refused larger
-first ask on Responses or native Messages, whatever its wording. If
-recovery from a status-only refusal or a refused larger first ask fails,
-Open Max reports the original error. A status alone does not change
+requests in the same turn stay there. If recovery from a status-only refusal
+fails, Open Max reports the original error. A status alone does not change
 the input estimate. The subscription route sends no reply limit and does
 not use these limit retries.
 Open Max estimates the input at about four bytes per token and scales the
