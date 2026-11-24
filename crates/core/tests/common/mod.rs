@@ -14,28 +14,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// A completions endpoint that answers each request with the next scripted
 /// reply (one JSON body, no stream) and records every request body.
 pub async fn recording_endpoint(responses: Vec<serde_json::Value>) -> (String, Arc<Mutex<Vec<String>>>) {
-    recording_http(responses.into_iter().map(|body| (200, body)).collect(), false).await
+    recording_http(responses, false).await
 }
 
 /// Each value is one terminal Responses event, framed as SSE.
 pub async fn recording_responses(responses: Vec<serde_json::Value>) -> (String, Arc<Mutex<Vec<String>>>) {
-    recording_http(responses.into_iter().map(|body| (200, body)).collect(), true).await
-}
-
-/// `recording_responses` with each reply's HTTP status: a body under any
-/// status but 200 goes as JSON, as a server's error does.
-pub async fn recording_responses_with_status(responses: Vec<(u16, serde_json::Value)>) -> (String, Arc<Mutex<Vec<String>>>) {
     recording_http(responses, true).await
 }
 
-async fn recording_http(responses: Vec<(u16, serde_json::Value)>, sse: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+async fn recording_http(responses: Vec<serde_json::Value>, sse: bool) -> (String, Arc<Mutex<Vec<String>>>) {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let record = bodies.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        for (status, body) in responses {
-            let sse = sse && status == 200;
+        for body in responses {
             let Ok((mut sock, _)) = listener.accept().await else { return };
             let mut buf = Vec::new();
             let mut chunk = [0u8; 8192];
@@ -69,7 +62,7 @@ async fn recording_http(responses: Vec<(u16, serde_json::Value)>, sse: bool) -> 
             let payload = if sse { format!("data: {payload}\n\n") } else { payload };
             let content_type = if sse { "text/event-stream" } else { "application/json" };
             let response = format!(
-                "HTTP/1.1 {status} Fixture\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 payload.len(),
                 payload
             );

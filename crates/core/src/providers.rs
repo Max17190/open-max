@@ -70,12 +70,6 @@ pub enum WireApi {
     Anthropic,
 }
 
-impl WireApi {
-    /// Whether a reply the limit cut inside its reasoning sends that reasoning back, so the model continues the thought:
-    /// native Messages drops a thinking block the cut left open, and Responses keeps only finished reasoning items.
-    pub(crate) fn replays_cut_thought(self) -> bool { match self { Self::ChatCompletions => true, Self::Responses | Self::Anthropic => false } }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderModel {
     pub id: String,
@@ -160,8 +154,6 @@ pub struct ActiveEndpoint {
     pub reply_room: usize,
     /// The longest reply a request may ask for: the most that replies cut in a row raise the limit to (see `reply_asks`).
     pub reply_ceiling: usize,
-    /// Whether max_tokens is the larger first ask of a route that cannot replay a cut thought (see `reply_asks`).
-    pub larger_first_ask: bool,
     /// Compaction ceiling in real tokens, before the window cap and calibration.
     pub compaction_tokens: usize,
     pub temperature: Option<f32>,
@@ -185,11 +177,12 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
-/// The first reply limit, the reserve, the room after a cut call or text (four times the ask), the ceiling for a
-/// `context`-token window, and whether the ask is `larger`: a model entry's `max_tokens` (its longest reply) is the
-/// ceiling, and the first ask is the default within it, or with `larger` (a route that sends the limit and cannot replay
-/// a cut thought, which starts over) the longest reply up to 16384. One chosen in settings is both ask and ceiling.
-fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>, larger: bool) -> (usize, usize, usize, usize, bool) {
+/// The reply limit a request starts at, the reserve, the room after a cut call or text, and the ceiling, for a
+/// `context`-token window. The model entry's `max_tokens` is the model's longest reply: a ceiling, not the first ask,
+/// so declaring it keeps the default limit. A `max_tokens` chosen in settings is both the ask and a ceiling. With
+/// neither, the ceiling is four times the default, which bounds thinking on a model whose longest reply is unknown.
+/// The room after a cut call or text is four times the ask, within the ceiling.
+fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>) -> (usize, usize, usize, usize) {
     let default = Settings::default().max_tokens;
     let chosen = (settings.max_tokens != default).then_some(settings.max_tokens);
     let ceiling = match (chosen, entry) {
@@ -198,10 +191,8 @@ fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>, larger:
         (None, None) => default * 4,
     };
     let (ask, reserve) = reply_limits(context, entry.map_or(settings.max_tokens, |entry| entry.min(settings.max_tokens)));
-    let larger = larger && chosen.is_none() && entry.is_some();
-    let ask = if larger { reply_limits(context, ceiling.min(16_384)).0 } else { ask };
     let ceiling = reply_limits(context, ceiling).0.max(ask);
-    (ask, reserve, ceiling.min(ask.saturating_mul(4)), ceiling, larger)
+    (ask, reserve, ceiling.min(ask.saturating_mul(4)), ceiling)
 }
 
 impl ActiveEndpoint {
@@ -670,7 +661,11 @@ pub fn resolve(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, R
 
 fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoint, ResolveError> {
     let (providers, parse_error) = load_snapshot(data_dir);
-    let provider_name = settings.provider.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let provider_name = settings
+        .provider
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     if let Some(ref name) = provider_name {
         let Some(p) = providers.get(name) else {
@@ -707,8 +702,12 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
             return Err(ResolveError::MissingModel);
         }
         let model_entry = p.models.iter().find(|m| m.id == model);
-        let context_tokens = model_entry.and_then(|m| m.context_tokens).or(settings.context_tokens).ok_or(ResolveError::MissingContextTokens)?.max(1);
-        let (max_tokens, reply_reserve, reply_room, reply_ceiling, larger_first_ask) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens), !p.wire_api.replays_cut_thought() && chatgpt.is_none());
+        let context_tokens = model_entry
+            .and_then(|m| m.context_tokens)
+            .or(settings.context_tokens)
+            .ok_or(ResolveError::MissingContextTokens)?
+            .max(1);
+        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens));
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
         // Sent anywhere else, it hands one server's credential to another.
@@ -738,7 +737,6 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
             reply_reserve,
             reply_room,
             reply_ceiling,
-            larger_first_ask,
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
                 .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -766,8 +764,11 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
     if model.is_empty() {
         return Err(ResolveError::MissingModel);
     }
-    let context_tokens = settings.context_tokens.ok_or(ResolveError::MissingContextTokens)?.max(1);
-    let (max_tokens, reply_reserve, reply_room, reply_ceiling, larger_first_ask) = reply_asks(context_tokens, settings, None, false);
+    let context_tokens = settings
+        .context_tokens
+        .ok_or(ResolveError::MissingContextTokens)?
+        .max(1);
+    let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, None);
     Ok(ActiveEndpoint {
         wire_api: WireApi::ChatCompletions,
         chatgpt: None,
@@ -781,8 +782,9 @@ fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEndpoi
         reply_reserve,
         reply_room,
         reply_ceiling,
-        larger_first_ask,
-        compaction_tokens: settings.compaction_tokens.unwrap_or_else(|| default_compaction_tokens(context_tokens)),
+        compaction_tokens: settings
+            .compaction_tokens
+            .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
         temperature: settings.temperature,
         reasoning_effort: settings.reasoning_effort,
         compat: CompatFlagsFile::default().into(),
@@ -1645,23 +1647,11 @@ mod tests {
         write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":4096,"max_tokens":100000}]}}}"#);
         let entry = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
         assert_eq!((entry.max_tokens, entry.reply_reserve), (2048, 2048));
-        // On Chat Completions, which replays a cut thought, a declared longest reply is the ceiling cut replies are raised to, not the first ask.
+        // A declared longest reply is the ceiling cut replies are raised to, not the first ask.
         write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":1048576,"max_tokens":393216}]}}}"#);
         let entry = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
         assert_eq!((entry.max_tokens, entry.reply_reserve, entry.reply_room, entry.reply_ceiling), (4096, 4096, 16_384, 393_216));
         assert_eq!((1..=7).map(|raise| entry.raised_limit(1_000, raise)).collect::<Vec<_>>(), [8192, 16_384, 32_768, 65_536, 131_072, 262_144, 393_216]);
-        // Where a cut thought is lost it is also the first ask, up to 16384, within the window; the reserve stays 4096.
-        for (context, longest, want) in [(1_048_576, 393_216, (16_384, 4096, 65_536, 393_216)), (1_048_576, 8192, (8192, 4096, 8192, 8192)), (16_384, 100_000, (14_336, 4096, 14_336, 14_336))] {
-            write_providers(&dir, &format!(r#"{{"providers":{{"p":{{"base_url":"http://t/v1","wire_api":"anthropic","models":[{{"id":"m","context_tokens":{context},"max_tokens":{longest}}}]}}}}}}"#));
-            let lost = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
-            assert_eq!((lost.max_tokens, lost.reply_reserve, lost.reply_room, lost.reply_ceiling, lost.larger_first_ask), (want.0, want.1, want.2, want.3, true), "{longest} on {context}");
-        }
-        // The ChatGPT subscription route sends no limit, so its first ask stays the default, a local reserve.
-        crate::chatgpt::tests::seeded(&dir);
-        write_providers(&dir, &format!(r#"{{"providers":{{"p":{{"base_url":"{}","wire_api":"responses","chatgpt_account":"main","models":[{{"id":"m","context_tokens":1048576,"max_tokens":393216}}]}}}}}}"#, crate::chatgpt::API));
-        let plan = resolve(&Settings { provider: Some("p".into()), model: "m".into(), ..Default::default() }, &dir).unwrap();
-        assert_eq!((plan.max_tokens, plan.larger_first_ask, plan.reply_ceiling), (4096, false, 393_216));
-        write_providers(&dir, r#"{"providers":{"p":{"base_url":"http://t/v1","models":[{"id":"m","context_tokens":1048576,"max_tokens":393216}]}}}"#);
         let chosen = resolve(&Settings { provider: Some("p".into()), model: "m".into(), max_tokens: 8000, ..Default::default() }, &dir).unwrap();
         assert_eq!((chosen.max_tokens, chosen.reply_ceiling), (8000, 8000), "a limit chosen in settings is its own ceiling");
         let flat = |context_tokens: usize, max_tokens: usize| {
@@ -1678,7 +1668,7 @@ mod tests {
         let docs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/configuration.md")).unwrap();
         for formula in [
             "reply_reserve = min(max_tokens, max(4096, context_tokens / 8))",
-            "limit = clamp(context_tokens - 1024 - prompt, reply_reserve, ask)",
+            "limit = clamp(context_tokens - 1024 - prompt, reply_reserve, max_tokens)",
             "`context_tokens - (reply_reserve + 1024)`",
         ] {
             assert!(docs.contains(formula), "docs/configuration.md does not state {formula}");
