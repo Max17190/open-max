@@ -108,8 +108,9 @@ openmax --update                     # update to the latest release
 
 Use `/login` and `/logout` inside a session for the same setup flow. Open Max
 returns to the conversation when setup finishes or you cancel. `/provider`
-and `/model` open the searchable provider/model picker. Setup does not change
-your selected provider until you choose one in that picker. See
+and `/model` open the searchable provider/model picker. If no provider or
+endpoint is selected, API login saves and activates the model you choose.
+Otherwise, choose a model in the picker to switch. See
 [provider connections](configuration.md#connecting-and-disconnecting-providers).
 
 ChatGPT account setup is a separate operation and cannot be combined with

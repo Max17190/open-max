@@ -629,8 +629,11 @@ async fn event_loop(
                 let Some(result) = result else { break; };
                 app.refresh_connection();
                 match result {
-                    Ok(()) if action == crate::setup::Action::Login => app.open_model_picker(),
-                    Ok(()) => app.note("provider disconnected"),
+                    Ok(Some((provider, model))) if !crate::setup::has_selection(&app.core.settings.lock().unwrap()) => {
+                        app.persist_model_selection(Some(provider), model);
+                    }
+                    Ok(_) if action == crate::setup::Action::Login => app.open_model_picker(),
+                    Ok(_) => app.note("Provider disconnected. Use /model or /login."),
                     Err(error) => app.error(&error),
                 }
                 app.dirty = Dirty::all();
@@ -1729,11 +1732,10 @@ impl App {
 
     fn open_model_picker(&mut self) {
         let settings = self.core.settings.lock().unwrap().clone();
-        let mut picker = model_picker::ModelPickerState::load(
+        let picker = model_picker::ModelPickerState::load(
             &self.core.data_dir, settings.provider.as_deref(), &settings.model,
+            !settings.base_url.trim().is_empty(),
         );
-        picker.items.retain(|item| !item.id.is_empty());
-        picker.filtered = (0..picker.items.len()).collect();
         if picker.items.is_empty() {
             self.note("no configured models; use /login to connect a provider");
             return;
@@ -5868,6 +5870,7 @@ mod tests {
                 &dir,
                 Some("alpha"),
                 "one",
+                false,
             ));
             let listed = app.model_picker.as_ref().unwrap().filtered.len();
             assert!(listed > 1, "need a list to step through");

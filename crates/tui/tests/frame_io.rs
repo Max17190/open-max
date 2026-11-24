@@ -957,6 +957,98 @@ mod first_frame {
         server.join().unwrap();
     }
 
+    fn connect_keyless(s: &mut Session, command: &str, name: &str, base: &str) {
+        let wait = Duration::from_secs(5);
+        let start = s.out.len();
+        if !command.is_empty() {
+            s.write(format!("{command}\r").as_bytes());
+        }
+        let mut from = start;
+        if command == "/login" || command.is_empty() {
+            from = s.wait_for_prompt(b"Connect a provider", from, wait).unwrap_or_else(|| panic!("{}", s.context()));
+            s.write(b"other\r");
+        }
+        for (label, answer) in [("Connection name", name), ("API base URL", base), ("API key (hidden", ""), ("Choose a model", "")] {
+            from = s.wait_for_prompt(label.as_bytes(), from, wait).unwrap_or_else(|| panic!("missing {label}: {}", s.context()));
+            s.write(format!("{answer}\r").as_bytes());
+        }
+    }
+
+    const LOGIN_CATALOG: &str = r#"{"data":[{"id":"alpha","context_length":32768}]}"#;
+    const LOGIN_REPLY: &str = r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"fixture reply"}}]}"#;
+
+    #[test]
+    fn first_session_login_saves_the_model_and_uses_it_without_another_picker() {
+        let base = endpoint(vec![LOGIN_CATALOG.into(), LOGIN_REPLY.into()]);
+        let mut s = Session::spawn_home("first-session-login", 85, 26, |_, cmd, terminal, _| {
+            cmd.stderr(terminal.try_clone().unwrap());
+        });
+        let wait = Duration::from_secs(5);
+        s.wait_for(b"Trust project", 0, wait).expect("trust question");
+        s.write(b"r\r");
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        let start = s.out.len();
+        connect_keyless(&mut s, "/login", "solo", &base);
+        let push = s.wait_for(KEYBOARD_PUSH, start, wait).expect("login returned");
+        s.wait_for(FRAME_END, push, wait).expect("first frame after login");
+        let shown = screen(&s.out, 85, 26).join("\n");
+        assert!(!shown.contains("type to filter"), "second model picker: {shown}");
+        s.write(b"hello\r");
+        let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("fixture reply"));
+        assert!(shown.contains("fixture reply"), "{shown}");
+        let settings = open_max_core::config::load(&s.dir.join("home/.openmax")).unwrap();
+        assert_eq!(settings.provider.as_deref(), Some("solo"));
+        assert_eq!(settings.model, "alpha");
+    }
+
+    #[test]
+    fn a_disconnected_provider_cannot_be_picked_in_the_session_or_on_restart() {
+        let base = endpoint(vec![LOGIN_CATALOG.into(), LOGIN_CATALOG.into(), LOGIN_REPLY.into()]);
+        let wait = Duration::from_secs(5);
+        let mut login = Session::spawn_home("shell-login", 85, 26, |_, cmd, terminal, _| {
+            cmd.arg("--login").stderr(terminal.try_clone().unwrap());
+        });
+        connect_keyless(&mut login, "", "original", &base);
+        assert!(login.wait_exit(wait).is_some_and(|status| status.success()), "{}", login.context());
+        let saved = login.dir.join("home/.openmax");
+        let spawn = |from: &Path| Session::spawn_home("disconnected-provider", 85, 26, |dir, cmd, terminal, _| {
+            for file in ["settings.json", "providers.json"] {
+                std::fs::copy(from.join(file), dir.join(file)).unwrap();
+            }
+            cmd.arg("--trust-project").stderr(terminal.try_clone().unwrap());
+        });
+        let mut s = spawn(&saved);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        let start = s.out.len();
+        s.write(b"/logout original\r");
+        let question = s.wait_for_prompt(b"Disconnect original?", start, wait).expect("logout question");
+        s.write(b"\x1b[B\r");
+        let push = s.wait_for(KEYBOARD_PUSH, question, wait).expect("logout returned");
+        s.wait_for(FRAME_END, push, wait).expect("first frame after logout");
+        let disconnect = screen(&s.out, 85, 26).join("\n");
+        let start = s.out.len();
+        connect_keyless(&mut s, "/login custom", "replacement", &base);
+        let push = s.wait_for(KEYBOARD_PUSH, start, wait).expect("login returned");
+        s.wait_for(FRAME_END, push, wait).expect("first frame after login");
+        let shown = screen(&s.out, 85, 26).join("\n");
+        assert!(shown.contains("replacement") && !shown.contains("original"), "{shown}");
+        assert!(disconnect.contains("Use /model or /login."), "{disconnect}");
+        let mut next = spawn(&s.dir.join("home/.openmax"));
+        let probe = next.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
+        next.write(ANSWER);
+        next.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        next.write(b"/model\r");
+        let shown = screen_when(&mut next, 85, 26, wait, |shown| shown.contains("replacement"));
+        assert!(shown.contains("replacement") && !shown.contains("original"), "{shown}");
+        s.write(b"\rhello\r");
+        let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("fixture reply"));
+        assert!(shown.contains("fixture reply"), "{shown}");
+    }
+
     /// What a session that painted first has to say before it runs lands on
     /// the shell, after the terminal is handed back (the alternate screen
     /// left), never on the screen the session leaves behind. A

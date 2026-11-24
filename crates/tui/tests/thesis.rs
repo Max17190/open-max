@@ -749,7 +749,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // lines over the 45,530 measured before it, and the 45,530 ceiling was
     // raised for it. Resolving the exact launch cgroup and sharing process
     // cleanup and output rendering saves 3 lines and lowers the ceiling by 3.
-    const BASELINE: usize = 45_569;
+    // Fixing first login and removing disconnected model rows saves 1 line.
+    const BASELINE: usize = 45_568;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
