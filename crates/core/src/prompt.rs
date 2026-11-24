@@ -721,7 +721,8 @@ fn capped_agents_md(text: &str, cap: usize) -> String {
     }
     let close = open_at_cut.map_or(String::new(), |m| format!("\n{m}"));
     dropped.retain(|h| !h.is_empty());
-    let sections = crate::compaction::take_note_bytes(&dropped.join("; "), 600);
+    let dropped = dropped.join("; ");
+    let sections = crate::compaction::take_note_bytes(&dropped, 600);
     let sections = if sections.is_empty() { String::new() } else { format!(" Sections not shown: {sections}.") };
     format!("{shown}{close}\n[AGENTS.md cut: {} of {} bytes shown.{sections} read_file AGENTS.md for the rest.]", shown.len(), text.len())
 }

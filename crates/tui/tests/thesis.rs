@@ -752,7 +752,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Fixing first login and removing disconnected model rows saves 1 line.
     // Provider setup and context refusal guidance and help paging add 29
     // production lines. The previous ceiling had room for 1 of them.
-    const BASELINE: usize = 45_593;
+    // Text-call recovery, offset by shared session task and compaction paths, adds 4 lines.
+    const BASELINE: usize = 45_597;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -922,8 +923,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     const TARGET: usize = 2_000;
-    const BASELINE: usize = 1_778;
-    // The margin kept from earlier growth; the paced request budget's trims lowered BASELINE by 13.
+    const BASELINE: usize = 1_772;
+    // Shared session task setup offsets the recovery, saving 6 lines.
+    // The margin is unchanged.
     const MARGIN: usize = 23;
     const RATCHET: usize = BASELINE + MARGIN;
     const LOOP: &str = "crates/core/src/agent.rs";

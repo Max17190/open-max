@@ -218,8 +218,7 @@ pub fn start_turn(
     // Titling here would fail-open secret/PII gates into the session index.
 
     let turn = {
-        let (core, session_id, project_root) =
-            (core.clone(), session_id.clone(), project_root.clone());
+        let (core, session_id) = (core.clone(), session_id.clone());
         async move {
             run_loop(&core, &session_id, &project_root, user_text, settings, cancelled).await
         }
@@ -228,32 +227,31 @@ pub fn start_turn(
     Ok(())
 }
 
-/// Run one turn to completion and guarantee it ends observably.
-///
-/// A turn owns the only terminator its clients get. A panic inside the loop
-/// would unwind past both the `Done` event and the bookkeeping below, leaving
-/// the session marked running forever: the TUI spinner never stops, a
-/// `--stdio` frontend blocks on a `done` that can no longer arrive, and every
-/// later prompt is refused because the session still looks busy. Isolating the
-/// loop in its own task turns that unwind into an ordinary error report.
-fn spawn_guarded_turn<F>(core: Arc<Core>, session_id: String, turn: F)
-where
-    F: std::future::Future<Output = String> + Send + 'static,
-{
+/// A turn owns the only terminator its clients get, even if the loop panics.
+fn spawn_guarded_turn(core: Arc<Core>, session_id: String, turn: impl std::future::Future<Output = String> + Send + 'static) {
+    spawn_session_work(core, session_id, "the turn", turn, |core, id, result| {
+        let stop_reason = result.unwrap_or_else(|message| {
+            core.send_agent(id, AgentEvent::Error { message });
+            "error".into()
+        });
+        vec![AgentEvent::Done { stop_reason }]
+    });
+}
+
+/// Isolate panics in session work, then settle before publishing its receipt.
+fn spawn_session_work<T: Send + 'static>(
+    core: Arc<Core>,
+    session_id: String,
+    subject: &'static str,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+    receipts: impl FnOnce(&Core, &str, Result<T, String>) -> Vec<AgentEvent> + Send + 'static,
+) {
     tokio::spawn(async move {
-        let stop_reason = match tokio::spawn(turn).await {
-            Ok(reason) => reason,
-            Err(join) => {
-                let detail = join_failure(join, "turn");
-                core.send_agent(&session_id, AgentEvent::Error {
-                    message: format!("the turn ended unexpectedly: {detail}"),
-                });
-                "error".into()
-            }
-        };
-        // Settle and publish under the admission lock. A consumer can start
-        // immediately on Done without a late cleanup deleting its new token.
-        finish_session_work(&core, &session_id, vec![AgentEvent::Done { stop_reason }]).await;
+        let result = tokio::spawn(work).await.map_err(|join| {
+            let detail = join_failure(join, subject.trim_start_matches("the "));
+            format!("{subject} ended unexpectedly: {detail}")
+        });
+        finish_session_work(&core, &session_id, receipts(&core, &session_id, result)).await;
     });
 }
 
@@ -362,36 +360,16 @@ pub fn compact_session(
     project_root: &Path,
 ) -> Result<(), String> {
     let cancelled = claim_session(core, session_id, project_root, "compacting", false)?;
-    let core = core.clone();
-    let session_id = session_id.to_string();
-    let project_root = project_root.to_path_buf();
-    tokio::spawn(async move {
-        let work = {
-            let core = core.clone();
-            let session_id = session_id.clone();
-            let project_root = project_root.clone();
-            let cancelled = cancelled.clone();
-            tokio::spawn(async move {
-                run_compact(&core, &session_id, &project_root, &cancelled).await
-            })
-        };
-        // Guarded like a turn: a panic inside must still release the claim
-        // and say something, or the session looks busy forever.
-        let outcome = match work.await {
-            Ok(outcome) => outcome,
-            Err(join) => {
-                let detail = join_failure(join, "compaction");
-                Err(format!("compaction ended unexpectedly: {detail}"))
-            }
-        };
-        let events = match outcome {
-            Ok(receipt) => vec![
-                AgentEvent::Budget { used_tokens: receipt.tokens_after, context_tokens: receipt.context_tokens },
-                AgentEvent::Compacted { tokens_before: receipt.tokens_before, tokens_after: receipt.tokens_after, compacted_messages: receipt.compacted_messages },
-            ],
-            Err(message) => vec![AgentEvent::Error { message }],
-        };
-        finish_session_work(&core, &session_id, events).await;
+    let work = {
+        let (core, session_id, project_root) = (core.clone(), session_id.to_string(), project_root.to_path_buf());
+        async move { run_compact(&core, &session_id, &project_root, &cancelled).await }
+    };
+    spawn_session_work(core.clone(), session_id.to_string(), "compaction", work, |_, _, result| match result.and_then(std::convert::identity) {
+        Ok(receipt) => vec![
+            AgentEvent::Budget { used_tokens: receipt.tokens_after, context_tokens: receipt.context_tokens },
+            AgentEvent::Compacted { tokens_before: receipt.tokens_before, tokens_after: receipt.tokens_after, compacted_messages: receipt.compacted_messages },
+        ],
+        Err(message) => vec![AgentEvent::Error { message }],
     });
     Ok(())
 }
@@ -729,6 +707,7 @@ async fn run_loop(
     let (mut request_budget, mut budget_noted, mut edited, mut ran) = (settings.request_budget.filter(|&budget| budget > 0), 0, false, false);
     if let Some(budget) = request_budget { insert_startup_note(core, session_id, guard.messages(), crate::notes::request_budget_start_note(budget, 0, &mut budget_noted)); }
     let mut repeats = RepeatTracker::default();
+    let mut text_calls = 0;
     // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
     let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
     let (mut at_reserve, mut reserve_only, mut reserve_refusal) = (false, false, None);
@@ -978,6 +957,17 @@ async fn run_loop(
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
+            let written_call = (!capped && tool_calls.is_empty() && matches!(result.finish_reason.as_str(), "stop" | "tool_calls"))
+                .then(|| crate::notes::written_call_json(&content, registry.tool_schemas_json())).flatten();
+            text_calls = written_call.map_or(0, |_| text_calls + 1);
+            if let Some(valid) = written_call {
+                if text_calls <= 2 && iteration + 1 < max_iterations {
+                    let at = guard.messages().len();
+                    insert_note(core, session_id, guard.messages(), at, crate::notes::written_call_note(valid));
+                    save_messages(core, session_id, guard.messages(), false).await;
+                    continue 'turns;
+                }
+            }
             // Cut while still thinking or writing, before any call: not an
             // answer, so not an end and no turn_end consult. The reply stays
             // as recorded above, the note goes after it, on disk before the
@@ -1100,6 +1090,9 @@ async fn run_loop(
             // turn_end run, so the late site stays quiet: one end, one fire.
             turn_end_fired = true;
             stop_reason = if refused || outcome.unverified { "unverified".into() } else if capped { "length".into() } else { result.finish_reason };
+            if written_call.is_some() {
+                core.send_agent(session_id, AgentEvent::Error { message: "The reply wrote a tool call as text. Nothing from it ran.".into() });
+            }
             // An end that stands with every gate passing names them, so it reads apart from one no gate judged.
             if !refused && !outcome.unverified && !outcome.passed.is_empty() {
                 core.send_agent(session_id, AgentEvent::TurnVerified { hooks: outcome.passed });
@@ -1107,6 +1100,7 @@ async fn run_loop(
             break 'turns;
         }
 
+        text_calls = 0;
         // True once any mutating call EXECUTED this iteration, a failed one
         // included (#242: a bash write-then-selftest that exits nonzero still
         // persisted the file): only then can extension files have changed, so
@@ -1199,7 +1193,7 @@ async fn run_loop(
                     Err(e) => {
                         // The transcript can hold this call with `{}`, so the
                         // reply is the model's only view of what it sent.
-                        let mut sent = take_note_bytes(&call.function.arguments, 120);
+                        let mut sent = take_note_bytes(&call.function.arguments, 120).to_owned();
                         if sent.len() < call.function.arguments.len() {
                             sent.push_str("...");
                         }

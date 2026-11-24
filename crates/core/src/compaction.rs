@@ -63,19 +63,9 @@ fn omitted_clause(omitted: usize) -> String {
     if omitted == 0 { String::new() } else { format!("(earlier requests not shown: {omitted}; the archive has every one) ") }
 }
 
-/// Byte-capped take on a char boundary. Every note field, the notes, and the
-/// arguments a tool error quotes are budgeted in bytes (the
-/// estimator is bytes/4), and a plain byte slice could split a multibyte
-/// char; this is the one cut they all use.
-pub(crate) fn take_note_bytes(s: &str, max_bytes: usize) -> String {
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        if i + c.len_utf8() > max_bytes {
-            break;
-        }
-        end = i + c.len_utf8();
-    }
-    s[..end].to_string()
+/// Take at most `max_bytes` without splitting a character.
+pub(crate) fn take_note_bytes(s: &str, max_bytes: usize) -> &str {
+    &s[..crate::text::floor_char_boundary(s, max_bytes)]
 }
 
 #[derive(Default)]
@@ -112,8 +102,8 @@ impl CompactionDigest {
                     && self.user_snippets.len() < 4
                 {
                     let snippet = take_note_bytes(trimmed, MAX_DIGEST_SNIPPET_BYTES);
-                    if !self.user_snippets.iter().any(|s| s == &snippet) {
-                        self.user_snippets.push(snippet);
+                    if !self.user_snippets.iter().any(|s| s == snippet) {
+                        self.user_snippets.push(snippet.to_owned());
                     }
                 }
             }
@@ -190,7 +180,7 @@ impl CompactionDigest {
             } else {
                 if shown.is_empty() {
                     let mark = " [cut short; the archive has it whole]";
-                    shown.push(take_note_bytes(prompt, cap - 3 - mark.len()) + mark);
+                    shown.push(format!("{}{mark}", take_note_bytes(prompt, cap - 3 - mark.len())));
                 }
                 break;
             }
@@ -474,11 +464,14 @@ pub(crate) async fn compact_messages(
         return Err(format!("compaction refused: {reason}"));
     }
     // The head the prune pins, and so the index its digest note takes.
-    let head = pinned_head(messages);
+    let slot = pinned_head(messages);
     // A prune that drops or shortens the stored note stores it again after
     // it, so the prune keeps room for it.
     let note = ctx.core.sessions.lock().await.get(ctx.session_id).and_then(|data| data.trailing_note.clone());
     let room = note.as_deref().map_or(0, |note| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + note.len()));
+    if !force && schemas_exceed_budget(trigger, schema_tokens + room) {
+        return Ok(0);
+    }
     // Once the archive lands the digest note gains its address, the paths the
     // last record carries forward, and either a summary at its cap or the
     // carried tools (a summary replaces the tool list), each field within
@@ -496,11 +489,7 @@ pub(crate) async fn compact_messages(
     let address = sessions::archive_display(ctx.core, ctx.session_id).len();
     let growth = estimate_tokens(address + paths + tools.max(MAX_SUMMARY_BYTES) + prompts + 100);
     let mut candidate = messages.clone();
-    let digest = if force {
-        prune_transcript(&mut candidate, trigger, ctx.keep, schema_tokens + room, total + room, growth, ctx.estimate)
-    } else {
-        enforce_budget(&mut candidate, trigger, ctx.keep, schema_tokens + room, growth, ctx.estimate)
-    };
+    let digest = prune_transcript(&mut candidate, trigger, ctx.keep, schema_tokens + room, total + room, growth, ctx.estimate);
     let Some(mut digest) = digest else { return Ok(0) };
     // A hydration repair still waiting for a save lands first, with its
     // boundary edits: the commit moves the boundaries as if they already
@@ -516,7 +505,6 @@ pub(crate) async fn compact_messages(
     {
         return Err("compaction refused: the session transcript or its replay boundaries could not be saved".into());
     }
-    let slot = pinned_head(&candidate);
     let summary = match summarize_compaction(ctx, &candidate[..slot], &digest, spend).await {
         Ok((notes, cut)) => Some((notes, cut)),
         Err(reason) if !force && total <= budget => {
@@ -538,7 +526,7 @@ pub(crate) async fn compact_messages(
     crate::notes::store_note(&mut candidate, note.as_deref());
     let dropped = digest.message_count;
     let record = digest.to_record(text);
-    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &digest.dropped, Some(&record), messages.len(), head)?;
+    sessions::commit_compaction(ctx.core, ctx.session_id, &candidate, &digest.dropped, Some(&record), messages.len(), slot)?;
     if let Some(data) = ctx.core.sessions.lock().await.get_mut(ctx.session_id) {
         data.persisted_count = candidate.len();
     }
@@ -885,7 +873,8 @@ pub(crate) fn to_real(estimate: usize, factor: f64) -> usize {
 ///
 /// Returns the digest of what the cut removed, or None when it removed
 /// nothing.
-pub(crate) fn enforce_budget(
+#[cfg(test)]
+fn enforce_budget(
     messages: &mut Vec<ChatMessage>,
     budget: usize,
     keep: usize,
@@ -905,8 +894,7 @@ pub(crate) fn enforce_budget(
     prune_transcript(messages, budget, keep, schema_tokens, total, growth, estimate)
 }
 
-/// The cut itself, shared by the budget path and the forced `/compact`,
-/// which fires inside the gap where `enforce_budget` correctly holds still.
+/// The cut shared by the budget path and the forced `/compact`.
 /// Drops whole exchanges into the digest until `cut_target` is met with
 /// `growth` tokens to spare for what the digest note gains later. No message
 /// it keeps is changed.
@@ -1674,7 +1662,7 @@ pub(crate) mod tests {
         let notes_room = MAX_SUMMARY_BYTES - digest.prompts_room();
         let archive = "a".repeat(200);
         // The notes as `summarize_compaction` caps them, ellipsis included.
-        let summary = take_note_bytes(&"m".repeat(MAX_SUMMARY_BYTES + 1), notes_room) + "…";
+        let summary = format!("{}…", take_note_bytes(&"m".repeat(MAX_SUMMARY_BYTES + 1), notes_room));
         let costs = [digest.format(None, Some(&archive)), digest.format(Some(&summary), Some(&archive))]
             .map(|note| ChatMessage::user(note).estimated_tokens());
         for cost in costs {
@@ -2387,6 +2375,24 @@ pub(crate) mod tests {
         assert_eq!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await, 0);
         assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original);
         assert!(requests.recv_timeout(Duration::from_millis(300)).is_err(), "no request");
+        assert!(!fixture.committed());
+    }
+
+    #[tokio::test]
+    async fn schemas_and_reserved_note_room_can_prevent_a_cut() {
+        let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        let original: Vec<_> = messages.iter().map(wire).collect();
+        crate::transcript::ensure_session_hydrated(&fixture.core, &fixture.id, &fixture.dir).await.unwrap();
+        let mut sessions = fixture.core.sessions.lock().await;
+        sessions.get_mut(&fixture.id).unwrap().trailing_note = Some("a ".repeat(100).into());
+        drop(sessions);
+        for schema_tokens in [2_000, 1_999] {
+            assert_eq!(compact_messages(&fixture.ctx(), &mut messages, 2_000, 100_000, schema_tokens, false, &mut RequestSpend::new(None)).await.unwrap(), 0);
+            assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original);
+        }
+        assert!(requests.recv_timeout(Duration::from_millis(300)).is_err());
         assert!(!fixture.committed());
     }
 

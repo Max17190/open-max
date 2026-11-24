@@ -863,6 +863,53 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
     }
 }
 
+/// Recognize intent only. The JSON and any arguments never leave this function.
+#[cold]
+pub(crate) fn written_call_json(text: &str, schemas: &serde_json::Value) -> Option<bool> {
+    use serde_json::Value;
+    use std::sync::LazyLock;
+    let text = text.trim();
+    let tagged = text.ends_with("</tool_call>");
+    let json = if tagged {
+        let (prefix, body) = text.strip_suffix("</tool_call>")?.split_once("<tool_call>")?;
+        if !prefix.is_empty() && (!prefix.ends_with('\n') || !prefix.starts_with(char::is_alphanumeric) || !body.starts_with(['\n', '\r']) || prefix.contains("```") || prefix.contains("~~~")
+            || prefix.split_whitespace().last().is_some_and(|word| word.eq_ignore_ascii_case("example:"))) {
+            return None;
+        }
+        body.trim()
+    } else if let Some(fence) = text.strip_prefix("```") {
+        let (info, body) = fence.split_once('\n')?;
+        if !matches!(info.trim(), "" | "json") {
+            return None;
+        }
+        body.strip_suffix("\n```")?.trim()
+    } else if text.starts_with('{') {
+        text
+    } else {
+        return None;
+    };
+    let offered = |name: &str| schemas.as_array().is_some_and(|entries| entries.iter().any(|e| crate::registry::entry_name(e) == name));
+    let mut values = serde_json::Deserializer::from_str(json).into_iter::<Value>();
+    if let Ok(object) = values.next()? {
+        if !json[values.byte_offset()..].trim().is_empty() {
+            return None;
+        }
+        let fields = object.as_object()?;
+        let args = fields.get("arguments").or_else(|| fields.get("parameters"))?;
+        return (fields.len() == 2 && offered(fields.get("name")?.as_str()?) && args.is_object()).then_some(true);
+    }
+    // Only explicit tags delimit a malformed object. Require the callee and
+    // the start of its arguments before accepting JSON-like broken syntax.
+    static BROKEN: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"^\{\s*"name"\s*:\s*"([^"\\]+)"\s*,\s*"(?:arguments|parameters)"\s*:\s*\{(?:[\x20\t\r\n{}\[\]:,0-9+eE.\-]|true|false|null|"(?:[^"\\]|\\.)*")*$"#).unwrap());
+    (tagged && offered(BROKEN.captures(json)?.get(1)?.as_str())).then_some(false)
+}
+
+#[cold]
+pub(crate) fn written_call_note(valid: bool) -> String {
+    let issue = if valid { "" } else { " The arguments were not valid JSON." };
+    format!("[tool call written as text: nothing ran.{issue} Only call the tool through the API with valid JSON arguments if the user's task requires running it. Otherwise return the requested answer without running anything.]")
+}
+
 /// The note after a reply the output limit cut before any tool call. The
 /// limit bounds how long the model thinks before it acts, so a cut thought
 /// is told to act. A cut inside a call or text needed room, not brevity:
@@ -894,6 +941,55 @@ pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usiz
 mod tests {
     use super::*;
     use crate::prompt::{NOTE_HEADER, NOTE_SEPARATOR};
+
+    #[test]
+    fn recognizes_only_call_shaped_replies_to_offered_tools() {
+        let registry = Registry::builtin_only();
+        let call = r#"{"name":"bash","arguments":{"command":"echo hello"}}"#;
+        let wrapped = format!("<tool_call>\n{call}\n</tool_call>");
+        let broken = "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"echo\nhello\"}}\n</tool_call>";
+        let open_array = "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"paths\":[\"a.txt\",2\n</tool_call>";
+        for (reply, expected) in [
+            (format!("  {call} \n"), Some(true)),
+            (format!("```json\r\n{call}\r\n```"), Some(true)),
+            (format!("```\n{call}\n```"), Some(true)),
+            (r#"{"parameters":{},"name":"bash"}"#.into(), Some(true)),
+            (format!("  {wrapped}\n"), Some(true)),
+            (format!("First, inspect the file:\n{wrapped}"), Some(true)),
+            (broken.into(), Some(false)),
+            (open_array.into(), Some(false)),
+            (format!("First, inspect the files:\n{open_array}"), Some(false)),
+            (format!("First, inspect the files:\n{open_array}\nA final sentence."), None),
+            (format!("For EXAMPLE:\n{wrapped}"), None),
+            (format!("First, inspect the file:\n{broken}"), Some(false)),
+            (format!("Example: {wrapped}"), None),
+            (format!("Example:\n<tool_call>{call}</tool_call>"), None),
+            (format!("Example:\n```xml\n{wrapped}"), None),
+            (format!("Example:\n~~~xml\n{wrapped}"), None),
+            (format!("Example:\n```json\n{call}\n```"), None),
+            (format!("Example:\n{call}"), None),
+            (format!("{wrapped} done"), None),
+            (format!("{call} done"), None),
+            (format!("```JSON\n{call}\n```"), None),
+            (format!("```json\n{call}\n````"), None),
+            (format!("<tool_call>{call}"), None),
+            (format!("<call>{call}</call>"), None),
+            (format!("{call}\n{wrapped}"), None),
+            (format!("{wrapped}\n{wrapped}"), None),
+            (format!("[{call}]"), None),
+            (r#"{"name":"other","arguments":{"name":"bash","arguments":{}}}"#.into(), None),
+            (r#"{"name":"bash","options":{}}"#.into(), None),
+            (r#"{"name":"bash","arguments":"{}"}"#.into(), None),
+            (r#"{"name":"bash","arguments":{},"example":true}"#.into(), None),
+            (r#"{"name":"bash","arguments":{},}"#.into(), None),
+            (r#"<tool_call>{"arguments":{},"name":"bash",}</tool_call>"#.into(), None),
+            (r#"<tool_call>{"name":"other","arguments":{,}}</tool_call>"#.into(), None),
+            (r#"<tool_call>{"name":"bash","arguments":{missing quotes}}</tool_call>"#.into(), None),
+            ("   ".into(), None),
+        ] {
+            assert_eq!(written_call_json(&reply, registry.tool_schemas_json()), expected, "{reply:?}");
+        }
+    }
 
     /// The note after a reply cut before any call follows what its usage
     /// accounts for, and is the note every cut got before whenever what

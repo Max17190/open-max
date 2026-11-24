@@ -260,6 +260,17 @@ and the run that writes a key already uses it.
   server reports incomplete at its output limit is continued the same way;
   a call in it is not kept.
 
+  When a complete reply looks like a tool call written as text, Open Max
+  keeps the reply and asks the model to use the API only if the task requires
+  running the tool. Otherwise it asks for the answer without running anything.
+  A `<tool_call>` block can follow prose if the opening tag has its own line
+  and the block ends the reply. An introduction ending in `example:` or prose
+  around a fenced example stays an answer. A bare or fenced object that is
+  the entire reply can still look like a call, even when the user requested
+  it as an example. Open Max never runs a call from reply text. It sends at
+  most two recovery notes in a row, within the turn's round cap. A real API
+  call breaks that streak and follows the ordinary approval rules.
+
   For a reasoning model the limit is also a bound on how long it thinks
   in one reply before it acts; the room after a cut call or text can be
   spent on thinking too, for that one request.
