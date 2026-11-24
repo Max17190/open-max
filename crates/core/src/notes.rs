@@ -72,7 +72,7 @@ pub(crate) fn insert_note(
     // parameter here neutralizes all of them at once, and a note added later
     // inherits the rule instead of reintroducing the class.
     let text = crate::text::one_line(&text);
-    msgs.insert(at, ChatMessage::user(text.clone()));
+    msgs.insert(at, ChatMessage::note(text.clone()));
     core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
 }
 
@@ -125,7 +125,7 @@ pub(crate) fn store_note(messages: &mut Vec<ChatMessage>, note: Option<&str>) {
     }
     match messages.last_mut().filter(|m| carries(m)) {
         Some(last) => last.content.get_or_insert_default().push_str(&format!("{}{note}", crate::prompt::NOTE_SEPARATOR)),
-        None => messages.push(ChatMessage::user(note)),
+        None => messages.push(ChatMessage::note(note)),
     }
 }
 
@@ -388,7 +388,7 @@ pub(crate) async fn report_schemas_over_budget(
         // at the top of an iteration, where the previous iteration's replies
         // are all appended, so the sequence is complete and the note lands
         // after it.
-        msgs.push(ChatMessage::user(note));
+        msgs.push(ChatMessage::note(note));
     }
 }
 
@@ -1035,7 +1035,7 @@ mod tests {
             let mut messages = history.clone();
             store_note(&mut messages, Some(&first));
             assert_eq!(messages.len(), history.len() + 1, "a message of its own after {history:?}");
-            assert_eq!(json(&messages[history.len()..]), json(&[ChatMessage::user(first.clone())]));
+            assert_eq!(json(&messages[history.len()..]), json(&[ChatMessage::note(first.clone())]));
         }
         let mut empty = round.clone();
         empty[3].content = None;

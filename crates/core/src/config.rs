@@ -399,31 +399,44 @@ pub struct RunOnly {
     file: Settings,
     run: Settings,
     pub(crate) keys: Vec<&'static str>,
+    /// The run's effort before the first session-only change, including CLI overrides.
+    session_effort: Option<Option<ReasoningEffort>>,
 }
 
 impl RunOnly {
     /// The overrides [`KeyFlags::apply`] reported, or None when there are none.
     pub fn new(file: Settings, run: Settings, applied: &Applied) -> Option<Self> {
-        (!applied.overridden.is_empty()).then(|| RunOnly { file, run, keys: applied.overridden.clone() })
+        (!applied.overridden.is_empty()).then(|| RunOnly {
+            file,
+            run,
+            keys: applied.overridden.clone(),
+            session_effort: None,
+        })
     }
 
     pub(crate) fn holds_endpoint(&self, settings: &Settings) -> bool {
         self.keys.contains(&"provider") || (selected(&settings.provider).is_none() && self.keys.contains(&"base_url"))
     }
 
-    /// Hold `effort` for this run only over `live`, the settings before it:
-    /// saves after it write the effort the file had until one is selected.
-    pub(crate) fn hold_effort(held: &mut Option<RunOnly>, live: &Settings, effort: Option<ReasoningEffort>) {
-        let run_only = held.get_or_insert_with(|| RunOnly { file: live.clone(), run: live.clone(), keys: Vec::new() });
-        if !run_only.keys.contains(&"reasoning_effort") {
-            run_only.file.reasoning_effort = live.reasoning_effort;
-            run_only.keys.push("reasoning_effort");
+    pub(crate) fn hold_session_effort(held: &mut Option<RunOnly>, live: &Settings) {
+        let run_only = held.get_or_insert_with(|| RunOnly {
+            file: live.clone(),
+            run: live.clone(),
+            keys: Vec::new(),
+            session_effort: None,
+        });
+        run_only.session_effort.get_or_insert(live.reasoning_effort);
+    }
+
+    pub(crate) fn reset_session_effort(&mut self, live: &mut Settings) {
+        if let Some(effort) = self.session_effort.take() {
+            live.reasoning_effort = effort;
         }
-        run_only.run.reasoning_effort = effort;
     }
 
     pub(crate) fn select_effort(&self, settings: &Settings) -> (Settings, RunOnly) {
         let mut selected = self.clone();
+        selected.session_effort = None;
         selected.keys.retain(|key| *key != "reasoning_effort");
         let (saved, mut next) = selected.save(settings);
         if next.holds_endpoint(settings) {
@@ -453,7 +466,14 @@ impl RunOnly {
                 }
             )*};
         }
-        keep!(provider, base_url, api_key, model, context_tokens, reasoning_effort, max_agent_tokens, max_agent_iterations);
+        keep!(provider, base_url, api_key, model, context_tokens, max_agent_tokens, max_agent_iterations);
+        let effort = self.session_effort.unwrap_or(settings.reasoning_effort);
+        if self.keys.contains(&"reasoning_effort") && effort == self.run.reasoning_effort {
+            saved.reasoning_effort = self.file.reasoning_effort;
+            next.keys.push("reasoning_effort");
+        } else {
+            saved.reasoning_effort = effort;
+        }
         if next.holds_endpoint(settings) {
             saved.model = self.file.model.clone();
             saved.reasoning_effort = self.file.reasoning_effort;

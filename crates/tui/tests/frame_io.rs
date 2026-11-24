@@ -567,7 +567,7 @@ mod first_frame {
             panic!("no first frame while trust.json and settings.json are unread: {}", s.context())
         });
         let shown = screen(&s.out[..frame + FRAME_END.len()], 80, 24).join("\n");
-        assert!(shown.contains("project") && shown.contains("READY") && shown.contains("❯"), "{shown}");
+        assert!(shown.contains("project") && !shown.contains("READY") && shown.contains("❯"), "{shown}");
 
         let dir = s.dir.join("home/.openmax");
         let root = std::fs::canonicalize(s.dir.join("project")).unwrap();
@@ -743,7 +743,7 @@ mod first_frame {
         let start = s.out.len();
         s.write(b"/login fixture\r");
         let restored = s.wait_for(LEAVE_ALT_SCREEN, start, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not restore terminal: {}", s.context()));
-        s.wait_for_prompt(b"API key (hidden)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
+        s.wait_for_prompt(b"API key (hidden; leave empty if the server does not require one)", restored, Duration::from_secs(5)).unwrap_or_else(|| panic!("setup did not receive input: {}", s.context()));
         // Ordinary c/d are text, not cancellation. Other modified or invalid input is inert.
         s.write(b"cd\x7f\x7f\x1b[120;1:3u\x01\x1bqX");
         s.write_bounded(format!("\x1b[200~{key}\x1b[201~\x7f\x1b[200~bad\npaste\x1b[201~\x1b[200~{key}\x1b[201~z\r").as_bytes());
@@ -893,7 +893,7 @@ mod first_frame {
         });
         // A server on this machine may check no key: an empty one goes on to
         // discovery.
-        let question = begin(&mut s, "/login manual", b"API key (hidden)");
+        let question = begin(&mut s, "/login manual", b"API key (hidden; leave empty if the server does not require one)");
         s.write(b"\r");
         s.wait_for_prompt(b"Model ID", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("an empty key on loopback was refused: {}", s.context()));
         s.write(b"\x1b");
@@ -901,7 +901,7 @@ mod first_frame {
         for (model, window, success) in [("m".repeat(257), None, false), ("m".repeat(258), None, false),
             (String::new(), None, false), ("m".repeat(256), Some("1"), true),
             ("zero-window".into(), Some("0"), false), ("reported-zero".into(), Some("1"), true)] {
-            let question = begin(&mut s, "/login manual", b"API key (hidden)");
+            let question = begin(&mut s, "/login manual", b"API key (hidden; leave empty if the server does not require one)");
             s.write(b"fixture-manual-key\r");
             if model == "reported-zero" {
                 s.wait_for_prompt(b"Choose a model", question, Duration::from_secs(5)).expect("reported model picker missing");
@@ -939,7 +939,7 @@ mod first_frame {
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("OpenAI API"));
         assert!(String::from_utf8_lossy(&s.out[question..]).contains("Anthropic API"));
         s.write(b"manual\r");
-        let key_prompt = s.wait_for_prompt(b"API key (hidden)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
+        let key_prompt = s.wait_for_prompt(b"API key (hidden; leave empty if the server does not require one)", question, Duration::from_secs(5)).expect("configured provider filter did not select it");
         s.write(b"\x04");
         resume(&mut s, key_prompt);
         let question = begin(&mut s, "/login", b"Connect a provider");

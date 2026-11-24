@@ -522,14 +522,19 @@ fn at_a_terminal(project: &Path, home: &Path, args: &[&str], answers: &[(&str, &
     let mut reader = controller.try_clone().unwrap();
     let shown = Arc::new(Mutex::new(Vec::new()));
     let sink = shown.clone();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut bytes = [0u8; 4096];
         while let Ok(n @ 1..) = reader.read(&mut bytes) {
             sink.lock().unwrap().extend_from_slice(&bytes[..n]);
         }
     });
-    let child = cmd(project, home).args(args).stdin(terminal.try_clone().unwrap()).stderr(terminal)
-        .stdout(Stdio::piped()).spawn().unwrap();
+    let mut child = cmd(project, home)
+        .args(args)
+        .stdin(terminal.try_clone().unwrap())
+        .stderr(terminal)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
     // What a person reads: control sequences (CSI, a final byte in @ to ~) dropped.
     let text = || {
         let raw = String::from_utf8_lossy(&shown.lock().unwrap()).replace("\r\n", "\n");
@@ -552,13 +557,18 @@ fn at_a_terminal(project: &Path, home: &Path, args: &[&str], answers: &[(&str, &
                 from += at + prompt.len();
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "no {prompt:?} after answer {from}: {}", text());
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                child.wait().unwrap();
+                reader.join().unwrap();
+                panic!("no {prompt:?} after answer {from}: {}", text());
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         controller.write_all(typed.as_bytes()).unwrap();
     }
     let status = finish_with_deadline(child).status.code();
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    reader.join().unwrap();
     (status, text())
 }
 
@@ -636,11 +646,43 @@ fn login_asks_again_and_connects_a_server_on_this_machine_without_a_key() {
         ("a context window is a positive number of tokens, such as 128000 or 128k\nContext window", "128k\r"),
     ]);
     assert_eq!(status, Some(0), "{shown}");
+    assert!(shown.contains("Saved connection local without an API key."), "{shown}");
+    assert!(!shown.contains("Credentials are stored locally"), "{shown}");
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join(".openmax/providers.json")).unwrap()).unwrap();
     let local = &saved["providers"]["local"];
     assert_eq!(local["api_key"], serde_json::Value::Null, "{saved}");
     assert_eq!(local["models"], serde_json::json!([{"id": "fixture-model", "context_tokens": 128000}]), "{saved}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn login_retries_a_server_rejected_key_without_losing_the_connection() {
+    let (project, home) = fresh_dirs("login-rejected-key");
+    let rejected = |status| format!("HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let (base_url, _, server) = spawn_http_script(vec![
+        rejected(401),
+        rejected(403),
+        catalog_reply(r#","context_window":32768"#),
+    ]);
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "retry-fixture\r"),
+        ("API base URL", &format!("{base_url}\r")),
+        ("API key", "first-bad-key\r"),
+        ("The provider rejected access (HTTP 401). Enter the API key again, or press Esc to cancel.\nAPI key", "second-bad-key\r"),
+        ("The provider rejected access (HTTP 403). Enter the API key again, or press Esc to cancel.\nAPI key", "accepted-key\r"),
+        ("Choose a model", "\r"),
+    ]);
+    assert_eq!(status, Some(0), "{shown}");
+    assert_eq!(shown.matches("Connection name").count(), 1, "{shown}");
+    assert_eq!(shown.matches("API base URL").count(), 1, "{shown}");
+    for key in ["first-bad-key", "second-bad-key", "accepted-key"] {
+        assert!(!shown.contains(key), "{shown}");
+    }
+    let saved = open_max_core::providers::read_catalog(&home.join(".openmax")).unwrap();
+    assert_eq!(saved["retry-fixture"]["api_key"], "accepted-key");
+    assert_eq!(saved["retry-fixture"]["base_url"], base_url);
+    server.join().unwrap();
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

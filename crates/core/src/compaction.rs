@@ -487,7 +487,7 @@ async fn prepare_compaction_digest(
     // here keeps one digest message.
     let note = digest.format(summary.as_deref(), Some(&path));
     if messages.len() > slot && is_digest_message(&messages[slot]) {
-        messages[slot] = ChatMessage::user(note.clone());
+        messages[slot] = ChatMessage::note(note.clone());
     }
     let record = digest.to_record(note);
     Ok((digest.dropped, record))
@@ -964,7 +964,7 @@ fn prune_transcript(
     if digest.message_count == 0 {
         return None;
     }
-    let note = ChatMessage::user(digest.format(None, None));
+    let note = ChatMessage::note(digest.format(None, None));
     if messages.len() > head && is_digest_message(&messages[head]) {
         messages[head] = note;
     } else {
@@ -981,7 +981,7 @@ fn prune_transcript(
     while total + growth > target && messages.len() > (head + 4).max(head + 1 + protected) {
         total = total.saturating_sub(drop_exchange(messages, &mut digest, head + 1));
         let stale = estimate(&messages[head]);
-        messages[head] = ChatMessage::user(digest.format(None, None));
+        messages[head] = ChatMessage::note(digest.format(None, None));
         total = total - stale + estimate(&messages[head]);
     }
     // The turn in progress keeps its prompt: when the cut removed it, it goes
@@ -991,7 +991,7 @@ fn prune_transcript(
         messages.insert(head + 1, prompt.clone());
         if digest.prompts.last() == prompt.content.as_ref() {
             digest.prompts.pop();
-            messages[head] = ChatMessage::user(digest.format(None, None));
+            messages[head] = ChatMessage::note(digest.format(None, None));
         }
     }
     Some(digest)
@@ -1006,7 +1006,7 @@ pub(crate) mod tests {
     use crate::types::{ToolCall, ToolCallFunction};
 
     pub(crate) fn msg(role: &str, len: usize) -> ChatMessage {
-        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, archived_tool_output: None, images: None }
+        ChatMessage { role: role.into(), content: Some("x".repeat(len)), tool_calls: None, tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_details: None, reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None }
     }
 
     /// The tool schemas the fixtures' requests carry.

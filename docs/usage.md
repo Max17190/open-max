@@ -8,14 +8,15 @@ openmax
 ```
 
 If you have not connected a model, start with [getting started](getting-started.md).
-For scripts and CI, see [unattended runs](unattended.md).
+On first setup, API login saves the model you choose as the default. After
+browser sign-in, choose a model with `/model`. You can use `/model` to change
+your selection later. For scripts and CI, see [unattended runs](unattended.md).
 
 On the first interactive run, inspect the project and answer the trust
 prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
 Change the mode later with `/permissions`, or `openmax --permissions <mode>`
-from a shell; **Shift+Tab** raises reasoning effort for this session. See
-[configuration](configuration.md#project-trust) for headless and stdio
-trust.
+from a shell. See [configuration](configuration.md#project-trust) for
+headless and stdio trust.
 
 ## Keys
 
@@ -29,7 +30,7 @@ trust.
 | **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved; `/effort` saves a level. Inside a picker, select the previous row |
+| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved, and switching sessions restores the previous setting. `/effort` saves a level unless the endpoint is a temporary launch override. Inside a picker, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
 | **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
 
@@ -64,6 +65,12 @@ other notes the harness writes during a turn stay in that turn. The full
 counting rule, including compaction and sessions saved by an earlier
 version, is in [the stdio protocol](stdio-protocol.md), whose `rewind`
 counts the same way.
+
+Some common command names print a pointer instead of running an action:
+`/undo` points to `/rewind`, `/cost` and `/usage` to `/status`, `/sessions`
+and `/history` to `/resume`, `/config` and `/settings` to
+`openmax --spec settings`, and `/diff` to `git diff`. A prompt template with one
+of those names runs instead.
 
 ## Command line
 
@@ -459,6 +466,8 @@ watcher nor a later launch stops them.
 At a terminal, the first frame (the project path, an empty conversation and
 the prompt) is painted before Open Max reads trust, settings or the session,
 and the status line fills in the model and approval mode once they are read.
+An empty conversation shows READY only once the model configuration resolves.
+Otherwise it shows a setup hint or the configuration error.
 The trust question, and a refusal to start (a trust or settings file that does
 not parse, a trust grant asked for from an agent session), then show on your
 shell, which the interface hands back for them.
@@ -467,13 +476,6 @@ The interface uses your terminal's own foreground and background colors. The
 palette's gray (color 8) marks secondary text, selection, and every border
 except the focused prompt's and the approval card's. There is no color
 setting.
-
-A few names that habit from other terminal agents suggests get a one-line
-pointer to the equivalent here instead of "unknown command": `/undo` to
-`/rewind` (which rewinds the conversation, not files), `/cost` and `/usage`
-to `/status`, `/sessions` and `/history` to `/resume`, `/config` and
-`/settings` to `openmax --spec settings`, and `/diff` to `git diff`. A prompt
-template of the same name, `/clear` included, runs instead.
 
 The persistent status line stays limited to model, context use, and approval
 mode so the transcript remains readable; `/status` is where the full runtime

@@ -66,7 +66,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         "alias for /permissions",
         false,
     ),
-    command("new", "", "start a fresh session (/clear does the same)", true),
+    command("new", "", "start a fresh session", true),
+    command("clear", "", "alias for /new", true),
     command("fork", "", "branch this session into a new one and switch to it", true),
     command(
         "rewind",

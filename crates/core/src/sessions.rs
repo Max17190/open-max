@@ -1461,7 +1461,7 @@ fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>, String> {
 
 /// Where each turn of `messages` ends, in order, as a message count. With
 /// `recorded` (the entry's `turn_ends`) those are the ends, plus one at the
-/// transcript's end when a user message follows the last of them: a turn
+/// transcript's end when user input follows the last of them: a turn
 /// whose process died before it finished. Without, each run of user
 /// messages opens a turn, which keeps a note the harness inserts ahead of a
 /// prompt in that prompt's turn but also opens one at every user message
@@ -1478,7 +1478,7 @@ pub fn turn_ends(recorded: Option<&[u64]>, messages: &[ChatMessage]) -> Vec<usiz
     ends.sort_unstable();
     ends.dedup();
     let last = ends.last().copied().unwrap_or(0);
-    if messages[last..].iter().any(|m| m.role == "user") {
+    if messages[last..].iter().any(|m| m.role == "user" && !m.harness_note) {
         ends.push(len);
     }
     ends

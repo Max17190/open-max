@@ -308,9 +308,10 @@ and the run that writes a key already uses it.
 - `reasoning_effort` (default unset): an explicit requested level: `none`,
   `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Use `/effort` for a
   keyboard picker, Shift+Tab to step up through the active protocol's levels
-  for the running session only (it saves nothing), `/effort high` to select
-  directly, or `--effort high` at launch. `/effort` choices persist, including selecting the current CLI level,
-  unless the endpoint is a temporary CLI override. In that case the saved
+  for the running session only. It saves nothing and switching sessions
+  restores the previous setting. Use `/effort high` to select directly or
+  `--effort high` at launch. `/effort` choices persist, including selecting
+  the current CLI level, unless the endpoint is a temporary CLI override. In that case the saved
   endpoint keeps its own effort setting. `/effort default` removes the setting
   in that same scope; `--effort default` clears it for the run when the file
   already sets it.
@@ -799,8 +800,9 @@ gateways (OpenRouter and similar), and private proxies.
 Run `openmax --login` from a terminal, or `/login` inside a session. Choose a
 provider with the arrow keys, type to filter, and press Enter. An answer setup
 cannot use (a connection name, URL, key, model ID or context window) is asked
-for again with the reason; Esc cancels a setup prompt before its changes are
-saved. The choices are:
+for again with the reason. If model discovery rejects access with HTTP 401
+or 403, setup asks for the key again without losing earlier answers. Esc
+cancels a setup prompt before its changes are saved. The choices are:
 
 - **OpenAI: ChatGPT plan:** browser sign-in using the account's plan. The
   command target is `chatgpt`; the default saved connection is `chatgpt-main`.
@@ -838,13 +840,12 @@ never replaces a `max_tokens` the entry already has. An endpoint without a
 model-list route can be configured with an exact model ID; setup reports
 that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.
-Run login again to add another. A login from the shell while settings.json
-selects no endpoint (no `provider` and no `base_url`) makes the connection and
-model it saved the default, through the same save `/model` makes, and says so;
-the next `openmax` runs on it. With an endpoint already selected, login leaves
-it selected: choose the new connection with `/model` afterward, or use the
-printed `openmax --provider ... --model ...` command. Login never changes
-project trust.
+Run login again to add another. When `settings.json` has no `provider` or
+`base_url`, API login from the shell makes the model you chose the default.
+With an endpoint already selected, login leaves it selected. Choose the new
+connection with `/model` or use the printed `openmax --provider ... --model ...`
+command. After browser sign-in, select a model with `/model`. Login never
+changes project trust.
 
 New Anthropic preset connections use the native Messages API, including
 streaming, tools, usage accounting, and effort controls. Existing compatibility

@@ -99,7 +99,7 @@ async fn model_discovery_refuses_redirects_and_does_not_echo_error_bodies() {
         .await;
         let error = discover(&base, "fixture-secret", &serde_json::Map::new(), false, false)
             .await
-            .unwrap_err();
+            .unwrap_err().to_string();
         assert!(error.contains(&format!("HTTP {status}")));
         assert!(!error.contains("fixture-secret"));
         task.await.unwrap();
@@ -122,7 +122,7 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
         let (base, task) = server(200, "", body).await;
         let error = discover(&base, "fixture-secret", &serde_json::Map::new(), false, false)
             .await
-            .unwrap_err();
+            .unwrap_err().to_string();
         assert!(error.contains(expected), "{error}");
         assert!(!error.contains("fixture-secret"));
         task.await.unwrap();
@@ -136,7 +136,7 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
         if length <= 1_048_576 {
             assert_eq!(result.unwrap()[0]["id"], "fixture-model");
         } else {
-            assert!(result.unwrap_err().contains("exceeds its size limit"));
+            assert!(result.unwrap_err().to_string().contains("exceeds its size limit"));
         }
         task.await.unwrap();
     }
@@ -167,13 +167,13 @@ async fn model_discovery_bounds_remote_data_and_rejects_invalid_or_empty_catalog
         headers.insert(header.into(), json!("fixture-old-secret"));
         let error = discover("http://127.0.0.1:9", "fixture-secret", &headers, false, false)
             .await
-            .unwrap_err();
+            .unwrap_err().to_string();
         assert!(error.contains("additional credentials"));
         assert!(!error.contains("fixture-old-secret"));
     }
     let headers = json!({"x-organization":42});
     assert!(discover("http://127.0.0.1:9", "fixture-secret", headers.as_object().unwrap(), false, false)
-        .await.unwrap_err().contains("headers must contain strings"));
+        .await.unwrap_err().to_string().contains("headers must contain strings"));
     for base in [
         "http://example.com/v1",
         "https://user:fixture-secret@example.com/v1",

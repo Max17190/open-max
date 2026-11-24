@@ -445,9 +445,8 @@ pub struct App {
     header_width: u16,
     status_line: Line<'static>,
     chatgpt_account: Option<String>,
-    /// What the empty conversation says in place of READY while no
-    /// endpoint resolves: the command that connects a model.
-    unconnected: Option<&'static str>,
+    /// Setup guidance or a resolution error, shown instead of READY.
+    unconnected: Option<String>,
     status_width: u16,
     /// Cached approval mode. A turn can adopt a stricter saved mode without
     /// marking chrome, so each draw compares this with the live mode.
@@ -631,8 +630,8 @@ async fn event_loop(
                 let Some(result) = result else { break; };
                 app.refresh_connection();
                 match result {
-                    Ok(_) if action == crate::setup::Action::Login => app.open_model_picker(),
-                    Ok(_) => app.note("provider credentials removed"),
+                    Ok(()) if action == crate::setup::Action::Login => app.open_model_picker(),
+                    Ok(()) => app.note("provider disconnected"),
                     Err(error) => app.error(&error),
                 }
                 app.dirty = Dirty::all();
@@ -862,11 +861,15 @@ impl App {
                 ))]);
             }
             match m.role.as_str() {
-                "user" => match (harness_note(m), &m.content) {
-                    (Some(note), _) => self.note(note),
-                    (None, Some(text)) => self.insert_user_block(text),
-                    (None, None) => {}
-                },
+                "user" => {
+                    if let Some(text) = &m.content {
+                        if m.harness_note {
+                            self.note(note_body(text));
+                        } else {
+                            self.insert_user_block(text);
+                        }
+                    }
+                }
                 "assistant" => {
                     if let Some(text) = &m.content {
                         if !text.trim().is_empty() {
@@ -968,6 +971,8 @@ impl App {
                 return false;
             }
         }
+        self.core.reset_session_effort();
+        self.refresh_connection();
         let left = self.session_id.take().filter(|_| self.created_session);
         self.created_session = false;
         self.resumed_awaiting_hydration = false;
@@ -1389,15 +1394,18 @@ impl App {
         // press is high, never none. After the highest it wraps to default.
         if is_shift_tab(&key) {
             self.refresh_project_root();
-            let current = self.core.settings.lock().unwrap().reasoning_effort.map_or("default", config::ReasoningEffort::as_str);
+            let current = self.core.settings.lock().unwrap().reasoning_effort;
             let levels = self.effort_levels();
-            let from = if current == "default" { "medium" } else { current };
-            let next = levels[levels.iter().position(|level| *level == from).map_or(0, |at| (at + 1) % levels.len())];
-            match self.core.set_reasoning_effort(config::ReasoningEffort::parse(next).unwrap_or_default(), false) {
-                Ok(_) => self.note(&format!("reasoning effort {next} for this session; /effort {next} saves it")),
+            let from = current.map_or("medium", config::ReasoningEffort::as_str);
+            let next = levels.iter().position(|level| *level == from)
+                .map_or(0, |at| (at + 1) % levels.len());
+            let next = levels[next];
+            let effort = config::ReasoningEffort::parse(next).unwrap_or_default();
+            match self.core.set_reasoning_effort(effort, false) {
+                Ok(_) => self.note(&format!("reasoning effort {next} for this session")),
                 Err(error) => self.error(&error),
             }
-            self.dirty.mark_chrome();
+            self.refresh_connection();
             return Ok(());
         }
 
@@ -1745,9 +1753,20 @@ impl App {
         let catalog = providers::load_providers(&self.core.data_dir);
         self.chatgpt_account = settings.provider.as_ref().and_then(|p| catalog.get(p))
             .and_then(|p| p.chatgpt_account.as_deref().map(open_max_core::text::one_line));
-        let resolved = providers::resolve(&settings, &self.core.data_dir);
-        self.unconnected = matches!(resolved, Err(ResolveError::MissingEndpoint | ResolveError::Unconfigured { endpoint: true, .. }))
-            .then_some(if catalog.is_empty() { "no model connected: type /login to connect a provider" } else { "no model connected: type /model to choose one" });
+        self.unconnected = match providers::resolve(&settings, &self.core.data_dir) {
+            Ok(_) => None,
+            Err(ResolveError::MissingModel | ResolveError::Unconfigured { endpoint: false, .. }) if !catalog.is_empty() => {
+                Some("no model connected: type /model to choose one".into())
+            }
+            Err(ResolveError::MissingEndpoint | ResolveError::Unconfigured { endpoint: true, .. }) => {
+                Some(if catalog.is_empty() {
+                    "no model connected: type /login to connect a provider".into()
+                } else {
+                    "no model connected: type /model to choose one".into()
+                })
+            }
+            Err(error) => Some(error.to_string()),
+        };
         self.dirty.mark_chrome();
     }
 
@@ -2335,7 +2354,7 @@ impl App {
                 };
                 match self.core.set_reasoning_effort(effort, true) {
                     Ok(persisted) => {
-                        self.dirty.mark_chrome();
+                        self.refresh_connection();
                         let scope = if persisted { "saved" } else { "for this run only (temporary endpoint)" };
                         self.note(&format!("reasoning effort requested: {raw_rest}; {scope}; applies to the next turn (model support varies)"));
                     }
@@ -2490,7 +2509,9 @@ impl App {
                 }
             },
             "new" | "clear" => {
-                if self.reset_for_new_session() { self.note("new session"); }
+                if self.reset_for_new_session() {
+                    self.note("new session");
+                }
             }
             "fork" => self.fork_current(None),
             "rewind" => match rest.first() {
@@ -2638,14 +2659,24 @@ impl App {
     /// /rewind with no turn: each turn of this session it can return to,
     /// numbered as /rewind counts them, with the start of its prompt.
     fn list_turns(&mut self) {
-        let id = self.session_id.clone().unwrap_or_default();
-        let messages = sessions::load_messages(&self.core, &id).ok().flatten().unwrap_or_default();
-        let recorded = sessions::meta(&self.core, &id).and_then(|meta| meta.turn_ends);
+        let Some(id) = self.session_id.as_deref() else {
+            return self.note("no turn to rewind to yet");
+        };
+        let messages = match sessions::load_messages(&self.core, id) {
+            Ok(Some(messages)) => messages,
+            Ok(None) => return self.note("no turn to rewind to yet"),
+            Err(error) => return self.error(&format!("could not read the session transcript: {error}")),
+        };
+        let recorded = sessions::meta(&self.core, id).and_then(|meta| meta.turn_ends);
         let (mut start, mut block) = (0, Vec::new());
         for (n, end) in sessions::turn_ends(recorded.as_deref(), &messages).into_iter().enumerate() {
-            let prompts = messages[start..end].iter().filter(|m| m.role == "user" && harness_note(m).is_none());
-            let prompt = prompts.filter_map(|m| m.content.as_deref()).next().unwrap_or_default();
-            block.push(help_line(&format!("/rewind {}", n + 1), &open_max_core::text::one_line(prompt).chars().take(72).collect::<String>()));
+            let prompt = messages[start..end]
+                .iter()
+                .filter(|m| m.role == "user" && !m.harness_note)
+                .find_map(|m| m.content.as_deref())
+                .unwrap_or_default();
+            let preview: String = open_max_core::text::one_line(prompt).chars().take(72).collect();
+            block.push(help_line(&format!("/rewind {}", n + 1), &preview));
             start = end;
         }
         if block.is_empty() {
@@ -2953,8 +2984,7 @@ impl App {
                 // reason), so ignoring it dropped harness corrections a
                 // stdio client would see. The bracket prefix is
                 // stripped for a cleaner line; the text is already the model's.
-                let shown = text.trim().trim_start_matches('[').trim_end_matches(']');
-                self.note(shown);
+                self.note(note_body(&text));
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if self.compacting {
@@ -3508,7 +3538,7 @@ impl App {
             self.perf_layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
             self.perf_selection_ms = 0.0;
             if self.composer.is_empty() {
-                render_ready(self.unconnected.unwrap_or("READY"), Rect { width: content_w, ..area }, frame.buffer_mut());
+                render_ready(self.unconnected.as_deref().unwrap_or("READY"), Rect { width: content_w, ..area }, frame.buffer_mut());
             }
             return;
         }
@@ -3881,19 +3911,20 @@ fn render_ready(text: &str, area: Rect, buf: &mut ratatui::buffer::Buffer) {
 
 /// The settings a model selection produces; pure, so the caller decides how
 /// and whether to persist them.
-pub(crate) fn model_selection(current: &config::Settings, provider: Option<String>, model: String) -> config::Settings {
+pub(crate) fn model_selection(
+    current: &config::Settings,
+    provider: Option<String>,
+    model: String,
+) -> config::Settings {
     let mut next = current.clone();
     next.provider = provider;
     next.model = model;
     next
 }
 
-/// The text of a harness note the core stored as a user message: one
-/// bracketed line, without the effort stamp only a turn's prompt carries.
-/// Drawn as the note it was when it arrived, never as a prompt.
-fn harness_note(m: &open_max_core::types::ChatMessage) -> Option<&str> {
-    let text = m.content.as_deref()?.strip_prefix('[')?.strip_suffix(']')?;
-    (m.role == "user" && m.effort.is_none() && !text.contains('\n')).then_some(text)
+fn note_body(text: &str) -> &str {
+    let text = text.trim();
+    text.strip_prefix('[').and_then(|body| body.strip_suffix(']')).unwrap_or(text)
 }
 
 /// Commands habit from other terminal agents suggests, each with where the
@@ -4187,9 +4218,6 @@ fn shell(frame: &mut Frame, project: &std::path::Path) {
     let layout = conversation_layout(area, true, input_h, 0, 0);
     if layout.header.height > 0 {
         header_path_line(project, layout.header.width as usize).render(layout.header, frame.buffer_mut());
-    }
-    if layout.chat.height > 0 {
-        render_ready("READY", layout.chat, frame.buffer_mut());
     }
     draw_composer(frame, layout.input, &mut composer, true, true);
 }
@@ -4651,28 +4679,56 @@ mod tests {
         let core = app.core.clone();
         let id = sessions::create(&core, dir.display().to_string()).unwrap().id;
         sessions::attach(&core, &id).unwrap();
-        let prompt = |text: &str| ChatMessage { effort: Some("default fixture".into()), ..ChatMessage::user(text) };
+        // An unstamped user message is what a steer (or an older transcript)
+        // saves. It may be byte-for-byte identical to a harness note.
+        let text = "[execution policy: auto; fixture.]";
         let history = vec![
             ChatMessage::system("rules"),
-            ChatMessage::user("[execution policy: auto; fixture.]"),
-            prompt("[first] question"),
+            ChatMessage { harness_note: true, ..ChatMessage::user(text) },
+            ChatMessage::user(text),
             ChatMessage::assistant(Some("first answer".into()), None),
-            prompt("second question"),
+            ChatMessage::user("second question"),
             ChatMessage::assistant(Some("second answer".into()), None),
         ];
         assert!(sessions::save_messages(&core, &id, &history, &mut 0, true));
         sessions::end_turn(&core, &id, &history[..4]);
         sessions::end_turn(&core, &id, &history);
         sessions::detach(&core, &id).unwrap();
-        assert!(app.switch_to_session(id));
+        assert!(app.switch_to_session(id.clone()));
+        let check_replay = |app: &App, turns| {
+            let shown = app.transcript.export_text();
+            assert!(shown.contains("> • execution policy: auto; fixture."), "{shown}");
+            assert_eq!(shown.matches("## user").count(), turns, "{shown}");
+            assert!(shown.contains(&format!("## user\n\n{text}\n")), "{shown}");
+        };
+        check_replay(&app, 2);
         app.handle_submit("/rewind".into()).await.unwrap();
         let shown = app.transcript.export_text();
-        assert!(shown.contains("execution policy: auto; fixture.") && !shown.contains("[execution policy"), "{shown}");
-        assert_eq!(shown.matches("## user").count(), 2, "{shown}");
         assert!(shown.contains("/rewind <turn> returns the conversation to the end of that turn; files stay as they are"), "{shown}");
-        for line in ["/rewind 1                        [first] question", "/rewind 2                        second question"] {
-            assert!(shown.contains(line), "{line}: {shown}");
+        for line in [format!("/rewind 1                        {text}"), "/rewind 2                        second question".into()] {
+            assert!(shown.contains(&line), "{line}: {shown}");
         }
+        app.handle_submit("/rewind 1".into()).await.unwrap();
+        assert_ne!(app.session_id.as_deref(), Some(id.as_str()));
+        check_replay(&app, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_distinguishes_an_unreadable_transcript_from_a_missing_one() {
+        use open_max_core::sessions;
+        let (mut app, dir) = app_fixture();
+        let id = sessions::create(&app.core, dir.display().to_string()).unwrap().id;
+        app.session_id = Some(id.clone());
+        let path = sessions::messages_display(&app.core, &id);
+        app.handle_submit("/rewind".into()).await.unwrap();
+        assert!(app.transcript.export_text().contains("no turn to rewind to yet"));
+        app.transcript = Transcript::new();
+        fs::create_dir_all(&path).unwrap();
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("could not read the session transcript:") && shown.contains(&path), "{shown}");
+        assert!(!shown.contains("no turn to rewind to yet"), "{shown}");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5065,12 +5121,17 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
         let shown = app.transcript.export_text();
-        assert!(shown.contains("reasoning effort medium for this session; /effort medium saves it"), "{shown}");
+        assert!(shown.contains("reasoning effort medium for this session"), "{shown}");
         app.handle_submit("/model other-model".into()).await.unwrap();
         let saved = config::load(&dir).unwrap();
         assert_eq!((saved.model.as_str(), saved.reasoning_effort), ("other-model", Some(config::ReasoningEffort::Low)));
         assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
+        app.handle_submit("/new".into()).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Low));
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
         app.handle_submit("/effort medium".into()).await.unwrap();
+        app.handle_submit("/clear".into()).await.unwrap();
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
         assert_eq!(config::load(&dir).unwrap().reasoning_effort, Some(config::ReasoningEffort::Medium));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -6480,8 +6541,18 @@ mod tests {
         app.startup(&args).await;
         let text = buffer_text(&render_app(&mut app, 96, 12));
         assert!(text.contains("no model connected: type /model to choose one"), "{text}");
-        app.handle_submit("/provider local".into()).await.unwrap();
-        assert_eq!(app.unconnected, None);
+        app.core.settings.lock().unwrap().provider = Some("local".into());
+        app.startup(&args).await;
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no model connected: type /model to choose one") && !text.contains("READY"), "{text}");
+        app.core.settings.lock().unwrap().model = "unknown-model".into();
+        app.startup(&args).await;
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("no context window configured:") && !text.contains("READY"), "{text}");
+        app.core.settings.lock().unwrap().model = "m".into();
+        app.startup(&args).await;
+        let text = buffer_text(&render_app(&mut app, 96, 12));
+        assert!(text.contains("READY"), "{text}");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6507,13 +6578,10 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The first frame (`shell`) is an empty session's own first frame but
-    /// for the status row, which it leaves blank: every other cell with its
-    /// style, and the cursor, match at every size, the heights that drop the
-    /// header, the status row or the composer's box included. So the
-    /// session's first frame, drawn over it, changes only that row.
+    /// Before settings are read, the shell leaves chat and status blank.
+    /// Its header, composer and cursor match the session at every size.
     #[test]
-    fn the_shell_is_an_empty_sessions_first_frame_but_its_status_row() {
+    fn the_shell_does_not_show_connection_state_before_settings_are_read() {
         fn painted(width: u16, height: u16, paint: impl FnOnce(&mut ratatui::Frame)) -> (Buffer, ratatui::layout::Position) {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(paint).unwrap();
@@ -6529,10 +6597,11 @@ mod tests {
             let size = format!("{width}x{height}");
             assert_eq!(first_cursor, session_cursor, "{size}");
             let input_h = crate::input::Composer::blank().height(width.saturating_sub(2)).saturating_add(2).max(3);
-            let status = conversation_layout(Rect::new(0, 0, width, height), true, input_h, 0, 0).status;
+            let layout = conversation_layout(Rect::new(0, 0, width, height), true, input_h, 0, 0);
+            let status = layout.status;
             for y in 0..height {
                 for x in 0..width {
-                    if status.height > 0 && y == status.y {
+                    if (status.height > 0 && y == status.y) || (layout.chat.y..layout.chat.bottom()).contains(&y) {
                         assert_eq!(first[(x, y)], ratatui::buffer::Cell::default(), "{size} status row");
                     } else {
                         assert_eq!(first[(x, y)], session[(x, y)], "{size} at ({x}, {y})");
@@ -6885,7 +6954,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             // File content that happens to look like an edit summary.
             open_max_core::types::ChatMessage {
@@ -6896,7 +6965,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
         ];
         let mut persisted = 0usize;
@@ -6975,7 +7044,7 @@ mod tests {
                     reasoning_content: None,
                     reasoning: None,
                     reasoning_details: None,
-                    reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                    reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
                 });
                 messages.push(open_max_core::types::ChatMessage {
                     role: "tool".into(),
@@ -6985,7 +7054,7 @@ mod tests {
                     reasoning_content: None,
                     reasoning: None,
                     reasoning_details: None,
-                    reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                    reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
                 });
             }
             let mut persisted = 0usize;
@@ -7105,7 +7174,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
@@ -7115,7 +7184,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             // A SUCCESSFUL command whose output merely opens with the same
             // sentence: equality, not a prefix, decides, so this replays ok
@@ -7128,7 +7197,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
         ];
         let mut persisted = 0usize;
@@ -7189,7 +7258,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             open_max_core::types::ChatMessage {
                 role: "tool".into(),
@@ -7199,7 +7268,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
             open_max_core::types::ChatMessage {
                 role: "assistant".into(),
@@ -7209,7 +7278,7 @@ mod tests {
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_details: None,
-                reasoning_origin: None, effort: None, archived_tool_output: None, images: None,
+                reasoning_origin: None, effort: None, harness_note: false, archived_tool_output: None, images: None,
             },
         ];
         let mut persisted = 0usize;
