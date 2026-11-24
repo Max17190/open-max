@@ -845,11 +845,11 @@ async fn run_loop(
                 if image_refusal.is_none() {
                     let status = message.strip_prefix("backend returned ").and_then(|m| m.get(..3)?.parse::<u16>().ok());
                     let length = crate::compaction::refused_for_length(&message);
-                    // Spend room and raises before trying the reserve; content repairs keep the smaller limit.
+                    // Spend room and raises before trying the reserve; content repairs keep the smaller limit. A refused larger first ask, whatever its words, keeps the turn at the reserve once that succeeds.
                     if endpoint.chatgpt.is_none() && limit > endpoint.reply_reserve && (length || matches!(status, Some(400 | 422))) && iteration + 1 < max_iterations {
                         let usual = endpoint.reply_limit(used_real);
                         at_reserve = !(endpoint.reply_reserve < usual && usual < limit && (roomy.is_some() || raise > 0));
-                        if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
+                        if (!length || endpoint.larger_first_ask) && reserve_refusal.is_none() { reserve_refusal = Some(message); }
                         (no_room, raise) = (true, 0); continue 'turns;
                     }
                     // Withhold reasoning sent alone and replace newly sent images with text after a refusal.

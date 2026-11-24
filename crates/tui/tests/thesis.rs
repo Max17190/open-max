@@ -734,7 +734,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // owner. A lint refusing in-place writes of files, with its reasoned
     // exceptions and the section banners dropped, removed 12.
     // Resolving HOME at entry points and passing it to the doctor removed 4.
-    const BASELINE: usize = 45_170;
+    // A larger first ask where a cut thought is lost, with method chains
+    // joined in resolve_endpoint, removed 2.
+    const BASELINE: usize = 45_168;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

@@ -1,6 +1,8 @@
 //! A reply the output limit cut while the model was still reasoning, on the
 //! native Messages and Responses wires: what the continuation sends, and
-//! what an endpoint the reasoning does not belong to receives instead.
+//! what an endpoint the reasoning does not belong to receives instead; and
+//! the limit a turn's first request asks for, by whether its wire replays
+//! a thought the limit cuts.
 #![allow(clippy::disallowed_methods)]
 mod common;
 
@@ -115,5 +117,68 @@ async fn a_responses_reply_cut_while_reasoning_goes_back_as_its_reasoning_item_a
         }
         let text = bodies[2].to_string();
         assert!(!text.contains("opaque-state") && text.contains(NOTE), "{text}");
+    }
+}
+
+/// A model entry that declares its longest reply, 131,072 here, on each wire.
+/// Chat Completions sends a reply's reasoning back even when the limit cut
+/// it, so the model continues the thought, and the first request asks for
+/// the default 4096, as before. Native Messages drops a thinking block the
+/// cut left open and Responses keeps only finished reasoning, so a cut
+/// thought starts again under the same limit: there the first request asks
+/// for the longest reply up to 16,384. A max_tokens chosen in settings is
+/// the first ask on every wire. A server that refuses the larger ask with a
+/// 400 gets the request again at 4096, which the rest of the turn keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_longest_reply_is_asked_for_first_up_to_16384_only_where_a_cut_thought_is_lost() {
+    let messages = json!({"id":"msg-fixture","type":"message","role":"assistant","model":"thinker",
+        "content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}});
+    let chat = json!({"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]});
+    let responses = json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":5},
+        "output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}]}});
+    let mut asked = Vec::new();
+    for (wire, key) in [("chat_completions", "max_tokens"), ("anthropic", "max_tokens"), ("responses", "max_output_tokens")] {
+        for chosen in [None, Some(8000)] {
+            let (url, bodies) = match wire {
+                "chat_completions" => common::recording_endpoint(vec![chat.clone()]).await,
+                "anthropic" => common::recording_endpoint(vec![messages.clone()]).await,
+                _ => common::recording_responses(vec![responses.clone()]).await,
+            };
+            let scratch = Scratch::new(&url, wire);
+            let mut settings = json!({"provider":"test","model":"thinker"});
+            if let Some(limit) = chosen { settings["max_tokens"] = json!(limit); }
+            std::fs::write(scratch.0.join("data/settings.json"), settings.to_string()).unwrap();
+            let providers = json!({"providers":{"test":{"base_url":url,"api_key":"fixture-key","wire_api":wire,
+                "models":[{"id":"thinker","context_tokens":1_048_576,"max_tokens":131_072}]}}});
+            std::fs::write(scratch.0.join("data/providers.json"), providers.to_string()).unwrap();
+            let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
+            common::drive_turn(&core, &mut rx, "first", &scratch.0.join("project"), "go").await;
+            let body: Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+            asked.push((wire, chosen, body[key].as_u64()));
+        }
+    }
+    assert_eq!(asked, [
+        ("chat_completions", None, Some(4096)), ("chat_completions", Some(8000), Some(8000)),
+        ("anthropic", None, Some(16_384)), ("anthropic", Some(8000), Some(8000)),
+        ("responses", None, Some(16_384)), ("responses", Some(8000), Some(8000)),
+    ]);
+
+    let call = json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":5},
+        "output":[{"type":"function_call","status":"completed","call_id":"call-1","name":"list_dir","arguments":"{\"path\":\".\"}"}]}});
+    // Refused as too large, or in words that name the context window: either way the reserve, for the rest of the turn.
+    for refused in ["max_output_tokens exceeds the maximum allowed for this request", "max_output_tokens is over this model's context window"] {
+        let refusal = json!({"error":{"message":refused,"type":"invalid_request_error"}});
+        let (url, bodies) = common::recording_responses_with_status(vec![(400, refusal), (200, call.clone()), (200, responses.clone())]).await;
+        let scratch = Scratch::new(&url, "responses");
+        std::fs::write(scratch.0.join("data/settings.json"), json!({"provider":"test","model":"thinker"}).to_string()).unwrap();
+        let providers = json!({"providers":{"test":{"base_url":url,"api_key":"fixture-key","wire_api":"responses",
+            "models":[{"id":"thinker","context_tokens":1_048_576,"max_tokens":131_072}]}}});
+        std::fs::write(scratch.0.join("data/providers.json"), providers.to_string()).unwrap();
+        let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
+        let events = common::drive_turn(&core, &mut rx, "refused", &scratch.0.join("project"), "go").await;
+        let errors: Vec<_> = events.iter().filter(|e| matches!(e, AgentEvent::Error { .. })).collect();
+        assert!(errors.is_empty(), "{refused}: {errors:?}");
+        let asked: Vec<u64> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_output_tokens"].as_u64().unwrap()).collect();
+        assert_eq!(asked, [16_384, 4096, 4096], "{refused}: refused, then the reserve for the rest of the turn");
     }
 }

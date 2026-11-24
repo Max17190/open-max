@@ -866,10 +866,10 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   in the model's providers.json entry (which wins); no default, nothing is
   queried from the server, and a guessed window is wrong in one direction or
   the other. `openmax --check` warns while it is missing.
-- `max_tokens`: the reply's limit (default 4096), reserved from input up to
-  max(4096, window/8). A per-model `max_tokens` in providers.json is the
-  model's longest reply: a ceiling the limit doubles up to while replies are
-  cut in a row before any call, and the limit itself only when lower.
+- `max_tokens`: the reply's limit (default 4096), reserved from input up to max(4096, window/8); set
+  here, it is the first ask on every wire. A per-model `max_tokens` in providers.json is the model's
+  longest reply: the ceiling replies cut in a row double the limit to, and the first ask up to 16384
+  where the wire sends the limit and drops a cut thought (Responses, native Messages), else when lower.
   HTTP 400 or 422 on a request with a limit above the reserve can trigger
   a retry at the reserve. If a status-only retry fails, keep the first error.
 - `temperature`: sent only when set. Unset (the default) leaves it to the
