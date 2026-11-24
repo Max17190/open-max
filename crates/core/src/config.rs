@@ -168,11 +168,11 @@ pub struct Settings {
     pub stuck_command_secs: Option<u64>,
 }
 
-/// A change across several files with its tests routinely takes more than
-/// fifty tool rounds, so the default leaves room for that and still ends a
-/// turn that never stops calling tools.
+/// The cap stops a turn that never stops calling tools. The default leaves
+/// room for long changes across many files, including the rounds needed to
+/// test and verify the work.
 fn default_max_agent_iterations() -> usize {
-    300
+    1_000
 }
 
 fn default_max_parallel_tools() -> usize {
@@ -529,15 +529,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_iteration_cap_defaults_to_300() {
+    fn missing_iteration_cap_defaults_to_1000() {
         let s: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(s.max_agent_iterations, 300);
+        assert_eq!(s.max_agent_iterations, 1_000);
     }
 
     #[test]
     fn default_settings_use_iteration_cap() {
         let s = Settings::default();
-        assert_eq!(s.max_agent_iterations, 300);
+        assert_eq!(s.max_agent_iterations, 1_000);
         assert_eq!(s.max_parallel_tools, 4);
     }
 
@@ -643,7 +643,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let s = load(&dir).unwrap();
-        assert_eq!(s.max_agent_iterations, 300);
+        assert_eq!(s.max_agent_iterations, 1_000);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -705,11 +705,11 @@ mod tests {
         let (mut run, applied) = flags.apply(&mut file);
         assert!(applied.written.is_empty(), "{applied:?}");
         assert_eq!(applied.overridden, ["max_agent_tokens", "max_agent_iterations"]);
-        assert_eq!((file.max_agent_tokens, file.max_agent_iterations), (None, 300));
+        assert_eq!((file.max_agent_tokens, file.max_agent_iterations), (None, 1_000));
         assert_eq!((run.max_agent_tokens, run.max_agent_iterations), (Some(9_000), 2));
         run.model = "chosen-model".into();
         let (saved, _) = RunOnly::new(file, run.clone(), &applied).unwrap().save(&run);
-        assert_eq!((saved.max_agent_tokens, saved.max_agent_iterations, saved.model.as_str()), (None, 300, "chosen-model"));
+        assert_eq!((saved.max_agent_tokens, saved.max_agent_iterations, saved.model.as_str()), (None, 1_000, "chosen-model"));
         // At the file's own value the flag still sets the run's ceiling.
         let mut file = Settings { max_agent_iterations: 2, ..Settings::default() };
         let (_, applied) = KeyFlags { max_agent_iterations: Some(2), ..KeyFlags::default() }.apply(&mut file);
