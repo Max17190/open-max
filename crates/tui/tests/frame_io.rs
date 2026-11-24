@@ -1028,7 +1028,7 @@ mod first_frame {
             false,
         );
         assert_eq!(code, Some(3), "{shell:?}");
-        assert!(shell.contains("openmax: trust grants are human actions"), "{shell:?}");
+        assert!(shell.contains("openmax: a trust grant is a human action: this process was started from an agent session"), "{shell:?}");
 
         let first_run = ["--trust-project", "--base-url", "http://127.0.0.1:9/v1", "-m", "stub-model", "--context-tokens", "16384"];
         let (code, shell) = on_the_shell("first-run", &|_, cmd| _ = cmd.args(first_run), true);

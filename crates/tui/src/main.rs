@@ -142,6 +142,11 @@ options:
                          of -p, --stdio and --subagent, and stdout not a
                          terminal, no session starts: the grant alone exits
                          0, and with --continue or a settings flag it exits 1
+      --permissions <mode>
+                         save auto, ask or readonly for this trusted project
+                         as /permissions does; with -p, --stdio or --subagent
+                         the run then follows it. Beside --trust-project, the
+                         grant records this mode instead and runs on as it does
       --update           update to the latest release the way it was installed
   -V, --version          print the version
   -h, --help             this help
@@ -209,6 +214,7 @@ struct CliArgs {
     /// `--mcp-timeout`: seconds each wait for an MCP server reply may take.
     mcp_timeout: Option<u64>,
     trust_project: bool,
+    permissions: Option<String>,
     /// `--subagent`: the task one child session runs in a new worktree (see
     /// `subagent`).
     subagent: Option<String>,
@@ -267,6 +273,7 @@ where
         mcp_server: None,
         mcp_timeout: None,
         trust_project: false,
+        permissions: None,
         subagent: None,
         update: false,
         worktree: false,
@@ -336,6 +343,7 @@ where
             Long("mcp-call") => out.mcp_call = true,
             Long("mcp-timeout") => out.mcp_timeout = Some(parser.value()?.parse()?),
             Long("trust-project") => out.trust_project = true,
+            Long("permissions") => set_once(&mut out.permissions, "--permissions", &mut parser)?,
             Long("subagent") => set_once(&mut out.subagent, "--subagent", &mut parser)?,
             Long("worktree") => out.worktree = true,
             Short('V') | Long("version") => {
@@ -417,7 +425,7 @@ fn flush_prompt_tokens(
 }
 
 /// Whether a human is standing behind an authority-GRANTING command
-/// (`--approve`, `--trust-project`). Two walls, both required to pass:
+/// (`--approve`, `--trust-project`, `--permissions`). Two walls, both required:
 ///
 /// 1. Not agent-spawned: the `OPENMAX_SESSION` marker every child carries.
 ///    That marker alone is one `env -u` away: an agent hitting the
@@ -509,6 +517,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         mcp_server,
         mcp_timeout,
         trust_project,
+        permissions,
         subagent,
         update,
         worktree,
@@ -550,9 +559,10 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
     // A sub-agent's child is a session too, but a new one in a new worktree.
     const RUNS: &[Option<&str>] = &[None, Some("--stdio"), Some("--print"), Some("--subagent")];
     const MCP: &[Option<&str>] = &[Some("--mcp-list"), Some("--mcp-call")];
-    let options: [(bool, &str, &[Option<&str>]); 18] = [
+    let options: [(bool, &str, &[Option<&str>]); 19] = [
         (account.is_some(), "--account", &[Some("--chatgpt")]),
         (*trust_project, "--trust-project", RUNS),
+        (permissions.is_some(), "--permissions", RUNS),
         (*continue_session, "--continue", SESSIONS),
         (session.is_some(), "--session", SESSIONS),
         (model.is_some(), "--model", RUNS),
@@ -587,6 +597,7 @@ fn operation(cli: &CliArgs) -> Result<Option<&'static str>, String> {
         });
     }
     if *second_look && prompts.len() > 1 { return Err("--second-look checks one prompt; give a single -p".into()) }
+    if let Some(mode) = permissions.as_deref().filter(|mode| open_max_core::config::ApprovalMode::parse(mode).is_none()) { return Err(format!("--permissions takes auto, ask or readonly, not '{mode}'")) }
     // A replay prints the JSON lines `--print --json` prints, so it is asked
     // for the same way.
     if operation == Some("--replay") && !*json {
@@ -732,7 +743,7 @@ fn main() -> std::io::Result<std::process::ExitCode> {
     // The interactive session at a terminal paints its first frame before
     // the runtime exists. Every other run, a session without a terminal at
     // both ends included, starts on the runtime.
-    if operation.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if operation.is_none() && exit_after_grant(&cli, true).is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         return session(cli);
     }
     runtime(None, runtime_workers(&cli)).block_on(run(cli))
@@ -1512,7 +1523,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         }
     }
     if let Some(code) = exit_after_grant(&cli, std::io::stdout().is_terminal()) {
-        eprintln!("openmax: stdout is not a terminal, so no session was started");
+        if !std::io::stdout().is_terminal() { eprintln!("openmax: stdout is not a terminal, so no session was started") }
         std::process::exit(code);
     }
 
@@ -2544,83 +2555,73 @@ fn print_usage_economics(data_dir: &std::path::Path) {
     }
 }
 
-/// The exit code of a run that ends once `ensure_project_trust` has
-/// recorded its grant, or None when it goes on. `--trust-project` with no
-/// `-p`, `--stdio` or `--subagent` goes on to the interactive session, which
-/// draws on stdout, so with stdout not a terminal no session starts. Going on
-/// there was wrong either way: with no controlling terminal (a CI job),
-/// starting the session failed after the grant was recorded and the run
-/// exited 1; with one, the session drew its frames into the pipe. The grant
-/// alone is the whole run and exits 0. `--continue` and the settings flags
-/// (`--model`, `--provider`, `--base-url`, `--api-key`, `--context-tokens`)
-/// ask for the session itself, so with any of them the run exits 1 rather
-/// than as if that session had run (see `operation`), and writes no settings.
+/// The exit code of a run that ends once `ensure_project_trust` has recorded
+/// its grant or mode, or None when it goes on. `--trust-project` with no `-p`,
+/// `--stdio` or `--subagent` goes on to the interactive session, which draws on
+/// stdout, so with stdout not a terminal no session starts. Going on there was
+/// wrong either way: with no controlling terminal (a CI job), starting the
+/// session failed after the grant was recorded and the run exited 1; with one,
+/// the session drew its frames into the pipe. The grant alone is the whole run
+/// and exits 0. A `--permissions` mode alone ends at a terminal too, so a
+/// pasted repair saves each directory's mode without a session between them.
+/// `--continue` and the settings flags (`--model`, `--provider`, `--base-url`,
+/// `--api-key`, `--context-tokens`) ask for the session itself, so with any of
+/// them the run exits 1 rather than as if that session had run (see
+/// `operation`), and writes no settings.
 fn exit_after_grant(cli: &CliArgs, stdout_is_terminal: bool) -> Option<i32> {
-    if !cli.trust_project || cli.print || cli.stdio || cli.subagent.is_some() || stdout_is_terminal {
-        return None;
-    }
     let asks_for_a_session = cli.continue_session || key_flags(cli) != Default::default();
-    Some(if asks_for_a_session { 1 } else { 0 })
+    let ends = (cli.trust_project || cli.permissions.is_some()) && !(cli.print || cli.stdio || cli.subagent.is_some())
+        && !(stdout_is_terminal && (cli.trust_project || asks_for_a_session));
+    ends.then_some(if asks_for_a_session { 1 } else { 0 })
 }
 
-/// Trust this project for the run, or refuse it. A project that is not yet
-/// trusted is offered to the human at the terminal through `ask`
-/// (`prompt_trust`). A `--trust-project` grant returns the line that reports
-/// it, which the caller prints where it can be read.
+/// Trust this project for the run, or refuse it (`ask` offers an untrusted one
+/// to the human at the terminal: `prompt_trust`), and save a `--permissions`
+/// mode, in the grant of a root it newly trusts, else selected on its own. A
+/// grant or a mode returns the line that reports it, for the caller to print.
 fn ensure_project_trust(
     cli: &CliArgs,
     data_dir: &std::path::Path,
     project: &std::path::Path,
     ask: impl FnOnce() -> Result<(), String>,
 ) -> Result<Option<String>, String> {
+    use open_max_core::{config::ApprovalMode, doctor::trust_command};
     // Trust grants are human actions. Any process the agent loop spawns
     // carries OPENMAX_SESSION, and both the flag and the interactive prompt
     // refuse under it: a session must not be able to grant itself (or a
     // child) trust in a new directory.
     let agent_spawned = std::env::var_os("OPENMAX_SESSION").is_some();
-    if cli.trust_project {
-        if agent_spawned {
-            return Err(format!(
-                "trust grants are human actions: this process was started from an agent session; ask the user to run `openmax --trust-project` in {}",
-                project.display()
-            ));
+    let selection = |mode: Option<ApprovalMode>| mode.map_or(String::new(), |mode| format!(" --permissions {}", mode.as_str()));
+    let permissions = cli.permissions.as_deref().and_then(ApprovalMode::parse);
+    let trusted = open_max_core::trust::is_trusted(data_dir, project)?;
+    if cli.trust_project && !(trusted && permissions.is_some()) {
+        // The walls of --approve: no session marker, then a human at a
+        // terminal, or an explicit attestation for automation a human runs.
+        // The repair is printed as one command to paste, so it carries the
+        // directory as a quoted `cd`: a parenthesized note is a shell syntax error.
+        require_human("a trust grant", &(trust_command(project) + &selection(permissions)))?;
+        match open_max_core::trust::grant_trust(data_dir, project, permissions.unwrap_or(ApprovalMode::Auto))? {
+            (trusted, Some(mode)) => return Ok(Some(format!("openmax: trusted project {} in {} mode (change it with /permissions)", trusted.display(), mode.as_str()))),
+            (trusted, None) if permissions.is_none() => return Ok(Some(format!("openmax: project {} was already trusted; its approval mode is unchanged (change it with /permissions)", trusted.display()))),
+            _ => {} // Trusted by another process since the check: the mode is selected below.
         }
-        // Same second wall as --approve: a human at a terminal, or an
-        // explicit attestation for automation a human runs. The repair is
-        // printed as one command to paste, so it carries the directory as a
-        // quoted `cd`: a parenthesized note is a shell syntax error.
-        require_human("a trust grant", &open_max_core::doctor::trust_command(project))?;
-        let (trusted, recorded) = open_max_core::trust::grant_trust(
-            data_dir,
-            project,
-            open_max_core::config::ApprovalMode::Auto,
-        )?;
-        return Ok(Some(match recorded {
-            Some(mode) => format!(
-                "openmax: trusted project {} in {} mode (change it with /permissions)",
-                trusted.display(),
-                mode.as_str()
-            ),
-            None => format!(
-                "openmax: project {} was already trusted; its approval mode is unchanged (change it with /permissions)",
-                trusted.display()
-            ),
+    }
+    if let Some(mode) = permissions.filter(|_| trusted || cli.trust_project) {
+        require_human("selecting an approval mode", &format!("cd {} && openmax{}", open_max_core::doctor::shell_quote(project), selection(Some(mode))))?;
+        return Ok(Some(match open_max_core::trust::set_approval_mode(data_dir, project, mode)? {
+            (root, true) => format!("openmax: saved {} mode for project {}", mode.as_str(), root.display()),
+            (root, false) => format!("openmax: project {} was already in {} mode; nothing changed", root.display(), mode.as_str()),
         }));
     }
-    if open_max_core::trust::is_trusted(data_dir, project)? {
-        return Ok(None);
-    }
-    if agent_spawned || cli.print || cli.stdio || cli.subagent.is_some() || !std::io::stdin().is_terminal() {
+    if trusted { return Ok(None) }
+    if permissions.is_some() || agent_spawned || cli.print || cli.stdio || cli.subagent.is_some() || !std::io::stdin().is_terminal() {
         // Name a grant that works for every caller here: a frontend's stdin is
         // its protocol pipe, and telling it to add --trust-project only leads
         // to require_human's no-terminal refusal. The grant is pasted into a
         // terminal that is rarely in the project, so it carries the project
-        // (see trust_command).
-        return Err(format!(
-            "project {} is not trusted; inspect it, then trust it once from a terminal with `{}`",
-            project.display(),
-            open_max_core::doctor::trust_command(project)
-        ));
+        // (see trust_command) and the mode a --permissions asked for.
+        return Err(format!("project {} is not trusted; inspect it, then trust it once from a terminal with `{}{}`",
+            project.display(), trust_command(project), selection(permissions.filter(|mode| *mode != ApprovalMode::Auto))));
     }
 
     ask().map(|()| None)
@@ -2978,7 +2979,7 @@ mod tests {
         let result = ensure_project_trust(&cli, &dir.join("data"), &dir, || unreachable!("a grant asks nothing"));
         std::env::remove_var("OPENMAX_SESSION");
         let err = result.unwrap_err();
-        assert!(err.contains("human actions"), "{err}");
+        assert!(err.contains("a trust grant is a human action") && err.contains("openmax --trust-project`"), "{err}");
         assert!(
             !open_max_core::trust::is_trusted(&dir.join("data"), &dir).unwrap_or(true),
             "no trust may be recorded"
@@ -3542,6 +3543,13 @@ mod tests {
         assert_eq!(exit(&["--trust-project", "-p", "inspect"], false), None);
         assert_eq!(exit(&["--trust-project", "--stdio"], false), None);
         assert_eq!(exit(&[], false), None);
+        // A saved mode ends the run by the same rule.
+        assert_eq!(exit(&["--permissions", "ask"], false), Some(0));
+        assert_eq!(exit(&["--permissions", "ask"], true), Some(0), "a mode alone is the whole run at a terminal too");
+        assert_eq!(exit(&["--permissions", "ask", "--continue"], true), None);
+        assert_eq!(exit(&["--trust-project", "--permissions", "ask"], true), None);
+        assert_eq!(exit(&["--permissions", "ask", "-p", "inspect"], false), None);
+        assert_eq!(exit(&["--permissions", "ask", "--continue"], false), Some(1));
         let settings_flags = [
             &["-m", "m"][..],
             &["--provider", "p"],
@@ -3786,8 +3794,9 @@ mod tests {
     fn an_option_the_operation_does_not_read_is_refused_naming_both() {
         let sessions: &[&str] = &["", "--stdio", "--print"];
         let runs: &[&str] = &["", "--stdio", "--print", "--subagent"];
-        let options: [(&[&str], &str, &[&str]); 14] = [
+        let options: [(&[&str], &str, &[&str]); 15] = [
             (&["--trust-project"], "--trust-project", runs),
+            (&["--permissions", "ask"], "--permissions", runs),
             (&["--continue"], "--continue", sessions),
             (&["-m", "m"], "--model", runs),
             (&["--provider", "p"], "--provider", runs),
@@ -3826,6 +3835,7 @@ mod tests {
             &["--trust-project", "--base-url", "http://h/v1", "-m", "m", "--api-key", "sk-k", "--context-tokens", "8", "-p", "x"],
             &["--provider", "p", "--context-tokens", "8", "--stdio"],
             &["--trust-project", "--continue", "--stdio"],
+            &["--trust-project", "--permissions", "ask", "-p", "x"],
             &["--trust-project", "-m", "m", "--subagent", "fix the test", "--worktree", "--json"],
             &["--recall", "q", "--json"],
             &["--json", "--replay", "f"],

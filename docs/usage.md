@@ -7,8 +7,8 @@ openmax
 
 On the first interactive run, inspect the project and answer the trust
 prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`.
-Change the mode later with `/permissions`; **Shift+Tab** cycles reasoning
-effort. See
+Change the mode later with `/permissions`, or `openmax --permissions <mode>`
+from a shell; **Shift+Tab** cycles reasoning effort. See
 [configuration](configuration.md#project-trust) for headless and stdio
 trust.
 
@@ -40,6 +40,7 @@ openmax --spec hooks                  # print an extension surface's contract
 openmax --recall "deploy port"        # search past sessions and memories
 openmax --replay <id>.events.jsonl --json   # a session's events, offline
 openmax --stdio                       # full session over JSONL pipes
+openmax --permissions auto            # save this project's approval mode
 openmax --mcp-list -- <server>        # list an MCP server's tools
 openmax --login                     # choose a provider and connect it
 openmax --login anthropic           # hidden API-key entry and model selection
@@ -159,18 +160,26 @@ cannot ask, so it declines every approval request: unattended runs need
 `auto`, the mode a trust grant records unless you pick another. A turn that
 declined a request ends the run with exit 3, unless it failed (1) or stopped
 short (4), and its last stderr line counts the requests and says how to allow
-the work. For a project in `ask`, select
-`auto` once, from a terminal session with `/permissions auto` or from a shell
-in the project's directory:
+the work. To prepare a project in `ask` for print runs, select `auto` once
+from a terminal in the project's directory (or `/permissions auto` in a
+session):
 
 ```sh
-echo '{"cmd":"approval_mode","mode":"auto"}' | openmax --stdio
+openmax --permissions auto
 ```
+
+It saves the mode every selector saves, which later sessions and print,
+stdio and sub-agent runs use. With `-p`, `--stdio` or `--subagent` it then
+runs under the new mode; alone it ends once the mode is saved, and beside
+`--trust-project` or `--continue` it runs on as they do. Like a trust grant it
+is a human act: it refuses a process an agent started, and with no terminal on
+stdin it needs `OPENMAX_HUMAN_ATTEST=1`. The end line gives it with a `cd` to
+the project, so it pastes into any shell.
 
 A sub-agent held to a stricter mode saved inside the project, such as `ask`
 saved for `.worktrees`, names that directory too, and its command selects
-`auto` there as well as in the project when the project is in `ask`. A `--second-look` session that
-declines a request ends the run with exit 3 too.
+`auto` there as well as in the project when the project is in `ask`. A
+`--second-look` session that declines a request ends the run with exit 3 too.
 
 A request for an agent-written tool no human has approved names its
 `openmax --approve` command instead. A print run an agent started (one whose
@@ -211,7 +220,7 @@ the prompts after it.
 | 0 | Every turn finished |
 | 1 | An operational failure: a turn failed or could not start, ended on any other stop reason (`truncated`, `empty`, `blocked`, or a provider's own, such as `content_filter`), or the session could not be opened |
 | 2 | A usage or configuration error before any turn, `--continue` found no prior session here, or `--session` named one this directory cannot continue |
-| 3 | The project is not trusted, or trust cannot be granted from this process, or a turn that otherwise finished declined an approval request, as a print run does in `ask` (see above) |
+| 3 | The project is not trusted, or trust cannot be granted or a `--permissions` mode selected from this process, or a turn that otherwise finished declined an approval request, as a print run does in `ask` (see above) |
 | 4 | A turn stopped short (`length` when replies in a row kept reaching their `max_tokens` before any tool call once it was raised to its ceiling, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
 
 [examples/run-task](../examples/run-task/README.md) is a caller built on these
