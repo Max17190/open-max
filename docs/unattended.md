@@ -174,10 +174,11 @@ been written when the run was interrupted. See
 
 Shell commands and hooks inherit the environment and get
 `GIT_TERMINAL_PROMPT=0`. External tools get `PATH`, `HOME`, `LANG` and `TERM`,
-plus the variables their manifests name. Tools have no controlling terminal,
-so provide any needed credentials or Git identity before they run, not through
-a prompt. See [Native execution and privacy](execution.md) for what commands
-can access.
+plus the variables their manifests name. When unset, `EMAIL=openmax@localhost`
+gives Git a fallback email and `CARGO_CACHE_AUTO_CLEAN_FREQUENCY=never` keeps
+Cargo's download cache intact. Tools have no controlling terminal, so provide
+any needed credentials or Git identity before they run, not through a prompt.
+See [Native execution and privacy](execution.md) for what commands can access.
 
 ## Checklist
 
