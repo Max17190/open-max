@@ -1,6 +1,28 @@
 # Getting started
 
-The full first-run guide: configuring an endpoint, approval modes, signing in, headless and unattended runs, and sub-agents.
+Install Open Max, connect a model, then open it in your project:
+
+```sh
+curl -fsSL https://useopenmax.dev/install.sh | sh
+```
+
+Open a new shell, or run `source ~/.openmax/bin/env`, to put `openmax` on
+its `PATH`. Then connect a provider:
+
+```sh
+openmax --login
+```
+
+Once a provider is connected, start Open Max in your project:
+
+```sh
+cd ~/code/my-app
+openmax
+```
+
+Inspect the project before answering the trust prompt. Pick a model with
+`/model`, then describe a task. See [Install](install.md) for other ways to
+install, or [Unattended runs](unattended.md) if no one will be at the terminal.
 
 ## Configure
 
@@ -71,19 +93,16 @@ openmax --trust-project --base-url http://127.0.0.1:11434/v1 --model qwen2.5-cod
 
 It trusts the project in `auto` mode (a project trusted already keeps its
 mode), writes the endpoint to `~/.openmax/settings.json`, and prints the
-answer, with no file to write by hand and nothing to restart. For a server that checks a key, add
+answer, with no file to write by hand and nothing to restart.
+
+For a server that checks a key, add
 `--api-key '$NAME'` naming the environment variable that holds it, exported
 before you run the command: the single quotes keep your shell from expanding
 it, so settings.json stores the variable's name and the key is read from the
 environment when a request is sent. A literal key works too, and is stored as
 given, in plain text in settings.json.
 
-After that, `openmax` alone starts the fullscreen session:
-
-```sh
-cd ~/code/my-app
-openmax
-```
+After that, `openmax` alone starts the fullscreen session.
 
 On the first interactive run, inspect the project and answer the trust prompt: `y` trusts it in `auto` mode, `a` in `ask`, and `r` in `readonly`. The interface paints its first frame before it reads trust, settings or the session, then asks on your shell. Headless and stdio runs never prompt: grant trust once from a terminal with `--trust-project`, which records `auto`, and later runs, including a frontend's `openmax --stdio`, need no flag:
 
