@@ -99,7 +99,10 @@ OPENMAX_HUMAN_ATTEST=1 openmax --trust-project --permissions auto --base-url htt
 
 With the named endpoint above, use `--provider ci --model my-model` in place
 of the flat endpoint flags. The named provider supplies the key and window.
-For the rules on which flags are saved and which override only the run, see
+That command does not save the named selection. Repeat
+`--provider ci --model my-model` on each `openmax -p` command below, or save
+`"provider": "ci"` and `"model": "my-model"` in `$HOME/.openmax/settings.json`
+first. For the rules on which flags are saved and which override only the run, see
 [Settings from the command line](configuration.md#settings-from-the-command-line).
 
 A print run cannot ask for approval, so it declines every approval request.
@@ -138,6 +141,10 @@ error or interrupted run may have no `done` event.
 | 3 | The project is untrusted, the process cannot grant trust or select `--permissions`, or a turn that otherwise finished declined an approval. Follow the trust or approval instruction on stderr. |
 | 4 | The turn stopped short with `length`, `max_iterations`, `budget_exhausted` or `unverified`. Use `openmax --continue -p "<follow-up>"` to continue. If a gate could not start or a hook failed closed, repair the hook first. |
 | 128 + signal number | A signal stopped the run. For SIGTERM, expect 143; check the saved session before deciding whether to continue. |
+
+In `readonly` mode, a policy refusal does not request approval. A turn can
+finish with `stop` and exit 0 even if a tool call was blocked. If the task
+requires that call to run, check its tool result or verify the expected effect.
 
 ## Bound the run
 
