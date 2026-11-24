@@ -2364,7 +2364,7 @@ mod tests {
         let pid = child.id();
         let cancel = CancelToken::default();
         let supervise = supervise_child(&mut child, pid, Duration::from_secs(10),
-            (IdleWatch::AfterMemoryKill, Some((counter, 3))), &cancel);
+            (IdleWatch::AfterMemoryKill, Some((counter.clone(), 3))), &cancel);
         tokio::pin!(supervise);
         assert!(tokio::time::timeout(Duration::from_secs(1), &mut supervise).await.is_err());
         assert!(dir.join("fifo").exists());
