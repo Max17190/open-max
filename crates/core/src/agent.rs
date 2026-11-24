@@ -5517,6 +5517,20 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_dropped_call_without_a_reasoning_count_gets_room_then_split_advice() {
+        let cut = |limit| format!(concat!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"I will write the file.\"}},\"finish_reason\":\"length\"}}]}}\n\n",
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":100,\"completion_tokens\":{}}}}}\n\n",
+            "data: [DONE]\n\n",
+        ), limit);
+        let (stop, limits, notes) = cut_recovery_turn(&[&cut(4096), &cut(16384), STOP_SSE], None).await;
+        assert_eq!(stop, "stop");
+        assert_eq!(limits, [4096, 16384, 4096], "{notes:?}");
+        assert!(notes[0].contains("The next reply alone may be up to 16384 tokens: send that call again now, whole."));
+        assert!(notes[1].contains(crate::notes::SPLIT_ADVICE));
+    }
+
     /// One turn of "write big.txt" on a 262,144-token window against replies
     /// in order (the last repeats), with the model's longest reply declared
     /// when `ceiling` is set. Returns the stop reason, the limit each request

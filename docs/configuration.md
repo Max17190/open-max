@@ -231,7 +231,12 @@ and the run that writes a key already uses it.
   although it spent the limit. When the reply's usage counts output that
   neither its reasoning nor what arrived accounts for, the note says the
   reply was cut while writing something that did not arrive, most likely a
-  call larger than the limit, and asks for the content in parts instead;
+  call larger than the limit. Without a reasoning count, a reply with some
+  readable output and no opaque reasoning gets that note only if less than a
+  quarter of the billed output arrived and the gap exceeds the usual margin.
+  A provider that hides most of its
+  reasoning can still look like a dropped call. The note asks for the call
+  again if there is room, or asks for the content in parts;
   when nothing arrived and no reasoning count is reported, it says it was
   either thinking that is not shown or such a call. A server can refuse a request that carries a reply
   holding reasoning and nothing else (HTTP 400 or 422): that reasoning then
