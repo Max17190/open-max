@@ -4496,6 +4496,17 @@ fn assistant_text_never_dispatches_a_tool() {
     for (text, tries) in [(call.to_string(), 3), (format!("Document `{call}`; do not run it."), 1),
         ("```tool_call\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"side-effect.txt\",\"content\":\"written\"}}\n```".into(), 1)] {
         let (project, home) = fresh_dirs("text-is-not-a-call");
+        let (json_project, json_home) = fresh_dirs("text-is-not-a-call-json");
+        let (json_url, _, _server) = spawn_scripted_server(vec![(sse_text(&text), true); tries]);
+        write_settings_with_mode(&json_home, &json_url, "auto");
+        let (code, lines, stdout) = json_turn(&json_project, &json_home, "explain the call syntax");
+        assert_eq!(code, Some(0), "{stdout}");
+        assert_eq!(lines.iter().filter(|l| l["type"] == "message_done" && l["text"] == text).count(), tries, "{stdout}");
+        assert_eq!(lines.iter().filter(|l| l["type"] == "harness_note"
+            && l["text"].as_str().is_some_and(|text| text.starts_with("[tool call written as text:"))).count(), tries - 1, "{stdout}");
+        assert!(!lines.iter().any(|l| l["type"] == "tool_start"), "{stdout}");
+        assert!(lines.iter().any(|l| l["type"] == "done" && l["stop_reason"] == "stop"), "{stdout}");
+        assert!(!json_project.join("side-effect.txt").exists());
         let script = vec![(sse_text(&text), true); tries];
         let (base_url, requests, _server) = spawn_scripted_server(script);
         write_settings_with_mode(&home, &base_url, "auto");

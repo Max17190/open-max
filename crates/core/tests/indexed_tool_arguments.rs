@@ -83,10 +83,14 @@ impl Turn {
 }
 
 async fn run(replies: Vec<WireReply>) -> Turn {
-    run_with_round_cap(replies, 8).await
+    run_with_prompt(replies, 8, "Check the result.").await
 }
 
 async fn run_with_round_cap(replies: Vec<WireReply>, max_rounds: usize) -> Turn {
+    run_with_prompt(replies, max_rounds, "Check the result.").await
+}
+
+async fn run_with_prompt(replies: Vec<WireReply>, max_rounds: usize, prompt: &str) -> Turn {
     let (url, requests) = common::recording_http_script(replies).await;
     let scratch = Scratch::new(&url, max_rounds);
     let project = scratch.0.join("project");
@@ -94,7 +98,7 @@ async fn run_with_round_cap(replies: Vec<WireReply>, max_rounds: usize) -> Turn 
     let id = sessions::create(&core, project.display().to_string())
         .unwrap()
         .id;
-    let events = common::drive_turn(&core, &mut rx, &id, &project, "Check the result.").await;
+    let events = common::drive_turn(&core, &mut rx, &id, &project, prompt).await;
     assert!(!project.join("ghost.txt").exists());
     assert_eq!(
         std::fs::read_to_string(project.join("evidence.txt")).unwrap(),
@@ -246,8 +250,9 @@ const CALL_AS_TEXT: &str =
 const MALFORMED: &str = " <tool_call>\n{\"name\":\"edit_file\",\"arguments\":{\"path\":\"evidence.txt\",\"edits\":[{\"old_string\":\"middle\",\"new_string\":\"first\"}}}\n</tool_call>\n";
 const PROSE_MALFORMED: &str = "First, write the line below:\n<tool_call>\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"ghost.txt\",\"content\":\"one\ntwo\"}}\n</tool_call>";
 const MISSING_DELIMITER: &str = r#"<tool_call>{"name":"write_file","arguments":{"path":"ghost.txt" "content":"text"}}</tool_call>"#;
-const TEXT_CALL_NOTE: &str = "[tool call written as text: nothing ran. Call the tool through the API with arguments that are valid JSON.]";
-const BAD_JSON_NOTE: &str = "[tool call written as text: nothing ran. The arguments were not valid JSON. Call the tool through the API with arguments that are valid JSON.]";
+const OPEN_ARRAY: &str = "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"paths\":[\"a.txt\"\n</tool_call>";
+const TEXT_CALL_NOTE: &str = "[tool call written as text: nothing ran. Only call the tool through the API with valid JSON arguments if the user's task requires running it. Otherwise return the requested answer without running anything.]";
+const BAD_JSON_NOTE: &str = "[tool call written as text: nothing ran. The arguments were not valid JSON. Only call the tool through the API with valid JSON arguments if the user's task requires running it. Otherwise return the requested answer without running anything.]";
 
 fn real_read() -> WireReply {
     sse(
@@ -283,6 +288,8 @@ async fn written_calls_are_replayed_as_text_then_retried_through_the_api() {
         (MALFORMED.to_string(), BAD_JSON_NOTE),
         (PROSE_MALFORMED.to_string(), BAD_JSON_NOTE),
         (MISSING_DELIMITER.to_string(), BAD_JSON_NOTE),
+        (OPEN_ARRAY.to_string(), BAD_JSON_NOTE),
+        (format!("First, inspect the files:\n{OPEN_ARRAY}"), BAD_JSON_NOTE),
         (format!("<tool_call>{CALL_AS_TEXT}</tool_call>"), TEXT_CALL_NOTE),
         (CALL_AS_TEXT.to_string(), TEXT_CALL_NOTE),
         (format!("```json\n{CALL_AS_TEXT}\n```"), TEXT_CALL_NOTE),
@@ -391,6 +398,31 @@ async fn answers_with_tool_names_or_examples_stay_answers() {
         assert_eq!(saved.role, "assistant");
         assert_eq!(saved.content.as_deref(), Some(text.as_str()));
     }
+}
+
+#[tokio::test]
+async fn quoting_a_call_does_not_ask_for_execution() {
+    let fenced = format!("```json\n{CALL_AS_TEXT}\n```");
+    let tagged = format!("<tool_call>\n{CALL_AS_TEXT}\n</tool_call>");
+    for text in [fenced, tagged, CALL_AS_TEXT.to_string()] {
+        let turn = run_with_prompt(vec![answer(&text), answer("Here is the requested example.")], 8,
+            "Quote a tool-call example without executing it.").await;
+        assert_eq!(turn.requests.len(), 2);
+        let messages = turn.requests[1]["messages"].as_array().unwrap();
+        assert_eq!(messages[messages.len() - 2], json!({"role":"assistant","content":text}));
+        assert_eq!(messages.last().unwrap(), &json!({"role":"user","content":TEXT_CALL_NOTE}));
+        assert_eq!(call_text_notes(&turn), [TEXT_CALL_NOTE]);
+        assert!(turn.saved.iter().any(|m| m.harness_note && m.content.as_deref() == Some(TEXT_CALL_NOTE)));
+        assert!(turn.outcomes().is_empty());
+        assert_eq!(turn.stop(), "stop");
+    }
+    let tutorial = format!("The API takes a name and arguments. For example:\n<tool_call>\n{CALL_AS_TEXT}\n</tool_call>");
+    let turn = run_with_prompt(vec![answer(&tutorial)], 8, "Write a tutorial with a tagged example.").await;
+    assert_eq!(turn.requests.len(), 1);
+    assert!(call_text_notes(&turn).is_empty());
+    assert!(turn.outcomes().is_empty());
+    assert_eq!(turn.saved.last().unwrap().content.as_deref(), Some(tutorial.as_str()));
+    assert_eq!(turn.stop(), "stop");
 }
 
 #[tokio::test]

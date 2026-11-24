@@ -1132,8 +1132,8 @@ the tool schemas sent on every request, context_tokens),
 (call_id, name, args), `tool_end` (call_id, ok, output, duration_ms), `harness_note`
 (call_id, text: a note the harness wrote into the MODEL's transcript - a
 refreeze receipt, a policy/providers/settings/approval notice, or a request
-to resend a tool call written as text through the API. No call in reply text
-runs. Frontends can render these notes; `call_id` links a note to the
+to retry a reply that looks like a tool call written as text. No call in reply
+text runs. Frontends can render these notes; `call_id` links a note to the
 tool result it rode, or is empty for a note inserted before the next prompt
 like a turn-start receipt), `retry` (attempt, max_attempts, reason: the
 model request is being resent after a transport failure, a 429 or transient

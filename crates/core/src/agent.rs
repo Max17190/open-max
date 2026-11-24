@@ -944,10 +944,6 @@ async fn run_loop(
             stop_reason = TRUNCATED.into();
             break 'turns;
         }
-        let written_call = (!capped && tool_calls.is_empty() && matches!(result.finish_reason.as_str(), "stop" | "tool_calls")
-            && (content.trim_start().starts_with(['{', '`']) || content.trim_end().ends_with("</tool_call>")))
-            .then(|| crate::notes::written_call_json(&content, registry.tool_schemas_json())).flatten();
-        text_calls = written_call.map_or(0, |_| text_calls + 1);
         // The output cap is different: the reply is the model's own, and the
         // calls it finished before the cut run as usual. Only the last call,
         // the one it was still writing, is refused with the cause, so the
@@ -961,6 +957,9 @@ async fn run_loop(
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
             repeats = RepeatTracker::default();
+            let written_call = (!capped && tool_calls.is_empty() && matches!(result.finish_reason.as_str(), "stop" | "tool_calls"))
+                .then(|| crate::notes::written_call_json(&content, registry.tool_schemas_json())).flatten();
+            text_calls = written_call.map_or(0, |_| text_calls + 1);
             if let Some(valid) = written_call {
                 if text_calls <= 2 && iteration + 1 < max_iterations {
                     let at = guard.messages().len();
@@ -1101,6 +1100,7 @@ async fn run_loop(
             break 'turns;
         }
 
+        text_calls = 0;
         // True once any mutating call EXECUTED this iteration, a failed one
         // included (#242: a bash write-then-selftest that exits nonzero still
         // persisted the file): only then can extension files have changed, so
@@ -1193,7 +1193,7 @@ async fn run_loop(
                     Err(e) => {
                         // The transcript can hold this call with `{}`, so the
                         // reply is the model's only view of what it sent.
-                        let mut sent = take_note_bytes(&call.function.arguments, 120);
+                        let mut sent = take_note_bytes(&call.function.arguments, 120).to_owned();
                         if sent.len() < call.function.arguments.len() {
                             sent.push_str("...");
                         }

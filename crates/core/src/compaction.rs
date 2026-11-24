@@ -64,8 +64,8 @@ fn omitted_clause(omitted: usize) -> String {
 }
 
 /// Take at most `max_bytes` without splitting a character.
-pub(crate) fn take_note_bytes(s: &str, max_bytes: usize) -> String {
-    s[..crate::text::floor_char_boundary(s, max_bytes)].to_string()
+pub(crate) fn take_note_bytes(s: &str, max_bytes: usize) -> &str {
+    &s[..crate::text::floor_char_boundary(s, max_bytes)]
 }
 
 #[derive(Default)]
@@ -102,8 +102,8 @@ impl CompactionDigest {
                     && self.user_snippets.len() < 4
                 {
                     let snippet = take_note_bytes(trimmed, MAX_DIGEST_SNIPPET_BYTES);
-                    if !self.user_snippets.iter().any(|s| s == &snippet) {
-                        self.user_snippets.push(snippet);
+                    if !self.user_snippets.iter().any(|s| s == snippet) {
+                        self.user_snippets.push(snippet.to_owned());
                     }
                 }
             }
@@ -180,7 +180,7 @@ impl CompactionDigest {
             } else {
                 if shown.is_empty() {
                     let mark = " [cut short; the archive has it whole]";
-                    shown.push(take_note_bytes(prompt, cap - 3 - mark.len()) + mark);
+                    shown.push(format!("{}{mark}", take_note_bytes(prompt, cap - 3 - mark.len())));
                 }
                 break;
             }
@@ -349,7 +349,7 @@ fn cap_notes(summary: &str, cut: bool, cap: usize) -> String {
         let open = summary.match_indices('\n').map(|(i, _)| i + 1).rfind(|&i| opens_open_part(&summary[i..]));
         let tail = open.map(|i| &summary[i..]).filter(|tail| tail.len() <= room / 4).unwrap_or("");
         let room = room - if tail.is_empty() { 0 } else { tail.len() + "…\n".len() };
-        let head = &summary[..crate::text::floor_char_boundary(summary, room)];
+        let head = take_note_bytes(summary, room);
         let end = head.rfind('\n').filter(|&i| i >= room / 2).unwrap_or(head.len());
         let notes = head[..end].trim_end().to_string() + "…";
         if tail.is_empty() { notes } else { notes + "\n" + tail }
@@ -469,7 +469,7 @@ pub(crate) async fn compact_messages(
     // it, so the prune keeps room for it.
     let note = ctx.core.sessions.lock().await.get(ctx.session_id).and_then(|data| data.trailing_note.clone());
     let room = note.as_deref().map_or(0, |note| estimate_tokens(crate::prompt::NOTE_SEPARATOR.len() + note.len()));
-    if !force && (total + room <= trigger || schemas_exceed_budget(trigger, schema_tokens + room)) {
+    if !force && schemas_exceed_budget(trigger, schema_tokens + room) {
         return Ok(0);
     }
     // Once the archive lands the digest note gains its address, the paths the
@@ -1662,7 +1662,7 @@ pub(crate) mod tests {
         let notes_room = MAX_SUMMARY_BYTES - digest.prompts_room();
         let archive = "a".repeat(200);
         // The notes as `summarize_compaction` caps them, ellipsis included.
-        let summary = take_note_bytes(&"m".repeat(MAX_SUMMARY_BYTES + 1), notes_room) + "…";
+        let summary = format!("{}…", take_note_bytes(&"m".repeat(MAX_SUMMARY_BYTES + 1), notes_room));
         let costs = [digest.format(None, Some(&archive)), digest.format(Some(&summary), Some(&archive))]
             .map(|note| ChatMessage::user(note).estimated_tokens());
         for cost in costs {
@@ -2375,6 +2375,24 @@ pub(crate) mod tests {
         assert_eq!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await, 0);
         assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original);
         assert!(requests.recv_timeout(Duration::from_millis(300)).is_err(), "no request");
+        assert!(!fixture.committed());
+    }
+
+    #[tokio::test]
+    async fn schemas_and_reserved_note_room_can_prevent_a_cut() {
+        let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        let original: Vec<_> = messages.iter().map(wire).collect();
+        crate::transcript::ensure_session_hydrated(&fixture.core, &fixture.id, &fixture.dir).await.unwrap();
+        let mut sessions = fixture.core.sessions.lock().await;
+        sessions.get_mut(&fixture.id).unwrap().trailing_note = Some("a ".repeat(100).into());
+        drop(sessions);
+        for schema_tokens in [2_000, 1_999] {
+            assert_eq!(compact_messages(&fixture.ctx(), &mut messages, 2_000, 100_000, schema_tokens, false, &mut RequestSpend::new(None)).await.unwrap(), 0);
+            assert_eq!(messages.iter().map(wire).collect::<Vec<_>>(), original);
+        }
+        assert!(requests.recv_timeout(Duration::from_millis(300)).is_err());
         assert!(!fixture.committed());
     }
 
