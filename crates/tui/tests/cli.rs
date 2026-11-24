@@ -636,7 +636,11 @@ fn run_documented_trust_command(line: &str) -> Result<(), String> {
         command.stdin(terminal);
     } else {
         // What a CI job gets: no controlling terminal either.
-        without_controlling_terminal(command.stdin(Stdio::piped()));
+        without_controlling_terminal(command.stdin(if args.iter().any(|a| a == "--stdio") {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        }));
     }
     let mut child = command.spawn().unwrap();
     let out = if args.iter().any(|a| a == "--stdio") {
@@ -816,6 +820,48 @@ fn trust_project_records_auto_for_a_project_it_newly_trusts() {
     let spawned = std::fs::canonicalize(&spawned).unwrap();
     assert!(!store.contains(spawned.to_str().unwrap()), "an agent-spawned grant recorded state: {store}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn a_positional_prompt_starts_a_turn_at_a_terminal() {
+    let (project, home) = fresh_dirs("interactive-prompt");
+    let (base_url, requests, _) = spawn_scripted_server(vec![(HELLO_SSE.to_string(), true)]);
+    write_settings(&home, &base_url);
+    let prompts = project.join(".agents/prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(prompts.join("review.md"), "Inspect $ARGUMENTS\n").unwrap();
+    let (mut pty, terminal) = pseudo_terminal();
+    let size = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCSWINSZ reads the winsize from a live descriptor.
+    unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&terminal), libc::TIOCSWINSZ, &size) };
+    let mut child = cmd(&project, &home)
+        .args(["--trust-project", "/review", "the failing test"])
+        .env("OPENMAX_NO_UPDATE_CHECK", "1")
+        .env("TERM", "xterm-256color")
+        .stdin(terminal.try_clone().unwrap())
+        .stdout(terminal)
+        .stderr(Stdio::piped())
+        .spawn().unwrap();
+    std::thread::spawn(move || { let _ = std::io::copy(&mut pty, &mut std::io::sink()); });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while requests.lock().unwrap().is_empty() && child.try_wait().unwrap().is_none()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let out = finish_with_deadline(child);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(requests[0].contains("Inspect the failing test"), "{:?}", requests[0]);
+}
+
+#[test]
+fn a_positional_prompt_without_terminal_output_points_to_print() {
+    let (project, home) = fresh_dirs("positional-no-terminal");
+    let out = cmd(&project, &home).arg("fix the failing test").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("use -p to run without one"));
 }
 
 /// Start `command` with no controlling terminal, as in a CI job. A run that
@@ -1730,8 +1776,6 @@ fn two_operations_on_one_command_line_are_refused_naming_both() {
     for (args, named) in cases {
         let out = cmd(&project, &home).args(args).stdin(Stdio::null()).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
-        // The usage text that follows a refusal names every flag, so only the
-        // first line shows whether the refusal named this conflict.
         let first = stderr.lines().next().unwrap_or_default();
         if out.status.code() != Some(2) || !named.iter().all(|flag| first.contains(flag)) {
             wrong.push(format!("{args:?} exited {:?}: {first}", out.status.code()));
@@ -2317,6 +2361,79 @@ fn a_print_prompt_on_stdin_survives_pkill_of_a_word_in_it() {
         assert!(first["messages"].to_string().contains(&prompt), "the model got the piped prompt: {first}");
         assert!(wire.lines().nth(1).unwrap().contains("alive"), "the call's output reached the model: {wire}");
     }
+}
+
+#[test]
+fn print_appends_input_from_a_pipe_or_file_to_the_first_prompt() {
+    let (project, home) = fresh_dirs("print-input");
+    let (url, requests, _) = spawn_scripted_server(vec![(HELLO_SSE.to_string(), true); 6]);
+    write_settings(&home, &url);
+    let file = project.join("notes.txt");
+    std::fs::write(&file, "notes from a file\n").unwrap();
+    for (stdin, piped, expected) in [
+        (Stdio::piped(), Some("notes from a pipe\n"), "summarize\n\nnotes from a pipe\n"),
+        (std::fs::File::open(&file).unwrap().into(), None, "summarize\n\nnotes from a file\n"),
+        (Stdio::piped(), Some(""), "summarize"),
+    ] {
+        let mut child = cmd(&project, &home).args(["--trust-project", "-p", "summarize", "-p", "follow up"])
+            .stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        if let Some(piped) = piped {
+            child.stdin.take().unwrap().write_all(piped.as_bytes()).unwrap();
+        }
+        let out = finish_with_deadline(child);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let sent = requests.lock().unwrap();
+        for (request, prompt) in sent[sent.len()-2..].iter().zip([expected, "follow up"]) {
+            let body: serde_json::Value = serde_json::from_str(request).unwrap();
+            let user = body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap();
+            assert_eq!(user["content"], prompt);
+        }
+    }
+}
+
+#[test]
+fn print_reads_stdin_from_a_socket_with_or_without_a_prompt() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let (project, home) = fresh_dirs("print-socket");
+    let (url, requests, _) = spawn_scripted_server(vec![(HELLO_SSE.to_string(), true); 2]);
+    write_settings(&home, &url);
+    for (args, expected) in [(&["-p"][..], "notes"), (&["-p", "summarize"][..], "summarize\n\nnotes")] {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"notes").unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        let out = cmd(&project, &home).arg("--trust-project").args(args)
+            .stdin(Stdio::from(OwnedFd::from(reader))).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let sent = requests.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_str(sent.last().unwrap()).unwrap();
+        let user = body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap();
+        assert_eq!(user["content"], expected);
+    }
+}
+
+#[test]
+fn print_explains_why_it_is_waiting_on_an_open_pipe() {
+    let (project, home) = fresh_dirs("print-wait");
+    let (url, requests, _) = spawn_scripted_server(vec![(HELLO_SSE.to_string(), true)]);
+    write_settings(&home, &url);
+    let mut child = cmd(&project, &home).args(["--trust-project", "-p", "summarize"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains("waiting for piped input") { let _ = send.send(line); }
+        }
+    });
+    let notice = receive.recv_timeout(std::time::Duration::from_secs(8));
+    let waiting = child.try_wait().unwrap().is_none() && requests.lock().unwrap().is_empty();
+    drop(child.stdin.take());
+    let out = finish_with_deadline(child);
+    reader.join().unwrap();
+    assert_eq!(notice.as_deref(), Ok("openmax: waiting for piped input; close the pipe or rerun with </dev/null to skip stdin"));
+    assert!(waiting && receive.try_recv().is_err() && out.status.success());
 }
 
 /// Piped input that cannot be read as text is named as such, not reported as
@@ -3809,6 +3926,38 @@ fn a_second_look_is_opt_in_and_takes_one_print_prompt() {
     }
 }
 
+#[test]
+fn a_print_session_save_warning_does_not_fail_a_finished_turn() {
+    let (project, home) = fresh_dirs("print-save-warning");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_settings(&home, &format!("http://{}/v1", listener.local_addr().unwrap()));
+    let sessions = home.join(".openmax/sessions");
+    let server = std::thread::spawn(move || {
+        let call = sse_tool_call("bash", serde_json::json!({"command": "true"}));
+        for (round, reply) in [call.as_str(), HELLO_SSE].into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream).unwrap();
+            if round == 1 {
+                // A directory at the existing transcript path blocks both append
+                // and rename, even for an account that can write through chmod.
+                let transcript = sessions.read_dir().unwrap().flatten().map(|entry| entry.path())
+                    .find(|path| path.to_string_lossy().ends_with(".messages.json")).unwrap();
+                std::fs::remove_file(&transcript).unwrap();
+                std::fs::create_dir(&transcript).unwrap();
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+    });
+    let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "say hi"]).output().unwrap();
+    server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(last_event(&out.stdout)["stop_reason"], "stop", "{stdout}");
+    assert!(stdout.contains("warning: failed to persist session to disk"), "{stdout}");
+    assert!(stderr.contains("openmax: warning: failed to persist session to disk:"), "{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+}
+
 /// A provider that fails after its 200 has gone out says so inside the
 /// stream. That used to read as a clean end: the turn stopped with nothing
 /// reported, and a tool call that streamed before the failure ran. The turn
@@ -3844,6 +3993,19 @@ fn a_provider_error_inside_the_stream_is_reported_and_runs_no_tool_call() {
     let last = lines.last().expect("at least one line");
     assert_eq!(last["type"], "done", "{stdout}");
     assert_eq!(last["stop_reason"], "error", "{stdout}");
+}
+
+#[test]
+fn a_failed_json_print_turn_reports_the_error_on_stderr() {
+    let (project, home) = fresh_dirs("print-json-error");
+    let failure = "data: {\"error\":{\"code\":400,\"message\":\"upstream rejected the request\"}}\n\ndata: [DONE]\n\n";
+    let (base_url, _, _) = spawn_scripted_server(vec![(failure.into(), true)]);
+    write_settings(&home, &base_url);
+    let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "say hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(last_event(&out.stdout)["stop_reason"], "error");
+    assert!(stderr.lines().any(|line| line == "openmax: error: backend reported an error (400): upstream rejected the request"), "{stderr}");
 }
 
 /// Control for the refusals above: in the same unattended mode, that exact
@@ -5189,6 +5351,35 @@ fn a_sub_agent_whose_stop_outlasts_its_deadline_keeps_its_worktree() {
     assert_eq!(edit.as_deref(), Some("edited\n"), "the run must name the worktree that holds the edit: {stderr}");
     assert!(!survived, "the filter outlived the run: {stderr}");
     assert_eq!(worktrees, 2, "{stderr}");
+}
+
+#[test]
+fn a_usage_refusal_prints_its_reason_and_one_help_pointer() {
+    let (project, home) = fresh_dirs("short-usage-error");
+    for (args, reason) in [
+        (&["--bogus"][..], "invalid option '--bogus'"),
+        (&["--stdio", "extra"][..], "--stdio takes no other arguments (got 'extra'); it reads commands on stdin"),
+    ] {
+        let out = cmd(&project, &home).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert_eq!(String::from_utf8_lossy(&out.stderr), format!("openmax: {reason}\nRun openmax --help to see the options.\n"));
+    }
+}
+
+#[test]
+fn familiar_command_line_spellings_point_to_the_supported_options() {
+    let (project, home) = fresh_dirs("cli-option-hints");
+    for (arg, reason) in [
+        ("--resume", "invalid option '--resume'; use --continue for the latest session or --session <id> for a named session"),
+        ("-r", "invalid option '-r'; use --continue for the latest session or --session <id> for a named session"),
+        ("help", "'help' is not a command"),
+        ("version", "'version' is not a command; use --version to see the version"),
+    ] {
+        let out = cmd(&project, &home).arg(arg).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).lines().next().unwrap(), format!("openmax: {reason}"));
+    }
 }
 
 /// A flag openmax does not take is a usage error, exit 2 naming it, and

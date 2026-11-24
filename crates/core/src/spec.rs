@@ -1361,8 +1361,9 @@ tail -n 1 /tmp/flaky.log
   is empty.
 - The child starts at this directory's place in the worktree and runs the task
   as one print-mode turn: its events print as they arrive, as `openmax -p`
-  prints them (text on stdout and tool progress on stderr, or with `--json`
-  one event line per event on stdout), the final answer last.
+  prints them: text on stdout and tool progress on stderr, or with `--json`
+  one event line per event on stdout. Warnings and errors go to stderr in
+  either mode.
 - Trust and mode: the worktree lies inside this project, so the trust a human
   granted the project covers it, as it covers any subdirectory; the flag
   grants nothing itself. The child runs in this project's approval mode, or in

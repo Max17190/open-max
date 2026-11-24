@@ -67,6 +67,12 @@ counts the same way.
 
 ## Command line
 
+`openmax "fix the failing test"` starts an interactive session and sends the
+prompt as its first message after trust and any session resume. Use `-p` to
+send a prompt without a terminal. Use `--help` and `--version`, not `help`
+or `version`. To resume a session, use `--continue` for the latest or
+`--session <id>` for a specific one, rather than `--resume` or `-r`.
+
 ```sh
 openmax --base-url http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b --context-tokens 32768
 openmax --continue                    # resume latest session here
@@ -150,21 +156,28 @@ approvals and permissions are those of `--continue`.
 
 ### Print mode
 
-Pass the task with `-p`, or pipe it into `openmax -p` with no prompt argument.
-
 A print prompt that starts with `-` parses as options, not text. Put it
 last, after `--`, which ends the options: `openmax -p -- '- list the files'`.
-An unknown option after `-p` is refused with that advice. Every word after
+Other unknown options after `-p` are refused with that advice. Every word after
 `--` is prompt text, a later `-p` included, so in a multi-turn run only the
 last turn can start with `-`:
 `openmax -p "list crates" -p -- "- summarize the first one"`.
+
+Print mode reads up to 8 MiB of UTF-8 from a pipe, socket or redirected file,
+even when you pass a prompt: `cat notes.txt | openmax -p "summarize this"`.
+The input follows the first prompt after a blank line, or supplies the prompt
+if you give `-p` alone. Empty input adds nothing. Open Max waits for EOF
+before starting the turn and prints a notice if a pipe stays open with no
+input for three seconds. Use `</dev/null` to run with just the command-line
+prompt. Add that redirection in a loop that reads stdin, or when the parent
+process leaves stdin open without writing to it.
 
 In print mode, text goes to stdout, and tool progress and errors to stderr. A
 note the harness writes for the model (a `harness_note` event, such as the
 execution policy notice) stays in the transcript and is written to neither
 stream, so a parent agent reading a child run's stderr does not receive it.
 With `--json`, each `AgentEvent` is one JSON line on stdout, `harness_note`
-included.
+included. Warnings and errors also go to stderr in JSON mode.
 
 Mutating tools honor the project's approval mode, and a print run
 cannot ask, so it declines every approval request: unattended runs need
@@ -231,7 +244,7 @@ turn that ends with any code but 0 skips the prompts after it.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Every turn finished |
+| 0 | Every turn finished, even if it reported a warning such as a failed session save |
 | 1 | An operational failure: a turn failed or could not start, ended on any other stop reason (`truncated`, `empty`, `blocked`, or a provider's own, such as `content_filter`), or the session could not be opened |
 | 2 | A usage or configuration error before any turn, `--continue` found no prior session here, or `--session` named one this directory cannot continue |
 | 3 | The project is not trusted, or trust cannot be granted or a `--permissions` mode selected from this process, or a turn that otherwise finished declined an approval request, as a print run does in `ask` (see above) |
