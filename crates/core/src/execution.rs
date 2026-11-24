@@ -104,8 +104,7 @@ pub(crate) struct ProcessRequest {
     pub cwd: PathBuf,
     pub stdin: StdinMode,
     pub timeout: Duration,
-    /// Stop the command once its processes sit this long with nothing to do ([`watch_for_stuck`]).
-    pub stuck_after: Option<Duration>,
+    pub idle_watch: IdleWatch,
     pub capture: CaptureSpec,
     /// OS-level containment for this one spawn. `None` is the default and
     /// preserves the module's stated posture exactly (host environment,
@@ -190,12 +189,19 @@ pub(crate) struct CaptureSpec {
     pub redraws: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleWatch {
+    Off,
+    AfterIdle(Duration),
+    /// Watch only after a new kernel memory kill in the launch cgroup.
+    AfterMemoryKill,
+}
+
 pub(crate) enum Termination {
     Exited(ExitStatus),
     Cancelled,
     TimedOut,
-    /// Stopped by [`ProcessRequest::stuck_after`] after `idle`, with the processes still `running`.
-    Stuck { idle: Duration, running: Vec<String> },
+    Stuck { idle: Duration, running: Vec<String>, after_memory_kill: bool },
 }
 
 pub(crate) struct CapturedStream {
@@ -927,6 +933,10 @@ pub(crate) async fn run_process(
     #[cfg(all(test, unix))]
     hold_before_exec(&mut command);
 
+    let memory = match request.idle_watch {
+        IdleWatch::AfterMemoryKill if cfg!(target_os = "linux") => memory_kill_counter(),
+        _ => None,
+    };
     let (mut child, group) = GroupGuard::spawn(&mut command)?;
     let pid = child.id();
     let stdout = child.stdout.take().ok_or_else(|| ProcessError::Wait(io::Error::other("stdout pipe unavailable")))?;
@@ -950,7 +960,7 @@ pub(crate) async fn run_process(
         }),
     };
 
-    let (termination, left_running) = supervise_child(&mut child, pid, request.timeout, request.stuck_after, &cancel).await?;
+    let (termination, left_running) = supervise_child(&mut child, pid, request.timeout, (request.idle_watch, memory), &cancel).await?;
     group.settled();
 
     if let Some(task) = stdin_task {
@@ -1104,10 +1114,21 @@ async fn supervise_child(
     child: &mut Child,
     pid: Option<u32>,
     timeout: Duration,
-    stuck_after: Option<Duration>,
+    (idle_watch, memory): (IdleWatch, Option<(String, u64)>),
     cancel: &CancelToken,
 ) -> Result<(Termination, Option<LeftRunning>), ProcessError> {
-    let stuck = async { match (stuck_after, pid) { (Some(after), Some(pid)) => watch_for_stuck(pid, after).await, _ => std::future::pending().await } };
+    let stuck = async {
+        let Some(pid) = pid else { return std::future::pending().await };
+        let after = match (idle_watch, memory) {
+            (IdleWatch::AfterIdle(after), _) => after,
+            (IdleWatch::AfterMemoryKill, Some((path, before))) => {
+                wait_for_memory_kill(before, || read_memory_kills(&path)).await;
+                Duration::from_secs(60)
+            }
+            _ => std::future::pending().await,
+        };
+        watch_for_stuck(pid, after).await
+    };
     tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
@@ -1132,8 +1153,28 @@ async fn supervise_child(
         }
         (idle, running) = stuck => {
             terminate_process_group(child, pid).await?;
-            Ok((Termination::Stuck { idle, running }, None))
+            Ok((Termination::Stuck { idle, running, after_memory_kill: idle_watch == IdleWatch::AfterMemoryKill }, None))
         }
+    }
+}
+
+/// The kernel's OOM-kill count for this process's memory cgroup and those under it: v2 `memory.events` (at /sys/fs/cgroup or, hybrid, /unified)
+/// or v1 `memory.oom_control` in the hierarchy listing `memory`, at the cgroup's path or else the root, where a container shows its own.
+#[inline(never)]
+pub(crate) fn memory_kill_counter() -> Option<(String, u64)> {
+    std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().filter_map(|l| l.split_once(':')?.1.split_once(':')).flat_map(|(c, path)| {
+        let (dirs, file) = if c.is_empty() { (vec![String::new(), "/unified".into()], "memory.events") } else if c.split(',').any(|c| c == "memory") { (vec!["/memory".into(), format!("/{c}")], "memory.oom_control") } else { (vec![], "") };
+        dirs.into_iter().flat_map(move |d| [format!("/sys/fs/cgroup{d}{}/{file}", path.trim_end_matches('/')), format!("/sys/fs/cgroup{d}/{file}")])
+    }).find_map(|path| read_memory_kills(&path).map(|count| (path, count)))
+}
+
+fn read_memory_kills(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.lines().find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok())
+}
+
+async fn wait_for_memory_kill(before: u64, mut count: impl FnMut() -> Option<u64>) {
+    while !count().is_some_and(|now| now > before) {
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -2091,7 +2132,7 @@ impl PausedSpawn {
                 cwd: std::env::temp_dir(),
                 stdin: StdinMode::Null,
                 timeout: Duration::from_secs(30),
-                stuck_after: None,
+                idle_watch: IdleWatch::Off,
                 capture: CaptureSpec { head_bytes: 64, tail_bytes: 64, spill_dir: None, spill_bytes_per_stream: 1024, redraws: false },
                 sandbox: None,
                 env_allowlist: None,
@@ -2245,7 +2286,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
-            stuck_after: None,
+            idle_watch: IdleWatch::Off,
             capture: CaptureSpec {
                 head_bytes: 4,
                 tail_bytes: 4,
@@ -2271,6 +2312,21 @@ mod tests {
         assert!(!timed_wait("202 0x7f00 0x189 0x0 0x0 0x0 0xffffffff 0x7ffc 0x7f4d"), "futex wait without one");
         assert!(!timed_wait("0 0x3 0x7ffc 0x1000 0x0 0x0 0x0 0x7ffc 0x7f4d"), "read");
         assert!(!timed_wait("running") && !timed_wait("-1 0x7ffc 0x7f4d"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn a_memory_watch_waits_for_an_increment_after_launch() {
+        use std::cell::Cell;
+        let count = Cell::new(Some(3));
+        let watch = wait_for_memory_kill(3, || count.get());
+        tokio::pin!(watch);
+        for sample in [Some(3), None, Some(2)] {
+            count.set(sample);
+            assert!(tokio::time::timeout(Duration::from_secs(6), &mut watch).await.is_err());
+        }
+        count.set(Some(4));
+        tokio::time::timeout(Duration::from_secs(5), watch).await.unwrap();
     }
 
     /// One drain finished, the other outlived the grace: the shape of a
@@ -2304,7 +2360,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
-            stuck_after: None,
+            idle_watch: IdleWatch::Off,
             capture: CaptureSpec {
                 head_bytes: 1024,
                 tail_bytes: 1024,
@@ -3129,7 +3185,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
-            stuck_after: None,
+            idle_watch: IdleWatch::Off,
             capture: CaptureSpec { head_bytes: 64, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
@@ -3153,7 +3209,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(5),
-            stuck_after: None,
+            idle_watch: IdleWatch::Off,
             capture: CaptureSpec { head_bytes: 4096, tail_bytes: 0, spill_dir: None, spill_bytes_per_stream: 0, redraws: false },
             sandbox: None,
             env_allowlist: None,
@@ -3274,7 +3330,7 @@ mod tests {
             cwd: scratch.to_path_buf(),
             stdin: StdinMode::Null,
             timeout: Duration::from_secs(10),
-            stuck_after: None,
+            idle_watch: IdleWatch::Off,
             capture: CaptureSpec {
                 head_bytes: 4096,
                 tail_bytes: 4096,
