@@ -1123,7 +1123,7 @@ async fn supervise_child(
             (IdleWatch::AfterIdle(after), _) => after,
             (IdleWatch::AfterMemoryKill, Some((path, before))) => {
                 wait_for_memory_kill(before, || read_memory_kills(&path)).await;
-                Duration::from_secs(60)
+                timeout_secs(60)
             }
             _ => std::future::pending().await,
         };
@@ -1174,7 +1174,7 @@ fn read_memory_kills(path: &str) -> Option<u64> {
 
 async fn wait_for_memory_kill(before: u64, mut count: impl FnMut() -> Option<u64>) {
     while !count().is_some_and(|now| now > before) {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(timeout_secs(5)).await;
     }
 }
 
@@ -2315,18 +2315,31 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test(start_paused = true)]
-    async fn a_memory_watch_waits_for_an_increment_after_launch() {
-        use std::cell::Cell;
-        let count = Cell::new(Some(3));
-        let watch = wait_for_memory_kill(3, || count.get());
-        tokio::pin!(watch);
-        for sample in [Some(3), None, Some(2)] {
-            count.set(sample);
-            assert!(tokio::time::timeout(Duration::from_secs(6), &mut watch).await.is_err());
-        }
-        count.set(Some(4));
-        tokio::time::timeout(Duration::from_secs(5), watch).await.unwrap();
+    #[tokio::test]
+    async fn a_memory_watch_stops_an_idle_command_only_after_a_new_kill() {
+        let _second = short_seconds(Duration::from_millis(10));
+        let dir = std::env::temp_dir().join(format!("openmax-oom-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let counter = dir.join("memory.events");
+        let set = |count| std::fs::write(&counter, format!("oom_kill {count}\n")).unwrap();
+        set(3);
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(&dir).args(["-c", "mkfifo fifo && exec cat fifo"]).kill_on_drop(true);
+        configure_process_group(command.as_std_mut(), true);
+        let (mut child, group) = GroupGuard::spawn(&mut command).unwrap();
+        let pid = child.id();
+        let cancel = CancelToken::default();
+        let supervise = supervise_child(&mut child, pid, Duration::from_secs(10),
+            (IdleWatch::AfterMemoryKill, Some((counter.to_str().unwrap().into(), 3))), &cancel);
+        tokio::pin!(supervise);
+        assert!(tokio::time::timeout(Duration::from_secs(1), &mut supervise).await.is_err());
+        assert!(dir.join("fifo").exists());
+        set(4);
+        let (termination, _) = tokio::time::timeout(Duration::from_secs(5), supervise).await.unwrap().unwrap();
+        assert!(matches!(termination, Termination::Stuck { after_memory_kill: true, running, .. }
+            if running.iter().any(|name| name.starts_with("cat ("))));
+        group.settled();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// One drain finished, the other outlived the grace: the shape of a
