@@ -877,9 +877,11 @@ pub(crate) fn written_call_json(text: &str, schemas: &serde_json::Value) -> Opti
             return None;
         }
         // The frame identifies the call. Parsing the body only selects the note.
-        static CALLEE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"^\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")"#).unwrap());
+        static CALLEE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"^\{\s*("(?:[^"\\]|\\.)*")\s*:\s*("(?:[^"\\]|\\.)*")"#).unwrap());
         let body = body.trim();
-        let name: String = serde_json::from_str(CALLEE.captures(body)?.get(1)?.as_str()).ok()?;
+        let (_, [key, name]) = CALLEE.captures(body)?.extract();
+        if serde_json::from_str::<String>(key).ok()? != "name" { return None; }
+        let name: String = serde_json::from_str(name).ok()?;
         return offered(&name).then(|| serde_json::from_str::<Value>(body).is_ok());
     }
     let json = if let Some(fence) = text.strip_prefix("```") {
@@ -994,10 +996,14 @@ mod tests {
         for (reply, expected) in [
             (tag(garbage), Some(false)),
             (format!("Example:\n{}", tag(garbage)), None),
+            (format!("Here is a malformed example.\n{}", tag(garbage)), Some(false)),
             (format!("```json\n{garbage}\n```"), None),
             (garbage.into(), None),
             (tag(string_args), Some(true)),
             (tag(r#"{"name":"b\u0061sh","arguments":{}}"#), Some(true)),
+            (tag(r#"{"na\u006de":"bash","arguments":{}}"#), Some(true)),
+            (tag(r#"{"na\u006de":"bash" anything goes"#), Some(false)),
+            (tag(r#"{"not_name":"bash","name":"bash","arguments":{}}"#), None),
             (tag(r#"{"name":"bash" anything goes"#), Some(false)),
             (format!("```json\n{string_args}\n```"), None),
             (format!("{valid}\n{valid}"), Some(false)),

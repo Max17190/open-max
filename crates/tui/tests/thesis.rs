@@ -753,8 +753,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Provider setup and context refusal guidance and help paging add 29
     // production lines. The previous ceiling had room for 1 of them.
     // Text-call recovery, offset by shared session task and compaction paths, adds 4 lines.
-    // Matching tagged calls by their frame saves 5 lines.
-    const BASELINE: usize = 45_592;
+    // Matching tagged calls by their frame saves 3 lines.
+    const BASELINE: usize = 45_594;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
