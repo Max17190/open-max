@@ -15,7 +15,7 @@ type WireReply = (u16, &'static str, String);
 
 struct Scratch(PathBuf);
 impl Scratch {
-    fn new(url: &str) -> Self {
+    fn new(url: &str, max_rounds: usize) -> Self {
         let dir = std::env::temp_dir().join(format!("openmax-wire-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("project")).unwrap();
         std::fs::create_dir_all(dir.join("data")).unwrap();
@@ -23,7 +23,7 @@ impl Scratch {
             &dir.join("data/settings.json"),
             json!({
                 "provider":"fixture", "model":"fixture", "context_tokens":WINDOW,
-                "max_tokens":RESERVE, "max_agent_iterations":8
+                "max_tokens":RESERVE, "max_agent_iterations":max_rounds
             })
             .to_string(),
         )
@@ -83,14 +83,23 @@ impl Turn {
 }
 
 async fn run(replies: Vec<WireReply>) -> Turn {
+    run_with_round_cap(replies, 8).await
+}
+
+async fn run_with_round_cap(replies: Vec<WireReply>, max_rounds: usize) -> Turn {
     let (url, requests) = common::recording_http_script(replies).await;
-    let scratch = Scratch::new(&url);
+    let scratch = Scratch::new(&url, max_rounds);
     let project = scratch.0.join("project");
     let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
     let id = sessions::create(&core, project.display().to_string())
         .unwrap()
         .id;
     let events = common::drive_turn(&core, &mut rx, &id, &project, "Check the result.").await;
+    assert!(!project.join("ghost.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(project.join("evidence.txt")).unwrap(),
+        FACT
+    );
     common::close(&core, &id).await;
     drop(core);
     let (core, _) = Core::new(scratch.0.join("data")).unwrap();
@@ -230,4 +239,193 @@ async fn indexed_calls_keep_their_results_when_an_earlier_argument_is_incomplete
             }
         }
     }
+}
+
+const CALL_AS_TEXT: &str =
+    r#"{"name":"write_file","arguments":{"path":"ghost.txt","content":"Do not write this."}}"#;
+const MALFORMED: &str = " <tool_call>\n{\"name\":\"edit_file\",\"arguments\":{\"path\":\"evidence.txt\",\"edits\":[{\"old_string\":\"middle\",\"new_string\":\"first\"}}}\n</tool_call>\n";
+const TEXT_CALL_NOTE: &str = "[tool call written as text: nothing ran. Call the tool through the API with arguments that are valid JSON.]";
+const BAD_JSON_NOTE: &str = "[tool call written as text: nothing ran. The JSON did not parse. Call the tool through the API with arguments that are valid JSON.]";
+
+fn real_read() -> WireReply {
+    sse(
+        &[tool_delta(
+            0,
+            "actual",
+            "read_file",
+            r#"{"path":"evidence.txt"}"#,
+        )],
+        "tool_calls",
+        Value::Null,
+    )
+}
+
+fn call_text_notes(turn: &Turn) -> Vec<&str> {
+    turn.events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::HarnessNote { call_id, text }
+                if text.starts_with("[tool call written as text:") =>
+            {
+                assert!(call_id.is_empty());
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn written_calls_are_replayed_as_text_then_retried_through_the_api() {
+    for (text, note) in [
+        (MALFORMED.to_string(), BAD_JSON_NOTE),
+        (format!("<tool_call>{CALL_AS_TEXT}</tool_call>"), TEXT_CALL_NOTE),
+        (CALL_AS_TEXT.to_string(), TEXT_CALL_NOTE),
+        (format!("{CALL_AS_TEXT}\n<tool_call>{CALL_AS_TEXT}</tool_call>"), TEXT_CALL_NOTE),
+        (format!("```json\n{CALL_AS_TEXT}\n```"), TEXT_CALL_NOTE),
+        (r#"<function=write_file>{"path":"ghost.txt","content":"Do not write this."}</function>"#.to_string(), TEXT_CALL_NOTE),
+    ] {
+        let turn = run(vec![answer(&text), real_read(), answer("Verified.")]).await;
+        assert_eq!(turn.stop(), "stop", "{text}");
+        assert_eq!(turn.requests.len(), 3, "{text}");
+        let starts = turn.events.iter().filter_map(|e| match e {
+            AgentEvent::ToolStart { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(starts, ["actual"], "{text}");
+        let outcomes = turn.outcomes();
+        assert!(matches!(outcomes.as_slice(), [("actual", true, result)] if result.contains(FACT)), "{outcomes:?}");
+        assert_eq!(call_text_notes(&turn), [note]);
+        let first = turn.requests[0]["messages"].as_array().unwrap();
+        let second = turn.requests[1]["messages"].as_array().unwrap();
+        let third = turn.requests[2]["messages"].as_array().unwrap();
+        assert_eq!(&second[..first.len()], first);
+        assert_eq!(&second[first.len()..], &[
+            json!({"role":"assistant","content":text}),
+            json!({"role":"user","content":note}),
+        ]);
+        assert_eq!(&third[..second.len()], second);
+        let saved = &turn.saved[first.len()..];
+        assert_eq!(saved[0].content.as_deref(), Some(text.as_str()));
+        assert_eq!(saved[0].role, "assistant");
+        assert!(saved[0].tool_calls.is_none());
+        assert_eq!(saved[1].content.as_deref(), Some(note));
+        assert!(saved[1].harness_note);
+        assert_eq!(saved.last().unwrap().content.as_deref(), Some("Verified."));
+    }
+}
+
+#[tokio::test]
+async fn written_calls_get_two_recoveries_in_a_row_within_the_round_cap() {
+    for (cap, count, diagnostic) in [
+        (
+            8,
+            3,
+            "A tool call kept arriving as text. Nothing from it ran.",
+        ),
+        (
+            2,
+            2,
+            "The last reply wrote a tool call as text. Nothing from it ran.",
+        ),
+    ] {
+        let turn = run_with_round_cap(vec![answer(CALL_AS_TEXT); count], cap).await;
+        assert_eq!(turn.stop(), "stop");
+        assert_eq!(turn.requests.len(), count);
+        assert!(turn.outcomes().is_empty());
+        assert_eq!(call_text_notes(&turn), vec![TEXT_CALL_NOTE; count - 1]);
+        assert!(
+            matches!(&turn.events[turn.events.len() - 2], AgentEvent::Error { message } if message == diagnostic)
+        );
+        let last = turn.requests.last().unwrap()["messages"]
+            .as_array()
+            .unwrap();
+        assert_eq!(last[last.len() - 2]["content"], CALL_AS_TEXT);
+        assert_eq!(last.last().unwrap()["content"], TEXT_CALL_NOTE);
+        assert_eq!(
+            turn.saved.last().unwrap().content.as_deref(),
+            Some(CALL_AS_TEXT)
+        );
+        assert_eq!(
+            turn.saved
+                .iter()
+                .filter(|m| m.content.as_deref() == Some(TEXT_CALL_NOTE) && m.harness_note)
+                .count(),
+            count - 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_calls_reset_the_written_call_streak() {
+    let turn = run(vec![
+        answer(CALL_AS_TEXT),
+        answer(CALL_AS_TEXT),
+        real_read(),
+        answer(CALL_AS_TEXT),
+        answer(CALL_AS_TEXT),
+        answer("Verified."),
+    ])
+    .await;
+    assert_eq!(turn.stop(), "stop");
+    assert_eq!(turn.requests.len(), 6);
+    assert_eq!(call_text_notes(&turn), [TEXT_CALL_NOTE; 4]);
+    assert_eq!(turn.outcomes().len(), 1);
+    assert_eq!(
+        turn.saved.last().unwrap().content.as_deref(),
+        Some("Verified.")
+    );
+}
+
+#[tokio::test]
+async fn answers_with_tool_names_or_examples_stay_answers() {
+    for text in [
+        "The bash and read_file tools are available.".to_string(),
+        r#"{"name":"example","arguments":{"path":"example.txt"}}"#.to_string(),
+        format!("A call looks like this:\n```json\n{CALL_AS_TEXT}\n```\nUse it to write a file."),
+        format!("{CALL_AS_TEXT}\nThis example is not a request to run it."),
+    ] {
+        let turn = run(vec![answer(&text)]).await;
+        assert_eq!(turn.stop(), "stop", "{text}");
+        assert_eq!(turn.requests.len(), 1, "{text}");
+        assert!(call_text_notes(&turn).is_empty(), "{text}");
+        assert!(turn.outcomes().is_empty());
+        let saved = turn.saved.last().unwrap();
+        assert_eq!(saved.role, "assistant");
+        assert_eq!(saved.content.as_deref(), Some(text.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn cut_text_and_mixed_api_replies_keep_their_existing_paths() {
+    let cut = sse(&[json!({"content": MALFORMED})], "length", Value::Null);
+    let turn = run(vec![cut, answer("Continued.")]).await;
+    assert_eq!(turn.stop(), "stop");
+    assert!(call_text_notes(&turn).is_empty());
+    assert!(turn.requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[reply cut:"));
+    assert!(turn
+        .saved
+        .iter()
+        .any(|m| m.content.as_deref() == Some(MALFORMED)));
+
+    let mixed = sse(
+        &[
+            json!({"content":CALL_AS_TEXT}),
+            tool_delta(0, "actual", "read_file", r#"{"path":"evidence.txt"}"#),
+        ],
+        "tool_calls",
+        Value::Null,
+    );
+    let turn = run(vec![mixed, answer("Verified.")]).await;
+    assert_eq!(turn.stop(), "stop");
+    assert!(call_text_notes(&turn).is_empty());
+    assert_eq!(turn.outcomes().len(), 1);
+    assert_eq!(turn.outcomes()[0].0, "actual");
 }

@@ -4493,21 +4493,26 @@ fn a_write_keeps_the_files_mode_links_and_permissions() {
 #[test]
 fn assistant_text_never_dispatches_a_tool() {
     let call = r#"<tool_call>{"name":"write_file","arguments":{"path":"side-effect.txt","content":"written"}}</tool_call>"#;
-    for text in [call.to_string(), format!("Document `{call}`; do not run it."),
-        "```tool_call\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"side-effect.txt\",\"content\":\"written\"}}\n```".into()] {
+    for (text, tries) in [(call.to_string(), 3), (format!("Document `{call}`; do not run it."), 1),
+        ("```tool_call\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"side-effect.txt\",\"content\":\"written\"}}\n```".into(), 1)] {
         let (project, home) = fresh_dirs("text-is-not-a-call");
-        let delta = serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]});
-        let (base_url, _requests, _server) = spawn_scripted_server(vec![
-            (format!("data: {delta}\n\ndata: [DONE]\n\n"), true),
-            (HELLO_SSE.to_string(), true),
-        ]);
+        let script = vec![(sse_text(&text), true); tries];
+        let (base_url, requests, _server) = spawn_scripted_server(script);
         write_settings_with_mode(&home, &base_url, "auto");
-        let (code, lines, stdout) = json_turn(&project, &home, "explain the call syntax");
-        assert_eq!(code, Some(0), "{stdout}");
-        assert!(!project.join("side-effect.txt").exists(), "prose executed: {stdout}");
-        assert!(!lines.iter().any(|l| l["type"] == "tool_start"), "{stdout}");
-        assert!(lines.iter().any(|l| l["type"] == "message_done" && l["text"] == text), "{stdout}");
-        assert!(!session_dump(&home).contains("\"role\":\"tool\""));
+        let out = cmd(&project, &home).args(["--trust-project", "-p", "explain the call syntax"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert_eq!(requests.lock().unwrap().len(), tries);
+        assert!(!project.join("side-effect.txt").exists(), "prose executed: {stderr}");
+        assert_eq!(stderr.lines().any(|line| line == "openmax: error: A tool call kept arriving as text. Nothing from it ran."), tries == 3, "{stderr}");
+        let sessions = home.join(".openmax/sessions");
+        let path = sessions.read_dir().unwrap().flatten().map(|e| e.path())
+            .find(|path| path.to_string_lossy().ends_with(".messages.json")).unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(!saved.contains("\"role\":\"tool\""));
+        assert_eq!(saved.matches("[tool call written as text:").count(), tries - 1);
+        assert!(saved.lines().any(|line| serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|m| m["role"] == "assistant" && m["content"] == text)));
     }
 }
 

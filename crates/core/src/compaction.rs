@@ -68,14 +68,7 @@ fn omitted_clause(omitted: usize) -> String {
 /// estimator is bytes/4), and a plain byte slice could split a multibyte
 /// char; this is the one cut they all use.
 pub(crate) fn take_note_bytes(s: &str, max_bytes: usize) -> String {
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        if i + c.len_utf8() > max_bytes {
-            break;
-        }
-        end = i + c.len_utf8();
-    }
-    s[..end].to_string()
+    s[..crate::text::floor_char_boundary(s, max_bytes)].to_string()
 }
 
 #[derive(Default)]

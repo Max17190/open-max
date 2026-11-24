@@ -260,6 +260,11 @@ and the run that writes a key already uses it.
   server reports incomplete at its output limit is continued the same way;
   a call in it is not kept.
 
+  When a complete reply consists only of tool calls written as text, Open Max
+  keeps the reply and adds a note asking for a real API call with valid JSON;
+  no call in the text runs. It retries at most twice in a row, within the
+  turn's round cap, and reports why it stops if the calls keep arriving as text.
+
   For a reasoning model the limit is also a bound on how long it thinks
   in one reply before it acts; the room after a cut call or text can be
   spent on thinking too, for that one request.

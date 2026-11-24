@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::agent::unapproved_capability;
 use crate::config::ApprovalMode;
 use crate::hooks::Hooks;
-use crate::permissions::TurnPermissions;
+use crate::permissions::{Permissions, TurnPermissions};
 use crate::registry::Registry;
 use crate::state::Core;
 use crate::types::{estimate_tokens, AgentEvent, ChatMessage, ToolCall};
@@ -573,18 +573,17 @@ pub(crate) async fn say_owed_budget_mark(core: &Arc<Core>, session_id: &str, mes
 }
 
 /// What a mutating call's permissions reload found, said on that call's
-/// result: that it left permissions.toml malformed (`fail_closed_now`, the
-/// parse reason, with the repair `permissions`, as reloaded, still allows),
-/// and the allow rules that cannot fire until a human approves them (`inert`).
+/// result: a malformed file with its available repair, or inert allow rules.
 pub(crate) async fn narrate_permissions_reload(
     core: &Arc<Core>,
     session_id: &str,
     project_root: &Path,
-    permissions: &TurnPermissions,
-    fail_closed_now: Option<String>,
-    inert: Vec<String>,
+    permissions: &mut TurnPermissions,
+    current: Permissions,
     messages: &mut [ChatMessage],
 ) {
+    let (fail_closed_now, inert) = (current.fail_closed_reason().map(str::to_string), current.notices().to_vec());
+    permissions.reload(current);
     if let Some(reason) = fail_closed_now {
         let novel = novel_policy_notices(core, session_id, vec![format!("permissions fail-closed: {reason}")]).await;
         if !novel.is_empty() {
@@ -863,6 +862,76 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
     }
 }
 
+/// `Some` only if every block is a call to a tool in the frozen schemas.
+/// The bool reports JSON validity; no arguments leave this recognizer.
+#[cold]
+pub(crate) fn written_call_json(mut text: &str, schemas: &serde_json::Value) -> Option<bool> {
+    use serde_json::Value;
+    use std::sync::LazyLock;
+    static PREFIX: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"^\{\s*"name"\s*:\s*"([^"\\]+)"\s*,\s*"(?:arguments|parameters)"\s*:\s*[{"]"#).unwrap());
+    static JSON_TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"^(?:[\x20\t\r\n{}\[\]:,0-9+eE.-]|true|false|null|"(?:[^"\\]|\\.)*")+$"#).unwrap());
+    let offered = |name: &str| schemas.as_array().is_some_and(|entries| entries.iter().any(|e| crate::registry::entry_name(e) == name));
+    let mut valid = true;
+    text = text.trim();
+    while !text.is_empty() {
+        let (callee, json, tail) = if let Some(rest) = text.strip_prefix("<tool_call>") {
+            let (body, tail) = rest.split_once("</tool_call>")?;
+            (None, body.trim(), Some(tail))
+        } else if let Some(rest) = text.strip_prefix("<function=").or_else(|| text.strip_prefix("<function name=\"")) {
+            let (name, rest) = rest.split_once('>')?;
+            let name = if text.starts_with("<function=") { name } else { name.strip_suffix('"')? };
+            let (body, tail) = rest.split_once("</function>")?;
+            (Some(name), body.trim(), Some(tail))
+        } else if let Some(rest) = text.strip_prefix("```") {
+            let (info, rest) = rest.split_once('\n')?;
+            if !matches!(info.trim(), "" | "json") { return None; }
+            let (body, tail) = rest.split_once("\n```")?;
+            let (closing, tail) = tail.split_once('\n').unwrap_or((tail, ""));
+            if !closing.trim().is_empty() { return None; }
+            (None, body.trim(), Some(tail))
+        } else { (None, text, None) };
+        if !json.starts_with('{') { return None; }
+        let mut parser = serde_json::Deserializer::from_str(json).into_iter::<Value>();
+        match parser.next()? {
+            Ok(object) => {
+                let args = if let Some(name) = callee {
+                    if !offered(name) { return None; }
+                    &object
+                } else {
+                    if !offered(object["name"].as_str()?) { return None; }
+                    object.get("arguments").or_else(|| object.get("parameters"))?
+                };
+                valid &= args.as_str().is_none_or(|s| serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok());
+            }
+            Err(error) => {
+                // Without closing markup, only an EOF proves where malformed JSON stopped.
+                if tail.is_none() && !error.is_eof() { return None; }
+                let name = if let Some(name) = callee { name } else { PREFIX.captures(json)?.get(1)?.as_str() };
+                if !offered(name) || !JSON_TOKENS.is_match(json) { return None; }
+                valid = false;
+            }
+        }
+        let end = parser.byte_offset();
+        let rest = if end == 0 { "" } else { &json[end..] };
+        if tail.is_some() && !rest.trim().is_empty() { return None; }
+        text = tail.unwrap_or(rest).trim();
+        if text.is_empty() { return Some(valid); }
+    }
+    None
+}
+
+#[cold]
+pub(crate) fn written_call_note(valid: bool) -> String {
+    let issue = if valid { "" } else { " The JSON did not parse." };
+    format!("[tool call written as text: nothing ran.{issue} Call the tool through the API with arguments that are valid JSON.]")
+}
+
+#[cold]
+pub(crate) fn report_written_call_end(core: &Core, session_id: &str, count: usize) {
+    let cause = if count > 2 { "A tool call kept arriving as text." } else { "The last reply wrote a tool call as text." };
+    core.send_agent(session_id, AgentEvent::Error { message: format!("{cause} Nothing from it ran.") });
+}
+
 /// The note after a reply the output limit cut before any tool call. The
 /// limit bounds how long the model thinks before it acts, so a cut thought
 /// is told to act. A cut inside a call or text needed room, not brevity:
@@ -893,6 +962,47 @@ pub(crate) fn reply_cut_note(max_tokens: usize, kind: CutKind, room: Option<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_only_whole_replies_of_offered_calls() {
+        let schemas = Registry::builtin_only();
+        let call = r#"{"name":"bash","arguments":{"command":"echo hello"}}"#;
+        let wrapped = format!("<tool_call>{call}</tool_call>");
+        for (reply, found) in [
+            (call.to_owned(), Some(true)),
+            (format!("  {call} \n {wrapped} {call}  "), Some(true)),
+            (format!("```json\r\n{call}\r\n```"), Some(true)),
+            (format!("```\n{call}\n```"), Some(true)),
+            (r#"{"parameters":{},"name":"bash"}"#.into(), Some(true)),
+            (r#"{"name":"bash","arguments":"{\"command\":\"echo hello\"}"}"#.into(), Some(true)),
+            (r#"{"name":"bash","arguments":"{"}"#.into(), Some(false)),
+            (r#"<function=bash>{"command":"echo hello"}</function>"#.into(), Some(true)),
+            (r#"<function name="bash">{"command":"echo hello"}</function>"#.into(), Some(true)),
+            (r#"<function=bash>{"command":"echo hello",}</function>"#.into(), Some(false)),
+            (r#"<tool_call>{"name":"edit_file","arguments":{"edits":[{"old_string":"yes"}}}</tool_call>"#.into(), Some(false)),
+            (r#"{"name":"bash","arguments":{}"#.into(), Some(false)),
+            (format!("{wrapped} done"), None),
+            (format!("{call} done"), None),
+            (format!("Example: {wrapped}"), None),
+            (format!("```JSON\n{call}\n```"), None),
+            (format!("```json\n{call}\n````"), None),
+            (format!("```json\n{call}\n``` {wrapped}"), None),
+            (format!("<tool_call>{call}"), None),
+            (format!("[{call}]"), None),
+            (format!("<tool_call>{call} {call}</tool_call>"), None),
+            (format!("{call} {{\"name\":\"other\",\"arguments\":{{}}}}"), None),
+            (r#"{"name":"other","arguments":{"name":"bash","arguments":{}}}"#.into(), None),
+            (r#"{"name":"bash","options":{}}"#.into(), None),
+            (r#"{"name":"bash","arguments":{missing quotes}}"#.into(), None),
+            (r#"{"name":"bash","arguments":{},} {"name":"other","arguments":{}}"#.into(), None),
+            (r#"{"arguments":{},"name":"bash""#.into(), None),
+            (r#"<function=other>{}</function>"#.into(), None),
+            ("   ".into(), None),
+        ] {
+            assert_eq!(written_call_json(&reply, schemas.tool_schemas_json()), found, "{reply}");
+        }
+    }
+
     use crate::prompt::{NOTE_HEADER, NOTE_SEPARATOR};
 
     /// The note after a reply cut before any call follows what its usage
