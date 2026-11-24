@@ -216,17 +216,17 @@ async fn indexed_calls_keep_their_results_when_an_earlier_argument_is_incomplete
                 let replayed = messages.iter().find(|m| m["tool_call_id"] == id).unwrap();
                 let saved = saved.content.as_deref().unwrap();
                 let expected = if ok {
-                    FACT
-                } else if output.contains("invalid JSON") {
-                    "invalid JSON"
-                } else {
-                    "Error"
-                };
-                if ok {
                     assert!(output.contains(FACT));
-                }
-                assert!(saved.contains(expected), "{id}: {saved}");
-                assert_eq!(replayed["content"].as_str(), Some(saved), "{id}");
+                    output.to_owned()
+                } else {
+                    format!("Error: {output}")
+                };
+                assert_eq!(saved, expected, "{id}");
+                assert_eq!(
+                    replayed["content"].as_str(),
+                    Some(expected.as_str()),
+                    "{id}"
+                );
             }
         }
     }
