@@ -834,13 +834,12 @@ pub(crate) fn cut_off_call_error(max_tokens: usize, room: Option<usize>) -> Stri
 /// it is complete drops a call the limit cuts, so the reply can arrive with
 /// nothing in it although it spent the whole limit.
 ///
-/// - `Lost`: usage reports the reasoning count, and the output beyond that
-///   reasoning (or beyond the reasoning text that arrived at four bytes a
-///   token, when that is more) and beyond the text that arrived is more than
-///   an eighth of the limit (256 tokens at least): something was written
-///   that did not arrive, most likely one call larger than the limit. Text
-///   that arrived counts at two bytes a token, so dense text is never read
-///   as lost.
+/// - `Lost`: with a reasoning count, the unaccounted output exceeds an eighth
+///   of the limit (256 tokens at least). Without a count, readable output
+///   must account for less than a quarter of the billed output, with no
+///   opaque reasoning attached, and the same minimum gap applies. A route that hides most of its reasoning
+///   can still look like a lost call. Readable reasoning counts at four
+///   bytes per token and answer text counts twice to allow for dense text.
 /// - `Unseen`: no reasoning count, and nothing at all arrived: either
 ///   thinking that is not shown or a call larger than the limit.
 /// - `Text`: what arrived accounts for the output, and the text in it is
@@ -853,16 +852,17 @@ pub(crate) fn cut_kind(max_tokens: usize, reply: &crate::client::CompletionResul
     use crate::types::estimate_tokens;
     // Readable reasoning only: `reasoning_details` can hold encrypted data and
     // signatures, whose bytes say nothing of the tokens behind them.
-    let thought = [reply.reasoning_content.as_deref(), reply.reasoning.as_deref()].into_iter().flatten().map(str::len).max().unwrap_or(0);
+    let thought = reply.reasoning_content.as_ref().map_or(0, String::len).max(reply.reasoning.as_ref().map_or(0, String::len));
     let margin = (max_tokens as u64 / 8).max(256);
-    let unseen = match reply.usage.and_then(|u| Some((u.output_tokens, u.reasoning_tokens?))) {
-        Some((output, reasoning)) => {
-            let arrived = reasoning.max(estimate_tokens(thought) as u64).saturating_add(2 * estimate_tokens(reply.content.len()) as u64);
-            (output.saturating_sub(arrived) > margin).then_some(CutKind::Lost)
-        }
-        None => (reply.content.is_empty() && thought == 0 && reply.reasoning_details.is_none()).then_some(CutKind::Unseen),
-    };
-    unseen.unwrap_or(if estimate_tokens(reply.content.len()) as u64 > margin { CutKind::Text } else { CutKind::Thought })
+    let text = estimate_tokens(reply.content.len()) as u64;
+    let arrived = |reasoning: u64| reasoning.max(estimate_tokens(thought) as u64).saturating_add(2 * text);
+    match reply.usage.map(|u| (u.output_tokens, u.reasoning_tokens)) {
+        Some((output, Some(reasoning))) if output.saturating_sub(arrived(reasoning)) > margin => CutKind::Lost,
+        Some((output, None)) if (thought > 0 || !reply.content.is_empty()) && reply.reasoning_details.is_none() && arrived(0).saturating_mul(4) < output && output.saturating_sub(arrived(0)) > margin => CutKind::Lost,
+        None | Some((_, None)) if reply.content.is_empty() && thought == 0 && reply.reasoning_details.is_none() => CutKind::Unseen,
+        _ if text > margin => CutKind::Text,
+        _ => CutKind::Thought,
+    }
 }
 
 /// The note after a reply the output limit cut before any tool call. The
@@ -940,7 +940,11 @@ mod tests {
             ("nothing arrived, no usage", reply("", None, None), "unshown"),
             // No count, something arrived: as before.
             ("text, no count", reply("so far", None, None), "before"),
-            ("reasoning, no count", reply("", Some("half a thought"), usage(4_096, None)), "before"),
+            ("short reasoning, no count", reply("", Some("half a thought"), usage(4_096, None)), "lost"),
+            ("below a quarter, no count", reply(&"x".repeat(1_536), Some(&"t".repeat(1_020)), usage(4_096, None)), "lost"),
+            ("at a quarter, no count", reply(&"x".repeat(1_536), Some(&"t".repeat(1_024)), usage(4_096, None)), "before"),
+            ("below a quarter, counted", reply("", Some(&"t".repeat(4_092)), usage(4_096, Some(3_584))), "before"),
+            ("at a quarter, counted", reply("", Some(&"t".repeat(4_096)), usage(4_096, Some(3_583))), "lost"),
         ];
         for (case, reply, want) in cases {
             // With no room to offer, a cut thought and a lost call get the notes they got before, and cut text is
