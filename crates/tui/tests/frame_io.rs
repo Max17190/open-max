@@ -1455,7 +1455,7 @@ mod first_frame {
 
     #[test]
     fn a_context_refusal_keeps_the_server_error_and_names_the_next_step() {
-        let refusal = r#"{"error":{"message":"maximum context length exceeded"}}"#;
+        let refusal = r#"{"error":{"message":"Request rejected:\nmaximum context length exceeded"}}"#;
         let base = endpoint_with_status(vec![
             ("400 Bad Request", refusal.into()),
             ("200 OK", LOGIN_REPLY.into()),
@@ -1471,7 +1471,8 @@ mod first_frame {
         let shown = screen_when(&mut s, 120, 26, wait, |shown| {
             shown.contains("use /new") && !shown.contains("esc to cancel")
         });
-        assert!(shown.contains("backend returned 400 Bad Request: maximum context length exceeded"), "{shown}");
+        assert!(shown.contains("backend returned 400 Bad Request: Request rejected:"), "{shown}");
+        assert!(shown.contains("maximum context length exceeded"), "{shown}");
         assert!(shown.contains("Check that context_tokens matches the served model."), "{shown}");
         assert!(shown.contains("If the session is too long, use /new."), "{shown}");
         s.write(b"/new\r");
