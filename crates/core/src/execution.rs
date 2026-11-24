@@ -1687,7 +1687,7 @@ fn unrecord(pid: u32) {
 /// launch runs in is not signalled, and while its leader runs, its record
 /// is kept for a launch outside it. The run directory is made absolute
 /// first, for the watcher, which runs in `/`: the data directory is relative
-/// when HOME is unset, empty or relative, and a launch that then cannot read
+/// when HOME is relative, and a launch that then cannot read
 /// its working directory, as when it was removed, reaps and records nothing.
 /// With `serves_lifeline`, which only a binary whose `main` hands
 /// [`LIFELINE_FLAG`] to [`lifeline`] passes, the record's first write starts

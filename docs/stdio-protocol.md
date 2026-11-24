@@ -39,6 +39,7 @@ A continued session must have a readable session index and transcript and no
 other writable owner. Failure is reported on stderr with a nonzero exit before
 the handshake.
 The process retains ownership while waiting for commands, including between turns.
+If `HOME` is empty or no [home directory](configuration.md) is found, the process exits 2 with a diagnostic on stderr before the handshake.
 
 ## Commands (stdin)
 

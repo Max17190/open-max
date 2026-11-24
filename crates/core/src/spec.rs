@@ -808,6 +808,8 @@ boundary and the supported model-switch recipe. Verify with `openmax
 
 const SETTINGS: &str = r#"# Settings (`~/.openmax/settings.json`)
 
+If HOME is unset, use the account home. If HOME is empty or no home is found, set HOME to your home directory.
+
 One JSON object. READ AT LAUNCH, once: the running process never re-reads
 this file, so an edit made mid-session changes nothing until the next
 `openmax` launch. This is deliberate - `base_url` and `api_key` are

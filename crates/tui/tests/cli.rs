@@ -30,6 +30,40 @@ fn finish_with_deadline(mut child: std::process::Child) -> std::process::Output 
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn state_dir_uses_the_account_home_without_home_in_the_environment() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let (project, _) = fresh_dirs("account-home");
+    // Bash expands ~ from the user database when HOME is unset. Use the
+    // read-only ledger command so the test never writes to that home.
+    let home = Command::new("/bin/bash").env_clear().args(["-c", "printf '%s' ~"]).output().unwrap();
+    assert!(home.status.success());
+    let home = Path::new(std::ffi::OsStr::from_bytes(&home.stdout));
+    assert!(home.is_absolute(), "the test account needs a home directory");
+    let expected = open_max_core::ledger::project_dir(&home.join(".openmax"), &project);
+    let output = Command::new(openmax_bin()).current_dir(&project).env_clear().arg("--ledger").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.trim_end().ends_with(&expected.to_string_lossy()[..]), "{stdout}");
+    assert!(project.read_dir().unwrap().next().is_none());
+    std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_home_refuses_stdio_before_touching_state() {
+    let (project, _) = fresh_dirs("empty-home");
+    let output = Command::new(openmax_bin()).current_dir(&project).env_clear().env("HOME", "")
+        .arg("--stdio").output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stderr, b"openmax: no home directory found; set HOME to your home directory\n");
+    assert!(output.stdout.is_empty());
+    assert!(project.read_dir().unwrap().next().is_none());
+    std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
+}
+
 #[test]
 fn an_idle_stdio_owner_excludes_continuation_until_process_exit() {
     let (project, home) = fresh_dirs("session-owner");

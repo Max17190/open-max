@@ -146,8 +146,8 @@ pub fn report_path(path: &Path, root: &Path) -> PathBuf {
 /// Validate all extension files for a project (global + project dirs).
 /// Missing dirs and files contribute nothing; an empty report means an empty
 /// (and healthy) configuration.
-pub fn check(project_root: &Path) -> Vec<Finding> {
-    check_at(project_root, &crate::state::default_data_dir())
+pub fn check(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
+    check_with(project_root, data_dir, false)
 }
 
 /// The same findings for the `--check` text report: where this module writes
@@ -157,16 +157,17 @@ pub fn check(project_root: &Path) -> Vec<Finding> {
 /// author bytes (a manifest line in a parse error) that must read exactly as
 /// they are in the file, and a reason relayed whole from a loader (the hook
 /// loader's fail-closed summary) prints as the loader wrote it.
-pub fn check_for_report(project_root: &Path) -> Vec<Finding> {
-    check_with(project_root, &crate::state::default_data_dir(), true)
+pub fn check_for_report(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
+    check_with(project_root, data_dir, true)
 }
 
 /// A finding plus the identity a loader would file it under, used to work out
 /// which of two files with the same identity actually wins.
 type Entry = (Finding, Option<String>);
 
+#[cfg(test)]
 pub(crate) fn check_at(project_root: &Path, data_dir: &Path) -> Vec<Finding> {
-    check_with(project_root, data_dir, false)
+    check(project_root, data_dir)
 }
 
 fn check_with(project_root: &Path, data_dir: &Path, for_report: bool) -> Vec<Finding> {
@@ -1299,14 +1300,6 @@ impl ExampleGates {
 /// never part of plain `--check`. `for_report` names files in messages as
 /// [`check_for_report`] does, for the text report.
 pub async fn run_examples(
-    project_root: &Path,
-    for_report: bool,
-    report: impl FnMut(&ExampleVerdict),
-) -> Result<Vec<ExampleVerdict>, String> {
-    run_examples_at(project_root, &crate::state::default_data_dir(), for_report, report).await
-}
-
-pub(crate) async fn run_examples_at(
     project_root: &Path,
     data_dir: &Path,
     for_report: bool,
@@ -3142,7 +3135,7 @@ mod tests {
 
     async fn examples(root: &Path, data: &Path) -> Result<Vec<ExampleVerdict>, String> {
         let _serial = EXAMPLE_RUNS.lock().await;
-        run_examples_at(root, data, false, |_| {}).await
+        run_examples(root, data, false, |_| {}).await
     }
 
     fn verdict<'a>(results: &'a [ExampleVerdict], tool: &str) -> &'a ExampleVerdict {
