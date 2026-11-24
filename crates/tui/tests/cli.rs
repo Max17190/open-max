@@ -1025,6 +1025,36 @@ fn check_exit_codes_follow_findings() {
     assert!(stdout.contains("broken.toml"), "{stdout}");
 }
 
+#[test]
+fn check_accepts_all_provider_model_fields() {
+    use open_max_core::providers::ProviderModel;
+    use serde_json::json;
+
+    let (project, home) = fresh_dirs("check-provider-model");
+    let data = home.join(".openmax");
+    std::fs::create_dir_all(&data).unwrap();
+    // An exhaustive literal requires this fixture to grow with the model type.
+    let model = ProviderModel {
+        id: "stub-model".into(),
+        name: Some("Stub".into()),
+        context_tokens: Some(16_384),
+        max_tokens: Some(4_096),
+        compaction_tokens: Some(12_000),
+        image_input: true,
+    };
+    let catalog = json!({"providers": {"stub": {
+        "base_url": "http://127.0.0.1:9/v1",
+        "models": [model],
+    }}});
+    std::fs::write(data.join("providers.json"), catalog.to_string()).unwrap();
+    let out = cmd(&project, &home).args(["--check", "--json"]).output().unwrap();
+    std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0]["surface"].as_str(), rows[0]["status"].as_str()), (Some("providers"), Some("ok")));
+}
+
 /// A project is often checked before anyone trusts it (a setup script, a CI
 /// step). No session runs there yet, so its rows are graded in the settings
 /// default, ask when unset, where the hook `--spec hooks` shows is inert until
