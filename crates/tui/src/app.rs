@@ -2110,6 +2110,7 @@ impl App {
                         panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
                         if self.session_id.as_deref() == Some(id.as_str()) {
                             self.session_id = None;
+                            self.core.reset_session_effort();
                             self.created_session = false;
                             self.resumed_awaiting_hydration = false;
                         }
@@ -3242,10 +3243,14 @@ impl App {
     }
 
     fn note(&mut self, text: &str) {
-        self.transcript.push(vec![Line::from(vec![
-            Span::styled("• ", Style::default().fg(theme::ACCENT)),
-            Span::styled(text.to_string(), theme::DIM_ITALIC),
-        ])]);
+        let lines = text.split('\n').enumerate().map(|(i, line)| {
+            let mark = if i == 0 { "• " } else { "  " };
+            Line::from(vec![
+                Span::styled(mark, Style::default().fg(theme::ACCENT)),
+                Span::styled(line.to_string(), theme::DIM_ITALIC),
+            ])
+        }).collect();
+        self.transcript.push(lines);
         self.dirty.mark_chat();
     }
 
@@ -4702,19 +4707,21 @@ mod tests {
         let history = vec![
             ChatMessage::system("rules"),
             ChatMessage { harness_note: true, ..ChatMessage::user(text) },
+            ChatMessage { harness_note: true, ..ChatMessage::user("[Earlier messages were compacted.\nOpen: check the remaining file.]") },
             ChatMessage::user(text),
             ChatMessage::assistant(Some("first answer".into()), None),
             ChatMessage::user("second question"),
             ChatMessage::assistant(Some("second answer".into()), None),
         ];
         assert!(sessions::save_messages(&core, &id, &history, &mut 0, true));
-        sessions::end_turn(&core, &id, &history[..4]);
+        sessions::end_turn(&core, &id, &history[..5]);
         sessions::end_turn(&core, &id, &history);
         sessions::detach(&core, &id).unwrap();
         assert!(app.switch_to_session(id.clone()));
         let check_replay = |app: &App, turns| {
             let shown = app.transcript.export_text();
             assert!(shown.contains("> • execution policy: auto; fixture."), "{shown}");
+            assert!(shown.contains("> • Earlier messages were compacted.\n>   Open: check the remaining file."), "{shown}");
             assert_eq!(shown.matches("## user").count(), turns, "{shown}");
             assert!(shown.contains(&format!("## user\n\n{text}\n")), "{shown}");
         };
@@ -4768,6 +4775,22 @@ mod tests {
         let shown = app.transcript.export_text();
         assert!(shown.contains(&format!("no session {id} to rewind")), "{shown}");
         assert!(!shown.contains("/rewind 1"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_the_active_session_restores_saved_effort() {
+        use open_max_core::sessions;
+        let (mut app, dir) = app_fixture();
+        let id = sessions::create(&app.core, dir.display().to_string()).unwrap().id;
+        assert!(app.switch_to_session(id.clone()));
+        app.handle_submit("/effort low".into()).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)).await.unwrap();
+        app.handle_submit("/resume".into()).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)).await.unwrap();
+        assert_eq!(app.session_id, None);
+        assert_eq!(app.core.settings.lock().unwrap().reasoning_effort, Some(config::ReasoningEffort::Low));
         fs::remove_dir_all(dir).unwrap();
     }
 
