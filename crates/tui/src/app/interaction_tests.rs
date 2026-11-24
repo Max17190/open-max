@@ -406,7 +406,7 @@ async fn model_picker_keys_move_filter_and_close() {
            "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
     )
     .unwrap();
-    app.model_picker = Some(crate::ui::model_picker::ModelPickerState::load(&dir, Some("alpha"), "one"));
+    app.model_picker = Some(crate::ui::model_picker::ModelPickerState::load(&dir, Some("alpha"), "one", false));
     app.mode = Mode::ModelPicker;
     let selected = |app: &App| app.model_picker.as_ref().unwrap().selected;
     let query = |app: &App| app.model_picker.as_ref().unwrap().query.clone();

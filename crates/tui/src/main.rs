@@ -1033,12 +1033,10 @@ async fn setup_on_shell(
     action: setup::Action,
     target: Option<&str>,
     keys: &mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
-) -> std::io::Result<Result<(), String>> {
+) -> std::io::Result<Result<Option<setup::Selection>, String>> {
     restore_terminal();
     let keys = futures_util::stream::poll_fn(|cx| keys.poll_recv(cx).map(|key| key.map(Ok)));
-    let result = setup::run(dir, action, target, Some(Box::new(keys)))
-        .await
-        .map(|_| ());
+    let result = setup::run(dir, action, target, Some(Box::new(keys))).await;
     enter_terminal()?;
     *terminal = frame_terminal()?;
     start_input();

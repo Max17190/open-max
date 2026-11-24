@@ -24,13 +24,15 @@ const LIMIT: usize = 1024 * 1024;
 /// Setup's keys: a session's reader (`app::TerminalInput`), else its own stream.
 pub(crate) type Keys<'a> = Box<dyn futures_util::Stream<Item = std::io::Result<Event>> + Unpin + 'a>;
 
-/// Ok with the connection and model an API-key login saved, else Ok(None).
+pub(crate) type Selection = (String, String);
+
+/// Ok with the connection and model an API login saved, else Ok(None).
 pub async fn run(
     dir: &Path,
     action: Action,
     target: Option<&str>,
     keys: Option<Keys<'_>>,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<Selection>, String> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Err("provider setup needs an interactive terminal".into());
     }
@@ -338,12 +340,16 @@ pub async fn run(
     Ok(Some((name, model)))
 }
 
+pub fn has_selection(settings: &open_max_core::config::Settings) -> bool {
+    settings.provider.as_deref().is_some_and(|p| !p.trim().is_empty()) || !settings.base_url.trim().is_empty()
+}
+
 /// After a login from the shell: when settings select no endpoint, the
 /// connection just made becomes the default through the save `/model`
 /// makes, so the next `openmax` runs on it; otherwise the selection stays.
 pub fn select_unless_chosen(dir: &Path, provider: &str, model: &str) -> Result<(), String> {
     let mut settings = open_max_core::config::load(dir)?;
-    if settings.provider.as_deref().is_some_and(|p| !p.trim().is_empty()) || !settings.base_url.trim().is_empty() {
+    if has_selection(&settings) {
         eprintln!(
             "Choose it with /model, or run openmax --provider {} --model {}",
             open_max_core::doctor::shell_quote(Path::new(provider)),

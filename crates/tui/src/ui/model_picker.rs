@@ -39,11 +39,14 @@ pub struct ModelPickerState {
 }
 
 impl ModelPickerState {
-    pub fn load(data_dir: &Path, active_provider: Option<&str>, active_model: &str) -> Self {
+    pub fn load(data_dir: &Path, active_provider: Option<&str>, active_model: &str, has_flat_endpoint: bool) -> Self {
         let catalogs = providers::load_providers(data_dir);
+        let active_provider = active_provider.map(str::trim).filter(|name| !name.is_empty());
+        let active_model = active_model.trim();
+        let active_configured = active_provider.map_or(has_flat_endpoint, |name| catalogs.contains_key(name));
         let mut items = Vec::new();
         for (provider, config) in catalogs {
-            for model in config.models {
+            for model in config.models.into_iter().filter(|model| !model.id.is_empty()) {
                 let active = active_provider == Some(provider.as_str()) && model.id == active_model;
                 items.push(ModelChoice {
                     provider: Some(provider.clone()),
@@ -54,10 +57,7 @@ impl ModelPickerState {
             }
         }
 
-        let current_present = items
-            .iter()
-            .any(|item| item.provider.as_deref() == active_provider && item.id == active_model);
-        if !current_present {
+        if active_configured && !active_model.is_empty() && !items.iter().any(|item| item.active) {
             items.push(ModelChoice {
                 provider: active_provider.map(str::to_string),
                 id: active_model.to_string(),
@@ -65,14 +65,7 @@ impl ModelPickerState {
                 active: true,
             });
         }
-        items.sort_by(|a, b| {
-            b.active.cmp(&a.active).then_with(|| {
-                a.provider
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.provider.as_deref().unwrap_or(""))
-            })
-        });
+        items.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.provider.cmp(&b.provider)));
 
         let filtered = (0..items.len()).collect();
         Self {
@@ -258,7 +251,7 @@ mod tests {
     #[test]
     fn active_choice_is_first_and_slashes_survive() {
         let dir = fixture();
-        let state = ModelPickerState::load(&dir, Some("beta"), "org/model/2");
+        let state = ModelPickerState::load(&dir, Some(" beta "), " org/model/2 ", false);
         let active = &state.items[0];
         assert!(active.active);
         assert_eq!(active.provider.as_deref(), Some("beta"));
@@ -267,18 +260,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_active_model_is_still_selectable() {
+    fn unlisted_model_on_a_configured_provider_is_still_selectable() {
         let dir = fixture();
-        let state = ModelPickerState::load(&dir, Some("alpha"), "custom/not-listed");
+        let state = ModelPickerState::load(&dir, Some(" alpha "), "custom/not-listed", false);
         assert_eq!(state.items[0].id, "custom/not-listed");
         assert!(state.items[0].active);
+        assert_eq!(state.items[0].provider.as_deref(), Some("alpha"));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn filter_matches_provider_name_and_id() {
         let dir = fixture();
-        let mut state = ModelPickerState::load(&dir, Some("alpha"), "one");
+        let mut state = ModelPickerState::load(&dir, Some("alpha"), "one", false);
         for c in "beta".chars() {
             state.push(c);
         }
@@ -299,7 +293,12 @@ mod tests {
     #[test]
     fn duplicate_ids_remain_distinct_and_provider_order_is_stable() {
         let dir = fixture();
-        let state = ModelPickerState::load(&dir, None, "direct/current");
+        let unconfigured = ModelPickerState::load(&dir, None, "direct/current", false);
+        assert!(unconfigured.items.iter().all(|item| item.provider.is_some() && !item.active));
+        let state = ModelPickerState::load(&dir, Some("  "), "direct/current", true);
+        let direct = state.selected_choice().unwrap();
+        assert!(direct.active && direct.provider.is_none());
+        assert_eq!(direct.id, "direct/current");
         let shared: Vec<_> = state
             .items
             .iter()
@@ -323,7 +322,7 @@ mod tests {
         use ratatui::Terminal;
 
         let dir = fixture();
-        let state = ModelPickerState::load(&dir, Some("alpha"), "one");
+        let state = ModelPickerState::load(&dir, Some("alpha"), "one", false);
         let backend = TestBackend::new(32, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -343,7 +342,7 @@ mod tests {
     #[test]
     fn a_listed_active_model_appears_once_and_the_selection_wraps() {
         let dir = fixture();
-        let mut state = ModelPickerState::load(&dir, Some("alpha"), "one");
+        let mut state = ModelPickerState::load(&dir, Some("alpha"), "one", false);
         assert_eq!(state.items.len(), 4);
         let mut stepped = Vec::new();
         for _ in 0..4 {
@@ -365,7 +364,7 @@ mod tests {
         use ratatui::Terminal;
 
         let dir = fixture();
-        let state = ModelPickerState::load(&dir, Some("alpha"), "one");
+        let state = ModelPickerState::load(&dir, Some("alpha"), "one", false);
         let draw = |width: u16, height: u16| {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| render(frame, frame.area(), &state)).unwrap();
