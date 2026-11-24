@@ -2387,6 +2387,21 @@ fn a_reply_cut_at_its_limit_names_max_tokens_and_check_states_where_it_is_set() 
     let (code, report) = check(&["--check"]);
     assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");
     assert!(report.lines().any(|l| l.starts_with("warn settings") && l.contains("max_tokens = 4096, the default")), "{report}");
+    // The ceiling it names is the one the route gets: a quarter of the window
+    // only on the vendor's own server for the wire, over https.
+    for (base, wire, ceiling) in [
+        ("https://api.openai.com/v1", "responses", "32768 (a quarter of the window)"),
+        ("https://api.anthropic.com/v1", "anthropic", "32768 (a quarter of the window)"),
+        ("https://api.openai.com.example.invalid/v1", "responses", "16384 (four times the default)"),
+        ("https://api.anthropic.com/v1", "responses", "16384 (four times the default)"),
+        ("http://api.openai.com/v1", "responses", "16384 (four times the default)"),
+    ] {
+        let catalog = serde_json::json!({"providers":{"stub":{"base_url":base,"wire_api":wire,"models":[{"id":"stub-model","context_tokens":131072}]}}});
+        std::fs::write(dir.join("providers.json"), catalog.to_string()).unwrap();
+        let (code, report) = check(&["--check"]);
+        assert_eq!(code, Some(0), "a warning does not fail the check:\n{report}");
+        assert!(report.lines().any(|l| l.starts_with("warn settings") && l.contains(&format!("max_tokens = 4096, the default, raised up to {ceiling}")) && l.contains("once the limit can grow no further, four continuations later")), "{report}");
+    }
     std::fs::write(dir.join("providers.json"), format!(r#"{{"providers":{{"stub":{{"base_url":"{base_url}","models":[{{"id":"stub-model","context_tokens":16384,"max_tokens":4096}}]}}}}}}"#)).unwrap();
     let (_, report) = check(&["--check"]);
     assert!(!report.contains("max_tokens"), "a 4096 on the model entry is a choice:\n{report}");

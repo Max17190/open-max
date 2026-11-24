@@ -71,9 +71,8 @@ pub enum WireApi {
 }
 
 impl WireApi {
-    pub(crate) fn reports_cuts(self) -> bool {
-        matches!(self, Self::Responses | Self::Anthropic)
-    }
+    /// Whether `base` is this wire's vendor's own server, which reports every reply it cuts and refuses a limit over the model's.
+    fn reports_cuts(self, base: &str) -> bool { same_server(base, match self { Self::Responses => crate::chatgpt::API, Self::Anthropic => "https://api.anthropic.com", Self::ChatCompletions => return false }) }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +159,7 @@ pub struct ActiveEndpoint {
     pub reply_room: usize,
     /// The longest reply a request may ask for: the most that replies cut in a row raise the limit to (see `reply_asks`).
     pub reply_ceiling: usize,
+    pub(crate) reports_cuts: bool, // Set off the subscription route by `WireApi::reports_cuts`.
     /// Compaction ceiling in real tokens, before the window cap and calibration.
     pub compaction_tokens: usize,
     pub temperature: Option<f32>,
@@ -183,13 +183,12 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
-/// First ask, reserve, room after a cut call or text, and ceiling. A model maximum never raises the first ask.
-/// Without a known maximum, only wires that report cuts and validate the limit may raise it to the window.
+/// First ask, reserve, room after a cut call or text (four times the ask, within the ceiling) and ceiling for a `context`-token window. The entry's `max_tokens`, the model's longest reply, is a ceiling and never the first ask; one chosen in settings is both.
+/// With neither, the ceiling bounds a thought that never ends: four times the default, or on a vendor's own server a quarter of the window if larger (setup's cap on a maximum a catalog reports).
 fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>, validated: bool) -> (usize, usize, usize, usize) {
     let default = Settings::default().max_tokens;
-    let unknown = if validated { context } else { default * 4 };
     let (ask, reserve) = reply_limits(context, settings.max_tokens.min(entry.unwrap_or(settings.max_tokens)));
-    let ceiling = if settings.max_tokens == default { reply_limits(context, entry.unwrap_or(unknown)).0 } else { ask };
+    let ceiling = if settings.max_tokens == default { reply_limits(context, entry.unwrap_or(if validated { (context / 4).max(default * 4) } else { default * 4 })).0 } else { ask };
     (ask, reserve, ceiling.min(ask.saturating_mul(4)), ceiling)
 }
 
@@ -676,7 +675,8 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
             .or(settings.context_tokens)
             .ok_or(ResolveError::MissingContextTokens)?
             .max(1);
-        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens), p.wire_api.reports_cuts() && chatgpt.is_none());
+        let reports_cuts = chatgpt.is_none() && p.wire_api.reports_cuts(base_url);
+        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens), reports_cuts);
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
         // Sent anywhere else, it hands one server's credential to another.
@@ -705,7 +705,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
             max_tokens,
             reply_reserve,
             reply_room,
-            reply_ceiling,
+            reply_ceiling, reports_cuts,
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
                 .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -750,7 +750,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
         max_tokens,
         reply_reserve,
         reply_room,
-        reply_ceiling,
+        reply_ceiling, reports_cuts: false,
         compaction_tokens: settings
             .compaction_tokens
             .unwrap_or_else(|| default_compaction_tokens(context_tokens)),

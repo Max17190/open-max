@@ -118,80 +118,55 @@ async fn a_responses_reply_cut_while_reasoning_goes_back_as_its_reasoning_item_a
     }
 }
 
-/// The synthetic model needs `needed` output tokens. Its answer depends on the
-/// limit actually received, so a client stuck at its ceiling cannot finish.
-async fn limit_turn(wire: &'static str, needed: u64, refuse_raise: bool) -> (Vec<u64>, Vec<String>, String) {
+/// One turn against a server of another vendor's on `wire`, for a model that
+/// needs `needed` output tokens in one reply. With `reports` the server says
+/// when it cut a reply; without, it stops at the limit and calls the reply done.
+/// Returns each request's limit, the cut notes and the turn's stop reason.
+async fn other_server_turn(wire: &'static str, needed: u64, reports: bool) -> (Vec<u64>, usize, String) {
     let field = if wire == "responses" { "max_output_tokens" } else { "max_tokens" };
-    let mut refused = false;
     let (url, bodies) = common::recording_http_with(10, move |body| {
         let limit = serde_json::from_str::<Value>(body).unwrap()[field].as_u64().unwrap();
-        if refuse_raise && limit > 16_384 {
-            refused = true;
-            return (400, "application/json", json!({"error":{"message":"unsupported reply limit"}}).to_string());
-        }
-        let used = if refused { 8 } else { needed.min(limit) };
-        let cut = !refused && needed > limit;
+        let (used, cut) = (needed.min(limit), needed > limit && reports);
         let usage = json!({"input_tokens":10,"output_tokens":used,"output_tokens_details":{"reasoning_tokens":used-1}});
-        match wire {
-            "responses" => {
-                let event = if cut {
-                    json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":usage}})
-                } else {
-                    json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"finished"}]}],"usage":usage}})
-                };
-                (200, "text/event-stream", format!("data: {event}\n\n"))
-            }
-            "anthropic" => (200, "application/json", json!({"type":"message","role":"assistant","stop_reason":if cut { "max_tokens" } else { "end_turn" },
-                "content":if cut { json!([{ "type":"thinking","thinking":"partial","signature":"fixture" }]) } else { json!([{ "type":"text","text":"finished" }]) },"usage":{"input_tokens":10,"output_tokens":used}}).to_string()),
-            "chat_completions" => (200, "application/json", json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"finished"}}],
-                "usage":{"prompt_tokens":10,"completion_tokens":limit-1,"completion_tokens_details":{"reasoning_tokens":limit-2}}}).to_string()),
-            _ => unreachable!(),
-        }
-    }).await;
+        let reply = match wire {
+            "responses" if cut => json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":usage}}),
+            "responses" => json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"finished"}]}],"usage":usage}}),
+            "anthropic" => json!({"type":"message","role":"assistant","stop_reason":if cut { "max_tokens" } else { "end_turn" },"content":[{"type":"text","text":"finished"}],"usage":{"input_tokens":10,"output_tokens":used}}),
+            _ => json!({"choices":[{"finish_reason":if cut { "length" } else { "stop" },"message":{"role":"assistant","content":"finished"}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":used,"completion_tokens_details":{"reasoning_tokens":used-1}}}),
+        };
+        if wire == "responses" { (200, "text/event-stream", format!("data: {reply}\n\n")) } else { (200, "application/json", reply.to_string()) }
+    })
+    .await;
     let scratch = Scratch::new(&url, wire);
     std::fs::write(scratch.0.join("data/settings.json"), r#"{"provider":"test","model":"thinker","context_tokens":131072}"#).unwrap();
     let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
     let events = common::drive_turn(&core, &mut rx, "limits", &scratch.0.join("project"), "go").await;
     let limits = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()[field].as_u64().unwrap()).collect();
-    let notes = events.iter().filter_map(|e| match e {
-        AgentEvent::HarnessNote { text, .. } if text.starts_with("[reply cut:") => Some(text.clone()), _ => None,
-    }).collect();
+    let notes = events.iter().filter(|e| matches!(e, AgentEvent::HarnessNote { text, .. } if text.starts_with("[reply cut:"))).count();
     let Some(AgentEvent::Done { stop_reason }) = events.last() else { panic!("{events:?}") };
-    if stop_reason == "stop" {
-        let answer = events.iter().rev().find_map(|e| match e { AgentEvent::MessageDone { text } => Some(text.as_str()), _ => None });
-        assert_eq!(answer, Some("finished"));
-    }
     (limits, notes, stop_reason.clone())
 }
 
+/// A server that is not the vendor's own is not trusted to report every cut,
+/// whatever wire it speaks: a reply with no call that spent 70% of the limit or
+/// more on its thought is read as cut, and with no known longest reply the
+/// limit grows to four times the default and no further. Every row is what
+/// the same turn gets from a build before reply cuts were keyed on the server.
 #[tokio::test]
-async fn a_reported_completion_keeps_the_answer_after_a_long_thought() {
-    for wire in ["responses", "anthropic"] {
-        for used in [2869, 4096] {
-            assert_eq!(limit_turn(wire, used, false).await, (vec![4096], vec![], "stop".into()), "{wire} at {used}");
-        }
+async fn another_vendors_server_keeps_the_silent_cut_rules_on_every_wire() {
+    let long = |limits: &[u64], notes| (limits.to_vec(), notes, "length".to_string());
+    let mut got = Vec::new();
+    for wire in ["chat_completions", "responses", "anthropic"] {
+        got.push(other_server_turn(wire, 2869, false).await);
+        for reports in [false, true] { got.push(other_server_turn(wire, u64::MAX / 4, reports).await); }
     }
-}
-
-#[tokio::test]
-async fn reported_cuts_raise_an_unknown_reply_limit_until_the_answer_fits() {
-    for wire in ["responses", "anthropic"] {
-        let (limits, notes, stop) = limit_turn(wire, 20_000, false).await;
-        assert_eq!((limits.as_slice(), stop.as_str()), (&[4096, 4096, 8192, 16384, 32768][..], "stop"), "{wire}");
-        assert_eq!(notes.len(), 4);
-        assert!(notes[3].contains("32768 tokens"));
-    }
-}
-
-#[tokio::test]
-async fn a_reported_cut_whose_raise_is_refused_uses_the_reserve() {
-    let (limits, _, stop) = limit_turn("responses", 20_000, true).await;
-    assert_eq!((limits.as_slice(), stop.as_str()), (&[4096, 4096, 8192, 16384, 32768, 4096][..], "stop"));
-}
-
-#[tokio::test]
-async fn unreported_chat_cuts_keep_the_near_threshold_and_unknown_ceiling() {
-    let (limits, notes, stop) = limit_turn("chat_completions", 20_000, false).await;
-    assert_eq!((limits.as_slice(), stop.as_str()), (&[4096, 4096, 8192, 16384, 16384, 16384, 16384][..], "length"));
-    assert_eq!(notes.len(), 6);
+    let finished = (vec![4096, 4096, 8192], 2, "stop".to_string());
+    let ceiling = long(&[4096, 4096, 8192, 16384, 16384, 16384, 16384], 6);
+    // A text the Messages-shaped server cut gets room once, then the rest in parts.
+    assert_eq!(got, [
+        finished.clone(), ceiling.clone(), ceiling.clone(),
+        finished.clone(), ceiling.clone(), ceiling,
+        finished, long(&[4096, 16384, 4096, 4096, 4096], 4), long(&[4096, 16384, 4096, 4096, 4096], 4),
+    ]);
 }
