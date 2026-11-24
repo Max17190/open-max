@@ -797,15 +797,18 @@ gateways (OpenRouter and similar), and private proxies.
 ## Connecting and disconnecting providers
 
 Run `openmax --login` from a terminal, or `/login` inside a session. Choose a
-provider with the arrow keys, type to filter, and press Enter. Esc cancels
-a setup prompt before its changes are saved. The choices are:
+provider with the arrow keys, type to filter, and press Enter. An answer setup
+cannot use (a connection name, URL, key, model ID or context window) is asked
+for again with the reason; Esc cancels a setup prompt before its changes are
+saved. The choices are:
 
 - **OpenAI: ChatGPT plan:** browser sign-in using the account's plan. The
   command target is `chatgpt`; the default saved connection is `chatgpt-main`.
 - **OpenAI API:** an API key with separate API billing. Target `openai`.
 - **Anthropic API:** an API key with separate API billing. Target `anthropic`.
 - **Other compatible API:** an HTTPS API URL and a Bearer API key. Target
-  `custom`. Plain HTTP is accepted only for a server on loopback.
+  `custom`. Plain HTTP is accepted only for a server on loopback, and a
+  server on loopback may take no key: leave the key empty and none is saved.
 - Existing named connections, for updating their API key or selected model.
 
 For example, `openmax --login anthropic` skips the provider menu. Keys are
@@ -820,7 +823,8 @@ API setup loads the endpoint's model catalog and lets you choose an exact
 model. OpenAI setup omits known dedicated embedding, image, speech, realtime,
 and moderation model families; other providers retain their own catalogs.
 When the API does not report its context window, enter the value from
-the model's documentation. For a Chat Completions connection setup writes
+the model's documentation, as tokens or with a k or m suffix (`128k` is
+128,000). For a Chat Completions connection setup writes
 no `max_tokens`, so the model runs at the reply limit settings.json gives
 (4096 by default), unless the catalog reports an output maximum under that
 limit, which it saves as the model's limit. For a Responses or native Messages connection, when the

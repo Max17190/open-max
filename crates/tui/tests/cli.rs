@@ -607,6 +607,43 @@ fn a_login_from_the_shell_selects_what_it_connected_when_nothing_is_selected() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
+/// The login wizard asks again after an answer it cannot take, and Esc still
+/// cancels with nothing saved. A server elsewhere is billed and needs a key;
+/// one on this machine is not said to bill and may take none, which saves
+/// none. A context window takes the usual k suffix.
+#[test]
+fn login_asks_again_and_connects_a_server_on_this_machine_without_a_key() {
+    let (project, home) = fresh_dirs("login-asks-again");
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "bad name\r"),
+        ("a connection name is 1 to 64 letters, digits, hyphens or underscores\nConnection name", "remote\r"),
+        ("API base URL", "https://example.invalid/v1\r"),
+        ("Connecting remote to https://example.invalid/v1. API usage is billed by this provider.\nAPI key", "\r"),
+        ("enter a valid API key; only a server on this machine may take none\nAPI key", "\x1b"),
+    ]);
+    assert_eq!(status, Some(1), "{shown}");
+    assert!(shown.ends_with("openmax: Cancelled\n"), "{shown}");
+    assert!(!home.join(".openmax/providers.json").exists(), "{shown}");
+
+    let (base_url, _, _server) = spawn_http_script(vec![catalog_reply("")]);
+    let (status, shown) = at_a_terminal(&project, &home, &["--login", "custom"], &[
+        ("Connection name", "local\r"),
+        ("API base URL", "http://127.0.0.1:9/v1?bad\r"),
+        ("plain HTTP is allowed only on loopback\nAPI base URL", &format!("{base_url}\r")),
+        (&format!("Connecting local to {base_url}.\nAPI key"), "\r"),
+        ("Choose a model", "\r"),
+        ("Context window in tokens", "12x\r"),
+        ("a context window is a positive number of tokens, such as 128000 or 128k\nContext window", "128k\r"),
+    ]);
+    assert_eq!(status, Some(0), "{shown}");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(".openmax/providers.json")).unwrap()).unwrap();
+    let local = &saved["providers"]["local"];
+    assert_eq!(local["api_key"], serde_json::Value::Null, "{saved}");
+    assert_eq!(local["models"], serde_json::json!([{"id": "fixture-model", "context_tokens": 128000}]), "{saved}");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
 /// Every line of a ```sh block that runs `--trust-project`.
 fn documented_trust_commands(markdown: &str) -> Vec<String> {
     let mut shell_block = None;

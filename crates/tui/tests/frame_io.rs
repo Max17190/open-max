@@ -798,17 +798,24 @@ mod first_frame {
         s.write(b"/login custom\r");
         let question = s.wait_for_prompt(b"Connection name", start, Duration::from_secs(5)).unwrap_or_else(|| panic!("custom setup did not request a name: {}", s.context()));
         s.write(b"openai\r");
-        let push = s.wait_for(KEYBOARD_PUSH, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
+        // A name setup cannot take is refused with the reason and asked for
+        // again; Esc still cancels with nothing saved.
+        let refused = s.wait_for(b"choose a connection name other than", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("reserved name was not rejected: {}", s.context()));
+        s.wait_for_prompt(b"Connection name", refused, Duration::from_secs(5)).unwrap_or_else(|| panic!("the name was not asked again: {}", s.context()));
+        s.write(b"\x1b");
+        let push = s.wait_for(KEYBOARD_PUSH, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("Esc did not cancel setup: {}", s.context()));
         assert!(!String::from_utf8_lossy(&s.out[question..push]).contains("API key (hidden)"));
         assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         for (name, valid) in [(String::new(), false), ("x".repeat(64), true), ("x".repeat(65), false),
             ("x".repeat(66), false), ("dash-name".into(), true), ("under_score".into(), true), ("bad name".into(), false)] {
             let question = begin(&mut s, "/login custom", b"Connection name");
             s.write(format!("\x1b[200~{name}\x1b[201~\r").as_bytes());
-            if valid {
-                s.wait_for_prompt(b"API base URL", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("valid connection name was refused: {}", s.context()));
-                s.write(b"\x1b");
-            }
+            // A valid name moves on to the URL; any other is refused, and the
+            // prompt drawn after the reason asks for it again.
+            let next: &[u8] = if valid { b"API base URL" } else { b"a connection name is 1 to 64" };
+            s.wait_for_prompt(next, question, Duration::from_secs(5))
+                .unwrap_or_else(|| panic!("{name:?} got no {}: {}", String::from_utf8_lossy(next), s.context()));
+            s.write(b"\x1b");
             resume(&mut s, question);
             assert_eq!(std::fs::read(dir.join("providers.json")).unwrap(), original_catalog);
         }
@@ -857,7 +864,7 @@ mod first_frame {
         entries["providers"]["manual"] = serde_json::json!({"base_url":format!("http://{}", manual.local_addr().unwrap())});
         std::fs::write(dir.join("providers.json"), entries.to_string()).unwrap();
         let manual_server = std::thread::spawn(move || {
-            for request in 0..6 {
+            for request in 0..7 {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut socket = loop {
                     match manual.accept() {
@@ -878,14 +885,18 @@ mod first_frame {
                     assert!(n > 0);
                     header.extend_from_slice(&buffer[..n]);
                 }
-                let (status, body) = if request < 5 { (404, "") } else {
+                let (status, body) = if request < 6 { (404, "") } else {
                     (200, r#"{"data":[{"id":"reported-zero","context_window":0}]}"#)
                 };
                 write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
+        // A server on this machine may check no key: an empty one goes on to
+        // discovery.
         let question = begin(&mut s, "/login manual", b"API key (hidden)");
         s.write(b"\r");
+        s.wait_for_prompt(b"Model ID", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("an empty key on loopback was refused: {}", s.context()));
+        s.write(b"\x1b");
         resume(&mut s, question);
         for (model, window, success) in [("m".repeat(257), None, false), ("m".repeat(258), None, false),
             (String::new(), None, false), ("m".repeat(256), Some("1"), true),
@@ -904,11 +915,14 @@ mod first_frame {
                 s.wait_for_prompt(b"Context window in tokens", question, Duration::from_secs(5)).unwrap_or_else(|| panic!("context window prompt missing: {}", s.context()));
                 s.write(format!("{window}\r").as_bytes());
             }
-            let error_from = s.out.len();
-            resume(&mut s, question);
-            if window == Some("0") {
-                assert!(screen(&s.out[error_from..], 80, 24).join("\n").contains("positive number of tokens"), "context-window refusal was not shown");
+            // An answer setup cannot take is refused with the reason and asked
+            // for again; Esc then cancels with nothing saved.
+            if !success {
+                let reason: &[u8] = if window.is_some() { b"a context window is a positive number of tokens" } else { b"a model ID is 1 to 256 characters" };
+                s.wait_for_prompt(reason, question, Duration::from_secs(5)).unwrap_or_else(|| panic!("{} was not asked again: {}", String::from_utf8_lossy(reason), s.context()));
+                s.write(b"\x1b");
             }
+            resume(&mut s, question);
             if success {
                 close_picker(&mut s);
                 let entries: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("providers.json")).unwrap()).unwrap();
