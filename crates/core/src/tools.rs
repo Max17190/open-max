@@ -2452,37 +2452,31 @@ async fn run_bash(data_dir: &Path, root: &Path, args: &Value, caps: OutputCaps, 
         // bash never runs sandboxed (request.sandbox is None above); keep
         // the honest message should that ever change.
         Err(e @ ProcessError::SandboxUnavailable(_)) => ToolOutcome::err(e.to_string()),
-        Ok(output) => match &output.termination {
-            Termination::Cancelled => {
-                ToolOutcome::from_killed_process("command cancelled by user", &output)
-            }
-            // A hung command's last output is the diagnostic: which test was
-            // running, what it was waiting on. The tail is already captured
-            // when the timeout fires, so dropping it would turn a measurable
-            // failure into a guess.
-            Termination::TimedOut => {
-                let (text, truncated) = render_process_output(&output, caps.command_bytes);
-                ToolOutcome::from_process(false, format!("{}\n{text}", deadline.timed_out_heading()), &output, truncated)
-            }
-            Termination::Stuck { idle, running, after_memory_kill } => {
-                let (text, truncated) = render_process_output(&output, caps.command_bytes);
-                let running = if running.len() > 8 { format!("{} and {} more", running[..8].join(", "), running.len() - 8) } else { running.join(", ") };
-                let heading = if *after_memory_kill {
-                    format!("command stopped after {}s of inactivity following a kernel memory kill in its cgroup. Retry with less parallelism or a smaller workload.", idle.as_secs())
-                } else {
-                    format!("command stopped: for {}s its processes used no CPU and read or wrote nothing, so it looked stuck.", idle.as_secs())
-                };
-                ToolOutcome::from_process(false, format!("{heading} Still running then: {running}. Output until the stop:\n{text}"), &output, truncated)
-            }
-            Termination::Exited(status) => {
-                exited_outcome(&output, status, caps.command_bytes, background_noted)
-            }
-        },
+        Ok(output) => render_bash_result(&output, deadline, caps.command_bytes, background_noted),
     };
     if let Some((before, now)) = oom_kills().map(|n| (OOM_KILLS.fetch_max(n + 1, Relaxed), n + 1)).filter(|&(before, now)| !memory_stop && before != 0 && before < now) {
         outcome.output.push_str(&format!("\n[openmax: since the last result, the kernel killed {} process(es) in this cgroup for running out of memory.]", now - before));
     }
     outcome
+}
+
+fn render_bash_result(output: &ProcessOutput, deadline: BashDeadline, cap: usize, background_noted: &AtomicBool) -> ToolOutcome {
+    let heading = match &output.termination {
+        Termination::Cancelled => return ToolOutcome::from_killed_process("command cancelled by user", output),
+        Termination::Exited(status) => return exited_outcome(output, status, cap, background_noted),
+        Termination::TimedOut => deadline.timed_out_heading(),
+        Termination::Stuck { idle, running, after_memory_kill } => {
+            let running = if running.len() > 8 { format!("{} and {} more", running[..8].join(", "), running.len() - 8) } else { running.join(", ") };
+            let reason = if *after_memory_kill {
+                format!("command stopped after {}s of inactivity following a kernel memory kill in its cgroup. Retry with less parallelism or a smaller workload.", idle.as_secs())
+            } else {
+                format!("command stopped: for {}s its processes used no CPU and read or wrote nothing, so it looked stuck.", idle.as_secs())
+            };
+            format!("{reason} Still running then: {running}. Output until the stop:")
+        }
+    };
+    let (text, truncated) = render_process_output(output, cap);
+    ToolOutcome::from_process(false, format!("{heading}\n{text}"), output, truncated)
 }
 
 /// The result of a bash or external tool process that exited on its own.

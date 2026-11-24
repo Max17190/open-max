@@ -747,13 +747,14 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // over the 45,255 measured before it, and the 45,255 ceiling was raised for it.
     // Watching for an idle shell after a memory kill adds 42 production
     // lines over the 45,530 measured before it, and the 45,530 ceiling was
-    // raised for it.
-    const BASELINE: usize = 45_572;
+    // raised for it. Resolving the exact launch cgroup and sharing process
+    // cleanup and output rendering saves 3 lines and lowers the ceiling by 3.
+    const BASELINE: usize = 45_569;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 45_572;
+    const CEILING: usize = 45_569;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 

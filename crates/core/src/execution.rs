@@ -1114,7 +1114,7 @@ async fn supervise_child(
     child: &mut Child,
     pid: Option<u32>,
     timeout: Duration,
-    (idle_watch, memory): (IdleWatch, Option<(String, u64)>),
+    (idle_watch, memory): (IdleWatch, Option<(PathBuf, u64)>),
     cancel: &CancelToken,
 ) -> Result<(Termination, Option<LeftRunning>), ProcessError> {
     let stuck = async {
@@ -1122,60 +1122,63 @@ async fn supervise_child(
         let after = match (idle_watch, memory) {
             (IdleWatch::AfterIdle(after), _) => after,
             (IdleWatch::AfterMemoryKill, Some((path, before))) => {
-                wait_for_memory_kill(before, || read_memory_kills(&path)).await;
+                while !read_memory_kills(&path).is_some_and(|now| now > before) {
+                    tokio::time::sleep(timeout_secs(5)).await;
+                }
                 timeout_secs(60)
             }
             _ => std::future::pending().await,
         };
         watch_for_stuck(pid, after).await
     };
-    tokio::select! {
+    let termination = tokio::select! {
         result = child.wait() => {
             let status = result.map_err(ProcessError::Wait)?;
-            // A shell can exit while ordinary background descendants retain the
-            // group. Those belong to this invocation, so clean them up too.
-            //
-            // This is the rule that makes `some-server &` look like it worked
-            // and then serve nothing: the shell returns, the group is killed,
-            // and the caller is handed a successful exit. Report it so the
-            // caller learns the rule from the result instead of from a failing
-            // request later.
-            let left_running = stop_what_was_left_running(pid).await;
-            Ok((Termination::Exited(status), left_running))
+            return Ok((Termination::Exited(status), stop_what_was_left_running(pid).await));
         }
-        _ = cancel.cancelled() => {
-            terminate_process_group(child, pid).await?;
-            Ok((Termination::Cancelled, None))
-        }
-        _ = tokio::time::sleep(timeout) => {
-            terminate_process_group(child, pid).await?;
-            Ok((Termination::TimedOut, None))
-        }
-        (idle, running) = stuck => {
-            terminate_process_group(child, pid).await?;
-            Ok((Termination::Stuck { idle, running, after_memory_kill: idle_watch == IdleWatch::AfterMemoryKill }, None))
-        }
-    }
+        _ = cancel.cancelled() => Termination::Cancelled,
+        _ = tokio::time::sleep(timeout) => Termination::TimedOut,
+        (idle, running) = stuck => Termination::Stuck { idle, running, after_memory_kill: idle_watch == IdleWatch::AfterMemoryKill },
+    };
+    terminate_process_group(child, pid).await?;
+    Ok((termination, None))
 }
 
-/// The kernel's OOM-kill count for this process's memory cgroup and those under it: v2 `memory.events` (at /sys/fs/cgroup or, hybrid, /unified)
-/// or v1 `memory.oom_control` in the hierarchy listing `memory`, at the cgroup's path or else the root, where a container shows its own.
 #[inline(never)]
-pub(crate) fn memory_kill_counter() -> Option<(String, u64)> {
-    std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().filter_map(|l| l.split_once(':')?.1.split_once(':')).flat_map(|(c, path)| {
-        let (dirs, file) = if c.is_empty() { (vec![String::new(), "/unified".into()], "memory.events") } else if c.split(',').any(|c| c == "memory") { (vec!["/memory".into(), format!("/{c}")], "memory.oom_control") } else { (vec![], "") };
-        dirs.into_iter().flat_map(move |d| [format!("/sys/fs/cgroup{d}{}/{file}", path.trim_end_matches('/')), format!("/sys/fs/cgroup{d}/{file}")])
-    }).find_map(|path| read_memory_kills(&path).map(|count| (path, count)))
+pub(crate) fn memory_kill_counter() -> Option<(PathBuf, u64)> {
+    memory_kill_counter_at(Path::new("/proc/self/cgroup"), Path::new("/proc/self/mountinfo"))
 }
 
-fn read_memory_kills(path: &str) -> Option<u64> {
+fn memory_kill_counter_at(cgroup: &Path, mountinfo: &Path) -> Option<(PathBuf, u64)> {
+    let groups = std::fs::read_to_string(cgroup).ok()?;
+    let mounts = std::fs::read_to_string(mountinfo).ok()?;
+    let has_memory = |controllers: &str| controllers.split(',').any(|name| name == "memory");
+    mounts.lines().find_map(|line| {
+        let (fields, fs_fields) = line.split_once(" - ")?;
+        let mut fs_fields = fs_fields.split_ascii_whitespace();
+        let (unified, file) = match fs_fields.next()? {
+            "cgroup2" => (true, "memory.events"),
+            "cgroup" if has_memory(fs_fields.nth(1)?) => (false, "memory.oom_control"),
+            _ => return None,
+        };
+        let (_, group) = groups.lines().filter_map(|line| line.split_once(':')?.1.split_once(':'))
+            .find(|(controllers, _)| if unified { controllers.is_empty() } else { has_memory(controllers) })?;
+        let mut fields = fields.split_ascii_whitespace().skip(3);
+        let (root, mount) = (fields.next()?, fields.next()?);
+        // Do not guess for escaped mount paths or paths outside the cgroup namespace.
+        let clean = |path: &str| path.starts_with('/') && !path.contains('\\')
+            && !path.split('/').any(|part| part == "..");
+        if !clean(root) || !clean(mount) || !clean(group) {
+            return None;
+        }
+        let relative = Path::new(group).strip_prefix(root).ok()?;
+        let path = Path::new(mount).join(relative).join(file);
+        read_memory_kills(&path).map(|count| (path, count))
+    })
+}
+
+fn read_memory_kills(path: &Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.lines().find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok())
-}
-
-async fn wait_for_memory_kill(before: u64, mut count: impl FnMut() -> Option<u64>) {
-    while !count().is_some_and(|now| now > before) {
-        tokio::time::sleep(timeout_secs(5)).await;
-    }
 }
 
 /// Resolves once the processes of the session `session` leads have used no CPU, read or written nothing and had no thread in a
@@ -2314,6 +2317,37 @@ mod tests {
         assert!(!timed_wait("running") && !timed_wait("-1 0x7ffc 0x7f4d"));
     }
 
+    #[test]
+    fn a_memory_watch_reads_the_launch_group_in_a_subtree_mount() {
+        let dir = std::env::temp_dir().join(format!("openmax-cgroup-{}", uuid::Uuid::new_v4()));
+        let mount = dir.join("mount");
+        let cgroup = dir.join("cgroup");
+        let mountinfo = dir.join("mountinfo");
+        std::fs::create_dir_all(mount.join("child")).unwrap();
+        let checks = || {
+            for (fs, source, group_entry, file) in [
+                ("cgroup2", "cgroup rw", "0::", "memory.events"),
+                ("cgroup", "cgroup rw,memory", "5:cpu,memory:", "memory.oom_control"),
+            ] {
+                std::fs::write(&mountinfo, format!("29 23 0:26 /parent {} rw - {fs} {source}\n", mount.display())).unwrap();
+                let child = mount.join("child").join(file);
+                std::fs::write(&child, "oom_kill 3\n").unwrap();
+                std::fs::write(mount.join(file), "oom_kill 8\n").unwrap();
+                std::fs::write(&cgroup, format!("{group_entry}/parent/child\n")).unwrap();
+                assert_eq!(memory_kill_counter_at(&cgroup, &mountinfo), Some((child.clone(), 3)));
+                std::fs::remove_file(child).unwrap();
+                assert_eq!(memory_kill_counter_at(&cgroup, &mountinfo), None);
+                std::fs::write(&cgroup, format!("{group_entry}/parent-other\n")).unwrap();
+                assert_eq!(memory_kill_counter_at(&cgroup, &mountinfo), None);
+            }
+        };
+        let result = std::panic::catch_unwind(checks);
+        std::fs::remove_dir_all(dir).unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_memory_watch_stops_an_idle_command_only_after_a_new_kill() {
@@ -2330,7 +2364,7 @@ mod tests {
         let pid = child.id();
         let cancel = CancelToken::default();
         let supervise = supervise_child(&mut child, pid, Duration::from_secs(10),
-            (IdleWatch::AfterMemoryKill, Some((counter.to_str().unwrap().into(), 3))), &cancel);
+            (IdleWatch::AfterMemoryKill, Some((counter, 3))), &cancel);
         tokio::pin!(supervise);
         assert!(tokio::time::timeout(Duration::from_secs(1), &mut supervise).await.is_err());
         assert!(dir.join("fifo").exists());

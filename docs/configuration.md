@@ -421,8 +421,9 @@ and the run that writes a key already uses it.
   read every counter restarts it too. A process started with `setsid` is not
   watched. When unset, Open Max watches for 60 seconds of inactivity only
   after the kernel reports a new out-of-memory kill in the command's launch
-  cgroup. A kill elsewhere in a shared cgroup can also arm the watch. Off
-  Linux, nothing changes.
+  cgroup. If Open Max cannot read that cgroup's own counter, it does not
+  start the automatic watch. A kill elsewhere in a shared cgroup can also
+  arm the watch. Off Linux, nothing changes.
 
 The input budget for the transcript and frozen tool schemas is
 `context_tokens - (reply_reserve + 1024)`, leaving room for the reply and 1024
