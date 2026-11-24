@@ -814,6 +814,15 @@ fn path_with_self_link(dir: &Path, inherited: &std::ffi::OsStr) -> Option<OsStri
     std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest)).ok()
 }
 
+#[inline(never)]
+fn command_defaults(command: &mut Command) {
+    for (name, fallback) in [("EMAIL", "openmax@localhost"), ("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never")] {
+        if std::env::var_os(name).is_none() {
+            command.env(name, fallback);
+        }
+    }
+}
+
 /// Execute one native process with concurrent bounded output capture.
 pub(crate) async fn run_process(
     request: ProcessRequest,
@@ -893,6 +902,7 @@ pub(crate) async fn run_process(
     // `$OPENMAX_BIN` names the same build in every one of them. Not applied
     // under a sandbox: a probe gets no handle to the harness.
     if request.sandbox.is_none() {
+        command_defaults(&mut command);
         if request.self_link {
             if let Some(path) = child_path() {
                 command.env("PATH", path);

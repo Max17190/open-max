@@ -739,7 +739,8 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // and the declined-approval end line, removed 2. A request budget set
     // from the turn's own pace (`request_budget_cycles`), with offsetting
     // trims in the tool call path and the budget notes, added none.
-    const BASELINE: usize = 45_168;
+    // Defaulting the Git email and Cargo cache policy in tool commands adds 10.
+    const BASELINE: usize = 45_178;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is

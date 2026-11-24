@@ -2423,6 +2423,62 @@ fn sse_text(text: &str) -> String {
     ])
 }
 
+fn run_bash_turn(home: &Path, child: &mut Command, shell: &str) -> String {
+    let (base_url, _, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({"command": shell})), true),
+        (sse_text("done"), true),
+    ]);
+    write_settings_with_mode(home, &base_url, "auto");
+    let out = child.args(["--trust-project", "--json", "-p", "Run the command"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let result = stdout.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "tool_end").unwrap_or_else(|| panic!("no tool result: {stdout}"));
+    assert_eq!(result["ok"], true, "{result}");
+    result["output"].as_str().unwrap().trim().to_string()
+}
+
+#[test]
+fn bash_defaults_environment_without_overwriting_explicit_values() {
+    let (project, home) = fresh_dirs("tool-env");
+    for (variable, default, custom) in [
+        ("EMAIL", "openmax@localhost", "configured@example.test"),
+        ("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never", "always"),
+    ] {
+        for (value, expected) in [(None, default), (Some(custom), custom), (Some(""), "")] {
+            let mut child = cmd(&project, &home);
+            match value {
+                Some(value) => child.env(variable, value),
+                None => child.env_remove(variable),
+            };
+            let shell = format!("printf '<%s>\\n' \"${{{variable}-unset}}\"");
+            assert_eq!(run_bash_turn(&home, &mut child, &shell), format!("<{expected}>"));
+        }
+    }
+    std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn bash_git_commit_uses_fallback_email_but_keeps_configured_identity() {
+    let (project, home) = fresh_dirs("tool-git-identity");
+    let mut child = cmd(&project, &home);
+    child.env_clear().envs([
+        ("HOME", home.as_os_str()),
+        ("PATH", std::ffi::OsStr::new("/usr/bin:/bin")),
+        ("OPENMAX_HUMAN_ATTEST", std::ffi::OsStr::new("1")),
+        ("GIT_CONFIG_NOSYSTEM", std::ffi::OsStr::new("1")),
+    ]);
+    // Supply only the name on the first commit so the test can run even on
+    // an OS account with an empty display name.
+    let shell = "set -e; git init -q; git -c user.name='Test Account' -c commit.gpgsign=false commit -q --allow-empty -m fallback; \
+        git log -1 --format='%ae %ce'; test -z \"$(git config --local --get-regexp '^user\\.' || :)\"; \
+        git config user.name 'Configured Name'; git config user.email configured@example.test; \
+        git -c commit.gpgsign=false commit -q --allow-empty -m configured; git log -1 --format='%an <%ae> %cn <%ce>'";
+    assert_eq!(run_bash_turn(&home, &mut child, shell),
+        "openmax@localhost openmax@localhost\nConfigured Name <configured@example.test> Configured Name <configured@example.test>");
+    std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
+}
+
 /// Emitting the same unapproved tool twice in one message is the bypass:
 /// consecutive external non-mutating calls are routed to the concurrent batch
 /// path, which has no approval UI. The gate has to survive that routing, so
