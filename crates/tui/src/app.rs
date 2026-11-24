@@ -862,11 +862,11 @@ impl App {
                 ))]);
             }
             match m.role.as_str() {
-                "user" => {
-                    if let Some(text) = &m.content {
-                        self.insert_user_block(text);
-                    }
-                }
+                "user" => match (harness_note(m), &m.content) {
+                    (Some(note), _) => self.note(note),
+                    (None, Some(text)) => self.insert_user_block(text),
+                    (None, None) => {}
+                },
                 "assistant" => {
                     if let Some(text) = &m.content {
                         if !text.trim().is_empty() {
@@ -2158,7 +2158,7 @@ impl App {
         let at = match turn.map(str::parse) {
             None => sessions::ForkAt::End,
             Some(Ok(n)) => sessions::ForkAt::Turn(n),
-            Some(Err(_)) => return self.note("usage: /rewind <turn>"),
+            Some(Err(_)) => return self.note("/rewind takes a turn number; /rewind alone lists the turns"),
         };
         match sessions::fork(&self.core, &parent, at) {
             Ok(child) => {
@@ -2489,13 +2489,13 @@ impl App {
                     }
                 }
             },
-            "new" => {
+            "new" | "clear" => {
                 if self.reset_for_new_session() { self.note("new session"); }
             }
             "fork" => self.fork_current(None),
             "rewind" => match rest.first() {
                 Some(turn) => self.fork_current(Some(turn)),
-                None => self.note("usage: /rewind <turn>"),
+                None => self.list_turns(),
             },
             "context" => {
                 // A hydrated session shows its frozen breakdown; before any
@@ -2628,10 +2628,32 @@ impl App {
                 Err(why) => self.note(&why),
             },
             "quit" | "exit" => self.should_quit = true,
-            other => self.note(&format!(
-                "unknown command: /{other} (see /help; prompt templates live in .agents/prompts/)"
-            )),
+            other => match HABITS.iter().find(|(names, _)| names.contains(&other)) {
+                Some((_, pointer)) => self.note(&format!("/{other} is not a command here; {pointer}")),
+                None => self.note(&format!("unknown command: /{other} (see /help; prompt templates live in .agents/prompts/)")),
+            },
         }
+    }
+
+    /// /rewind with no turn: each turn of this session it can return to,
+    /// numbered as /rewind counts them, with the start of its prompt.
+    fn list_turns(&mut self) {
+        let id = self.session_id.clone().unwrap_or_default();
+        let messages = sessions::load_messages(&self.core, &id).ok().flatten().unwrap_or_default();
+        let recorded = sessions::meta(&self.core, &id).and_then(|meta| meta.turn_ends);
+        let (mut start, mut block) = (0, Vec::new());
+        for (n, end) in sessions::turn_ends(recorded.as_deref(), &messages).into_iter().enumerate() {
+            let prompts = messages[start..end].iter().filter(|m| m.role == "user" && harness_note(m).is_none());
+            let prompt = prompts.filter_map(|m| m.content.as_deref()).next().unwrap_or_default();
+            block.push(help_line(&format!("/rewind {}", n + 1), &open_max_core::text::one_line(prompt).chars().take(72).collect::<String>()));
+            start = end;
+        }
+        if block.is_empty() {
+            return self.note("no turn to rewind to yet");
+        }
+        self.note("/rewind <turn> returns the conversation to the end of that turn; files stay as they are");
+        self.transcript.push(block);
+        self.dirty.mark_chat();
     }
 
     /// The registry the next new session would freeze from today's config,
@@ -3866,6 +3888,24 @@ pub(crate) fn model_selection(current: &config::Settings, provider: Option<Strin
     next
 }
 
+/// The text of a harness note the core stored as a user message: one
+/// bracketed line, without the effort stamp only a turn's prompt carries.
+/// Drawn as the note it was when it arrived, never as a prompt.
+fn harness_note(m: &open_max_core::types::ChatMessage) -> Option<&str> {
+    let text = m.content.as_deref()?.strip_prefix('[')?.strip_suffix(']')?;
+    (m.role == "user" && m.effort.is_none() && !text.contains('\n')).then_some(text)
+}
+
+/// Commands habit from other terminal agents suggests, each with where the
+/// same thing lives here, so typing one gets a pointer, not "unknown command".
+const HABITS: &[(&[&str], &str)] = &[
+    (&["undo"], "/rewind <turn> rewinds the conversation, not files, to the end of a turn; /rewind alone lists the turns"),
+    (&["cost", "usage"], "/status shows this session's context and prompt cache use"),
+    (&["sessions", "history"], "/resume lists this project's sessions"),
+    (&["config", "settings"], "settings live in ~/.openmax/settings.json, and openmax --spec settings describes each one"),
+    (&["diff"], "run git diff in a shell to see what changed"),
+];
+
 /// Single source of truth for `/help` and onboarding copy.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("enter", "send · shift+enter or alt+enter for a newline"),
@@ -4599,6 +4639,66 @@ mod tests {
         .expect("the turn never settled");
     }
 
+    /// /rewind alone lists the turns it can return to, numbered as it counts
+    /// them, each with its prompt. A harness note stored ahead of a prompt
+    /// is drawn as the note it was, after a rewind or a resume, never as a
+    /// prompt of its own, and lists no turn.
+    #[tokio::test]
+    async fn rewind_lists_the_turns_and_a_reloaded_harness_note_keeps_its_mark() {
+        use open_max_core::sessions;
+        use open_max_core::types::ChatMessage;
+        let (mut app, dir) = app_fixture();
+        let core = app.core.clone();
+        let id = sessions::create(&core, dir.display().to_string()).unwrap().id;
+        sessions::attach(&core, &id).unwrap();
+        let prompt = |text: &str| ChatMessage { effort: Some("default fixture".into()), ..ChatMessage::user(text) };
+        let history = vec![
+            ChatMessage::system("rules"),
+            ChatMessage::user("[execution policy: auto; fixture.]"),
+            prompt("[first] question"),
+            ChatMessage::assistant(Some("first answer".into()), None),
+            prompt("second question"),
+            ChatMessage::assistant(Some("second answer".into()), None),
+        ];
+        assert!(sessions::save_messages(&core, &id, &history, &mut 0, true));
+        sessions::end_turn(&core, &id, &history[..4]);
+        sessions::end_turn(&core, &id, &history);
+        sessions::detach(&core, &id).unwrap();
+        assert!(app.switch_to_session(id));
+        app.handle_submit("/rewind".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("execution policy: auto; fixture.") && !shown.contains("[execution policy"), "{shown}");
+        assert_eq!(shown.matches("## user").count(), 2, "{shown}");
+        assert!(shown.contains("/rewind <turn> returns the conversation to the end of that turn; files stay as they are"), "{shown}");
+        for line in ["/rewind 1                        [first] question", "/rewind 2                        second question"] {
+            assert!(shown.contains(line), "{line}: {shown}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Commands habit suggests get the equivalent here: /clear is /new, and
+    /// the others name the command or the place that does the same.
+    #[tokio::test]
+    async fn habitual_commands_point_to_their_equivalent() {
+        let (mut app, dir) = app_fixture();
+        app.session_id = Some(open_max_core::sessions::create(&app.core, dir.display().to_string()).unwrap().id);
+        app.handle_submit("/clear".into()).await.unwrap();
+        assert_eq!(app.session_id, None, "/clear starts a fresh session");
+        for (typed, pointer) in [
+            ("undo", "/rewind <turn> rewinds the conversation, not files"),
+            ("usage", "/status shows this session's context"),
+            ("sessions", "/resume lists"),
+            ("settings", "settings live in ~/.openmax/settings.json"),
+            ("diff", "run git diff in a shell"),
+        ] {
+            app.handle_submit(format!("/{typed}")).await.unwrap();
+            let shown = app.transcript.export_text();
+            assert!(shown.contains(&format!("/{typed} is not a command here; {pointer}")), "{typed}: {shown}");
+        }
+        assert!(!app.transcript.export_text().contains("unknown command"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// /rewind <n> and /fork branch the current session into a new one and
     /// switch to it: the branch replays only the history it was cut at, the
     /// original keeps every turn and stays resumable, and a turn that does
@@ -4629,7 +4729,7 @@ mod tests {
         assert!(app.transcript.export_text().contains("no turn 3 to rewind to; the session has 2"));
         app.handle_submit("/rewind one".into()).await.unwrap();
         assert_eq!(app.session_id.as_deref(), Some(parent.as_str()));
-        assert!(app.transcript.export_text().contains("usage: /rewind <turn>"));
+        assert!(app.transcript.export_text().contains("/rewind takes a turn number; /rewind alone lists the turns"));
 
         app.handle_submit("/rewind 1".into()).await.unwrap();
         let child = app.session_id.clone().unwrap();

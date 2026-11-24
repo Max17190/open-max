@@ -47,8 +47,8 @@ trust.
 | `/logout [provider]` | Disconnect a provider |
 | `/permissions [auto\|ask\|readonly]` | Pick or save this project's permission mode. New trust grants default to `auto`; explicit `ask` and `readonly` choices are preserved |
 | `/approvals auto\|ask\|readonly` | Alias for `/permissions` |
-| `/new` · `/resume` | Fresh session · pick an earlier one |
-| `/fork` · `/rewind <n>` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
+| `/new` · `/resume` | Fresh session (`/clear` does the same) · pick an earlier one |
+| `/fork` · `/rewind [n]` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch; `/rewind` alone lists the turns with their numbers. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
 | `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
@@ -467,6 +467,13 @@ The interface uses your terminal's own foreground and background colors. The
 palette's gray (color 8) marks secondary text, selection, and every border
 except the focused prompt's and the approval card's. There is no color
 setting.
+
+A few names that habit from other terminal agents suggests get a one-line
+pointer to the equivalent here instead of "unknown command": `/undo` to
+`/rewind` (which rewinds the conversation, not files), `/cost` and `/usage`
+to `/status`, `/sessions` and `/history` to `/resume`, `/config` and
+`/settings` to `openmax --spec settings`, and `/diff` to `git diff`. A prompt
+template of the same name, `/clear` included, runs instead.
 
 The persistent status line stays limited to model, context use, and approval
 mode so the transcript remains readable; `/status` is where the full runtime
