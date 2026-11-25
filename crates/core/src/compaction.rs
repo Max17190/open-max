@@ -3,7 +3,7 @@
 //! system prompt through the user's original request, see `pinned_head`) and
 //! the newest exchanges, which stay byte for byte up to `cut_target`. Before
 //! the cut the session's own model writes the notes it will continue from, in
-//! a request whose prompt is the transcript up to the cut plus one ask
+//! a request whose prompt is the whole transcript plus one ask
 //! (`NOTES_ASK`); the notes take the removed span's place in one context note
 //! that names the archive holding every byte the cut removed. Without notes
 //! a cut that can wait leaves the history whole once; the next try, or the
@@ -80,8 +80,8 @@ pub(crate) struct CompactionDigest {
     prompts: Vec<String>,
     /// Prompts earlier notes left out (`CompactionRecord::prompts_omitted`).
     prompts_omitted: usize,
-    /// Every message as dropped, in transcript order, held for the notes
-    /// request and the archive append.
+    /// Every message as dropped, in transcript order, held for the archive
+    /// append.
     dropped: Vec<ChatMessage>,
 }
 
@@ -249,28 +249,27 @@ impl CompactionDigest {
 
 const MAX_SUMMARY_BYTES: usize = 4_000;
 
-/// The ask that ends the notes request, after the transcript up to the cut.
-pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request is about to be removed from the conversation to keep requests small. Write the notes you will continue from. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), at most 400 words and under 4,000 bytes in all: anything past 4,000 bytes is cut off and lost, so keep every part short. Use four labeled parts. State: what is finished and verified, what is half done, and the next step. Files: every path changed or still needed, with the names and places in it that matter. Facts: commands that work in this project, each failure seen with its cause, and every instruction the user gave after the original request, in the user's words; copy identifiers, paths and error text exactly. Open: what is unresolved or unverified. If a context note appears above, carry forward what still holds.]";
+/// The ask that ends the notes request, after the transcript.
+pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request and the newest exchanges is about to be removed from the conversation to keep requests small. The newest exchanges stay as they are, so the notes need not repeat them. Write the notes you will continue from. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), at most 400 words and under 4,000 bytes in all: anything past 4,000 bytes is cut off and lost, so keep every part short. Use four labeled parts. State: what is finished and verified, what is half done, and the next step. Files: every path changed or still needed, with the names and places in it that matter. Facts: commands that work in this project, each failure seen with its cause, and every instruction the user gave after the original request, in the user's words; copy identifiers, paths and error text exactly. Open: what is unresolved or unverified. If a context note appears above, carry forward what still holds.]";
 
 /// What ends the ask the second time, after a reply that made a call.
 const NOTES_ONLY: &str = "[Your reply made a tool call, which did not run: no tool runs for this reply. Reply with the notes alone, in plain text.]";
 
-/// The notes request's messages: `head`, every message the cut removes, and
-/// the ask. The ask is stamped with the effort in force, as a turn's prompt
+/// The notes request's messages: `sent`, the transcript it shows, and the
+/// ask. The ask is stamped with the effort in force, as a turn's prompt
 /// is, so where a turn changed the effort and its prompt stays after the cut,
 /// the change rides just ahead of the ask and the effort every earlier request
 /// named at its top stays there: what they sent stays a cached prefix.
-pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped: &[ChatMessage]) -> Vec<ChatMessage> {
-    let mut messages = head.to_vec();
-    messages.extend(dropped.iter().cloned());
+pub(crate) fn notes_messages(client: &ChatClient, sent: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut messages = sent.to_vec();
     messages.push(ChatMessage { effort: Some(client.effort_stamp()), ..ChatMessage::user(NOTES_ASK) });
     messages
 }
 
-/// The notes the session's own model writes before a cut. The request is the
-/// transcript up to the cut (`head`, then every message the cut removes, in
-/// order) and `NOTES_ASK`, with the turn's tools: a prompt the session
-/// already sent, so a prompt cache can serve all of it but the ask. Only the
+/// The notes the session's own model writes before a cut. The request is
+/// `sent`, the transcript the next request would send, and `NOTES_ASK`, with
+/// the turn's tools: it extends the request before it, so a prompt cache
+/// serves all of it but the newest results and the ask. Only the
 /// reply's text is taken, or, when a reply that ended on its own has no
 /// text and no call, its reasoning. A call never runs, and a reply with one gives no notes, text or not: on the
 /// reset's first ask (`first`) it is asked once more, ending in `NOTES_ONLY`, which spends the reset's asks.
@@ -286,12 +285,12 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 /// request cost cannot omit the one the harness makes on its own behalf.
 async fn summarize_compaction(
     ctx: &CompactionCtx<'_>,
-    head: &[ChatMessage],
-    digest: &CompactionDigest, first: &mut bool,
+    sent: &[ChatMessage],
+    first: &mut bool,
     spend: &mut RequestSpend,
 ) -> Result<(String, bool), String> {
     let CompactionCtx { core, session_id, client, cancelled, schemas, factor, .. } = *ctx;
-    let mut messages = notes_messages(client, head, &digest.dropped);
+    let mut messages = notes_messages(client, sent);
     // In real tokens by the session's learned factor, as every request is
     // admitted, and by the route's estimator, which counts only what it sends.
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
@@ -504,7 +503,8 @@ pub(crate) async fn compact_messages(
         return Err("compaction refused: the session transcript or its replay boundaries could not be saved".into());
     }
     let mut first = total <= budget; // Within the budget, the reset's first ask: a cut that can wait for notes waits once.
-    let summary = match summarize_compaction(ctx, &candidate[..slot], &digest, &mut first, spend).await {
+    let sent = if first { &messages[..] } else { &messages[..slot + digest.message_count] }; // Over the budget, up to the cut: the whole may not fit beside the reply.
+    let summary = match summarize_compaction(ctx, sent, &mut first, spend).await {
         Ok(notes) => Some(notes),
         Err(reason) => {
             if !ctx.cancelled.is_cancelled() { ctx.core.send_agent(ctx.session_id, AgentEvent::CompactionSkipped { reason }); }
@@ -2137,29 +2137,34 @@ pub(crate) mod tests {
         assert_eq!(messages.iter().filter(|m| m.effort.is_some()).count(), 1, "the one prompt, in the opening");
     }
 
-    /// The notes request is the transcript up to the cut, each message as the
-    /// request before the cut sent it, then the ask, with the turn's tools:
-    /// every byte ahead of the ask is one a prompt cache already holds.
+    /// Within the budget the notes request is the whole transcript, each
+    /// message as the turn's next request would send it, then the ask, with
+    /// the turn's tools: it extends the request before it, as an ordinary
+    /// request does. Over the budget, where the whole transcript may not fit
+    /// beside the reply, it is the transcript up to the cut, then the ask.
     #[tokio::test]
-    async fn the_notes_request_is_the_transcript_up_to_the_cut_then_the_ask() {
-        let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
-        let fixture = Fixture::new(&url);
-        let mut messages = session(60, 2_000);
-        let original = messages.clone();
-        let (earlier, sent_before) = crate::client::tests::spawn_recording_once(reply("ok", false));
-        let client = ChatClient::new(earlier, None, "fixture".into(), None, 512);
-        client.stream_chat(&original, client.reply_reserve, SCHEMAS, Arc::new(CancelToken::default()), |_| {}).await.unwrap();
-        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
-        let (notes, before) = (body(&requests), body(&sent_before));
-        let cut = original.len() - (messages.len() - pinned_head(&messages) - 1);
-        let sent = notes["messages"].as_array().unwrap();
-        assert_eq!(sent.len(), cut + 1, "the transcript up to the cut, then the ask");
-        assert_eq!(sent[..cut], before["messages"].as_array().unwrap()[..cut]);
-        assert_eq!((&sent[cut]["role"], &sent[cut]["content"]), (&"user".into(), &NOTES_ASK.into()));
-        assert_eq!(notes["tools"], before["tools"]);
-        assert_eq!(notes["tools"], serde_json::from_str::<Value>(SCHEMAS).unwrap(), "the turn's tools");
-        assert_eq!((&notes["tool_choice"], &before["tool_choice"]), (&"auto".into(), &"auto".into()), "the turn's tool choice: a server that renders the prompt from it renders the cached one");
-        assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
+    async fn the_notes_request_is_the_whole_transcript_then_the_ask_within_the_budget() {
+        for (budget, whole) in [(100_000, true), (20_000, false)] {
+            let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+            let fixture = Fixture::new(&url);
+            let mut messages = session(60, 2_000);
+            let original = messages.clone();
+            let (earlier, sent_before) = crate::client::tests::spawn_recording_once(reply("ok", false));
+            let client = ChatClient::new(earlier, None, "fixture".into(), None, 512);
+            client.stream_chat(&original, client.reply_reserve, SCHEMAS, Arc::new(CancelToken::default()), |_| {}).await.unwrap();
+            assert!(fixture.cut(&mut messages, 20_000, budget, &mut RequestSpend::new(None)).await > 0);
+            let (notes, before) = (body(&requests), body(&sent_before));
+            let cut = if whole { original.len() } else { original.len() - (messages.len() - pinned_head(&messages) - 1) };
+            let sent = notes["messages"].as_array().unwrap();
+            assert!(cut < original.len() || whole, "over the budget the cut removes the oldest only");
+            assert_eq!(sent.len(), cut + 1, "{budget}: the transcript up to {cut} of {}, then the ask", original.len());
+            assert_eq!(sent[..cut], before["messages"].as_array().unwrap()[..cut]);
+            assert_eq!((&sent[cut]["role"], &sent[cut]["content"]), (&"user".into(), &NOTES_ASK.into()));
+            assert_eq!(notes["tools"], before["tools"]);
+            assert_eq!(notes["tools"], serde_json::from_str::<Value>(SCHEMAS).unwrap(), "the turn's tools");
+            assert_eq!((&notes["tool_choice"], &before["tool_choice"]), (&"auto".into(), &"auto".into()), "the turn's tool choice: a server that renders the prompt from it renders the cached one");
+            assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
+        }
     }
 
     /// A reply that makes a call gives no notes, whatever text is beside it:
@@ -2312,13 +2317,22 @@ pub(crate) mod tests {
         // A thought in a leading think tag is no text either, and the second ask stays within the longest reply
         // and the window the prompt leaves; where neither has room above the first limit it is not sent.
         let think = stream(&[serde_json::json!({ "choices": [{ "delta": { "content": "<think>half a thought" }, "finish_reason": "length" }] })]);
-        for (bounds, sent, notes) in [((768, usize::MAX), vec![512, 768], true), ((usize::MAX, 1_024), vec![512], false), ((512, usize::MAX), vec![512], false)] {
+        // Within the budget the prompt is the whole transcript and the ask, the window it leaves is what bounds
+        // the second ask, and a cut with no notes waits.
+        let whole = notes_messages(&Fixture::new("http://127.0.0.1:9").client, &session(60, 2_000)).iter().map(ChatMessage::estimated_tokens).sum::<usize>() + request_overhead(SCHEMAS);
+        for (budget, bounds, sent, notes) in [
+            (20_000, (768, usize::MAX), vec![512, 768], true),
+            (20_000, (usize::MAX, 1_024), vec![512], false),
+            (20_000, (512, usize::MAX), vec![512], false),
+            (100_000, (usize::MAX, whole + 1_024 + 768), vec![512, 768], true),
+            (100_000, (usize::MAX, whole + 1_024 + 512), vec![512], false),
+        ] {
             let (url, requests) = serve_in_order(vec![think.clone(), reply("State: halfway.", false)]);
             let mut fixture = Fixture::new(&url);
             fixture.client.reply_bounds = bounds;
             let mut messages = session(60, 2_000);
-            assert!(fixture.cut(&mut messages, 20_000, 20_000, &mut RequestSpend::new(None)).await > 0, "{bounds:?}");
-            assert_eq!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."), notes, "{bounds:?}");
+            assert_eq!(fixture.cut(&mut messages, 20_000, budget, &mut RequestSpend::new(None)).await > 0, notes || budget == 20_000, "{bounds:?}");
+            assert_eq!(messages[pinned_head(&messages)].content.as_deref().is_some_and(|c| c.contains("Summary: State: halfway.")), notes, "{bounds:?}");
             assert_eq!(requests.try_iter().map(|b| b["max_tokens"].as_u64().unwrap()).collect::<Vec<_>>(), sent, "{bounds:?}");
         }
     }
@@ -2614,10 +2628,17 @@ pub(crate) mod tests {
         assert!(digest.format(None, None).contains("oldest first: a | b."));
     }
 
-    /// The notes request states the byte cap the notes are cut at.
+    /// The notes request states the byte cap the notes are cut at, and that
+    /// the newest exchanges it shows stay, so the notes need not repeat them.
+    /// It fits in the 1,024 tokens the input budget leaves past the reply
+    /// reserve, so within the budget the whole transcript, the ask and the
+    /// reply fit the window.
     #[test]
     fn the_notes_ask_states_the_byte_cap() {
         assert_eq!(MAX_SUMMARY_BYTES, 4_000);
         assert!(NOTES_ASK.contains("under 4,000 bytes in all: anything past 4,000 bytes is cut off"), "{NOTES_ASK}");
+        assert!(NOTES_ASK.contains("except the original request and the newest exchanges is about to be removed"), "{NOTES_ASK}");
+        assert!(NOTES_ASK.contains("The newest exchanges stay as they are, so the notes need not repeat them."), "{NOTES_ASK}");
+        assert!(ChatMessage::user(NOTES_ASK).estimated_tokens() < 1_024, "the ask fits the budget's margin");
     }
 }

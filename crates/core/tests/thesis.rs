@@ -834,7 +834,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     const ORIGINAL_REQUEST: &str = "add a word count tool";
     const FOLLOW_UP: &str = "read the README too";
     const NOTES_REPLY: &str = "State: added the tool and read README.md. Facts: the user said read the README too.";
-    const NOTES_ASK: &str = "[context note: everything above this message except the original request is about to be removed";
+    const NOTES_ASK: &str = "[context note: everything above this message except the original request and the newest exchanges is about to be removed";
     let name = match wire {
         WireApi::ChatCompletions => "Chat Completions",
         WireApi::Responses => "Responses",

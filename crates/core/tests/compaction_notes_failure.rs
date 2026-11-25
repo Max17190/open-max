@@ -18,7 +18,7 @@ type WireReply = (u16, &'static str, String);
 
 struct Scratch(PathBuf);
 impl Scratch {
-    fn new(url: &str) -> Self {
+    fn new(url: &str, wire: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("openmax-wire-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("project")).unwrap();
         std::fs::create_dir_all(dir.join("data")).unwrap();
@@ -34,7 +34,7 @@ impl Scratch {
         sessions::write_atomic(
             &dir.join("data/providers.json"),
             json!({
-                "providers":{"fixture":{"base_url":url,"api_key":"fixture-key"}}
+                "providers":{"fixture":{"base_url":url,"api_key":"fixture-key","wire_api":wire}}
             })
             .to_string(),
         )
@@ -57,6 +57,8 @@ impl Drop for Scratch {
 
 struct Turn {
     requests: Vec<Value>,
+    /// Each request body as sent.
+    bodies: Vec<String>,
     events: Vec<AgentEvent>,
     saved: Vec<ChatMessage>,
     archived: Vec<ChatMessage>,
@@ -85,8 +87,13 @@ async fn run(replies: Vec<WireReply>, seed: Vec<ChatMessage>) -> Turn {
 
 /// `run` with `extra` settings merged over the scratch's own.
 async fn run_with(extra: Value, replies: Vec<WireReply>, seed: Vec<ChatMessage>) -> Turn {
+    run_on("chat_completions", extra, replies, seed).await
+}
+
+/// `run_with` over `wire`, the provider's `wire_api`.
+async fn run_on(wire: &str, extra: Value, replies: Vec<WireReply>, seed: Vec<ChatMessage>) -> Turn {
     let (url, requests) = common::recording_http_script(replies).await;
-    let scratch = Scratch::new(&url);
+    let scratch = Scratch::new(&url, wire);
     let settings_path = scratch.0.join("data/settings.json");
     let mut settings: Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
     settings.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -111,14 +118,10 @@ async fn run_with(extra: Value, replies: Vec<WireReply>, seed: Vec<ChatMessage>)
     drop(core);
     let (core, _) = Core::new(scratch.0.join("data")).unwrap();
     let saved = sessions::load_messages(&core, &id).unwrap().unwrap();
-    let requests = requests
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|body| serde_json::from_str(body).unwrap())
-        .collect();
+    let bodies = requests.lock().unwrap().clone();
     Turn {
-        requests,
+        requests: bodies.iter().map(|body| serde_json::from_str(body).unwrap()).collect(),
+        bodies,
         events,
         saved,
         archived: std::fs::read_to_string(sessions::archive_display(&core, &id))
@@ -378,5 +381,83 @@ async fn a_notes_reply_that_makes_a_call_is_asked_once_more_and_reported() {
         assert_eq!(reasons, if notes { vec![] } else { vec!["the notes reply made a call (finish_reason tool_calls)"] });
         let cuts = compacted(&turn);
         assert!(matches!(cuts[..], [(before, after, dropped)] if before > 200_000 && after < 30_000 && dropped > 0), "{cuts:?}");
+    }
+}
+
+/// One reply on `wire`: a call reading `path`, or with none the turn's answer.
+fn reply_on(wire: &str, path: Option<&str>) -> WireReply {
+    let arguments = path.map(|path| json!({ "path": path }));
+    match wire {
+        "responses" => {
+            let item = match &arguments {
+                Some(arguments) => json!({"type":"function_call","status":"completed","call_id":"read-new","name":"read_file","arguments":arguments.to_string()}),
+                None => json!({"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"The primary reply."}]}),
+            };
+            let event = json!({"type":"response.completed","response":{"status":"completed","output":[item]}});
+            (200, "text/event-stream", format!("data: {event}\n\n"))
+        }
+        "anthropic" => {
+            let (block, stop) = match arguments {
+                Some(input) => (json!({"type":"tool_use","id":"read-new","name":"read_file","input":input}), "tool_use"),
+                None => (json!({"type":"text","text":"The primary reply."}), "end_turn"),
+            };
+            let body = json!({"type":"message","role":"assistant","stop_reason":stop,"content":[block]});
+            (200, "application/json", body.to_string())
+        }
+        _ => match path {
+            Some(path) => read_call("read-new", path),
+            None => answer("The primary reply."),
+        },
+    }
+}
+
+/// A native Messages cache mark as a body carries it, ahead of its block's
+/// other keys or after them: no content, so a comparison leaves it out.
+const MARKS: [&str; 2] = [r#""cache_control":{"type":"ephemeral"},"#, r#","cache_control":{"type":"ephemeral"}"#];
+
+/// The conversation `body` sends on `wire`, each message as the bytes sent,
+/// its cache marks aside. On native Messages each block counts as one, with
+/// its role, since a user turn joins a tool result and the text after it.
+fn conversation(wire: &str, body: &str) -> Vec<String> {
+    type Fields = std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>;
+    let body = MARKS.iter().fold(body.to_string(), |body, mark| body.replace(mark, ""));
+    let fields: Fields = serde_json::from_str(&body).unwrap();
+    let items: Vec<Box<serde_json::value::RawValue>> =
+        serde_json::from_str(fields[if wire == "responses" { "input" } else { "messages" }].get()).unwrap();
+    if wire != "anthropic" {
+        return items.iter().map(|item| item.get().to_string()).collect();
+    }
+    let mut blocks = Vec::new();
+    for item in items {
+        let message: Fields = serde_json::from_str(item.get()).unwrap();
+        let content: Vec<Box<serde_json::value::RawValue>> = serde_json::from_str(message["content"].get()).unwrap();
+        blocks.extend(content.iter().map(|block| format!("{}:{}", message["role"].get(), block.get())));
+    }
+    blocks
+}
+
+/// The notes request extends the request sent just before it, as an ordinary
+/// request does: on each wire its conversation starts with every message
+/// that request sent, byte for byte, and is the conversation the turn's next
+/// request sends from the same history, plus the ask. A prompt cache that
+/// resumes only where an earlier request ended serves it whole but the
+/// newest exchange and the ask. Here the first read crosses the trigger and
+/// the notes request is refused, so the cut waits and the next request
+/// carries the same history.
+#[tokio::test]
+async fn the_notes_request_is_the_next_request_plus_the_ask_on_every_wire() {
+    for wire in ["chat_completions", "responses", "anthropic"] {
+        let replies = vec![reply_on(wire, Some("part-0.txt")), bad_request("the notes request is refused"), reply_on(wire, None)];
+        let turn = run_on(wire, json!({"compaction_tokens": 20_000}), replies, history(22_000)).await;
+        assert_eq!(turn.stop(), "stop", "{wire}: {:?}", turn.events);
+        let sent: Vec<Vec<String>> = turn.bodies.iter().map(|body| conversation(wire, body)).collect();
+        let [before, notes, next] = &sent[..] else { panic!("{wire}: {} requests, not three", sent.len()) };
+        let (ask, asked) = notes.split_last().unwrap();
+        assert!(ask.contains("[context note: everything above"), "{wire}: request 2 is not the notes request");
+        // Where two conversations first differ, by message, and their lengths.
+        let differ = |a: &[String], b: &[String]| (a.iter().zip(b).position(|(a, b)| a != b), a.len(), b.len());
+        assert!(asked == &next[..], "{wire}: the notes request is not the next request plus the ask: {:?}", differ(asked, next));
+        assert!(notes.starts_with(before), "{wire}: the notes request does not start with the request before it: {:?}", differ(notes, before));
+        assert!(next.len() > before.len() + 1, "{wire}: the newest exchange rides the notes request");
     }
 }

@@ -512,10 +512,14 @@ byte-stable and the server can reuse its prompt cache.
 
 Before the cut, the
 session's own model writes the notes it will continue from: one extra
-request whose prompt is the conversation up to the cut, as earlier requests
-already sent it, with the same tools and tool choice, plus one ask: a server
-that builds its prompt from the tools and the tool choice builds the one it
-already cached. A reply the
+request whose prompt is the whole conversation, as the next request would
+send it, with the same tools and tool choice, plus one ask. It extends the
+request before it, as any request does, so a server that caches a prompt
+only where an earlier one ended, or builds it from the tools and the tool
+choice, serves it from cache. The ask says the newest exchanges stay, so the
+notes need not repeat them. Over the input budget, where the whole
+conversation may not fit beside the reply, the prompt is the conversation up
+to the cut instead. A reply the
 limit cut before any text is asked for once more at twice the limit. The notes, up to 4,000
 bytes, take the removed span's place in one context note. A reply with
 no text that ended on its own and made no call gives its reasoning as the
