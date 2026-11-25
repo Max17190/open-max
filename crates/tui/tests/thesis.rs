@@ -1163,9 +1163,23 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
         .expect("the thesis job does not split its tests between jobs");
     let split: Vec<&str> = split.split(", ").collect();
     assert_eq!(split, ["thesis", "thesis_rounds"], "the thesis job's split changed");
-    let mut targets: Vec<String> = thesis_sources()
-        .into_iter()
-        .filter_map(|(path, _)| Some(path.strip_suffix(".rs")?.rsplit_once("/tests/")?.1.to_string()))
+    // Every test target cargo knows whose name `--test 'thesis*'` would
+    // match, from the manifests: a tests/<name>/main.rs directory or a
+    // `[[test]]` entry counts as a file under tests/ does.
+    let metadata = Command::new(env!("CARGO"))
+        .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
+        .current_dir(repo())
+        .output()
+        .expect("cargo metadata runs");
+    assert!(metadata.status.success(), "cargo metadata failed: {}", String::from_utf8_lossy(&metadata.stderr));
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).expect("cargo metadata prints JSON");
+    let mut targets: Vec<String> = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata lists the packages")
+        .iter()
+        .flat_map(|package| package["targets"].as_array().cloned().unwrap_or_default())
+        .filter(|target| target["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|kind| kind == "test")))
+        .filter_map(|target| target["name"].as_str().filter(|name| name.starts_with("thesis")).map(str::to_string))
         .collect();
     targets.sort();
     targets.dedup();
