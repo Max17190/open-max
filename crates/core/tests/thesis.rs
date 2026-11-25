@@ -1013,6 +1013,14 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
         let note = messages[original + 1]["content"].as_str().unwrap();
         assert!(note.starts_with("[context note:") && note.contains(NOTES_REPLY), "{note}");
     }
+    // On every wire the note after the cut says the edits are on disk and
+    // points at the working tree before any edit, and every later request
+    // carries it.
+    const TREE: &str = "The removed messages are out of the conversation, but every edit you made is on disk as you left it: the files are the truth. \
+        Before you edit a file, look at its current state (in a project under version control, its status and its diff \
+        against where the work began show every change so far; otherwise open the file again), and do not redo work already there.";
+    let pointed: Vec<usize> = (0..bodies.len()).filter(|&i| bodies[i].contains(TREE)).map(|i| i + 1).collect();
+    assert_eq!(pointed, (rewritten + 1..=bodies.len()).collect::<Vec<_>>(), "the requests whose note points at the files ({name})");
 
     // Every request repeats what the request before it sent ahead of its
     // note, but the two the compaction makes.

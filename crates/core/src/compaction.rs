@@ -228,7 +228,7 @@ impl CompactionDigest {
         if let Some(path) = archive {
             parts.push(format!("Full dropped messages: {path} (bash: grep or tail it)."));
         }
-        parts.push("The messages after this note are unchanged and continue from it; files on disk are as the work so far left them.".into());
+        parts.push("The messages after this note are unchanged and continue from it. The removed messages are out of the conversation, but every edit you made is on disk as you left it: the files are the truth. Before you edit a file, look at its current state (in a project under version control, its status and its diff against where the work began show every change so far; otherwise open the file again), and do not redo work already there.".into());
         parts.join(" ")
     }
 
@@ -250,7 +250,7 @@ impl CompactionDigest {
 const MAX_SUMMARY_BYTES: usize = 4_000;
 
 /// The ask that ends the notes request, after the transcript.
-pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request and the newest exchanges is about to be removed from the conversation to keep requests small. The newest exchanges stay as they are, so the notes need not repeat them. Write the notes you will continue from. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), at most 400 words and under 4,000 bytes in all: anything past 4,000 bytes is cut off and lost, so keep every part short. Use four labeled parts. State: what is finished and verified, what is half done, and the next step. Files: every path changed or still needed, with the names and places in it that matter. Facts: commands that work in this project, each failure seen with its cause, and every instruction the user gave after the original request, in the user's words; copy identifiers, paths and error text exactly. Open: what is unresolved or unverified. If a context note appears above, carry forward what still holds.]";
+pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request and the newest exchanges is about to be removed from the conversation to keep requests small. The newest exchanges stay as they are and every edit you made stays on disk, so write the notes you will continue from with only what neither of them shows. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), under 4,000 bytes in all: anything past 4,000 bytes is cut off and lost, so keep every part short. Use five labeled parts. Changed: each file you changed, with one line on what is already done in it. Decisions: what you decided and why. Failed: what you tried that did not work, and why. Check: the exact command that checks the work, and its last result. Open: what the task still requires that is not done yet, with any instruction the user gave after the original request. Copy paths, commands and error text exactly. If a context note appears above, carry forward what still holds.]";
 
 /// What ends the ask the second time, after a reply that made a call.
 const NOTES_ONLY: &str = "[Your reply made a tool call, which did not run: no tool runs for this reply. Reply with the notes alone, in plain text.]";
@@ -684,7 +684,7 @@ pub(crate) fn requested_keep(requested: Option<usize>, ratio: Option<f64>) -> us
 /// so this constant and the format cannot drift apart. Counted into the
 /// irreducible floor below, so a trigger is only honored when its target has
 /// room for the note too.
-const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 1_900;
+const DIGEST_NOTE_ALLOWANCE_TOKENS: usize = 2_000;
 
 /// The token total at which compaction fires. The resolved ceiling can only
 /// lower the window-derived `budget`, which keeps requests within the
@@ -2440,7 +2440,8 @@ pub(crate) mod tests {
         assert!(note.contains("Tools used: read_file.") && note.contains("Files touched: src/lib.rs."), "{note}");
         assert!(!note.contains("Summary:"), "{note}");
         assert!(note.contains(&sessions::archive_display(&fixture.core, &fixture.id)), "{note}");
-        assert!(note.ends_with("files on disk are as the work so far left them."), "{note}");
+        assert!(note.contains("every edit you made is on disk as you left it: the files are the truth."), "{note}");
+        assert!(note.ends_with("otherwise open the file again), and do not redo work already there."), "{note}");
         assert!(fixture.committed() && fixture.dir.join("hooked.json").exists(), "the archive, the record and the hook");
     }
 
@@ -2657,17 +2658,22 @@ pub(crate) mod tests {
         assert!(digest.format(None, None).contains("oldest first: a | b."));
     }
 
-    /// The notes request states the byte cap the notes are cut at, and that
-    /// the newest exchanges it shows stay, so the notes need not repeat them.
-    /// It fits in the 1,024 tokens the input budget leaves past the reply
-    /// reserve, so within the budget the whole transcript, the ask and the
-    /// reply fit the window.
+    /// The notes request states the byte cap the notes are cut at, says the
+    /// newest exchanges it shows stay and the edits stay on disk, and asks
+    /// for what neither shows, what is still to do last, where a cut over the
+    /// cap keeps it. It fits in the 1,024 tokens the input budget leaves past
+    /// the reply reserve, so within the budget the whole transcript, the ask
+    /// and the reply fit the window.
     #[test]
     fn the_notes_ask_states_the_byte_cap() {
         assert_eq!(MAX_SUMMARY_BYTES, 4_000);
         assert!(NOTES_ASK.contains("under 4,000 bytes in all: anything past 4,000 bytes is cut off"), "{NOTES_ASK}");
         assert!(NOTES_ASK.contains("except the original request and the newest exchanges is about to be removed"), "{NOTES_ASK}");
-        assert!(NOTES_ASK.contains("The newest exchanges stay as they are, so the notes need not repeat them."), "{NOTES_ASK}");
+        assert!(NOTES_ASK.contains("The newest exchanges stay as they are and every edit you made stays on disk, so write the notes you will continue from with only what neither of them shows."), "{NOTES_ASK}");
+        let parts = ["Changed: each file you changed, with one line on what is already done in it.", "Decisions:", "Failed:", "Check: the exact command that checks the work, and its last result.", "Open: what the task still requires that is not done yet"];
+        let at: Vec<usize> = parts.iter().map(|part| NOTES_ASK.find(part).unwrap_or_else(|| panic!("{part}"))).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "the parts in order, Open last: {at:?}");
+        assert!(opens_open_part("Open: the docs"), "the part a cut over the cap keeps");
         assert!(ChatMessage::user(NOTES_ASK).estimated_tokens() < 1_024, "the ask fits the budget's margin");
     }
 }
