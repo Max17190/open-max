@@ -998,6 +998,8 @@ mod first_frame {
         s.write(b"hello\r");
         let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("fixture reply"));
         assert!(shown.contains("fixture reply"), "{shown}");
+        // The mode note is the model's; the footer shows the mode.
+        assert!(!shown.contains("execution policy"), "{shown}");
         let settings = open_max_core::config::load(&s.dir.join("home/.openmax")).unwrap();
         assert_eq!(settings.provider.as_deref(), Some("solo"));
         assert_eq!(settings.model, "alpha");

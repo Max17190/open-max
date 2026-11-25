@@ -3003,13 +3003,13 @@ impl App {
                 self.note_tool_runs(runs);
             }
             AgentEvent::HarnessNote { text, .. } => {
-                // Render it: not every note has a TUI-visible equivalent (the
-                // hook-write note produced no screen change, and Refrozen
-                // shows only its generic toolbox summary, not the NOT-loaded
-                // reason), so ignoring it dropped harness corrections a
-                // stdio client would see. The bracket prefix is
-                // stripped for a cleaner line; the text is already the model's.
-                self.note(note_body(&text));
+                // Render it: few notes have a TUI-visible equivalent (the
+                // hook-write note none, Refrozen only a toolbox summary without
+                // the NOT-loaded reason), so dropping them hid corrections a
+                // stdio client sees. The execution policy has one, the footer's
+                // mode, so its model-facing wording is not shown. The bracket
+                // prefix is stripped; the text is already the model's.
+                if !text.starts_with("[execution policy:") { self.note(note_body(&text)) }
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if self.compacting {

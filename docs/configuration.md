@@ -588,7 +588,9 @@ Returning to `ask` restores content requirements for anything created in `auto`.
 
 The model reads the mode in a one-line `[execution policy: <mode>; ...]` note
 placed ahead of a session's first prompt, and written again only when the mode
-changes or a resumed session's history no longer holds it. The history resends
+changes or a resumed session's history no longer holds it. The terminal
+interface does not show the note as it is written, since its status line shows
+the mode; a stdio or `--json` client receives it as a `harness_note`. The history resends
 it on every later request, so it states only the mode's limits; content
 approval detail is in `openmax --spec tools`, `hooks`, and `permissions`. The
 tools and hooks contracts state each mode's rule and leave what applies only
