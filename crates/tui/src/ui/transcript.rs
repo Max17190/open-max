@@ -1979,10 +1979,8 @@ fn rebuild(chars: &[(char, Style)]) -> Line<'static> {
             }
         }
     }
-    if let Some(current) = style {
-        if !buf.is_empty() {
-            spans.push(Span::styled(buf, current));
-        }
+    if let Some(current) = style.filter(|_| !buf.is_empty()) {
+        spans.push(Span::styled(buf, current));
     }
     Line::from(spans)
 }

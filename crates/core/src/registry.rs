@@ -1262,13 +1262,11 @@ fn validate_subschema(schema: &Value, path: &str) -> Result<(), String> {
             ));
         }
     };
-    if let Some(description) = map.get("description") {
-        if !description.is_string() {
-            return Err(format!(
-                "{}.description must be a string",
-                crate::text::one_line(path)
-            ));
-        }
+    if map.get("description").is_some_and(|description| !description.is_string()) {
+        return Err(format!(
+            "{}.description must be a string",
+            crate::text::one_line(path)
+        ));
     }
     if let Some(values) = map.get("enum") {
         match values.as_array() {

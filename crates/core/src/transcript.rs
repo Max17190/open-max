@@ -332,10 +332,8 @@ fn restore_if_current(
     take_seq: u64,
     messages: Vec<ChatMessage>,
 ) {
-    if let Some(data) = map.get_mut(session_id) {
-        if data.take_seq == take_seq && data.messages.is_empty() {
-            data.messages = messages;
-        }
+    if let Some(data) = map.get_mut(session_id).filter(|data| data.take_seq == take_seq && data.messages.is_empty()) {
+        data.messages = messages;
     }
 }
 
