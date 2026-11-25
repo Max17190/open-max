@@ -436,7 +436,7 @@ async fn run_compact(
     let should_cut = tokens_before > cut_target(trigger, keep, schema_tokens, guard.messages(), &estimate);
     let compacted_messages = if should_cut {
         let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-        let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor, keep };
+        let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor, keep, waited: false };
         compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, true, &mut RequestSpend::new(settings.max_agent_tokens)).await
     } else {
         Ok(0)
@@ -748,9 +748,9 @@ async fn run_loop(
         );
         let trigger = soft_spent.map_or(trigger, |at| at.saturating_add((trigger / 4).min(keep)).max(trigger).min(budget));
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep,
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep, waited: soft_spent.is_some(),
         };
-        let compacted = compact_messages(&ctx, guard.messages(), trigger, soft_spent.map_or(budget, |_| trigger), schema_tokens, false, &mut spend).await;
+        let compacted = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await;
         if let Err(message) = compacted.map(|dropped| if dropped > 0 { soft_spent = None }) {
             core.send_agent(session_id, AgentEvent::Error { message });
             stop_reason = "error".into();

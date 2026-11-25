@@ -296,7 +296,7 @@ async fn summarize_compaction(
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
     if !spend.admits(estimated) { return Err("the notes request would pass the turn's token ceiling".into()); }
     // The turn's tools and tool choice go unchanged: a server that renders a prompt from them renders the one it cached. A reply the limit cut before any text is asked again at twice the limit, within the longest reply and the window left.
-    let mut limit = client.reply_reserve;
+    let (mut limit, mut again) = (client.reply_reserve, true); // One more request at most: for the notes alone after a call, or at a higher limit.
     let result = loop {
         let mut resent = Vec::new();
         let outcome = client.stream_chat(&messages, limit, schemas, cancelled.clone(), |delta| {
@@ -310,11 +310,11 @@ async fn summarize_compaction(
         };
         spend.record(core, session_id, estimated, &result);
         // Asked again with the same request up to its last message, which a prompt cache has just stored.
-        if !result.tool_calls.is_empty() && *first && !cancelled.is_cancelled() && spend.admits(estimated) { *first = false; if let Some(ask) = messages.last_mut() { ask.content = Some(format!("{NOTES_ASK}\n\n{NOTES_ONLY}")); } continue; }
+        if !result.tool_calls.is_empty() && again && *first && !cancelled.is_cancelled() && spend.admits(estimated) { (again, *first) = (false, false); if let Some(ask) = messages.last_mut() { ask.content = Some(format!("{NOTES_ASK}\n\n{NOTES_ONLY}")); } continue; }
         let unwritten = result.finish_reason == "length" && crate::client::strip_leading_think(&result.content).unwrap_or_else(|| result.content.clone()).trim().is_empty();
         let room = (limit * 2).min(client.reply_bounds.0).min(client.reply_bounds.1.saturating_sub(1024 + estimated));
-        if !(unwritten && limit == client.reply_reserve && room > limit && spend.admits(estimated)) { break result; }
-        limit = room;
+        if !(unwritten && again && room > limit && spend.admits(estimated)) { break result; }
+        (limit, again) = (room, false);
     };
     if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" { return Err(format!("the notes reply ended {}", result.finish_reason)); }
     let cut = result.finish_reason == "length";
@@ -440,6 +440,7 @@ pub(crate) struct CompactionCtx<'a> {
     pub(crate) factor: f64,
     /// The most a cut keeps of the newest exchanges (`requested_keep`).
     pub(crate) keep: usize,
+    pub(crate) waited: bool, // A cut this turn already waited for notes that did not come: the next one cuts without them.
 }
 
 /// A failed archive or transcript write must not discard the live history.
@@ -502,8 +503,8 @@ pub(crate) async fn compact_messages(
     {
         return Err("compaction refused: the session transcript or its replay boundaries could not be saved".into());
     }
-    let mut first = total <= budget; // Within the budget, the reset's first ask: a cut that can wait for notes waits once.
-    let sent = if first { &messages[..] } else { &messages[..slot + digest.message_count] }; // Over the budget, up to the cut: the whole may not fit beside the reply.
+    let mut first = !ctx.waited && total <= budget; // A cut that can wait for notes waits once a turn, and only within the budget.
+    let sent = if total <= budget { &messages[..] } else { &messages[..slot + digest.message_count] }; // Over the budget, up to the cut: the whole may not fit beside the reply.
     let summary = match summarize_compaction(ctx, sent, &mut first, spend).await {
         Ok(notes) => Some(notes),
         Err(reason) => {
@@ -1029,6 +1030,7 @@ pub(crate) mod tests {
             schemas: SCHEMAS,
             factor: 1.0,
             keep: KEEP_RECENT_TOKENS,
+            waited: false,
         };
         assert!(sessions::save_messages(&core, &session_id, &messages, &mut 0, true));
         let mut spend = RequestSpend::new(None);
@@ -1157,7 +1159,7 @@ pub(crate) mod tests {
         let client = ChatClient::from_endpoint(&endpoint);
         let hooks = Hooks::discover(&project, &core.data_dir);
         let cancelled = Arc::new(CancelToken::default());
-        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &project, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS, factor: 1.0, keep: KEEP_RECENT_TOKENS };
+        let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &project, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS, factor: 1.0, keep: KEEP_RECENT_TOKENS, waited: false };
         let budget = 16_000;
         // At the window, so the cut is made without notes.
         compact_messages(&ctx, &mut messages, budget, budget, 0, false, &mut RequestSpend::new(None)).await.unwrap();
@@ -1200,7 +1202,7 @@ pub(crate) mod tests {
             ));
             let client = ChatClient::new(url, None, "fixture".into(), None, 512);
             let (hooks, cancelled) = (Hooks::default(), Arc::new(CancelToken::default()));
-            let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS, factor: 1.0, keep: KEEP_RECENT_TOKENS };
+            let ctx = CompactionCtx { core: &core, session_id: &id, project_root: &dir, client: &client, estimate: &ChatMessage::estimated_tokens, hooks: &hooks, cancelled: &cancelled, schemas: SCHEMAS, factor: 1.0, keep: KEEP_RECENT_TOKENS, waited: false };
             // Small messages, so the cut stops just under its target.
             let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("Find the build result.")];
             messages.extend((0..300).map(|_| msg("assistant", 400)));
@@ -1905,6 +1907,7 @@ pub(crate) mod tests {
                 schemas: SCHEMAS,
                 factor: 1.0,
                 keep: KEEP_RECENT_TOKENS,
+                waited: false,
             }
         }
 
@@ -2165,6 +2168,22 @@ pub(crate) mod tests {
             assert_eq!((&notes["tool_choice"], &before["tool_choice"]), (&"auto".into(), &"auto".into()), "the turn's tool choice: a server that renders the prompt from it renders the cached one");
             assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
         }
+        // A cut that already waited this turn still sends the whole transcript within the budget, and one the
+        // user cancels leaves the history whole: only a failure that is not a cancel cuts without notes.
+        let (url, requests) = crate::client::tests::spawn_recording_once(reply("State: halfway.", false));
+        let fixture = Fixture::new(&url);
+        let (mut messages, waited) = (session(60, 2_000), CompactionCtx { waited: true, ..fixture.ctx() });
+        assert!(sessions::save_messages(&fixture.core, &fixture.id, &messages, &mut 0, true));
+        let whole = messages.len();
+        assert!(compact_messages(&waited, &mut messages, 20_000, 100_000, 0, false, &mut RequestSpend::new(None)).await.unwrap() > 0);
+        assert_eq!(body(&requests)["messages"].as_array().unwrap().len(), whole + 1, "the whole transcript, then the ask");
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        let (mut messages, waited) = (session(60, 2_000), CompactionCtx { waited: true, ..fixture.ctx() });
+        assert!(sessions::save_messages(&fixture.core, &fixture.id, &messages, &mut 0, true));
+        let before = serde_json::to_value(&messages).unwrap();
+        fixture.cancelled.cancel();
+        assert_eq!(compact_messages(&waited, &mut messages, 20_000, 100_000, 0, false, &mut RequestSpend::new(None)).await.unwrap(), 0);
+        assert!(serde_json::to_value(&messages).unwrap() == before && !fixture.committed(), "a cancel cuts nothing");
     }
 
     /// A reply that makes a call gives no notes, whatever text is beside it:
@@ -2182,6 +2201,16 @@ pub(crate) mod tests {
         assert!(!note.contains("Summary:") && !note.contains("re-read"), "{note}");
         assert_eq!(fixture.skipped(), ["the notes reply made a call (finish_reason tool_calls)"]);
         assert_eq!(requests.try_iter().count(), 2, "asked twice, not more");
+        // The ask for notes alone and the ask at a higher limit share one request: after either, no third.
+        let think = stream(&[serde_json::json!({ "choices": [{ "delta": { "content": "<think>half a thought" }, "finish_reason": "length" }] })]);
+        for (first, second, cut) in [(reply("Let me look.", true), think.clone(), true), (think, reply("Let me look.", true), false)] {
+            let (url, requests) = serve_in_order(vec![first, second, reply("State: halfway.", false)]);
+            let fixture = Fixture::new(&url);
+            let mut messages = session(60, 2_000);
+            assert_eq!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0, cut, "a spent ask for notes alone cuts; a spent limit retry waits");
+            assert!(!messages[pinned_head(&messages)].content.as_deref().unwrap_or_default().contains("Summary:"));
+            assert_eq!(requests.try_iter().count(), 2, "two requests, not three");
+        }
     }
 
     /// A reply that makes a call is asked once more, with the same request

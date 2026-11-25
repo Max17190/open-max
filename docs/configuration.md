@@ -529,7 +529,9 @@ A call in that reply never runs, and a reply that makes one gives no notes,
 whatever text is beside it. On a cut's first ask within the input budget, it
 is asked once more at once: the same request, its ask ending with a line that
 says no tool runs and only the notes are wanted, so a prompt cache serves all
-of it but that line. Nothing else of either exchange is kept.
+of it but that line. A notes request is sent again once at most: after a call it
+is not sent again at a higher limit, and after a higher limit not again for
+the notes alone. Nothing else of either exchange is kept.
 
 The notes request has no overall deadline, as no request does: only a
 connection that falls silent ends it. When no notes come back (an error, an
@@ -539,7 +541,8 @@ and reports why it skipped the cut. It asks again once the history has grown
 a quarter of the trigger in force then past the size it skipped at (at most
 what a cut keeps, 20,000 tokens or `compaction_keep_tokens`), or when the input
 budget forces a cut, whichever comes first, and that second time it makes the
-cut even without notes. So a cut asks for notes at most twice. A forced cut,
+cut even without notes, unless the turn is cancelled. Within the input budget
+that second request is the whole conversation too. So a cut asks for notes at most twice. A forced cut,
 a cut whose second ask was spent on a reply with a call, or `/compact` still
 makes the cut; its note lists the tools used, the files touched and the
 earlier goals, and the turn reports why it had no notes. Each cut a turn makes
