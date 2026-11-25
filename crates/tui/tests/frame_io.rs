@@ -1051,6 +1051,12 @@ mod first_frame {
         s.write(b"\rhello\r");
         let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("fixture reply"));
         assert!(shown.contains("fixture reply"), "{shown}");
+        // A model the connection saved no window for would fail at the next
+        // prompt, so /model refuses it and keeps the selection.
+        s.write(b"/model beta\r");
+        let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("no context window saved for beta"));
+        assert!(shown.contains("replacement has no context window saved for beta") && !shown.contains("model set to beta"), "{shown}");
+        assert_eq!(open_max_core::config::load(&s.dir.join("home/.openmax")).unwrap().model, "alpha");
     }
 
     /// What a session that painted first has to say before it runs lands on

@@ -1791,6 +1791,9 @@ impl App {
 
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
         let next = model_selection(&self.core.settings.lock().unwrap(), provider.clone(), model.clone());
+        if let (Some(name), Err(open_max_core::providers::ResolveError::MissingContextTokens)) = (&provider, open_max_core::providers::resolve_endpoint(&next, &self.core.data_dir)) {
+            return self.error(&format!("{name} has no context window saved for {model}, so the model is unchanged: run /login {name} and choose {model} to record it"));
+        }
         // The core's own save: it fingerprints the exact bytes it writes,
         // under its lock, so a TUI-authored save never reads as drift and a
         // racing external edit still does. Adopted in memory only on success.
@@ -5867,7 +5870,7 @@ mod tests {
             fs::write(
                 dir.join("providers.json"),
                 r#"{"providers":{"alpha":{"base_url":"http://alpha/v1",
-                   "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+                   "models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384},{"id":"three","context_tokens":16384}]}}}"#,
             )
             .unwrap();
             // No cache invalidation needed: the providers cache is keyed on
@@ -6340,6 +6343,8 @@ mod tests {
             assert_eq!(settings.provider.as_deref(), Some(provider));
             assert_eq!(settings.model, expected);
         }
+        // A connection with no catalog runs at the window settings give it.
+        app.core.settings.lock().unwrap().context_tokens = Some(16384);
         app.handle_submit("/model fixture/exact/model".into()).await.unwrap();
         assert_eq!(app.core.settings.lock().unwrap().model, "fixture/exact/model");
         app.handle_submit("/model".into()).await.unwrap();
@@ -8896,7 +8901,7 @@ mod tests {
         fs::write(
             dir.join("providers.json"),
             r#"{"providers":{"alpha":{"base_url":"http://127.0.0.1:9/v1",
-               "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+               "models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384},{"id":"three","context_tokens":16384}]}}}"#,
         )
         .unwrap();
         app.handle_submit("/provider alpha".into()).await.unwrap();
