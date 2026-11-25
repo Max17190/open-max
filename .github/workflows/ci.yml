@@ -165,6 +165,9 @@ jobs:
                   argv = a[0] if a else k.get('args')
                   log.append((time.time() - t, ' '.join(map(str, argv))[:160] if isinstance(argv, (list, tuple)) else str(argv)[:160]))
           subprocess.run = run
+          import faulthandler, os
+          if os.environ.get("DIAG_STACKS"):
+              faulthandler.dump_traceback_later(8, repeat=True)
           @atexit.register
           def dump():
               log.sort(reverse=True)
@@ -181,7 +184,7 @@ jobs:
           python3 -c 'import socket,time
           for h in ["127.0.0.1", "127.0.0.1", "localhost"]:
               t=time.time(); n=socket.getfqdn(h); print("getfqdn", h, n, round(time.time()-t,2))'
-          HOME="$RUNNER_TEMP/h" TMPDIR="$RUNNER_TEMP/t" python3 -u examples/run-task/demo.py --openmax target/debug/openmax 2>&1 | perl -MTime::HiRes=time -ne 'printf "%.2f %s", time, $_'
+          DIAG_STACKS=1 HOME="$RUNNER_TEMP/h" TMPDIR="$RUNNER_TEMP/t" python3 -u examples/run-task/demo.py --openmax target/debug/openmax 2>&1 | perl -MTime::HiRes=time -ne 'printf "%.2f %s", time, $_'
           python3 examples/repo-memory/test_repo_memory.py target/debug/openmax > "$RUNNER_TEMP/repo-memory.log" 2>&1 &
           memory=$!
           python3 examples/run-task/test_run_task.py target/debug/openmax > "$RUNNER_TEMP/run-task.log" 2>&1 &
