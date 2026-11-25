@@ -1055,14 +1055,14 @@ spending a read on the address - lexical ranking cannot separate those two,
 because they are about the same thing in the same words.
 "#;
 
-const STDIO: &str = r#"# stdio protocol (openmax-stdio/12)
+const STDIO: &str = r#"# stdio protocol (openmax-stdio/13)
 
 `openmax --stdio` speaks line-delimited JSON both ways: commands on stdin,
 `AgentEvent` envelopes on stdout. This is the stable contract for custom
 frontends, editor integrations, and one openmax driving another.
 
 Handshake: the first stdout line is
-{"type":"hello","proto":"openmax-stdio/12","protocol_version":12,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
+{"type":"hello","proto":"openmax-stdio/13","protocol_version":13,"session_id":"...","version":"...","project":"/abs/path","continued":false}.
 `protocol_version` is compared as an integer; any wire change bumps it.
 
 Commands, one JSON object per line:
@@ -1148,11 +1148,11 @@ per tool or skill file added, modified, or removed), `schemas_over_budget`
 (schema_tokens, budget_tokens: the tool schemas take
 most of what the window can spend, so compaction runs early and stops
 entirely once they reach it; advisory, at most once per session), `compacted` (tokens_before,
-tokens_after, compacted_messages: the receipt of a forced compaction;
-compacted_messages of 0 means the transcript was already at or under the
-prune target and nothing changed), `compaction_skipped` (reason: a cut the
-window does not force was not made because its notes did not arrive; the
-history stays whole and the turn goes on),
+tokens_after, compacted_messages: a cut a turn made, or the receipt of a forced
+compaction, where compacted_messages of 0 means the transcript was already at
+or under the prune target), `compaction_skipped` (reason: the notes a cut asked
+for did not arrive; a cut that can wait is not made and the history stays
+whole, and any other is made on the digest, with `compacted` after it),
 `hook_failed` (hook, event, detail: a hook did not run - an observe-only hook
 failed or a hook file on disk is not loaded, and the turn proceeded; or, in
 auto, a `user_prompt_submit` gate could not start and did not check the

@@ -987,6 +987,17 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     // opens the ask's own message or block is one an earlier request sent.
     let (asked, before) = (&prompts[NOTES], &prompts[NOTES - 1]);
     assert_eq!(asked.text[..asked.frozen], before.text[..before.frozen], "the notes request carries the turn's tools");
+    // Every other field but the reply limit is the request before it's too,
+    // the tool choice among them: a server that renders the prompt from
+    // them renders the one it cached. (The tools are held just above.)
+    let fields = |body: &str| {
+        let mut body: serde_json::Value = serde_json::from_str(body).unwrap();
+        for key in ["messages", "input", "tools", "max_tokens", "max_output_tokens"] {
+            body.as_object_mut().unwrap().remove(key);
+        }
+        body
+    };
+    assert_eq!(fields(&bodies[NOTES]), fields(&bodies[NOTES - 1]), "the notes request's fields outside the conversation");
     let ask = asked.text.find(NOTES_ASK).unwrap();
     let ask_message = asked.text[..ask].rfind("},{").unwrap() + 1;
     assert!(

@@ -1,4 +1,4 @@
-# stdio protocol (`openmax-stdio/12`)
+# stdio protocol (`openmax-stdio/13`)
 
 `openmax --stdio` speaks line-delimited JSON both ways, so any process that
 reads and writes JSONL (an editor plugin, an orchestrator, another openmax) can
@@ -15,7 +15,7 @@ This file is the normative reference for every field of every line.
 The first stdout line is:
 
 ```json
-{"type":"hello","proto":"openmax-stdio/12","protocol_version":12,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
+{"type":"hello","proto":"openmax-stdio/13","protocol_version":13,"session_id":"...","version":"0.2.0","project":"/abs/path","continued":false}
 ```
 
 `protocol_version` is an integer a client compares directly; `proto` carries
@@ -120,8 +120,8 @@ events either, but carry one).
 | `approval_settled` | `approval_id`, `outcome` (`approved`, `declined`, `timed_out`, or `cancelled`) |
 | `refrozen` | `tools`, `skills`, `changes` (the refreeze receipt: one line per tool or skill file added, modified, or removed) |
 | `schemas_over_budget` | `schema_tokens`, `budget_tokens` (the frozen tool schemas take most of what the window can spend, so compaction runs early against what little is left; once `schema_tokens` reaches `budget_tokens` it stops entirely, since pruning cannot pay a fixed per-request cost. Advisory, at most once per session; the turn still runs) |
-| `compaction_skipped` | `reason` (a soft cut kept the original history because the notes did not arrive. A cut forced by the input budget or `/compact` can still use a deterministic digest. Cancellation does not report a skip) |
-| `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (the receipt of a forced compaction; `compacted_messages` of 0 means the transcript was already at or under the cut target and nothing changed) |
+| `compaction_skipped` | `reason` (the notes a cut asked for did not arrive. A cut that can still wait is not made and the history stays whole; a cut the input budget forces, a cut asked for notes twice, and `/compact` are made on a deterministic digest, and `compacted` follows. Cancellation does not report it) |
+| `compacted` | `tokens_before`, `tokens_after`, `compacted_messages` (a cut a turn made, sent as it lands, or the receipt of a forced compaction; sizes in tokens, tool schemas included, as `budget` counts them; for `/compact`, `compacted_messages` of 0 means the transcript was already at or under the cut target and nothing changed) |
 | `hook_failed` | `hook`, `event`, `detail` (a hook did not run: an observe-only hook failed or a hook file on disk is not loaded, and the turn proceeded; or, in auto, a `user_prompt_submit` gate could not start and did not check the prompt, or a blocking `turn_end` gate could not start and the turn ends `unverified`; or a hook file fails closed and the turn ends `unverified`) |
 | `turn_refused` | `hook`, `reason`, `continuation`, `continuations_left` (a blocking `turn_end` hook refused the model's completion and the harness honored it; see below) |
 | `turn_verified` | `hooks` (the model's end stands and every blocking `turn_end` gate that judged it passed, named by file stem in the order they ran; see below) |
@@ -317,6 +317,7 @@ Any wire change bumps `protocol_version`. What each version changed:
 
 | Version | Change |
 | --- | --- |
+| 13 | A cut a turn makes sends `compacted`, and a cut made without notes sends `compaction_skipped` before it |
 | 12 | `tool_end` carries `duration_ms` |
 | 11 | `compaction_skipped` event |
 | 10 | A `retry` can follow `token` lines of the attempt it voids: a reply the network cut, or the provider failed with a retryable fault, after its text began is asked for again, at most twice in a row |

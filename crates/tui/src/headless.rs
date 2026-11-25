@@ -428,8 +428,8 @@ async fn run_turn_events(
                 let _ = writeln!(stderr, "openmax: {}; retrying ({attempt} of {max_attempts})", one_line(reason));
             }
             AgentEvent::CompactionSkipped { reason } => {
-                // Advisory: the history stays whole and the turn goes on.
-                let _ = writeln!(stderr, "openmax: context cut skipped: {}", one_line(reason));
+                // Advisory: the history stays whole, or `compacted` follows.
+                let _ = writeln!(stderr, "openmax: no notes for the context cut: {}", one_line(reason));
             }
             AgentEvent::SchemasOverBudget { schema_tokens, budget_tokens } => {
                 // Advisory: the turn still runs, so the exit code is untouched.

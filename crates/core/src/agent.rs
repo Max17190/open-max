@@ -746,7 +746,7 @@ async fn run_loop(
         let trigger = compaction_trigger(
             budget, schema_tokens, endpoint.compaction_tokens, keep, prompt_ratio, guard.messages(), &estimate,
         );
-        let trigger = soft_spent.map_or(trigger, |at| (at + (trigger / 4).min(keep)).max(trigger).min(budget));
+        let trigger = soft_spent.map_or(trigger, |at| at.saturating_add((trigger / 4).min(keep)).max(trigger).min(budget));
         let ctx = CompactionCtx {
             core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep,
         };
@@ -9538,10 +9538,10 @@ echo run >> {}
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// After a failed soft cut, the turn does not ask for notes again until
-    /// it needs to make room.
+    /// After a failed soft cut, the turn keeps its history whole and does
+    /// not ask for notes again until it has grown a quarter of the trigger.
     #[tokio::test]
-    async fn a_turn_without_notes_skips_the_soft_cut_until_the_window_forces_it() {
+    async fn a_turn_without_notes_waits_a_quarter_of_the_trigger_to_ask_again() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -9550,8 +9550,8 @@ echo run >> {}
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("a.txt"), "hello\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
-        // Every reply is a call with no text, the notes request's included.
-        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        // Every reply is a call, and every notes request is refused.
+        let (base_url, requests) = refusing_endpoint(&[TOOL_SSE], |_, body| body.contains(crate::compaction::NOTES_ASK).then_some(400)).await;
         {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
@@ -9572,13 +9572,13 @@ echo run >> {}
 
         start_turn(core.clone(), id.clone(), project, "keep reading".into()).unwrap();
         assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
-        assert_eq!(*requests.lock().unwrap(), 6 + 1, "six turn requests and one notes request");
+        assert_eq!(requests.lock().unwrap().len(), 6 + 1, "six turn requests and one notes request");
         assert!(!transcript(&core, &id).await.iter().any(is_digest_message), "history stays live without notes");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A cut without notes returns the turn to its configured trigger: a turn
-    /// whose notes request once came back empty asks again a quarter of the
+    /// whose notes request once failed asks again a quarter of the
     /// trigger later, cuts on the digest when that fails too, and asks again
     /// once its history crosses the trigger after that cut, rather than
     /// growing to the window between every later cut.
@@ -9595,8 +9595,8 @@ echo run >> {}
         let lines: String = (0..130).map(|i| format!("{i:05} {}\n", "x".repeat(60))).collect();
         std::fs::write(project.join("a.txt"), lines).unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
-        // Every reply is a call with no text, the notes request's included.
-        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        // Every reply is a call, and every notes request is refused.
+        let (base_url, requests) = refusing_endpoint(&[TOOL_SSE], |_, body| body.contains(crate::compaction::NOTES_ASK).then_some(400)).await;
         {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
@@ -9622,7 +9622,7 @@ echo run >> {}
         // trigger later, cuts on the digest, and the history then crosses the
         // configured trigger again and does the same: five notes requests,
         // where waiting for the window between cuts made three.
-        assert_eq!(*requests.lock().unwrap() - ITERATIONS, 5, "five notes requests");
+        assert_eq!(requests.lock().unwrap().len() - ITERATIONS, 5, "five notes requests");
         let _ = std::fs::remove_dir_all(dir);
     }
 

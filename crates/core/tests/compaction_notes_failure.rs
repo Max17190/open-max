@@ -92,8 +92,13 @@ async fn run_with(extra: Value, replies: Vec<WireReply>, seed: Vec<ChatMessage>)
     settings.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
     sessions::write_atomic(&settings_path, settings.to_string()).unwrap();
     let project = scratch.0.join("project");
-    let lines: String = (0..300).map(|i| format!("{i:04} {}\n", "b".repeat(66))).collect();
-    sessions::write_atomic(&project.join("big.txt"), lines).unwrap();
+    // Five reads of about 1,000 estimated tokens each: together past a
+    // quarter of a 20,000-token trigger, the newest two well inside what a
+    // cut at that trigger keeps.
+    for part in 0..5 {
+        let lines: String = (0..55).map(|i| format!("{part}{i:03} {}\n", "b".repeat(66))).collect();
+        sessions::write_atomic(&project.join(format!("part-{part}.txt")), lines).unwrap();
+    }
     let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
     let id = sessions::create(&core, project.display().to_string())
         .unwrap()
@@ -213,7 +218,8 @@ async fn notes_failure_preserves_history_when_the_window_does_not_force_a_cut() 
     let refusal = length_refusal(260_000, RESERVE);
     for (tokens, mut notes, expected_skip, expected_output) in [
         (215_000, vec![summary], None, vec![16]),
-        (260_000, vec![refusal.clone()], None, vec![]),
+        // The window forces this cut: it lands on the digest, and says why it had no notes.
+        (260_000, vec![refusal.clone()], Some("the notes request failed: backend returned 400"), vec![]),
         (
             215_000,
             vec![refusal],
@@ -269,7 +275,8 @@ async fn notes_failure_preserves_history_when_the_window_does_not_force_a_cut() 
                 .collect::<Vec<_>>(),
             expected_output
         );
-        assert_eq!(archived_fact, expected_skip.is_none());
+        assert_eq!(archived_fact, expected_skip.is_none() || tokens == 260_000);
+        assert_eq!(compacted(&turn).len(), usize::from(archived_fact), "each cut is reported");
         assert_eq!(saved_fact, tokens < 260_000);
         assert_eq!(body.contains(FACT), saved_fact);
         assert_eq!(
@@ -293,35 +300,83 @@ fn read_call(id: &str, path: &str) -> WireReply {
 
 /// A soft cut whose notes request fails is asked again once the history has
 /// grown a quarter of the trigger past the size it failed at, rather than
-/// waiting for the window for the rest of the turn.
+/// waiting for the window for the rest of the turn. The reads keep the newest
+/// messages small enough for the configured trigger to hold, so the second
+/// ask comes from the quarter and not from the window.
 #[tokio::test]
 async fn a_failed_notes_request_is_asked_again_after_a_quarter_of_the_trigger() {
-    let turn = run_with(
-        json!({"compaction_tokens": 20_000}),
-        vec![
-            bad_request("the notes request is refused once"),
-            read_call("big", "big.txt"),
-            read_call("small-1", "evidence.txt"),
-            read_call("small-2", "evidence.txt"),
-            answer("State: halfway."),
-            answer("The primary reply."),
-        ],
-        history(25_000),
-    )
-    .await;
+    let mut replies = vec![bad_request("the notes request is refused once")];
+    replies.extend((0..5).map(|part| read_call(&format!("part-{part}"), &format!("part-{part}.txt"))));
+    replies.extend([answer("State: halfway."), answer("The primary reply.")]);
+    let turn = run_with(json!({"compaction_tokens": 20_000}), replies, history(25_000)).await;
     assert_eq!(turn.stop(), "stop", "{:?}", turn.events);
-    let asks: Vec<usize> = turn
-        .requests
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.starts_with("[context note: everything above")))
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(asks, [0, 4], "asked at the trigger, then again after the growth");
-    assert_eq!(turn.requests.len(), 6);
+    assert_eq!(asks(&turn), [0, 6], "asked at the trigger, then again once five reads grew it a quarter");
+    assert_eq!(turn.requests.len(), 8);
     let skipped = turn.events.iter().filter(|e| matches!(e, AgentEvent::CompactionSkipped { .. })).count();
     assert_eq!(skipped, 1);
     let last = turn.requests.last().unwrap().to_string();
     assert!(last.contains("Summary: State: halfway.") && last.contains(TASK));
     assert!(turn.archived.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains(FACT))));
+    assert_eq!(compacted(&turn).len(), 1, "the cut is reported");
+}
+
+/// The indexes of the requests that ask for notes.
+fn asks(turn: &Turn) -> Vec<usize> {
+    turn.requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.starts_with("[context note: everything above")))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Each automatic cut the turn reported: the size before it, the size
+/// after it and the messages it archived.
+fn compacted(turn: &Turn) -> Vec<(usize, usize, usize)> {
+    turn.events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => Some((*tokens_before, *tokens_after, *compacted_messages)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A notes reply that makes a call, with text beside it or not, runs no tool
+/// and gives no notes: the same request is sent once more, its ask saying no
+/// tool runs, and the notes that then arrive are the cut's. When that reply
+/// makes a call too, the cut lands on the digest at once, and the event log
+/// says why and what it cut, so no paid request goes unaccounted for.
+#[tokio::test]
+async fn a_notes_reply_that_makes_a_call_is_asked_once_more_and_reported() {
+    let preamble = || sse(
+        &[json!({"content":"Let me re-read the file first."}), json!({"tool_calls":[{"index":0,"id":"notes-call","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"evidence.txt\"}"}}]})],
+        "tool_calls",
+        Value::Null,
+    );
+    for (second, notes) in [(answer("State: halfway."), true), (preamble(), false)] {
+        let turn = run(vec![preamble(), second, answer("The primary reply.")], history(215_000)).await;
+        assert_eq!(turn.stop(), "stop", "{:?}", turn.events);
+        assert!(!turn.events.iter().any(|e| matches!(e, AgentEvent::ToolStart { .. })), "the call in a notes reply never runs");
+        assert_eq!(asks(&turn), [0, 1], "asked twice, then the turn's own request");
+        assert_eq!(turn.requests.len(), 3);
+        let (asked, again) = (&turn.requests[0]["messages"], &turn.requests[1]["messages"]);
+        let last = asked.as_array().unwrap().len() - 1;
+        assert_eq!(asked.as_array().unwrap()[..last], again.as_array().unwrap()[..last], "the same request up to the ask");
+        assert!(again[last]["content"].as_str().unwrap().ends_with("Reply with the notes alone, in plain text.]"));
+        let body = turn.requests[2].to_string();
+        assert_eq!(body.contains("Summary: State: halfway."), notes);
+        assert!(!body.contains("re-read") && body.contains(TASK) && body.contains(STEER));
+        let reasons: Vec<&str> = turn
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::CompactionSkipped { reason } => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, if notes { vec![] } else { vec!["the notes reply made a call (finish_reason tool_calls)"] });
+        let cuts = compacted(&turn);
+        assert!(matches!(cuts[..], [(before, after, dropped)] if before > 200_000 && after < 30_000 && dropped > 0), "{cuts:?}");
+    }
 }

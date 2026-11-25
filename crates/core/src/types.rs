@@ -295,16 +295,16 @@ pub enum AgentEvent {
         #[serde(skip)]
         runs: Vec<(String, String)>,
     },
-    /// A forced compaction (`/compact`) finished. The automatic budget prune
-    /// speaks through the digest note it leaves in the transcript; the forced
-    /// path has no following turn to carry that note to, so the receipt is an
-    /// event. `compacted_messages` of 0 means the transcript was already at
-    /// or under the prune target and nothing changed.
+    /// A cut a turn made, as soon as it lands, or the receipt of a forced
+    /// compaction (`/compact`), sent once the session is free. Sizes are in
+    /// real tokens with the tool schemas. On `/compact`, `compacted_messages`
+    /// of 0 means the transcript was already at or under the prune target
+    /// and nothing changed.
     Compacted { tokens_before: usize, tokens_after: usize, compacted_messages: usize },
-    /// A cut the trigger asked for and the window does not force was not
-    /// made, because the notes it needs did not arrive; `reason` says why.
-    /// The history stays whole and the turn goes on, so it is advisory: the
-    /// window forces the cut, with the deterministic digest, if it fills.
+    /// The notes a cut asked for did not arrive; `reason` says why. A cut that
+    /// can still wait is not made: the history stays whole and the turn goes
+    /// on. One the window forces, asked twice or forced is made on the
+    /// deterministic digest, and `Compacted` follows.
     CompactionSkipped { reason: String },
     /// The frozen tool schemas take most of what the
     /// window has to spend, so the transcript is squeezed into what little
@@ -403,7 +403,7 @@ mod tests {
     /// exactly as `--stdio` and `--print --json` emit it: both write
     /// `to_json_line`, which this pins, and crates/tui/tests/cli.rs checks
     /// that one turn comes out of the two in the same bytes. These strings
-    /// are the `openmax-stdio/12` contract: session_id first, then the `type`
+    /// are the `openmax-stdio/13` contract: session_id first, then the `type`
     /// discriminator, then variant fields in declaration order. A change here
     /// is a protocol break and must bump `PROTO_VERSION`.
     /// `every_agent_event_variant_is_pinned_here` fails to compile if a variant

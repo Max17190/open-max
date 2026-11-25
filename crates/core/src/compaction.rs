@@ -6,8 +6,8 @@
 //! a request whose prompt is the transcript up to the cut plus one ask
 //! (`NOTES_ASK`); the notes take the removed span's place in one context note
 //! that names the archive holding every byte the cut removed. Without notes
-//! the history stays whole until a later try brings them or the window forces
-//! the cut, which then leaves a deterministic digest. A request costs its history plus
+//! a cut that can wait leaves the history whole once; the next try, or the
+//! window, makes it, on a deterministic digest if no notes come. A request costs its history plus
 //! `request_overhead`, in estimated tokens the server's own counts calibrate
 //! (`token_factor`).
 //!
@@ -252,6 +252,9 @@ const MAX_SUMMARY_BYTES: usize = 4_000;
 /// The ask that ends the notes request, after the transcript up to the cut.
 pub(crate) const NOTES_ASK: &str = "[context note: everything above this message except the original request is about to be removed from the conversation to keep requests small. Write the notes you will continue from. Reply with the notes alone: plain text, no tool call (a call in this reply does not run), at most 400 words and under 4,000 bytes in all: anything past 4,000 bytes is cut off and lost, so keep every part short. Use four labeled parts. State: what is finished and verified, what is half done, and the next step. Files: every path changed or still needed, with the names and places in it that matter. Facts: commands that work in this project, each failure seen with its cause, and every instruction the user gave after the original request, in the user's words; copy identifiers, paths and error text exactly. Open: what is unresolved or unverified. If a context note appears above, carry forward what still holds.]";
 
+/// What ends the ask the second time, after a reply that made a call.
+const NOTES_ONLY: &str = "[Your reply made a tool call, which did not run: no tool runs for this reply. Reply with the notes alone, in plain text.]";
+
 /// The notes request's messages: `head`, every message the cut removes, and
 /// the ask. The ask is stamped with the effort in force, as a turn's prompt
 /// is, so where a turn changed the effort and its prompt stays after the cut,
@@ -269,10 +272,10 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 /// order) and `NOTES_ASK`, with the turn's tools: a prompt the session
 /// already sent, so a prompt cache can serve all of it but the ask. Only the
 /// reply's text is taken, or, when a reply that ended on its own has no
-/// text and no call, its reasoning. A call in it never runs, nothing of this
-/// exchange is stored or shown, and an empty reply, an error, a cancel, a
-/// cut stream or a request the spend ceiling refuses gives no notes: the
-/// error says which, so a soft cut can report why it did not run.
+/// text and no call, its reasoning. A call never runs, and a reply with one gives no notes, text or not: on the
+/// reset's first ask (`first`) it is asked once more, ending in `NOTES_ONLY`, which spends the reset's asks.
+/// Nothing of this exchange is stored or shown. An empty reply, an error, a cancel, a cut stream or a request
+/// the spend ceiling refuses gives no notes too: the error says which, so a cut can report why it had none.
 ///
 /// Like every turn request it has no overall deadline, only the client's
 /// silence timeout: the notes are a full reply at the reply limit, which a
@@ -284,11 +287,11 @@ pub(crate) fn notes_messages(client: &ChatClient, head: &[ChatMessage], dropped:
 async fn summarize_compaction(
     ctx: &CompactionCtx<'_>,
     head: &[ChatMessage],
-    digest: &CompactionDigest,
+    digest: &CompactionDigest, first: &mut bool,
     spend: &mut RequestSpend,
 ) -> Result<(String, bool), String> {
     let CompactionCtx { core, session_id, client, cancelled, schemas, factor, .. } = *ctx;
-    let messages = notes_messages(client, head, &digest.dropped);
+    let mut messages = notes_messages(client, head, &digest.dropped);
     // In real tokens by the session's learned factor, as every request is
     // admitted, and by the route's estimator, which counts only what it sends.
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
@@ -307,19 +310,16 @@ async fn summarize_compaction(
             Err(error) => { spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(limit)); return Err(format!("the notes request failed: {}", crate::text::one_line(&error))); }
         };
         spend.record(core, session_id, estimated, &result);
+        // Asked again with the same request up to its last message, which a prompt cache has just stored.
+        if !result.tool_calls.is_empty() && *first && !cancelled.is_cancelled() && spend.admits(estimated) { *first = false; if let Some(ask) = messages.last_mut() { ask.content = Some(format!("{NOTES_ASK}\n\n{NOTES_ONLY}")); } continue; }
         let unwritten = result.finish_reason == "length" && crate::client::strip_leading_think(&result.content).unwrap_or_else(|| result.content.clone()).trim().is_empty();
         let room = (limit * 2).min(client.reply_bounds.0).min(client.reply_bounds.1.saturating_sub(1024 + estimated));
         if !(unwritten && limit == client.reply_reserve && room > limit && spend.admits(estimated)) { break result; }
         limit = room;
     };
-    if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" {
-        return Err(format!("the notes reply ended {}", result.finish_reason));
-    }
+    if result.finish_reason == TRUNCATED || result.finish_reason == "cancelled" { return Err(format!("the notes reply ended {}", result.finish_reason)); }
     let cut = result.finish_reason == "length";
-    let mut summary = result.content;
-    if let Some(clean) = crate::client::strip_leading_think(&summary) {
-        summary = clean;
-    }
+    let mut summary = crate::client::strip_leading_think(&result.content).unwrap_or(result.content);
     // Some models write the notes in their reasoning and end the reply with
     // no text. A reply that finished on its own with no call holds nothing
     // else, so its reasoning is the notes.
@@ -327,8 +327,8 @@ async fn summarize_compaction(
         summary = result.reasoning_content.or(result.reasoning).unwrap_or_default();
     }
     let summary = summary.trim().replace('\r', "");
-    if summary.is_empty() {
-        return Err(format!("the notes reply had no text (finish_reason {})", result.finish_reason));
+    if summary.is_empty() || !result.tool_calls.is_empty() {
+        return Err(format!("the notes reply {} (finish_reason {})", if result.tool_calls.is_empty() { "had no text" } else { "made a call" }, result.finish_reason));
     }
     Ok((summary, cut))
 }
@@ -503,15 +503,14 @@ pub(crate) async fn compact_messages(
     {
         return Err("compaction refused: the session transcript or its replay boundaries could not be saved".into());
     }
-    let summary = match summarize_compaction(ctx, &candidate[..slot], &digest, spend).await {
-        Ok((notes, cut)) => Some((notes, cut)),
-        Err(reason) if !force && total <= budget => {
-            if !ctx.cancelled.is_cancelled() {
-                ctx.core.send_agent(ctx.session_id, AgentEvent::CompactionSkipped { reason });
-            }
-            return Ok(0);
+    let mut first = total <= budget; // Within the budget, the reset's first ask: a cut that can wait for notes waits once.
+    let summary = match summarize_compaction(ctx, &candidate[..slot], &digest, &mut first, spend).await {
+        Ok(notes) => Some(notes),
+        Err(reason) => {
+            if !ctx.cancelled.is_cancelled() { ctx.core.send_agent(ctx.session_id, AgentEvent::CompactionSkipped { reason }); }
+            if !force && (first || (ctx.cancelled.is_cancelled() && total <= budget)) { return Ok(0); }
+            None // A hard limit, a spent second ask or a manual cut still cuts, on the deterministic digest.
         }
-        Err(_) => None, // A hard limit or manual cut still needs the deterministic digest.
     };
     if let Some(prior) = sessions::last_compaction(ctx.core, ctx.session_id) {
         digest.absorb_prior(&prior);
@@ -529,6 +528,7 @@ pub(crate) async fn compact_messages(
         data.persisted_count = candidate.len();
     }
     *messages = candidate;
+    if !force { ctx.core.send_agent(ctx.session_id, AgentEvent::Compacted { tokens_before: to_real(total, ctx.factor), tokens_after: to_real(schema_tokens + messages.iter().map(ctx.estimate).sum::<usize>(), ctx.factor), compacted_messages: dropped }); }
     if let Ok(value) = serde_json::to_value(&record) {
         let failures = ctx.hooks.compaction(ctx.session_id, ctx.project_root, &value, ctx.cancelled).await;
         report_hook_failures(ctx.core, ctx.session_id, failures);
@@ -1914,12 +1914,17 @@ pub(crate) mod tests {
             compact_messages(&self.ctx(), messages, trigger, budget, 0, false, spend).await.unwrap()
         }
 
-        /// The reasons of the skipped cuts reported so far.
+        /// The reasons of the notes not written reported so far.
         fn skipped(&self) -> Vec<String> {
-            let mut events = self.events.lock().unwrap();
-            std::iter::from_fn(|| events.try_recv().ok())
-                .filter_map(|env| match env.event { AgentEvent::CompactionSkipped { reason } => Some(reason), _ => None })
+            self.reported().into_iter()
+                .filter_map(|event| match event { AgentEvent::CompactionSkipped { reason } => Some(reason), _ => None })
                 .collect()
+        }
+
+        /// The events about the cut reported so far, usage aside.
+        fn reported(&self) -> Vec<AgentEvent> {
+            let mut events = self.events.lock().unwrap();
+            std::iter::from_fn(|| events.try_recv().ok()).map(|env| env.event).filter(|e| !matches!(e, AgentEvent::Usage { .. })).collect()
         }
 
         /// Whether a cut committed anything: an archive line, a record, or a
@@ -2157,35 +2162,66 @@ pub(crate) mod tests {
         assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
     }
 
-    /// The notes are the reply's text. A call beside it never runs, and
-    /// nothing of the exchange is kept: not the call, not the ask.
+    /// A reply that makes a call gives no notes, whatever text is beside it:
+    /// a sentence written before a call is not the notes. A cut that could
+    /// wait asks once more, and when that reply makes a call too, the reset
+    /// has spent its two asks and cuts on the digest, saying why.
     #[tokio::test]
-    async fn notes_beside_a_call_are_kept_and_the_call_is_not() {
-        let (url, _requests) = crate::client::tests::spawn_recording_once(reply("State: wired the parser.", true));
+    async fn text_beside_a_call_is_not_the_notes() {
+        let preamble = reply("Let me re-read the file first.", true);
+        let (url, requests) = serve_in_order(vec![preamble.clone(), preamble]);
+        let fixture = Fixture::new(&url);
+        let mut messages = session(60, 2_000);
+        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0, "the second ask is spent: the cut lands");
+        let note = messages[pinned_head(&messages)].content.clone().unwrap();
+        assert!(!note.contains("Summary:") && !note.contains("re-read"), "{note}");
+        assert_eq!(fixture.skipped(), ["the notes reply made a call (finish_reason tool_calls)"]);
+        assert_eq!(requests.try_iter().count(), 2, "asked twice, not more");
+    }
+
+    /// A reply that makes a call is asked once more, with the same request
+    /// but for its last message: the ask, then `NOTES_ONLY`. Notes that then
+    /// arrive are the cut's, and nothing of either exchange is kept: not the
+    /// call, not the asks.
+    #[tokio::test]
+    async fn a_reply_with_a_call_is_asked_once_more_for_the_notes_alone() {
+        let (url, requests) = serve_in_order(vec![reply("Let me re-read the file first.", true), reply("State: wired the parser.", false)]);
         let fixture = Fixture::new(&url);
         let mut messages = session(60, 2_000);
         let dropped = fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await;
         assert!(dropped > 0);
         let note = messages[pinned_head(&messages)].content.clone().unwrap();
-        assert!(note.contains("Summary: State: wired the parser."), "{note}");
+        assert!(note.contains("Summary: State: wired the parser.") && !note.contains("re-read"), "{note}");
+        let (asked, mut again) = (requests.try_recv().unwrap(), requests.try_recv().unwrap());
+        let last = again["messages"].as_array().unwrap().len() - 1;
+        assert_eq!(again["messages"][last]["content"], format!("{NOTES_ASK}\n\n{NOTES_ONLY}"));
+        again["messages"][last]["content"] = NOTES_ASK.into();
+        assert_eq!(again, asked, "the request is the same but for the ask's text");
+        assert!(requests.try_recv().is_err() && fixture.skipped().is_empty(), "two asks, and notes");
         let archive = sessions::load_archive(&fixture.core, &fixture.id);
         assert_eq!(archive.len(), dropped, "the archive holds what the cut removed and nothing else");
         let leaked = |m: &ChatMessage| {
-            m.content.as_deref() == Some(NOTES_ASK)
+            m.content.as_deref().is_some_and(|c| c.starts_with(NOTES_ASK))
                 || m.tool_call_id.as_deref() == Some("notes_call")
                 || m.tool_calls.iter().flatten().any(|call| call.id == "notes_call")
         };
         assert!(!messages.iter().chain(&archive).any(leaked), "the notes exchange was stored");
     }
 
-    /// A hard cut lands on its deterministic digest even without notes.
+    /// A hard cut lands on its deterministic digest even without notes, and
+    /// says why it had none, then what it cut.
     async fn assert_digest_cut_without_notes(url: &str, spend: &mut RequestSpend) {
         let fixture = Fixture::new(url);
         let mut messages = session(60, 2_000);
-        assert!(fixture.cut(&mut messages, 20_000, 20_000, spend).await > 0, "the hard limit forces the cut");
+        let before = tokens(&messages);
+        let dropped = fixture.cut(&mut messages, 20_000, 20_000, spend).await;
+        assert!(dropped > 0, "the hard limit forces the cut");
         let note = messages[pinned_head(&messages)].content.clone().unwrap();
         assert!(note.contains("Tools used: read_file.") && !note.contains("Summary:"), "{note}");
-        assert!(fixture.committed() && fixture.skipped().is_empty(), "the archive, the record and the hook, and no skip");
+        assert!(fixture.committed(), "the archive, the record and the hook");
+        let reported = fixture.reported();
+        assert!(matches!(&reported[..], [AgentEvent::CompactionSkipped { .. }, AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages }]
+            if (*tokens_before, *tokens_after, *compacted_messages) == (before, tokens(&messages), dropped)), "{reported:?}");
     }
 
     /// An endpoint that answers successive connections with the given whole

@@ -758,8 +758,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Keeping a Chat Completions refusal as the reply adds 20 lines and
     // refusing a model with no context window adds 7; folding nested checks
     // into one condition in the stream reader and eight other places saves 27.
-    // Sending the notes request with the turn's tool choice and asking again
-    // after a skipped cut save 4 lines and lower the ceiling by 4.
+    // Sending the notes request with the turn's tool choice, asking again
+    // after a skipped cut or a reply that makes a call, and reporting each
+    // cut a turn makes save 4 lines and lower the ceiling by 4.
     const BASELINE: usize = 45_593;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
