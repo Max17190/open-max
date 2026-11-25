@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socketserver
 import subprocess
 import threading
 
@@ -18,6 +19,19 @@ TASK = "Make greet.sh print hello."
 CHECK = 'test "$(sh greet.sh)" = hello || { echo "greet.sh printed: $(sh greet.sh)"; exit 1; }'
 DONE = {"text": "Done."}
 FIX = {"tool": "write_file", "args": {"path": "greet.sh", "content": "echo hello\n"}}
+
+
+class LoopbackServer(ThreadingHTTPServer):
+    """A server on loopback that skips the reverse lookup of its own address.
+
+    HTTPServer.server_bind names the server by `socket.getfqdn(host)`, a
+    reverse DNS lookup that nothing here reads, and on CI's macos-latest that
+    lookup of 127.0.0.1 has taken about 35 seconds.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def run(argv, cwd, env, code=0):
@@ -57,7 +71,7 @@ def endpoint(replies):
             self.end_headers()
             self.wfile.write(body)
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Endpoint) as server:
+    with LoopbackServer(("127.0.0.1", 0), Endpoint) as server:
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         try:

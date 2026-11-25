@@ -6,12 +6,26 @@ Build both commits locally. This comparison uses a loopback endpoint only.
 import json
 import os
 import shutil
+import socketserver
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
+
+
+class LoopbackServer(HTTPServer):
+    """A server on loopback that skips the reverse lookup of its own address.
+
+    HTTPServer.server_bind names the server by `socket.getfqdn(host)`, a
+    reverse DNS lookup that nothing here reads, and on CI's macos-latest that
+    lookup of 127.0.0.1 has taken about 35 seconds.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def tool(name, arguments):
@@ -74,7 +88,7 @@ def capture(server, root, binary):
 
 
 def main(base, candidate):
-    with TemporaryDirectory() as tmp, HTTPServer(("127.0.0.1", 0), Endpoint) as server:
+    with TemporaryDirectory() as tmp, LoopbackServer(("127.0.0.1", 0), Endpoint) as server:
         worker = Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
