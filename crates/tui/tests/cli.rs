@@ -3212,7 +3212,8 @@ fn a_print_turn_a_provider_filter_ended_exits_1() {
 
 /// A reply the model refused is no finished turn either, on each protocol
 /// that reports one: native Messages' `refusal` stop reason and a Responses
-/// refusal part each end the turn `refusal`, and print mode exits 1.
+/// refusal part each end the turn `refusal`, and print mode exits 1. Most of
+/// the reply limit spent first does not make it a cut, so nothing is asked again.
 #[test]
 fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
     let event = |value: serde_json::Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
@@ -3221,17 +3222,17 @@ fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I can't help with that"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
-        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":7}}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":900}}),
         serde_json::json!({"type":"message_stop"}),
     ].into_iter().map(event).collect::<String>();
     let responses = event(serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message",
-        "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":7}}}));
+        "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":900}}}));
     for (wire, reply) in [("anthropic", native), ("responses", responses)] {
         let (project, home) = fresh_dirs(&format!("refusal-{wire}"));
         let (base_url, requests, _server) = spawn_scripted_server(vec![(reply, true), (sse_text("asked again"), true)]);
         let dir = home.join(".openmax");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"auto"}"#).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"auto","max_tokens":1000}"#).unwrap();
         std::fs::write(dir.join("providers.json"), serde_json::json!({"providers":{"stub":{"base_url":base_url,"wire_api":wire,
             "models":[{"id":"stub-model","context_tokens":16384}]}}}).to_string()).unwrap();
         let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "say hi"]).output().unwrap();
