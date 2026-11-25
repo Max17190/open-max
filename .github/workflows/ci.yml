@@ -38,14 +38,27 @@ env:
 # pinned to a dated master commit and given its toolchain as an input.
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.partition }})
     runs-on: ${{ matrix.os }}
     strategy:
       # A failure on one runner cancels nothing on the other, so each
       # runner's failures are all shown, as the ci profile shows a run's.
       fail-fast: false
+      # macos-latest's three cores ran the tests for 73 seconds after a
+      # 57-second build, the longest test job, so its tests are split in two
+      # by nextest's hash of each test's name, one half on each of two
+      # runners; ubuntu-latest runs them all in one (`1/1`). Every test runs
+      # on each runner, in exactly one of its jobs.
       matrix:
         os: [ubuntu-latest, macos-latest]
+        partition: [1/1, 1/2, 2/2]
+        exclude:
+          - os: ubuntu-latest
+            partition: 1/2
+          - os: ubuntu-latest
+            partition: 2/2
+          - os: macos-latest
+            partition: 1/1
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -104,7 +117,7 @@ jobs:
       # runner has cores, under the ci profile of .config/nextest.toml:
       # every failure shown, none run again, a hung test stopped.
       - name: Test
-        run: cargo nextest run --workspace --locked --profile ci
+        run: cargo nextest run --workspace --locked --profile ci --partition hash:${{ matrix.partition }}
 
       # The doc tests, which nextest does not run.
       - name: Doc tests
