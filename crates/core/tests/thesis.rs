@@ -1016,7 +1016,7 @@ async fn cacheable_share_case(gate: &str, wire: WireApi, ratchet: f64, billed_ra
     // On every wire the note after the cut says the edits are on disk and
     // points at the working tree before any edit, and every later request
     // carries it.
-    const TREE: &str = "The removed messages are gone, but every edit you made is on disk as you left it: the files are the truth. \
+    const TREE: &str = "The removed messages are out of the conversation, but every edit you made is on disk as you left it: the files are the truth. \
         Before you edit a file, look at its current state (in a project under version control, its status and its diff \
         against where the work began show every change so far; otherwise open the file again), and do not redo work already there.";
     let pointed: Vec<usize> = (0..bodies.len()).filter(|&i| bodies[i].contains(TREE)).map(|i| i + 1).collect();

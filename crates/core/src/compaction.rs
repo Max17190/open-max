@@ -228,7 +228,7 @@ impl CompactionDigest {
         if let Some(path) = archive {
             parts.push(format!("Full dropped messages: {path} (bash: grep or tail it)."));
         }
-        parts.push("The messages after this note are unchanged and continue from it. The removed messages are gone, but every edit you made is on disk as you left it: the files are the truth. Before you edit a file, look at its current state (in a project under version control, its status and its diff against where the work began show every change so far; otherwise open the file again), and do not redo work already there.".into());
+        parts.push("The messages after this note are unchanged and continue from it. The removed messages are out of the conversation, but every edit you made is on disk as you left it: the files are the truth. Before you edit a file, look at its current state (in a project under version control, its status and its diff against where the work began show every change so far; otherwise open the file again), and do not redo work already there.".into());
         parts.join(" ")
     }
 
