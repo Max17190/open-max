@@ -68,7 +68,6 @@ pub(super) fn serialize(client: &ChatClient, messages: &[ChatMessage], limit: us
     let mut body = json!({"model":client.model,"input":input,"store":false,"stream":true,
         "include":["reasoning.encrypted_content"]});
     if !functions.is_empty() { body["tools"] = json!(functions); }
-    if client.notes_only.load(std::sync::atomic::Ordering::Relaxed) && tools != "[]" && !tools.is_empty() { body["tool_choice"] = json!("none"); }
     if let Some(effort) = effort {
         body["reasoning"] = json!({"effort": effort});
     }
@@ -581,9 +580,8 @@ mod tests {
         }
         let earlier: Value = serde_json::from_slice(&serialize(&client, &history, client.reply_reserve, "[]").unwrap()).unwrap();
         client.reasoning_effort = Some(High);
-        // The cut keeps the newest turn's prompt and removes all but the opening.
-        let (head, dropped) = (&history[..3], &history[3..]);
-        let notes = crate::compaction::notes_messages(&client, head, dropped);
+        // The notes request sends the whole history, then the ask.
+        let notes = crate::compaction::notes_messages(&client, &history);
         let sent: Value = serde_json::from_slice(&serialize(&client, &notes, client.reply_reserve, "[]").unwrap()).unwrap();
         assert_eq!(sent["reasoning"], earlier["reasoning"], "the top names the effort the conversation opened with");
         let (input, before) = (sent["input"].as_array().unwrap(), earlier["input"].as_array().unwrap());

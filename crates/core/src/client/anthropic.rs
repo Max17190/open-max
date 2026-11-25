@@ -98,7 +98,7 @@ pub(super) fn serialize(client: &ChatClient, messages: &[ChatMessage], limit: us
     }
     if !functions.is_empty() {
         body["tools"] = json!(functions);
-        body["tool_choice"] = json!({"type": if client.notes_only.load(std::sync::atomic::Ordering::Relaxed) { "none" } else { "auto" }});
+        body["tool_choice"] = json!({"type": "auto"});
     }
     if let Some(temperature) = client.temperature {
         body["temperature"] = json!(temperature);

@@ -436,7 +436,7 @@ async fn run_compact(
     let should_cut = tokens_before > cut_target(trigger, keep, schema_tokens, guard.messages(), &estimate);
     let compacted_messages = if should_cut {
         let hooks = Hooks::discover_for_mode(project_root, &core.data_dir, core.approval_mode(project_root));
-        let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor, keep };
+        let ctx = CompactionCtx { core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled, schemas: &schemas_wire, factor, keep, waited: false };
         compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, true, &mut RequestSpend::new(settings.max_agent_tokens)).await
     } else {
         Ok(0)
@@ -713,7 +713,7 @@ async fn run_loop(
     let (mut at_reserve, mut reserve_only, mut reserve_refusal) = (false, false, None);
     // A reply cut inside a call or its text gets room once. A refusal or spent room means asking for the rest in parts.
     let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
-    let mut soft_spent = false; // A cut without notes waits for the window; a cut clears it.
+    let mut soft_spent = None::<usize>; // After a cut without notes, the size it was asked at: the next waits until the history grows a quarter of the trigger past it (at most what a cut keeps), then cuts on the digest if notes fail again; a cut clears it.
     let mut image_refusal: Option<String> = None;
 
     'turns: for iteration in 0..max_iterations {
@@ -743,21 +743,22 @@ async fn run_loop(
                 .await;
         }
         let keep = requested_keep(settings.compaction_keep_tokens, prompt_ratio);
-        let trigger = if soft_spent { budget } else { compaction_trigger(
+        let trigger = compaction_trigger(
             budget, schema_tokens, endpoint.compaction_tokens, keep, prompt_ratio, guard.messages(), &estimate,
-        ) };
+        );
+        let trigger = soft_spent.map_or(trigger, |at| at.saturating_add((trigger / 4).min(keep)).max(trigger).min(budget));
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep,
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep, waited: soft_spent.is_some(),
         };
         let compacted = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await;
-        if let Err(message) = compacted.map(|dropped| soft_spent &= dropped == 0) {
+        if let Err(message) = compacted.map(|dropped| if dropped > 0 { soft_spent = None }) {
             core.send_agent(session_id, AgentEvent::Error { message });
             stop_reason = "error".into();
             break 'turns;
         }
         let used = schema_tokens
             + guard.messages().iter().map(&estimate).sum::<usize>();
-        soft_spent |= used > trigger;
+        if used > trigger { soft_spent = Some(used) }
         let used_real = to_real(used, factor);
         // The ceiling refuses the request it cannot afford, not just the one
         // after it: what the turn has spent plus the request-side size of the
@@ -9537,10 +9538,10 @@ echo run >> {}
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// After a failed soft cut, the turn does not ask for notes again until
-    /// it needs to make room.
+    /// After a failed soft cut, the turn keeps its history whole and does
+    /// not ask for notes again until it has grown a quarter of the trigger.
     #[tokio::test]
-    async fn a_turn_without_notes_skips_the_soft_cut_until_the_window_forces_it() {
+    async fn a_turn_without_notes_waits_a_quarter_of_the_trigger_to_ask_again() {
         use crate::state::Core;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
@@ -9549,8 +9550,8 @@ echo run >> {}
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("a.txt"), "hello\n").unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
-        // Every reply is a call with no text, the notes request's included.
-        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        // Every reply is a call, and every notes request is refused.
+        let (base_url, requests) = refusing_endpoint(&[TOOL_SSE], |_, body| body.contains(crate::compaction::NOTES_ASK).then_some(400)).await;
         {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
@@ -9571,15 +9572,16 @@ echo run >> {}
 
         start_turn(core.clone(), id.clone(), project, "keep reading".into()).unwrap();
         assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
-        assert_eq!(*requests.lock().unwrap(), 6 + 1, "six turn requests and one notes request");
+        assert_eq!(requests.lock().unwrap().len(), 6 + 1, "six turn requests and one notes request");
         assert!(!transcript(&core, &id).await.iter().any(is_digest_message), "history stays live without notes");
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A cut the window forces returns the turn to its configured trigger: a
-    /// turn whose notes request once came back empty asks again once its
-    /// history crosses the trigger after that cut, rather than growing to the
-    /// window between every later cut.
+    /// A cut without notes returns the turn to its configured trigger: a turn
+    /// whose notes request once failed asks again a quarter of the
+    /// trigger later, cuts on the digest when that fails too, and asks again
+    /// once its history crosses the trigger after that cut, rather than
+    /// growing to the window between every later cut.
     #[tokio::test]
     async fn a_cut_that_lands_restores_the_configured_trigger() {
         use crate::state::Core;
@@ -9593,8 +9595,8 @@ echo run >> {}
         let lines: String = (0..130).map(|i| format!("{i:05} {}\n", "x".repeat(60))).collect();
         std::fs::write(project.join("a.txt"), lines).unwrap();
         crate::trust::trust_project(&core.data_dir, &project).unwrap();
-        // Every reply is a call with no text, the notes request's included.
-        let (base_url, requests) = counting_endpoint(TOOL_SSE).await;
+        // Every reply is a call, and every notes request is refused.
+        let (base_url, requests) = refusing_endpoint(&[TOOL_SSE], |_, body| body.contains(crate::compaction::NOTES_ASK).then_some(400)).await;
         {
             let mut s = core.settings.lock().unwrap();
             s.base_url = base_url;
@@ -9615,11 +9617,12 @@ echo run >> {}
 
         start_turn(core.clone(), id.clone(), project, "keep reading".into()).unwrap();
         assert_eq!(drive_turn(&mut rx).await.0, "max_iterations");
-        assert!(transcript(&core, &id).await.iter().any(is_digest_message), "the window forced a cut");
-        // The first soft cut gets no notes, the window forces a cut (its own
-        // notes request), and the history then crosses the configured
-        // trigger again: one more notes request, not none.
-        assert_eq!(*requests.lock().unwrap() - ITERATIONS, 3, "three notes requests");
+        assert!(transcript(&core, &id).await.iter().any(is_digest_message), "a cut landed on the digest");
+        // The first soft cut gets no notes, the second, a quarter of the
+        // trigger later, cuts on the digest, and the history then crosses the
+        // configured trigger again and does the same: five notes requests,
+        // where waiting for the window between cuts made three.
+        assert_eq!(requests.lock().unwrap().len() - ITERATIONS, 5, "five notes requests");
         let _ = std::fs::remove_dir_all(dir);
     }
 
