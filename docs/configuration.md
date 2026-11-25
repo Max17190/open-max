@@ -545,7 +545,11 @@ it is writes nothing.
 
 `/permissions` opens a picker; `/permissions
 auto|ask|readonly` selects directly. The approval card also offers **Auto for
-project**. From a shell, `openmax --permissions auto|ask|readonly` selects for
+project**. A card left unanswered for 10 minutes declines the call as timed
+out, and the model is told to stop and summarize what it was about to do. To
+stop being asked about one command, such as `cargo test`, add an `allow` rule
+for it in `.openmax/permissions.toml` and approve the file once with
+`openmax --approve` (see [Permissions](extending.md#permissions)). From a shell, `openmax --permissions auto|ask|readonly` selects for
 the project it runs in, and says what it saved or that the mode was already
 saved. With `-p`, `--stdio` or `--subagent` the run goes on under the new mode;
 alone it ends once the mode is saved. It combines with the flags

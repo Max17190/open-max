@@ -1536,6 +1536,8 @@ mod first_frame {
         s.write(b"\x1b[6~");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("ctrl+f") && !shown.contains("Key bindings"));
         assert!(shown.contains("ctrl+f") && !shown.contains("Key bindings"), "{shown}");
+        // Prompt history is kept per project, and the help says so.
+        assert!(shown.contains("search this project's") && !shown.contains("all projects"), "{shown}");
         s.write(b"\x1b[6~\x1b[6~");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Commands"));
         assert!(shown.contains("Commands"), "{shown}");

@@ -27,11 +27,12 @@ headless and stdio trust.
 | **@** | Mention a project file |
 | Mouse drag | Select transcript or prompt text |
 | Double / triple click | Select the word under the pointer · the whole logical line |
-| **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
+| **Ctrl+C**, or **y** in the conversation | Copy selected text (in the prompt **y** types itself; without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved, and switching sessions restores the previous setting. `/effort` saves a level unless the endpoint is a temporary launch override. Inside a picker, select the previous row |
+| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved, and switching sessions restores the previous setting. `/effort` saves a level unless the endpoint is a temporary launch override. Inside the model picker or a completion list, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
+| **Ctrl+R** | Search this project's prompt history (each project keeps its own) |
 | **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
 
 ## Slash commands
@@ -57,7 +58,7 @@ headless and stdio trust.
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint, cache, performance, privacy, and network details |
 | `/update` | Update to the latest release, then resume this session in it |
-| `/quit` | Exit |
+| `/quit` · `/exit` | Exit |
 
 Turn `n` of `/rewind` is the `n`th prompt you sent that ran and stayed in
 the transcript, cut where it finished: a completion gate's refusal and
