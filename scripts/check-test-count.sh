@@ -25,7 +25,7 @@
 # script reports how far there is to go and passes.
 set -u -o pipefail
 
-linux_floor=1935
+linux_floor=1937
 macos_floor=1924
 target=2000
 
