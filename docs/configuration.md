@@ -308,7 +308,10 @@ and the run that writes a key already uses it.
   estimate between calibrations. The price is a larger context on every
   request while no cut fires. To keep more or less
   history on a model, set the cap in that model's entry and leave the
-  global setting unset.
+  global setting unset. The value is where a turn's first automatic cut
+  fires, not a strict cap: each cut doubles the size the turn's next cut
+  waits for, up to the default (see
+  [context window and compaction](#context-window-and-compaction)).
 
 - `compaction_keep_tokens` (default unset) sets the most an automatic cut or
   `/compact` keeps of the newest exchanges, its context note included. Unset
@@ -501,6 +504,22 @@ falls back to the input budget. The `/compact` command makes the same cut
 against the calibrated trigger and uses the input budget if the frozen
 schemas alone fill the trigger.
 
+Each automatic cut a turn makes doubles the size the turn's next cut waits
+for, so a turn cuts first at `compaction_tokens`, then at twice it, then at
+four times it, and so on. A cut costs requests, as the model re-reads what
+it removed, and a fixed size cut a long task again every time its history
+grew back, so the number of cuts and the work they repeat grew with the
+task's length. Doubled, the number of cuts grows only with its logarithm,
+and the work a cut repeats stays a bounded share of the turn's. The size
+grows at most to the larger of the value and the default, four fifths of the
+window, which keeps the fifth the default leaves for the reply, the next
+round and the cut's own notes request; unset, the value is the default, so
+it never grows. Each new turn starts again at the value.
+A growing size also means a cut keeps more: a quarter of the doubled size,
+up to the same 20,000 tokens or `compaction_keep_tokens`. A cut that waits
+for notes asks again a quarter of the size in force later, and a cut that
+does not land does not double it.
+
 A compaction is one cut. It keeps, byte for byte, the system prompt, the
 opening of the conversation through your original request, the prompt of the
 turn in progress, and the newest exchanges. It aims to fit the note, that
@@ -687,8 +706,9 @@ Two cases call for setting these yourself:
   long requests would pay the higher rate; `"compaction_tokens": 190000` in
   that model's entry cuts before most requests reach the step. It is not a
   price limit: the round that crosses the trigger and the cut's own notes
-  request can still pass the step, and a cut that cannot reach its target
-  waits for the input budget.
+  request can still pass the step, a cut that cannot reach its target
+  waits for the input budget, and after a turn's first cut the next waits
+  for twice the value, so the later requests of a long turn pass the step.
 - When a provider accepts less input than the model's advertised window,
   set `context_tokens` to that maximum input, not the advertised window. For
   example, a model advertised at 1,000,000 tokens served with at most

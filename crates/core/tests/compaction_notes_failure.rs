@@ -461,3 +461,59 @@ async fn the_notes_request_is_the_next_request_plus_the_ask_on_every_wire() {
         assert!(next.len() > before.len() + 1, "{wire}: the newest exchange rides the notes request");
     }
 }
+
+/// The size each automatic cut of a turn fired at, from its `compacted` event.
+fn cut_sizes(events: &[AgentEvent]) -> Vec<usize> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Compacted { tokens_before, .. } => Some(*tokens_before),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each cut a turn makes doubles the size the next one waits for: a turn of
+/// reads of about 1,000 tokens each, under a `compaction_tokens` of 20,000,
+/// cuts at 20,000, then 40,000, then 80,000, each within one read of its
+/// size, where a fixed size cut every time the history grew back to 20,000.
+/// Every reply is a call, the notes replies' included, so each cut lands on
+/// the digest after its second ask. The next turn starts again from the
+/// configured size: the history the first turn left, under the size its
+/// fourth cut would have waited for, is cut on the next turn's first request.
+#[tokio::test]
+async fn each_cut_doubles_the_size_the_next_waits_for_until_the_turn_ends() {
+    const SETTING: usize = 20_000;
+    const READS: usize = 130;
+    let mut replies: Vec<WireReply> = (0..READS + 6).map(|n| read_call(&format!("read-{n}"), &format!("big-{n}.txt"))).collect();
+    replies.extend([answer("State: second turn."), answer("The second reply.")]);
+    let (url, requests) = common::recording_http_script(replies).await;
+    let scratch = Scratch::new(&url, "chat_completions");
+    let settings_path = scratch.0.join("data/settings.json");
+    let mut settings: Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings["compaction_tokens"] = json!(SETTING);
+    settings["max_agent_iterations"] = json!(READS);
+    sessions::write_atomic(&settings_path, settings.to_string()).unwrap();
+    let project = scratch.0.join("project");
+    for n in 0..READS + 6 {
+        let lines: String = (0..52).map(|i| format!("{n:03}{i:02} {}\n", "c".repeat(66))).collect();
+        sessions::write_atomic(&project.join(format!("big-{n}.txt")), lines).unwrap();
+    }
+    let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
+    let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+
+    let first = common::drive_turn(&core, &mut rx, &id, &project, TASK).await;
+    let sizes = cut_sizes(&first);
+    assert_eq!(sizes.len(), 3, "three cuts in {READS} reads: {sizes:?}");
+    for (k, &size) in sizes.iter().enumerate() {
+        let at = SETTING << k;
+        assert!(size > at && size <= at + 1_200, "cut {k} fired at {size}, not within one read past {at}: {sizes:?}");
+    }
+    assert_eq!(requests.lock().unwrap().len(), READS + 6, "each cut asked twice for notes");
+
+    let second = common::drive_turn(&core, &mut rx, &id, &project, STEER).await;
+    let sizes = cut_sizes(&second);
+    assert!(matches!(sizes[..], [size] if size > SETTING && size < SETTING << 3), "the next turn cuts at the configured size again: {sizes:?}");
+    assert!(requests.lock().unwrap().last().unwrap().contains("Summary: State: second turn."));
+    common::close(&core, &id).await;
+}
