@@ -1526,11 +1526,19 @@ fn reference_machine() -> bool {
 /// 0.14 in a quiet run). After: 2.77 to 2.91 ms, 2.71 to 2.72 times its
 /// floor, about 55M instructions (registry 1.51 ms, prompt 0.29, hooks 0.45,
 /// permissions 0.40, templates 0.14). A release build asserts the 10 ms
-/// target on the median everywhere and, on a machine of the reference
-/// machine's class (`reference_machine`), where the ratio was measured, a
-/// ratchet on it 10% over 2.88, its highest with no other work on the same
-/// cores, rounded up to a tenth; elsewhere, CI's runners included, it prints
-/// the ratio. A debug build asserts a 20x sanity bound on the median.
+/// target on the median and, on a machine of the reference machine's class
+/// (`reference_machine`), where the ratio was measured, a ratchet on it 10%
+/// over 2.88, its highest with no other work on the same cores, rounded up
+/// to a tenth. On another Mac, CI's macos-latest among them, the shared
+/// runner's own speed decides the median: over 31 runs on macos-latest from
+/// 2026-11-23 to 2026-11-24 it spanned 3.80 to 10.08 ms, past the target
+/// once with a ratio of 3.95, while the ratio stayed within 3.81 to 4.56. So
+/// there a release build asserts a ratchet on the ratio, 10% over 4.56,
+/// rounded up to a tenth, in place of the target; a change that adds work
+/// moves the ratio as it moves the median. Elsewhere, ubuntu-latest
+/// included, whose medians spanned 2.65 to 4.89 ms, it asserts the target
+/// and prints the ratio. A debug build asserts a 20x sanity bound on the
+/// median.
 /// The test holds the statements in docs/development.md of the target and the ratchet.
 #[test]
 fn a_hundred_extensions_load_in_under_10_ms() {
@@ -1542,9 +1550,17 @@ fn a_hundred_extensions_load_in_under_10_ms() {
     use std::time::{Duration, Instant};
     const TARGET: Duration = Duration::from_millis(10);
     const RATIO_MEASURED: f64 = 2.88;
+    // The highest ratio of 31 release runs on CI's macos-latest, 2026-11-23
+    // to 2026-11-24, whose medians spanned 3.80 to 10.08 ms.
+    const MACOS_RUNNER_RATIO_MEASURED: f64 = 4.56;
     let ratchet = (RATIO_MEASURED * 1.1 * 10.0).ceil() / 10.0;
+    let runner_ratchet = (MACOS_RUNNER_RATIO_MEASURED * 1.1 * 10.0).ceil() / 10.0;
     let reference = reference_machine();
     let gated = reference && !cfg!(debug_assertions);
+    // Another Mac, CI's macos-latest among them: the shared runner's own
+    // speed moves the median load past the target with the harness's work
+    // unchanged, while the ratio holds, so the ratio is what it gates there.
+    let runner = cfg!(target_os = "macos") && !reference && !cfg!(debug_assertions);
     let runs = if cfg!(debug_assertions) { 5 } else { 101 };
     let (dir, data, project) = hundred_extensions();
     let load = || {
@@ -1698,16 +1714,23 @@ fn a_hundred_extensions_load_in_under_10_ms() {
         totals[runs / 10],
         totals[runs * 9 / 10],
         breakdown.join(", "),
-        match (reference, cfg!(debug_assertions)) {
-            (true, false) => "asserted: the reference machine's class in a release build",
-            (true, true) => "not asserted: a debug build",
-            (false, _) => "not asserted: not the reference machine's class",
+        match (reference, runner, cfg!(debug_assertions)) {
+            (true, _, false) => "asserted: the reference machine's class in a release build".to_string(),
+            (_, _, true) => "not asserted: a debug build".to_string(),
+            (false, true, false) => format!("not asserted: not the reference machine's class; this Mac's ratchet {runner_ratchet:.1} asserted instead"),
+            (false, false, false) => "not asserted: not a Mac".to_string(),
         },
         instructions.map_or("uncounted".to_string(), |n| (n / runs as u64).to_string()),
         if cfg!(debug_assertions) { "debug" } else { "release" },
     );
     if cfg!(debug_assertions) {
         assert!(total < TARGET * 20, "a debug load of 100 extensions took {total:?}, past the 20x sanity bound");
+    } else if runner {
+        assert!(
+            ratio <= runner_ratchet,
+            "a load of 100 extensions took {ratio:.2} times the time to read their files ({total:?} over {read:?}), over this \
+             Mac's ratchet of {runner_ratchet:.1}"
+        );
     } else {
         assert!(total <= TARGET, "a load of 100 extensions took {total:?}, past the {TARGET:?} target");
     }
@@ -1724,7 +1747,11 @@ fn a_hundred_extensions_load_in_under_10_ms() {
             "on a machine of the reference machine's class holds a load to at most {ratchet:.1} times the time to read their \
              files, 10% over the ratio of {RATIO_MEASURED} measured on efficiency cores alone, rounded up to a tenth"
         ),
-        "Elsewhere, CI's runners included, a release build prints the ratio, whose scale is the machine's own.".to_string(),
+        format!(
+            "On another Mac, CI's macos-latest among them, a release build holds the ratio to at most {runner_ratchet:.1}, 10% over \
+             {MACOS_RUNNER_RATIO_MEASURED}, the highest of 31 runs on macos-latest, rounded up to a tenth, in place of the 10 ms target"
+        ),
+        "Elsewhere a release build prints the ratio, whose scale is the machine's own.".to_string(),
     ] {
         assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     }
