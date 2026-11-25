@@ -3212,26 +3212,29 @@ fn a_print_turn_a_provider_filter_ended_exits_1() {
 
 /// A reply the model refused is no finished turn either, on each protocol
 /// that reports one: native Messages' `refusal` stop reason and a Responses
-/// refusal part each end the turn `refusal`, and print mode exits 1.
+/// refusal part each end the turn `refusal`, and print mode exits 1. Most of
+/// the reply limit spent first, or all of it, does not make it a cut, so
+/// nothing is asked again.
 #[test]
 fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
     let event = |value: serde_json::Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
-    let native = [
+    let native = |spent: u64| [
         serde_json::json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"stub-model","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I can't help with that"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
-        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":7}}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":spent}}),
         serde_json::json!({"type":"message_stop"}),
     ].into_iter().map(event).collect::<String>();
-    let responses = event(serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message",
-        "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":7}}}));
-    for (wire, reply) in [("anthropic", native), ("responses", responses)] {
-        let (project, home) = fresh_dirs(&format!("refusal-{wire}"));
-        let (base_url, _requests, _server) = spawn_scripted_server(vec![(reply, true)]);
+    let responses = |spent: u64| event(serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message",
+        "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":spent}}}));
+    for (wire, spent) in [("anthropic", 900), ("anthropic", 1000), ("responses", 900), ("responses", 1000)] {
+        let reply = if wire == "anthropic" { native(spent) } else { responses(spent) };
+        let (project, home) = fresh_dirs(&format!("refusal-{wire}-{spent}"));
+        let (base_url, requests, _server) = spawn_scripted_server(vec![(reply, true), (sse_text("asked again"), true)]);
         let dir = home.join(".openmax");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"auto"}"#).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"auto","max_tokens":1000}"#).unwrap();
         std::fs::write(dir.join("providers.json"), serde_json::json!({"providers":{"stub":{"base_url":base_url,"wire_api":wire,
             "models":[{"id":"stub-model","context_tokens":16384}]}}}).to_string()).unwrap();
         let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "say hi"]).output().unwrap();
@@ -3239,6 +3242,70 @@ fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
         assert_eq!(out.status.code(), Some(1), "{wire}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
         let done: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
         assert_eq!(done["stop_reason"], "refusal", "{wire}: {stdout}");
+        let answer = stdout.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|l| l["type"] == "message_done");
+        assert_eq!(answer.unwrap()["text"], "I can't help with that", "{wire}: {stdout}");
+        assert_eq!(requests.lock().unwrap().len(), 1, "{wire}: {stdout}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+/// A Chat Completions reply is a refusal when its `refusal` field has text
+/// and the model wrote no text and no call. Then the refusal is the answer,
+/// shown and stored, the turn ends `refusal` after one request, and print
+/// mode exits 1, whether or not the stream sends a finish reason, an empty
+/// `content` rides beside it, or a long thought came first (not a cut, so
+/// not asked again). An empty refusal is no refusal, and text wins over one.
+/// A call beside a refusal is the model acting: it runs, and the refusal is
+/// kept as that reply's text.
+#[test]
+fn a_chat_completions_refusal_is_the_answer_only_when_it_has_text_and_no_reply_beside_it() {
+    let chunk = |delta: serde_json::Value, finish: Option<&str>| serde_json::json!({"choices":[{"delta":delta,"finish_reason":finish}]});
+    let body = |message: serde_json::Value| serde_json::json!({"choices":[{"message":message,"finish_reason":"stop"}]}).to_string() + "\n";
+    let no = "I can't help with that";
+    let call = serde_json::json!([{"index":0,"id":"call_0","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]);
+    let thought = serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":10,"completion_tokens":905,"completion_tokens_details":{"reasoning_tokens":900}}});
+    let spent = serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1000}});
+    // Name, first reply; then the exit code, the stop reason, the first answer and the requests made.
+    let cases = [
+        ("streamed", sse(&[chunk(serde_json::json!({"content":null,"refusal":no}), None), chunk(serde_json::json!({}), Some("stop"))]), 1, "refusal", no, 1),
+        ("one body", body(serde_json::json!({"role":"assistant","content":null,"refusal":no})), 1, "refusal", no, 1),
+        ("empty content streamed", sse(&[chunk(serde_json::json!({"content":"","refusal":no}), Some("stop"))]), 1, "refusal", no, 1),
+        ("empty content in one body", body(serde_json::json!({"content":"","refusal":no})), 1, "refusal", no, 1),
+        ("no finish reason", sse(&[chunk(serde_json::json!({"refusal":no}), None)]), 1, "refusal", no, 1),
+        ("after a long thought", sse(&[chunk(serde_json::json!({"reasoning_content":"weighing it","refusal":no}), None), thought]), 1, "refusal", no, 1),
+        ("at the reply limit", sse(&[chunk(serde_json::json!({"refusal":no}), None), spent]), 1, "refusal", no, 1),
+        ("empty refusal streamed", sse(&[chunk(serde_json::json!({"content":"","refusal":""}), None),
+            chunk(serde_json::json!({"content":"Hello there."}), Some("stop"))]), 0, "stop", "Hello there.", 1),
+        ("empty refusal in one body", body(serde_json::json!({"content":"Hello there.","refusal":""})), 0, "stop", "Hello there.", 1),
+        ("text and a refusal", sse(&[chunk(serde_json::json!({"content":"Hello there."}), None),
+            chunk(serde_json::json!({"refusal":no}), Some("stop"))]), 0, "stop", "Hello there.", 1),
+        ("beside a call", sse(&[chunk(serde_json::json!({"content":"","refusal":no,"tool_calls":call}), Some("tool_calls"))]), 0, "stop", no, 2),
+    ];
+    for (name, reply, code, stop, text, made) in cases {
+        let (project, home) = fresh_dirs("chat-refusal");
+        let (base_url, requests, _server) = spawn_scripted_server(vec![(reply, true), (sse_text("done"), true)]);
+        let dir = home.join(".openmax");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"auto","max_tokens":1000}"#).unwrap();
+        std::fs::write(dir.join("providers.json"), serde_json::json!({"providers":{"stub":{"base_url":base_url,
+            "models":[{"id":"stub-model","context_tokens":16384}]}}}).to_string()).unwrap();
+        let out = cmd(&project, &home).args(["--trust-project", "--json", "-p", "say hi"]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(code), "{name}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+        let lines: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.last().unwrap()["stop_reason"], stop, "{name}: {stdout}");
+        let answer = lines.iter().find(|l| l["type"] == "message_done").unwrap();
+        assert_eq!(answer["text"], text, "{name}: {stdout}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), made, "{name}: {stdout}");
+        // Stored as the reply: on disk, and sent back with the call's result.
+        let id = lines[0]["session_id"].as_str().unwrap();
+        let stored = std::fs::read_to_string(dir.join("sessions").join(format!("{id}.messages.json"))).unwrap();
+        assert!(stored.contains(&format!("\"content\":{}", serde_json::json!(text))), "{name}: {stored}");
+        if made == 2 {
+            assert!(requests[1].contains(&format!("\"content\":{}", serde_json::json!(text))) && requests[1].contains("call_0"), "{name}");
+        }
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 }
@@ -7151,7 +7218,7 @@ fn flags_override_a_configured_install_for_this_run_only() {
     assert!(stdout.contains("stub says hi"), "the turn must use the flag's endpoint: {stderr}");
     assert!(
         stderr.contains(&format!(
-            "openmax: for this run only, the command line overrides base_url, api_key, context_tokens in {}; the file is unchanged, so set them there to keep them",
+            "openmax: for this run only, the command line sets base_url, api_key, context_tokens; they were not written to {}, so save them there to keep them",
             settings_path.display()
         )),
         "{stderr}"

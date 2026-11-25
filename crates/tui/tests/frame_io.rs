@@ -1003,6 +1003,8 @@ mod first_frame {
         assert_eq!(settings.model, "alpha");
     }
 
+    /// A disconnected provider cannot be picked, the connection made after
+    /// it answers, and a model it saved no window for is refused.
     #[test]
     fn a_disconnected_provider_cannot_be_picked_in_the_session_or_on_restart() {
         let base = endpoint(vec![LOGIN_CATALOG.into(), LOGIN_CATALOG.into(), LOGIN_REPLY.into()]);
@@ -1047,6 +1049,13 @@ mod first_frame {
         s.write(b"\rhello\r");
         let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("fixture reply"));
         assert!(shown.contains("fixture reply"), "{shown}");
+        // A model the connection saved no window for would fail at the next
+        // prompt, so /model refuses it and keeps the selection.
+        s.write(b"/model beta\r");
+        let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("no context window saved for beta"));
+        assert!(shown.contains("replacement has no context window saved for beta"), "{shown}");
+        assert!(!shown.contains("model set to beta"), "{shown}");
+        assert_eq!(open_max_core::config::load(&s.dir.join("home/.openmax")).unwrap().model, "alpha");
     }
 
     /// What a session that painted first has to say before it runs lands on
@@ -1469,12 +1478,13 @@ mod first_frame {
         s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
         s.write(b"ctx\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| {
-            shown.contains("use /new") && !shown.contains("esc to cancel")
+            shown.contains("use /compact or /new.") && !shown.contains("esc to cancel")
         });
         assert!(shown.contains("backend returned 400 Bad Request: Request rejected:"), "{shown}");
         assert!(shown.contains("maximum context length exceeded"), "{shown}");
         assert!(shown.contains("Check that context_tokens matches the served model."), "{shown}");
-        assert!(shown.contains("If the session is too long, use /new."), "{shown}");
+        // Compaction keeps the conversation, so it is named first.
+        assert!(shown.contains("If the session is too long, use /compact or /new."), "{shown}");
         s.write(b"/new\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("new session"));
         assert!(shown.contains("new session") && !shown.contains("maximum context length"), "{shown}");
@@ -1490,6 +1500,9 @@ mod first_frame {
         let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
         s.write(ANSWER);
         s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        // The idle screen points to the help, which lists keys and commands.
+        let idle = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("/help keys"));
+        assert!(idle.contains("/help keys and commands"), "{idle}");
         s.write(b"/help\r");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Key bindings"));
         assert!(shown.contains("Key bindings") && shown.contains("send"), "{shown}");
@@ -1497,6 +1510,8 @@ mod first_frame {
         s.write(b"\x1b[6~");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("ctrl+f") && !shown.contains("Key bindings"));
         assert!(shown.contains("ctrl+f") && !shown.contains("Key bindings"), "{shown}");
+        // Prompt history is kept per project, and the help says so.
+        assert!(shown.contains("search this project's") && !shown.contains("all projects"), "{shown}");
         s.write(b"\x1b[6~\x1b[6~");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Commands"));
         assert!(shown.contains("Commands"), "{shown}");

@@ -1717,7 +1717,7 @@ fn apply_endpoint_flags(core: &Core, cli: &CliArgs) -> Result<Vec<String>, Strin
     }
     if !applied.overridden.is_empty() {
         lines.push(format!(
-            "openmax: for this run only, the command line overrides {} in {}; the file is unchanged, so set them there to keep them",
+            "openmax: for this run only, the command line sets {}; they were not written to {}, so save them there to keep them",
             applied.overridden.join(", "),
             path.display()
         ));

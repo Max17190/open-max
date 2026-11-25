@@ -136,7 +136,7 @@ error or interrupted run may have no `done` event.
 | Code | Meaning and next step |
 | --- | --- |
 | 0 | Every turn finished. A warning such as a failed session save does not change this status. Read the answer and check the work. |
-| 1 | A run failed or could not start, could not open the session, or ended on a different stop reason such as `truncated`, `empty`, `blocked` or a provider's `content_filter`. Read the reported error or stop reason. |
+| 1 | A run failed or could not start, could not open the session, or ended on a different stop reason such as `truncated`, `empty`, `blocked`, a model's `refusal` or a provider's `content_filter`. Read the reported error or stop reason. |
 | 2 | A usage or configuration error before any turn, or `--continue` or `--session` could not find a session this directory can continue. Correct the command or settings. |
 | 3 | The project is untrusted, the process cannot grant trust or select `--permissions`, or a turn that otherwise finished declined an approval. Follow the trust or approval instruction on stderr. |
 | 4 | The turn stopped short with `length`, `max_iterations`, `budget_exhausted` or `unverified`. Use `openmax --continue -p "<follow-up>"` to continue. If a gate could not start or a hook failed closed, repair the hook first. |

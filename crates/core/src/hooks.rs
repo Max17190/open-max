@@ -699,10 +699,8 @@ impl Hooks {
         cwd: &Path,
         cancel: &Arc<CancelToken>,
     ) -> PreToolResult {
-        if let Some(reason) = self.fail_closed_reason() {
-            if !self.repairs_failed_hook(tool, args, cwd) {
-                return PreToolResult::Block { reason };
-            }
+        if let Some(reason) = self.fail_closed_reason().filter(|_| !self.repairs_failed_hook(tool, args, cwd)) {
+            return PreToolResult::Block { reason };
         }
         for hook in &self.pre {
             // A gate never gates its own repair: a broken one would otherwise

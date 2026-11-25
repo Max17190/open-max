@@ -836,12 +836,8 @@ fn validate_chatgpt(base: &str, wire: WireApi, extra_credentials: bool) -> Resul
 /// A provider's own key: its `api_key`, else the first non-empty variable
 /// its `api_key_env` names.
 fn provider_key(key: Option<&str>, env: &[String]) -> Option<String> {
-    if let Some(k) = key {
-        if let Some(v) = expand_secret(k) {
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
+    if let Some(v) = key.and_then(expand_secret).filter(|v| !v.is_empty()) {
+        return Some(v);
     }
     for name in env {
         if let Ok(v) = std::env::var(name) {

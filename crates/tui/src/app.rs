@@ -874,11 +874,9 @@ impl App {
                     }
                 }
                 "assistant" => {
-                    if let Some(text) = &m.content {
-                        if !text.trim().is_empty() {
-                            self.last_assistant_response = Some(text.clone());
-                            self.transcript.push_assistant(markdown::render(text));
-                        }
+                    if let Some(text) = m.content.as_ref().filter(|text| !text.trim().is_empty()) {
+                        self.last_assistant_response = Some(text.clone());
+                        self.transcript.push_assistant(markdown::render(text));
                     }
                     if let Some(calls) = &m.tool_calls {
                         // Tool results directly follow their assistant message;
@@ -1789,6 +1787,13 @@ impl App {
 
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
         let next = model_selection(&self.core.settings.lock().unwrap(), provider.clone(), model.clone());
+        // A model with no window would fail at the next prompt, so it is not saved. Its effort is checked after.
+        let sized = config::Settings { reasoning_effort: None, ..next.clone() };
+        let window = open_max_core::providers::resolve_endpoint(&sized, &self.core.data_dir);
+        if let (Some(name), Err(open_max_core::providers::ResolveError::MissingContextTokens)) = (&provider, window) {
+            let fix = format!("/login {name} saves one for a model the server lists, or set its context_tokens in providers.json");
+            return self.error(&format!("{name} has no context window saved for {model}, so the selection is unchanged: {fix}"));
+        }
         // The core's own save: it fingerprints the exact bytes it writes,
         // under its lock, so a TUI-authored save never reads as drift and a
         // racing external edit still does. Adopted in memory only on success.
@@ -2444,10 +2449,7 @@ impl App {
                             let _ = self.core.save_settings(&s);
                         }
                         self.refresh_connection();
-                        let ep = {
-                            let s = self.core.settings.lock().unwrap();
-                            open_max_core::providers::resolve(&s, &self.core.data_dir)
-                        };
+                        let ep = open_max_core::providers::resolve(&self.core.settings.lock().unwrap(), &self.core.data_dir);
                         match ep {
                             Ok(ep) => self.note(&format!(
                                 "provider {name} → {} ({})",
@@ -3155,7 +3157,7 @@ impl App {
                 self.dirty.mark_chrome();
                 let provider_error = message.starts_with("backend returned ") || message.starts_with("backend reported an error");
                 if provider_error && open_max_core::refused_for_length(&message) {
-                    self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /new."));
+                    self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /compact or /new."));
                 } else {
                     self.error(&message);
                 }
@@ -3897,7 +3899,7 @@ impl App {
         } else if self.quit_armed {
             "ctrl+c again to quit"
         } else {
-            "shift+tab effort · /permissions"
+            "/help keys and commands · shift+tab effort"
         };
         hint.into()
     }
@@ -3978,13 +3980,13 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("g / G in history", "top of scrollback · follow latest"),
     ("/ at the start", "command menu · tab or enter completes"),
     ("@", "mention a project file (fuzzy search)"),
-    ("ctrl+r", "search prompt history (all projects)"),
+    ("ctrl+r", "search this project's prompt history"),
     ("ctrl+f", "find in conversation"),
     ("n / N after find", "next or previous match in scrollback"),
     ("esc", "follow latest · cancel turn · return to composer"),
     ("wheel · pgup/pgdn", "scroll the conversation · over the prompt, the draft"),
     ("click in the prompt", "put the cursor there in a wrapped draft"),
-    ("mouse drag", "select transcript or prompt text · y or ctrl+c copies"),
+    ("mouse drag", "select text · ctrl+c copies (y too in the conversation)"),
     ("double / triple click", "select the word · the whole line"),
     ("ctrl+o / o", "expand a [pasted #N] under the cursor, else the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
@@ -5865,7 +5867,7 @@ mod tests {
             fs::write(
                 dir.join("providers.json"),
                 r#"{"providers":{"alpha":{"base_url":"http://alpha/v1",
-                   "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+                   "models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384},{"id":"three","context_tokens":16384}]}}}"#,
             )
             .unwrap();
             // No cache invalidation needed: the providers cache is keyed on
@@ -6328,6 +6330,8 @@ mod tests {
             "fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384}]},
             "empty":{"base_url":"http://127.0.0.1:9/v1"}
         }}).to_string()).unwrap();
+        // A connection with no catalog runs at the window settings give it.
+        app.core.settings.lock().unwrap().context_tokens = Some(16384);
         for (provider, current, expected) in [
             ("fixture", "one", "one"), ("fixture", "missing", "one"),
             ("fixture", "two", "two"), ("empty", "keep-exact", "keep-exact"),
@@ -6338,6 +6342,17 @@ mod tests {
             assert_eq!(settings.provider.as_deref(), Some(provider));
             assert_eq!(settings.model, expected);
         }
+        // A switch names the endpoint it resolved to, and one that cannot
+        // resolve says why.
+        assert!(app.transcript.export_text().contains("provider fixture → http://127.0.0.1:9/v1 (two)"));
+        fs::write(dir.join("providers.json"), json!({"providers":{
+            "fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384}]},
+            "empty":{"base_url":"http://127.0.0.1:9/v1"},
+            "blank":{"base_url":"","models":[{"id":"m","context_tokens":16384}]}
+        }}).to_string()).unwrap();
+        app.handle_submit("/provider blank".into()).await.unwrap();
+        assert!(app.transcript.export_text().contains("no model endpoint configured"));
+        app.handle_submit("/provider empty".into()).await.unwrap();
         app.handle_submit("/model fixture/exact/model".into()).await.unwrap();
         assert_eq!(app.core.settings.lock().unwrap().model, "fixture/exact/model");
         app.handle_submit("/model".into()).await.unwrap();
@@ -8894,7 +8909,7 @@ mod tests {
         fs::write(
             dir.join("providers.json"),
             r#"{"providers":{"alpha":{"base_url":"http://127.0.0.1:9/v1",
-               "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+               "models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384},{"id":"three","context_tokens":16384}]}}}"#,
         )
         .unwrap();
         app.handle_submit("/provider alpha".into()).await.unwrap();

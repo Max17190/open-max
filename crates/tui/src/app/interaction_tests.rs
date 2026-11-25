@@ -988,7 +988,7 @@ fn the_status_row_fits_each_width_and_redraws_when_it_changes() {
     };
     let wide = status(&mut app, 100);
     assert!(wide.ends_with("test-model  ask "), "{wide:?}");
-    assert!(wide.starts_with(" shift+tab effort · /permissions"), "{wide:?}");
+    assert!(wide.starts_with(" /help keys and commands · shift+tab effort"), "{wide:?}");
 
     // A narrower frame with nothing else changed still lays the row out
     // again for its own width.
@@ -1002,7 +1002,7 @@ fn the_status_row_fits_each_width_and_redraws_when_it_changes() {
     // Below 54 cells only the model is left, at most half the row.
     app.dirty = Dirty::default();
     let tight = status(&mut app, 30);
-    assert_eq!(tight, " shift+tab effort… test-model ");
+    assert_eq!(tight, " /help keys and c… test-model ");
     app.dirty = Dirty::default();
     assert_eq!(status(&mut app, 4), "te… ", "four cells hold a clipped model");
     app.dirty = Dirty::default();
