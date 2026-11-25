@@ -563,6 +563,7 @@ struct StreamDeltaJson {
     // cannot fail the whole chunk and the content beside it.
     reasoning_details: Option<Value>,
     tool_calls: Option<Vec<ToolCallDelta>>,
+    refusal: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1093,6 +1094,7 @@ async fn read_sse(
     let mut open_details = OpenDetails::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
+    let mut refused = false;
     // Did the server ever say it was done (a `[DONE]` line or a
     // finish_reason chunk)? Without one, the stream ending means the
     // connection dropped mid-answer, not that the model finished.
@@ -1221,14 +1223,15 @@ async fn read_sse(
                 }
             }
 
+            refused |= choice.delta.as_ref().is_some_and(|d| d.refusal.is_some());
             if let Some(reason) = choice.finish_reason {
                 // Servers that end a stream here and never send `[DONE]`
                 // are still finished: this is a terminator too.
                 saw_terminator = true;
-                finish_reason = reason;
+                finish_reason = if refused && reason == "stop" { "refusal".into() } else { reason };
             }
             let delta = choice.delta.unwrap_or_default();
-            if let Some(text) = delta.content {
+            if let Some(text) = delta.content.or(delta.refusal) {
                 if !text.is_empty() {
                     content.push_str(&text);
                     on_delta(StreamDelta::Content(text));
@@ -1469,7 +1472,7 @@ fn parse_complete_response(
         return Err(format!("response had no choices: {}", truncate(&v.to_string(), 400)));
     };
     let msg = &choice["message"];
-    let content = msg["content"].as_str().unwrap_or("").to_string();
+    let content = msg["content"].as_str().or(msg["refusal"].as_str()).unwrap_or("").to_string();
     if !content.is_empty() {
         on_delta(StreamDelta::Content(content.clone()));
     }
@@ -1493,10 +1496,10 @@ fn parse_complete_response(
         }
     }
     let tool_calls = finalize_tool_calls(partials);
-    let finish_reason = choice["finish_reason"]
-        .as_str()
-        .unwrap_or(if tool_calls.is_empty() { "stop" } else { "tool_calls" })
-        .to_string();
+    let finish_reason = match choice["finish_reason"].as_str().unwrap_or(if tool_calls.is_empty() { "stop" } else { "tool_calls" }) {
+        "stop" if msg["refusal"].is_string() => "refusal".to_string(),
+        reason => reason.to_string(),
+    };
     // The same empty reply the stream parser refuses above: a server that
     // ignores `stream` and answers in one JSON body can end it as a tool call
     // with nothing usable as one and no text, and returned as it came that

@@ -3211,8 +3211,11 @@ fn a_print_turn_a_provider_filter_ended_exits_1() {
 }
 
 /// A reply the model refused is no finished turn either, on each protocol
-/// that reports one: native Messages' `refusal` stop reason and a Responses
-/// refusal part each end the turn `refusal`, and print mode exits 1.
+/// that reports one: native Messages' `refusal` stop reason, a Responses
+/// refusal part and a Chat Completions `refusal` field, streamed or in one
+/// body, each end the turn `refusal` with the refusal as its answer, in one
+/// request, and print mode exits 1. Read as no reply, a Chat Completions
+/// refusal was dropped and asked again, and the next answer exited 0.
 #[test]
 fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
     let event = |value: serde_json::Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
@@ -3226,9 +3229,14 @@ fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
     ].into_iter().map(event).collect::<String>();
     let responses = event(serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message",
         "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":7}}}));
-    for (wire, reply) in [("anthropic", native), ("responses", responses)] {
+    let chat = sse(&[
+        serde_json::json!({"choices":[{"delta":{"role":"assistant","content":null,"refusal":"I can't help with that"},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+    ]);
+    let whole = serde_json::json!({"choices":[{"message":{"role":"assistant","content":null,"refusal":"I can't help with that"},"finish_reason":"stop"}]}).to_string() + "\n";
+    for (wire, reply) in [("anthropic", native), ("responses", responses), ("chat_completions", chat), ("chat_completions", whole)] {
         let (project, home) = fresh_dirs(&format!("refusal-{wire}"));
-        let (base_url, _requests, _server) = spawn_scripted_server(vec![(reply, true)]);
+        let (base_url, requests, _server) = spawn_scripted_server(vec![(reply, true), (sse_text("asked again"), true)]);
         let dir = home.join(".openmax");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.json"), r#"{"provider":"stub","model":"stub-model","approval_mode":"auto"}"#).unwrap();
@@ -3239,6 +3247,9 @@ fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
         assert_eq!(out.status.code(), Some(1), "{wire}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
         let done: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
         assert_eq!(done["stop_reason"], "refusal", "{wire}: {stdout}");
+        let answer = stdout.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|l| l["type"] == "message_done");
+        assert_eq!(answer.unwrap()["text"], "I can't help with that", "{wire}: {stdout}");
+        assert_eq!(requests.lock().unwrap().len(), 1, "{wire}: {stdout}");
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 }
