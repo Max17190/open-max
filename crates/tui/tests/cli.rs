@@ -3213,22 +3213,24 @@ fn a_print_turn_a_provider_filter_ended_exits_1() {
 /// A reply the model refused is no finished turn either, on each protocol
 /// that reports one: native Messages' `refusal` stop reason and a Responses
 /// refusal part each end the turn `refusal`, and print mode exits 1. Most of
-/// the reply limit spent first does not make it a cut, so nothing is asked again.
+/// the reply limit spent first, or all of it, does not make it a cut, so
+/// nothing is asked again.
 #[test]
 fn a_print_turn_the_model_refused_exits_1_on_each_protocol() {
     let event = |value: serde_json::Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
-    let native = [
+    let native = |spent: u64| [
         serde_json::json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"stub-model","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I can't help with that"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
-        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":900}}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":spent}}),
         serde_json::json!({"type":"message_stop"}),
     ].into_iter().map(event).collect::<String>();
-    let responses = event(serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message",
-        "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":900}}}));
-    for (wire, reply) in [("anthropic", native), ("responses", responses)] {
-        let (project, home) = fresh_dirs(&format!("refusal-{wire}"));
+    let responses = |spent: u64| event(serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message",
+        "role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that"}]}],"usage":{"input_tokens":10,"output_tokens":spent}}}));
+    for (wire, spent) in [("anthropic", 900), ("anthropic", 1000), ("responses", 900), ("responses", 1000)] {
+        let reply = if wire == "anthropic" { native(spent) } else { responses(spent) };
+        let (project, home) = fresh_dirs(&format!("refusal-{wire}-{spent}"));
         let (base_url, requests, _server) = spawn_scripted_server(vec![(reply, true), (sse_text("asked again"), true)]);
         let dir = home.join(".openmax");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3263,6 +3265,7 @@ fn a_chat_completions_refusal_is_the_answer_only_when_it_has_text_and_no_reply_b
     let call = serde_json::json!([{"index":0,"id":"call_0","type":"function","function":{"name":"bash","arguments":"{\"command\":\"true\"}"}}]);
     let thought = serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],
         "usage":{"prompt_tokens":10,"completion_tokens":905,"completion_tokens_details":{"reasoning_tokens":900}}});
+    let spent = serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1000}});
     // Name, first reply; then the exit code, the stop reason, the first answer and the requests made.
     let cases = [
         ("streamed", sse(&[chunk(serde_json::json!({"content":null,"refusal":no}), None), chunk(serde_json::json!({}), Some("stop"))]), 1, "refusal", no, 1),
@@ -3271,6 +3274,7 @@ fn a_chat_completions_refusal_is_the_answer_only_when_it_has_text_and_no_reply_b
         ("empty content in one body", body(serde_json::json!({"content":"","refusal":no})), 1, "refusal", no, 1),
         ("no finish reason", sse(&[chunk(serde_json::json!({"refusal":no}), None)]), 1, "refusal", no, 1),
         ("after a long thought", sse(&[chunk(serde_json::json!({"reasoning_content":"weighing it","refusal":no}), None), thought]), 1, "refusal", no, 1),
+        ("at the reply limit", sse(&[chunk(serde_json::json!({"refusal":no}), None), spent]), 1, "refusal", no, 1),
         ("empty refusal streamed", sse(&[chunk(serde_json::json!({"content":"","refusal":""}), None),
             chunk(serde_json::json!({"content":"Hello there."}), Some("stop"))]), 0, "stop", "Hello there.", 1),
         ("empty refusal in one body", body(serde_json::json!({"content":"Hello there.","refusal":""})), 0, "stop", "Hello there.", 1),
