@@ -102,7 +102,10 @@ of the flat endpoint flags. The named provider supplies the key and window.
 That command does not save the named selection. Repeat
 `--provider ci --model my-model` on each `openmax -p` command below, or save
 `"provider": "ci"` and `"model": "my-model"` in `$HOME/.openmax/settings.json`
-first. For the rules on which flags are saved and which override only the run, see
+first. A print run with neither, where no provider is selected and a saved
+connection has a base URL and a model, exits 2 and names the `--provider` and
+`--model` flags for each such connection. For the rules on which flags are
+saved and which override only the run, see
 [Settings from the command line](configuration.md#settings-from-the-command-line).
 
 A print run cannot ask for approval, so it declines every approval request.
