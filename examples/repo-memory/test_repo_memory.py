@@ -6,10 +6,25 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socketserver
 import subprocess
 import sys
 import tempfile
 import threading
+
+
+class LoopbackServer(ThreadingHTTPServer):
+    """A server on loopback that skips the reverse lookup of its own address.
+
+    HTTPServer.server_bind names the server by `socket.getfqdn(host)`, a
+    reverse DNS lookup that nothing here reads, and on CI's macos-latest that
+    lookup of 127.0.0.1 has taken about 35 seconds.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 
 EXAMPLE = Path(__file__).with_name("repo_memory.py")
 MEMORY = Path(".openmax/memory/repo-verification.md")
@@ -72,7 +87,7 @@ def mock_turn(binary, repo, home, read_recipe):
 
     home.mkdir()
     env = {"HOME": str(home), "PATH": os.defpath, "OPENMAX_HUMAN_ATTEST": "1"}
-    with ThreadingHTTPServer(("127.0.0.1", 0), Endpoint) as server:
+    with LoopbackServer(("127.0.0.1", 0), Endpoint) as server:
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         try:
