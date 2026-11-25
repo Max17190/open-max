@@ -20,7 +20,7 @@ pub use setup::{edit_catalog, read_catalog};
 /// request, and the drift of the token estimate between calibrations. The
 /// input budget still caps the trigger; a lower ceiling for a model is its
 /// entry's `compaction_tokens`.
-fn default_compaction_tokens(context_tokens: usize) -> usize {
+pub(crate) fn default_compaction_tokens(context_tokens: usize) -> usize {
     context_tokens.saturating_mul(4) / 5
 }
 
