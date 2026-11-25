@@ -988,10 +988,14 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
 /// and a file under a crate's tests/ is a target named after its stem), the
 /// binary's `thesis_frames` module where the runner gates one of its tests,
 /// and the first-frame test's baseline binary, an example that `cargo test`
-/// leaves unbuilt once a target is selected. The module's tests run from
-/// the binary's own unit-test harness, one more whole-program LTO unit, so
-/// a runner whose matrix entry reports them all (`frames: false`) neither
-/// builds nor runs it. Its gate step runs exactly every thesis test but the
+/// leaves unbuilt once a target is selected. Each runner splits those
+/// targets between two jobs by name (`tests: [thesis, thesis_rounds]`), so
+/// their whole-program LTO links run on two machines at once, and the two
+/// names are every thesis* test target, so none is left ungated. The
+/// module's tests run from the binary's own unit-test harness, one more
+/// whole-program LTO unit, so a runner whose matrix entry reports them all
+/// (`frames: false`) neither builds nor runs it, and one that gates them
+/// builds and runs it in its `thesis_rounds` job. Its gate step runs exactly every thesis test but the
 /// ones its runner reports, and fails the pull request when one fails. The Reports
 /// workflow runs the reported tests instead, every night, in release and one
 /// at a time on the same runners, from a matrix that lists the same tests;
@@ -1149,6 +1153,37 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
         let holding: Vec<&&str> = names.iter().filter(|name| name.contains(test)).collect();
         assert_eq!(holding, [&test], "the reported `{test}` names no thesis test, or the gate step skips more than it");
     }
+    // Each runner's thesis tests are split between two jobs by test target
+    // name, so their release links run on two machines at once: together
+    // the two names are every thesis* test target of the workspace, and the
+    // `thesis_rounds` job builds and runs the binary's unit-test harness.
+    let split = job
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("tests: [")?.strip_suffix(']').map(str::to_string))
+        .expect("the thesis job does not split its tests between jobs");
+    let split: Vec<&str> = split.split(", ").collect();
+    assert_eq!(split, ["thesis", "thesis_rounds"], "the thesis job's split changed");
+    // Every test target cargo knows whose name `--test 'thesis*'` would
+    // match, from the manifests: a tests/<name>/main.rs directory or a
+    // `[[test]]` entry counts as a file under tests/ does.
+    let metadata = Command::new(env!("CARGO"))
+        .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
+        .current_dir(repo())
+        .output()
+        .expect("cargo metadata runs");
+    assert!(metadata.status.success(), "cargo metadata failed: {}", String::from_utf8_lossy(&metadata.stderr));
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).expect("cargo metadata prints JSON");
+    let mut targets: Vec<String> = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata lists the packages")
+        .iter()
+        .flat_map(|package| package["targets"].as_array().cloned().unwrap_or_default())
+        .filter(|target| target["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|kind| kind == "test")))
+        .filter_map(|target| target["name"].as_str().filter(|name| name.starts_with("thesis")).map(str::to_string))
+        .collect();
+    targets.sort();
+    targets.dedup();
+    assert_eq!(targets, split, "a thesis* test target is in neither of the thesis job's splits, so no pull request gates it");
     let commands = |n: usize| -> Vec<&str> { steps[n].iter().skip_while(|line| **line != "run: |").skip(1).copied().collect() };
     // Exactly these, so no filter or skip of the step's own takes a test out
     // of it: only its runner's reported list does.
@@ -1156,8 +1191,8 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
         commands(gates),
         [
             "skip=; for test in ${{ matrix.reported }}; do skip=\"$skip --skip $test\"; done",
-            "cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1",
-            "if ${{ matrix.frames }}; then",
+            "cargo test --release --workspace --locked --test ${{ matrix.tests }} --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1",
+            "if ${{ matrix.frames && matrix.tests == 'thesis_rounds' }}; then",
             "cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1",
             "fi",
             "exit ${failed:-0}",
@@ -1203,7 +1238,7 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
     assert_eq!(
         commands(build),
         [
-            "cargo test --release --workspace --locked --no-run --test 'thesis*' ${{ matrix.frames && '--bin openmax' || '' }}",
+            "cargo test --release --workspace --locked --no-run --test ${{ matrix.tests }} ${{ matrix.frames && matrix.tests == 'thesis_rounds' && '--bin openmax' || '' }}",
             "cargo build --release --workspace --locked --example startup_baseline",
         ],
         "the thesis job does not build in release what its steps run and the baseline binary"
@@ -5236,11 +5271,12 @@ const ORPHANS_LISTING: &str = "zero-orphans-after-kill-9.txt";
 /// in that job, under a name per runner, fails when the file is missing once
 /// the gates have passed, and replaces it on a re-run of the job. After a
 /// failing gate it only warns of a missing file, as a release build that
-/// failed leaves none.
+/// failed leaves none, and the runner's `thesis_rounds` job, whose tests
+/// write none, uploads nothing.
 #[test]
 fn ci_keeps_the_orphan_listing_on_each_runner() {
     let job = ci_job("thesis");
-    let gate = "cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1";
+    let gate = "cargo test --release --workspace --locked --test ${{ matrix.tests }} --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1";
     let gates = job.iter().position(|line| line.trim() == gate).expect("the thesis job runs no thesis gates");
     let path = format!("path: target/tmp/{ORPHANS_LISTING}");
     let kept = job.iter().position(|line| line.trim() == path).expect("the thesis job keeps no orphan listing");
@@ -5250,7 +5286,7 @@ fn ci_keeps_the_orphan_listing_on_each_runner() {
     let wanted = [
         "if: ${{ !cancelled() }}",
         "name: zero-orphans-after-kill-9-${{ matrix.os }}",
-        "if-no-files-found: ${{ steps.gates.outcome == 'success' && 'error' || 'warn' }}",
+        "if-no-files-found: ${{ matrix.tests != 'thesis' && 'ignore' || steps.gates.outcome == 'success' && 'error' || 'warn' }}",
         "overwrite: true",
     ];
     for key in wanted {

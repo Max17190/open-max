@@ -221,14 +221,23 @@ jobs:
   # frame is held as a ratio to a baseline binary's start, as timed from the
   # spawn it includes the runner's own process start, which is not the
   # harness's work.
+  # Each runner's thesis tests are split between two jobs by test target
+  # name (`tests`), so their release links run on two machines at once:
+  # each is a whole-program LTO unit built on one core, and in one job
+  # their build took 74 to 196 seconds on macos-latest, against 9 to 18
+  # for the gates. `thesis` builds the binary that its tests and the tui's run;
+  # `thesis_rounds` builds the binary's unit-test harness where the runner
+  # gates one of its tests. Every thesis* test target in the workspace is
+  # one of the two.
   # crates/tui/tests/thesis.rs holds this wiring.
   thesis:
-    name: Thesis (${{ matrix.os }})
+    name: Thesis (${{ matrix.os }}, ${{ matrix.tests }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        tests: [thesis, thesis_rounds]
         # The thesis tests a runner does not gate, as it does not meet their
         # targets with room: the gate step skips them, and the Reports
         # workflow, whose matrix lists the same tests, measures them every
@@ -238,7 +247,8 @@ jobs:
         # unit-test harness, which the release profile links as one more
         # whole-program LTO unit, the longest of the build, so a runner that
         # reports all of them builds no harness its gates would run no test
-        # from.
+        # from, and one that gates them builds it in its `thesis_rounds`
+        # job, beside the shortest link.
         include:
           - os: ubuntu-latest
             reported: harness_time_per_tool_round
@@ -267,7 +277,7 @@ jobs:
       # which `cargo test` leaves unbuilt once a target is selected.
       - name: Build release tests
         run: |
-          cargo test --release --workspace --locked --no-run --test 'thesis*' ${{ matrix.frames && '--bin openmax' || '' }}
+          cargo test --release --workspace --locked --no-run --test ${{ matrix.tests }} ${{ matrix.frames && matrix.tests == 'thesis_rounds' && '--bin openmax' || '' }}
           cargo build --release --workspace --locked --example startup_baseline
 
       # Every thesis test but the ones this runner reports, failing the pull
@@ -278,8 +288,8 @@ jobs:
         timeout-minutes: 5
         run: |
           skip=; for test in ${{ matrix.reported }}; do skip="$skip --skip $test"; done
-          cargo test --release --workspace --locked --test 'thesis*' --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1
-          if ${{ matrix.frames }}; then
+          cargo test --release --workspace --locked --test ${{ matrix.tests }} --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1
+          if ${{ matrix.frames && matrix.tests == 'thesis_rounds' }}; then
             cargo test --release --workspace --locked --bin openmax -- --test-threads=1 --nocapture thesis_frames $skip || failed=1
           fi
           exit ${failed:-0}
@@ -288,8 +298,9 @@ jobs:
       # when the run's watcher removed its record, just after its own SIGKILL,
       # and each process of the tool tree and the watcher with when it was
       # gone after the SIGKILL: the 100 ms gate's evidence, kept on each
-      # runner, after a failing gate too. A missing listing fails this step
-      # only when the gates passed. A re-run of the job keeps the artifacts its
+      # runner by its `thesis` job, whose tui thesis tests write it, after a
+      # failing gate too. A missing listing fails this step only when the
+      # gates passed, and never in the `thesis_rounds` job, which writes none. A re-run of the job keeps the artifacts its
       # earlier attempt uploaded, and the upload refuses a name the run already
       # holds unless it may overwrite it, so the re-run replaces it.
       - name: Keep the orphan listing
@@ -298,7 +309,7 @@ jobs:
         with:
           name: zero-orphans-after-kill-9-${{ matrix.os }}
           path: target/tmp/zero-orphans-after-kill-9.txt
-          if-no-files-found: ${{ steps.gates.outcome == 'success' && 'error' || 'warn' }}
+          if-no-files-found: ${{ matrix.tests != 'thesis' && 'ignore' || steps.gates.outcome == 'success' && 'error' || 'warn' }}
           overwrite: true
 
   # Capability is meant to land in files, not in the core: the target is that
