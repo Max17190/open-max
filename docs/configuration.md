@@ -115,10 +115,11 @@ the same name, and one rule decides what each does:
   saves it: every value it had is kept, and a setting it left out is written
   with its default. The run prints `openmax: wrote <keys> to <path>` on
   stderr.
-- A key the file sets to another value is overridden for this run only. The
-  file keeps its value, and the run prints `openmax: for this run only, the
-  command line overrides <keys> in <path>; the file is unchanged, so set them
-  there to keep them` on stderr. A `/model` or `/provider` save during the
+- A key the file sets to another value is overridden for this run only, as
+  are `--provider` and `--model` beside it. The file keeps its value, and the
+  run prints `openmax: for this run only, the command line sets <keys>; they
+  were not written to <path>, so save them there to keep them` on stderr. A
+  `/model` or `/provider` save during the
   session writes the file's value for each overridden key until the session
   sets that key to another value itself; from then on the session's value is
   saved, as any in-session choice is. A switch to another provider than the
@@ -545,7 +546,12 @@ it is writes nothing.
 
 `/permissions` opens a picker; `/permissions
 auto|ask|readonly` selects directly. The approval card also offers **Auto for
-project**. From a shell, `openmax --permissions auto|ask|readonly` selects for
+project**. A card left unanswered for 10 minutes declines the call as timed
+out, and the model is told to stop and summarize what it was about to do. To
+stop being asked about one command, such as `cargo test`, add an `allow` rule
+for it in `.openmax/permissions.toml` and approve the file once with
+`openmax --approve` (see [Permissions](extending.md#permissions)). From a
+shell, `openmax --permissions auto|ask|readonly` selects for
 the project it runs in, and says what it saved or that the mode was already
 saved. With `-p`, `--stdio` or `--subagent` the run goes on under the new mode;
 alone it ends once the mode is saved. It combines with the flags
@@ -588,7 +594,10 @@ Returning to `ask` restores content requirements for anything created in `auto`.
 
 The model reads the mode in a one-line `[execution policy: <mode>; ...]` note
 placed ahead of a session's first prompt, and written again only when the mode
-changes or a resumed session's history no longer holds it. The history resends
+changes or a resumed session's history no longer holds it. The terminal
+interface does not show the note, live or in a resumed session, since its
+status line shows the mode; a stdio or `--json` client receives it as a
+`harness_note`. The history resends
 it on every later request, so it states only the mode's limits; content
 approval detail is in `openmax --spec tools`, `hooks`, and `permissions`. The
 tools and hooks contracts state each mode's rule and leave what applies only
@@ -887,8 +896,10 @@ ChatGPT logout revokes and clears its local tokens. For an API-key connection,
 confirming logout removes that named connection and its model catalog from
 `providers.json`. It does not revoke the API key at its issuer or edit shell
 environment variables. A still-selected removed provider fails explicitly;
-it cannot fall back to another key or endpoint. Other connections and settings
-remain unchanged.
+it cannot fall back to another key or endpoint. After `/logout`, the notice
+names `/login` alone when `providers.json` has no connection left, and
+`/model` or `/login` otherwise. Other connections and settings remain
+unchanged.
 
 Connection setup requires a human terminal, runs without project hooks, and
 grants no trust. Catalog writes preserve unrelated entries, take a shared

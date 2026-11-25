@@ -27,11 +27,12 @@ headless and stdio trust.
 | **@** | Mention a project file |
 | Mouse drag | Select transcript or prompt text |
 | Double / triple click | Select the word under the pointer · the whole logical line |
-| **y** or **Ctrl+C** | Copy selected text (without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
+| **Ctrl+C**, or **y** in the conversation | Copy selected text (in the prompt **y** types itself; without a selection, **Ctrl+C** clears an idle prompt or cancels a running turn) |
 | Click in the prompt | Put the cursor there in a wrapped draft |
 | Wheel | Scroll the conversation · over the prompt, a long draft |
-| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved, and switching sessions restores the previous setting. `/effort` saves a level unless the endpoint is a temporary launch override. Inside a picker, select the previous row |
+| **Shift+Tab** | Request the next reasoning effort level up, for this session only: from the model's default the first press requests `high`, and after the highest level it returns to default. Nothing is saved, and switching sessions restores the previous setting. `/effort` saves a level unless the endpoint is a temporary launch override. Inside the model picker or a completion list, select the previous row |
 | **Esc** | Clear selection · close menu · cancel turn · return to composer |
+| **Ctrl+R** | Search this project's prompt history (each project keeps its own) |
 | **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
 
 ## Slash commands
@@ -40,7 +41,7 @@ headless and stdio trust.
 | --- | --- |
 | `/help` | Keybindings and commands |
 | `/model` | Search configured providers and select a model |
-| `/model <id>` | Set an exact model id on the active endpoint |
+| `/model <id>` | Set an exact model id on the active endpoint; on a provider, only one with a context window: `/login <provider>` saves one for a model the server lists, and `context_tokens` in `providers.json` sets one for any |
 | `/effort [level]` | Pick reasoning effort with arrow keys and Enter, or request an exact level for the next turn. `default` omits the setting; `none` is explicit. Model support varies |
 | `/copy` | Copy the latest assistant response |
 | `/provider [name]` | Pick a provider/model pair, or switch to a named provider |
@@ -57,7 +58,7 @@ headless and stdio trust.
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint, cache, performance, privacy, and network details |
 | `/update` | Update to the latest release, then resume this session in it |
-| `/quit` | Exit |
+| `/quit` · `/exit` | Exit |
 
 Turn `n` of `/rewind` is the `n`th prompt you sent that ran and stayed in
 the transcript, cut where it finished: a completion gate's refusal and
@@ -254,7 +255,7 @@ turn that ends with any code but 0 skips the prompts after it.
 | Code | Meaning |
 | --- | --- |
 | 0 | Every turn finished, even if it reported a warning such as a failed session save |
-| 1 | An operational failure: a turn failed or could not start, ended on any other stop reason (`truncated`, `empty`, `blocked`, or a provider's own, such as `content_filter`), or the session could not be opened |
+| 1 | An operational failure: a turn failed or could not start, ended on any other stop reason (`truncated`, `empty`, `blocked`, a model's `refusal`, or a provider's own, such as `content_filter`), or the session could not be opened |
 | 2 | A usage or configuration error before any turn, `--continue` found no prior session here, or `--session` named one this directory cannot continue |
 | 3 | The project is not trusted, or trust cannot be granted or a `--permissions` mode selected from this process, or a turn that otherwise finished declined an approval request, as a print run does in `ask` (see above) |
 | 4 | A turn stopped short (`length` when replies in a row kept reaching their `max_tokens` before any tool call once it was raised to its ceiling, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
@@ -478,6 +479,9 @@ palette's gray (color 8) marks secondary text, selection, and every border
 except the focused prompt's and the approval card's. There is no color
 setting.
 
-The persistent status line stays limited to model, context use, and approval
-mode so the transcript remains readable; `/status` is where the full runtime
-detail lives.
+The persistent status line stays short so the transcript remains readable.
+On its right are the model (with the requested reasoning effort, if any),
+context use, the share of prompt tokens served from cache once the provider
+reports it, and the approval mode. On its left are the keys for the moment:
+while nothing else is going on, it points to `/help`, which lists every key
+and command. `/status` is where the full runtime detail lives.

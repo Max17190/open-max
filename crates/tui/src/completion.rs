@@ -115,7 +115,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         true,
     ),
     command("update", "", "update to the latest release and resume this session", true),
-    command("quit", "", "exit", true),
+    command("quit", "", "exit (/exit does the same)", true),
 ];
 
 impl CommandSpec {

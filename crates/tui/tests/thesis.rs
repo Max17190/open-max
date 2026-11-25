@@ -755,6 +755,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Text-call recovery, offset by shared session task and compaction paths, adds 4 lines.
     // Matching tagged calls by their frame saves 3 lines.
     // Recovering tagged calls to unoffered tools adds 3 lines.
+    // Keeping a Chat Completions refusal as the reply adds 20 lines and
+    // refusing a model with no context window adds 7; folding nested checks
+    // into one condition in the stream reader and eight other places saves 27.
     const BASELINE: usize = 45_597;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the

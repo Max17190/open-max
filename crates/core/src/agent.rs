@@ -879,9 +879,9 @@ async fn run_loop(
         // reasoning, so the continuation resumes the thought instead of
         // starting it over; the wire skips it wherever the reasoning does
         // not go back (another endpoint, a path that does not replay it).
-        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). One with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not).
+        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). One with no call that ended on its own, a refusal aside, after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not).
         let (silent, repeated) = (content.trim().is_empty() && tool_calls.is_empty(), result.repeats_a_stop(&mut stops, limit));
-        let near = endpoint.chatgpt.is_none() && tool_calls.is_empty() && !result.hit_output_cap(limit) && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED) && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
+        let near = endpoint.chatgpt.is_none() && tool_calls.is_empty() && !result.hit_output_cap(limit) && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED | "refusal") && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
         let capped = result.hit_output_cap(limit) || (silent && repeated) || near;
         let cut_thought = capped
             && (result.reasoning_content.is_some() || result.reasoning.is_some() || result.reasoning_details.is_some());

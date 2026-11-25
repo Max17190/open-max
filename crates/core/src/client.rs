@@ -395,6 +395,18 @@ pub struct CompletionResult {
 }
 
 impl CompletionResult {
+    /// A Chat Completions refusal comes in its own field. Its text is the reply only when the model wrote none,
+    /// and a reply that then stopped with no call ends as `refusal`: its own end, not a cut or an empty reply.
+    fn take_refusal(&mut self, refusal: String, on_delta: &mut impl FnMut(StreamDelta)) {
+        if self.content.is_empty() && !refusal.is_empty() {
+            if self.tool_calls.is_empty() && self.finish_reason == "stop" {
+                self.finish_reason = "refusal".into();
+            }
+            on_delta(StreamDelta::Content(refusal.clone()));
+            self.content = refusal;
+        }
+    }
+
     pub(crate) fn hit_output_cap(&self, limit: usize) -> bool {
         // Some servers report tool_calls even when the arguments hit the cap, and some send no usage: a last call
         // whose JSON stops before it closes is cut whatever was reported (blank is a call with no arguments).
@@ -563,6 +575,7 @@ struct StreamDeltaJson {
     // cannot fail the whole chunk and the content beside it.
     reasoning_details: Option<Value>,
     tool_calls: Option<Vec<ToolCallDelta>>,
+    refusal: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -846,10 +859,8 @@ impl ChatClient {
                     _ = cancelled.cancelled() => return Ok(cancelled_response()),
                 }
             } else { None };
-            if let Some(key) = access.as_deref().or(self.api_key.as_deref()) {
-                if !key.is_empty() {
-                    req = if self.wire_api == crate::providers::WireApi::Anthropic { req.header("x-api-key", key) } else { req.bearer_auth(key) };
-                }
+            if let Some(key) = access.as_deref().or(self.api_key.as_deref()).filter(|key| !key.is_empty()) {
+                req = if self.wire_api == crate::providers::WireApi::Anthropic { req.header("x-api-key", key) } else { req.bearer_auth(key) };
             }
             if self.wire_api == crate::providers::WireApi::Anthropic && !self.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("anthropic-version")) {
                 req = req.header("anthropic-version", "2023-06-01");
@@ -1093,6 +1104,7 @@ async fn read_sse(
     let mut open_details = OpenDetails::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
+    let mut refusal = String::new();
     // Did the server ever say it was done (a `[DONE]` line or a
     // finish_reason chunk)? Without one, the stream ending means the
     // connection dropped mid-answer, not that the model finished.
@@ -1228,12 +1240,12 @@ async fn read_sse(
                 finish_reason = reason;
             }
             let delta = choice.delta.unwrap_or_default();
-            if let Some(text) = delta.content {
-                if !text.is_empty() {
-                    content.push_str(&text);
-                    on_delta(StreamDelta::Content(text));
-                }
+            if let Some(text) = delta.content.filter(|text| !text.is_empty()) {
+                content.push_str(&text);
+                on_delta(StreamDelta::Content(text));
             }
+            // Shown once the reply is over, and only if it has no text.
+            refusal.push_str(delta.refusal.as_deref().unwrap_or_default());
             // Reasoning models surface thinking under different keys.
             if let Some(text) = &delta.reasoning_content {
                 reasoning_content.get_or_insert_with(String::new).push_str(text);
@@ -1241,14 +1253,8 @@ async fn read_sse(
             if let Some(text) = &delta.reasoning {
                 reasoning.get_or_insert_with(String::new).push_str(text);
             }
-            if let Some(text) = delta.reasoning_content {
-                if !text.is_empty() {
-                    on_delta(StreamDelta::Reasoning(text));
-                }
-            } else if let Some(text) = delta.reasoning {
-                if !text.is_empty() {
-                    on_delta(StreamDelta::Reasoning(text));
-                }
+            if let Some(text) = delta.reasoning_content.or(delta.reasoning).filter(|text| !text.is_empty()) {
+                on_delta(StreamDelta::Reasoning(text));
             }
             if let Some(Value::Array(parts)) = delta.reasoning_details {
                 for part in parts {
@@ -1322,7 +1328,9 @@ async fn read_sse(
     }
     let (reasoning_content, reasoning) = reasoning_fields(reasoning_content, reasoning);
     let reasoning_details = Some(reasoning_details).filter(|d| !d.is_empty()).and_then(|d| serde_json::value::to_raw_value(&d).ok());
-    (CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage }, unfinished)
+    let mut result = CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage };
+    result.take_refusal(refusal, on_delta);
+    (result, unfinished)
 }
 
 /// Where each text or summary block of a streaming reply's
@@ -1508,7 +1516,9 @@ fn parse_complete_response(
     let text = |key: &str| msg[key].as_str().map(str::to_string);
     let (reasoning_content, reasoning) = reasoning_fields(text("reasoning_content"), text("reasoning"));
     let reasoning_details = Some(&msg["reasoning_details"]).filter(|d| d.as_array().is_some_and(|a| !a.is_empty())).and_then(opaque);
-    Ok(CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage })
+    let mut result = CompletionResult { content, tool_calls, reasoning_content, reasoning, reasoning_details, finish_reason, usage };
+    result.take_refusal(msg["refusal"].as_str().unwrap_or_default().to_string(), on_delta);
+    Ok(result)
 }
 
 /// A value from a one-shot reply, kept to send back; null is absent. It is

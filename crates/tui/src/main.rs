@@ -1580,8 +1580,27 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     // adds an endpoint or a window.
     let unattended = cli.stdio || cli.print || cli.subagent.is_some();
     if unattended {
-        if let Err(e) = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir) {
+        let settings = core.settings.lock().unwrap().clone();
+        if let Err(e) = open_max_core::providers::resolve(&settings, &core.data_dir) {
             eprintln!("openmax: {e}");
+            // A login saves a connection without selecting it for a print
+            // run: name the flags that select each one that can answer.
+            use open_max_core::providers::ResolveError::{MissingEndpoint, Unconfigured};
+            if settings.provider.is_none() && matches!(e, MissingEndpoint | Unconfigured { endpoint: true, .. }) {
+                let quote = |text: &str| open_max_core::doctor::shell_quote(std::path::Path::new(text));
+                let saved: Vec<String> = open_max_core::providers::load_providers(&core.data_dir)
+                    .iter()
+                    .filter(|(_, p)| !p.base_url.trim().is_empty())
+                    .filter_map(|(name, p)| Some(format!("--provider {} --model {}", quote(name), quote(&p.models.first()?.id))))
+                    .collect();
+                if !saved.is_empty() {
+                    eprintln!(
+                        "openmax: a connection is saved but none is selected; select one for this run with {}, \
+                         or save provider and model in ~/.openmax/settings.json",
+                        saved.join(" or ")
+                    );
+                }
+            }
             std::process::exit(2);
         }
     }
@@ -1717,7 +1736,7 @@ fn apply_endpoint_flags(core: &Core, cli: &CliArgs) -> Result<Vec<String>, Strin
     }
     if !applied.overridden.is_empty() {
         lines.push(format!(
-            "openmax: for this run only, the command line overrides {} in {}; the file is unchanged, so set them there to keep them",
+            "openmax: for this run only, the command line sets {}; they were not written to {}, so save them there to keep them",
             applied.overridden.join(", "),
             path.display()
         ));

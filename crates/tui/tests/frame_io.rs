@@ -998,11 +998,16 @@ mod first_frame {
         s.write(b"hello\r");
         let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("fixture reply"));
         assert!(shown.contains("fixture reply"), "{shown}");
+        // The mode note is the model's; the footer shows the mode.
+        assert!(!shown.contains("execution policy"), "{shown}");
         let settings = open_max_core::config::load(&s.dir.join("home/.openmax")).unwrap();
         assert_eq!(settings.provider.as_deref(), Some("solo"));
         assert_eq!(settings.model, "alpha");
     }
 
+    /// Disconnecting the only provider says /login is what is left to do, a
+    /// disconnected provider cannot be picked, the connection made after it
+    /// answers, and a model it saved no window for is refused.
     #[test]
     fn a_disconnected_provider_cannot_be_picked_in_the_session_or_on_restart() {
         let base = endpoint(vec![LOGIN_CATALOG.into(), LOGIN_CATALOG.into(), LOGIN_REPLY.into()]);
@@ -1036,7 +1041,8 @@ mod first_frame {
         s.wait_for(FRAME_END, push, wait).expect("first frame after login");
         let shown = screen(&s.out, 85, 26).join("\n");
         assert!(shown.contains("replacement") && !shown.contains("original"), "{shown}");
-        assert!(disconnect.contains("Use /model or /login."), "{disconnect}");
+        // No connection is left, so the notice names the one step that works.
+        assert!(disconnect.contains("Provider disconnected; no connection is left, so /login connects one."), "{disconnect}");
         let mut next = spawn(&s.dir.join("home/.openmax"));
         let probe = next.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
         next.write(ANSWER);
@@ -1047,6 +1053,13 @@ mod first_frame {
         s.write(b"\rhello\r");
         let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("fixture reply"));
         assert!(shown.contains("fixture reply"), "{shown}");
+        // A model the connection saved no window for would fail at the next
+        // prompt, so /model refuses it and keeps the selection.
+        s.write(b"/model beta\r");
+        let shown = screen_when(&mut s, 85, 26, wait, |shown| shown.contains("no context window saved for beta"));
+        assert!(shown.contains("replacement has no context window saved for beta"), "{shown}");
+        assert!(!shown.contains("model set to beta"), "{shown}");
+        assert_eq!(open_max_core::config::load(&s.dir.join("home/.openmax")).unwrap().model, "alpha");
     }
 
     /// What a session that painted first has to say before it runs lands on
@@ -1469,16 +1482,40 @@ mod first_frame {
         s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
         s.write(b"ctx\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| {
-            shown.contains("use /new") && !shown.contains("esc to cancel")
+            shown.contains("use /compact or /new.") && !shown.contains("esc to cancel")
         });
         assert!(shown.contains("backend returned 400 Bad Request: Request rejected:"), "{shown}");
         assert!(shown.contains("maximum context length exceeded"), "{shown}");
         assert!(shown.contains("Check that context_tokens matches the served model."), "{shown}");
-        assert!(shown.contains("If the session is too long, use /new."), "{shown}");
+        // Compaction keeps the conversation, so it is named first.
+        assert!(shown.contains("If the session is too long, use /compact or /new."), "{shown}");
         s.write(b"/new\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("new session"));
         assert!(shown.contains("new session") && !shown.contains("maximum context length"), "{shown}");
         s.write(b"hello\r");
+        let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("fixture reply"));
+        assert!(shown.contains("fixture reply"), "{shown}");
+    }
+
+    /// A key the provider rejects mid-session ends the turn with the server's
+    /// error and the step that replaces the key, and the next prompt after
+    /// it runs.
+    #[test]
+    fn a_rejected_key_names_the_login_that_replaces_it() {
+        let rejected = r#"{"error":{"message":"Incorrect API key provided"}}"#;
+        let base = endpoint_with_status(vec![("401 Unauthorized", rejected.into()), ("200 OK", LOGIN_REPLY.into())]);
+        let mut s = Session::spawn_with("rejected-key", 120, 26, &serde_json::json!({
+            "base_url": base, "model": "stub-model", "context_tokens": 32768,
+        }).to_string());
+        let wait = Duration::from_secs(5);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        s.write(b"hello\r");
+        let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("to replace them") && !shown.contains("esc to cancel"));
+        assert!(shown.contains("backend returned 401 Unauthorized: Incorrect API key provided"), "{shown}");
+        assert!(shown.contains("The provider rejected this connection's credentials: run /login to replace them."), "{shown}");
+        s.write(b"again\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("fixture reply"));
         assert!(shown.contains("fixture reply"), "{shown}");
     }
@@ -1490,6 +1527,9 @@ mod first_frame {
         let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
         s.write(ANSWER);
         s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        // The idle screen points to the help, which lists keys and commands.
+        let idle = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("/help keys"));
+        assert!(idle.contains("/help keys and commands"), "{idle}");
         s.write(b"/help\r");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Key bindings"));
         assert!(shown.contains("Key bindings") && shown.contains("send"), "{shown}");
@@ -1497,6 +1537,8 @@ mod first_frame {
         s.write(b"\x1b[6~");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("ctrl+f") && !shown.contains("Key bindings"));
         assert!(shown.contains("ctrl+f") && !shown.contains("Key bindings"), "{shown}");
+        // Prompt history is kept per project, and the help says so.
+        assert!(shown.contains("search this project's") && !shown.contains("all projects"), "{shown}");
         s.write(b"\x1b[6~\x1b[6~");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Commands"));
         assert!(shown.contains("Commands"), "{shown}");

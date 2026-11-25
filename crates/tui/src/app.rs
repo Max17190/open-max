@@ -633,6 +633,9 @@ async fn event_loop(
                         app.persist_model_selection(Some(provider), model);
                     }
                     Ok(_) if action == crate::setup::Action::Login => app.open_model_picker(),
+                    Ok(_) if open_max_core::providers::load_providers(&app.core.data_dir).is_empty() => {
+                        app.note("Provider disconnected; no connection is left, so /login connects one.")
+                    }
                     Ok(_) => app.note("Provider disconnected. Use /model or /login."),
                     Err(error) => app.error(&error),
                 }
@@ -867,18 +870,16 @@ impl App {
                 "user" => {
                     if let Some(text) = &m.content {
                         if m.harness_note {
-                            self.note(note_body(text));
+                            self.harness_note(text);
                         } else {
                             self.insert_user_block(text);
                         }
                     }
                 }
                 "assistant" => {
-                    if let Some(text) = &m.content {
-                        if !text.trim().is_empty() {
-                            self.last_assistant_response = Some(text.clone());
-                            self.transcript.push_assistant(markdown::render(text));
-                        }
+                    if let Some(text) = m.content.as_ref().filter(|text| !text.trim().is_empty()) {
+                        self.last_assistant_response = Some(text.clone());
+                        self.transcript.push_assistant(markdown::render(text));
                     }
                     if let Some(calls) = &m.tool_calls {
                         // Tool results directly follow their assistant message;
@@ -1787,8 +1788,24 @@ impl App {
         }
     }
 
+    /// A harness note, its bracket prefix stripped; the text is already the
+    /// model's. The execution policy note is not shown: the status line shows
+    /// the mode, and the note's wording is written for the model.
+    fn harness_note(&mut self, text: &str) {
+        if !text.starts_with("[execution policy:") {
+            self.note(note_body(text));
+        }
+    }
+
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
         let next = model_selection(&self.core.settings.lock().unwrap(), provider.clone(), model.clone());
+        // A model with no window would fail at the next prompt, so it is not saved. Its effort is checked after.
+        let sized = config::Settings { reasoning_effort: None, ..next.clone() };
+        let window = open_max_core::providers::resolve_endpoint(&sized, &self.core.data_dir);
+        if let (Some(name), Err(open_max_core::providers::ResolveError::MissingContextTokens)) = (&provider, window) {
+            let fix = format!("/login {name} saves one for a model the server lists, or set its context_tokens in providers.json");
+            return self.error(&format!("{name} has no context window saved for {model}, so the selection is unchanged: {fix}"));
+        }
         // The core's own save: it fingerprints the exact bytes it writes,
         // under its lock, so a TUI-authored save never reads as drift and a
         // racing external edit still does. Adopted in memory only on success.
@@ -2444,10 +2461,7 @@ impl App {
                             let _ = self.core.save_settings(&s);
                         }
                         self.refresh_connection();
-                        let ep = {
-                            let s = self.core.settings.lock().unwrap();
-                            open_max_core::providers::resolve(&s, &self.core.data_dir)
-                        };
+                        let ep = open_max_core::providers::resolve(&self.core.settings.lock().unwrap(), &self.core.data_dir);
                         match ep {
                             Ok(ep) => self.note(&format!(
                                 "provider {name} → {} ({})",
@@ -3002,9 +3016,8 @@ impl App {
                 // hook-write note produced no screen change, and Refrozen
                 // shows only its generic toolbox summary, not the NOT-loaded
                 // reason), so ignoring it dropped harness corrections a
-                // stdio client would see. The bracket prefix is
-                // stripped for a cleaner line; the text is already the model's.
-                self.note(note_body(&text));
+                // stdio client would see.
+                self.harness_note(&text);
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if self.compacting {
@@ -3155,7 +3168,9 @@ impl App {
                 self.dirty.mark_chrome();
                 let provider_error = message.starts_with("backend returned ") || message.starts_with("backend reported an error");
                 if provider_error && open_max_core::refused_for_length(&message) {
-                    self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /new."));
+                    self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /compact or /new."));
+                } else if message.starts_with("backend returned 401") {
+                    self.error(&format!("{message}\nThe provider rejected this connection's credentials: run /login to replace them."));
                 } else {
                     self.error(&message);
                 }
@@ -3897,7 +3912,7 @@ impl App {
         } else if self.quit_armed {
             "ctrl+c again to quit"
         } else {
-            "shift+tab effort · /permissions"
+            "/help keys and commands · shift+tab effort"
         };
         hint.into()
     }
@@ -3978,13 +3993,13 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("g / G in history", "top of scrollback · follow latest"),
     ("/ at the start", "command menu · tab or enter completes"),
     ("@", "mention a project file (fuzzy search)"),
-    ("ctrl+r", "search prompt history (all projects)"),
+    ("ctrl+r", "search this project's prompt history"),
     ("ctrl+f", "find in conversation"),
     ("n / N after find", "next or previous match in scrollback"),
     ("esc", "follow latest · cancel turn · return to composer"),
     ("wheel · pgup/pgdn", "scroll the conversation · over the prompt, the draft"),
     ("click in the prompt", "put the cursor there in a wrapped draft"),
-    ("mouse drag", "select transcript or prompt text · y or ctrl+c copies"),
+    ("mouse drag", "select text · ctrl+c copies (y too in the conversation)"),
     ("double / triple click", "select the word · the whole line"),
     ("ctrl+o / o", "expand a [pasted #N] under the cursor, else the last tool block"),
     ("ctrl+t", "show or hide model thinking"),
@@ -4700,7 +4715,8 @@ mod tests {
     /// /rewind alone lists the turns it can return to, numbered as it counts
     /// them, each with its prompt. A harness note stored ahead of a prompt
     /// is drawn as the note it was, after a rewind or a resume, never as a
-    /// prompt of its own, and lists no turn.
+    /// prompt of its own, and lists no turn. The execution policy note is not
+    /// drawn there either, as it is not live: the status line shows the mode.
     #[tokio::test]
     async fn rewind_lists_the_turns_and_a_reloaded_harness_note_keeps_its_mark() {
         use open_max_core::sessions;
@@ -4728,7 +4744,7 @@ mod tests {
         assert!(app.switch_to_session(id.clone()));
         let check_replay = |app: &App, turns| {
             let shown = app.transcript.export_text();
-            assert!(shown.contains("> • execution policy: auto; fixture."), "{shown}");
+            assert!(!shown.contains("> • execution policy"), "{shown}");
             assert!(shown.contains("> • Earlier messages were compacted.\n>   Open: check the remaining file."), "{shown}");
             assert_eq!(shown.matches("## user").count(), turns, "{shown}");
             assert!(shown.contains(&format!("## user\n\n{text}\n")), "{shown}");
@@ -5865,7 +5881,7 @@ mod tests {
             fs::write(
                 dir.join("providers.json"),
                 r#"{"providers":{"alpha":{"base_url":"http://alpha/v1",
-                   "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+                   "models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384},{"id":"three","context_tokens":16384}]}}}"#,
             )
             .unwrap();
             // No cache invalidation needed: the providers cache is keyed on
@@ -6328,6 +6344,8 @@ mod tests {
             "fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384}]},
             "empty":{"base_url":"http://127.0.0.1:9/v1"}
         }}).to_string()).unwrap();
+        // A connection with no catalog runs at the window settings give it.
+        app.core.settings.lock().unwrap().context_tokens = Some(16384);
         for (provider, current, expected) in [
             ("fixture", "one", "one"), ("fixture", "missing", "one"),
             ("fixture", "two", "two"), ("empty", "keep-exact", "keep-exact"),
@@ -6338,6 +6356,17 @@ mod tests {
             assert_eq!(settings.provider.as_deref(), Some(provider));
             assert_eq!(settings.model, expected);
         }
+        // A switch names the endpoint it resolved to, and one that cannot
+        // resolve says why.
+        assert!(app.transcript.export_text().contains("provider fixture → http://127.0.0.1:9/v1 (two)"));
+        fs::write(dir.join("providers.json"), json!({"providers":{
+            "fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384}]},
+            "empty":{"base_url":"http://127.0.0.1:9/v1"},
+            "blank":{"base_url":"","models":[{"id":"m","context_tokens":16384}]}
+        }}).to_string()).unwrap();
+        app.handle_submit("/provider blank".into()).await.unwrap();
+        assert!(app.transcript.export_text().contains("no model endpoint configured"));
+        app.handle_submit("/provider empty".into()).await.unwrap();
         app.handle_submit("/model fixture/exact/model".into()).await.unwrap();
         assert_eq!(app.core.settings.lock().unwrap().model, "fixture/exact/model");
         app.handle_submit("/model".into()).await.unwrap();
@@ -8894,7 +8923,7 @@ mod tests {
         fs::write(
             dir.join("providers.json"),
             r#"{"providers":{"alpha":{"base_url":"http://127.0.0.1:9/v1",
-               "models":[{"id":"one"},{"id":"two"},{"id":"three"}]}}}"#,
+               "models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384},{"id":"three","context_tokens":16384}]}}}"#,
         )
         .unwrap();
         app.handle_submit("/provider alpha".into()).await.unwrap();
