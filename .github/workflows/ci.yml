@@ -178,7 +178,9 @@ jobs:
           time /bin/echo hi
           mkdir -p "$RUNNER_TEMP/h" "$RUNNER_TEMP/t"
           time env -i HOME="$RUNNER_TEMP/h" PATH="$PATH" git var GIT_COMMITTER_IDENT || true
-          time python3 -c 'import socket; print(socket.gethostname(), socket.getfqdn())'
+          python3 -c 'import socket,time
+          for h in ["127.0.0.1", "127.0.0.1", "localhost"]:
+              t=time.time(); n=socket.getfqdn(h); print("getfqdn", h, n, round(time.time()-t,2))'
           HOME="$RUNNER_TEMP/h" TMPDIR="$RUNNER_TEMP/t" python3 -u examples/run-task/demo.py --openmax target/debug/openmax 2>&1 | perl -MTime::HiRes=time -ne 'printf "%.2f %s", time, $_'
           python3 examples/repo-memory/test_repo_memory.py target/debug/openmax > "$RUNNER_TEMP/repo-memory.log" 2>&1 &
           memory=$!
