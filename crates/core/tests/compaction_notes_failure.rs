@@ -80,9 +80,20 @@ impl Turn {
 }
 
 async fn run(replies: Vec<WireReply>, seed: Vec<ChatMessage>) -> Turn {
+    run_with(json!({}), replies, seed).await
+}
+
+/// `run` with `extra` settings merged over the scratch's own.
+async fn run_with(extra: Value, replies: Vec<WireReply>, seed: Vec<ChatMessage>) -> Turn {
     let (url, requests) = common::recording_http_script(replies).await;
     let scratch = Scratch::new(&url);
+    let settings_path = scratch.0.join("data/settings.json");
+    let mut settings: Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    sessions::write_atomic(&settings_path, settings.to_string()).unwrap();
     let project = scratch.0.join("project");
+    let lines: String = (0..300).map(|i| format!("{i:04} {}\n", "b".repeat(66))).collect();
+    sessions::write_atomic(&project.join("big.txt"), lines).unwrap();
     let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
     let id = sessions::create(&core, project.display().to_string())
         .unwrap()
@@ -225,7 +236,7 @@ async fn notes_failure_preserves_history_when_the_window_does_not_force_a_cut() 
             .iter()
             .any(|e| matches!(e, AgentEvent::ToolStart { .. })));
         assert_eq!(turn.requests.len(), notes_count + 1);
-        assert_eq!(turn.requests[0]["tool_choice"], "none");
+        assert_eq!(turn.requests[0]["tool_choice"], "auto", "the notes request keeps the turn's tool choice");
         assert_eq!(turn.requests.last().unwrap()["tool_choice"], "auto");
         assert!(turn.requests[0].to_string().contains(FACT));
         let body = turn.requests.last().unwrap().to_string();
@@ -270,4 +281,47 @@ async fn notes_failure_preserves_history_when_the_window_does_not_force_a_cut() 
             }
         );
     }
+}
+
+fn read_call(id: &str, path: &str) -> WireReply {
+    sse(
+        &[json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":"read_file","arguments":json!({"path":path}).to_string()}}]})],
+        "tool_calls",
+        Value::Null,
+    )
+}
+
+/// A soft cut whose notes request fails is asked again once the history has
+/// grown a quarter of the trigger past the size it failed at, rather than
+/// waiting for the window for the rest of the turn.
+#[tokio::test]
+async fn a_failed_notes_request_is_asked_again_after_a_quarter_of_the_trigger() {
+    let turn = run_with(
+        json!({"compaction_tokens": 20_000}),
+        vec![
+            bad_request("the notes request is refused once"),
+            read_call("big", "big.txt"),
+            read_call("small-1", "evidence.txt"),
+            read_call("small-2", "evidence.txt"),
+            answer("State: halfway."),
+            answer("The primary reply."),
+        ],
+        history(25_000),
+    )
+    .await;
+    assert_eq!(turn.stop(), "stop", "{:?}", turn.events);
+    let asks: Vec<usize> = turn
+        .requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["messages"].as_array().unwrap().last().unwrap()["content"].as_str().is_some_and(|c| c.starts_with("[context note: everything above")))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(asks, [0, 4], "asked at the trigger, then again after the growth");
+    assert_eq!(turn.requests.len(), 6);
+    let skipped = turn.events.iter().filter(|e| matches!(e, AgentEvent::CompactionSkipped { .. })).count();
+    assert_eq!(skipped, 1);
+    let last = turn.requests.last().unwrap().to_string();
+    assert!(last.contains("Summary: State: halfway.") && last.contains(TASK));
+    assert!(turn.archived.iter().any(|m| m.content.as_deref().is_some_and(|c| c.contains(FACT))));
 }

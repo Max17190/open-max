@@ -513,8 +513,9 @@ byte-stable and the server can reuse its prompt cache.
 Before the cut, the
 session's own model writes the notes it will continue from: one extra
 request whose prompt is the conversation up to the cut, as earlier requests
-already sent it, with the same tools and `tool_choice` set to `none`, plus one
-ask; a route that refuses that field is asked again without it. A reply the
+already sent it, with the same tools and tool choice, plus one ask: a server
+that builds its prompt from the tools and the tool choice builds the one it
+already cached. A reply the
 limit cut before any text is asked for once more at twice the limit. The notes, up to 4,000
 bytes, take the removed span's place in one context note. A reply with
 no text that ended on its own and made no call gives its reasoning as the
@@ -526,8 +527,11 @@ The notes request has no overall deadline, as no request does: only a
 connection that falls silent ends it. When no notes come back (an error, an
 empty reply, a call, a silent connection, or a request `max_agent_tokens`
 refuses), an automatic cut below the input budget leaves the history intact
-and reports why it skipped the cut. For the rest of that turn, it waits until
-the input budget forces a cut. A forced cut or `/compact` still makes the cut;
+and reports why it skipped the cut. It asks again once the history has grown
+a quarter of the trigger past the size it skipped at (at most what a cut
+keeps, 20,000 tokens or `compaction_keep_tokens`), or when the input budget
+forces a cut, whichever comes first, and that second time it makes the cut
+even without notes. A forced cut or `/compact` still makes the cut;
 its note lists the tools used, the files touched and the earlier goals.
 
 Everything a cut removes is appended verbatim to

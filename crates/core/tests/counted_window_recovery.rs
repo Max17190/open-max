@@ -412,7 +412,7 @@ async fn a_retry_without_usage_still_calibrates_the_next_round() {
         turn.events
     );
     assert_eq!(turn.limits(), [RESERVE, 2888, RESERVE, RESERVE]);
-    assert_eq!(turn.requests[2]["tool_choice"], "none");
+    assert_eq!(turn.requests[2]["tool_choice"], "auto", "the notes request keeps the turn's tool choice");
     assert_eq!(turn.outcomes()[0].0, "check");
     assert!(turn.outcomes()[0].1);
     let budgets = turn

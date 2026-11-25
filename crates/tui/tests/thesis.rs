@@ -758,12 +758,14 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // Keeping a Chat Completions refusal as the reply adds 20 lines and
     // refusing a model with no context window adds 7; folding nested checks
     // into one condition in the stream reader and eight other places saves 27.
-    const BASELINE: usize = 45_597;
+    // Sending the notes request with the turn's tool choice and asking again
+    // after a skipped cut save 4 lines and lower the ceiling by 4.
+    const BASELINE: usize = 45_593;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 45_597;
+    const CEILING: usize = 45_593;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 

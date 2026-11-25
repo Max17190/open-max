@@ -68,7 +68,6 @@ pub(super) fn serialize(client: &ChatClient, messages: &[ChatMessage], limit: us
     let mut body = json!({"model":client.model,"input":input,"store":false,"stream":true,
         "include":["reasoning.encrypted_content"]});
     if !functions.is_empty() { body["tools"] = json!(functions); }
-    if client.notes_only.load(std::sync::atomic::Ordering::Relaxed) && tools != "[]" && !tools.is_empty() { body["tool_choice"] = json!("none"); }
     if let Some(effort) = effort {
         body["reasoning"] = json!({"effort": effort});
     }

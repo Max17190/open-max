@@ -6,8 +6,8 @@
 //! a request whose prompt is the transcript up to the cut plus one ask
 //! (`NOTES_ASK`); the notes take the removed span's place in one context note
 //! that names the archive holding every byte the cut removed. Without notes
-//! the history stays whole unless the window forces the cut, which then leaves
-//! a deterministic digest. A request costs its history plus
+//! the history stays whole until a later try brings them or the window forces
+//! the cut, which then leaves a deterministic digest. A request costs its history plus
 //! `request_overhead`, in estimated tokens the server's own counts calibrate
 //! (`token_factor`).
 //!
@@ -293,18 +293,16 @@ async fn summarize_compaction(
     // admitted, and by the route's estimator, which counts only what it sends.
     let estimated = to_real(messages.iter().map(ctx.estimate).sum::<usize>() + request_overhead(schemas), factor);
     if !spend.admits(estimated) { return Err("the notes request would pass the turn's token ceiling".into()); }
-    // tool_choice "none" beside the same tools makes the reply notes, not a call (a route refusing it is asked without); a reply the limit cut before any text is asked again at twice the limit, within the longest reply and the window left.
-    let (mut limit, mut choice, flag) = (client.reply_reserve, true, &client.notes_only);
+    // The turn's tools and tool choice go unchanged: a server that renders a prompt from them renders the one it cached. A reply the limit cut before any text is asked again at twice the limit, within the longest reply and the window left.
+    let mut limit = client.reply_reserve;
     let result = loop {
-        flag.store(choice, std::sync::atomic::Ordering::Relaxed);
         let mut resent = Vec::new();
         let outcome = client.stream_chat(&messages, limit, schemas, cancelled.clone(), |delta| {
             if let crate::client::StreamDelta::Usage(usage) = delta { resent.push(usage); }
         }).await;
         // Paid for however it ended: the client's resends, and without a completed response the reply it asked for.
-        flag.store(false, std::sync::atomic::Ordering::Relaxed); for usage in resent { spend.charge(core, session_id, usage); }
+        for usage in resent { spend.charge(core, session_id, usage); }
         let result = match outcome {
-            Err(error) if choice && error.contains("tool_choice") => { choice = false; continue; }
             Ok(result) => result,
             Err(error) => { spend.tokens = spend.tokens.saturating_add(estimated.saturating_add(limit)); return Err(format!("the notes request failed: {}", crate::text::one_line(&error))); }
         };
@@ -2155,7 +2153,7 @@ pub(crate) mod tests {
         assert_eq!((&sent[cut]["role"], &sent[cut]["content"]), (&"user".into(), &NOTES_ASK.into()));
         assert_eq!(notes["tools"], before["tools"]);
         assert_eq!(notes["tools"], serde_json::from_str::<Value>(SCHEMAS).unwrap(), "the turn's tools");
-        assert_eq!((&notes["tool_choice"], &before["tool_choice"]), (&"none".into(), &"auto".into()), "the notes ask is answered in text");
+        assert_eq!((&notes["tool_choice"], &before["tool_choice"]), (&"auto".into(), &"auto".into()), "the turn's tool choice: a server that renders the prompt from it renders the cached one");
         assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
     }
 
@@ -2220,7 +2218,7 @@ pub(crate) mod tests {
         let (url, requests) = crate::client::tests::spawn_recording_once(reply("", true));
         assert_digest_cut_without_notes(&url, &mut RequestSpend::new(None)).await;
         let sent = body(&requests);
-        assert_eq!((sent["messages"].as_array().unwrap().last().unwrap()["content"].as_str(), sent["tool_choice"].as_str()), (Some(NOTES_ASK), Some("none")));
+        assert_eq!((sent["messages"].as_array().unwrap().last().unwrap()["content"].as_str(), sent["tool_choice"].as_str()), (Some(NOTES_ASK), Some("auto")));
     }
 
     #[tokio::test]
@@ -2289,18 +2287,21 @@ pub(crate) mod tests {
         }
     }
 
-    /// A route that refuses tool_choice is asked again without it.
+    /// The notes request is sent once with the turn's own tool choice: a
+    /// route that refuses it is not asked again with another, and the soft
+    /// cut waits, history whole.
     #[tokio::test]
-    async fn a_route_that_refuses_tool_choice_is_asked_without_it() {
-        let refusal = r#"{"error":{"message":"tool_choice none is not supported"}}"#;
+    async fn a_refused_notes_request_is_sent_once_with_the_turns_tool_choice() {
+        let refusal = r#"{"error":{"message":"tool_choice is not supported"}}"#;
         let refused = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}", refusal.len());
         let (url, requests) = serve_in_order(vec![refused, reply("State: halfway.", false)]);
         let fixture = Fixture::new(&url);
         let mut messages = session(60, 2_000);
-        assert!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await > 0);
-        assert!(messages[pinned_head(&messages)].content.as_deref().unwrap().contains("Summary: State: halfway."));
+        let before = messages.clone();
+        assert_eq!(fixture.cut(&mut messages, 20_000, 100_000, &mut RequestSpend::new(None)).await, 0);
+        assert_eq!(messages.len(), before.len(), "the history stays whole");
         let choices: Vec<Value> = requests.try_iter().map(|b| b["tool_choice"].clone()).collect();
-        assert_eq!(choices, ["none", "auto"]);
+        assert_eq!(choices, ["auto"]);
     }
 
     /// The notes request is admitted in real tokens by the session's learned
