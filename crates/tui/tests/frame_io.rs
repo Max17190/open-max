@@ -1479,16 +1479,40 @@ mod first_frame {
         s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
         s.write(b"ctx\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| {
-            shown.contains("use /new") && !shown.contains("esc to cancel")
+            shown.contains("/new starts over") && !shown.contains("esc to cancel")
         });
         assert!(shown.contains("backend returned 400 Bad Request: Request rejected:"), "{shown}");
         assert!(shown.contains("maximum context length exceeded"), "{shown}");
         assert!(shown.contains("Check that context_tokens matches the served model."), "{shown}");
-        assert!(shown.contains("If the session is too long, use /new."), "{shown}");
+        // Compaction keeps the conversation, so it is named first.
+        assert!(shown.contains("If the session is too long, /compact shortens it and keeps notes of what it cut, or /new"), "{shown}");
         s.write(b"/new\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("new session"));
         assert!(shown.contains("new session") && !shown.contains("maximum context length"), "{shown}");
         s.write(b"hello\r");
+        let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("fixture reply"));
+        assert!(shown.contains("fixture reply"), "{shown}");
+    }
+
+    /// A key the provider rejects mid-session ends the turn with the server's
+    /// error and the step that replaces the key, and the next prompt after
+    /// it runs.
+    #[test]
+    fn a_rejected_key_names_the_login_that_replaces_it() {
+        let rejected = r#"{"error":{"message":"Incorrect API key provided"}}"#;
+        let base = endpoint_with_status(vec![("401 Unauthorized", rejected.into()), ("200 OK", LOGIN_REPLY.into())]);
+        let mut s = Session::spawn_with("rejected-key", 120, 26, &serde_json::json!({
+            "base_url": base, "model": "stub-model", "context_tokens": 32768,
+        }).to_string());
+        let wait = Duration::from_secs(5);
+        let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
+        s.write(ANSWER);
+        s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        s.write(b"hello\r");
+        let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("enter it again") && !shown.contains("esc to cancel"));
+        assert!(shown.contains("backend returned 401 Unauthorized: Incorrect API key provided"), "{shown}");
+        assert!(shown.contains("The provider rejected the API key: run /login to enter it again."), "{shown}");
+        s.write(b"again\r");
         let shown = screen_when(&mut s, 120, 26, wait, |shown| shown.contains("fixture reply"));
         assert!(shown.contains("fixture reply"), "{shown}");
     }

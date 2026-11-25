@@ -3159,11 +3159,12 @@ impl App {
                 self.pending_approval = None;
                 self.dirty.mark_chrome();
                 let provider_error = message.starts_with("backend returned ") || message.starts_with("backend reported an error");
-                if provider_error && open_max_core::refused_for_length(&message) {
-                    self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /new."));
-                } else {
-                    self.error(&message);
-                }
+                let next = if provider_error && open_max_core::refused_for_length(&message) {
+                    "\nCheck that context_tokens matches the served model.\nIf the session is too long, /compact shortens it and keeps notes of what it cut, or /new starts over."
+                } else if message.starts_with("backend returned 401") {
+                    "\nThe provider rejected the API key: run /login to enter it again."
+                } else { "" };
+                self.error(&format!("{message}{next}"));
             }
         }
     }
