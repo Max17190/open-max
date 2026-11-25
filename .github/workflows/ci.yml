@@ -152,6 +152,30 @@ jobs:
       - name: Test the examples
         timeout-minutes: 10
         run: |
+          mkdir -p "$RUNNER_TEMP/sc"
+          cat > "$RUNNER_TEMP/sc/sitecustomize.py" <<'PY'
+          import subprocess, time, sys, atexit
+          _r = subprocess.run
+          log = []
+          def run(*a, **k):
+              t = time.time()
+              try:
+                  return _r(*a, **k)
+              finally:
+                  argv = a[0] if a else k.get('args')
+                  log.append((time.time() - t, ' '.join(map(str, argv))[:160] if isinstance(argv, (list, tuple)) else str(argv)[:160]))
+          subprocess.run = run
+          @atexit.register
+          def dump():
+              log.sort(reverse=True)
+              sys.stderr.write(f"SUBPROC total {sum(d for d, _ in log):.1f}s over {len(log)} calls\n")
+              for d, c in log[:15]:
+                  sys.stderr.write(f"  {d:6.2f}s {c}\n")
+          PY
+          export PYTHONPATH="$RUNNER_TEMP/sc"
+          time target/debug/openmax --version
+          time target/debug/openmax --version
+          time /bin/echo hi
           python3 examples/repo-memory/test_repo_memory.py target/debug/openmax > "$RUNNER_TEMP/repo-memory.log" 2>&1 &
           memory=$!
           python3 examples/run-task/test_run_task.py target/debug/openmax > "$RUNNER_TEMP/run-task.log" 2>&1 &
