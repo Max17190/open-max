@@ -633,6 +633,9 @@ async fn event_loop(
                         app.persist_model_selection(Some(provider), model);
                     }
                     Ok(_) if action == crate::setup::Action::Login => app.open_model_picker(),
+                    Ok(_) if open_max_core::providers::load_providers(&app.core.data_dir).is_empty() => {
+                        app.note("Provider disconnected; no connection is left, so /login connects one.")
+                    }
                     Ok(_) => app.note("Provider disconnected. Use /model or /login."),
                     Err(error) => app.error(&error),
                 }
@@ -867,7 +870,7 @@ impl App {
                 "user" => {
                     if let Some(text) = &m.content {
                         if m.harness_note {
-                            self.note(note_body(text));
+                            self.harness_note(text);
                         } else {
                             self.insert_user_block(text);
                         }
@@ -1782,6 +1785,15 @@ impl App {
                 }
             }
             Err(error) => error.to_string(),
+        }
+    }
+
+    /// A harness note, its bracket prefix stripped; the text is already the
+    /// model's. The execution policy note is not shown: the status line shows
+    /// the mode, and the note's wording is written for the model.
+    fn harness_note(&mut self, text: &str) {
+        if !text.starts_with("[execution policy:") {
+            self.note(note_body(text));
         }
     }
 
@@ -3004,9 +3016,8 @@ impl App {
                 // hook-write note produced no screen change, and Refrozen
                 // shows only its generic toolbox summary, not the NOT-loaded
                 // reason), so ignoring it dropped harness corrections a
-                // stdio client would see. The bracket prefix is
-                // stripped for a cleaner line; the text is already the model's.
-                self.note(note_body(&text));
+                // stdio client would see.
+                self.harness_note(&text);
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if self.compacting {
@@ -3158,6 +3169,8 @@ impl App {
                 let provider_error = message.starts_with("backend returned ") || message.starts_with("backend reported an error");
                 if provider_error && open_max_core::refused_for_length(&message) {
                     self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /compact or /new."));
+                } else if message.starts_with("backend returned 401") {
+                    self.error(&format!("{message}\nThe provider rejected this connection's credentials: run /login to replace them."));
                 } else {
                     self.error(&message);
                 }
@@ -4702,7 +4715,8 @@ mod tests {
     /// /rewind alone lists the turns it can return to, numbered as it counts
     /// them, each with its prompt. A harness note stored ahead of a prompt
     /// is drawn as the note it was, after a rewind or a resume, never as a
-    /// prompt of its own, and lists no turn.
+    /// prompt of its own, and lists no turn. The execution policy note is not
+    /// drawn there either, as it is not live: the status line shows the mode.
     #[tokio::test]
     async fn rewind_lists_the_turns_and_a_reloaded_harness_note_keeps_its_mark() {
         use open_max_core::sessions;
@@ -4730,7 +4744,7 @@ mod tests {
         assert!(app.switch_to_session(id.clone()));
         let check_replay = |app: &App, turns| {
             let shown = app.transcript.export_text();
-            assert!(shown.contains("> • execution policy: auto; fixture."), "{shown}");
+            assert!(!shown.contains("> • execution policy"), "{shown}");
             assert!(shown.contains("> • Earlier messages were compacted.\n>   Open: check the remaining file."), "{shown}");
             assert_eq!(shown.matches("## user").count(), turns, "{shown}");
             assert!(shown.contains(&format!("## user\n\n{text}\n")), "{shown}");

@@ -594,7 +594,10 @@ Returning to `ask` restores content requirements for anything created in `auto`.
 
 The model reads the mode in a one-line `[execution policy: <mode>; ...]` note
 placed ahead of a session's first prompt, and written again only when the mode
-changes or a resumed session's history no longer holds it. The history resends
+changes or a resumed session's history no longer holds it. The terminal
+interface does not show the note, live or in a resumed session, since its
+status line shows the mode; a stdio or `--json` client receives it as a
+`harness_note`. The history resends
 it on every later request, so it states only the mode's limits; content
 approval detail is in `openmax --spec tools`, `hooks`, and `permissions`. The
 tools and hooks contracts state each mode's rule and leave what applies only
@@ -893,8 +896,10 @@ ChatGPT logout revokes and clears its local tokens. For an API-key connection,
 confirming logout removes that named connection and its model catalog from
 `providers.json`. It does not revoke the API key at its issuer or edit shell
 environment variables. A still-selected removed provider fails explicitly;
-it cannot fall back to another key or endpoint. Other connections and settings
-remain unchanged.
+it cannot fall back to another key or endpoint. After `/logout`, the notice
+names `/login` alone when `providers.json` has no connection left, and
+`/model` or `/login` otherwise. Other connections and settings remain
+unchanged.
 
 Connection setup requires a human terminal, runs without project hooks, and
 grants no trust. Catalog writes preserve unrelated entries, take a shared
