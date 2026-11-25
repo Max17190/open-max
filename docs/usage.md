@@ -255,7 +255,7 @@ turn that ends with any code but 0 skips the prompts after it.
 | Code | Meaning |
 | --- | --- |
 | 0 | Every turn finished, even if it reported a warning such as a failed session save |
-| 1 | An operational failure: a turn failed or could not start, ended on any other stop reason (`truncated`, `empty`, `blocked`, or a provider's own, such as `refusal` or `content_filter`), or the session could not be opened |
+| 1 | An operational failure: a turn failed or could not start, ended on any other stop reason (`truncated`, `empty`, `blocked`, a model's `refusal`, or a provider's own, such as `content_filter`), or the session could not be opened |
 | 2 | A usage or configuration error before any turn, `--continue` found no prior session here, or `--session` named one this directory cannot continue |
 | 3 | The project is not trusted, or trust cannot be granted or a `--permissions` mode selected from this process, or a turn that otherwise finished declined an approval request, as a print run does in `ask` (see above) |
 | 4 | A turn stopped short (`length` when replies in a row kept reaching their `max_tokens` before any tool call once it was raised to its ceiling, which the stderr line names with where it is set, `max_iterations`, `budget_exhausted`, or `unverified`). Resubmit to continue. An `unverified` from a gate that could not start, or from a hook file failing closed, repeats until the hook is repaired |
