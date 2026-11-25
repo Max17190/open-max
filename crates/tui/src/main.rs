@@ -1582,11 +1582,6 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     if unattended {
         if let Err(e) = open_max_core::providers::resolve(&core.settings.lock().unwrap(), &core.data_dir) {
             eprintln!("openmax: {e}");
-            let quote = |text: &str| open_max_core::doctor::shell_quote(std::path::Path::new(text));
-            let connected: Vec<_> = open_max_core::providers::load_providers(&core.data_dir).iter().filter_map(|(name, p)| Some(format!("--provider {} --model {}", quote(name), quote(&p.models.first()?.id)))).collect();
-            if matches!(e, open_max_core::providers::ResolveError::Unconfigured { endpoint: true, .. } | open_max_core::providers::ResolveError::MissingEndpoint) && !connected.is_empty() {
-                eprintln!("openmax: a connection is saved but none is selected; select one for this run with {}, or save provider and model in ~/.openmax/settings.json", connected.join(" or "));
-            }
             std::process::exit(2);
         }
     }
@@ -1722,7 +1717,7 @@ fn apply_endpoint_flags(core: &Core, cli: &CliArgs) -> Result<Vec<String>, Strin
     }
     if !applied.overridden.is_empty() {
         lines.push(format!(
-            "openmax: for this run only, the command line sets {}; nothing was written to {}, so save them there to keep them",
+            "openmax: for this run only, the command line sets {}; they were not written to {}, so save them there to keep them",
             applied.overridden.join(", "),
             path.display()
         ));

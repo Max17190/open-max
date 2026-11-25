@@ -41,7 +41,7 @@ headless and stdio trust.
 | --- | --- |
 | `/help` | Keybindings and commands |
 | `/model` | Search configured providers and select a model |
-| `/model <id>` | Set an exact model id on the active endpoint; on a provider, one it saved a context window for (`/login <provider>` saves the one you choose) |
+| `/model <id>` | Set an exact model id on the active endpoint; on a provider, only one with a context window: `/login <provider>` saves one for a model the server lists, and `context_tokens` in `providers.json` sets one for any |
 | `/effort [level]` | Pick reasoning effort with arrow keys and Enter, or request an exact level for the next turn. `default` omits the setting; `none` is explicit. Model support varies |
 | `/copy` | Copy the latest assistant response |
 | `/provider [name]` | Pick a provider/model pair, or switch to a named provider |

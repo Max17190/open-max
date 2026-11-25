@@ -633,9 +633,7 @@ async fn event_loop(
                         app.persist_model_selection(Some(provider), model);
                     }
                     Ok(_) if action == crate::setup::Action::Login => app.open_model_picker(),
-                    Ok(_) => app.note(if open_max_core::providers::load_providers(&app.core.data_dir).is_empty() {
-                        "Provider disconnected; no connection is left, so /login connects one."
-                    } else { "Provider disconnected; /model lists the connections left." }),
+                    Ok(_) => app.note("Provider disconnected. Use /model or /login."),
                     Err(error) => app.error(&error),
                 }
                 app.dirty = Dirty::all();
@@ -876,11 +874,9 @@ impl App {
                     }
                 }
                 "assistant" => {
-                    if let Some(text) = &m.content {
-                        if !text.trim().is_empty() {
-                            self.last_assistant_response = Some(text.clone());
-                            self.transcript.push_assistant(markdown::render(text));
-                        }
+                    if let Some(text) = m.content.as_ref().filter(|text| !text.trim().is_empty()) {
+                        self.last_assistant_response = Some(text.clone());
+                        self.transcript.push_assistant(markdown::render(text));
                     }
                     if let Some(calls) = &m.tool_calls {
                         // Tool results directly follow their assistant message;
@@ -1791,8 +1787,12 @@ impl App {
 
     fn persist_model_selection(&mut self, provider: Option<String>, model: String) {
         let next = model_selection(&self.core.settings.lock().unwrap(), provider.clone(), model.clone());
-        if let (Some(name), Err(open_max_core::providers::ResolveError::MissingContextTokens)) = (&provider, open_max_core::providers::resolve_endpoint(&next, &self.core.data_dir)) {
-            return self.error(&format!("{name} has no context window saved for {model}, so the model is unchanged: run /login {name} and choose {model} to record it"));
+        // A model with no window would fail at the next prompt, so it is not saved. Its effort is checked after.
+        let sized = config::Settings { reasoning_effort: None, ..next.clone() };
+        let window = open_max_core::providers::resolve_endpoint(&sized, &self.core.data_dir);
+        if let (Some(name), Err(open_max_core::providers::ResolveError::MissingContextTokens)) = (&provider, window) {
+            let fix = format!("/login {name} saves one for a model the server lists, or set its context_tokens in providers.json");
+            return self.error(&format!("{name} has no context window saved for {model}, so the selection is unchanged: {fix}"));
         }
         // The core's own save: it fingerprints the exact bytes it writes,
         // under its lock, so a TUI-authored save never reads as drift and a
@@ -2438,13 +2438,26 @@ impl App {
                             ));
                             return;
                         };
-                        // Keep the model only if it is still in this catalog;
-                        // otherwise switch to the first listed model. Saved as
-                        // a pick is, so a model with no window is refused.
-                        let current = self.core.settings.lock().unwrap().model.clone();
-                        let keep = p.models.is_empty() || p.models.iter().any(|m| m.id == current);
-                        let model = if keep { current } else { p.models[0].id.clone() };
-                        self.persist_model_selection(Some(name), model);
+                        {
+                            let mut s = self.core.settings.lock().unwrap();
+                            s.provider = Some(name.clone());
+                            // Keep the model only if it is still in this catalog;
+                            // otherwise switch to the first listed model.
+                            if !p.models.is_empty() && !p.models.iter().any(|m| m.id == s.model) {
+                                s.model = p.models[0].id.clone();
+                            }
+                            let _ = self.core.save_settings(&s);
+                        }
+                        self.refresh_connection();
+                        let ep = open_max_core::providers::resolve(&self.core.settings.lock().unwrap(), &self.core.data_dir);
+                        match ep {
+                            Ok(ep) => self.note(&format!(
+                                "provider {name} → {} ({})",
+                                extensions::display_base_url(&ep.base_url),
+                                ep.model
+                            )),
+                            Err(e) => self.error(&e.to_string()),
+                        }
                     }
                 }
             }
@@ -2987,13 +3000,13 @@ impl App {
                 self.note_tool_runs(runs);
             }
             AgentEvent::HarnessNote { text, .. } => {
-                // Render it: few notes have a TUI-visible equivalent (the
-                // hook-write note none, Refrozen only a toolbox summary without
-                // the NOT-loaded reason), so dropping them hid corrections a
-                // stdio client sees. The execution policy has one, the footer's
-                // mode, so its model-facing wording is not shown. The bracket
-                // prefix is stripped; the text is already the model's.
-                if !text.starts_with("[execution policy:") { self.note(note_body(&text)) }
+                // Render it: not every note has a TUI-visible equivalent (the
+                // hook-write note produced no screen change, and Refrozen
+                // shows only its generic toolbox summary, not the NOT-loaded
+                // reason), so ignoring it dropped harness corrections a
+                // stdio client would see. The bracket prefix is
+                // stripped for a cleaner line; the text is already the model's.
+                self.note(note_body(&text));
             }
             AgentEvent::Compacted { tokens_before, tokens_after, compacted_messages } => {
                 if self.compacting {
@@ -3143,12 +3156,11 @@ impl App {
                 self.pending_approval = None;
                 self.dirty.mark_chrome();
                 let provider_error = message.starts_with("backend returned ") || message.starts_with("backend reported an error");
-                let next = if provider_error && open_max_core::refused_for_length(&message) {
-                    "\nCheck that context_tokens matches the served model.\nIf the session is too long, /compact shortens it and keeps notes of what it cut, or /new starts over."
-                } else if message.starts_with("backend returned 401") {
-                    "\nThe provider rejected the API key: run /login to enter it again."
-                } else { "" };
-                self.error(&format!("{message}{next}"));
+                if provider_error && open_max_core::refused_for_length(&message) {
+                    self.error(&format!("{message}\nCheck that context_tokens matches the served model.\nIf the session is too long, use /compact or /new."));
+                } else {
+                    self.error(&message);
+                }
             }
         }
     }
@@ -6330,6 +6342,17 @@ mod tests {
             assert_eq!(settings.provider.as_deref(), Some(provider));
             assert_eq!(settings.model, expected);
         }
+        // A switch names the endpoint it resolved to, and one that cannot
+        // resolve says why.
+        assert!(app.transcript.export_text().contains("provider fixture → http://127.0.0.1:9/v1 (two)"));
+        fs::write(dir.join("providers.json"), json!({"providers":{
+            "fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384}]},
+            "empty":{"base_url":"http://127.0.0.1:9/v1"},
+            "blank":{"base_url":"","models":[{"id":"m","context_tokens":16384}]}
+        }}).to_string()).unwrap();
+        app.handle_submit("/provider blank".into()).await.unwrap();
+        assert!(app.transcript.export_text().contains("no model endpoint configured"));
+        app.handle_submit("/provider empty".into()).await.unwrap();
         app.handle_submit("/model fixture/exact/model".into()).await.unwrap();
         assert_eq!(app.core.settings.lock().unwrap().model, "fixture/exact/model");
         app.handle_submit("/model".into()).await.unwrap();

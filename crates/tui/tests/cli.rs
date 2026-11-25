@@ -7190,31 +7190,6 @@ fn a_fresh_install_answers_in_one_command() {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
-/// A connection saved by a login is not selected for a print run until
-/// settings or flags name it: the run that names neither exits 2 and gives
-/// the flags that select each saved connection, and the run with them
-/// answers, writes no settings file, and says the selection was not saved.
-#[test]
-fn a_print_run_with_a_saved_connection_and_no_selection_names_the_flags() {
-    let (project, home) = fresh_dirs("saved-unselected");
-    let (base_url, _requests, _server) = spawn_stub_server();
-    let dir = home.join(".openmax");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("providers.json"), serde_json::json!({"providers":{"local":{"base_url":base_url,
-        "models":[{"id":"stub-model","context_tokens":16384}]}}}).to_string()).unwrap();
-    let out = cmd(&project, &home).args(["--trust-project", "-p", "say hi"]).output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("openmax: a connection is saved but none is selected; select one for this run with --provider 'local' --model 'stub-model'"), "{stderr}");
-    let out = cmd(&project, &home).args(["--provider", "local", "--model", "stub-model", "-p", "say hi"]).output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "{stderr}");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("stub says hi"), "{stderr}");
-    assert!(stderr.contains("the command line sets provider, model; nothing was written to"), "{stderr}");
-    assert!(!dir.join("settings.json").exists());
-    let _ = std::fs::remove_dir_all(project.parent().unwrap());
-}
-
 /// On an install that already sets a key, the flag for it applies to this
 /// run only: the turn goes to the flag's endpoint, the run says which keys
 /// the command line overrode, and settings.json keeps its bytes, so a typo
@@ -7238,7 +7213,7 @@ fn flags_override_a_configured_install_for_this_run_only() {
     assert!(stdout.contains("stub says hi"), "the turn must use the flag's endpoint: {stderr}");
     assert!(
         stderr.contains(&format!(
-            "openmax: for this run only, the command line sets base_url, api_key, context_tokens; nothing was written to {}, so save them there to keep them",
+            "openmax: for this run only, the command line sets base_url, api_key, context_tokens; they were not written to {}, so save them there to keep them",
             settings_path.display()
         )),
         "{stderr}"
