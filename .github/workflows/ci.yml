@@ -176,6 +176,10 @@ jobs:
           time target/debug/openmax --version
           time target/debug/openmax --version
           time /bin/echo hi
+          mkdir -p "$RUNNER_TEMP/h" "$RUNNER_TEMP/t"
+          time env -i HOME="$RUNNER_TEMP/h" PATH="$PATH" git var GIT_COMMITTER_IDENT || true
+          time python3 -c 'import socket; print(socket.gethostname(), socket.getfqdn())'
+          HOME="$RUNNER_TEMP/h" TMPDIR="$RUNNER_TEMP/t" python3 -u examples/run-task/demo.py --openmax target/debug/openmax 2>&1 | perl -MTime::HiRes=time -ne 'printf "%.2f %s", time, $_'
           python3 examples/repo-memory/test_repo_memory.py target/debug/openmax > "$RUNNER_TEMP/repo-memory.log" 2>&1 &
           memory=$!
           python3 examples/run-task/test_run_task.py target/debug/openmax > "$RUNNER_TEMP/run-task.log" 2>&1 &
