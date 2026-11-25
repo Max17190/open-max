@@ -2450,6 +2450,7 @@ fn every_test_runs_under_a_checksummed_nextest_that_retries_none() {
             .map(String::as_str)
             .filter(|partition| !excluded.contains(&(runner.to_string(), partition.to_string())))
             .collect();
+        assert!(!kept.is_empty(), "{runner} has no test jobs");
         let whole = (1..=kept.len()).map(|k| format!("{k}/{}", kept.len())).collect::<Vec<_>>();
         assert_eq!(kept, whole, "{runner}'s test jobs do not run each of its tests exactly once");
     }
