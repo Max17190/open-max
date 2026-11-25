@@ -1003,6 +1003,9 @@ mod first_frame {
         assert_eq!(settings.model, "alpha");
     }
 
+    /// Disconnecting the selected provider says what is left to do, the
+    /// connection made after it answers, and a model it saved no window for
+    /// is refused.
     #[test]
     fn a_disconnected_provider_cannot_be_picked_in_the_session_or_on_restart() {
         let base = endpoint(vec![LOGIN_CATALOG.into(), LOGIN_CATALOG.into(), LOGIN_REPLY.into()]);
@@ -1036,7 +1039,8 @@ mod first_frame {
         s.wait_for(FRAME_END, push, wait).expect("first frame after login");
         let shown = screen(&s.out, 85, 26).join("\n");
         assert!(shown.contains("replacement") && !shown.contains("original"), "{shown}");
-        assert!(disconnect.contains("Use /model or /login."), "{disconnect}");
+        // No connection is left, so the notice names the one step that works.
+        assert!(disconnect.contains("Provider disconnected; no connection is left, so /login connects one."), "{disconnect}");
         let mut next = spawn(&s.dir.join("home/.openmax"));
         let probe = next.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
         next.write(ANSWER);

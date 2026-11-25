@@ -633,7 +633,9 @@ async fn event_loop(
                         app.persist_model_selection(Some(provider), model);
                     }
                     Ok(_) if action == crate::setup::Action::Login => app.open_model_picker(),
-                    Ok(_) => app.note("Provider disconnected. Use /model or /login."),
+                    Ok(_) => app.note(if open_max_core::providers::load_providers(&app.core.data_dir).is_empty() {
+                        "Provider disconnected; no connection is left, so /login connects one."
+                    } else { "Provider disconnected; /model lists the connections left." }),
                     Err(error) => app.error(&error),
                 }
                 app.dirty = Dirty::all();

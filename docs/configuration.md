@@ -887,8 +887,9 @@ ChatGPT logout revokes and clears its local tokens. For an API-key connection,
 confirming logout removes that named connection and its model catalog from
 `providers.json`. It does not revoke the API key at its issuer or edit shell
 environment variables. A still-selected removed provider fails explicitly;
-it cannot fall back to another key or endpoint. Other connections and settings
-remain unchanged.
+it cannot fall back to another key or endpoint. After `/logout`, the notice
+names `/model` while other connections are left and `/login` when none is.
+Other connections and settings remain unchanged.
 
 Connection setup requires a human terminal, runs without project hooks, and
 grants no trust. Catalog writes preserve unrelated entries, take a shared
