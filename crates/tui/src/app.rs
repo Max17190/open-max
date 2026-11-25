@@ -3903,7 +3903,7 @@ impl App {
         } else if self.quit_armed {
             "ctrl+c again to quit"
         } else {
-            "shift+tab effort · /permissions"
+            "/help keys and commands · shift+tab effort"
         };
         hint.into()
     }

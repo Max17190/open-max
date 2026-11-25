@@ -478,6 +478,9 @@ palette's gray (color 8) marks secondary text, selection, and every border
 except the focused prompt's and the approval card's. There is no color
 setting.
 
-The persistent status line stays limited to model, context use, and approval
-mode so the transcript remains readable; `/status` is where the full runtime
-detail lives.
+The persistent status line stays short so the transcript remains readable.
+On its right are the model (with the requested reasoning effort, if any),
+context use, the share of prompt tokens served from cache once the provider
+reports it, and the approval mode. On its left are the keys for the moment:
+while nothing else is going on, it points to `/help`, which lists every key
+and command. `/status` is where the full runtime detail lives.

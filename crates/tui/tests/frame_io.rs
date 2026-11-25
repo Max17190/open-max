@@ -1524,6 +1524,9 @@ mod first_frame {
         let probe = s.wait_for(KEYBOARD_QUERY, 0, wait).expect("keyboard probe");
         s.write(ANSWER);
         s.wait_for(KEYBOARD_PUSH, probe, wait).expect("keyboard ready");
+        // The idle screen points to the help, which lists keys and commands.
+        let idle = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("/help keys"));
+        assert!(idle.contains("/help keys and commands"), "{idle}");
         s.write(b"/help\r");
         let shown = screen_when(&mut s, 60, 20, wait, |shown| shown.contains("Key bindings"));
         assert!(shown.contains("Key bindings") && shown.contains("send"), "{shown}");
