@@ -521,7 +521,12 @@ notes need not repeat them. Over the input budget, where the whole
 conversation may not fit beside the reply, the prompt is the conversation up
 to the cut instead. A reply the
 limit cut before any text is asked for once more at twice the limit. The notes, up to 4,000
-bytes, take the removed span's place in one context note. A reply with
+bytes, take the removed span's place in one context note. The ask wants
+only what neither those exchanges nor the files show: each file changed with
+what is done in it, decisions, what failed, the command that checks the work with its last
+result, and what the task still requires. The note says every edit is on
+disk as the model left it, and to look at a file's current state (its status
+and diff, under version control) before editing it. A reply with
 no text that ended on its own and made no call gives its reasoning as the
 notes, since some models write them there. Notes over the cap end at their
 last whole line, and notes the reply limit cut end with a line that says so.
