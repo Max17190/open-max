@@ -115,10 +115,10 @@ the same name, and one rule decides what each does:
   saves it: every value it had is kept, and a setting it left out is written
   with its default. The run prints `openmax: wrote <keys> to <path>` on
   stderr.
-- A key the file sets to another value is overridden for this run only. The
-  file keeps its value, and the run prints `openmax: for this run only, the
-  command line overrides <keys> in <path>; the file is unchanged, so set them
-  there to keep them` on stderr. A `/model` or `/provider` save during the
+- A key the file sets to another value is overridden for this run only, as
+  are `--provider` and `--model` beside it. The file keeps its value, and the
+  run prints `openmax: for this run only, the command line sets <keys>;
+  nothing was written to <path>, so save them there to keep them` on stderr. A `/model` or `/provider` save during the
   session writes the file's value for each overridden key until the session
   sets that key to another value itself; from then on the session's value is
   saved, as any in-session choice is. A switch to another provider than the
