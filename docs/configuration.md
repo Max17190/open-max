@@ -116,7 +116,8 @@ the same name, and one rule decides what each does:
   with its default. The run prints `openmax: wrote <keys> to <path>` on
   stderr.
 - A key the file sets to another value is overridden for this run only, as
-  are `--provider` and `--model` beside it. The file keeps its value, and the
+  is every flag on a run that selects another endpoint than the file's (see
+  below). The file keeps its value, and the
   run prints `openmax: for this run only, the command line sets <keys>; they
   were not written to <path>, so save them there to keep them` on stderr. A
   `/model` or `/provider` save during the
@@ -549,8 +550,9 @@ auto|ask|readonly` selects directly. The approval card also offers **Auto for
 project**. A card left unanswered for 10 minutes declines the call as timed
 out, and the model is told to stop and summarize what it was about to do. To
 stop being asked about one command, such as `cargo test`, add an `allow` rule
-for it in `.openmax/permissions.toml` and approve the file once with
-`openmax --approve` (see [Permissions](extending.md#permissions)). From a
+for it in `.openmax/permissions.toml` and approve the file with
+`openmax --approve .openmax/permissions.toml` (see
+[Permissions](extending.md#permissions)). From a
 shell, `openmax --permissions auto|ask|readonly` selects for
 the project it runs in, and says what it saved or that the mode was already
 saved. With `-p`, `--stdio` or `--subagent` the run goes on under the new mode;
