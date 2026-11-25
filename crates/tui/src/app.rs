@@ -2438,29 +2438,13 @@ impl App {
                             ));
                             return;
                         };
-                        {
-                            let mut s = self.core.settings.lock().unwrap();
-                            s.provider = Some(name.clone());
-                            // Keep the model only if it is still in this catalog;
-                            // otherwise switch to the first listed model.
-                            if !p.models.is_empty() && !p.models.iter().any(|m| m.id == s.model) {
-                                s.model = p.models[0].id.clone();
-                            }
-                            let _ = self.core.save_settings(&s);
-                        }
-                        self.refresh_connection();
-                        let ep = {
-                            let s = self.core.settings.lock().unwrap();
-                            open_max_core::providers::resolve(&s, &self.core.data_dir)
-                        };
-                        match ep {
-                            Ok(ep) => self.note(&format!(
-                                "provider {name} → {} ({})",
-                                extensions::display_base_url(&ep.base_url),
-                                ep.model
-                            )),
-                            Err(e) => self.error(&e.to_string()),
-                        }
+                        // Keep the model only if it is still in this catalog;
+                        // otherwise switch to the first listed model. Saved as
+                        // a pick is, so a model with no window is refused.
+                        let current = self.core.settings.lock().unwrap().model.clone();
+                        let keep = p.models.is_empty() || p.models.iter().any(|m| m.id == current);
+                        let model = if keep { current } else { p.models[0].id.clone() };
+                        self.persist_model_selection(Some(name), model);
                     }
                 }
             }
@@ -6334,6 +6318,8 @@ mod tests {
             "fixture":{"base_url":"http://127.0.0.1:9/v1","models":[{"id":"one","context_tokens":16384},{"id":"two","context_tokens":16384}]},
             "empty":{"base_url":"http://127.0.0.1:9/v1"}
         }}).to_string()).unwrap();
+        // A connection with no catalog runs at the window settings give it.
+        app.core.settings.lock().unwrap().context_tokens = Some(16384);
         for (provider, current, expected) in [
             ("fixture", "one", "one"), ("fixture", "missing", "one"),
             ("fixture", "two", "two"), ("empty", "keep-exact", "keep-exact"),
@@ -6344,8 +6330,6 @@ mod tests {
             assert_eq!(settings.provider.as_deref(), Some(provider));
             assert_eq!(settings.model, expected);
         }
-        // A connection with no catalog runs at the window settings give it.
-        app.core.settings.lock().unwrap().context_tokens = Some(16384);
         app.handle_submit("/model fixture/exact/model".into()).await.unwrap();
         assert_eq!(app.core.settings.lock().unwrap().model, "fixture/exact/model");
         app.handle_submit("/model".into()).await.unwrap();
