@@ -666,22 +666,25 @@ fn gauge(checkout: &Path, flags: &[&str]) -> Result<String, String> {
     Ok(report)
 }
 
-/// What scripts/count-core-lines.sh --files prints for this checkout. Both
-/// line tests below read it, and it is the same report each time, so the
-/// script reads the workspace once per test binary instead of once per test.
+/// What scripts/count-core-lines.sh --formatted --files prints for this
+/// checkout. Both line tests below read it, and it is the same report each
+/// time, so the script reads the workspace once per test binary instead of
+/// once per test.
 fn repo_lines() -> Result<&'static str, String> {
     static REPORT: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-    REPORT.get_or_init(|| gauge(&repo(), &["--files"])).as_deref().map_err(String::clone)
+    REPORT.get_or_init(|| gauge(&repo(), &["--formatted", "--files"])).as_deref().map_err(String::clone)
 }
 
-/// The core, production Rust without its tests, stays under its line
-/// ratchet, against a target of about 37,000 lines.
-/// scripts/count-core-lines.sh measures it as core-excluding-tests (the
-/// lines of crates/*/src less test-only items, by the method its header
-/// states) beside total-including-tests (every line of Rust under crates/),
-/// so a test's lines count toward the second wherever they sit and toward
-/// the first nowhere. The target is not met yet, so this prints it beside
-/// both numbers and holds the ratchet: core-excluding-tests at least
+/// The core, crates/core's production Rust without its tests, stays under
+/// its line ratchet. scripts/count-core-lines.sh --formatted measures it as
+/// core-excluding-tests (the lines of src less test-only items, by the
+/// method its header states, after rustfmt has formatted a copy, so packing
+/// code onto fewer lines saves none) beside total-including-tests (every
+/// line of Rust under crates/core), so a test's lines count toward the
+/// second wherever they sit and toward the first nowhere. The terminal UI's
+/// row is printed, not held: its cost is gated as binary size, frame time
+/// and memory. This prints both numbers and holds the ratchet:
+/// core-excluding-tests at least
 /// BASELINE, the count this test last measured, and at most RATCHET, which
 /// is BASELINE plus MARGIN but never past CEILING. A change that needs more
 /// raises BASELINE to its new count in its own diff and says why; one that
@@ -706,68 +709,15 @@ fn repo_lines() -> Result<&'static str, String> {
 /// that names its line, whatever follows it.
 #[test]
 fn core_source_stays_under_its_line_budget() -> Result<(), String> {
-    const TARGET: usize = 37_000;
-    // Several replacements per edit_file call, and an excerpt of the
-    // changed lines in its result, so an edit takes one round, not one per
-    // replacement plus a read-back. The opt-in soft request budget and its
-    // notes. Compaction makes one cut and asks for notes in the conversation.
-    // A cut skipped for want of notes is reported, and the prompts of later
-    // turns a cut removes stay in its note word for word, and long notes keep
-    // their open part. AGENTS.md rides as far as the window allows, cut at a
-    // line with its dropped sections named, and a note counts the later
-    // prompts it leaves out. The daily release notice, /update with its
-    // session resume, and openmax --update. A cut whose notes do not arrive
-    // lands on the digest, so the skip report's branch is gone, and a notes
-    // reply cut before any text is asked again within the reply bounds. A
-    // reply with no call that stops near the limit is read as a cut thought.
-    // A retryable server fault after reply text is asked for again as a cut is.
-    // Image input (read_file and tool images, one shared preparation step,
-    // on for a model entry that declares it, and its images sent only to an
-    // endpoint that reads them), raised for by its owner. Saying in a bash
-    // result that the kernel killed a process for memory, with offsetting
-    // trims, removed 6. Naming setsid on Linux builds added 5. The opt-in
-    // second look after a short print run (`--second-look`), skipped when the run
-    // changed a file it was given, added 94, and
-    // CEILING was raised for it by its owner. Stopping a bash command whose
-    // processes sit idle (`stuck_command_secs`), with offsetting trims in
-    // run_process and run_bash, removed 1. Keeping credential values out of
-    // tool results and diffs added 54, and CEILING was raised for it by its
-    // owner. A lint refusing in-place writes of files, with its reasoned
-    // exceptions and the section banners dropped, removed 12.
-    // Resolving HOME at entry points and passing it to the doctor removed 4.
-    // Selecting the saved approval mode with `--permissions`, with
-    // offsetting trims in ensure_project_trust
-    // and the declined-approval end line, removed 2. A request budget set
-    // from the turn's own pace (`request_budget_cycles`), with offsetting
-    // trims in the tool call path and the budget notes, added none.
-    // Defaulting the Git email and Cargo cache policy in tool commands adds 10.
-    // Saying what to do next on the command line and in print mode adds 77
-    // production lines over the 45,178 measured before it, and the 45,186
-    // ceiling was raised for it.
-    // Fixing provider setup and session controls adds 275 production lines
-    // over the 45,255 measured before it, and the 45,255 ceiling was raised for it.
-    // Watching for an idle shell after a memory kill adds 42 production
-    // lines over the 45,530 measured before it, and the 45,530 ceiling was
-    // raised for it. Resolving the exact launch cgroup and sharing process
-    // cleanup and output rendering saves 3 lines and lowers the ceiling by 3.
-    // Fixing first login and removing disconnected model rows saves 1 line.
-    // Provider setup and context refusal guidance and help paging add 29
-    // production lines. The previous ceiling had room for 1 of them.
-    // Text-call recovery, offset by shared session task and compaction paths, adds 4 lines.
-    // Matching tagged calls by their frame saves 3 lines.
-    // Recovering tagged calls to unoffered tools adds 3 lines.
-    // Keeping a Chat Completions refusal as the reply adds 20 lines and
-    // refusing a model with no context window adds 7; folding nested checks
-    // into one condition in the stream reader and eight other places saves 27.
-    // Sending the notes request with the turn's tool choice, asking again
-    // after a skipped cut or a reply that makes a call, and reporting each
-    // cut a turn makes save 3 lines and lower the ceiling by 3.
-    const BASELINE: usize = 45_594;
+    // crates/core alone, counted after rustfmt (--formatted): 34,580 lines
+    // when the gate moved to that count from 45,594 lines of crates/core and
+    // crates/tui as written. The raises before it are in the git history.
+    const BASELINE: usize = 34_580;
     const MARGIN: usize = 200;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
     // CEILING.
-    const CEILING: usize = 45_594;
+    const CEILING: usize = 34_780;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 
@@ -869,27 +819,45 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
             "the gauge stopped without naming the item: {stop}"
         );
     }
+    // Packing code onto one line saves nothing under --formatted, which
+    // counts a formatted copy and leaves the checkout as it was.
+    let packed = std::env::temp_dir().join(format!("openmax-line-gauge-packed-{}-{nonce}", std::process::id()));
+    let lib = packed.join("crates/delta/src/lib.rs");
+    std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    let source = "pub fn sum() -> u32 { let a = 1; let b = 2; a + b }\n";
+    std::fs::write(&lib, source).unwrap();
+    let (raw, formatted) = (gauge(&packed, &[]), gauge(&packed, &["--formatted"]));
+    let kept = std::fs::read_to_string(&lib).unwrap();
+    let _ = std::fs::remove_dir_all(&packed);
+    assert!(raw?.contains("TOTAL  core-excluding-tests=1 "), "the packed fixture is not one line as written");
+    let formatted = formatted?;
+    assert!(
+        formatted.contains("TOTAL  core-excluding-tests=5 "),
+        "--formatted did not count the packed fixture as rustfmt lays it out, in 5 lines: {formatted}"
+    );
+    assert_eq!(kept, source, "--formatted changed the checkout it counted");
 
     let report = repo_lines()?;
-    let count = |name: &str| -> usize {
+    let count = |row: &str, name: &str| -> usize {
         report
             .lines()
-            .find(|line| line.starts_with("TOTAL "))
+            .find(|line| line.split_whitespace().next() == Some(row))
             .and_then(|row| row.split_whitespace().find_map(|field| field.strip_prefix(name)?.parse().ok()))
-            .unwrap_or_else(|| panic!("no total {name} in the gauge's report: {report}"))
+            .unwrap_or_else(|| panic!("no {row} {name} in the gauge's report: {report}"))
     };
-    let (core, total) = (count("core-excluding-tests="), count("total-including-tests="));
-    println!("core source: {core} lines excluding tests (ratchet {RATCHET}, target {TARGET}), {total} including tests");
+    let (core, total) = (count("core", "core-excluding-tests="), count("core", "total-including-tests="));
+    println!("core source: {core} lines excluding tests (ratchet {RATCHET}), {total} including tests");
+    println!("tui source, not held: {} lines excluding tests", count("tui", "core-excluding-tests="));
     assert!(
         core <= CEILING,
         "core-excluding-tests is {core}, {} over CEILING, {CEILING}, past which no BASELINE raises its ratchet of \
-         {RATCHET}: trim it (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
+         {RATCHET}: trim it (scripts/count-core-lines.sh --formatted --files counts each file)",
         core - CEILING
     );
     assert!(
         core <= RATCHET,
         "core-excluding-tests is {core}, {} over its ratchet of {RATCHET}: trim it, or set BASELINE to {core} in this \
-         change and say why (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
+         change and say why (scripts/count-core-lines.sh --formatted --files counts each file)",
         core - RATCHET
     );
     // Lines a change removes stay removed: it lowers BASELINE with them, so a
@@ -903,11 +871,10 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     for claim in [
         format!(
-            "The ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
+            "The ratchet is {} today, {} over the baseline measurement of {} lines",
             thousands(RATCHET as u64),
             thousands((RATCHET - BASELINE) as u64),
-            thousands(BASELINE as u64),
-            thousands(TARGET as u64)
+            thousands(BASELINE as u64)
         ),
         format!("The core's ratchet is never raised above {}", thousands(CEILING as u64)),
     ] {
@@ -917,12 +884,12 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 }
 
 /// The agent loop, crates/core/src/agent.rs without its tests, stays under
-/// its line ratchet, against a target of 2,000 lines.
-/// scripts/count-core-lines.sh --files gives each file's
+/// its line ratchet.
+/// scripts/count-core-lines.sh --formatted --files gives each file's
 /// core-excluding-tests by the method core_source_stays_under_its_line_budget
 /// holds to its fixture, so the loop is measured as the core is, not by a
-/// second counter. This prints the target beside the loop's two counts and
-/// holds a ratchet by the same rule: the loop's
+/// second counter. This prints the loop's two counts and holds a ratchet
+/// by the same rule: the loop's
 /// core-excluding-tests at least BASELINE, the count this test last
 /// measured, and at most RATCHET, BASELINE plus MARGIN. A change that needs
 /// more raises BASELINE to its new count in its own diff and says why; one
@@ -931,11 +898,9 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 /// under the core's ratchet. docs/development.md states this ratchet, held here.
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
-    const TARGET: usize = 2_000;
-    // Taking the recovery note only when it can be sent saves 2 lines.
-    const BASELINE: usize = 1_770;
-    // Shared session task setup offsets the recovery, saving 6 lines.
-    // The margin is unchanged.
+    // Counted after rustfmt: 2,495 lines when the gate moved to that count
+    // from 1,771 lines as written.
+    const BASELINE: usize = 2_495;
     const MARGIN: usize = 23;
     const RATCHET: usize = BASELINE + MARGIN;
     const LOOP: &str = "crates/core/src/agent.rs";
@@ -951,13 +916,13 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     };
     let (lines, total) = (count("core-excluding-tests="), count("total-including-tests="));
     println!(
-        "MEASURE agent_loop_stays_under_its_line_ratchet {lines} lines excluding tests (ratchet {RATCHET}, target {TARGET}), \
+        "MEASURE agent_loop_stays_under_its_line_ratchet {lines} lines excluding tests (ratchet {RATCHET}), \
          {total} including tests"
     );
     assert!(
         lines <= RATCHET,
         "{LOOP} has {lines} lines excluding tests, {} over its ratchet of {RATCHET}: trim it, or set BASELINE to \
-         {lines} in this change and say why (scripts/count-core-lines.sh --excluded lists the lines it leaves out)",
+         {lines} in this change and say why (scripts/count-core-lines.sh --formatted --files counts each file)",
         lines - RATCHET
     );
     assert!(
@@ -968,11 +933,10 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     );
     let stated = std::fs::read_to_string(repo().join("docs/development.md")).unwrap();
     let claim = format!(
-        "The agent loop's ratchet is {} today, {} over the baseline measurement of {} lines, against a target of {}",
+        "The agent loop's ratchet is {} today, {} over the baseline measurement of {} lines",
         thousands(RATCHET as u64),
         thousands(MARGIN as u64),
-        thousands(BASELINE as u64),
-        thousands(TARGET as u64)
+        thousands(BASELINE as u64)
     );
     assert!(stated.contains(&claim), "docs/development.md does not say \"{claim}\", which this test holds");
     Ok(())
