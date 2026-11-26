@@ -137,7 +137,8 @@ Linux and macOS: a print run's process group gets SIGKILL in the middle of a
 launch since, each of the three, and the watcher, which leads a session of its
 own, is gone, exited and collected,
 within 100 ms of the signal, and none of the three before the 50 ms grace.
-CI's thesis job asserts that bound in a release build on both runners and
+CI's thesis job asserts that bound in a release build on both runners (macOS
+after every push to main) and
 keeps each pid and when it was gone as an artifact.
 
 `zero_orphans_after_kill_9_with_relative_home` holds the same for `kill -9

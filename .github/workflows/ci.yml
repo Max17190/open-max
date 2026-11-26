@@ -213,7 +213,7 @@ jobs:
 
   # The thesis tests' timing assertions hold only in a release build, and the
   # test job builds in debug, so this job builds them in release, with the
-  # profile the published binary ships with, on the test job's runners, and
+  # profile the published binary ships with, on ubuntu-latest, and
   # runs them one test at a time, so no measurement runs beside another, each
   # printing what it measured: each test target named thesis* in the
   # workspace, and the binary's thesis_frames module on a runner that gates
@@ -228,7 +228,11 @@ jobs:
   # for the gates. `thesis` builds the binary that its tests and the tui's run;
   # `thesis_rounds` builds the binary's unit-test harness where the runner
   # gates one of its tests. Every thesis* test target in the workspace is
-  # one of the two.
+  # one of the two. On macos-latest the same job runs in the Thesis (macOS)
+  # workflow (thesis-macos.yml) after every push to main and every night,
+  # not on pull requests: its release build of the binary took 150 to 220
+  # seconds there, the longest of the gate, and set how long every pull
+  # request waited.
   # crates/tui/tests/thesis.rs holds this wiring.
   thesis:
     name: Thesis (${{ matrix.os }}, ${{ matrix.tests }})
@@ -236,7 +240,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         tests: [thesis, thesis_rounds]
         # The thesis tests a runner does not gate, as it does not meet their
         # targets with room: the gate step skips them, and the Reports
@@ -253,9 +257,6 @@ jobs:
           - os: ubuntu-latest
             reported: harness_time_per_tool_round
             frames: true
-          - os: macos-latest
-            reported: harness_time_per_tool_round transcript_frame_p99_at_100k_lines transcript_frame_p99_at_1m_lines
-            frames: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -264,9 +265,8 @@ jobs:
         with:
           toolchain: stable
 
-      # Only main saves this one: a release build's caches on two runners
-      # from every pull request would push main's out of the repository's
-      # cache space.
+      # Only main saves this one: a release build's cache from every pull
+      # request would push main's out of the repository's cache space.
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
