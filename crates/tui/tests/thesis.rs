@@ -979,8 +979,13 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
 }
 
 /// The thesis gates run in release on both runners: every thesis test runs
-/// in CI's thesis job in release and fails the pull request, but for the
-/// ones a runner reports instead. A
+/// in CI's thesis job in release and fails its run, but for the ones a
+/// runner reports instead. The job gates every pull request on
+/// ubuntu-latest, in ci.yml, and the same job, step for step, gates every
+/// push to main and every merge group on macos-latest, in the Thesis (macOS)
+/// workflow, which also runs every night and on demand and never on a pull
+/// request: its release build of the binary was the longest job of the
+/// pull request's gate. A
 /// test that times the harness asserts its bound only in a release build,
 /// and the test job builds in debug, so ci.yml's `thesis` job builds in
 /// release, on each of the test job's runners, every test target named
@@ -1017,10 +1022,36 @@ fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
 /// or the job's environment.
 #[test]
 fn the_thesis_gates_run_in_release_on_both_runners() {
-    let job = ci_job("thesis");
-    let runners =
-        |job: &[String]| job.iter().find_map(|line| Some(line.trim().strip_prefix("os: [")?.strip_suffix(']')?.to_string()));
-    assert_eq!(runners(&job), runners(&ci_job("test")), "the thesis job does not run on the test job's runners");
+    // The job on ubuntu-latest, in the pull request's gate, and the same job
+    // on macos-latest, in the Thesis (macOS) workflow, which gates main:
+    // their steps are the same lines, and only their runner and its matrix
+    // entry differ.
+    let (gate, main) = (ci_job("thesis"), workflow_job("thesis-macos.yml", "thesis"));
+    let steps_of = |job: &[String]| -> Vec<String> {
+        job.iter()
+            .skip_while(|line| line.trim() != "steps:")
+            .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+            .cloned()
+            .collect()
+    };
+    assert!(!steps_of(&gate).is_empty(), "the thesis job has no steps");
+    assert_eq!(steps_of(&main), steps_of(&gate), "the Thesis (macOS) workflow does not run ci.yml's thesis job step for step");
+    let events = triggers("thesis-macos.yml");
+    let names: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
+    assert_eq!(
+        names,
+        ["push", "merge_group", "schedule", "workflow_dispatch"],
+        "the macOS thesis gates do not run on every push to main, merge group, night and on demand, or run on pull requests"
+    );
+    assert_eq!(events[0].1, ["branches: [main]"], "the macOS thesis gates do not run on every push to main");
+    let job: Vec<String> = gate.iter().chain(&main).cloned().collect();
+    let runners = |job: &[String]| -> String {
+        let all: Vec<&str> =
+            job.iter().filter_map(|line| line.trim().strip_prefix("os: [")?.strip_suffix(']')).collect();
+        all.join(", ")
+    };
+    assert_eq!(runners(&gate), "ubuntu-latest", "the pull request's thesis gate runs on another runner than ubuntu-latest");
+    assert_eq!(runners(&job), runners(&ci_job("test")), "the thesis jobs do not run on the test job's runners");
     // The job's own lines, then each list item's, a step's or a matrix
     // entry's, from its `- ` line to the next, without blanks or comments.
     let mut steps: Vec<Vec<&str>> = vec![Vec::new()];
@@ -1051,9 +1082,20 @@ fn the_thesis_gates_run_in_release_on_both_runners() {
             "Cargo.toml's {section} turns on debug assertions, so every timing test holds only its debug bound"
         );
     }
-    let workflow_env = ci.lines().skip_while(|line| *line != "env:").skip(1).take_while(|line| line.starts_with(' '));
-    let debug: Vec<&str> = workflow_env
-        .map(str::trim)
+    let macos = std::fs::read_to_string(repo().join(".github/workflows/thesis-macos.yml")).unwrap();
+    let workflow_env = |text: &str| -> Vec<String> {
+        text.lines()
+            .skip_while(|line| *line != "env:")
+            .skip(1)
+            .take_while(|line| line.starts_with(' '))
+            .map(|line| line.trim().to_string())
+            .collect()
+    };
+    let (ci_env, macos_env) = (workflow_env(&ci), workflow_env(&macos));
+    let debug: Vec<&str> = ci_env
+        .iter()
+        .chain(&macos_env)
+        .map(String::as_str)
         .chain(steps.iter().flatten().copied())
         .filter(|line| {
             line.starts_with("env:")
@@ -1665,6 +1707,7 @@ fn every_thesis_gate_named_for_a_bound_prints_its_measurement_and_bound() {
     }
     let reported: Vec<String> = ci_job("thesis")
         .iter()
+        .chain(&workflow_job("thesis-macos.yml", "thesis"))
         .filter_map(|line| line.trim().strip_prefix("reported: ").map(str::to_string))
         .flat_map(|tests| tests.split(' ').map(str::to_string).collect::<Vec<_>>())
         .collect();
@@ -2374,7 +2417,7 @@ fn the_ci_jobs_start_at_once_and_a_newer_push_cancels_its_run() {
     // job's cache step may restore.
     let saved: Vec<&str> =
         jobs.iter().copied().filter(|job| ci_job(job).iter().any(|line| line.trim() == "save-if: ${{ github.ref == 'refs/heads/main' }}")).collect();
-    for workflow in ["ci.yml", "release-build.yml", "mutants.yml", "reports.yml"] {
+    for workflow in ["ci.yml", "release-build.yml", "mutants.yml", "reports.yml", "thesis-macos.yml"] {
         let lines: Vec<String> = std::fs::read_to_string(repo().join(".github/workflows").join(workflow))
             .unwrap()
             .lines()
@@ -5275,14 +5318,20 @@ const ORPHANS_LISTING: &str = "zero-orphans-after-kill-9.txt";
 /// write none, uploads nothing.
 #[test]
 fn ci_keeps_the_orphan_listing_on_each_runner() {
-    let job = ci_job("thesis");
+    for job in [ci_job("thesis"), workflow_job("thesis-macos.yml", "thesis")] {
+        keeps_the_orphan_listing(&job);
+    }
+}
+
+/// The steps of a thesis job keep the orphan listing after its gates.
+fn keeps_the_orphan_listing(job: &[String]) {
     let gate = "cargo test --release --workspace --locked --test ${{ matrix.tests }} --no-fail-fast -- --test-threads=1 --nocapture $skip || failed=1";
     let gates = job.iter().position(|line| line.trim() == gate).expect("the thesis job runs no thesis gates");
     let path = format!("path: target/tmp/{ORPHANS_LISTING}");
     let kept = job.iter().position(|line| line.trim() == path).expect("the thesis job keeps no orphan listing");
     assert!(gates < kept, "the thesis job keeps the listing before its gates write it");
-    assert!(step_keys(&job, gates).contains(&"id: gates"), "the gates step has no `id: gates` for the listing's step to read");
-    let keys = step_keys(&job, kept);
+    assert!(step_keys(job, gates).contains(&"id: gates"), "the gates step has no `id: gates` for the listing's step to read");
+    let keys = step_keys(job, kept);
     let wanted = [
         "if: ${{ !cancelled() }}",
         "name: zero-orphans-after-kill-9-${{ matrix.os }}",
