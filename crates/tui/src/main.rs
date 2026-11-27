@@ -1599,7 +1599,7 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     if let Some(task) = cli.subagent {
         let code = subagent::run(core, core_rx, &project, task, cli.json, quit.clone()).await;
         open_max_core::chatgpt::finish_refreshes().await;
-        std::process::exit(if signalled() { quit_status() } else { code });
+        std::process::exit(if stopped_by_a_signal() { quit_status() } else { code });
     }
 
     if cli.stdio || cli.print {
@@ -1623,8 +1623,10 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
         // exit runs no destructor that would stop them.
         open_max_core::execution::kill_process_groups();
         open_max_core::chatgpt::finish_refreshes().await;
-        // A signal that landed as the last turn ended still stops the run.
-        let code = if signalled() { quit_status() } else { code };
+        // A signal that landed as the last turn ended still stops the run. A
+        // reader that left once the output was all written does not: a run
+        // its closed output stopped already returned that status.
+        let code = if stopped_by_a_signal() { quit_status() } else { code };
         std::process::exit(code);
     }
 
@@ -2085,12 +2087,24 @@ pub(crate) fn quit_status() -> i32 {
 /// macOS), the status a shell reports for a job a closed pipe ended. A
 /// signal already recorded keeps its own status. Whether this recorded it.
 pub(crate) fn output_closed() -> bool {
-    QUIT_SIGNAL.compare_exchange(0, 13, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    QUIT_SIGNAL.compare_exchange(0, OUTPUT_CLOSED, Ordering::SeqCst, Ordering::SeqCst).is_ok()
 }
 
-/// Whether a signal has asked the session to end.
+/// The quit `output_closed` records: SIGPIPE's number, a signal the process
+/// ignores and so never receives.
+const OUTPUT_CLOSED: i32 = 13;
+
+/// Whether a signal or a closed output has asked the session to end.
 pub(crate) fn signalled() -> bool {
     QUIT_SIGNAL.load(Ordering::SeqCst) != 0
+}
+
+/// Whether a signal, and not a closed output, has asked the session to end.
+/// A signal gives a run its status however the run ended; a closed output
+/// only when it stopped the run, which then returns that status itself, so
+/// a run whose output was all written exits as it would have.
+pub(crate) fn stopped_by_a_signal() -> bool {
+    !matches!(QUIT_SIGNAL.load(Ordering::SeqCst), 0 | OUTPUT_CLOSED)
 }
 
 /// Resolves at `at`, timed by a thread of its own instead of the runtime's

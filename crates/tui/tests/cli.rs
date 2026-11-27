@@ -6149,6 +6149,69 @@ fn a_print_run_whose_reader_goes_before_its_turn_asks_nothing() {
     }
 }
 
+/// A run that wrote all of its output exits with its own status even when
+/// its reader leaves before the process exits, as `grep -q` leaves once it
+/// has its match: 141 is for output that could not be delivered, and a
+/// script under `set -o pipefail` would read it as a failed run. The reader
+/// here reads everything, then the run is held (SIGSTOP) while the pipe
+/// closes, so the close lands after its last write, before it exits.
+#[test]
+fn a_print_run_whose_output_was_all_read_exits_with_its_own_status() {
+    let bound = std::time::Duration::from_secs(10);
+    for json in [false, true] {
+        let tag = if json { "all-read-json" } else { "all-read-text" };
+        let (project, home) = fresh_dirs(tag);
+        let (base_url, requests, _server) = spawn_scripted_server(vec![(HELLO_SSE.to_string(), true); 2]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let mode: &[&str] = if json { &["--json"] } else { &[] };
+        let mut child = cmd(&project, &home)
+            .arg("--trust-project")
+            .args(mode)
+            .args(["-p", "answer this"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The whole output, read on a thread so a run that never ends it
+        // fails the test instead of hanging it: the done event, or the
+        // answer and the blank line after it.
+        let (sent, read) = std::sync::mpsc::channel();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        std::thread::spawn(move || {
+            let mut all = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                all.push_str(&line);
+                if if json { line.contains(r#""type":"done""#) } else { all.ends_with("stub says hi\n\n") } {
+                    break;
+                }
+            }
+            let _ = sent.send((all, reader));
+        });
+        let Ok((all, reader)) = read.recv_timeout(bound) else {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("{tag}: the output never ended: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        let pid = child.id() as libc::pid_t;
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        drop(reader);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        let output = finish_within(child, std::time::Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(all.contains("stub says hi"), "{tag}: {all}");
+        assert_eq!(output.status.code(), Some(0), "{tag}: {:?}\n{stderr}", output.status);
+        assert_eq!(requests.lock().unwrap().len(), 1, "{tag}: {stderr}");
+        assert!(!stderr.contains("stdout was closed"), "{tag}: a finished run said it was stopped: {stderr}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
 /// Output no reader can leave, a file or /dev/null, runs a turn to its end
 /// with every request made, and exits 0. So does a file that refuses the
 /// writes: a write error that is not a reader leaving (here EFBIG, a file at

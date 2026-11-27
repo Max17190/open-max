@@ -254,7 +254,8 @@ A run stopped by a signal ends with that signal's status (a shell reports
 reader of its pipe exits (`openmax -p ... | head -1`) or the process holding
 the other end dies, stops the same way, starts no later prompt, and exits
 141, the status of a job a closed pipe ended; so does a finished turn whose
-last output found the reader gone. Output to a file or to /dev/null is never
+last output found the reader gone, while a run that wrote all of its output
+keeps its own status. Output to a file or to /dev/null is never
 stopped, and a write error there, such as a full disk, only drops the text
 ([details](execution.md#signals-and-cancellation)). Otherwise the exit code says how the run ended, and a turn that
 ends with any code but 0 skips the prompts after it.

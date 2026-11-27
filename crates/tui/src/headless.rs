@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use open_max_core::agent;
@@ -99,9 +99,12 @@ async fn run_and_look(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<Agen
     let changed = move || given.map(|files| files.iter().filter(|(path, was)| {
         std::fs::symlink_metadata(path).ok().map(|m| (m.len(), m.modified().ok())).as_ref() != Some(was)
     }).count());
+    // A reader that leaves once the run's output is all written takes no
+    // status from it; only a signal does.
     let touched = match crate::until_stopped(args.quit.notified(), &mut None, changed).await {
         Some(touched) if !crate::signalled() => touched,
-        _ => return crate::quit_status(),
+        _ if crate::stopped_by_a_signal() => return crate::quit_status(),
+        _ => return code,
     };
     let skip = match touched {
         _ if written > SECOND_LOOK_MAX_OUTPUT => format!("the run wrote {written} output tokens, over {SECOND_LOOK_MAX_OUTPUT}"),
@@ -117,8 +120,10 @@ async fn run_and_look(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<Agen
     let prompts = vec![format!("{SECOND_LOOK}{}", args.prompts.concat())];
     let look = HeadlessArgs { prompts, session: None, continue_session: false, second_look: false, written: AtomicU64::new(0), ..args };
     match run_session(&core, &mut core_rx, &look).await {
-        _ if crate::signalled() => crate::quit_status(),
+        _ if crate::stopped_by_a_signal() => crate::quit_status(),
         0 => code,
+        // Stopped by its reader leaving: what it had to say was not delivered.
+        stopped if crate::signalled() => stopped,
         // A declined approval: the setup, not the look, kept the work from being done.
         3 => 3,
         failed => {
@@ -209,19 +214,17 @@ async fn run_prompts(
 ) -> i32 {
     let project = &args.project;
     let mut exit_code = 0i32;
+    RAN_ITS_PROMPTS.store(false, Ordering::SeqCst);
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
     for prompt in &args.prompts {
         // A signal that landed as the previous turn ended stops the run here,
-        // before the next prompt is recorded and its hooks run.
-        // So does a reader the OS already reports gone, which the watch may
-        // not have been told of yet: no turn is spent on output nobody reads.
-        if reader_gone_now() {
-            output_gone(&args.quit);
-        }
-        if crate::signalled() {
-            break;
+        // before the next prompt is recorded and its hooks run, and so does a
+        // reader that left (`stop_before_a_turn`): the prompts left are a
+        // run that did not finish.
+        if stop_before_a_turn(&args.quit) {
+            return crate::quit_status();
         }
         // Prompt templates belong to the harness, not to the terminal UI: a
         // delegated `openmax -p "/greet world"` submits what the composer
@@ -230,19 +233,23 @@ async fn run_prompts(
         // for any length of time, and starting the turn claims the session,
         // which waits on the session index lock, so both run where a signal
         // bounds them.
+        // The stop is asked again just before the turn starts, since the wait
+        // a stop bounds here prefers finished work to a stop that came with it.
         let start = {
             let (core, session_id, project) = (core.clone(), session_id.to_string(), project.clone());
-            let prompt = prompt.clone();
+            let (prompt, quit) = (prompt.clone(), args.quit.clone());
             move || {
                 let text = templates::expand_user_input(&core.data_dir, &project, &prompt);
-                agent::start_turn(core, session_id, project, text)
+                if stop_before_a_turn(&quit) { return Ok(false) }
+                agent::start_turn(core, session_id, project, text).map(|()| true)
             }
         };
-        // A turn started under a signal is stopped by `run_turn_events`.
+        // A turn started as a signal or a close landed is stopped by
+        // `run_turn_events` before its first event.
         match crate::until_stopped(args.quit.notified(), stop_by, start).await {
-            Some(Ok(())) => {}
+            Some(Ok(true)) => {}
             Some(Err(e)) => { eprintln!("openmax: {e}"); return 1 }
-            None => return crate::quit_status(),
+            Some(Ok(false)) | None => return crate::quit_status(),
         }
 
         let mut saw_tokens = false;
@@ -255,6 +262,7 @@ async fn run_prompts(
         }
     }
 
+    RAN_ITS_PROMPTS.store(true, Ordering::SeqCst);
     exit_code
 }
 
@@ -509,10 +517,30 @@ fn output_gone(quit: &Notify) {
     }
 }
 
-/// Stop the run (`output_gone`) once the OS reports stdout's reader gone.
+/// Whether the run must start no new turn: a signal or a closed output has
+/// asked it to stop, or the OS already reports stdout's reader gone, which
+/// the watch may not have been told of yet; that is recorded here
+/// (`output_gone`).
+fn stop_before_a_turn(quit: &Notify) -> bool {
+    if reader_gone_now() {
+        output_gone(quit);
+    }
+    crate::signalled()
+}
+
+/// Set once the session's prompts have all run, so the run has no more
+/// output to write unless a second look starts, which asks again before its
+/// turn (`stop_before_a_turn`).
+static RAN_ITS_PROMPTS: AtomicBool = AtomicBool::new(false);
+
+/// Stop the run (`output_gone`) once the OS reports stdout's reader gone,
+/// unless the run has already written all it had to: a reader that leaves
+/// then stops nothing and takes nothing from its status.
 async fn watch_output(quit: Arc<Notify>) {
     reader_gone().await;
-    output_gone(&quit);
+    if !RAN_ITS_PROMPTS.load(Ordering::SeqCst) {
+        output_gone(&quit);
+    }
 }
 
 /// Write `text` to stdout and flush it: false when the write finds the
