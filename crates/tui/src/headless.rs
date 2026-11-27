@@ -199,6 +199,12 @@ async fn run_prompts(
         if crate::signalled() {
             break;
         }
+        // A reader that left between turns, or before the first, gets no
+        // new turn: its model requests would be spent on output nobody reads.
+        if reader_gone_now() {
+            output_gone(&mut stderr);
+            return crate::quit_status();
+        }
         // Prompt templates belong to the harness, not to the terminal UI: a
         // delegated `openmax -p "/greet world"` submits what the composer
         // would, so hooks and the transcript see the expanded text. The
@@ -271,8 +277,17 @@ async fn run_turn_events(
     let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
     let quit = args.quit.notified();
     tokio::pin!(quit);
+    // Whether stdout failed a write or its reader is gone (`reader_gone`):
+    // nobody reads the turn any more, so it stops as a SIGPIPE would stop it.
+    let mut lost = false;
+    let gone = reader_gone();
+    tokio::pin!(gone);
 
     loop {
+        if lost && stop_by.is_none() {
+            output_gone(stderr);
+            *stop_by = Some(Instant::now() + crate::stop_settle());
+        }
         // A signal, here or while the turn was starting, cancels the turn.
         if let (None, Some(by)) = (stopping, *stop_by) {
             core.cancel(session_id);
@@ -296,6 +311,10 @@ async fn run_turn_events(
                 *stop_by = Some(Instant::now() + crate::stop_settle());
                 continue;
             }
+            _ = &mut gone, if stop_by.is_none() => {
+                lost = true;
+                continue;
+            }
             _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
                 if settle.is_some() => return stopping.unwrap_or(1),
         };
@@ -307,8 +326,7 @@ async fn run_turn_events(
         if json {
             // The line `--stdio` frames for the same event, byte for byte.
             if let Ok(line) = env.to_json_line() {
-                let _ = writeln!(stdout, "{line}");
-                let _ = stdout.flush();
+                lost |= !put(stdout, format_args!("{line}\n"));
             }
         }
 
@@ -339,7 +357,7 @@ async fn run_turn_events(
             }
             AgentEvent::Done { stop_reason } => {
                 if !json {
-                    let _ = writeln!(stdout);
+                    lost |= !put(stdout, format_args!("\n"));
                     // A failed turn already printed its error line; a
                     // "stopped (error)" after it would only repeat it.
                     let reported = stop_reason == "error" && error_printed;
@@ -370,6 +388,12 @@ async fn run_turn_events(
                     "stop" | "tool_calls" | "cancelled" => 0,
                     _ => 1,
                 };
+                // A turn whose last output found its reader gone was not
+                // delivered, however its work ended.
+                if lost && stopping.is_none() {
+                    output_gone(stderr);
+                    return crate::quit_status();
+                }
                 return stopping.unwrap_or(exit_code);
             }
             AgentEvent::Usage { completion_tokens, .. } => {
@@ -379,19 +403,14 @@ async fn run_turn_events(
             _ if json => {}
             AgentEvent::Token { text } => {
                 *saw_tokens = true;
-                let _ = write!(stdout, "{text}");
-                let _ = stdout.flush();
+                lost |= !put(stdout, format_args!("{text}"));
             }
             AgentEvent::MessageDone { text } => {
                 if !text.is_empty() {
                     // Some backends only deliver the final message (no stream).
-                    if !*saw_tokens {
-                        let _ = write!(stdout, "{text}");
-                    }
-                    if !text.ends_with('\n') {
-                        let _ = writeln!(stdout);
-                    }
-                    let _ = stdout.flush();
+                    let unprinted = if *saw_tokens { "" } else { text.as_str() };
+                    let end = if text.ends_with('\n') { "" } else { "\n" };
+                    lost |= !put(stdout, format_args!("{unprinted}{end}"));
                     *saw_tokens = false;
                 }
             }
@@ -424,7 +443,7 @@ async fn run_turn_events(
             }
             AgentEvent::Retry { attempt, max_attempts, reason } => {
                 // A cut reply's text stays printed; the fresh one starts on its own line.
-                if std::mem::take(saw_tokens) { let _ = writeln!(stdout); }
+                if std::mem::take(saw_tokens) { lost |= !put(stdout, format_args!("\n")); }
                 let _ = writeln!(stderr, "openmax: {}; retrying ({attempt} of {max_attempts})", one_line(reason));
             }
             AgentEvent::CompactionSkipped { reason } => {
@@ -465,6 +484,118 @@ async fn run_turn_events(
             | AgentEvent::ApprovalSettled { .. } => {}
         }
     }
+}
+
+/// Record that stdout's reader is gone, as a SIGPIPE would have (see
+/// `output_closed`), and say so on stderr the first time.
+fn output_gone(stderr: &mut io::Stderr) {
+    if crate::output_closed() {
+        let _ = writeln!(stderr, "openmax: stdout was closed; stopping the run");
+    }
+}
+
+/// Write `text` to stdout and flush it: false when the write finds the
+/// reader gone (`reader_left`). Rust starts the process with SIGPIPE
+/// ignored, so the error is the only sign. Any other error drops the text
+/// and the run goes on, as a full disk under a redirect always did. Stdout
+/// inherited in non-blocking mode answers a full pipe with WouldBlock, so
+/// the write waits until the pipe has room and finishes, as a blocking
+/// write does (`Waiting`).
+fn put(stdout: &mut io::Stdout, text: std::fmt::Arguments) -> bool {
+    let mut out = Waiting(stdout);
+    match out.write_fmt(text).and_then(|()| out.flush()) {
+        Err(e) => !reader_left(&e),
+        Ok(()) => true,
+    }
+}
+
+/// Stdout, with each write or flush that would block waiting for room and
+/// trying again. A write that fails takes none of its bytes, and a failed
+/// flush leaves what it could not hand over in the buffer, so trying again
+/// neither loses nor repeats any.
+struct Waiting<'a>(&'a mut io::Stdout);
+
+impl Write for Waiting<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            match self.0.write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && wait_for_room() => {}
+                written => return written,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        loop {
+            match self.0.flush() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && wait_for_room() => {}
+                flushed => return flushed,
+            }
+        }
+    }
+}
+
+/// Whether a failed write to stdout means its reader is gone: a pipe or a
+/// socket whose other end closed, or a terminal that hung up. A terminal's
+/// hang-up is EIO, which on a file is the disk's own error, so it counts
+/// only when stdout is a terminal.
+fn reader_left(e: &io::Error) -> bool {
+    use io::ErrorKind::{BrokenPipe, ConnectionReset, NotConnected};
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::EIO) {
+        // SAFETY: isatty only reads the descriptor's type.
+        return unsafe { libc::isatty(1) } == 1;
+    }
+    matches!(e.kind(), BrokenPipe | ConnectionReset | NotConnected)
+}
+
+/// Block until stdout can take more, or reports its reader gone, which the
+/// next write then finds; false when it cannot wait.
+fn wait_for_room() -> bool {
+    #[cfg(unix)]
+    {
+        let mut out = libc::pollfd { fd: 1, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one valid pollfd; an interrupted wait is tried again by the caller.
+        unsafe { libc::poll(&mut out, 1, -1) >= 0 || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted }
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// Whether the OS already reports stdout's reader gone, asked without
+/// waiting: a pipe, socket or terminal answers with a hang-up or an error.
+/// A file never does, and macOS answers for /dev/null that it cannot be
+/// polled, which is not a close.
+fn reader_gone_now() -> bool {
+    #[cfg(unix)]
+    {
+        let mut out = libc::pollfd { fd: 1, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one valid pollfd, and a zero timeout.
+        unsafe { libc::poll(&mut out, 1, 0) > 0 && out.revents & (libc::POLLHUP | libc::POLLERR) != 0 }
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// Resolves once the OS reports stdout's reader gone, before any write: a
+/// pipe or socket whose other end closed, a terminal that hung up. Between
+/// tool rounds a text run can write nothing to stdout for as long as the
+/// turn takes, so a failed write alone would find out at its end. Output
+/// the OS cannot watch, a file or /dev/null, which no reader can leave,
+/// never resolves it. The registration only watches the descriptor and
+/// leaves its flags, shared with whoever else holds it, as they are.
+async fn reader_gone() {
+    #[cfg(unix)]
+    if let Ok(out) = tokio::io::unix::AsyncFd::with_interest(1, tokio::io::Interest::WRITABLE) {
+        // Writable alone is room in the pipe; closed is the reader gone.
+        while let Ok(mut ready) = out.writable().await {
+            if ready.ready().is_write_closed() {
+                return;
+            }
+            ready.clear_ready();
+        }
+    }
+    std::future::pending().await
 }
 
 /// `name summary`, collapsed to just the name when the summary is the name

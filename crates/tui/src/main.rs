@@ -2079,6 +2079,15 @@ pub(crate) fn quit_status() -> i32 {
     128 + QUIT_SIGNAL.load(Ordering::SeqCst)
 }
 
+/// Stop a print run whose output can no longer be written as SIGPIPE would
+/// have, had Rust not started the process with it ignored: the run stops as
+/// a signal stops it and exits 141 (13 is SIGPIPE's number on Linux and
+/// macOS), the status a shell reports for a job a closed pipe ended. A
+/// signal already recorded keeps its own status. Whether this recorded it.
+pub(crate) fn output_closed() -> bool {
+    QUIT_SIGNAL.compare_exchange(0, 13, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
+
 /// Whether a signal has asked the session to end.
 pub(crate) fn signalled() -> bool {
     QUIT_SIGNAL.load(Ordering::SeqCst) != 0

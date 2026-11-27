@@ -5958,6 +5958,202 @@ fn sigusr2_stops_a_text_print_run_and_its_tool_tree() {
     assert!(stderr.contains("openmax: stopped (cancelled)"), "{stderr}");
 }
 
+/// A round that writes a line of text, then runs `command` in bash.
+fn sse_text_then_bash(text: &str, command: &str) -> String {
+    let call = serde_json::json!({
+        "index": 0, "id": "call_0", "type": "function",
+        "function": {"name": "bash", "arguments": serde_json::json!({ "command": command }).to_string()}
+    });
+    sse(&[
+        serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+    ])
+}
+
+/// Wait up to `bound` for `child` to exit and return its output; past it,
+/// kill it and fail with its stderr.
+fn finish_within(mut child: std::process::Child, bound: std::time::Duration) -> std::process::Output {
+    let deadline = std::time::Instant::now() + bound;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("still running after {bound:?}: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// A print run whose reader goes away, as `openmax -p ... | head -1` leaves
+/// one once `head` has its line, or a parent that dies leaves it, made every
+/// request and tool call left in its turn, ran its next prompts, and exited
+/// 0, for output nobody read. Rust starts the process with SIGPIPE ignored,
+/// so each write failed unseen. It now stops as a SIGPIPE would have stopped
+/// it: the turn is cancelled, its running command stopped, what it did
+/// saved, no later prompt starts, and the run exits 141, the status a shell
+/// reports for a job a closed pipe ended. In text mode the run writes
+/// nothing while the command runs, so the stop comes from the closed pipe
+/// itself and not from a failed write. Every wait is bounded, and the stop,
+/// which takes a fraction of a second, has ten times its 3 second deadline.
+#[test]
+fn a_print_run_stops_when_its_reader_closes_the_pipe() {
+    let bound = std::time::Duration::from_secs(10);
+    for json in [false, true] {
+        let tag = if json { "reader-gone-json" } else { "reader-gone-text" };
+        let (project, home) = fresh_dirs(tag);
+        let pid_file = project.parent().unwrap().join("pids");
+        let command = format!("echo $$ >> '{}'; exec sleep 7841", pid_file.display());
+        let mut script = vec![(sse_text_then_bash("working\n", &command), true); 5];
+        script.extend([(sse_text("done"), true), (sse_text("second"), true)]);
+        let (base_url, requests, _server) = spawn_scripted_server(script);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let mode: &[&str] = if json { &["--json"] } else { &[] };
+        let mut child = cmd(&project, &home)
+            .arg("--trust-project")
+            .args(mode)
+            .args(["-p", "work through the rounds", "-p", "then answer this"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The first line, read on a thread of its own so a run that never
+        // writes one fails the test instead of hanging it.
+        let (lines, first) = std::sync::mpsc::channel();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line);
+            let _ = lines.send((read.map(|_| line), reader));
+        });
+        let reader = match first.recv_timeout(bound) {
+            Ok((Ok(line), reader)) if !line.is_empty() => reader,
+            got => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("{tag}: no first line ({:?}): {}", got.map(|(read, _)| read), String::from_utf8_lossy(&output.stderr));
+            }
+        };
+        let deadline = std::time::Instant::now() + bound;
+        let tool: i32 = loop {
+            let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            if let Some(pid) = recorded.lines().find_map(|l| l.trim().parse().ok()) {
+                break pid;
+            }
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("{tag}: the command never started: {}", String::from_utf8_lossy(&output.stderr));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // The reader has its first line and goes, with the round's command running.
+        drop(reader);
+        let closed = std::time::Instant::now();
+        let output = finish_within(child, std::time::Duration::from_secs(30));
+        let elapsed = closed.elapsed();
+        let alive = || unsafe { libc::kill(tool, 0) == 0 };
+        let stopped_by = std::time::Instant::now() + bound;
+        while alive() && std::time::Instant::now() < stopped_by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let survived = alive();
+        if survived {
+            unsafe { libc::kill(tool, libc::SIGKILL) };
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{tag}: {elapsed:?} from the closed pipe to {:?}", output.status);
+        assert!(!survived, "{tag}: the round's command outlived the run: {stderr}");
+        assert_eq!(output.status.code(), Some(141), "{tag}: {:?}\n{stderr}", output.status);
+        // The first round's request only: neither the next round nor the second prompt asked.
+        assert_eq!(requests.lock().unwrap().len(), 1, "{tag}: a request was made after the reader left\n{stderr}");
+        assert_eq!(stderr.matches("openmax: stdout was closed; stopping the run").count(), 1, "{tag}: {stderr}");
+        // The cancelled round is saved, so `--continue` resumes from it.
+        let sessions = home.join(".openmax").join("sessions");
+        let saved: String = std::fs::read_dir(&sessions)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".messages.json"))
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect();
+        assert!(saved.contains("work through the rounds") && saved.contains(r#""role":"tool""#), "{tag}: {saved}");
+        assert!(!saved.contains("then answer this"), "{tag}: the second prompt was recorded: {saved}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+/// Output no reader can leave, a file or /dev/null, runs a turn to its end
+/// with every request made, and exits 0. So does a file that refuses the
+/// writes: a write error that is not a reader leaving (here EFBIG, a file at
+/// its size limit, as a full disk's ENOSPC is another) drops the text and
+/// the run goes on, as it always did.
+#[test]
+fn a_print_run_into_a_file_or_dev_null_runs_to_its_end() {
+    for (tag, json) in [("to-file", false), ("to-dev-null", true), ("to-a-full-file", false)] {
+        let (project, home) = fresh_dirs(tag);
+        let mut script = vec![(sse_text_then_bash("working\n", "true"), true); 3];
+        script.push((sse_text("done"), true));
+        let (base_url, requests, _server) = spawn_scripted_server(script);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let file = project.parent().unwrap().join("stdout.txt");
+        // The full file is at the size limit the run gets below, which the
+        // session's own files stay well under.
+        const LIMIT: u64 = 1 << 20;
+        const WHOLE: &str = "working\nworking\nworking\ndone\n\n";
+        let full = tag == "to-a-full-file";
+        std::fs::write(&file, if full { vec![b'x'; LIMIT as usize] } else { Vec::new() }).unwrap();
+        let out = match json {
+            true => std::fs::File::create("/dev/null").unwrap(),
+            false => std::fs::OpenOptions::new().append(true).open(&file).unwrap(),
+        };
+        let mode: &[&str] = if json { &["--json"] } else { &[] };
+        let mut command = cmd(&project, &home);
+        if full {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: setrlimit and sigaction are async-signal-safe, and
+            // nothing else runs between fork and exec. With SIGXFSZ ignored,
+            // a write past the limit fails with EFBIG.
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::rlimit { rlim_cur: LIMIT as libc::rlim_t, rlim_max: libc::RLIM_INFINITY };
+                    let mut ignore: libc::sigaction = std::mem::zeroed();
+                    ignore.sa_sigaction = libc::SIG_IGN;
+                    match libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0
+                        && libc::sigaction(libc::SIGXFSZ, &ignore, std::ptr::null_mut()) == 0
+                    {
+                        true => Ok(()),
+                        false => Err(std::io::Error::last_os_error()),
+                    }
+                });
+            }
+        }
+        let child = command
+            .arg("--trust-project")
+            .args(mode)
+            .args(["-p", "work through the rounds"])
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = finish_within(child, std::time::Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{tag}: {stderr}");
+        assert_eq!(requests.lock().unwrap().len(), 4, "{tag}: {stderr}");
+        assert!(!stderr.contains("stdout was closed"), "{tag}: {stderr}");
+        match (json, full) {
+            (true, _) => {}
+            // Some of the output was refused (macOS takes one write that
+            // starts at the limit itself; Linux refuses it too).
+            (false, true) => assert!(std::fs::metadata(&file).unwrap().len() < LIMIT + WHOLE.len() as u64, "{tag}"),
+            (false, false) => assert_eq!(std::fs::read_to_string(&file).unwrap(), WHOLE, "{tag}"),
+        }
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
 /// SIGINT, SIGHUP and SIGQUIT stop a sub-agent as SIGTERM does (the thesis
 /// gate's case): the run exits 128 plus the signal's number with the child's
 /// tool tree stopped, its worktree removed, and what it wrote committed to
