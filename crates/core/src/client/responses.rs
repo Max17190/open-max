@@ -284,6 +284,7 @@ pub(super) async fn read(
                         }
                         response["output"] = Value::Array(output.into_values().collect());
                     }
+                    drain(stream);
                     return match complete(&response) {
                         Ok(done) => {
                             if result.content.is_empty() && !done.content.is_empty() {

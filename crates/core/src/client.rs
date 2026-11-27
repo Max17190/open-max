@@ -371,6 +371,12 @@ const MAX_TOOL_CALLS: usize = 128;
 /// held the turn forever.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Reads what is left of a body after the reply's last event, beside the turn and for at most a second. A body read
+/// to its end gives its connection back for the next request; one dropped unread closes it, and the next opens a new one.
+fn drain(mut stream: impl futures_util::Stream + Send + Unpin + 'static) {
+    tokio::spawn(tokio::time::timeout(std::time::Duration::from_secs(1), async move { while stream.next().await.is_some() {} }));
+}
+
 #[derive(Default)]
 pub struct CompletionResult {
     pub content: String,
@@ -1181,6 +1187,7 @@ async fn read_sse(
             let Some(data) = data_line(line) else { continue };
             if data == b"[DONE]" {
                 saw_terminator = true;
+                drain(stream);
                 break 'outer;
             }
             let chunk = match serde_json::from_slice::<StreamChunk>(data) {
@@ -4981,6 +4988,63 @@ pub(crate) mod tests {
             for name in ["x-grok-conv-id", "modal-routing-affinity-key"] {
                 assert_eq!(head.contains(&format!("{name}: {key}")), routed == Some(name), "{model}: {head}");
             }
+        }
+    }
+
+    /// The bug this guards: a reply was taken at its last event and the rest of its body dropped unread, so the
+    /// connection closed and every request opened a new one (on a remote endpoint, a new TLS handshake each). A
+    /// server that ends each body a moment after its last event, as one behind a proxy does, then serves three
+    /// requests on every wire over the connection the first one opened.
+    #[tokio::test]
+    async fn a_finished_reply_gives_its_connection_back_on_every_wire() {
+        use crate::providers::WireApi;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let replies = [
+            (WireApi::ChatCompletions, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
+            (WireApi::Responses, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"),
+            (WireApi::Anthropic, concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n")),
+        ];
+        for (wire, reply) in replies {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = ChatClient::new(format!("http://{}", listener.local_addr().unwrap()), Some("key".into()), "fixture".into(), None, 64);
+            client.wire_api = wire;
+            let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = accepted.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut socket = tokio::io::BufReader::new(socket);
+                        loop {
+                            let (mut line, mut length) = (String::new(), 0);
+                            while socket.read_line(&mut line).await.unwrap_or(0) > 0 && line != "\r\n" {
+                                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = n.trim().parse().unwrap(); }
+                                line.clear();
+                            }
+                            if line.is_empty() { return; }
+                            socket.read_exact(&mut vec![0; length]).await.unwrap();
+                            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                            let _ = socket.write_all(format!("{head}{:x}\r\n{reply}\r\n", reply.len()).as_bytes()).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            let _ = socket.write_all(b"0\r\n\r\n").await;
+                        }
+                    });
+                }
+            });
+            for _ in 0..3 {
+                let result = client.stream_chat(&[ChatMessage::user("go")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+                assert_eq!(result.content, "ok", "{wire:?}");
+                // The tool a reply calls runs before the next request.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            server.abort();
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "{wire:?}");
         }
     }
 }
