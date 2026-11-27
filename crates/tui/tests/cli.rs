@@ -4096,6 +4096,292 @@ const STREAM_ERROR_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+/// The request every check test gives the author.
+const CHECKED_TASK: &str = "Write the word one to a file, then list the files.";
+
+/// A bash call whose reply reports a little usage.
+fn bash_call(command: &str) -> String {
+    sse_tool_call("bash", serde_json::json!({ "command": command }))
+}
+
+/// The checker's own folder, as its commands find it.
+const CHECK_DIR: &str = "\"$TMPDIR/openmax-check/$OPENMAX_CHECK\"";
+
+/// The checker's first turn: write a plan, end.
+fn checker_plans() -> [String; 2] {
+    [bash_call(&format!("printf '# plan\\n' > {CHECK_DIR}/plan.md")), sse_text("planned")]
+}
+
+/// The checker's second turn: append `objections`, one JSON object a line, end.
+fn checker_objects(objections: &[serde_json::Value]) -> [String; 2] {
+    let lines: Vec<String> = objections.iter().map(|o| o.to_string()).collect();
+    let command = format!("cat >> {CHECK_DIR}/objections.jsonl <<'EOF'\n{}\nEOF", lines.join("\n"));
+    [bash_call(&command), sse_text(&format!("{} objections", objections.len()))]
+}
+
+/// What a `--second-look` run left behind.
+struct Checked {
+    code: Option<i32>,
+    sent: Vec<serde_json::Value>,
+    stderr: String,
+    project: PathBuf,
+    home: PathBuf,
+    tmp: PathBuf,
+}
+
+impl Checked {
+    /// The harness's record of the check, from the data dir.
+    fn record(&self) -> serde_json::Value {
+        let checks = self.home.join(".openmax").join("checks");
+        let dir = std::fs::read_dir(&checks).unwrap().flatten().next().unwrap().path();
+        serde_json::from_slice(&std::fs::read(dir.join("record.json")).unwrap()).unwrap()
+    }
+
+    /// The last message of request `n`.
+    fn last(&self, n: usize) -> String {
+        self.sent[n]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string()
+    }
+}
+
+/// `openmax --json -p CHECKED_TASK`, with `--second-look` when `look`, in
+/// `mode`, against `script`, in a project `given` fills first; TMPDIR is
+/// the test's own.
+fn checked_run(tag: &str, look: bool, mode: &str, given: impl Fn(&Path), script: Vec<String>) -> Checked {
+    let (project, home) = fresh_dirs(tag);
+    given(&project);
+    let tmp = project.parent().unwrap().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (base_url, requests, _server) = spawn_scripted_server(script.into_iter().map(|sse| (sse, true)).collect());
+    write_settings_with_mode(&home, &base_url, mode);
+    let mut run = cmd(&project, &home);
+    run.env("TMPDIR", &tmp).stdin(Stdio::null());
+    if mode == "ask" {
+        trust_in_ask(&project, &home);
+    } else {
+        run.arg("--trust-project");
+    }
+    if look {
+        run.arg("--second-look");
+    }
+    let out = run.args(["--json", "-p", CHECKED_TASK]).output().unwrap();
+    let sent = requests.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap()).collect();
+    Checked { code: out.status.code(), sent, stderr: String::from_utf8_lossy(&out.stderr).into_owned(), project, home, tmp }
+}
+
+/// The check's mechanism end to end, on the request bodies the endpoint
+/// got. The checker's first request holds the request and the plan
+/// instruction, and none of the author's calls or words; its second holds
+/// the changed paths, the diff and the author's final message, still none of
+/// the author's calls. Of three objections and a reading, the one whose quote
+/// is not in the request is dropped unrun, the one whose command passes is
+/// dropped, and the one that fails again reaches the author's own session in
+/// one message, with the output the harness got, the reading beside it as
+/// information. An author that fixes it ends the run: no second check, the
+/// last re-run finds the command passing, and the exit status is the
+/// author's, which is 1 when that second end fails, with the command still
+/// failing.
+#[test]
+fn a_check_hands_back_once_only_what_fails_again() {
+    let objections = [
+        serde_json::json!({"quote": "the moon", "command": "false", "expected": "x", "observed": "y", "kind": "fails"}),
+        serde_json::json!({"quote": "list the files", "command": "true", "expected": "x", "observed": "zzz", "kind": "fails"}),
+        serde_json::json!({"quote": "Write the word one", "command": "cat out.txt; grep -q two out.txt", "expected": "the word two", "observed": "one", "kind": "fails"}),
+        serde_json::json!({"quote": "list the files", "command": "", "expected": "hidden files listed too", "kind": "reading"}),
+    ];
+    let fix = [bash_call("printf 'two\\n' > out.txt"), sse_text("fixed")];
+    for (tag, second, code) in [("fixed", fix.to_vec(), 0), ("second-end-fails", vec![STREAM_ERROR_SSE.to_string()], 1)] {
+        let mut script = vec![bash_call("printf 'one\\n' > out.txt"), sse_text("wrote out.txt")];
+        script.extend(checker_plans());
+        script.extend(checker_objects(&objections));
+        script.extend(second.clone());
+        let run = checked_run(&format!("check-{tag}"), true, "auto", |_| {}, script);
+        let stderr = &run.stderr;
+        assert_eq!(run.code, Some(code), "{tag}: {stderr}");
+        assert_eq!(run.sent.len(), 6 + second.len(), "{tag}: {stderr}");
+
+        // The plan: the system prompt, the policy note, and one message.
+        let plan = run.sent[2]["messages"].as_array().unwrap();
+        assert_eq!(plan.len(), 3, "{plan:?}");
+        let ask = run.last(2);
+        assert!(ask.starts_with(include_str!("../check-plan.txt").split("{dir}").next().unwrap()), "{ask}");
+        assert!(ask.ends_with(&format!("The request:\n\n{CHECKED_TASK}")), "{ask}");
+        assert!(!ask.contains("out.txt"), "the plan is asked from the request alone: {ask}");
+        for n in [2, 4] {
+            let body = run.sent[n].to_string();
+            assert!(!body.contains("printf 'one"), "{tag}: request {n} holds an author's call: {body}");
+        }
+        assert!(!run.sent[2].to_string().contains("wrote out.txt"), "the final message waits for the second turn");
+        let checks = run.last(4);
+        assert!(checks.contains("created: out.txt") && checks.contains("+one") && checks.contains("Their final message:\nwrote out.txt"), "{checks}");
+
+        // The hand-back: one message, in the author's session.
+        let back = &run.sent[6];
+        let handed: Vec<&str> = back["messages"].as_array().unwrap().iter().filter_map(|m| m["content"].as_str()).filter(|c| c.starts_with("A separate check")).collect();
+        assert_eq!(handed.len(), 1, "{back}");
+        let handed = handed[0];
+        assert!(back.to_string().contains("wrote out.txt"), "the author's own session continues: {back}");
+        assert!(handed.contains("The request says: \"Write the word one\".\n`cat out.txt; grep -q two out.txt` exited with status 1 and printed:\n```\none\n```\nThe check expected: the word two"), "{handed}");
+        assert!(handed.contains("The check read it as: hidden files listed too"), "{handed}");
+        assert!(!handed.contains("the moon") && !handed.contains("zzz"), "{handed}");
+        assert!(stderr.contains("openmax: check: 1 of 4 objections reproduced"), "{stderr}");
+
+        let record = run.record();
+        let verdicts: Vec<&str> = record["objections"].as_array().unwrap().iter().map(|v| v["verdict"].as_str().unwrap()).collect();
+        assert_eq!(verdicts, ["dropped: its quote is not in the request", "dropped: its command passed", "kept", "aside: a reading"], "{record}");
+        if code == 0 {
+            assert!(stderr.contains("openmax: check: after the author's second end, 1 of 1 command pass"), "{stderr}");
+            assert_eq!(std::fs::read_to_string(run.project.join("out.txt")).unwrap(), "two\n");
+        } else {
+            assert!(stderr.contains("openmax: check: after the author's second end, 0 of 1 command pass"), "{stderr}");
+        }
+        let _ = std::fs::remove_dir_all(run.project.parent().unwrap());
+    }
+}
+
+/// The restore is the guarantee: a checker that rewrites an author file,
+/// removes a given one, puts a link where a directory was, adds files and
+/// leaves a listener running on a port in a session of its own gets every
+/// file back byte for byte, everything it added removed, and the listener
+/// stopped. With no objection the run ends as the author left it. The
+/// diff the checker reads is cut at 4 KB.
+#[cfg(unix)]
+#[test]
+fn a_check_puts_back_every_file_and_stops_what_the_checker_started() {
+    let given = |dir: &Path| {
+        std::fs::write(dir.join("data.txt"), "given\n").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("keep.txt"), "keep\n").unwrap();
+    };
+    let listen = concat!(
+        "export D=\"$TMPDIR/openmax-check/$OPENMAX_CHECK\"; printf broken > out.txt; rm data.txt; rm -r sub; ln -s \"$TMPDIR\" sub; ",
+        "printf x > new.txt; mkdir extra; printf y > extra/z; ",
+        "perl -MPOSIX -MIO::Socket::INET -e 'exit if fork; POSIX::setsid(); my $s = IO::Socket::INET->new(Listen => 5, LocalAddr => \"127.0.0.1\", LocalPort => 0) or die; ",
+        "open my $f, \">\", \"$ENV{D}/port.tmp\"; print $f $s->sockport; close $f; rename \"$ENV{D}/port.tmp\", \"$ENV{D}/port\"; sleep 300' </dev/null >/dev/null 2>&1; ",
+        "while [ ! -s \"$D/port\" ]; do sleep 0.05; done",
+    );
+    let mut script = vec![bash_call("printf 'answer\\n' > out.txt && seq 1 3000 > big.txt"), sse_text("done")];
+    script.extend(checker_plans());
+    script.extend([bash_call(listen), sse_text("0 objections")]);
+    let run = checked_run("check-restore", true, "auto", given, script);
+    let stderr = &run.stderr;
+    assert_eq!((run.code, run.sent.len()), (Some(0), 6), "{stderr}");
+    for (path, held) in [("out.txt", "answer\n"), ("data.txt", "given\n"), ("sub/keep.txt", "keep\n")] {
+        assert_eq!(std::fs::read(run.project.join(path)).unwrap(), held.as_bytes(), "{path}: {stderr}");
+    }
+    assert!(std::fs::symlink_metadata(run.project.join("sub")).unwrap().is_dir(), "{stderr}");
+    assert!(!run.project.join("new.txt").exists() && !run.project.join("extra").exists(), "{stderr}");
+    let checks = std::fs::read_dir(run.tmp.join("openmax-check")).unwrap().flatten().next().unwrap().path();
+    let port: u16 = std::fs::read_to_string(checks.join("port")).unwrap().trim().parse().unwrap();
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "the checker's listener on {port} still answers: {stderr}");
+    assert!(stderr.contains("openmax: check: stopped 1 process the checker started"), "{stderr}");
+    assert!(stderr.contains("openmax: check: the work stands as the author left it"), "{stderr}");
+    let diff = run.last(4);
+    let diff = &diff[diff.find("What changed in their text files").unwrap()..diff.find("Their final message:").unwrap()];
+    assert!(diff.contains("[cut]") && diff.len() < 4096 + 200, "{} bytes: {diff}", diff.len());
+    let _ = std::fs::remove_dir_all(run.project.parent().unwrap());
+}
+
+/// No check after a run that failed, declined an approval or was stopped by
+/// a signal; none in ask, where the checker could run nothing; and none
+/// without the flag, where the requests are the author's alone, byte for
+/// byte the requests the author makes with it.
+#[test]
+fn a_check_runs_only_after_a_finished_run_in_auto_and_only_when_asked() {
+    let failed = checked_run("check-after-failure", true, "auto", |_| {}, vec![STREAM_ERROR_SSE.to_string(), sse_text("x")]);
+    assert_eq!((failed.code, failed.sent.len()), (Some(1), 1), "{}", failed.stderr);
+    assert!(!failed.stderr.contains("openmax: check"), "{}", failed.stderr);
+
+    let write = sse_tool_call("write_file", serde_json::json!({"path": "out.txt", "content": "x"}));
+    let declined = checked_run("check-after-decline", true, "ask", |_| {}, vec![write, sse_text("not written"), sse_text("x")]);
+    assert_eq!((declined.code, declined.sent.len()), (Some(3), 2), "{}", declined.stderr);
+    assert!(!declined.stderr.contains("openmax: check"), "{}", declined.stderr);
+
+    let ask = checked_run("check-in-ask", true, "ask", |_| {}, vec![sse_text("an answer"), sse_text("x")]);
+    assert_eq!((ask.code, ask.sent.len()), (Some(0), 1), "{}", ask.stderr);
+    assert!(ask.stderr.contains("openmax: check skipped: the approval mode is ask, and the check runs commands only in auto"), "{}", ask.stderr);
+
+    let script = || vec![bash_call("printf 'one\\n' > out.txt"), sse_text("wrote out.txt"), sse_text("x")];
+    let off = checked_run("check-off", false, "auto", |_| {}, script());
+    let mut on = script();
+    on.truncate(2);
+    on.extend(checker_plans());
+    on.extend(checker_objects(&[]));
+    let on = checked_run("check-on", true, "auto", |_| {}, on);
+    assert_eq!((off.code, off.sent.len(), on.code, on.sent.len()), (Some(0), 2, Some(0), 6), "{}\n{}", off.stderr, on.stderr);
+    assert!(!off.stderr.contains("openmax: check"), "{}", off.stderr);
+    for n in 0..2 {
+        let (a, b) = (off.sent[n].to_string(), on.sent[n].to_string());
+        let (a, b) = (a.replace(&off.project.display().to_string(), "P"), b.replace(&on.project.display().to_string(), "P"));
+        assert_eq!(a, b, "request {n} differs with the flag on");
+    }
+    for run in [failed, declined, ask, off, on] {
+        let _ = std::fs::remove_dir_all(run.project.parent().unwrap());
+    }
+
+    let (project, home) = fresh_dirs("check-one-prompt");
+    for args in [&["--second-look", "-p", "a", "-p", "b"][..], &["--second-look"][..]] {
+        let out = cmd(&project, &home).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A signal, or a reader that leaves, stops a check in progress as it stops
+/// any other work: the checker's turn is cancelled, the file it overwrote is
+/// put back all the same, nothing more is asked of the endpoint, and the run
+/// exits with the signal's status, or with the author's when its output was
+/// all written. A signal during the author's own turn starts no check.
+#[cfg(unix)]
+#[test]
+fn a_check_in_progress_stops_and_still_puts_the_work_back() {
+    for (tag, during) in [("signal-in-author", false), ("signal", true), ("reader-leaves", true)] {
+        let (project, home) = fresh_dirs(&format!("check-stop-{tag}"));
+        let tmp = project.parent().unwrap().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut script = match during {
+            false => vec![bash_call("sleep 30"), sse_text("x")],
+            true => vec![bash_call("printf 'one\\n' > out.txt"), sse_text("wrote out.txt")],
+        };
+        script.extend(checker_plans());
+        script.extend([bash_call("printf broken > out.txt; echo held; sleep 30"), sse_text("x"), sse_text("x")]);
+        let (base_url, requests, _server) = spawn_scripted_server(script.into_iter().map(|s| (s, true)).collect());
+        write_settings_with_mode(&home, &base_url, "auto");
+        let mut child = cmd(&project, &home)
+            .env("TMPDIR", &tmp)
+            .env("OPENMAX_TEST_STOP_SETTLE_MS", "1000")
+            .args(["--trust-project", "--json", "--second-look", "-p", CHECKED_TASK])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        let marker = if during { "echo held" } else { "sleep 30" };
+        while reader.read_line(&mut line).unwrap_or(0) > 0 && !(line.contains("\"tool_start\"") && line.contains(marker)) {
+            line.clear();
+        }
+        assert!(!line.is_empty(), "{tag}: the run ended before it could be stopped");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        match tag {
+            "reader-leaves" => drop(reader),
+            _ => unsafe { libc::kill(pid, libc::SIGTERM); },
+        }
+        let output = finish_within(child, std::time::Duration::from_secs(20));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let (code, asked) = match tag { "signal-in-author" => (143, 1), "signal" => (143, 5), _ => (0, 5) };
+        assert_eq!(output.status.code(), Some(code), "{tag}: {:?}\n{stderr}", output.status);
+        assert_eq!(requests.lock().unwrap().len(), asked, "{tag}: {stderr}");
+        if during {
+            assert_eq!(std::fs::read_to_string(project.join("out.txt")).unwrap(), "one\n", "{tag}: {stderr}");
+        } else {
+            assert!(!stderr.contains("openmax: check"), "{tag}: {stderr}");
+        }
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
 #[test]
 fn a_print_session_save_warning_does_not_fail_a_finished_turn() {
     let (project, home) = fresh_dirs("print-save-warning");
