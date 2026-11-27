@@ -47,7 +47,7 @@ use crate::client::{ChatClient, TRUNCATED};
 use crate::compaction::{
     compact_messages, compaction_trigger, cut_target, over_budget_error_context, refusal_ratio,
     request_overhead, requested_keep, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
-    to_estimate, to_real, token_factor, updated_prompt_ratio, CompactionCtx, RequestSpend,
+    to_estimate, to_real, token_factor, updated_prompt_ratio, drop_images, CompactionCtx, RequestSpend, SizeSteps,
 };
 use crate::config::{ApprovalMode, Settings};
 use crate::hooks::{Hooks, PreToolResult};
@@ -715,6 +715,7 @@ async fn run_loop(
     let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
     let mut soft_spent = None::<usize>; // After a cut without notes, the size it was asked at: the next waits until the history grows a quarter of the trigger past it (at most what a cut keeps), then cuts on the digest if notes fail again; a cut clears it.
     let mut image_refusal: Option<String> = None;
+    let mut size_steps = SizeSteps::default(); // A request refused for its size (413): the steps it has taken.
 
     'turns: for iteration in 0..max_iterations {
         // One refresh, split around the steers. The mode in force first, so
@@ -747,17 +748,25 @@ async fn run_loop(
             budget, schema_tokens, endpoint.compaction_tokens, keep, prompt_ratio, guard.messages(), &estimate,
         );
         let trigger = soft_spent.map_or(trigger, |at| at.saturating_add((trigger / 4).min(keep)).max(trigger).min(budget));
+        let forced = size_steps.cut.take();
+        let before = forced.is_some().then(|| schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>());
+        let keep = if forced.is_some() { crate::compaction::size_keep(keep, guard.messages(), &estimate) } else { keep };
         let ctx = CompactionCtx {
             core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep, waited: soft_spent.is_some(),
         };
-        let compacted = compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, false, &mut spend).await;
-        if let Err(message) = compacted.map(|dropped| if dropped > 0 { soft_spent = None }) {
-            core.send_agent(session_id, AgentEvent::Error { message });
-            stop_reason = "error".into();
-            break 'turns;
-        }
+        let dropped = match compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, forced.is_some(), &mut spend).await {
+            Ok(dropped) if dropped > 0 || forced.is_none() => dropped,
+            result => {
+                core.send_agent(session_id, AgentEvent::Error { message: forced.or(result.err()).unwrap_or_default() }); // A size cut that fails or drops nothing ends on its refusal.
+                stop_reason = "error".into();
+                break 'turns;
+            }
+        };
+        if dropped > 0 { soft_spent = None }
         let used = schema_tokens
             + guard.messages().iter().map(&estimate).sum::<usize>();
+        // A forced cut is reported as the trigger's is: compaction leaves that to the caller, which `/compact` does on release.
+        if let Some(before) = before.filter(|_| dropped > 0) { core.send_agent(session_id, AgentEvent::Compacted { tokens_before: to_real(before, factor), tokens_after: to_real(used, factor), compacted_messages: dropped }); }
         if used > trigger { soft_spent = Some(used) }
         let used_real = to_real(used, factor);
         // The ceiling refuses the request it cannot afford, not just the one
@@ -815,7 +824,7 @@ async fn run_loop(
             break 'turns;
         }
         let result = match result {
-            Ok(r) => { reserve_only |= limit == endpoint.reply_reserve && reserve_refusal.is_some(); (image_refusal, at_reserve, reserve_refusal) = (None, false, None); r }
+            Ok(r) => { reserve_only |= limit == endpoint.reply_reserve && reserve_refusal.is_some(); (image_refusal, size_steps, at_reserve, reserve_refusal) = (None, SizeSteps::default(), false, None); r }
             Err(mut message) => {
                 if image_refusal.is_none() {
                     let status = message.strip_prefix("backend returned ").and_then(|m| m.get(..3)?.parse::<u16>().ok());
@@ -830,15 +839,17 @@ async fn run_loop(
                     // Only an explicit representation error authorizes withholding a saved thought.
                     let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
                     let lone = batcher.lock().unwrap().thought_refused && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0;
-                    let images = status.is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && drop_new_images(guard.messages(), &message);
-                    if lone || images {
+                    let size = (status == Some(413)).then(|| size_steps.next(guard.messages(), &message)).flatten();
+                    let images = status != Some(413) && status.is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && drop_images(guard.messages(), &message, false);
+                    if lone || images || size.is_some() {
                         // A failed rewrite leaves the file stale, so the next save writes it whole.
-                        if !save_messages(core, session_id, guard.messages(), true).await {
+                        if (lone || images || size.as_ref().is_some_and(|(_, changed)| *changed)) && !save_messages(core, session_id, guard.messages(), true).await {
                             if let Some(data) = core.sessions.lock().await.get_mut(session_id) {
                                 data.persisted_count = sessions::PERSISTED_STALE;
                             }
                         }
                         if images { core.send_agent(session_id, AgentEvent::Retry { attempt: 2, max_attempts: 2, reason: format!("the provider refused images a tool just returned ({message}); each is now a line saying so") }); image_refusal = Some(message.clone()); }
+                        if let Some((retry, _)) = size { core.send_agent(session_id, retry); }
                         if iteration + 1 < max_iterations { continue 'turns; }
                     }
                 }
@@ -1529,17 +1540,6 @@ async fn run_loop(
         end_turn_hooks(core, session_id, &hooks, project_root, &stop_reason, &honored).await;
     }
     stop_reason
-}
-
-/// Replace each image tool results added since the last reply with the line an image left out carries. Whether there was one.
-fn drop_new_images(messages: &mut [ChatMessage], refusal: &str) -> bool {
-    let start = messages.iter().rposition(|m| m.role == "assistant").map_or(0, |i| i + 1);
-    let reason = crate::client::truncate(refusal.split_once(": ").map_or(refusal, |(_, said)| said), 200);
-    let line = |(n, image): (usize, crate::types::Image)| format!("\n[image {} of this result ({} bytes) not shown: the provider refused it: {reason}]", n + 1, image.data.len() / 4 * 3 - image.data.bytes().rev().take_while(|&b| b == b'=').count());
-    let mut new = messages[start..].iter_mut().filter(|m| m.role == "tool" && m.images.is_some()).peekable();
-    let dropped = new.peek().is_some();
-    new.for_each(|m| { let lines: String = m.images.take().into_iter().flatten().enumerate().map(line).collect(); m.content.get_or_insert_with(String::new).push_str(&lines) });
-    dropped
 }
 
 /// Runs the `turn_end` hooks for an end no refusal can change, after

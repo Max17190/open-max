@@ -712,7 +712,10 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     // crates/core alone, counted after rustfmt (--formatted): 34,580 lines
     // when the gate moved to that count from 45,594 lines of crates/core and
     // crates/tui as written. The raises before it are in the git history.
-    const BASELINE: usize = 34_580;
+    // Sending a request refused for its size again after each step that
+    // changes it, least lost first, with the steps beside the cut in
+    // compaction.rs, adds 105.
+    const BASELINE: usize = 34_685;
     const MARGIN: usize = 500;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
@@ -899,9 +902,10 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
 #[test]
 fn agent_loop_stays_under_its_line_ratchet() -> Result<(), String> {
     // Counted after rustfmt: 2,495 lines when the gate moved to that count
-    // from 1,771 lines as written.
-    const BASELINE: usize = 2_495;
-    const MARGIN: usize = 30;
+    // from 1,771 lines as written. Sending a request refused for its size
+    // again adds 3, and the margin gives them up, so the ratchet stays.
+    const BASELINE: usize = 2_498;
+    const MARGIN: usize = 27;
     const RATCHET: usize = BASELINE + MARGIN;
     const LOOP: &str = "crates/core/src/agent.rs";
     let report = repo_lines()?;
