@@ -477,6 +477,30 @@ The retry leaves 256 tokens of margin and needs at least 1,024 reply tokens.
 The subscription route sends no reply limit and does
 not use these limit retries.
 
+A server that refuses a request with HTTP 413 refuses its size in bytes,
+which images grow far faster than the token count: every image a tool
+returned stays in the history and goes with each request. Such a request
+goes again after each step that changes it, losing the least first, and
+stops at the first resend it gets through. First each image a tool returned
+before the latest reply becomes a line naming its bytes and the refusal,
+with the history otherwise as it was. Then each image a tool has just
+returned becomes a line. Then the history is cut as a compaction cuts it,
+reported as any other cut, except that a size refusal says nothing of
+tokens: the cut keeps at most half of what follows the opening, and never
+more than `compaction_keep_tokens`, so it drops an older exchange whenever
+one can go, however far the history is under the window. The cut goes
+again while each one drops something, so each halves what is left. A step
+with nothing to change is skipped without a request. A request still
+refused ends the turn with the refusal, as does a cut that fails or finds
+nothing to drop: that cut's retry event is followed by the error, with no
+resend. So one refused request goes again at most five times: once after
+each image step and otherwise after a cut. A 413 whose text names the
+context length is a length refusal too, so the reply-limit retries above
+may come first, adding at most two requests where the route sends a reply
+limit. Each resend counts toward `max_agent_iterations`, and its retry
+event names the step, with attempts counted up to 6 for one refused
+request.
+
 Open Max estimates the input at about four bytes per token and scales the
 estimate up when the server reports more prompt tokens than estimated or
 refuses a request for length that the estimate said fit.

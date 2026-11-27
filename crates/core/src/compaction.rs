@@ -615,6 +615,64 @@ pub(crate) fn cut_target(
     (schema_tokens + messages[..head].iter().map(estimate).sum::<usize>() + (budget / 4).min(keep)).min(budget)
 }
 
+/// What a cut that answers a refusal for size keeps of the newest exchanges:
+/// at most half of what follows the pinned opening, and never more than
+/// `keep`. A refusal for size says nothing of tokens, so a history under the
+/// usual target still loses an older exchange whenever one can go.
+pub(crate) fn size_keep(keep: usize, messages: &[ChatMessage], estimate: &dyn Fn(&ChatMessage) -> usize) -> usize {
+    let head = pinned_head(messages).min(messages.len());
+    keep.min(messages[head..].iter().map(estimate).sum::<usize>() / 2)
+}
+
+/// How far one request refused for its size (HTTP 413) has gone. It goes
+/// again after each step that changes it, least lost first: each image a tool
+/// returned before the latest reply becomes a line, then each image a tool
+/// has just returned, then the history is cut (`size_keep`) while a cut drops
+/// something, five resends at most. A reply starts it over.
+#[derive(Default)]
+pub(crate) struct SizeSteps {
+    step: u8,
+    resends: u32,
+    /// The refusal the next cut answers, taken where the turn compacts.
+    pub(crate) cut: Option<String>,
+}
+
+impl SizeSteps {
+    /// Takes the next step for `refusal`, if one is left: an image step
+    /// changes `messages` in place, and the cut is set up for the next round.
+    /// The retry event to send, and whether `messages` changed.
+    pub(crate) fn next(&mut self, messages: &mut [ChatMessage], refusal: &str) -> Option<(AgentEvent, bool)> {
+        let (step, done) = if self.step < 1 && drop_images(messages, refusal, true) {
+            (1, "each image from before the latest reply is now a line")
+        } else if self.step < 2 && drop_images(messages, refusal, false) {
+            (2, "each image a tool just returned is now a line")
+        } else if self.resends < 5 {
+            (3, "the history is cut")
+        } else {
+            return None;
+        };
+        (self.step, self.resends) = (step, self.resends + 1);
+        if step == 3 {
+            self.cut = Some(refusal.to_string());
+        }
+        let reason = format!("the provider refused the request for its size ({refusal}); {done}");
+        Some((AgentEvent::Retry { attempt: self.resends + 1, max_attempts: 6, reason }, step < 3))
+    }
+}
+
+/// Replace each image tool results added since the last reply (`older`: before it) with the line an image left out carries. Whether there was one.
+pub(crate) fn drop_images(messages: &mut [ChatMessage], refusal: &str, older: bool) -> bool {
+    let start = messages.iter().rposition(|m| m.role == "assistant").map_or(0, |i| i + 1);
+    let reason = crate::client::truncate(refusal.split_once(": ").map_or(refusal, |(_, said)| said), 200);
+    let why = if older { "the provider refused a request this large" } else { "the provider refused it" };
+    let line = |(n, image): (usize, crate::types::Image)| format!("\n[image {} of this result ({} bytes) not shown: {why}: {reason}]", n + 1, image.data.len() / 4 * 3 - image.data.bytes().rev().take_while(|&b| b == b'=').count());
+    let (before, after) = messages.split_at_mut(start);
+    let mut new = if older { before } else { after }.iter_mut().filter(|m| m.role == "tool" && m.images.is_some()).peekable();
+    let dropped = new.peek().is_some();
+    new.for_each(|m| { let lines: String = m.images.take().into_iter().flatten().enumerate().map(line).collect(); m.content.get_or_insert_with(String::new).push_str(&lines) });
+    dropped
+}
+
 /// The prompt a cut puts back after its note for the turn in progress: the
 /// newest one it removed (only prompts carry an effort stamp), if none is kept.
 fn restored_prompt<'a>(kept: &[ChatMessage], dropped: &'a [ChatMessage]) -> Option<&'a ChatMessage> {

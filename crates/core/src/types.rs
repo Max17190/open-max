@@ -230,7 +230,7 @@ pub enum AgentEvent {
     /// transient 5xx, or, before any reply text, a stream that died or went silent, or a stream or reply the provider
     /// failed with a rate limit, an overload, or a server fault, or a reply the network cut after its text began, at
     /// most twice). Emitted before the wait; a cancel during it ends the turn and the attempt never goes out. What
-    /// streamed for it is void. Also attempt 2 of 2 when a host refused new tool images, resent as lines.
+    /// streamed for it is void. Also attempt 2 of 2 when a host refused new tool images, resent as lines, or a request for its size (413), resent shortened.
     Retry { attempt: u32, max_attempts: u32, reason: String },
     Diff { call_id: String, path: String, diff: String, added: usize, removed: usize },
     /// Mutating tool waiting on the user. `detail` is a short args preview
