@@ -6084,6 +6084,71 @@ fn a_print_run_stops_when_its_reader_closes_the_pipe() {
     }
 }
 
+/// A reader can go before any turn starts: before the run is launched, or
+/// while the run waits on the session index lock to open its session, a
+/// wait another openmax process can hold for any length of time. Either way
+/// no model request is made, and the close stops the run as a signal does,
+/// with the same deadline: here the debug build's 1 second
+/// (OPENMAX_TEST_STOP_SETTLE_MS), so a run held on the lock past it ends
+/// with 141 instead of waiting on.
+#[test]
+fn a_print_run_whose_reader_goes_before_its_turn_asks_nothing() {
+    let deadline = std::time::Duration::from_secs(1);
+    for held in [false, true] {
+        let tag = if held { "reader-gone-at-setup" } else { "reader-gone-at-launch" };
+        let (project, home) = fresh_dirs(tag);
+        let (base_url, requests, _server) = spawn_scripted_server(vec![(sse_text("done"), true); 2]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let sessions = home.join(".openmax").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let lock_path = sessions.join("index.lock");
+        let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).unwrap();
+        if held {
+            lock.try_lock().expect("nothing else holds the lock yet");
+        }
+        // Close-on-exec, so no process this suite starts holds the read end.
+        let (read_end, write_end) = std::io::pipe().unwrap();
+        // Closed before the launch, or held until the run waits on the lock.
+        let mut read_end = held.then_some(read_end);
+        let mut child = cmd(&project, &home)
+            .env("OPENMAX_TEST_STOP_SETTLE_MS", deadline.as_millis().to_string())
+            .args(["--trust-project", "--json", "-p", "answer this"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(write_end))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let closed = std::time::Instant::now();
+        if held {
+            // The run opens the lock file just before it waits on it.
+            let opened_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !holds_open(child.id() as libc::pid_t, &lock_path) {
+                if std::time::Instant::now() >= opened_by || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("{tag}: the run never waited on the lock: {}", String::from_utf8_lossy(&output.stderr));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            read_end = None;
+        }
+        drop(read_end);
+        let closed = if held { std::time::Instant::now() } else { closed };
+        let output = finish_within(child, std::time::Duration::from_secs(30));
+        let elapsed = closed.elapsed();
+        drop(lock);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{tag}: {elapsed:?} from the closed pipe to {:?}", output.status);
+        assert_eq!(output.status.code(), Some(141), "{tag}: {:?}\n{stderr}", output.status);
+        assert_eq!(requests.lock().unwrap().len(), 0, "{tag}: a model request was made\n{stderr}");
+        assert_eq!(stderr.matches("openmax: stdout was closed; stopping the run").count(), 1, "{tag}: {stderr}");
+        // Held on the lock, the run ends at the deadline; the bound leaves
+        // a slow machine ten times the deadline for the exit itself.
+        assert!(elapsed < deadline * 11, "{tag}: took {elapsed:?}, past the {deadline:?} deadline\n{stderr}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
 /// Output no reader can leave, a file or /dev/null, runs a turn to its end
 /// with every request made, and exits 0. So does a file that refuses the
 /// writes: a write error that is not a reader leaving (here EFBIG, a file at

@@ -64,7 +64,26 @@ fn file_states(root: &Path) -> Option<HashMap<PathBuf, (u64, Option<SystemTime>)
 /// it states is still there: on a tree the run already changed, the second
 /// session can undo a correct repair. The exit status stays the first's
 /// unless a signal lands or the second session declines an approval (3).
-pub async fn run(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
+///
+/// Stdout is watched for the whole run (`watch_output`): a reader that goes
+/// away stops the run as a signal does, in its setup, between its turns, in
+/// a turn, and in its cleanup alike.
+pub async fn run(core: Arc<Core>, core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
+    // Polled beside the run on this task: a task of its own raised a
+    // print turn's peak memory.
+    let watch = watch_output(args.quit.clone());
+    let run = run_and_look(core, core_rx, args);
+    tokio::pin!(watch, run);
+    let mut watching = true;
+    loop {
+        tokio::select! {
+            code = &mut run => return code,
+            () = &mut watch, if watching => watching = false,
+        }
+    }
+}
+
+async fn run_and_look(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
     // Both scans run off this thread so a signal still ends the run in time.
     let project = args.project.clone();
     let given = match args.second_look {
@@ -196,14 +215,13 @@ async fn run_prompts(
     for prompt in &args.prompts {
         // A signal that landed as the previous turn ended stops the run here,
         // before the next prompt is recorded and its hooks run.
+        // So does a reader the OS already reports gone, which the watch may
+        // not have been told of yet: no turn is spent on output nobody reads.
+        if reader_gone_now() {
+            output_gone(&args.quit);
+        }
         if crate::signalled() {
             break;
-        }
-        // A reader that left between turns, or before the first, gets no
-        // new turn: its model requests would be spent on output nobody reads.
-        if reader_gone_now() {
-            output_gone(&mut stderr);
-            return crate::quit_status();
         }
         // Prompt templates belong to the harness, not to the terminal UI: a
         // delegated `openmax -p "/greet world"` submits what the composer
@@ -277,16 +295,13 @@ async fn run_turn_events(
     let mut settle: Option<tokio::sync::oneshot::Receiver<()>> = None;
     let quit = args.quit.notified();
     tokio::pin!(quit);
-    // Whether stdout failed a write or its reader is gone (`reader_gone`):
-    // nobody reads the turn any more, so it stops as a SIGPIPE would stop it.
+    // Whether a write found stdout's reader gone: the turn then stops as a
+    // SIGPIPE would stop it, through the quit (`output_gone`).
     let mut lost = false;
-    let gone = reader_gone();
-    tokio::pin!(gone);
 
     loop {
-        if lost && stop_by.is_none() {
-            output_gone(stderr);
-            *stop_by = Some(Instant::now() + crate::stop_settle());
+        if lost {
+            output_gone(&args.quit);
         }
         // A signal, here or while the turn was starting, cancels the turn.
         if let (None, Some(by)) = (stopping, *stop_by) {
@@ -309,10 +324,6 @@ async fn run_turn_events(
             },
             _ = &mut quit, if stop_by.is_none() => {
                 *stop_by = Some(Instant::now() + crate::stop_settle());
-                continue;
-            }
-            _ = &mut gone, if stop_by.is_none() => {
-                lost = true;
                 continue;
             }
             _ = async { if let Some(settle) = settle.as_mut() { let _ = settle.await; } },
@@ -391,7 +402,7 @@ async fn run_turn_events(
                 // A turn whose last output found its reader gone was not
                 // delivered, however its work ended.
                 if lost && stopping.is_none() {
-                    output_gone(stderr);
+                    output_gone(&args.quit);
                     return crate::quit_status();
                 }
                 return stopping.unwrap_or(exit_code);
@@ -486,12 +497,22 @@ async fn run_turn_events(
     }
 }
 
-/// Record that stdout's reader is gone, as a SIGPIPE would have (see
-/// `output_closed`), and say so on stderr the first time.
-fn output_gone(stderr: &mut io::Stderr) {
+/// Stop the run because stdout's reader is gone, by the one path a signal
+/// takes: record the status a SIGPIPE would have given (`output_closed`),
+/// then notify `quit`, which every wait of the run answers by starting the
+/// stop's deadline. Only the first stop is recorded and said on stderr; a
+/// signal that came first keeps its own.
+fn output_gone(quit: &Notify) {
     if crate::output_closed() {
-        let _ = writeln!(stderr, "openmax: stdout was closed; stopping the run");
+        let _ = writeln!(io::stderr(), "openmax: stdout was closed; stopping the run");
+        quit.notify_one();
     }
+}
+
+/// Stop the run (`output_gone`) once the OS reports stdout's reader gone.
+async fn watch_output(quit: Arc<Notify>) {
+    reader_gone().await;
+    output_gone(&quit);
 }
 
 /// Write `text` to stdout and flush it: false when the write finds the

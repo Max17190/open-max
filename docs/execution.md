@@ -68,8 +68,9 @@ command, is stopped with the rest.
 A print run (`-p`, with or without `--json`) whose stdout's reader is gone
 stops as a signal stops it: the reader of its pipe or socket exits or dies,
 or its terminal hangs up while SIGHUP is ignored. It finds out from the
-operating system as the reader goes, even while it writes nothing, before
-each turn starts, or from a write that fails with a broken pipe, a reset or
+operating system as the reader goes, at any point of the run, even while it
+writes nothing or waits on the session index, and again before each turn
+starts, or from a write that fails with a broken pipe, a reset or
 unconnected socket, or, on a terminal, an I/O error. It says `openmax:
 stdout was closed; stopping the run` on stderr, cancels the turn, which
 stops its tools and saves the session for `--continue`, starts no later
