@@ -1581,7 +1581,9 @@ fn replacements(args: &Value) -> Result<Vec<(String, String, bool)>, String> {
 /// Replace exact text in one file. Each replacement of a call is matched
 /// against the file as it was before the call and none may overlap another;
 /// the file is written only when all match, so a failure changes nothing and
-/// names the one that failed. The result shows the changed lines in place,
+/// names the one that failed. A replacement whose old and new text are the
+/// same changes nothing, so it is left out and named, and the call is refused
+/// only when every one is such. The result shows the changed lines in place,
 /// so the edit needs no read-back.
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     let Some(rel) = file_path_arg(args) else {
@@ -1595,6 +1597,7 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     // several; in a list each names its place.
     let total = list.len();
     let label = |i: usize| if total == 1 { String::new() } else { format!("edit {} of {total}: ", i + 1) };
+    let mut noops = Vec::new();
     for (i, (old_string, new_string, _)) in list.iter().enumerate() {
         // An empty old_string matches between every pair of characters, so
         // the ambiguity error would steer the model to replace_all, which
@@ -1606,8 +1609,12 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
             ));
         }
         if old_string == new_string {
-            return ToolOutcome::err(format!("{}old_string and new_string are identical", label(i)));
+            noops.push(i + 1);
         }
+    }
+    if noops.len() == total {
+        let every = if total == 1 { "" } else { "in every edit, " };
+        return ToolOutcome::err(format!("{every}old_string and new_string are identical"));
     }
     let path = match resolve(root, rel) {
         Ok(p) => p,
@@ -1635,6 +1642,9 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     // Every match as (start, end, replacement), in the file as read.
     let mut spans = Vec::new();
     for (i, (old_string, new_string, replace_all)) in list.iter().enumerate() {
+        if noops.contains(&(i + 1)) {
+            continue;
+        }
         // Strings that differ only in line endings are the same edit once
         // read as CRLF; writing it would report a change that never reached
         // the file.
@@ -1707,6 +1717,14 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(e);
     }
     let mut outcome = changed_file("edited", root, &path, &old, &new);
+    if !noops.is_empty() {
+        let n: Vec<String> = noops.iter().map(usize::to_string).collect();
+        let s = if n.len() == 1 { "" } else { "s" };
+        outcome.output.push_str(&format!(
+            "\nedit{s} {} of {total} changed nothing (old_string and new_string are identical); the others were applied",
+            n.join(", ")
+        ));
+    }
     outcome.output.push_str(&edit_excerpt(&new, &changed));
     outcome
 }
@@ -3097,6 +3115,37 @@ mod tests {
             {"old_string": "alpha", "new_string": "omega"}, {"old_string": "omega", "new_string": "z"}]}));
         assert!(!out.ok && out.output.contains("as it was before this call"), "{}", out.output);
         assert_eq!(std::fs::read_to_string(root.join("list.txt")).unwrap(), original);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A replacement that changes nothing does not cost the call: the others
+    /// apply and the result names it. Only a call whose every replacement
+    /// changes nothing is refused, and it writes nothing.
+    #[test]
+    fn a_replacement_that_changes_nothing_is_named_and_the_others_apply() {
+        let root = temp_project();
+        std::fs::write(root.join("n.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let out = edit_file(&root, &json!({"path": "n.txt", "edits": [
+            {"old_string": "alpha", "new_string": "A"},
+            {"old_string": "beta", "new_string": "beta"},
+            {"old_string": "not in the file", "new_string": "not in the file"},
+            {"old_string": "gamma", "new_string": "G"}]}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(root.join("n.txt")).unwrap(), "A\nbeta\nG\n");
+        let mut lines = out.output.lines();
+        assert_eq!(lines.next(), Some("edited n.txt (+2 −2)"), "{}", out.output);
+        assert_eq!(
+            lines.next(),
+            Some("edits 2, 3 of 4 changed nothing (old_string and new_string are identical); the others were applied")
+        );
+        // Errors of the others keep their place in the list.
+        let out = edit_file(&root, &json!({"path": "n.txt", "edits": [
+            {"old_string": "A", "new_string": "A"}, {"old_string": "delta", "new_string": "D"}]}));
+        assert!(!out.ok && out.output.starts_with("edit 2 of 2: old_string not found"), "{}", out.output);
+        let out = edit_file(&root, &json!({"path": "n.txt", "edits": [
+            {"old_string": "A", "new_string": "A"}, {"old_string": "G", "new_string": "G"}]}));
+        assert_eq!((out.ok, out.output.as_str()), (false, "in every edit, old_string and new_string are identical"));
+        assert_eq!(std::fs::read_to_string(root.join("n.txt")).unwrap(), "A\nbeta\nG\n");
         let _ = std::fs::remove_dir_all(root);
     }
 
