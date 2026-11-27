@@ -66,6 +66,8 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: stable
+          # The line gate formats a copy of the source before counting it.
+          components: rustfmt
 
       # Only main saves this cache, as it saves every other cache here. A copy
       # a pull request saved would serve only that pull request's later runs,
@@ -264,6 +266,8 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: stable
+          # The line gate formats a copy of the source before counting it.
+          components: rustfmt
 
       # Only main saves this one: a release build's cache from every pull
       # request would push main's out of the repository's cache space.

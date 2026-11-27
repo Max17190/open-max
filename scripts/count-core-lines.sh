@@ -1,7 +1,7 @@
 #!/bin/bash
 # Count the workspace's Rust lines two ways, per crate and in total.
 #
-# Usage: scripts/count-core-lines.sh [--excluded] [--files] [checkout]
+# Usage: scripts/count-core-lines.sh [--formatted] [--excluded] [--files] [checkout]
 #
 # core-excluding-tests: the lines of crates/<crate>/src/**/*.rs less those
 #   of test-only code, so the lines a build without cfg(test) reads, except
@@ -17,6 +17,16 @@
 # rows, a row for each file a crate's row counts: the file's two counts, by
 # the same method, then its path, with 0 core-excluding-tests outside src/,
 # so a crate's file rows add up to its row.
+#
+# --formatted counts a copy of the checkout's Rust files under crates/ (build
+# output aside)
+# whose crates/*/src files rustfmt has formatted first, in the edition the
+# checkout's Cargo.toml names (2021 if it names none) and under the
+# checkout's rustfmt.toml if it has one, its defaults otherwise, so no
+# configuration outside the checkout applies. Code is then counted in one
+# layout whatever its lines were packed to, and the checkout is not changed.
+# rustfmt's output is stable within a style edition. A file rustfmt cannot
+# format stops the count.
 #
 # Method. Each file under src/ is split into tokens, so that a bracket, `#`
 # or `;` inside a literal or a comment stays part of it: line and block
@@ -82,8 +92,10 @@ set -u -o pipefail
 
 list=0
 files=0
+formatted=0
 while [ $# -gt 0 ]; do
   case $1 in
+    --formatted) formatted=1 ;;
     --excluded) list=1 ;;
     --files) files=1 ;;
     *) break ;;
@@ -91,12 +103,31 @@ while [ $# -gt 0 ]; do
   shift
 done
 if [ $# -gt 1 ]; then
-  echo "usage: $0 [--excluded] [--files] [checkout]" >&2
+  echo "usage: $0 [--formatted] [--excluded] [--files] [checkout]" >&2
   exit 2
 fi
 checkout=${1:-$(dirname "$0")/..}
 
-exec perl - "$list" "$files" "$checkout" <<'PERL'
+if [ "$formatted" = 1 ]; then
+  [ -d "$checkout/crates" ] || { echo "count-core-lines: no crates/ in $checkout" >&2; exit 1; }
+  copy=$(mktemp -d) || exit 1
+  trap 'rm -rf "$copy"' EXIT
+  (cd "$checkout" && find crates \( -path 'crates/*/target' ! -path 'crates/*/*/*' \) -prune -o -name '*.rs' -type f -print0 |
+    tar --null -T - -cf - | tar -xf - -C "$copy") ||
+    { echo "count-core-lines: cannot copy $checkout/crates" >&2; exit 1; }
+  config="$copy/rustfmt.toml"
+  : > "$config"
+  for name in rustfmt.toml .rustfmt.toml; do
+    [ -f "$checkout/$name" ] && cp "$checkout/$name" "$config"
+  done
+  edition=$(sed -n 's/^edition *= *"\([0-9]*\)".*/\1/p' "$checkout/Cargo.toml" 2>/dev/null | head -n 1)
+  (cd "$copy" && find crates -path 'crates/*/src/*' -name '*.rs' -print0 |
+    xargs -0 rustfmt --edition "${edition:-2021}" --config-path "$config") ||
+    { echo "count-core-lines: rustfmt could not format the copy of $checkout/crates" >&2; exit 1; }
+  checkout=$copy
+fi
+
+perl - "$list" "$files" "$checkout" <<'PERL'
 use strict;
 use warnings;
 
