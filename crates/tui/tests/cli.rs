@@ -6069,7 +6069,7 @@ fn a_print_run_stops_when_its_reader_closes_the_pipe() {
         assert_eq!(output.status.code(), Some(141), "{tag}: {:?}\n{stderr}", output.status);
         // The first round's request only: neither the next round nor the second prompt asked.
         assert_eq!(requests.lock().unwrap().len(), 1, "{tag}: a request was made after the reader left\n{stderr}");
-        assert_eq!(stderr.matches("openmax: stdout was closed; stopping the run").count(), 1, "{tag}: {stderr}");
+        assert_eq!(stderr.matches("openmax: stdout was closed; stopping the work left").count(), 1, "{tag}: {stderr}");
         // The cancelled round is saved, so `--continue` resumes from it.
         let sessions = home.join(".openmax").join("sessions");
         let saved: String = std::fs::read_dir(&sessions)
@@ -6141,7 +6141,7 @@ fn a_print_run_whose_reader_goes_before_its_turn_asks_nothing() {
         eprintln!("{tag}: {elapsed:?} from the closed pipe to {:?}", output.status);
         assert_eq!(output.status.code(), Some(141), "{tag}: {:?}\n{stderr}", output.status);
         assert_eq!(requests.lock().unwrap().len(), 0, "{tag}: a model request was made\n{stderr}");
-        assert_eq!(stderr.matches("openmax: stdout was closed; stopping the run").count(), 1, "{tag}: {stderr}");
+        assert_eq!(stderr.matches("openmax: stdout was closed; stopping the work left").count(), 1, "{tag}: {stderr}");
         // Held on the lock, the run ends at the deadline; the bound leaves
         // a slow machine ten times the deadline for the exit itself.
         assert!(elapsed < deadline * 11, "{tag}: took {elapsed:?}, past the {deadline:?} deadline\n{stderr}");
@@ -6207,9 +6207,85 @@ fn a_print_run_whose_output_was_all_read_exits_with_its_own_status() {
         assert!(all.contains("stub says hi"), "{tag}: {all}");
         assert_eq!(output.status.code(), Some(0), "{tag}: {:?}\n{stderr}", output.status);
         assert_eq!(requests.lock().unwrap().len(), 1, "{tag}: {stderr}");
-        assert!(!stderr.contains("stdout was closed"), "{tag}: a finished run said it was stopped: {stderr}");
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
+}
+
+/// A close matters for as long as work can follow in the run, not only
+/// until the run's own prompts are done: here a `--second-look` run whose
+/// first session finished and was read to its end, and whose reader leaves
+/// before the second session can open, which waits on the session index
+/// lock the test holds. The close stops the run there within the stop's
+/// deadline (1 second here, OPENMAX_TEST_STOP_SETTLE_MS), the second
+/// session asks nothing, and the run keeps the first session's status,
+/// since its output was all written. The run is held (SIGSTOP) as soon as
+/// the first session's last line is read, and the attempt counts only when
+/// the index then still lists that session alone, so the second session
+/// has not opened; a run that got further is started again.
+#[test]
+fn a_second_look_stops_when_the_reader_leaves_before_it_starts() {
+    let (deadline, bound) = (std::time::Duration::from_secs(1), std::time::Duration::from_secs(10));
+    for attempt in 1..=5 {
+        let (project, home) = fresh_dirs("reader-gone-before-second-look");
+        let (base_url, requests, _server) = spawn_scripted_server(vec![(HELLO_SSE.to_string(), true); 2]);
+        write_settings_with_mode(&home, &base_url, "auto");
+        let sessions = home.join(".openmax").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(sessions.join("index.lock")).unwrap();
+        let mut child = cmd(&project, &home)
+            .env("OPENMAX_TEST_STOP_SETTLE_MS", deadline.as_millis().to_string())
+            .args(["--trust-project", "--json", "--second-look", "-p", "answer this"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        // The first session's output, read to its end on a thread, which
+        // holds the run the moment it has the last line.
+        let (sent, read) = std::sync::mpsc::channel();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.contains(r#""type":"done""#) {
+                line.clear();
+            }
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            let _ = sent.send((line, reader));
+        });
+        let got = read.recv_timeout(bound);
+        let Ok((line, reader)) = got else {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the first session never ended: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        assert!(line.contains(r#""stop_reason":"stop""#), "the first session did not finish: {line}");
+        let index = std::fs::read_to_string(sessions.join("index.json")).unwrap_or_default();
+        let listed = serde_json::from_str::<Vec<serde_json::Value>>(&index).map_or(0, |listed| listed.len());
+        if lock.try_lock().is_err() || listed != 1 {
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(project.parent().unwrap());
+            eprintln!("attempt {attempt}: the run got past the first session before it was held; again");
+            continue;
+        }
+        drop(reader);
+        let closed = std::time::Instant::now();
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        let output = finish_within(child, std::time::Duration::from_secs(30));
+        let elapsed = closed.elapsed();
+        drop(lock);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{elapsed:?} from the closed pipe to {:?}", output.status);
+        assert_eq!(output.status.code(), Some(0), "{:?}\n{stderr}", output.status);
+        assert_eq!(requests.lock().unwrap().len(), 1, "the second session asked the endpoint\n{stderr}");
+        assert!(stderr.contains("openmax: stdout was closed; stopping the work left"), "{stderr}");
+        assert!(elapsed < deadline * 11, "took {elapsed:?}, past the {deadline:?} deadline\n{stderr}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+        return;
+    }
+    panic!("the run got past its first session before it could be held, five times");
 }
 
 /// Output no reader can leave, a file or /dev/null, runs a turn to its end

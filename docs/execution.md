@@ -72,14 +72,15 @@ operating system as the reader goes, at any point of the run, even while it
 writes nothing or waits on the session index, and again before each turn
 starts, or from a write that fails with a broken pipe, a reset or
 unconnected socket, or, on a terminal, an I/O error. It says `openmax:
-stdout was closed; stopping the run` on stderr, cancels the turn, which
+stdout was closed; stopping the work left` on stderr, cancels the turn, which
 stops its tools and saves the session for `--continue`, starts no later
 prompt, and exits 141 (128 plus SIGPIPE's number), the status a shell
 reports for a job a closed pipe ended. A turn that finished its work but
 whose last output found the reader gone exits 141 too, since that output
 was not delivered. A run that wrote all of its output exits with its own
 status even if its reader leaves before the process exits, as `grep -q`
-does. Output to a file or to /dev/null is never stopped: a
+does; the work left, such as a `--second-look` session, is stopped all the
+same. Output to a file or to /dev/null is never stopped: a
 write it refuses for any other reason, such as a full disk, is dropped and
 the run goes on. A `--stdio` session's client that closes stdin ends it as
 its protocol says: the running turn finishes first.

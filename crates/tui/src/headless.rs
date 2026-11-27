@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use open_max_core::agent;
@@ -121,9 +121,10 @@ async fn run_and_look(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<Agen
     let look = HeadlessArgs { prompts, session: None, continue_session: false, second_look: false, written: AtomicU64::new(0), ..args };
     match run_session(&core, &mut core_rx, &look).await {
         _ if crate::stopped_by_a_signal() => crate::quit_status(),
+        // Cut short by its reader leaving: the run's own output was all
+        // written, so its status stands, as it does whatever the look says.
+        _ if crate::signalled() => code,
         0 => code,
-        // Stopped by its reader leaving: what it had to say was not delivered.
-        stopped if crate::signalled() => stopped,
         // A declined approval: the setup, not the look, kept the work from being done.
         3 => 3,
         failed => {
@@ -214,7 +215,6 @@ async fn run_prompts(
 ) -> i32 {
     let project = &args.project;
     let mut exit_code = 0i32;
-    RAN_ITS_PROMPTS.store(false, Ordering::SeqCst);
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
@@ -262,7 +262,6 @@ async fn run_prompts(
         }
     }
 
-    RAN_ITS_PROMPTS.store(true, Ordering::SeqCst);
     exit_code
 }
 
@@ -512,7 +511,7 @@ async fn run_turn_events(
 /// signal that came first keeps its own.
 fn output_gone(quit: &Notify) {
     if crate::output_closed() {
-        let _ = writeln!(io::stderr(), "openmax: stdout was closed; stopping the run");
+        let _ = writeln!(io::stderr(), "openmax: stdout was closed; stopping the work left");
         quit.notify_one();
     }
 }
@@ -528,19 +527,14 @@ fn stop_before_a_turn(quit: &Notify) -> bool {
     crate::signalled()
 }
 
-/// Set once the session's prompts have all run, so the run has no more
-/// output to write unless a second look starts, which asks again before its
-/// turn (`stop_before_a_turn`).
-static RAN_ITS_PROMPTS: AtomicBool = AtomicBool::new(false);
-
 /// Stop the run (`output_gone`) once the OS reports stdout's reader gone,
-/// unless the run has already written all it had to: a reader that leaves
-/// then stops nothing and takes nothing from its status.
+/// whatever it is doing then: `run` polls this until it returns, when no
+/// more work can follow. A reader that leaves once the run's output is all
+/// written takes nothing from its status, which comes from a closed output
+/// only when it stopped output that was still to be written.
 async fn watch_output(quit: Arc<Notify>) {
     reader_gone().await;
-    if !RAN_ITS_PROMPTS.load(Ordering::SeqCst) {
-        output_gone(&quit);
-    }
+    output_gone(&quit);
 }
 
 /// Write `text` to stdout and flush it: false when the write finds the
