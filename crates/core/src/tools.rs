@@ -2071,11 +2071,12 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         None => None,
     };
     // Full-corpus scans (rare or no matches) dominate this tool's latency, so
-    // walk and scan in parallel. Hits are collected per file and sorted before
-    // the cap so the output order is deterministic across runs.
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let hits: std::sync::Mutex<Vec<(String, usize, String)>> = std::sync::Mutex::new(Vec::new());
-    let enough = AtomicBool::new(false);
+    // walk and scan in parallel. Every file is searched and the first hits in
+    // path and line order are kept, so a capped result is the same whatever
+    // the threads' timing; a search with few hits reads every file anyway.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = std::sync::Mutex::new(std::collections::BTreeSet::<(String, usize, String)>::new());
+    let (found, files) = (AtomicUsize::new(0), AtomicUsize::new(0));
     // Files passed over, by reason: a skipped file can hold the match, so a
     // search that skips any must say so rather than answer "no matches".
     let too_large = AtomicUsize::new(0);
@@ -2088,9 +2089,6 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         .run(|| {
             Box::new(|entry| {
                 use ignore::WalkState;
-                if enough.load(Ordering::Relaxed) {
-                    return WalkState::Quit;
-                }
                 let Ok(entry) = entry else { return WalkState::Continue };
                 let path = entry.path();
                 if !path.is_file() || !link_stays_in_root(&entry, &root_canon) {
@@ -2128,10 +2126,12 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
                     }
                 }
                 if !file_hits.is_empty() {
-                    let mut all = hits.lock().unwrap();
-                    all.extend(file_hits);
-                    if all.len() >= MAX_GREP_RESULTS {
-                        enough.store(true, Ordering::Relaxed);
+                    found.fetch_add(file_hits.len(), Ordering::Relaxed);
+                    files.fetch_add(1, Ordering::Relaxed);
+                    let mut kept = hits.lock().unwrap();
+                    kept.extend(file_hits);
+                    while kept.len() > MAX_GREP_RESULTS {
+                        kept.pop_last();
                     }
                 }
                 WalkState::Continue
@@ -2139,22 +2139,23 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
         });
 
     let skipped = skipped_note(too_large.into_inner(), not_text.into_inner(), unreadable.into_inner());
-    let mut hits = hits.into_inner().unwrap();
+    let hits = hits.into_inner().unwrap();
     if hits.is_empty() {
         return ToolOutcome::ok(match skipped {
             Some(note) => format!("no matches\n{note}"),
             None => "no matches".into(),
         });
     }
-    hits.sort();
-    let capped = hits.len() >= MAX_GREP_RESULTS;
-    hits.truncate(MAX_GREP_RESULTS);
     let mut out = String::new();
     for (rel, line_no, line) in hits {
         out.push_str(&format!("{rel}:{line_no}: {line}\n"));
     }
-    if capped {
-        out.push_str("… result limit reached; refine the pattern\n");
+    let (found, files) = (found.into_inner(), files.into_inner());
+    if found > MAX_GREP_RESULTS {
+        out.push_str(&format!(
+            "… the first {MAX_GREP_RESULTS} of {found} matches in {files} file{}, by path; narrow it with path, glob or a more specific pattern\n",
+            if files == 1 { "" } else { "s" }
+        ));
     }
     if let Some(note) = skipped {
         out.push_str(&note);
@@ -3595,9 +3596,39 @@ mod tests {
         std::fs::write(root.join("big.txt"), big).unwrap();
         let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "*.txt"}));
         assert!(out.ok);
-        assert!(out.output.contains("result limit reached"), "{}", out.output);
+        assert!(
+            out.output.ends_with("… the first 50 of 70 matches in 1 file, by path; narrow it with path, glob or a more specific pattern\n"),
+            "{}",
+            out.output
+        );
         let hits = out.output.lines().filter(|l| l.contains("big.txt")).count();
         assert_eq!(hits, MAX_GREP_RESULTS, "{}", out.output);
+        // Exactly as many hits as the cap cuts nothing, so nothing says so.
+        std::fs::write(root.join("big.txt"), "alpha\n".repeat(MAX_GREP_RESULTS)).unwrap();
+        let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "*.txt"}));
+        assert_eq!(out.output.lines().count(), MAX_GREP_RESULTS, "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A capped search shows the first hits in path and line order, the same
+    /// on every run however the threads that search are scheduled.
+    #[test]
+    fn a_capped_grep_shows_the_same_first_hits_every_run() {
+        let root = temp_project();
+        for d in 0..8 {
+            std::fs::create_dir_all(root.join(format!("d{d}"))).unwrap();
+            for f in 0..40 {
+                std::fs::write(root.join(format!("d{d}/f{f:02}.txt")), "beta\nnone\nbeta\n".repeat(20)).unwrap();
+            }
+        }
+        let first = grep_tool(&root, &json!({"pattern": "beta"})).output;
+        assert!(first.starts_with("d0/f00.txt:1: beta\nd0/f00.txt:3: beta\n"), "{first}");
+        // 40 hits a file: all of the first, then the first 10 of the second.
+        assert!(first.contains("d0/f01.txt:15: beta\n") && !first.contains("d0/f01.txt:16:"), "{first}");
+        assert!(first.ends_with("the first 50 of 12800 matches in 320 files, by path; narrow it with path, glob or a more specific pattern\n"), "{first}");
+        for _ in 0..20 {
+            assert_eq!(grep_tool(&root, &json!({"pattern": "beta"})).output, first);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
