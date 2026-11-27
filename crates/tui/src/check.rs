@@ -33,6 +33,9 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::headless::{run_session, HeadlessArgs};
 
+const PLAN: &str = include_str!("../check-plan.txt");
+const RUN: &str = include_str!("../check-run.txt");
+
 /// The most files a project may hold for its run to be checked: past it the
 /// copy that guarantees the restore costs too much.
 pub(crate) const MAX_FILES: usize = 20_000;
@@ -393,6 +396,56 @@ fn alive(_: i32) -> bool {
     true
 }
 
+/// What the checker is shown of the author's work: the paths changed, and
+/// the diff of the text among them, each cut short where long.
+fn changes(root: &Path, start: &Start, end: &Tree) -> (Vec<String>, String) {
+    let mut paths = Vec::new();
+    let mut diff = String::new();
+    let under_git = |rel: &Path| rel.components().next().is_some_and(|c| c.as_os_str() == ".git");
+    let (mut git, mut more) = (0, 0);
+    let removed = start.tree.entries.keys().filter(|rel| !end.entries.contains_key(*rel)).map(|rel| (rel, "removed"));
+    let touched = end.entries.iter().filter_map(|(rel, kind)| match start.tree.entries.get(rel) {
+        None => Some((rel, "created")),
+        Some(was) if was != kind => Some((rel, "changed")),
+        Some(_) => None,
+    });
+    let mut listed: Vec<(&PathBuf, &str)> = touched.chain(removed).collect();
+    listed.sort();
+    for (rel, how) in listed {
+        if under_git(rel) {
+            git += 1;
+            continue;
+        }
+        if paths.len() == SHOWN_PATHS {
+            more += 1;
+            continue;
+        }
+        paths.push(format!("{how}: {}", rel.display()));
+        if how == "removed" || diff.len() >= SHOWN_BYTES {
+            continue;
+        }
+        let old = match how {
+            "created" => Some(""),
+            _ => start.text.get(rel).map(String::as_str),
+        };
+        let new = std::fs::read(root.join(rel)).ok().and_then(|b| String::from_utf8(b).ok()).filter(|t| !t.contains('\0'));
+        let name = rel.display().to_string();
+        diff.push_str(&match (old, new) {
+            (Some(old), Some(new)) => similar::TextDiff::configure().deadline(std::time::Instant::now() + Duration::from_millis(200))
+                .diff_lines(old, &new).unified_diff().context_radius(3).header(&format!("a/{name}"), &format!("b/{name}")).to_string(),
+            (None, Some(_)) => format!("{name}: changed; its earlier text was not kept\n"),
+            _ => format!("{name}: not text\n"),
+        });
+    }
+    if more > 0 {
+        paths.push(format!("and {more} more"));
+    }
+    if git > 0 {
+        paths.push(format!("and {git} under .git"));
+    }
+    (paths, cut(&diff, SHOWN_BYTES))
+}
+
 /// `text` cut at `max` bytes, on a character boundary, saying it was cut.
 fn cut(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -402,17 +455,63 @@ fn cut(text: &str, max: usize) -> String {
     format!("{}\n[cut]\n", &text[..end])
 }
 
-/// What the author left, read once it ended: the tree's copy and what it
-/// left running.
+/// A print run's settings held for one checker turn: at most `requests`.
+fn hold_requests(core: &Core, requests: usize) -> usize {
+    let mut settings = core.settings.lock().unwrap();
+    let was = settings.max_agent_iterations;
+    settings.max_agent_iterations = was.clamp(1, requests);
+    was
+}
+
+fn turn(args: &HeadlessArgs, prompt: String, session: Option<String>) -> HeadlessArgs {
+    HeadlessArgs {
+        prompts: vec![prompt],
+        project: args.project.clone(),
+        continue_session: session.is_some(),
+        session,
+        json: args.json,
+        second_look: false,
+        quit: args.quit.clone(),
+    }
+}
+
+/// What the author left, read once it ended: the tree's copy, the paths and
+/// diff to show, the task text and the final message.
 struct End {
     snap: Arc<Snapshot>,
+    paths: Vec<String>,
+    diff: String,
+    task: String,
+    message: String,
     running: Vec<(i32, String)>,
 }
 
-fn end(root: &Path, skip: &[PathBuf], mark: &Mark, copy: PathBuf) -> Result<End, String> {
+#[allow(clippy::too_many_arguments)]
+fn end(core: &Core, root: &Path, skip: &[PathBuf], start: &Start, mark: &Mark, author: &str, prompt: &str, copy: PathBuf) -> Result<End, String> {
     let tree = scan(root, skip, MAX_FILES).ok_or(format!("the project holds more than {MAX_FILES} files, or one of its directories could not be read"))?;
+    let (paths, diff) = changes(root, start, &tree);
     let snap = Arc::new(snapshot(root, tree, copy)?);
-    Ok(End { snap, running: mark.running() })
+    let task = open_max_core::templates::expand_user_input(&core.data_dir, root, prompt);
+    let messages = open_max_core::sessions::load_messages(core, author).ok().flatten().unwrap_or_default();
+    let last = messages.iter().rev().find(|m| m.role == "assistant" && m.content.as_deref().is_some_and(|c| !c.trim().is_empty()));
+    let message = cut(last.and_then(|m| m.content.as_deref()).unwrap_or(""), SHOWN_BYTES);
+    Ok(End { snap, paths, diff, task, message, running: mark.running() })
+}
+
+/// The URLs named in the commands of session `id`, from its event log.
+fn urls(core: &Core, id: &str) -> Vec<String> {
+    let log = std::fs::read_to_string(core.data_dir.join("sessions").join(format!("{id}.events.jsonl"))).unwrap_or_default();
+    let mut found = Vec::new();
+    for line in log.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|l| l["type"] == "tool_start") {
+        let text = line["args"].to_string();
+        for (at, _) in text.match_indices("http") {
+            let url: String = text[at..].chars().take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '\\' | '`' | ')' | '>')).collect();
+            if (url.starts_with("http://") || url.starts_with("https://")) && !found.contains(&url) {
+                found.push(url);
+            }
+        }
+    }
+    found
 }
 
 /// Stop what the check started and put the project back, to the end
@@ -442,8 +541,7 @@ fn stopped(code: i32) -> i32 {
     if crate::stopped_by_a_signal() { crate::quit_status() } else { code }
 }
 
-/// A print run with `--second-look`: the author's turn, then the copy of
-/// the project the check puts it back from, and the guard.
+/// A print run with `--second-look`: the author's turn, then the checker's two.
 pub(crate) async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
     let project = args.project.clone();
     let checks = std::env::temp_dir().join("openmax-check");
@@ -461,23 +559,24 @@ pub(crate) async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEv
     };
     let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let id = format!("{}-{nanos}", std::process::id());
-    let kept = core.data_dir.join("checks").join(&id);
+    let (dir, kept) = (checks.join(&id), core.data_dir.join("checks").join(&id));
     let (authors, checkers) = (Mark::new(&kept, format!("{id}-author")), Mark::new(&kept, id.clone()));
     let held = begun.as_ref().and_then(|_| std::fs::create_dir_all(&kept).ok()).and_then(|()| authors.hold());
     let mut author = None;
     let code = run_session(&core, &mut rx, &args, &mut author).await;
     Mark::release(held);
     let (Some(author), true) = (author, code == 0 && !crate::signalled()) else { return code };
-    if begun.is_none() {
+    let Some(begun) = begun else {
         match mode {
             ApprovalMode::Auto => eprintln!("openmax: check skipped: the project holds more than {MAX_FILES} files, or one of its directories could not be read"),
             mode => eprintln!("openmax: check skipped: the approval mode is {}, and the check runs commands only in auto", mode.as_str()),
         }
         return code;
-    }
+    };
+
     let read = {
-        let (root, skip, mark, copy) = (project.clone(), skip.clone(), authors.clone(), kept.join("author-end"));
-        move || end(&root, &skip, &mark, copy)
+        let (core, root, skip, mark, author, prompt, copy) = (core.clone(), project.clone(), skip.clone(), authors.clone(), author.clone(), args.prompts.concat(), kept.join("author-end"));
+        move || end(&core, &root, &skip, &begun, &mark, &author, &prompt, copy)
     };
     let left = match crate::until_stopped(args.quit.notified(), &mut None, read).await {
         Some(_) | None if crate::signalled() => return stopped(code),
@@ -488,8 +587,39 @@ pub(crate) async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEv
         }
         Some(Ok(left)) => left,
     };
-    let mut record = json!({ "author_session": author, "left_running": left.running });
+    let _ = std::fs::create_dir_all(&dir);
+    eprintln!("openmax: check: a new session checks the work; its files are in {}, the harness's record in {}", dir.display(), kept.display());
+    let mut record = json!({ "author_session": author, "paths": left.paths, "left_running": left.running });
+
+    // The checker: a plan from the request alone, then the checks.
+    let shown = dir.display().to_string();
+    let held = checkers.hold();
+    let (was, mut checker) = (hold_requests(&core, PLAN_REQUESTS), None);
+    let plan = turn(&args, format!("{}{}", PLAN.replace("{dir}", &shown), left.task), None);
+    let planned = run_session(&core, &mut rx, &plan, &mut checker).await;
+    let _ = std::fs::copy(dir.join("plan.md"), kept.join("plan.md"));
+    if let (Some(session), 0 | 4, false) = (&checker, planned, crate::signalled()) {
+        hold_requests(&core, RUN_REQUESTS);
+        let paths = if left.paths.is_empty() { "(none)".to_string() } else { left.paths.join("\n") };
+        let text = RUN.replace("{dir}", &shown).replace("{paths}", &paths).replace("{diff}", left.diff.trim_end()).replace("{message}", left.message.trim_end());
+        run_session(&core, &mut rx, &turn(&args, text, Some(session.clone())), &mut None).await;
+    }
+    core.settings.lock().unwrap().max_agent_iterations = was;
+    Mark::release(held);
     guard(&checkers, &project, &left.snap, &skip, &mut record, "checker").await;
+    record["checker_session"] = json!(checker);
+    if let Some(session) = &checker {
+        let named = urls(&core, session);
+        for url in &named {
+            eprintln!("openmax: check: the checker named {url}");
+        }
+        record["urls"] = json!(named);
+    }
+    if crate::signalled() {
+        save(&kept, &record);
+        return stopped(code);
+    }
+
     save(&kept, &record);
-    stopped(code)
+    code
 }

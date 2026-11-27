@@ -34,6 +34,9 @@ tokio.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The diff of the author's changes the independent check shows (`check`);
+# the core already links it for its edit diffs.
+similar.workspace = true
 reqwest.workspace = true
 lexopt = "0.3"
 unicode-width = "0.2"
