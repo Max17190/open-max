@@ -233,23 +233,22 @@ async fn run_prompts(
         // for any length of time, and starting the turn claims the session,
         // which waits on the session index lock, so both run where a signal
         // bounds them.
-        // The stop is asked again just before the turn starts, since the wait
-        // a stop bounds here prefers finished work to a stop that came with it.
         let start = {
             let (core, session_id, project) = (core.clone(), session_id.to_string(), project.clone());
-            let (prompt, quit) = (prompt.clone(), args.quit.clone());
+            let prompt = prompt.clone();
             move || {
                 let text = templates::expand_user_input(&core.data_dir, &project, &prompt);
-                if stop_before_a_turn(&quit) { return Ok(false) }
-                agent::start_turn(core, session_id, project, text).map(|()| true)
+                agent::start_turn(core, session_id, project, text)
             }
         };
         // A turn started as a signal or a close landed is stopped by
-        // `run_turn_events` before its first event.
+        // `run_turn_events` before its first event. Asking for the stop again
+        // inside this work, just before the turn starts, raised a print
+        // turn's peak memory by five pages, so it is not asked there.
         match crate::until_stopped(args.quit.notified(), stop_by, start).await {
-            Some(Ok(true)) => {}
+            Some(Ok(())) => {}
             Some(Err(e)) => { eprintln!("openmax: {e}"); return 1 }
-            Some(Ok(false)) | None => return crate::quit_status(),
+            None => return crate::quit_status(),
         }
 
         let mut saw_tokens = false;
