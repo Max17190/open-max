@@ -113,8 +113,8 @@ reports for a job a closed pipe ended. A turn that finished its work but
 whose last output found the reader gone exits 141 too, since that output
 was not delivered. A run that wrote all of its output exits with its own
 status even if its reader leaves before the process exits, as `grep -q`
-does; the work left, such as a `--second-look` session, is stopped all the
-same. Output to a file or to /dev/null is never stopped: a
+does; the work left, such as a `--second-look` check, is stopped all the
+same, and the check still puts the project back as the run left it. Output to a file or to /dev/null is never stopped: a
 write it refuses for any other reason, such as a full disk, is dropped and
 the run goes on. A `--stdio` session's client that closes stdin ends it as
 its protocol says: the running turn finishes first.

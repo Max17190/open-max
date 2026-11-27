@@ -17,7 +17,6 @@
 //! restore does: every file and link of the project is copied when the author
 //! ends, and after the check each one whose bytes, mode or target differ is
 //! written back, and everything the check added is removed.
-#![allow(dead_code, unused_imports)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -35,6 +34,7 @@ use crate::headless::{run_session, HeadlessArgs};
 
 const PLAN: &str = include_str!("../check-plan.txt");
 const RUN: &str = include_str!("../check-run.txt");
+const HANDBACK: &str = include_str!("../check-handback.txt");
 
 /// The most files a project may hold for its run to be checked: past it the
 /// copy that guarantees the restore costs too much.
@@ -455,6 +455,103 @@ fn cut(text: &str, max: usize) -> String {
     format!("{}\n[cut]\n", &text[..end])
 }
 
+fn one_space(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `quote` is in `task`, whitespace aside: each part between
+/// ellipses in turn, once its quotation marks are trimmed.
+fn quoted(task: &str, quote: &str) -> bool {
+    let (task, quote) = (one_space(task), one_space(quote.trim().trim_matches(|c| matches!(c, '"' | '\'' | '\u{201c}' | '\u{201d}'))));
+    let parts: Vec<&str> = quote.split("...").flat_map(|p| p.split('\u{2026}')).map(str::trim).filter(|p| !p.is_empty()).collect();
+    let mut from = 0;
+    !parts.is_empty() && parts.iter().all(|part| match task[from..].find(part) {
+        Some(at) => { from += at + part.len(); true }
+        None => false,
+    })
+}
+
+/// A field of an objection as text: a string as it is, any other value as JSON.
+fn field(objection: &Value, key: &str) -> String {
+    match &objection[key] {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// How an objection's command ran when the harness ran it.
+enum Ran {
+    Exited(Option<i32>, String),
+    TimedOut,
+    Stopped,
+}
+
+/// Run `command` with bash in the project, as the checker's own bash calls
+/// run, with its output to `out`, for at most `RERUN_LIMIT`; a stop ends it.
+async fn rerun(project: &Path, command: &str, mark: &Mark, out: &Path, quit: &Notify) -> Ran {
+    let Ok(file) = std::fs::OpenOptions::new().create_new(true).write(true).open(out) else { return Ran::Exited(None, "the harness could not record the output".into()) };
+    let Ok(err) = file.try_clone() else { return Ran::Exited(None, "the harness could not record the output".into()) };
+    let mut run = tokio::process::Command::new("bash");
+    run.args(["-c", command]).current_dir(project).stdin(std::process::Stdio::null()).stdout(file).stderr(err)
+        .env(MARKER, &mark.tag).env("OPENMAX_SESSION", "1").env("GIT_TERMINAL_PROMPT", "0").env_remove("OPENMAX_HUMAN_ATTEST").kill_on_drop(true);
+    #[cfg(unix)]
+    run.process_group(0);
+    let held = mark.open();
+    let spawned = run.spawn();
+    drop(held);
+    let Ok(mut child) = spawned else { return Ran::Exited(None, "bash could not be started".into()) };
+    let pid = child.id();
+    let ran = tokio::select! {
+        status = child.wait() => status.ok().map(|s| s.code()),
+        _ = tokio::time::sleep(RERUN_LIMIT) => None,
+        () = quit.notified() => None,
+    };
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: the command's own process group, which it leads.
+        unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+    }
+    let _ = child.wait().await;
+    match ran {
+        _ if crate::signalled() => Ran::Stopped,
+        None => Ran::TimedOut,
+        Some(code) => {
+            let bytes = std::fs::read(out).unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes);
+            let shown = if text.len() <= 2 * OUTPUT_BYTES { text.to_string() } else {
+                let head = (0..=OUTPUT_BYTES).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+                let tail = (text.len() - OUTPUT_BYTES..text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
+                format!("{}\n[{} bytes not shown]\n{}", &text[..head], tail - head, &text[tail..])
+            };
+            Ran::Exited(code, shown)
+        }
+    }
+}
+
+/// Whether a command that ran shows its objection again: it failed, or it
+/// printed what the checker observed.
+fn reproduced(ran: &Ran, observed: &str) -> bool {
+    match ran {
+        Ran::Exited(code, output) => *code != Some(0) || (!observed.trim().is_empty() && output.contains(observed.trim())),
+        _ => false,
+    }
+}
+
+/// Whether the project's permission rules and `pre_tool_use` hooks let the
+/// command run as a bash call, as the checker's own would have had to.
+async fn allowed(core: &Core, project: &Path, session: &str, command: &str) -> bool {
+    use open_max_core::{hooks, permissions};
+    let args = json!({ "command": command });
+    let rules = permissions::Permissions::discover_for_mode(project, &core.data_dir, ApprovalMode::Auto);
+    if matches!(rules.evaluate("bash", &args), permissions::PermissionDecision::Deny { .. } | permissions::PermissionDecision::Ask) {
+        return false;
+    }
+    let gates = hooks::Hooks::discover_for_mode(project, &core.data_dir, ApprovalMode::Auto);
+    let cancel = Arc::new(open_max_core::state::CancelToken::default());
+    matches!(gates.pre_tool_use(session, "bash", &args, project, &cancel).await, hooks::PreToolResult::Allow)
+}
+
 /// A print run's settings held for one checker turn: at most `requests`.
 fn hold_requests(core: &Core, requests: usize) -> usize {
     let mut settings = core.settings.lock().unwrap();
@@ -541,7 +638,7 @@ fn stopped(code: i32) -> i32 {
     if crate::stopped_by_a_signal() { crate::quit_status() } else { code }
 }
 
-/// A print run with `--second-look`: the author's turn, then the checker's two.
+/// A print run with `--second-look`: the author's turn, then the check.
 pub(crate) async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
     let project = args.project.clone();
     let checks = std::env::temp_dir().join("openmax-check");
@@ -620,6 +717,155 @@ pub(crate) async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEv
         return stopped(code);
     }
 
+    let objections = std::fs::read_to_string(dir.join("objections.jsonl")).unwrap_or_default();
+    let (failures, readings, reran) = filter(&core, &project, &author, &checkers, &left.task, &objections, &kept, &args.quit, &mut record).await;
+    if reran {
+        guard(&checkers, &project, &left.snap, &skip, &mut record, "re-run").await;
+    }
+    let ended: Vec<&(i32, String)> = left.running.iter().filter(|(pid, _)| !alive(*pid)).collect();
+    record["ended_while_checked"] = json!(ended);
+    if crate::signalled() {
+        save(&kept, &record);
+        return stopped(code);
+    }
+    if failures.is_empty() && ended.is_empty() {
+        eprintln!("openmax: check: the work stands as the author left it");
+        let core = core.clone();
+        let _ = crate::until_stopped(args.quit.notified(), &mut None, move || open_max_core::sessions::touch(&core, &author)).await;
+        save(&kept, &record);
+        return code;
+    }
+
+    // The hand-back: once, in the author's own session.
+    let message = handback(&failures, &readings, &ended);
+    eprintln!("openmax: check: handing {} objection{} back to the author", failures.len(), if failures.len() == 1 { "" } else { "s" });
+    record["handed_back"] = json!(message);
+    let second = run_session(&core, &mut rx, &turn(&args, message, Some(author.clone())), &mut None).await;
+    if !crate::signalled() && !failures.is_empty() {
+        last_look(&project, &skip, &checkers, &kept, &failures, &args.quit, &mut record).await;
+    }
     save(&kept, &record);
-    code
+    if crate::stopped_by_a_signal() { crate::quit_status() } else { second }
+}
+
+/// An objection that the harness reproduced: the objection, then how its
+/// command exited and what it printed.
+type Failure = (Value, Option<i32>, String);
+
+/// Keep the objections in `lines` whose quote is the request's and whose
+/// command fails again in the harness's hands, at most `KEPT`, and the
+/// readings aside; each verdict goes to the record. Whether any command ran.
+#[allow(clippy::too_many_arguments)]
+async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, task: &str, lines: &str, kept: &Path, quit: &Notify, record: &mut Value) -> (Vec<Failure>, Vec<Value>, bool) {
+    let (mut failures, mut readings, mut verdicts, mut reruns) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    for line in lines.lines().filter(|l| !l.trim().is_empty()) {
+        let objection: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        let (quote, command, kind) = (field(&objection, "quote"), field(&objection, "command"), field(&objection, "kind"));
+        let verdict = match kind.as_str() {
+            _ if !objection.is_object() => "dropped: not a JSON object".to_string(),
+            "fails" | "missing" | "unrequested" | "reading" if kind != "unrequested" && !quoted(task, &quote) => "dropped: its quote is not in the request".into(),
+            "reading" if readings.len() < KEPT => {
+                readings.push(objection.clone());
+                "aside: a reading".into()
+            }
+            "reading" => "dropped: past the readings kept".into(),
+            "fails" | "missing" | "unrequested" if command.trim().is_empty() || command.contains('\n') => "dropped: its command is not one line".into(),
+            "fails" | "missing" | "unrequested" if failures.len() >= KEPT || reruns >= RERUNS => "dropped: past the commands run again".into(),
+            "fails" | "missing" | "unrequested" if !allowed(core, project, author, &command).await => "dropped: a permission rule or hook refuses its command".into(),
+            "fails" | "missing" | "unrequested" => {
+                reruns += 1;
+                let ran = rerun(project, &command, mark, &kept.join(format!("rerun-{reruns}.out")), quit).await;
+                match ran {
+                    Ran::Stopped => break,
+                    Ran::TimedOut => "dropped: its command did not finish".into(),
+                    Ran::Exited(..) if !reproduced(&ran, &field(&objection, "observed")) => "dropped: its command passed".into(),
+                    Ran::Exited(status, output) => {
+                        failures.push((objection.clone(), status, output));
+                        "kept".into()
+                    }
+                }
+            }
+            _ => "dropped: its kind is not one of the four".into(),
+        };
+        verdicts.push(json!({ "objection": objection, "verdict": verdict }));
+    }
+    eprintln!("openmax: check: {} of {} objection{} reproduced", failures.len(), verdicts.len(), if verdicts.len() == 1 { "" } else { "s" });
+    record["objections"] = json!(verdicts);
+    (failures, readings, reruns > 0)
+}
+
+/// The one message the author gets: each reproduced objection with the
+/// output the harness got, the readings as information, and what the check
+/// ended that the author had left running.
+fn handback(failures: &[Failure], readings: &[Value], ended: &[&(i32, String)]) -> String {
+    let parts: Vec<&str> = HANDBACK.split("\n%%\n").map(str::trim).collect();
+    let mut message = String::new();
+    if !failures.is_empty() {
+        message.push_str(parts[0]);
+        for (n, (objection, status, output)) in failures.iter().enumerate() {
+            let status = status.map_or("was ended by a signal".to_string(), |s| format!("exited with status {s}"));
+            let quote = one_space(&field(objection, "quote"));
+            let says = if quote.is_empty() { String::new() } else { format!(" The request says: \"{quote}\".") };
+            message.push_str(&format!("\n\n{}.{says}\n`{}` {status} and printed:\n```\n{}\n```\nThe check expected: {}",
+                n + 1, field(objection, "command"), output.trim_end(), one_space(&field(objection, "expected"))));
+        }
+        if !readings.is_empty() {
+            message.push_str(&format!("\n\n{}", parts[1]));
+            for reading in readings {
+                message.push_str(&format!("\n- The request says: \"{}\". The check read it as: {}", one_space(&field(reading, "quote")), one_space(&field(reading, "expected"))));
+            }
+        }
+    }
+    if !ended.is_empty() {
+        message.push_str(&format!("\n\n{}", parts[2]));
+        for (_, line) in ended {
+            message.push_str(&format!("\n- `{line}`"));
+        }
+    }
+    if !failures.is_empty() {
+        message.push_str(&format!("\n\n{}", parts[3]));
+    }
+    message.trim().to_string()
+}
+
+/// At the author's second end, run the handed-back commands once more and
+/// record which now pass, then put the tree back as the author left it.
+async fn last_look(project: &Path, skip: &[PathBuf], mark: &Mark, kept: &Path, failures: &[Failure], quit: &Arc<Notify>, record: &mut Value) {
+    let take = {
+        let (root, skip, copy) = (project.to_path_buf(), skip.to_vec(), kept.join("second-end"));
+        move || scan(&root, &skip, MAX_FILES).ok_or_else(|| "the tree could not be listed".to_string()).and_then(|tree| snapshot(&root, tree, copy))
+    };
+    let snap = match crate::until_stopped(quit.notified(), &mut None, take).await {
+        Some(Ok(snap)) if !crate::signalled() => Arc::new(snap),
+        Some(Err(why)) => return eprintln!("openmax: check: the commands were not run again: {why}"),
+        _ => return,
+    };
+    let mut passing = Vec::new();
+    for (n, (objection, ..)) in failures.iter().enumerate() {
+        let ran = rerun(project, &field(objection, "command"), mark, &kept.join(format!("final-{}.out", n + 1)), quit).await;
+        if matches!(ran, Ran::Stopped) {
+            break;
+        }
+        passing.push(json!({ "command": field(objection, "command"), "passes": !reproduced(&ran, &field(objection, "observed")) }));
+    }
+    guard(mark, project, &snap, skip, record, "last re-run").await;
+    let now = passing.iter().filter(|p| p["passes"] == true).count();
+    eprintln!("openmax: check: after the author's second end, {now} of {} command{} pass", failures.len(), if failures.len() == 1 { "" } else { "s" });
+    record["last_re_run"] = json!(passing);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quote_is_found_whitespace_and_ellipses_aside() {
+        let task = "Write the two\nnames it prints,  one per line, to the file named below.";
+        assert!(quoted(task, "two names it prints"));
+        assert!(quoted(task, "\u{201c}the two names\u{201d}"));
+        assert!(quoted(task, "two names ... one per line"));
+        assert!(!quoted(task, "one per line ... two names"), "parts in another order are not a quote");
+        assert!(!quoted(task, "three names"));
+        assert!(!quoted(task, "  "), "an empty quote quotes nothing");
+    }
 }

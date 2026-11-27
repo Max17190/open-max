@@ -1,0 +1,7 @@
+A separate check, which did not see your reasoning, ran commands on your work. Each result below is from the harness running the command again a moment ago, from the project directory, on your files as you left them.
+%%
+The check also read the request differently from you in the places below, and the request's words may allow both. Keep your reading unless the request's words decide it; where one change satisfies both readings at no cost, make it.
+%%
+While the check ran, these processes, which were running when you finished, ended, and nothing was started again in their place. If your work needs them, start them again.
+%%
+Run the commands yourself. If one is wrong, say why in one line and leave your work as it is.

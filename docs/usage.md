@@ -222,8 +222,26 @@ the project, so it pastes into any shell.
 
 A sub-agent held to a stricter mode saved inside the project, such as `ask`
 saved for `.worktrees`, names that directory too, and its command selects
-`auto` there as well as in the project when the project is in `ask`. A
-`--second-look` session that declines a request ends the run with exit 3 too.
+`auto` there as well as in the project when the project is in `ask`.
+
+`--second-look`, with one `-p` in `auto`, checks a run whose turn ends with
+status 0. A new session in the same project first plans checks from the
+prompt alone, writing to a folder of its own under the temporary directory
+(`openmax-check/<id>`), then gets the paths the run changed, their diff
+(cut at 4 KB) and the run's final message, never its reasoning or its calls,
+runs its checks and appends each failure to `objections.jsonl` there. With no
+model call, Open Max then stops every process the check started, however it
+detached, and puts every file and link of the project back as the run left
+it, from a copy taken when the run ended; a project of more than 20,000 files
+or 512 MiB is not checked. It drops each objection whose quote is not in the
+prompt or whose command passes when Open Max runs it again itself (for at most
+60 seconds, through the project's permission rules and `pre_tool_use` hooks),
+keeps a difference of reading aside as information, and sends what is left,
+at most five, with the output it just got, to the run's own session in one
+message, once. That session's end stands: the run exits with its status, and
+the commands are run once more and recorded as passing or not. Every
+verdict, and the copy, is in `~/.openmax/checks/<id>/`; stderr has a line
+for each step. A run in another mode is not checked.
 
 A request for an agent-written tool no human has approved names its
 `openmax --approve` command instead. A print run an agent started (one whose
