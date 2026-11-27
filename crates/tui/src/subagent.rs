@@ -103,7 +103,6 @@ pub async fn run(
             session: None,
             json,
             second_look: false,
-            written: Default::default(),
             quit: quit.clone(),
         };
         crate::headless::run(core.clone(), core_rx, args).await
