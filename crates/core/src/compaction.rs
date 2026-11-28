@@ -762,6 +762,48 @@ pub(crate) fn requested_trigger(requested: usize, ratio: Option<f64>, budget: us
     to_estimate(requested.max(COMPACTION_TOKENS_FLOOR), setting_factor(ratio)).min(budget)
 }
 
+/// Turn-scoped compaction ceiling in real tokens: on a fresh turn before any
+/// file edit wait up to 2x the configured ceiling so exploration keeps freshly
+/// read files, and double after each automatic cut so reset work stays bounded.
+pub(crate) fn turn_ceiling(configured: usize, context_tokens: usize, resets: u32, pre_edit: bool) -> usize {
+    let default = context_tokens.saturating_mul(4) / 5;
+    let base = configured.max(COMPACTION_TOKENS_FLOOR);
+    let shift = (resets + u32::from(pre_edit && resets == 0)).min(16);
+    base.saturating_mul(1usize << shift).min(default.max(base))
+}
+
+/// Turn-scoped compaction state: tracks deferred soft-cut waits, automatic cut
+/// count for exponential growth, and whether the turn began under its ceiling.
+#[derive(Default)]
+pub(crate) struct TurnCompaction {
+    pub soft_spent: Option<usize>,
+    pub resets: u32,
+    pub pre_edit_room: Option<bool>,
+}
+
+impl TurnCompaction {
+    #[allow(clippy::too_many_arguments)]
+    pub fn trigger(
+        &mut self,
+        endpoint: &crate::providers::ActiveEndpoint,
+        budget: usize,
+        schema_tokens: usize,
+        keep: usize,
+        factor: f64,
+        prompt_ratio: Option<f64>,
+        edited: bool,
+        messages: &[ChatMessage],
+        estimate: &dyn Fn(&ChatMessage) -> usize,
+    ) -> usize {
+        let pre_edit = *self.pre_edit_room.get_or_insert_with(|| {
+            to_real(schema_tokens + messages.iter().map(estimate).sum::<usize>(), factor) <= endpoint.turn_ceiling(0, false)
+        }) && !edited;
+        let base = compaction_trigger(budget, schema_tokens, endpoint.turn_ceiling(self.resets, pre_edit), keep, prompt_ratio, messages, estimate);
+        self.soft_spent.map_or(base, |at| at.saturating_add((base / 4).min(keep)).max(base).min(budget))
+    }
+    pub fn on_cut(&mut self, forced: bool) { (self.soft_spent, self.resets) = (None, self.resets + u32::from(!forced)); }
+}
+
 /// Real tokens per estimated token for a compaction setting: the observed
 /// ratio, which may relax a setting as well as tighten it, up to the cap.
 fn setting_factor(ratio: Option<f64>) -> f64 {
@@ -2785,5 +2827,19 @@ pub(crate) mod tests {
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "the parts in order, Open last: {at:?}");
         assert!(opens_open_part("Open: the docs"), "the part a cut over the cap keeps");
         assert!(ChatMessage::user(NOTES_ASK).estimated_tokens() < 1_024, "the ask fits the budget's margin");
+    }
+
+    #[test]
+    fn turn_ceiling_waits_before_first_edit_and_doubles_each_cut() {
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 0, true), 90_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 0, false), 45_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 1, false), 90_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 2, false), 180_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 8, false), 800_000);
+        assert_eq!(turn_ceiling(800_000, 1_000_000, 0, true), 800_000);
+        assert_eq!(turn_ceiling(0, 1_000_000, 0, true), 40_000);
+        assert_eq!(turn_ceiling(0, 1_000_000, 1, false), 40_000);
+        assert_eq!(turn_ceiling(10_000, 1_000_000, 0, true), 40_000);
+        assert_eq!(turn_ceiling(10_000, 1_000_000, 1, false), 40_000);
     }
 }

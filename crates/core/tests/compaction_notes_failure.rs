@@ -384,13 +384,14 @@ async fn a_notes_reply_that_makes_a_call_is_asked_once_more_and_reported() {
     }
 }
 
-/// One reply on `wire`: a call reading `path`, or with none the turn's answer.
+/// One reply on `wire`: a call writing `path` (so the turn has edited and crosses
+/// its base ceiling), or with none the turn's answer.
 fn reply_on(wire: &str, path: Option<&str>) -> WireReply {
-    let arguments = path.map(|path| json!({ "path": path }));
+    let arguments = path.map(|path| json!({ "path": path, "content": "b".repeat(4_500) }));
     match wire {
         "responses" => {
             let item = match &arguments {
-                Some(arguments) => json!({"type":"function_call","status":"completed","call_id":"read-new","name":"read_file","arguments":arguments.to_string()}),
+                Some(arguments) => json!({"type":"function_call","status":"completed","call_id":"write-new","name":"write_file","arguments":arguments.to_string()}),
                 None => json!({"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"The primary reply."}]}),
             };
             let event = json!({"type":"response.completed","response":{"status":"completed","output":[item]}});
@@ -398,14 +399,18 @@ fn reply_on(wire: &str, path: Option<&str>) -> WireReply {
         }
         "anthropic" => {
             let (block, stop) = match arguments {
-                Some(input) => (json!({"type":"tool_use","id":"read-new","name":"read_file","input":input}), "tool_use"),
+                Some(input) => (json!({"type":"tool_use","id":"write-new","name":"write_file","input":input}), "tool_use"),
                 None => (json!({"type":"text","text":"The primary reply."}), "end_turn"),
             };
             let body = json!({"type":"message","role":"assistant","stop_reason":stop,"content":[block]});
             (200, "application/json", body.to_string())
         }
-        _ => match path {
-            Some(path) => read_call("read-new", path),
+        _ => match arguments {
+            Some(arguments) => sse(
+                &[json!({"tool_calls":[{"index":0,"id":"write-new","type":"function","function":{"name":"write_file","arguments":arguments.to_string()}}]})],
+                "tool_calls",
+                Value::Null,
+            ),
             None => answer("The primary reply."),
         },
     }
