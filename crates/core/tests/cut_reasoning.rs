@@ -171,8 +171,8 @@ async fn another_vendors_server_keeps_the_silent_cut_rules_on_every_wire() {
         got.push(other_server_turn(wire, 2869, false).await);
         for reports in [false, true] { got.push(other_server_turn(wire, u64::MAX / 4, reports).await); }
     }
-    let finished = (vec![4096, 4096, 8192], 2, "stop".to_string());
-    let ceiling = long(&[4096, 4096, 8192, 16384, 16384, 16384, 16384], 6);
+    let finished = (vec![4096, 4096, 16384], 2, "stop".to_string());
+    let ceiling = long(&[4096, 4096, 16384, 16384, 16384, 16384], 5);
     // A text the Messages-shaped server cut gets room once, then the rest in parts.
     assert_eq!(got, [
         finished.clone(), ceiling.clone(), ceiling.clone(),
@@ -197,18 +197,44 @@ async fn a_server_declared_to_report_cuts_gets_the_vendor_rules_on_responses_and
         }
     }
     let row = |limits: &[u64], notes, stop: &str| (limits.to_vec(), notes, stop.to_string());
-    let finished = row(&[4096, 4096, 8192], 2, "stop");
+    let finished = row(&[4096, 4096, 16384], 2, "stop");
     // Undeclared, every wire: a reply that spent 70% of the limit or all of it
     // is read as cut, and the limit grows to four times the default.
-    let silent = [finished.clone(), finished.clone(), row(&[4096, 4096, 8192, 16384, 16384, 16384, 16384], 6, "length")];
+    let silent = [finished.clone(), finished.clone(), row(&[4096, 4096, 16384, 16384, 16384, 16384], 5, "length")];
     // Declared: both completed replies stand, and a thought that never ends is
     // raised to a quarter of the window, as on the vendor's own server.
     let declared = |never_ends| vec![row(&[4096], 0, "stop"), row(&[4096], 0, "stop"), never_ends];
     // The Messages-shaped server cuts inside its text, which gets room once.
     let messages = [finished.clone(), row(&[4096, 16384], 1, "stop"), row(&[4096, 16384, 4096, 4096, 4096], 4, "length")];
     assert_eq!(got, [
-        silent.to_vec(), declared(row(&[4096, 4096, 8192, 16384, 32768, 32768, 32768, 32768], 7, "length")),
+        silent.to_vec(), declared(row(&[4096, 4096, 16384, 32768, 32768, 32768, 32768], 6, "length")),
         messages.to_vec(), declared(row(&[4096, 16384, 32768, 32768, 32768, 32768], 5, "length")),
         silent.to_vec(), silent.to_vec(),
     ].concat());
+}
+
+/// A multi-cut thought chain jumps to reply_room on cut #2 and retains that
+/// base limit across subsequent tool rounds in the same turn, while a single
+/// cut keeps the base limit at 4096.
+#[tokio::test]
+async fn multi_cut_chain_raises_base_limit_for_later_rounds_while_single_cut_does_not() {
+    let cut_reply = json!({"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"","reasoning_content":"thinking..."}}],"usage":{"prompt_tokens":10,"completion_tokens":4096,"completion_tokens_details":{"reasoning_tokens":4095}}});
+    let call_reply = json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":50}});
+    let done_reply = json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":10,"completion_tokens":10}});
+    // Single cut before a tool call: base limit stays 4096.
+    let (url, bodies) = common::recording_endpoint(vec![cut_reply.clone(), call_reply.clone(), done_reply.clone()]).await;
+    let scratch = Scratch::new(&url, "chat_completions");
+    std::fs::write(scratch.0.join("data/settings.json"), r#"{"provider":"test","model":"thinker","context_tokens":131072}"#).unwrap();
+    let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
+    common::drive_turn(&core, &mut rx, "single", &scratch.0.join("project"), "go").await;
+    let limits: Vec<u64> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
+    assert_eq!(limits, vec![4096, 4096, 4096]);
+    // Two cuts before a tool call: jumps to 16384 and keeps 16384 on the follow-up round.
+    let (url, bodies) = common::recording_endpoint(vec![cut_reply.clone(), cut_reply, call_reply, done_reply]).await;
+    let scratch = Scratch::new(&url, "chat_completions");
+    std::fs::write(scratch.0.join("data/settings.json"), r#"{"provider":"test","model":"thinker","context_tokens":131072}"#).unwrap();
+    let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
+    common::drive_turn(&core, &mut rx, "multi", &scratch.0.join("project"), "go").await;
+    let limits: Vec<u64> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
+    assert_eq!(limits, vec![4096, 4096, 16384, 16384]);
 }
