@@ -238,15 +238,19 @@ async fn run_prompts(
             let prompt = prompt.clone();
             move || {
                 let text = templates::expand_user_input(&core.data_dir, &project, &prompt);
+                if stop_known() {
+                    return Err(String::new());
+                }
                 agent::start_turn(core, session_id, project, text)
             }
         };
-        // A turn started as a signal or a close landed is stopped by
-        // `run_turn_events` before its first event. Asking for the stop again
-        // inside this work, just before the turn starts, raised a print
-        // turn's peak memory by five pages, so it is not asked there.
+        // A stop known once the prompt is expanded starts no turn
+        // (`stop_known`), and one that lands as the turn starts is stopped by
+        // `run_turn_events` before its first event.
         match crate::until_stopped(args.quit.notified(), stop_by, start).await {
             Some(Ok(())) => {}
+            // No error of a turn's start is empty: this one is `stop_known`'s.
+            Some(Err(e)) if e.is_empty() => return crate::quit_status(),
             Some(Err(e)) => { eprintln!("openmax: {e}"); return 1 }
             None => return crate::quit_status(),
         }
@@ -523,6 +527,15 @@ fn stop_before_a_turn(quit: &Notify) -> bool {
     if reader_gone_now() {
         output_gone(quit);
     }
+    crate::signalled()
+}
+
+/// Whether a stop is already recorded, by a signal or by the watch on stdout
+/// (`output_gone`): read where a turn would start, with nothing captured
+/// and out of line, since state carried into that work and code inlined
+/// there each raised a print turn's peak memory by pages.
+#[inline(never)]
+fn stop_known() -> bool {
     crate::signalled()
 }
 
