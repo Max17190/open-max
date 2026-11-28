@@ -36,6 +36,40 @@ Running the text through `eval` shows in a few places. Bash's `set -x` trace lin
 
 Each `bash` or external tool call runs in its own process group, and processes it leaves running in the background are terminated when it returns. Outside a sandbox the call also leads a session of its own, and on Linux every stop reaches the session's other process groups too, such as the one GNU `timeout` moves its command to; a process that starts a session of its own with `setsid` is out of reach and keeps running. The first call in a session that terminated some gets a result that explains why and how to keep one running (a named tmux session); every later one gets one line that says so on its own, which still holds if the model never saw the first (its turn was cancelled) or compaction dropped it. A session loaded again from its file, as a resume does, or one whose extensions were refrozen, explains once more.
 
+## What a session leaves running
+
+When a terminal UI session ends, by `/quit` or by a signal, and its tools have
+been stopped, it prints on the shell each process its commands started that is
+still running: the pid, the command name and each TCP port the process listens
+on, then one `kill` command that stops them all. It stops none of them itself,
+and prints nothing when none is left. `/status` lists the same during the
+session, a command still running among them.
+
+The TUI finds them by their environment. As it starts, it sets `OPENMAX_RUN`
+to a value no other run shares (its pid and its start time), replacing any
+value it inherited. Every `bash` call and hook inherits it, as does a
+sub-agent the session starts, with its commands, and a process keeps the
+environment it started with when it leaves its tool's session or daemonizes.
+A process is listed when its environment holds that value and the user
+running Open Max may read that environment. So these are not listed:
+
+- a process started with a cleared environment, or by a program that gives it
+  an environment of its own (a tmux server that was already running when a
+  command opened a window in it);
+- an external tool's processes, whose scrubbed environment has no
+  `OPENMAX_RUN` unless its manifest's `env` names it;
+- a process that runs as another user;
+- on macOS, a process running one of the system's own programs (such as those
+  in `/bin` and `/usr/bin`), whose environment macOS does not show to other
+  processes. A server run by an installed interpreter or a built binary is
+  listed.
+
+A tmux server a command started is listed too, since it was left running on
+purpose or not. Ports are those of the listening TCP sockets among the
+process's open descriptors: on Linux from `/proc/<pid>/net/tcp` and
+`/proc/<pid>/net/tcp6`, on macOS from `proc_pidfdinfo`. Neither needs elevated
+rights. Print runs (`-p`) and `--stdio` sessions report nothing.
+
 ## Signals and cancellation
 
 Tools run in a session of their own, so Ctrl+C or Ctrl+\ at the shell reaches

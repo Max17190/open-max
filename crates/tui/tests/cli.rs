@@ -7500,6 +7500,121 @@ fn a_signal_ends_the_tui_with_its_status_and_stops_the_tool_tree() {
     assert!(screen_text.contains("\x1b[?1049l"), "the terminal was not handed back: {screen_text:?}");
     assert_eq!(status.code(), Some(143), "{status:?}");
     assert!(survivors.is_empty(), "tool processes outlived the session: {survivors:?}");
+    // Nothing was left running, so the session's end reports nothing.
+    assert!(!screen_text.contains("still running"), "{screen_text:?}");
+}
+
+/// A process a tool call starts in a session of its own is out of the
+/// harness's reach and outlives the TUI. The session ends by naming it, with
+/// the TCP port it listens on and the command that stops it, and leaves it
+/// running: the report signals nothing.
+#[test]
+fn the_tui_names_what_its_commands_left_running_when_it_ends() {
+    let (project, home) = fresh_dirs("left-running-tui");
+    let held = project.parent().unwrap().join("held");
+    // perl leaves the call's session, then becomes this test binary holding a
+    // listener (`a_listener_held_for_the_tui_test`): a program of its own,
+    // whose environment macOS shows to its user, unlike its system programs'.
+    let script = format!(
+        "OPENMAX_TEST_HELD='{held}' perl -MPOSIX -e 'fork and exit; POSIX::setsid(); exec @ARGV' '{bin}' \
+         --exact a_listener_held_for_the_tui_test --ignored </dev/null >/dev/null 2>&1",
+        held = held.display(),
+        bin = std::env::current_exe().unwrap().display(),
+    );
+    let (base_url, _requests, _server) = spawn_scripted_server(vec![
+        (sse_tool_call("bash", serde_json::json!({ "command": script })), true),
+        (sse_text("Launched"), true),
+    ]);
+    write_settings_with_mode(&home, &base_url, "auto");
+    let (pty, terminal) = pseudo_terminal();
+    let size = libc::winsize { ws_row: 24, ws_col: 60, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCSWINSZ reads one winsize from a live descriptor.
+    unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&terminal), libc::TIOCSWINSZ, &size) };
+    let mut child = cmd(&project, &home)
+        .arg("--trust-project")
+        .env("TERM", "xterm-256color")
+        .stdin(terminal.try_clone().unwrap())
+        .stdout(terminal.try_clone().unwrap())
+        .stderr(terminal)
+        .spawn()
+        .unwrap();
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let mut reader = pty.try_clone().unwrap();
+    let drained = screen.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            drained.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let shown = |bytes: &[u8]| screen.lock().unwrap().windows(bytes.len()).any(|w| w == bytes);
+    let holder = || -> Option<(i32, u16)> {
+        let text = std::fs::read_to_string(&held).ok()?;
+        let (pid, port) = text.trim().split_once(' ')?;
+        Some((pid.parse().ok()?, port.parse().ok()?))
+    };
+    let wait_for = |what: &str, done: &dyn Fn() -> bool, child: &mut std::process::Child| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some((pid, _)) = holder() {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                panic!("{what}: {}", String::from_utf8_lossy(&screen.lock().unwrap()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    wait_for("the TUI never asked about the keyboard", &|| shown(b"\x1b[?u"), &mut child);
+    let mut keys = pty.try_clone().unwrap();
+    keys.write_all(b"\x1b[?62cstart a server\r").unwrap();
+    wait_for("the listener never started", &|| holder().is_some(), &mut child);
+    wait_for("the turn never ended", &|| shown(b"Launched"), &mut child);
+    let (pid, port) = holder().unwrap();
+    // `/status` lists it during the session, off the event loop.
+    keys.write_all(b"/status\r").unwrap();
+    let stop = format!("kill {pid}");
+    wait_for("/status never listed what was left running", &|| shown(stop.as_bytes()), &mut child);
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let output = finish_with_deadline(child);
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let screen_text = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+    drop(pty);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    assert_eq!(output.status.code(), Some(143), "{screen_text}");
+    assert!(alive, "the report stopped the process it names");
+    let report = screen_text
+        .split_once("openmax: still running, started by this run's commands:")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("no report of what was left running: {screen_text:?}"));
+    let row = report.lines().nth(1).unwrap_or_default();
+    assert!(row.starts_with(&format!("  pid {pid}  ")), "{report:?}");
+    assert!(row.trim_end().ends_with(&format!(", listening on TCP {port}")), "{report:?}");
+    let stop = report.lines().nth(2).unwrap_or_default();
+    assert_eq!(stop.trim_end(), format!("openmax: to stop them: kill {pid}"), "{report:?}");
+}
+
+/// Not a test: the process `the_tui_names_what_its_commands_left_running_when_it_ends`
+/// leaves running, a listener on a free port that writes its pid and port to
+/// the file `OPENMAX_TEST_HELD` names and waits to be killed.
+#[test]
+#[ignore = "child process for the_tui_names_what_its_commands_left_running_when_it_ends"]
+fn a_listener_held_for_the_tui_test() {
+    let Some(file) = std::env::var_os("OPENMAX_TEST_HELD") else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let partial = std::path::PathBuf::from(&file).with_extension("partial");
+    std::fs::write(&partial, format!("{} {port}\n", std::process::id())).unwrap();
+    std::fs::rename(&partial, &file).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(60));
 }
 
 /// A fresh install has no endpoint, model or window. One run must name all

@@ -54,8 +54,13 @@ running in the background is stopped when the call returns. A signal or a
 `kill -9` of Open Max stops its tools too: after `kill -9`, a watcher process
 stops them within 100 ms. A process that starts a session of its own (as
 `setsid` does) is out of reach and keeps running, and so is, on macOS, one that
-leaves its tool's process group. To keep work running on purpose, start it in a
-named tmux session. See [native execution](execution.md#signals-and-cancellation).
+leaves its tool's process group. When a terminal UI session ends, it prints
+each process its commands left running that it can find, with its pid, its
+command name and the TCP ports it listens on, and the `kill` command that stops
+them; it stops none itself, and `/status` shows the same list during the
+session. To keep work running on purpose, start it in a named tmux session.
+See [native execution](execution.md#signals-and-cancellation) and
+[what a session leaves running](execution.md#what-a-session-leaves-running).
 
 ## How much memory does it use, and how fast does it start?
 

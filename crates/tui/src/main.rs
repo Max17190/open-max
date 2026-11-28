@@ -6,6 +6,7 @@ mod setup;
 mod completion;
 mod headless;
 mod input;
+mod leftover;
 mod mcp;
 mod stdio;
 mod subagent;
@@ -751,6 +752,9 @@ fn main() -> std::io::Result<std::process::ExitCode> {
             }
         }
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && exit_after_grant(&cli, true).is_none() {
+            // While this is the only thread: every command the session runs
+            // inherits the mark its exit reads back.
+            leftover::mark_run();
             return session(cli);
         }
         if !cli.prompts.is_empty() {
@@ -929,6 +933,11 @@ fn session(cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
     runtime.block_on(open_max_core::chatgpt::finish_refreshes());
     let code = end_session(result, warnings, granted);
     drop(runtime);
+    // The runtime's shutdown has stopped every tool group; what still runs
+    // with the session's mark left them (`leftover`). Reported, not stopped.
+    for line in leftover::exit_report(&leftover::left_after_exit(std::time::Duration::from_millis(50))) {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
     match update::relaunch(&core) {
         Some(failed) => Ok(std::process::ExitCode::from(u8::try_from(failed).unwrap_or(1))),
         None => code,
