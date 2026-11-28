@@ -53,10 +53,10 @@ pub async fn run(core: Arc<Core>, core_rx: mpsc::UnboundedReceiver<AgentEventEnv
 }
 
 async fn run_and_look(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
-    if args.second_look {
-        return crate::check::run(core, core_rx, args).await;
+    if !args.second_look {
+        return run_session(&core, &mut core_rx, &args, None).await;
     }
-    run_session(&core, &mut core_rx, &args, None).await
+    crate::check::run(core, core_rx, args).await
 }
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in

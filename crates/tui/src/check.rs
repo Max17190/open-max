@@ -67,7 +67,12 @@ const MARKER: &str = "OPENMAX_CHECK";
 
 #[derive(Clone, PartialEq)]
 enum Kind {
-    File { size: u64, mode: u32 },
+    File {
+        size: u64,
+        mode: u32,
+        #[cfg(unix)]
+        id: (u64, u64),
+    },
     Link(PathBuf),
     Other,
 }
@@ -80,19 +85,30 @@ struct Tree {
 }
 
 #[cfg(unix)]
+#[cold]
 fn mode(meta: &std::fs::Metadata) -> u32 {
     std::os::unix::fs::PermissionsExt::mode(&meta.permissions())
 }
 
 #[cfg(not(unix))]
+#[cold]
 fn mode(_: &std::fs::Metadata) -> u32 {
     0
+}
+
+#[cfg(unix)]
+#[cold]
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
 }
 
 /// The tree under `root`, `.git` included and `skip` left out; None past
 /// `limit` files or when a directory or entry cannot be read. When `strict` is
 /// true, unsupported file types (named pipes, sockets) return None; when false
 /// (cleanup walk), they are recorded as `Kind::Other` so restore removes them.
+#[cold]
+#[inline(never)]
 fn scan_walk(root: &Path, skip: &[PathBuf], limit: usize, strict: bool) -> Option<Tree> {
     let (mut tree, mut todo) = (Tree::default(), vec![root.to_path_buf()]);
     while let Some(dir) = todo.pop() {
@@ -109,7 +125,12 @@ fn scan_walk(root: &Path, skip: &[PathBuf], limit: usize, strict: bool) -> Optio
             } else if meta.file_type().is_symlink() {
                 tree.entries.insert(rel, Kind::Link(std::fs::read_link(&path).ok()?));
             } else if meta.file_type().is_file() {
-                tree.entries.insert(rel, Kind::File { size: meta.len(), mode: mode(&meta) });
+                tree.entries.insert(rel, Kind::File {
+                    size: meta.len(),
+                    mode: mode(&meta),
+                    #[cfg(unix)]
+                    id: file_id(&meta),
+                });
             } else if strict {
                 return None;
             } else {
@@ -123,14 +144,18 @@ fn scan_walk(root: &Path, skip: &[PathBuf], limit: usize, strict: bool) -> Optio
     Some(tree)
 }
 
+#[cold]
 fn scan(root: &Path, skip: &[PathBuf], limit: usize) -> Option<Tree> {
     scan_walk(root, skip, limit, true)
 }
 
+#[cold]
 fn hash_bytes(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
 }
 
+#[cold]
+#[inline(never)]
 fn hash_file(path: &Path) -> Option<u64> {
     let mut file = std::fs::File::open(path).ok()?;
     let (mut h, mut buf) = (0xcbf29ce484222325u64, [0u8; 8192]);
@@ -153,6 +178,8 @@ struct Start {
     text: HashMap<PathBuf, String>,
 }
 
+#[cold]
+#[inline(never)]
 fn start(root: &Path, skip: &[PathBuf]) -> Option<Start> {
     let tree = scan(root, skip, MAX_FILES)?;
     let (mut hashes, mut text, mut read, mut hashed) = (HashMap::new(), HashMap::new(), 0, 0);
@@ -187,6 +214,8 @@ struct Snapshot {
 /// Create `dir` with owner-only (`0700`) permissions on Unix before anything is
 /// written inside it. Uses `File::set_permissions` (`fchmod`) rather than
 /// `fs::set_permissions` (`chmod`) to stay within the macOS libSystem import cap.
+#[cold]
+#[inline(never)]
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
@@ -204,13 +233,15 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Copy bytes without `std::fs::copy` (whose macOS copyfile/clonefile calls add
-/// five libSystem imports past the launch-shape cap), setting `file_mode` on
-/// Unix at creation so private files never become readable to other users.
+/// five libSystem imports past the launch-shape cap), creating the destination
+/// owner-only (`0600`) first before applying `file_mode` via `fchmod`.
+#[cold]
+#[inline(never)]
 fn copy_file_mode(from: &Path, to: &Path, file_mode: u32) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, file_mode);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut dst = opts.open(to)?;
     std::io::copy(&mut std::fs::File::open(from)?, &mut dst)?;
     #[cfg(unix)]
@@ -218,12 +249,51 @@ fn copy_file_mode(from: &Path, to: &Path, file_mode: u32) -> std::io::Result<()>
     Ok(())
 }
 
+/// Restore a file whose path still resolves to the author's original inode in
+/// place, preserving hard links, owner, group, and ACLs.
+#[cold]
+#[inline(never)]
+fn restore_in_place(from: &Path, to: &Path, file_mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Ok(file) = std::fs::File::open(to) {
+        let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(file_mode | 0o200));
+    } else {
+        let _ = std::process::Command::new("chmod").args(["u+rw", "--"]).arg(to)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    }
+    let mut dst = std::fs::OpenOptions::new().write(true).truncate(true).open(to)?;
+    std::io::copy(&mut std::fs::File::open(from)?, &mut dst)?;
+    #[cfg(unix)]
+    let _ = dst.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(file_mode));
+    Ok(())
+}
+
+/// Re-create a hard link without introducing a `link(2)` dynamic import past
+/// the macOS launch-shape cap.
+#[cfg(unix)]
+#[cold]
+#[inline(never)]
+fn relink_file(existing: &Path, link_path: &Path) -> bool {
+    std::process::Command::new("ln")
+        .arg("--")
+        .arg(existing)
+        .arg(link_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cold]
 fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
     copy_file_mode(from, to, 0o600)
 }
 
 /// Copy every file of `tree` under `copy`, or say why the check cannot
 /// promise to put them back.
+#[cold]
+#[inline(never)]
 fn snapshot(root: &Path, tree: Tree, copy: PathBuf) -> Result<Snapshot, String> {
     let bytes: u64 = tree.entries.values().map(|k| if let Kind::File { size, .. } = k { *size } else { 0 }).sum();
     if bytes > MAX_BYTES {
@@ -243,6 +313,7 @@ fn snapshot(root: &Path, tree: Tree, copy: PathBuf) -> Result<Snapshot, String> 
 }
 
 /// Whether two files hold the same bytes.
+#[cold]
 fn same_bytes(a: &Path, b: &Path) -> bool {
     let (Ok(mut a), Ok(mut b)) = (std::fs::File::open(a), std::fs::File::open(b)) else { return false };
     let (mut x, mut y) = (vec![0; 64 << 10], vec![0; 64 << 10]);
@@ -257,6 +328,7 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
     }
 }
 
+#[cold]
 fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -270,6 +342,7 @@ fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize>
 
 /// Remove whatever is at `path`, a directory with all it holds included,
 /// without following a link.
+#[cold]
 fn remove(path: &Path) {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => drop(std::fs::remove_dir_all(path)),
@@ -313,6 +386,12 @@ fn restore(root: &Path, snap: &Snapshot, skip: &[PathBuf]) -> (Vec<String>, Vec<
             fixed.insert(shown(rel));
         }
     }
+    #[cfg(unix)]
+    let mut live_inodes: HashMap<(u64, u64), PathBuf> = HashMap::new();
+    #[cfg(unix)]
+    let mut replaced: Vec<(&PathBuf, u32, (u64, u64))> = Vec::new();
+    #[cfg(not(unix))]
+    let mut replaced: Vec<(&PathBuf, u32)> = Vec::new();
     for (rel, kind) in &snap.tree.entries {
         let path = root.join(rel);
         let meta = std::fs::symlink_metadata(&path).ok();
@@ -331,22 +410,73 @@ fn restore(root: &Path, snap: &Snapshot, skip: &[PathBuf]) -> (Vec<String>, Vec<
                     Err(_) => failed.push(shown(rel)),
                 }
             }
-            Kind::File { mode: was, .. } => {
+            Kind::File { mode: was, #[cfg(unix)] id, .. } => {
                 let from = snap.copy.join(rel);
-                let held = meta.as_ref().is_some_and(|m| m.is_file() && mode(m) == *was) && same_bytes(&path, &from);
-                if held {
-                    continue;
+                #[cfg(unix)]
+                {
+                    if meta.as_ref().is_some_and(|m| m.is_file() && file_id(m) == *id) {
+                        live_inodes.entry(*id).or_insert_with(|| path.clone());
+                        let bytes_match = same_bytes(&path, &from);
+                        if meta.as_ref().is_some_and(|m| mode(m) == *was) && bytes_match {
+                            continue;
+                        }
+                        let ok = if bytes_match {
+                            std::fs::File::open(&path)
+                                .and_then(|f| f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(*was)))
+                                .is_ok()
+                        } else {
+                            restore_in_place(&from, &path, *was).is_ok()
+                        };
+                        if ok {
+                            fixed.insert(shown(rel));
+                        } else {
+                            failed.push(shown(rel));
+                        }
+                        continue;
+                    }
+                    replaced.push((rel, *was, *id));
                 }
-                // Unlink first so a checker-replaced hard link is replaced with
-                // a fresh file rather than truncating the outside linked target.
-                remove(&path);
-                if copy_file_mode(&from, &path, *was).is_err() {
-                    failed.push(shown(rel));
-                    continue;
+                #[cfg(not(unix))]
+                {
+                    if meta.as_ref().is_some_and(|m| m.is_file() && mode(m) == *was) && same_bytes(&path, &from) {
+                        continue;
+                    }
+                    replaced.push((rel, *was));
                 }
-                fixed.insert(shown(rel));
             }
             Kind::Other => {}
+        }
+    }
+    // Pass 2: entries the checker deleted or replaced with a different inode.
+    // Unlink first so we never write through a checker-created hard link to an
+    // external file, then re-link to any surviving/restored sibling inode.
+    #[cfg(unix)]
+    for (rel, was, id) in replaced {
+        let path = root.join(rel);
+        let from = snap.copy.join(rel);
+        remove(&path);
+        if let Some(sibling) = live_inodes.get(&id) {
+            if relink_file(sibling, &path) {
+                fixed.insert(shown(rel));
+                continue;
+            }
+        }
+        if copy_file_mode(&from, &path, was).is_ok() {
+            live_inodes.entry(id).or_insert_with(|| path.clone());
+            fixed.insert(shown(rel));
+        } else {
+            failed.push(shown(rel));
+        }
+    }
+    #[cfg(not(unix))]
+    for (rel, was) in replaced {
+        let path = root.join(rel);
+        let from = snap.copy.join(rel);
+        remove(&path);
+        if copy_file_mode(&from, &path, was).is_ok() {
+            fixed.insert(shown(rel));
+        } else {
+            failed.push(shown(rel));
         }
     }
     (fixed.into_iter().collect(), failed)
@@ -479,6 +609,8 @@ fn alive(_: i32) -> bool {
 
 /// What the checker is shown of the author's work: the paths changed, and
 /// the diff of the text among them, each cut short where long.
+#[cold]
+#[inline(never)]
 fn changes(root: &Path, start: &Start, end: &Tree) -> (Vec<String>, String) {
     let mut paths = Vec::new();
     let mut diff = String::new();
@@ -668,6 +800,8 @@ fn apply_rerun_env(run: &mut tokio::process::Command, out: &Path) {
 
 /// Run `command` with bash in the project, as the checker's own bash calls
 /// run, with its output to `out`, for at most `RERUN_LIMIT`; a stop ends it.
+#[cold]
+#[inline(never)]
 async fn rerun(project: &Path, command: &str, mark: &Mark, out: &Path, quit: &Notify) -> Ran {
     let Ok(file) = std::fs::OpenOptions::new().create_new(true).write(true).open(out) else { return Ran::Exited(None, "the harness could not record the output".into()) };
     let Ok(err) = file.try_clone() else { return Ran::Exited(None, "the harness could not record the output".into()) };
@@ -773,6 +907,8 @@ struct End {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
 fn end(core: &Core, root: &Path, skip: &[PathBuf], start: &Start, mark: &Mark, author: &str, task: String, copy: PathBuf) -> Result<End, String> {
     let tree = scan(root, skip, MAX_FILES).ok_or(format!("the project holds more than {MAX_FILES} files, or one of its directories could not be read"))?;
     let snap = Arc::new(snapshot(root, tree, copy)?);
@@ -1037,6 +1173,8 @@ async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, snap: &A
 /// The one message the author gets: each reproduced objection with the
 /// output the harness got, the readings as information, and what the check
 /// ended that the author had left running.
+#[cold]
+#[inline(never)]
 fn handback(failures: &[Failure], readings: &[Value], ended: &[&(i32, String)]) -> String {
     let parts: Vec<&str> = HANDBACK.split("\n%%\n").map(str::trim).collect();
     let mut message = String::new();
@@ -1175,9 +1313,44 @@ mod tests {
             assert!(scan(&dir, &[], MAX_FILES).is_none(), "named pipe must be rejected");
             // Cleanup walk still removes checker-created pipes and stray files.
             std::fs::write(dir.join("stray.txt"), "x").unwrap();
-            let (fixed, failed) = restore(&dir, &snap, &[snap_dir]);
+            let (fixed, failed) = restore(&dir, &snap, std::slice::from_ref(&snap_dir));
             assert!(failed.is_empty(), "{failed:?}");
             assert!(!fifo.exists() && !dir.join("stray.txt").exists(), "fixed={fixed:?}");
+
+            // Hard links preserved on in-place edit, checker-replaced outside
+            // hard link never clobbers target, and deleted siblings re-link.
+            let link_a = dir.join("link_a.txt");
+            let link_b = dir.join("link_b.txt");
+            let outside = dir.join("outside.txt");
+            std::fs::write(&link_a, "orig").unwrap();
+            assert!(relink_file(&link_a, &link_b));
+            std::fs::write(&outside, "secret").unwrap();
+            let orig_id = file_id(&std::fs::symlink_metadata(&link_a).unwrap());
+            let snap_links_dir = dir.join("snap_links");
+            let tree_links = scan(&dir, &[snap_dir.clone(), snap_links_dir.clone(), outside.clone()], MAX_FILES).unwrap();
+            let snap_links = snapshot(&dir, tree_links, snap_links_dir.clone()).unwrap();
+            // 1. In-place write through one name keeps same inode and link.
+            std::fs::write(&link_a, "mutated").unwrap();
+            let (_, failed) = restore(&dir, &snap_links, &[snap_dir.clone(), snap_links_dir.clone(), outside.clone()]);
+            assert!(failed.is_empty(), "{failed:?}");
+            assert_eq!(std::fs::read_to_string(&link_a).unwrap(), "orig");
+            assert_eq!(file_id(&std::fs::symlink_metadata(&link_a).unwrap()), orig_id);
+            assert_eq!(file_id(&std::fs::symlink_metadata(&link_b).unwrap()), orig_id);
+            // 2. Replace link_a with hard link to outside: outside stays intact, link_a re-links to link_b.
+            std::fs::remove_file(&link_a).unwrap();
+            assert!(relink_file(&outside, &link_a));
+            let (_, failed) = restore(&dir, &snap_links, &[snap_dir.clone(), snap_links_dir.clone(), outside.clone()]);
+            assert!(failed.is_empty(), "{failed:?}");
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
+            assert_eq!(std::fs::read_to_string(&link_a).unwrap(), "orig");
+            assert_eq!(file_id(&std::fs::symlink_metadata(&link_a).unwrap()), orig_id);
+            // 3. Delete both siblings: both restore as hard links to one inode.
+            std::fs::remove_file(&link_a).unwrap();
+            std::fs::remove_file(&link_b).unwrap();
+            let (_, failed) = restore(&dir, &snap_links, &[snap_dir, snap_links_dir, outside]);
+            assert!(failed.is_empty(), "{failed:?}");
+            assert_eq!(std::fs::read_to_string(&link_a).unwrap(), "orig");
+            assert_eq!(file_id(&std::fs::symlink_metadata(&link_a).unwrap()), file_id(&std::fs::symlink_metadata(&link_b).unwrap()));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
