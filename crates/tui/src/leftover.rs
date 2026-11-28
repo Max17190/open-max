@@ -43,6 +43,11 @@ pub(crate) fn still_running() -> Vec<Left> {
 fn marked(tag: &[u8]) -> Vec<Left> {
     let entry = [MARKER.as_bytes(), b"=", tag].concat();
     let mut left = platform::scan(&entry, std::process::id());
+    // A process names itself: its name reaches the shell and the transcript
+    // as text, never as a line break or an escape sequence.
+    for p in &mut left {
+        p.name = open_max_core::text::one_line(&p.name);
+    }
     left.sort_by_key(|p| p.pid);
     left
 }
