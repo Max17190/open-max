@@ -89,6 +89,9 @@ pub struct SessionData {
     /// response or refusal for length. See
     /// `compaction::token_factor`.
     pub prompt_ratio: Option<(String, f64)>,
+    /// Half the image bytes a request refused for its size (413) carried, the most later requests carry
+    /// (`compaction::bound_session_images`). In memory only.
+    pub image_bytes: Option<usize>,
 }
 
 /// Cooperative cancellation for one agent turn: a flag for cheap synchronous

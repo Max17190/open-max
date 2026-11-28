@@ -731,6 +731,7 @@ async fn run_loop(
         narrate_approval_policy(core, session_id, policy_mode, guard.messages()).await;
         // A mark the last request reached without a round of calls to carry its note is said now.
         crate::notes::say_owed_budget_mark(core, session_id, guard.messages(), request_budget, iteration, &mut budget_noted, settings.request_budget.is_none()).await;
+        crate::compaction::bound_session_images(core, session_id, guard.messages(), settings.image_bytes).await;
         // The tool schemas are re-sent whole on every request, so they are
         // as real as the transcript: the overhead every request carries
         // besides the history, the note stored in it included.
@@ -841,6 +842,7 @@ async fn run_loop(
                     // Only an explicit representation error authorizes withholding a saved thought.
                     let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
                     let lone = batcher.lock().unwrap().thought_refused && lone.filter_map(|m| m.reasoning_origin.take()).count() > 0;
+                    if status == Some(413) { crate::compaction::learn_image_bytes(core, session_id, guard.messages()).await; }
                     let size = (status == Some(413)).then(|| size_steps.next(guard.messages(), &message)).flatten();
                     let images = status != Some(413) && status.is_some_and(|code| (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)) && drop_images(guard.messages(), &message, false);
                     if lone || images || size.is_some() {

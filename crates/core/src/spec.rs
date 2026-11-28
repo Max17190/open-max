@@ -888,6 +888,8 @@ Fields (all optional in JSON; an empty `base_url`/`model` or a missing
   external tool's images (an MCP tool's included) come back with its result.
   One call shows at most 8 images, 5 MiB in all; the result names any left
   out and why. Set it only for a model that takes images.
+- `image_bytes`: base64 bytes of images one request carries (unset 8 MiB):
+  past it the oldest from before the latest reply become lines, to half.
 - `compaction_tokens`: optional global ceiling for compaction. Unset uses the
   active model's ceiling, else four fifths of the window; the window budget
   always caps it.
