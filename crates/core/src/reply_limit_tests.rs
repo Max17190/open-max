@@ -135,6 +135,11 @@ async fn a_vendor_servers_completed_answer_stands_after_a_long_thought() {
         // doubles), and a fourth that stops below half of that ends the turn.
         let t = turn_as(Shape::Silent, wire, 131_072, 2869, u64::MAX).await;
         assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), (vec![4096, 4096, 4096, 8192], 2, "empty"), "{wire}");
+        // Spending all of the limit on a completed empty reply does not count as
+        // a cut by token count alone; only a repeated unreported stop does.
+        let t = turn_as(Shape::Silent, wire, 131_072, 4096, u64::MAX).await;
+        let expected = if wire == "responses" { (vec![4096, 4096, 4096, 8192], 2, "empty") } else { (vec![4096, 4096], 0, "empty") };
+        assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), expected, "{wire}");
     }
 }
 

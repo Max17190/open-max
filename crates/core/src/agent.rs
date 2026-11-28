@@ -895,7 +895,7 @@ async fn run_loop(
         // not go back (another endpoint, a path that does not replay it).
         // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). A vendor's own server reports each cut, so a reply it finished, calls and all, may spend the whole limit. Elsewhere, one with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not). A refusal is its own end, never a cut.
         let (silent, repeated) = (content.trim().is_empty() && tool_calls.is_empty(), result.repeats_a_stop(&mut stops, limit));
-        let hit = result.hit_output_cap(if endpoint.reports_cuts && !silent { usize::MAX } else { limit });
+        let hit = result.hit_output_cap(if endpoint.reports_cuts { usize::MAX } else { limit });
         let near = !endpoint.reports_cuts && endpoint.chatgpt.is_none() && tool_calls.is_empty() && !hit && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED) && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
         let capped = result.finish_reason != "refusal" && (hit || (silent && repeated) || near);
         let cut_thought = capped
