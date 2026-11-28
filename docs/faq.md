@@ -6,12 +6,16 @@ Short answers, each with a link to the page or example that holds the detail.
 
 Every request starts with the built-in prompt: the base rules, a map of your
 project's top two levels and the schemas of the seven built-in tools. It is
-under 700 tokens with this repository's map; the map is capped at 1,200 bytes,
-so a project with a larger tree pays a little more. Your own `AGENTS.md`, the
-index lines of your skills and memories, and the schemas of your own tools add
-to it, and the conversation comes after it. `/context` shows each of those
-parts with its cost, the total per request and, once the provider reports it,
-the share served from its cache. See [usage](usage.md#slash-commands).
+under 700 tokens with the map of a fixed snapshot of this repository's tree,
+which the size test uses; the map is capped at 1,200 bytes, so a project with
+a larger tree pays a little more. Your own `AGENTS.md`, the index lines of
+your skills and memories, and the schemas of your own tools add to it, and the
+conversation comes after it.
+
+`/context` lists each part of the prompt and the tools with its cost. Its
+"total per request" row sums those parts only; its "context used" row counts the
+whole conversation as well, the notes in it included. Once the provider reports it, it
+also shows the share served from its cache. See [usage](usage.md#slash-commands).
 
 ## Why does the prompt not change under me within a session?
 
