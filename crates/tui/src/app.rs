@@ -2148,6 +2148,9 @@ impl App {
                         panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
                         if self.session_id.as_deref() == Some(id.as_str()) {
                             self.session_id = None;
+                            // The next prompt starts a new session, which
+                            // has spent nothing yet.
+                            self.tokens = usage::Totals::default();
                             self.core.reset_session_effort();
                             self.created_session = false;
                             self.resumed_awaiting_hydration = false;

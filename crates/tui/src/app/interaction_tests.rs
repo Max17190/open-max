@@ -606,10 +606,13 @@ async fn sessions_panel_moves_deletes_and_closes() {
     press(&mut app, key(KeyCode::Char('k'))).await;
     assert_eq!(at(&app), 0);
 
-    // Deleting the open session leaves the app without one.
+    // Deleting the open session leaves the app without one, and without
+    // the tokens it spent, so the next session's totals start from nothing.
     let doomed = app.sessions_panel.as_ref().unwrap().items[0].id.clone();
     let kept = app.sessions_panel.as_ref().unwrap().items[1].id.clone();
     app.session_id = Some(doomed.clone());
+    app.on_agent_event(AgentEvent::Usage { prompt_tokens: 900, completion_tokens: 40, cached_tokens: None });
+    assert!(app.tokens.status_segment().is_some());
     press(&mut app, key(KeyCode::Char('x'))).await;
     assert_eq!(app.sessions_panel.as_ref().unwrap().confirm_delete.as_deref(), Some(doomed.as_str()));
     press(&mut app, key(KeyCode::Char('y'))).await;
@@ -618,6 +621,8 @@ async fn sessions_panel_moves_deletes_and_closes() {
     assert_eq!(left.len(), 2);
     assert!(!left.contains(&doomed) && left.iter().all(|id| ids.contains(id)));
     assert_eq!(app.session_id, None);
+    assert_eq!(app.tokens.status_segment(), None, "the deleted session's tokens are gone");
+    assert!(app.tokens.rows().iter().all(|(_, value)| value == "not reported"));
 
     // Deleting another session keeps the open one.
     app.session_id = Some(kept.clone());
