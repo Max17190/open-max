@@ -1,6 +1,7 @@
 pub mod context;
 pub mod extensions;
 pub mod markdown;
+pub mod memory;
 pub mod model_picker;
 pub mod sessions;
 pub mod text;

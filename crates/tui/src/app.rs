@@ -373,6 +373,14 @@ pub struct App {
     page_h: u16,
 
     files_tx: mpsc::UnboundedSender<Vec<String>>,
+    /// Listings (/tools, /skills, /memory) built off the event loop: their
+    /// disk reads finish on a task and the block arrives here, so a slow
+    /// tree never holds a frame or a key. The loop takes the receiver. Each
+    /// carries the transcript generation it was asked in, so one that lands
+    /// after /new, /clear or a switch of session is dropped.
+    listing_tx: mpsc::UnboundedSender<(u64, Vec<Line<'static>>)>,
+    listing_rx: Option<mpsc::UnboundedReceiver<(u64, Vec<Line<'static>>)>>,
+    transcript_gen: u64,
     should_quit: bool,
     setup_request: Option<(crate::setup::Action, Option<String>)>,
     dirty: Dirty,
@@ -554,6 +562,7 @@ async fn event_loop(
     app.emit_presence_title();
 
     let mut input = TerminalInput::start();
+    let mut listing_rx = app.listing_rx.take().expect("the event loop runs once per app");
     // No frame is written while the probe waits, so none can cut into its
     // query or the flags pushed on its answer. Input has not started, so no
     // keypress waits on this.
@@ -600,6 +609,7 @@ async fn event_loop(
                     None => app.should_quit = true,
                 }
             }
+            Some((generation, lines)) = listing_rx.recv() => app.on_listing(generation, lines),
             Some(files) = files_rx.recv() => {
                 app.file_index = Some(Arc::new(files));
                 app.file_index_pending = false;
@@ -680,6 +690,14 @@ async fn event_loop(
     Ok(())
 }
 
+/// What the next new session would load, built off the event loop.
+async fn preview_registry(core: &Core, project: &std::path::Path) -> registry::Registry {
+    let (data_dir, project) = (core.data_dir.clone(), project.to_path_buf());
+    tokio::task::spawn_blocking(move || registry::Registry::build(&data_dir, &project))
+        .await
+        .unwrap_or_else(|_| registry::Registry::builtin_only())
+}
+
 /// One frame, wrapped in a synchronized update so the terminal applies it
 /// atomically: no half-painted frames under tmux or slow connections. The
 /// writer holds ratatui's own flushes until the update is closed, so a frame
@@ -723,6 +741,7 @@ impl App {
         project: PathBuf,
         files_tx: mpsc::UnboundedSender<Vec<String>>,
     ) -> Self {
+        let (listing_tx, listing_rx) = mpsc::unbounded_channel();
         Self {
             composer: Composer::new(&core.data_dir, &project),
             core,
@@ -771,6 +790,9 @@ impl App {
             tick_i: 0,
             page_h: 10,
             files_tx,
+            listing_tx,
+            listing_rx: Some(listing_rx),
+            transcript_gen: 0,
             should_quit: false,
             setup_request: None,
             dirty: Dirty::all(),
@@ -978,6 +1000,7 @@ impl App {
         self.created_session = false;
         self.resumed_awaiting_hydration = false;
         self.transcript = Transcript::new();
+        self.transcript_gen += 1;
         self.running = false;
         // Session-scoped like `running`: the old session's receipt is
         // filtered out once the id changes, so a flag left armed here would
@@ -2567,22 +2590,46 @@ impl App {
                 ));
             }
             "tools" | "skills" => {
-                let block = |registry: &registry::Registry, frozen| match head {
-                    "tools" => extensions::tools_block(registry, frozen),
-                    _ => extensions::skills_block(&registry.skills, &self.project, frozen),
-                };
-                // Hold the sessions lock only long enough to format a frozen
-                // registry. Disk preview runs after the lock is released so a
-                // slow tools/skills tree cannot stall other session access.
-                let frozen = {
-                    let sessions = self.core.sessions.lock().await;
-                    self.session_id.as_ref().and_then(|id| sessions.get(id)).map(|data| block(&data.registry, true))
-                };
-                let lines = match frozen {
-                    Some(lines) => lines,
-                    None => block(&self.preview_registry().await, false),
-                };
-                self.transcript.push(lines);
+                let (core, project) = (self.core.clone(), self.project.clone());
+                let session_id = self.session_id.clone();
+                let tools = head == "tools";
+                self.spawn_listing(async move {
+                    // Recorded use rides beside each of the user's own
+                    // extensions; a record that cannot be read shows none.
+                    let (data_dir, root) = (core.data_dir.clone(), project.clone());
+                    let usage = tokio::task::spawn_blocking(move || open_max_core::ledger::load_usage(&data_dir, &root).ok())
+                        .await
+                        .ok()
+                        .flatten();
+                    let block = |registry: &registry::Registry, frozen| match tools {
+                        true => extensions::tools_block(registry, frozen, usage.as_ref()),
+                        false => extensions::skills_block(&registry.skills, &project, frozen, usage.as_ref()),
+                    };
+                    // Hold the sessions lock only long enough to format a
+                    // frozen registry. Disk preview runs after the lock is
+                    // released so a slow tools/skills tree cannot stall
+                    // other session access.
+                    let frozen = {
+                        let sessions = core.sessions.lock().await;
+                        session_id.as_ref().and_then(|id| sessions.get(id)).map(|data| block(&data.registry, true))
+                    };
+                    match frozen {
+                        Some(lines) => lines,
+                        None => block(&preview_registry(&core, &project).await, false),
+                    }
+                });
+            }
+            "memory" => {
+                // The scan reads every memory file and the access log.
+                let project = self.project.clone();
+                self.spawn_listing(async move {
+                    let scan = tokio::task::spawn_blocking(move || {
+                        open_max_core::memory::scan(&project, open_max_core::memory::unix_now())
+                    })
+                    .await
+                    .unwrap_or_default();
+                    crate::ui::memory::memory_block(&scan)
+                });
             }
             "status" => {
                 let s = self.core.settings.lock().unwrap().clone();
@@ -2712,10 +2759,25 @@ impl App {
     /// The registry the next new session would freeze from today's config,
     /// built on a blocking thread so a slow tree cannot stall the loop.
     async fn preview_registry(&self) -> registry::Registry {
-        let (data_dir, project) = (self.core.data_dir.clone(), self.project.clone());
-        tokio::task::spawn_blocking(move || registry::Registry::build(&data_dir, &project))
-            .await
-            .unwrap_or_else(|_| registry::Registry::builtin_only())
+        preview_registry(&self.core, &self.project).await
+    }
+
+    /// Build a listing on a task; the event loop pushes it when it is done.
+    fn spawn_listing(&self, build: impl std::future::Future<Output = Vec<Line<'static>>> + Send + 'static) {
+        let (tx, generation) = (self.listing_tx.clone(), self.transcript_gen);
+        tokio::spawn(async move {
+            let _ = tx.send((generation, build.await));
+        });
+    }
+
+    fn on_listing(&mut self, generation: u64, lines: Vec<Line<'static>>) {
+        if generation != self.transcript_gen {
+            return;
+        }
+        self.transcript.push(lines);
+        self.refilter_scroll_search_live();
+        self.dirty.mark_chat();
+        self.dirty.mark_chrome();
     }
 
     async fn on_core_event(&mut self, env: AgentEventEnvelope) {
@@ -9027,16 +9089,24 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Run a listing command and push its block, which arrives off the
+    /// event loop as it would in a running session.
+    async fn list(app: &mut App, command: &str) {
+        app.handle_submit(command.into()).await.unwrap();
+        let (generation, lines) = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
+        app.on_listing(generation, lines);
+    }
+
     /// /tools and /skills list what the next new session would load when no
     /// session has frozen its own, and /context counts the same tools.
     #[tokio::test]
     async fn tools_skills_and_context_preview_the_next_session() {
         let (mut app, dir) = app_fixture();
-        app.handle_submit("/tools".into()).await.unwrap();
+        list(&mut app, "/tools").await;
         let shown = app.transcript.export_text();
         assert!(shown.contains("tools (preview of the next new session)"), "{shown}");
         assert!(shown.contains("read_file") && shown.contains("built-in"), "{shown}");
-        app.handle_submit("/skills".into()).await.unwrap();
+        list(&mut app, "/skills").await;
         let shown = app.transcript.export_text();
         assert!(shown.contains("skills (preview of the next new session)"), "{shown}");
         assert!(shown.contains("(none loaded)") && shown.contains("0 skills"), "{shown}");
@@ -9045,6 +9115,110 @@ mod tests {
         assert!(shown.contains("context (preview of the next new session)"), "{shown}");
         assert!(!shown.contains("tools (0 built-in)"), "{shown}");
         assert!(!shown.contains("unknown command"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// /memory lists what the agent wrote with how often the file tools used
+    /// it and whether a new session indexes it, and /tools and /skills show
+    /// the use this project recorded for the user's own extensions, unused
+    /// ones included. Each block stays whole when wrapped at 60, 80 and 120
+    /// columns.
+    #[tokio::test]
+    async fn memory_tools_and_skills_show_recorded_use() {
+        let (mut app, dir) = app_fixture();
+        list(&mut app, "/memory").await;
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("(none yet) the agent writes one fact per file under .openmax/memory/"), "{shown}");
+        assert!(shown.contains("openmax --recall"), "{shown}");
+
+        let memory = dir.join(".openmax/memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("deploy-port.md"), "# The staging deploy port is 7443\nSee infra.\n").unwrap();
+        fs::write(memory.join("old-host.md"), "The old build host was ci-3\n").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(40 * 86_400);
+        fs::File::options().write(true).open(memory.join("old-host.md")).unwrap().set_modified(old).unwrap();
+        let reads = [("deploy-port".to_string(), "read".to_string()), ("deploy-port".to_string(), "write".to_string())];
+        open_max_core::memory::record_accesses(&dir, &reads);
+        list(&mut app, "/memory").await;
+        let shown = app.transcript.export_text();
+        let row = |name: &str| shown.lines().find(|l| l.contains(name)).unwrap_or_default().to_string();
+        assert!(row("deploy-port").contains("indexed") && row("deploy-port").contains("2 uses"), "{shown}");
+        assert!(row("deploy-port").contains("<2h ago") && row("deploy-port").contains("The staging deploy port is 7443"), "{shown}");
+        assert!(row("old-host").contains("faded") && row("old-host").contains("0 uses") && row("old-host").contains("40d ago"), "{shown}");
+        assert!(shown.contains("2 on disk · 1 indexed · 1 faded (unused for 21 days; still on disk)"), "{shown}");
+
+        let tools = dir.join(".openmax/tools");
+        fs::create_dir_all(&tools).unwrap();
+        for name in ["deploy", "lint"] {
+            fs::write(
+                tools.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\ndescription = \"Run {name}\"\ncommand = \"true\"\n[params]\ntype = \"object\"\n"),
+            )
+            .unwrap();
+        }
+        let skill = dir.join(".agents/skills/release");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: release\ndescription: How to cut a release\n---\nSteps\n").unwrap();
+        let delta = open_max_core::ledger::UsageDelta {
+            tools: vec![("deploy".into(), true), ("deploy".into(), false), ("deploy".into(), true)],
+            skills: vec!["release".into()],
+        };
+        open_max_core::ledger::record_usage(&app.core.data_dir, &dir, &delta).unwrap();
+        list(&mut app, "/tools").await;
+        list(&mut app, "/skills").await;
+        let shown = app.transcript.export_text();
+        let row = |name: &str| shown.lines().find(|l| l.contains(&format!("  {name} "))).unwrap_or_default().to_string();
+        assert!(row("deploy").contains("3 calls · 1 failed"), "{shown}");
+        assert!(row("lint").contains("no calls recorded"), "{shown}");
+        assert!(row("release").contains("1 body read"), "{shown}");
+        assert!(!row("read_file").contains("calls"), "built-ins carry no record: {shown}");
+        assert!(shown.contains("not a rating · openmax --spec usage"), "{shown}");
+
+        for width in [60u16, 80, 120] {
+            app.transcript.set_width(width);
+            let painted = buffer_text(&render_app(&mut app, width, 200));
+            for (name, shows) in [
+                ("deploy-port", &["indexed", "2 uses", "<2h ago"][..]),
+                ("old-host", &["faded", "0 uses", "40d ago"]),
+                ("deploy", &["external", "3 calls · 1 failed"]),
+                ("lint", &["external", "no calls recorded"]),
+                ("release", &["project", "1 body read"]),
+            ] {
+                let row = painted.lines().find(|l| l.starts_with(&format!("  {name} "))).unwrap_or_default();
+                for text in shows {
+                    assert!(row.contains(text), "{name} row lacks {text} at {width} columns:\n{painted}");
+                }
+            }
+            // A description may wrap; read the frame's words in order.
+            let words = painted.split_whitespace().collect::<Vec<_>>().join(" ");
+            for description in ["The staging deploy port is 7443", "The old build host was ci-3", "Run deploy", "Run lint", "How to cut a release"] {
+                assert!(words.contains(description), "{description} at {width} columns:\n{painted}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A listing that lands after /new belongs to the conversation it was
+    /// asked in and is dropped; one that lands under an open find bar joins
+    /// its matches.
+    #[tokio::test]
+    async fn a_late_listing_stays_with_its_conversation_and_joins_the_find_bar() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/memory".into()).await.unwrap();
+        let late = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
+        app.handle_submit("/new".into()).await.unwrap();
+        app.on_listing(late.0, late.1);
+        assert!(!app.transcript.export_text().contains("(none yet)"), "{}", app.transcript.export_text());
+
+        app.transcript.push_user(vec![Line::from("hay")]);
+        app.handle_submit("/memory".into()).await.unwrap();
+        let (generation, lines) = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)).await.unwrap();
+        let typed: Vec<KeyEvent> = "none yet".chars().map(|c| press(KeyCode::Char(c))).collect();
+        type_keys(&mut app, &typed).await;
+        assert!(app.scroll_search.as_ref().unwrap().2.is_empty());
+        app.on_listing(generation, lines);
+        assert_eq!(app.scroll_search.as_ref().unwrap().2.len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 

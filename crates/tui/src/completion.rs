@@ -90,6 +90,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     command("tools", "", "list tools frozen for this session", true),
     command("skills", "", "list skills frozen for this session", true),
+    command("memory", "", "list what the agent remembers in this project", true),
     command(
         "reload",
         "",

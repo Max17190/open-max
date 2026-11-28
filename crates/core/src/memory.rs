@@ -45,7 +45,7 @@ const MAX_NAME_CHARS: usize = 64;
 /// A memory whose most recent use is older than this many days drops out of
 /// the index: still on disk, still greppable, no longer spending prompt
 /// bytes. This is an index policy, not an estimate of a fact's useful life.
-pub(crate) const INDEX_FLOOR_DAYS: f64 = 21.0;
+pub const INDEX_FLOOR_DAYS: f64 = 21.0;
 
 /// ACT-R base-level activation: `ln(sum(t_hours^-d))` with d = 0.5. Ages are
 /// clamped to one hour so a just-written memory contributes exactly 1.0 and
@@ -79,6 +79,9 @@ pub struct MemoryEntry {
     /// Age in hours of the most recent event; the index floor gates on this,
     /// not on activation, so frequency raises rank, never index lifespan.
     pub last_event_hours: u64,
+    /// Reads and writes of this file the access log holds, so a viewer can
+    /// say how often it was used without reading the log again.
+    pub uses: usize,
     /// True when the entry made it into the injected index.
     pub in_index: bool,
 }
@@ -273,10 +276,12 @@ fn entry_from(
     // A gc tombstone is a horizon: a name reused after deletion starts fresh
     // instead of inheriting the dead namesake's access history.
     let horizon = log.iter().filter(|r| r.name == name && r.kind == "gc").map(|r| r.ts).max();
+    let mut uses = 0;
     for record in
         log.iter().filter(|r| r.name == name && r.kind != "gc" && horizon.is_none_or(|h| r.ts > h))
     {
         hour_buckets.insert((now.saturating_sub(record.ts) / 3600).max(1));
+        uses += 1;
     }
     if hour_buckets.is_empty() {
         hour_buckets.insert(1);
@@ -289,6 +294,7 @@ fn entry_from(
         path: format!("{MEMORY_DIR}/{name}.md"),
         activation: activation(&ages),
         last_event_hours,
+        uses,
         in_index: false,
     })
 }

@@ -52,7 +52,8 @@ headless and stdio trust.
 | `/new` · `/resume` | Fresh session (`/clear` does the same) · pick an earlier one |
 | `/fork` · `/rewind [n]` | Branch this session into a new one at its end · at the end of turn `n`, and switch to the branch; `/rewind` alone lists the turns with their numbers. The original is not changed; `/resume` lists the branch as a fork of it. Files are not changed either: edits made after the cut stay on disk |
 | `/reload` | Force a re-freeze now and rebuild the system prompt and the tools array, so the changes the note carried and an `AGENTS.md` edit move into them (the prompt cache re-prefills once). Extension changes re-freeze automatically and leave the prompt and the tools array as they are |
-| `/tools` · `/skills` · `/context` | Session tools, skills, token budget |
+| `/tools` · `/skills` · `/context` | Session tools, skills, token budget. Your own tools show the calls and failures this project recorded, your skills how often their body was read |
+| `/memory` | This project's memories under `.openmax/memory/`, which the agent writes: each one's description, how many reads and writes the file tools logged, how long since the last, and whether a new session's index carries it or it has faded (still on disk; `openmax --recall` searches it) |
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
