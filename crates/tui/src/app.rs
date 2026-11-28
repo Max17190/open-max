@@ -49,6 +49,9 @@ const TICK: Duration = Duration::from_millis(120);
 /// relaxed tick suffices. Draws in that state are tail-only and sub-ms, so
 /// the cost is a fraction of a percent of one core, and only while waiting.
 const WAIT_TICK: Duration = Duration::from_millis(50);
+/// How long a model request may deliver nothing before the spinner says the
+/// server has gone silent.
+const SERVER_SILENT_AFTER: Duration = Duration::from_secs(15);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
 
@@ -358,6 +361,11 @@ pub struct App {
     first_token: Option<Instant>,
     stream_chars: usize,
     running_tool: Option<(String, String)>,
+    /// Since when the model request in flight has delivered nothing: set as
+    /// a request goes out and on each delta, cleared once its reply is done,
+    /// a tool runs or a retry waits. Past [`SERVER_SILENT_AFTER`] the spinner
+    /// says so.
+    reply_wait: Option<Instant>,
     /// Pending mutating-tool gate: id, tool name, summary, detail preview.
     pending_approval: Option<(String, String, String, String, Vec<String>)>,
     pending_diffs: HashMap<String, DiffText>,
@@ -781,6 +789,7 @@ impl App {
             first_token: None,
             stream_chars: 0,
             running_tool: None,
+            reply_wait: None,
             pending_approval: None,
             pending_diffs: HashMap::new(),
             tool_meta: HashMap::new(),
@@ -1018,6 +1027,7 @@ impl App {
         self.first_token = None;
         self.stream_chars = 0;
         self.running_tool = None;
+        self.reply_wait = None;
         self.pending_approval = None;
         self.model_picker = None;
         self.pending_diffs.clear();
@@ -2910,12 +2920,14 @@ impl App {
     fn on_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Token { text } => {
+                self.reply_wait = Some(Instant::now());
                 self.first_token.get_or_insert_with(Instant::now);
                 self.stream_chars += text.len();
                 self.stream_text.push_str(&text);
                 self.dirty.mark_tail();
             }
             AgentEvent::Thinking { text } => {
+                self.reply_wait = Some(Instant::now());
                 self.first_token.get_or_insert_with(Instant::now);
                 self.stream_chars += text.len();
                 self.thinking_chars += text.chars().count();
@@ -2931,6 +2943,7 @@ impl App {
                 self.dirty.mark_tail();
             }
             AgentEvent::MessageDone { text } => {
+                self.reply_wait = None;
                 if !text.trim().is_empty() {
                     self.last_assistant_response = Some(text.clone());
                     let rendered = if self.stream_text == text {
@@ -2945,6 +2958,9 @@ impl App {
                 self.dirty.mark_chat();
             }
             AgentEvent::Budget { used_tokens, context_tokens } => {
+                // Sent as each of a turn's model requests goes out; the one
+                // `/compact` sends is its receipt.
+                self.reply_wait = (self.running && !self.compacting).then(Instant::now);
                 self.budget = Some((used_tokens, context_tokens));
                 self.dirty.mark_chrome();
             }
@@ -2971,6 +2987,7 @@ impl App {
                     },
                 );
                 self.running_tool = Some((name, summary));
+                self.reply_wait = None;
                 self.dirty.mark_tail();
             }
             AgentEvent::Diff { call_id, path, diff, added, removed } => {
@@ -3122,6 +3139,7 @@ impl App {
                 // to the attempt that failed; the fresh attempt starts its
                 // own. The reason can carry a backend body; the note is one line.
                 self.clear_live_tail();
+                self.reply_wait = None;
                 self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
                 self.dirty.mark_tail();
             }
@@ -3184,6 +3202,7 @@ impl App {
                 self.steered = 0;
                 self.set_presence(Presence::Idle);
                 self.running_tool = None;
+                self.reply_wait = None;
                 self.pending_approval = None;
                 // Spinner/status clear plus any transcript note/stats.
                 self.dirty.mark_chat();
@@ -3856,10 +3875,14 @@ impl App {
             let elapsed = self.turn_started.map(|t| t.elapsed()).unwrap_or_default();
             let toks = self.tok_per_sec();
             let mut meta = format!(" {}", elapsed_label(elapsed));
-            if toks > 0.0 {
+            let silent = self.reply_wait.map(|since| since.elapsed()).filter(|quiet| *quiet >= SERVER_SILENT_AFTER);
+            if let Some(quiet) = silent {
+                // Rates and hints describe a reply that is flowing; this one is not.
+                meta.push_str(&format!(" · server silent for {}s", quiet.as_secs()));
+            } else if toks > 0.0 {
                 meta.push_str(&format!(" · {toks:.0} tok/s"));
             }
-            if self.thinking_chars > 0 && self.stream_text.is_empty() {
+            if silent.is_none() && self.thinking_chars > 0 && self.stream_text.is_empty() {
                 meta.push_str(if self.show_thinking {
                     " · thinking (ctrl+t to hide)"
                 } else {
@@ -7734,6 +7757,32 @@ mod tests {
             app.last_tool_output.as_deref(),
             Some("test one ok\ntest two ok\ntest three ok\ntest four ok")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A model request that has delivered nothing for 15 seconds says so on
+    /// the spinner line, with how long and that esc cancels; a delta, a
+    /// finished reply or a running tool takes it back.
+    #[test]
+    fn a_silent_server_is_named_on_the_spinner_after_15_seconds() {
+        let (mut app, dir) = app_fixture();
+        app.running = true;
+        app.turn_started = Some(std::time::Instant::now() - Duration::from_secs(40));
+        app.on_agent_event(AgentEvent::Budget { used_tokens: 10, context_tokens: 8000 });
+        assert!(!buffer_text(&render_app(&mut app, 80, 16)).contains("silent"), "a fresh request is not silent");
+        app.reply_wait = Some(std::time::Instant::now() - Duration::from_secs(23));
+        for width in [60u16, 80, 120] {
+            let text = buffer_text(&render_app(&mut app, width, 16));
+            assert!(text.contains("server silent for 23s · esc to cancel"), "{width}: {text}");
+        }
+        app.on_agent_event(AgentEvent::Token { text: "hel".into() });
+        assert!(!buffer_text(&render_app(&mut app, 80, 16)).contains("silent"), "a delta ends the silence");
+        app.reply_wait = Some(std::time::Instant::now() - Duration::from_secs(16));
+        assert!(buffer_text(&render_app(&mut app, 80, 16)).contains("server silent for 16s"), "a stall mid-reply counts");
+        app.on_agent_event(AgentEvent::ToolStart { call_id: "c".into(), name: "bash".into(), args: json!({"command": "make"}) });
+        assert!(app.reply_wait.is_none(), "a running tool is not the server");
+        app.on_agent_event(AgentEvent::Retry { attempt: 2, max_attempts: 8, reason: "502".into() });
+        assert!(app.reply_wait.is_none(), "a retry's wait is not the server's silence");
         fs::remove_dir_all(dir).unwrap();
     }
 
