@@ -45,7 +45,7 @@ use tokio::sync::oneshot;
 use crate::batch::{batchable_call, execute_readonly_batch, parallel_tool_limit, partition_concurrent_runs, ReadonlyBatchCtx};
 use crate::client::{ChatClient, TRUNCATED};
 use crate::compaction::{
-    compact_messages, compaction_trigger, cut_target, over_budget_error_context, refusal_ratio,
+    compact_messages, cut_target, over_budget_error_context, refusal_ratio,
     request_overhead, requested_keep, requested_trigger, route_ratio, schemas_exceed_budget, schemas_outgrow_budget, take_note_bytes,
     to_estimate, to_real, token_factor, updated_prompt_ratio, drop_images, CompactionCtx, RequestSpend, SizeSteps,
 };
@@ -714,7 +714,7 @@ async fn run_loop(
     let (mut at_reserve, mut reserve_only, mut reserve_refusal) = (false, false, None);
     // A reply cut inside a call or its text gets room once. A refusal or spent room means asking for the rest in parts.
     let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
-    let (mut soft_spent, mut resets) = (None::<usize>, 0u32); // After a cut without notes, the size it was asked at, and how many automatic cuts have landed this turn.
+    let mut tc = crate::compaction::TurnCompaction::default();
     let (mut image_refusal, mut accepted) = (None::<String>, 0); // And the last limit a reply came back at.
     let mut size_steps = SizeSteps::default(); // A request refused for its size (413): the steps it has taken.
 
@@ -746,15 +746,12 @@ async fn run_loop(
                 .await;
         }
         let keep = requested_keep(settings.compaction_keep_tokens, prompt_ratio);
-        let trigger = compaction_trigger(
-            budget, schema_tokens, endpoint.turn_ceiling(resets, first_turn && !edited), keep, prompt_ratio, guard.messages(), &estimate,
-        );
-        let trigger = soft_spent.map_or(trigger, |at| at.saturating_add((trigger / 4).min(keep)).max(trigger).min(budget));
+        let trigger = tc.trigger(&endpoint, budget, schema_tokens, keep, factor, prompt_ratio, edited, guard.messages(), &estimate);
         let forced = size_steps.cut.take();
         let before = forced.is_some().then(|| schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>());
         let keep = if forced.is_some() { crate::compaction::size_keep(keep, guard.messages(), &estimate) } else { keep };
         let ctx = CompactionCtx {
-            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep, waited: soft_spent.is_some(),
+            core, session_id, project_root, client: &client, estimate: &estimate, hooks: &hooks, cancelled: &cancelled, schemas: &schemas_wire, factor, keep, waited: tc.soft_spent.is_some(),
         };
         let dropped = match compact_messages(&ctx, guard.messages(), trigger, budget, schema_tokens, forced.is_some(), &mut spend).await {
             Ok(dropped) if dropped > 0 || forced.is_none() => dropped,
@@ -764,12 +761,12 @@ async fn run_loop(
                 break 'turns;
             }
         };
-        if dropped > 0 { (soft_spent, resets) = (None, resets + u32::from(forced.is_none())); }
+        if dropped > 0 { tc.on_cut(forced.is_some()); }
         let used = schema_tokens
             + guard.messages().iter().map(&estimate).sum::<usize>();
         // A forced cut is reported as the trigger's is: compaction leaves that to the caller, which `/compact` does on release.
         if let Some(before) = before.filter(|_| dropped > 0) { core.send_agent(session_id, AgentEvent::Compacted { tokens_before: to_real(before, factor), tokens_after: to_real(used, factor), compacted_messages: dropped }); }
-        if used > trigger { soft_spent = Some(used) }
+        if used > trigger { tc.soft_spent = Some(used) }
         let used_real = to_real(used, factor);
         // The ceiling refuses the request it cannot afford, not just the one
         // after it: what the turn has spent plus the request-side size of the
@@ -9432,7 +9429,7 @@ echo run >> {}
             let schema_tokens = request_overhead(&data.registry.schemas_wire_arc());
             let budget = 400_000 - (2_048 + 1024);
             assert_eq!(
-                compaction_trigger(budget, schema_tokens, 20_000, KEEP_RECENT_TOKENS, None, &data.messages, &ChatMessage::estimated_tokens),
+                crate::compaction::compaction_trigger(budget, schema_tokens, 20_000, KEEP_RECENT_TOKENS, None, &data.messages, &ChatMessage::estimated_tokens),
                 budget,
                 "fixture must sit in the fallback band"
             );
@@ -9634,6 +9631,70 @@ echo run >> {}
         // configured trigger again and does the same: five notes requests,
         // where waiting for the window between cuts made three.
         assert_eq!(requests.lock().unwrap().len() - ITERATIONS, 5, "five notes requests");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A second user turn that starts under the configured ceiling gets the 2x
+    /// pre-edit exploration allowance until it edits a file, then cuts at 1x.
+    #[tokio::test]
+    async fn second_turn_waits_for_first_edit_before_cutting_at_configured_ceiling() {
+        use crate::state::Core;
+
+        let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
+        let (core, mut rx) = Core::new(dir.clone()).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // Each read adds ~2,000 estimated tokens (small enough to stay well
+        // under the irreducible tail floor for a 40,000-token ceiling).
+        let chunk: String = (0..130).map(|i| format!("{i:05} {}\n", "x".repeat(60))).collect();
+        for i in 0..5 {
+            std::fs::write(project.join(format!("a{i}.txt")), &chunk).unwrap();
+        }
+        crate::trust::grant_trust(&core.data_dir, &project, crate::config::ApprovalMode::Auto).unwrap();
+        let text_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let read_sse = |i: usize| format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"r{i}\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":\"{{\\\"path\\\":\\\"a{i}.txt\\\"}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+        let write_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_w\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\",\\\"content\\\":\\\"ok\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (r0, r1, r2, r3, r4) = (read_sse(0), read_sse(1), read_sse(2), read_sse(3), read_sse(4));
+        let replies = [&r0, &r1, &r2, &r3, &r4, write_sse, text_sse];
+        let (base_url, requests) = refusing_endpoint(&replies, |_, body| body.contains(crate::compaction::NOTES_ASK).then_some(400)).await;
+        {
+            let mut s = core.settings.lock().unwrap();
+            s.base_url = base_url;
+            s.model = "stub".into();
+            s.approval_mode = crate::config::ApprovalMode::Auto;
+            s.context_tokens = Some(200_000);
+            s.max_tokens = 1_024;
+            s.compaction_tokens = Some(40_000);
+            s.max_agent_iterations = 12;
+        }
+        let id = sessions::create(&core, project.display().to_string()).unwrap().id;
+        // Seed ~34,000 tokens of prior turn history (< 40k ceiling so Turn 2
+        // begins under its base ceiling and earns the 2x pre-edit allowance).
+        let mut data = build_session_data(&core, &id, &project).unwrap();
+        while data.messages.iter().map(ChatMessage::estimated_tokens).sum::<usize>() < 34_000 {
+            data.messages.push(ChatMessage::user("q ".repeat(400)));
+            data.messages.push(ChatMessage::assistant(Some("a ".repeat(400)), None));
+        }
+        assert!(sessions::save_messages(&core, &id, &data.messages, &mut data.persisted_count, true));
+        core.sessions.lock().await.insert(id.clone(), data);
+        // Turn 2 reads five ~2k files (~44k > 40k, < 80k), writes b.txt, then replies.
+        start_turn(core.clone(), id.clone(), project, "turn two".into()).unwrap();
+        assert_eq!(drive_turn(&mut rx).await.0, "stop");
+        let reqs = requests.lock().unwrap();
+        let notes: Vec<usize> = reqs.iter().enumerate().filter(|(_, body)| body.contains(crate::compaction::NOTES_ASK)).map(|(i, _)| i).collect();
+        // Reqs: 0..=4=reads, 5=write (no cut yet: ~44k < 80k), 6=notes (after edit: ~44k > 40k), 7=final.
+        assert_eq!(notes, vec![6], "notes must fire only after the edit, not before: len={}", reqs.len());
         let _ = std::fs::remove_dir_all(dir);
     }
 
