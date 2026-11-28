@@ -212,6 +212,8 @@ impl ActiveEndpoint {
         if raise == 0 && cuts > 1 { min = min.max(self.reply_room(prompt).saturating_sub(1)); }
         (raise + 1..raise + 32).find(|&r| self.raised_limit(prompt, r) > min)
     }
+    /// Turn-scoped compaction ceiling (doubles per automatic cut; waits up to 2x before the first edit on a fresh turn).
+    pub(crate) fn turn_ceiling(&self, resets: u32, pre_edit: bool) -> usize { crate::compaction::turn_ceiling(self.compaction_tokens, self.context_tokens, resets, pre_edit) }
 }
 
 /// Turn-scoped state for reply-limit cuts and adaptive escalation.

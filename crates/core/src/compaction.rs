@@ -762,6 +762,15 @@ pub(crate) fn requested_trigger(requested: usize, ratio: Option<f64>, budget: us
     to_estimate(requested.max(COMPACTION_TOKENS_FLOOR), setting_factor(ratio)).min(budget)
 }
 
+/// Turn-scoped compaction ceiling in real tokens: on a fresh turn before any
+/// file edit wait up to 2x the configured ceiling so exploration keeps freshly
+/// read files, and double after each automatic cut so reset work stays bounded.
+pub(crate) fn turn_ceiling(configured: usize, context_tokens: usize, resets: u32, pre_edit: bool) -> usize {
+    let default = context_tokens.saturating_mul(4) / 5;
+    let shift = (resets + u32::from(pre_edit && resets == 0)).min(16);
+    configured.saturating_mul(1usize << shift).min(default.max(configured))
+}
+
 /// Real tokens per estimated token for a compaction setting: the observed
 /// ratio, which may relax a setting as well as tighten it, up to the cap.
 fn setting_factor(ratio: Option<f64>) -> f64 {
@@ -2785,5 +2794,15 @@ pub(crate) mod tests {
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "the parts in order, Open last: {at:?}");
         assert!(opens_open_part("Open: the docs"), "the part a cut over the cap keeps");
         assert!(ChatMessage::user(NOTES_ASK).estimated_tokens() < 1_024, "the ask fits the budget's margin");
+    }
+
+    #[test]
+    fn turn_ceiling_waits_before_first_edit_and_doubles_each_cut() {
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 0, true), 90_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 0, false), 45_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 1, false), 90_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 2, false), 180_000);
+        assert_eq!(turn_ceiling(45_000, 1_000_000, 8, false), 800_000);
+        assert_eq!(turn_ceiling(800_000, 1_000_000, 0, true), 800_000);
     }
 }

@@ -714,7 +714,7 @@ async fn run_loop(
     let (mut at_reserve, mut reserve_only, mut reserve_refusal) = (false, false, None);
     // A reply cut inside a call or its text gets room once. A refusal or spent room means asking for the rest in parts.
     let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
-    let mut soft_spent = None::<usize>; // After a cut without notes, the size it was asked at: the next waits until the history grows a quarter of the trigger past it (at most what a cut keeps), then cuts on the digest if notes fail again; a cut clears it.
+    let (mut soft_spent, mut resets) = (None::<usize>, 0u32); // After a cut without notes, the size it was asked at, and how many automatic cuts have landed this turn.
     let (mut image_refusal, mut accepted) = (None::<String>, 0); // And the last limit a reply came back at.
     let mut size_steps = SizeSteps::default(); // A request refused for its size (413): the steps it has taken.
 
@@ -747,7 +747,7 @@ async fn run_loop(
         }
         let keep = requested_keep(settings.compaction_keep_tokens, prompt_ratio);
         let trigger = compaction_trigger(
-            budget, schema_tokens, endpoint.compaction_tokens, keep, prompt_ratio, guard.messages(), &estimate,
+            budget, schema_tokens, endpoint.turn_ceiling(resets, first_turn && !edited), keep, prompt_ratio, guard.messages(), &estimate,
         );
         let trigger = soft_spent.map_or(trigger, |at| at.saturating_add((trigger / 4).min(keep)).max(trigger).min(budget));
         let forced = size_steps.cut.take();
@@ -764,7 +764,7 @@ async fn run_loop(
                 break 'turns;
             }
         };
-        if dropped > 0 { soft_spent = None }
+        if dropped > 0 { (soft_spent, resets) = (None, resets + u32::from(forced.is_none())); }
         let used = schema_tokens
             + guard.messages().iter().map(&estimate).sum::<usize>();
         // A forced cut is reported as the trigger's is: compaction leaves that to the caller, which `/compact` does on release.
@@ -9596,7 +9596,7 @@ echo run >> {}
     #[tokio::test]
     async fn a_cut_that_lands_restores_the_configured_trigger() {
         use crate::state::Core;
-        const ITERATIONS: usize = 40;
+        const ITERATIONS: usize = 70;
 
         let dir = std::env::temp_dir().join(format!("openmax-agent-{}", uuid::Uuid::new_v4()));
         let (core, mut rx) = Core::new(dir.clone()).unwrap();
