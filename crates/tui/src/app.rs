@@ -2836,8 +2836,11 @@ impl App {
                 let arg = raw_rest.trim();
                 // A running turn's tools could rewrite the files between
                 // their write and their approval, and the gate would judge
-                // an end whose turn it did not see start.
-                if self.running && !arg.is_empty() {
+                // an end whose turn it did not see start. That holds for a
+                // session left by /new or /resume while its turn winds down
+                // too: a cancelled turn's end is still judged by the gate.
+                let left_turn = self.left_running.iter().any(|id| self.core.is_running(id));
+                if (self.running || left_turn) && !arg.is_empty() {
                     return self.note("finish or cancel the turn before /gate changes the gate; /gate alone shows it");
                 }
                 let changing = self.gate_change.clone();
@@ -7811,6 +7814,16 @@ mod tests {
         app.slash("gate cargo test").await;
         assert!(app.transcript.export_text().contains("finish or cancel the turn before /gate changes the gate"));
         app.running = false;
+        // A session left by /new while its turn still winds down holds it too.
+        app.left_running = vec!["left".into()];
+        app.core.running.lock().unwrap().insert("left".into());
+        app.transcript = Transcript::new();
+        app.slash("gate cargo test").await;
+        assert!(app.transcript.export_text().contains("finish or cancel the turn before /gate changes the gate"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!manifest.exists(), "/gate wrote a gate while a left turn ran");
+        app.core.running.lock().unwrap().clear();
+        app.left_running.clear();
         app.queued = vec!["/gate true".into()];
         app.flush_queue = true;
         let event = AgentEvent::Error { message: "unrelated".into() };
