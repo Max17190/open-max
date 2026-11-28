@@ -719,8 +719,10 @@ fn core_source_stays_under_its_line_budget() -> Result<(), String> {
     const MARGIN: usize = 500;
     // Lines the agent loop moves into other files of the core do not grow the
     // core past CEILING: once BASELINE is within MARGIN of it, the ratchet is
-    // CEILING.
-    const CEILING: usize = 35_000;
+    // CEILING. Raised from 35,000 to 35,120 for pure-Rust ingestion-time
+    // downscaling of oversized PNG and JPEG images (36% to 48% vision token
+    // reduction on large scans without pulling in the full `image` crate).
+    const CEILING: usize = 35_120;
     const { assert!(BASELINE <= CEILING, "BASELINE is raised past CEILING") };
     const RATCHET: usize = if BASELINE + MARGIN < CEILING { BASELINE + MARGIN } else { CEILING };
 

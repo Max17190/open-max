@@ -625,69 +625,117 @@ const IMAGE_BUDGET: u64 = 5 * 1024 * 1024;
 const MAX_IMAGES: usize = 8;
 const MAX_IMAGE_DIM: u32 = 1568;
 const MAX_IMAGE_FILE_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 64_000_000;
 
 #[cold]
 #[inline(never)]
-fn downscale_image(mime: &str, bytes: &[u8], max: u32) -> Option<(Vec<u8>, [u32; 4])> {
-    use image::{codecs::*, imageops::*, ColorType as C, ImageEncoder as _, ImageFormat as Fmt};
-    let fmt = match mime {
-        "image/png" if max > MAX_IMAGE_DIM => Fmt::Png,
-        "image/jpeg" if max > MAX_IMAGE_DIM => Fmt::Jpeg,
+fn downscale_image(mime: &str, bytes: &[u8], w0: u32, h0: u32) -> Option<(Vec<u8>, [u32; 4])> {
+    if w0.max(h0) <= MAX_IMAGE_DIM || u64::from(w0) * u64::from(h0) > MAX_IMAGE_PIXELS {
+        return None;
+    }
+    let (raw, sw, sh, ch, orient) = match mime {
+        "image/jpeg" => {
+            let mut dec = jpeg_decoder::Decoder::new(bytes);
+            dec.read_info().ok()?;
+            let info = dec.info()?;
+            let (sw, sh) = (u32::from(info.width), u32::from(info.height));
+            if sw == 0 || sh == 0 || sw.max(sh) <= MAX_IMAGE_DIM || u64::from(sw) * u64::from(sh) > MAX_IMAGE_PIXELS { return None; }
+            let pix = dec.decode().ok()?;
+            let rgb = match info.pixel_format {
+                jpeg_decoder::PixelFormat::RGB24 => pix,
+                jpeg_decoder::PixelFormat::L8 => pix.iter().flat_map(|&g| [g, g, g]).collect(),
+                _ => return None,
+            };
+            let (mut p, mut t) = (2, &[][..]);
+            while let Some(&[0xFF, m, a, b0]) = bytes.get(p..p + 4) {
+                let n = usize::from(u16::from_be_bytes([a, b0]));
+                match m {
+                    0xFF => p += 1,
+                    m if matches!(m, 0xD9 | 0xDA) || n < 2 => break,
+                    0xE1 if n >= 8 && bytes.get(p + 4..p + 10) == Some(b"Exif\0\0") => { t = &bytes[p + 10..(p + 2 + n).min(bytes.len())]; break; }
+                    _ => p += 2 + n,
+                }
+            }
+            let le = t.starts_with(b"II");
+            let u = |o, k| -> Option<u32> { (0..k).try_fold(0, |v, i| Some(v << 8 | u32::from(*t.get(o + if le { k - 1 - i } else { i })?))) };
+            let ifd = ((le || t.starts_with(b"MM")) && u(2, 2) == Some(42)).then(|| u(4, 4)).flatten().unwrap_or(0) as usize;
+            let n = (ifd >= 8 && ifd < t.len()).then(|| u(ifd, 2)).flatten().unwrap_or(0) as usize;
+            let orient = (0..n.min(t.len() / 12)).map(|k| ifd + 2 + k * 12).find_map(|e| u(e + 8, 2).filter(|v| u(e, 2) == Some(0x0112) && (1..=8).contains(v))).unwrap_or(1);
+            (rgb, sw, sh, 3usize, orient)
+        }
+        "image/png" => {
+            let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+            dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+            let mut r = dec.read_info().ok()?;
+            let info = r.info();
+            let (sw, sh) = (info.width, info.height);
+            if sw == 0 || sh == 0 || sw.max(sh) <= MAX_IMAGE_DIM || u64::from(sw) * u64::from(sh) > MAX_IMAGE_PIXELS { return None; }
+            let mut buf = vec![0u8; r.output_buffer_size()];
+            let frame = r.next_frame(&mut buf).ok()?;
+            buf.truncate(frame.buffer_size());
+            let (buf, ch) = match frame.color_type {
+                png::ColorType::Rgb => (buf, 3),
+                png::ColorType::Rgba => (buf, 4),
+                png::ColorType::Grayscale => (buf.iter().flat_map(|&g| [g, g, g]).collect(), 3),
+                png::ColorType::GrayscaleAlpha => (buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(), 4),
+                _ => return None,
+            };
+            (buf, sw, sh, ch, 1)
+        }
         _ => return None,
     };
-    let img = image::load_from_memory_with_format(bytes, fmt).ok()?;
-    let (w, h) = (img.width(), img.height());
-    (w > 0 && h > 0 && w.max(h) > MAX_IMAGE_DIM).then_some(())?;
-    let l = u64::from(w.max(h));
-    let has_alpha = fmt == Fmt::Png && img.color().has_alpha();
+    if raw.len() < sw as usize * sh as usize * ch { return None; }
+    let (ew, eh) = if orient >= 5 { (sh, sw) } else { (sw, sh) };
+    let l = u64::from(ew.max(eh));
     let fit = |n| ((u64::from(n) * u64::from(MAX_IMAGE_DIM) + l / 2) / l).max(1) as u32;
-    let mut b = resize(&img.into_rgba8(), fit(w), fit(h), Triangle);
-    let mut orient = 1u32;
-    if fmt == Fmt::Jpeg {
-        let (mut p, mut t) = (2, &[][..]);
-        while let Some(&[0xFF, m, a, b0]) = bytes.get(p..p + 4) {
-            let n = usize::from(u16::from_be_bytes([a, b0]));
-            match m {
-                0xFF => p += 1,
-                m if matches!(m, 0xD9 | 0xDA) || n < 2 => break,
-                0xE1 if n >= 8 && bytes.get(p + 4..p + 10) == Some(b"Exif\0\0") => {
-                    t = &bytes[p + 10..(p + 2 + n).min(bytes.len())];
-                    break;
+    let (nw, nh) = (fit(ew), fit(eh));
+    let mut dst = vec![0u8; nw as usize * nh as usize * ch];
+    for oy in 0..nh {
+        let ry0 = (u64::from(oy) * u64::from(eh) / u64::from(nh)) as u32;
+        let ry1 = ((u64::from(oy + 1) * u64::from(eh) / u64::from(nh)) as u32).max(ry0 + 1).min(eh);
+        for ox in 0..nw {
+            let rx0 = (u64::from(ox) * u64::from(ew) / u64::from(nw)) as u32;
+            let rx1 = ((u64::from(ox + 1) * u64::from(ew) / u64::from(nw)) as u32).max(rx0 + 1).min(ew);
+            let (mut s, mut n) = ([0u64; 4], 0u64);
+            for ry in ry0..ry1 {
+                for rx in rx0..rx1 {
+                    let (sx, sy) = match orient {
+                        2 => (sw - 1 - rx, ry), 3 => (sw - 1 - rx, sh - 1 - ry), 4 => (rx, sh - 1 - ry),
+                        5 => (ry, rx), 6 => (ry, sh - 1 - rx), 7 => (sw - 1 - ry, sh - 1 - rx), 8 => (sw - 1 - ry, rx),
+                        _ => (rx, ry),
+                    };
+                    let p = (sy as usize * sw as usize + sx as usize) * ch;
+                    if ch == 4 {
+                        let a = u64::from(raw[p + 3]);
+                        for c in 0..3 { s[c] += u64::from(raw[p + c]) * a; }
+                        s[3] += a;
+                    } else {
+                        for c in 0..3 { s[c] += u64::from(raw[p + c]); }
+                    }
+                    n += 1;
                 }
-                _ => p += 2 + n,
+            }
+            let o = (oy as usize * nw as usize + ox as usize) * ch;
+            if ch == 4 {
+                dst[o + 3] = ((s[3] + n / 2) / n) as u8;
+                for c in 0..3 {
+                    if let Some(v) = (s[c] + s[3] / 2).checked_div(s[3]) { dst[o + c] = v as u8; }
+                }
+            } else {
+                for c in 0..3 { dst[o + c] = ((s[c] + n / 2) / n) as u8; }
             }
         }
-        let le = t.starts_with(b"II");
-        let u = |o, k| -> Option<u32> {
-            let at = |i| t.get(o + if le { k - 1 - i } else { i }).copied();
-            (0..k).try_fold(0, |v, i| Some(v << 8 | u32::from(at(i)?)))
-        };
-        let ok = (le || t.starts_with(b"MM")) && u(2, 2) == Some(42);
-        let ifd = ok.then(|| u(4, 4)).flatten().unwrap_or(0) as usize;
-        let n = (ifd >= 8 && ifd < t.len()).then(|| u(ifd, 2)).flatten().unwrap_or(0) as usize;
-        orient = (0..n.min(t.len() / 12))
-            .map(|k| ifd + 2 + k * 12)
-            .find_map(|e| u(e + 8, 2).filter(|v| u(e, 2) == Some(0x0112) && (1..=8).contains(v)))
-            .unwrap_or(1);
-        b = match orient {
-            3 | 4 => rotate180(&b),
-            5 | 6 => rotate90(&b),
-            7 | 8 => rotate270(&b),
-            _ => b,
-        };
-        if matches!(orient, 2 | 4 | 5 | 7) {
-            flip_horizontal_in_place(&mut b);
-        }
     }
-    let ((bw, bh), mut out) = (b.dimensions(), Vec::new());
-    let rgb = || b.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>();
-    let res = match (fmt, has_alpha) {
-        (Fmt::Png, true) => png::PngEncoder::new(&mut out).write_image(&b, bw, bh, C::Rgba8),
-        (Fmt::Png, false) => png::PngEncoder::new(&mut out).write_image(&rgb(), bw, bh, C::Rgb8),
-        _ => jpeg::JpegEncoder::new_with_quality(&mut out, 85).write_image(&rgb(), bw, bh, C::Rgb8),
-    };
-    let (ow, oh) = if orient >= 5 { (h, w) } else { (w, h) };
-    res.ok().map(|()| (out, [bw, bh, ow, oh]))
+    let mut out = Vec::new();
+    if mime == "image/jpeg" {
+        jpeg_encoder::Encoder::new(&mut out, 85).encode(&dst, nw as u16, nh as u16, jpeg_encoder::ColorType::Rgb).ok()?;
+    } else {
+        let mut enc = png::Encoder::new(&mut out, nw, nh);
+        enc.set_color(if ch == 4 { png::ColorType::Rgba } else { png::ColorType::Rgb });
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().ok()?.write_image_data(&dst).ok()?;
+    }
+    Some((out, [nw, nh, ew, eh]))
 }
 
 /// The variable naming the folder an external tool may put images in, set
@@ -719,7 +767,7 @@ pub(crate) fn prepare_images(files: &[(String, PathBuf)], orig: &mut Option<(u32
                     (None, _) => "not a PNG, JPEG, GIF or WebP image".into(),
                     (Some(mime), None) => format!("{mime} whose header gives no size"),
                     (Some(mime), Some((mut w, mut h))) => {
-                        if let Some((b, [nw, nh, ow, oh])) = downscale_image(mime, &bytes, w.max(h)) {
+                        if let Some((b, [nw, nh, ow, oh])) = downscale_image(mime, &bytes, w, h) {
                             (len, bytes, w, h, *orig) = (b.len() as u64, b, nw, nh, Some((ow, oh)));
                         }
                         let left = IMAGE_BUDGET - spent;
@@ -5010,30 +5058,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    fn synthetic_rgb(w: u32, h: u32) -> image::RgbImage {
-        image::RgbImage::from_fn(w, h, |x, y| {
-            image::Rgb([
-                ((x * 5 + y * 3) % 256) as u8,
-                ((x * 3 + y * 7 + (x ^ y) % 19) % 256) as u8,
-                ((x + y * 11 + (x & y) % 23) % 256) as u8,
-            ])
-        })
+    fn synthetic_rgb(w: u32, h: u32) -> (u32, u32, Vec<u8>) {
+        let mut buf = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                buf.extend_from_slice(&[
+                    ((x * 5 + y * 3) % 256) as u8,
+                    ((x * 3 + y * 7 + (x ^ y) % 19) % 256) as u8,
+                    ((x + y * 11 + (x & y) % 23) % 256) as u8,
+                ]);
+            }
+        }
+        (w, h, buf)
     }
 
-    fn encode_png_rgb(img: &image::RgbImage) -> Vec<u8> {
-        use image::ImageEncoder;
+    fn encode_png_bytes(w: u32, h: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut out)
-            .write_image(img, img.width(), img.height(), image::ColorType::Rgb8)
-            .unwrap();
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(data).unwrap();
         out
     }
 
-    fn encode_jpeg_rgb(img: &image::RgbImage, quality: u8) -> Vec<u8> {
-        use image::ImageEncoder;
+    fn encode_png_rgb(img: &(u32, u32, Vec<u8>)) -> Vec<u8> {
+        encode_png_bytes(img.0, img.1, png::ColorType::Rgb, &img.2)
+    }
+
+    fn encode_jpeg_rgb(img: &(u32, u32, Vec<u8>), quality: u8) -> Vec<u8> {
         let mut out = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
-            .write_image(img, img.width(), img.height(), image::ColorType::Rgb8)
+        jpeg_encoder::Encoder::new(&mut out, quality)
+            .encode(&img.2, img.0 as u16, img.1 as u16, jpeg_encoder::ColorType::Rgb)
             .unwrap();
         out
     }
@@ -5125,10 +5180,13 @@ mod tests {
 
         // EXIF orientation 6 (Rotate90 CW): a raw 1600x1200 image whose top-left
         // quadrant is red becomes 1176x1568 upright with red in the top-right.
-        let rot_src = image::RgbImage::from_fn(1600, 1200, |x, y| {
-            if x < 800 && y < 600 { image::Rgb([240, 10, 10]) } else { image::Rgb([20, 20, 20]) }
-        });
-        let plain_jpg = encode_jpeg_rgb(&rot_src, 85);
+        let mut rot_buf = Vec::with_capacity(1600 * 1200 * 3);
+        for y in 0..1200u32 {
+            for x in 0..1600u32 {
+                rot_buf.extend_from_slice(if x < 800 && y < 600 { &[240, 10, 10] } else { &[20, 20, 20] });
+            }
+        }
+        let plain_jpg = encode_jpeg_rgb(&(1600, 1200, rot_buf), 85);
         let exif: &[u8] = &[
             b'E', b'x', b'i', b'f', 0, 0,
             b'I', b'I', 42, 0, 8, 0, 0, 0,
@@ -5144,37 +5202,44 @@ mod tests {
         assert_eq!((out.images[0].width, out.images[0].height), (1176, 1568));
         assert!(out.output.contains("1176x1568 (resized from 1200x1600)"), "{}", out.output);
         let rot_decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
-        let loaded_rot = image::load_from_memory(&rot_decoded).unwrap().into_rgb8();
-        let top_right = loaded_rot.get_pixel(1000, 100);
-        let top_left = loaded_rot.get_pixel(100, 100);
-        assert!(top_right[0] > 200 && top_right[1] < 40, "top-right should be red: {top_right:?}");
-        assert!(top_left[0] < 60, "top-left should stay dark: {top_left:?}");
+        let mut jdec = jpeg_decoder::Decoder::new(rot_decoded.as_slice());
+        let rot_px = jdec.decode().unwrap();
+        let rw = usize::from(jdec.info().unwrap().width);
+        let px = |x: usize, y: usize| &rot_px[(y * rw + x) * 3..(y * rw + x) * 3 + 3];
+        assert!(px(1000, 100)[0] > 200 && px(1000, 100)[1] < 40, "top-right should be red: {:?}", px(1000, 100));
+        assert!(px(100, 100)[0] < 60, "top-left should stay dark: {:?}", px(100, 100));
 
-        let rgba = image::RgbaImage::from_fn(1600, 1200, |x, y| {
-            image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 180])
-        });
-        let mut alpha_png = Vec::new();
-        image::ImageEncoder::write_image(
-            image::codecs::png::PngEncoder::new(&mut alpha_png),
-            &rgba,
-            1600,
-            1200,
-            image::ColorType::Rgba8,
-        )
-        .unwrap();
+        // RGBA PNG with opaque red left, semi-transparent green middle, fully transparent right.
+        let mut rgba = Vec::with_capacity(1600 * 1200 * 4);
+        for _y in 0..1200u32 {
+            for x in 0..1600u32 {
+                let p = if x < 533 { [220, 20, 20, 255] } else if x < 1066 { [20, 200, 40, 128] } else { [0, 0, 0, 0] };
+                rgba.extend_from_slice(&p);
+            }
+        }
+        let alpha_png = encode_png_bytes(1600, 1200, png::ColorType::Rgba, &rgba);
         std::fs::write(root.join("alpha.png"), &alpha_png).unwrap();
         let out = super::read_file(&root, &json!({"path": "alpha.png"}), on, &CancelToken::default());
         assert!(out.ok, "{}", out.output);
         assert_eq!((out.images[0].mime.as_str(), out.images[0].width, out.images[0].height), ("image/png", 1568, 1176));
         let decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
-        let loaded = image::load_from_memory(&decoded).unwrap();
-        assert!(loaded.color().has_alpha(), "alpha channel preserved");
+        let mut pdec = png::Decoder::new(std::io::Cursor::new(decoded)).read_info().unwrap();
+        let mut pbuf = vec![0u8; pdec.output_buffer_size()];
+        let pinfo = pdec.next_frame(&mut pbuf).unwrap();
+        assert_eq!(pinfo.color_type, png::ColorType::Rgba);
+        let apx = |x: usize, y: usize| &pbuf[(y * 1568 + x) * 4..(y * 1568 + x) * 4 + 4];
+        assert_eq!(apx(100, 500), &[220, 20, 20, 255], "opaque region preserved");
+        assert_eq!(apx(780, 500), &[20, 200, 40, 128], "semi-transparent region preserved");
+        assert_eq!(apx(1400, 500)[3], 0, "fully transparent region preserved");
 
-        let raw_img = image::RgbImage::from_fn(2400, 1800, |x, y| {
-            let h = x.wrapping_mul(2654435761) ^ y.wrapping_mul(2246822519);
-            image::Rgb([(h >> 16) as u8, (h >> 8) as u8, h as u8])
-        });
-        let over_five_mib = encode_jpeg_rgb(&raw_img, 100);
+        let mut raw_buf = Vec::with_capacity(2400 * 1800 * 3);
+        for y in 0..1800u32 {
+            for x in 0..2400u32 {
+                let h = x.wrapping_mul(2654435761) ^ y.wrapping_mul(2246822519);
+                raw_buf.extend_from_slice(&[(h >> 16) as u8, (h >> 8) as u8, h as u8]);
+            }
+        }
+        let over_five_mib = encode_jpeg_rgb(&(2400, 1800, raw_buf), 100);
         assert!(over_five_mib.len() as u64 > IMAGE_BUDGET, "fixture must exceed 5 MiB wire budget");
         std::fs::write(root.join("raw.jpg"), &over_five_mib).unwrap();
         let out = super::read_file(&root, &json!({"path": "raw.jpg"}), on, &CancelToken::default());
@@ -5223,6 +5288,13 @@ mod tests {
         let out = super::read_file(&root, &json!({"path": "bad_huge.png"}), on, &CancelToken::default());
         assert_eq!((out.ok, out.images.len()), (false, 0));
         assert!(out.output.contains("over the 5 MiB of images one call shows"), "{}", out.output);
+
+        // Images past MAX_IMAGE_PIXELS skip decoding so compressed pixel bombs
+        // never exhaust memory.
+        let bomb_png = png(10_000, 10_000, 128);
+        std::fs::write(root.join("bomb.png"), &bomb_png).unwrap();
+        let out = super::read_file(&root, &json!({"path": "bomb.png"}), on, &CancelToken::default());
+        assert!(out.ok && !out.output.contains("resized from"), "{}", out.output);
 
         let too_big_path = root.join("too_big.png");
         {
