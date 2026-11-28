@@ -1374,18 +1374,17 @@ async fn terminate_remaining_group(pid: Option<u32>) -> bool {
 #[cfg(unix)]
 fn configure_process_group(command: &mut std::process::Command, new_session: bool) {
     use std::os::unix::process::CommandExt;
-    if !new_session {
-        command.process_group(0);
-        return;
-    }
     // Runs between fork and exec, where only async-signal-safe calls are
-    // allowed, and setsid is one. A failure fails the spawn rather than
-    // running the command on the terminal. std has no stable way to ask
-    // posix_spawn for a new session, so these spawns take its fork path.
+    // allowed. Reset SIGINT and SIGQUIT to SIG_DFL because POSIX preserves
+    // SIG_IGN across execve, so a harness started by a non-interactive
+    // background shell or CI runner would otherwise leave every tool child
+    // ignoring Ctrl-C and SIGINT.
     unsafe {
-        command.pre_exec(|| match libc::setsid() {
-            -1 => Err(io::Error::last_os_error()),
-            _ => Ok(()),
+        command.pre_exec(move || {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            let ok = if new_session { libc::setsid() != -1 } else { libc::setpgid(0, 0) != -1 };
+            if ok { Ok(()) } else { Err(io::Error::last_os_error()) }
         });
     }
 }
@@ -4521,6 +4520,73 @@ mod tests {
             assert!(stdout.contains(expected), "{cmd}: expected {expected:?} in {stdout:?}");
         }
         assert!(!marker.exists(), "command after timed-out pipeline must not run");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A harness started by a non-interactive background shell or CI runner
+    /// inherits SIGINT and SIGQUIT as SIG_IGN. Child commands run in their own
+    /// session or process group must reset both to SIG_DFL so Ctrl-C and
+    /// explicit SIGINT work inside tool subprocesses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_commands_reset_ignored_sigint_and_sigquit_to_default() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "OPENMAX_TEST_IGNORED_SIGNALS";
+        if std::env::var_os(CHILD).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "execution::tests::child_commands_reset_ignored_sigint_and_sigquit_to_default"])
+                .env(CHILD, "1");
+            // SAFETY: signal() is async-signal-safe between fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                    libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("openmax-sigdfl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for sig in ["INT", "QUIT"] {
+            let output = run_process(
+                ProcessRequest {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), format!("kill -{sig} $$; echo survived").into()],
+                    cwd: dir.clone(),
+                    stdin: StdinMode::Null,
+                    timeout: Duration::from_secs(5),
+                    idle_watch: IdleWatch::Off,
+                    capture: CaptureSpec {
+                        head_bytes: 1024,
+                        tail_bytes: 1024,
+                        spill_dir: None,
+                        spill_bytes_per_stream: 0,
+                        redraws: false,
+                    },
+                    sandbox: None,
+                    env_allowlist: None,
+                    self_link: false,
+                    env: Vec::new(),
+                },
+                Arc::new(CancelToken::default()),
+            )
+            .await
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout.rendered_bytes()).into_owned();
+            assert!(!stdout.contains("survived"), "SIG{sig} was still ignored in child: {stdout:?}");
+            assert!(
+                matches!(output.termination, Termination::Exited(s) if !s.success()),
+                "SIG{sig} must terminate child non-zero"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }
