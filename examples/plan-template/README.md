@@ -34,19 +34,23 @@ as:
 Carry out step 1 of PLAN.md, run its check, and mark it done in PLAN.md.
 ```
 
-## A plan that cannot edit
+## A planning turn without edits
 
 The template asks the model to write only `PLAN.md`; it is an instruction, and
-the model can still call other tools. To make the planning turn unable to
-change any file, run it in `readonly`:
+the model can still call other tools. To have the harness refuse its edits,
+run the planning turn in `readonly`:
 
 ```text
 /permissions readonly
 /plan add a --verbose flag to the CLI
 ```
 
-In `readonly` every mutating call is refused, `write_file` of `PLAN.md` and
-`bash` among them, while the model can still read and search. The template
+In `readonly` every call to a tool classified as mutating is refused,
+`write_file` of `PLAN.md` and `bash` among them, while the model can still read
+and search. That is the harness's gate, not a sandbox: an approved hook, or an
+approved external tool marked `mutating = false`, still runs and can write
+files. When you need a hard guarantee that nothing writes, run the session in
+an OS sandbox or container with the project mounted read-only. The template
 tells it to give the plan in its reply when the write is refused. Then switch
 back and keep the plan:
 
@@ -57,8 +61,11 @@ Write the plan from your last reply to PLAN.md, then stop.
 
 `/permissions` saves the mode for this project, so switch it back before you
 want edits again. From a shell, `openmax --permissions readonly` does the same.
-In `ask` the planning turn can write, but each write raises an approval card:
-approve the one for `PLAN.md` and decline the rest.
+In `ask` the planning turn can write, and each mutating call raises an
+approval card unless an approved `allow` rule in `.openmax/permissions.toml`
+covers it. To review every write, first remove or narrow `allow` rules that
+could permit one, `bash` rules included; then approve the card for `PLAN.md`
+and decline the rest.
 
 ## Test
 

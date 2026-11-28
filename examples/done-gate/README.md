@@ -73,9 +73,10 @@ openmax --approve .openmax/hooks/done-gate.toml
 That approves the manifest and the script it runs in one act and prints both
 hashes. An edit to either file revokes the approval, and an approved gate that
 changed fails closed: tool calls are refused and every turn ends `unverified`
-until the approved content is back or you approve the new content. So in `ask` the model cannot quietly swap your check for one that
-passes. In `auto` it can, since it may edit any file the gate reads, the hook
-files among them; see the limits below.
+until the approved content is back or you approve the new content. So in `ask` an edit that swaps your check for one that passes
+turns every end `unverified` instead of passing. In `auto` no approval is
+consulted, and the model may edit any file the gate reads, the hook files among
+them; see the limits below.
 
 ## When the check cannot pass
 

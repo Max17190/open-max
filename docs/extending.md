@@ -169,7 +169,8 @@ the composer a built-in slash command wins over a template with the same stem
 (a `fork.md` never runs as `/fork`), and `/help` leaves such a template out;
 `-p` and stdio, which have no built-in slash commands, still expand it.
 [examples/plan-template](../examples/plan-template/README.md) is a `/plan`
-template that writes `PLAN.md` before any edit, and pairs it with `readonly`.
+template that writes `PLAN.md` before any edit, and shows how `readonly` refuses
+the planning turn's other edits.
 
 ## Hooks
 

@@ -6,8 +6,12 @@ check=${1:?usage: sh done-gate.sh '<check command>'}
 # that cannot be refused (blockable false) still needs an honest exit, since
 # exit 0 there would record the end as verified.
 cat > /dev/null
-output=$(sh -c "$check" 2>&1) && exit 0
-status=$?
+end=$(mktemp) || exit 1
+trap 'rm -f "$end"' EXIT
+# The check's output streams through tail, which keeps only its last bytes, so
+# a verbose check costs no memory here; its exit code comes back on fd 3.
+status=$( { { sh -c "$check" 2>&1 3>&-; echo $? >&3; } | tail -c 380 > "$end"; } 3>&1 )
+[ "$status" = 0 ] && exit 0
 printf 'Not done: `%s` exits %s. Fix the cause, then end the turn again.\n' "$check" "$status"
-printf '%s\n' "$output" | tail -c 380
+cat "$end"
 exit 1
