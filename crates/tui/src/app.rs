@@ -2321,9 +2321,6 @@ impl App {
         } else {
             text
         };
-        if self.gate_change_pending() {
-            self.composer.load(&text);
-        }
         self.submit_prompt(text);
         Ok(())
     }
@@ -2336,7 +2333,13 @@ impl App {
 
     fn submit_prompt(&mut self, text: String) {
         if self.gate_change_pending() {
-            return self.note("a /gate change is still being written, so no turn starts until it is; send the prompt again in a moment");
+            // It waits in the queue strip and goes out once the change is
+            // on disk (on_listing), so its turn is judged by the new gate.
+            self.queued.push(text);
+            self.transcript.follow();
+            self.dirty.mark_chat();
+            self.dirty.mark_chrome();
+            return;
         }
         if self.running {
             // A running turn takes the message at its next iteration
@@ -2921,6 +2924,12 @@ impl App {
     }
 
     fn on_listing(&mut self, generation: u64, lines: Vec<Line<'static>>) {
+        // A /gate change clears its flag before its listing is sent, so
+        // what was typed while it was written goes out now.
+        let gate_landed = !self.gate_change.load(std::sync::atomic::Ordering::Acquire);
+        if gate_landed && !self.running && self.pending_approval.is_none() && self.steered == 0 && !self.queued.is_empty() {
+            self.send_next_queued();
+        }
         if generation != self.transcript_gen || lines.is_empty() {
             return;
         }
@@ -2945,19 +2954,28 @@ impl App {
         if self.flush_queue {
             self.flush_queue = false;
             if !self.running && self.pending_approval.is_none() && !self.queued.is_empty() {
-                let text = self.queued.remove(0);
-                // A queued entry already went through handle_submit, which
-                // expanded any template, so it is a prompt: a body that
-                // starts with `/` is not dispatched again as a command.
-                self.refresh_project_root();
-                self.submit_prompt(text.clone());
-                if !self.running {
-                    // The turn never started (server stopped, start error):
-                    // nothing will drain the rest, so hand it all back.
-                    self.queued.insert(0, text);
-                    self.return_queue_to_composer();
-                }
+                self.send_next_queued();
             }
+        }
+    }
+
+    /// Start a turn with the oldest queued entry.
+    fn send_next_queued(&mut self) {
+        let text = self.queued.remove(0);
+        // A queued entry already went through handle_submit, which
+        // expanded any template, so it is a prompt: a body that
+        // starts with `/` is not dispatched again as a command.
+        self.refresh_project_root();
+        if self.gate_change_pending() {
+            // Still waiting on a /gate change, which sends it when it lands.
+            return self.queued.insert(0, text);
+        }
+        self.submit_prompt(text.clone());
+        if !self.running {
+            // The turn never started (server stopped, start error):
+            // nothing will drain the rest, so hand it all back.
+            self.queued.insert(0, text);
+            self.return_queue_to_composer();
         }
     }
 
@@ -7831,16 +7849,21 @@ mod tests {
         assert!(app.queued.is_empty() || app.composer.text() == "/gate true", "the entry went out as a prompt or came back");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!manifest.exists(), "a queued entry ran /gate");
-        // While a change is being written no turn starts: the prompt stays
-        // in the composer, and a second change waits for the first.
+        // While a change is being written no turn starts: the prompt waits
+        // in the queue and a second change waits for the first. Once the
+        // change lands, the prompt goes out.
         (app.running, app.queued) = (false, Vec::new());
-        app.composer.load("");
         app.gate_change.store(true, std::sync::atomic::Ordering::Release);
         app.handle_submit("hello".into()).await.unwrap();
-        assert!(!app.running && app.composer.text() == "hello", "a turn started under a /gate change");
+        assert!(!app.running && app.queued == ["hello"], "a turn started under a /gate change");
         app.slash("gate npm test").await;
-        let shown = app.transcript.export_text();
-        assert!(shown.contains("no turn starts until it is") && shown.contains("the last /gate change is still being written"), "{shown}");
+        assert!(app.transcript.export_text().contains("the last /gate change is still being written"));
+        let generation = app.transcript_gen;
+        app.on_listing(generation, Vec::new());
+        assert!(!app.running && app.queued == ["hello"], "the prompt went out before the change landed");
+        app.gate_change.store(false, std::sync::atomic::Ordering::Release);
+        app.on_listing(generation, Vec::new());
+        assert!(app.running && app.queued.is_empty(), "the prompt did not go out once the change landed");
         fs::remove_dir_all(dir).unwrap();
     }
 
