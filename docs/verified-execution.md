@@ -2,7 +2,9 @@
 
 This page is for a program that hands Open Max a task: a script, a CI job or
 another agent. It puts in one place what such a caller needs to hold a run to
-its own checks and to read back what happened.
+its own checks and to read back what happened. To hold the turns of your own
+sessions, interactive ones included, to a command instead, copy the two files
+of [examples/done-gate](../examples/done-gate/README.md).
 
 ## What it is
 
@@ -278,6 +280,7 @@ What it does not give you:
 | --- | --- |
 | The whole path, with no model | `python3 examples/run-task/demo.py` |
 | A turn's end held to a command | `run_task.py --check "<command>"`, or a `turn_end` hook with `blocking = true` |
+| Every turn of your own sessions held to a command | The two files of [examples/done-gate](../examples/done-gate/README.md) in `.openmax/hooks/` |
 | A slow check to decide the result | `run_task.py --final-check "<command>"` |
 | A check that cannot pass to stop sooner | `max_refusals` in the gate's hook file |
 | A bound on one run's work | `--max-agent-iterations <n>`, `--max-agent-tokens <n>` |

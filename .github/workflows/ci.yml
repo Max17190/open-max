@@ -135,9 +135,9 @@ jobs:
   # The examples' own scripts drive a debug build of the binary end to end.
   # They took 2.5 minutes after the tests on macos-latest, the longest part
   # of the gate's slowest job, so they run in a job of their own beside the
-  # tests, on the same runners, and the two scripts run at once: each keeps
-  # its state in a temporary HOME of its own. A failure of either fails the
-  # job, and the step after shows each script's output. The job
+  # tests, on the same runners, and the scripts run at once: each keeps its
+  # state in a temporary HOME of its own. A failure of any fails the job,
+  # and the step after shows each script's output. The job
   # builds the test job's dependencies again, so it restores the cache that
   # job saves on main and saves none of its own.
   examples:
@@ -171,8 +171,17 @@ jobs:
           memory=$!
           python3 examples/run-task/test_run_task.py target/debug/openmax > "$RUNNER_TEMP/run-task.log" 2>&1 &
           task=$!
+          python3 examples/done-gate/test_done_gate.py target/debug/openmax > "$RUNNER_TEMP/done-gate.log" 2>&1 &
+          gate=$!
+          python3 examples/mcp-tool/test_mcp_tool.py target/debug/openmax > "$RUNNER_TEMP/mcp-tool.log" 2>&1 &
+          mcp=$!
+          python3 examples/plan-template/test_plan_template.py target/debug/openmax > "$RUNNER_TEMP/plan-template.log" 2>&1 &
+          plan=$!
           wait "$memory" || { echo "::error::the repository memory example failed"; failed=1; }
           wait "$task" || { echo "::error::the run task example failed"; failed=1; }
+          wait "$gate" || { echo "::error::the done gate example failed"; failed=1; }
+          wait "$mcp" || { echo "::error::the MCP tool example failed"; failed=1; }
+          wait "$plan" || { echo "::error::the plan template example failed"; failed=1; }
           exit ${failed:-0}
 
       # Each script's output, after a failure or a timeout of the step above
@@ -180,7 +189,7 @@ jobs:
       - name: Show the examples' output
         if: ${{ !cancelled() }}
         run: |
-          for log in repo-memory run-task; do
+          for log in repo-memory run-task done-gate mcp-tool plan-template; do
             echo "--- $log"
             if [ -f "$RUNNER_TEMP/$log.log" ]; then cat "$RUNNER_TEMP/$log.log"; else echo "(no output)"; fi
           done

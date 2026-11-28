@@ -1,0 +1,22 @@
+# One proxy tool for one MCP server. Copy to .openmax/tools/notes.toml.
+# Every request pays for this small schema, not for the server's own tools:
+# the notes skill lists those, and the model reads it when it needs them.
+name = "notes"
+description = "Call a notes MCP server tool; the notes skill lists names and arguments"
+command = "sh"
+# The words after "mcp" are the server command, run from the project root.
+args = ["-c", "exec \"$OPENMAX_BIN\" --mcp-call -- \"$@\"", "mcp", "python3", "scripts/notes_server.py", "notes"]
+# A tool's environment is scrubbed, and the server gets only what the tool
+# does: name each credential it reads, as in env = ["NOTES_TOKEN"].
+# Covers starting the server and the call.
+timeout_secs = 120
+# Keep true unless every tool the server offers is read-only.
+mutating = true
+
+[params]
+type = "object"
+required = ["tool", "arguments"]
+[params.properties.tool]
+type = "string"
+[params.properties.arguments]
+type = "object"

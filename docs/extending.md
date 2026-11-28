@@ -104,7 +104,9 @@ tools/call), and stops it, with every wait bounded by `--mcp-timeout`
 (default 30 seconds). A server that needs a persistent session is not
 supported yet. `openmax --spec mcp` prints the recipe the agent follows: the
 proxy tool's TOML, with the server's credentials granted through `env`, and
-the shell lines that generate the skill.
+the shell lines that generate the skill. [examples/mcp-tool](../examples/mcp-tool/README.md)
+works the recipe through for a small stdio server, with a test that needs no
+network.
 
 ## Memory
 
@@ -166,6 +168,9 @@ the same, so a delegated child process gets the project's templates too. In
 the composer a built-in slash command wins over a template with the same stem
 (a `fork.md` never runs as `/fork`), and `/help` leaves such a template out;
 `-p` and stdio, which have no built-in slash commands, still expand it.
+[examples/plan-template](../examples/plan-template/README.md) is a `/plan`
+template that writes `PLAN.md` before any edit, and shows how `readonly` refuses
+the planning turn's other edits.
 
 ## Hooks
 
@@ -181,7 +186,9 @@ gate's `max_refusals` (1 to 8, default 8) lowers its own share: once that many
 of its refusals were honored in a turn, its next one ends the turn
 `unverified`, so a check that cannot pass stops costing work sooner. An
 end that every gate passed is recorded as a `turn_verified` event naming them
-([stdio protocol](stdio-protocol.md)). While
+([stdio protocol](stdio-protocol.md)). [examples/done-gate](../examples/done-gate/README.md)
+is a gate to copy into a project: two files that hold every turn to one
+command you name. While
 a hook file fails closed (below), every turn's end is reported and ends
 `unverified` without a refusal, until a turn repairs it: that turn's end is
 judged by the hooks on disk then. Each

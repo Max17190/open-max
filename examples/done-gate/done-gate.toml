@@ -1,0 +1,11 @@
+# A completion gate: Open Max refuses the end of a turn while the check fails.
+# Copy this file and done-gate.sh into .openmax/hooks/, then put your own
+# check in place of "cargo test" below. It runs with sh -c in the project root.
+event = "turn_end"
+blocking = true
+command = "sh"
+args = [".openmax/hooks/done-gate.sh", "cargo test"]
+# The most a completion gate may run. Lower it for a fast check.
+timeout_secs = 600
+# Three refusals in one turn, then the turn ends unverified (the cap is 8).
+max_refusals = 3
