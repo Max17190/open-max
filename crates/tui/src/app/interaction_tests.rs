@@ -1655,3 +1655,33 @@ async fn diff_on_a_branch_of_a_compacted_session_names_what_it_cannot_list() {
     assert!(shown.ends_with("> no file changes in this session yet. /diff lists edit and write tools only; git diff shows what shell commands changed\n"), "{shown}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// /diff shows counts as the tools gave them: an edit whose diff was cut
+/// off at its deadline keeps the result's word that its counts are an
+/// upper bound, and a file written with no line changed is named apart,
+/// in no file or change count.
+#[tokio::test]
+async fn diff_marks_overcounts_and_sets_unchanged_writes_apart() {
+    let (mut app, dir) = app_fixture();
+    let big = "--- a/big.txt\n+++ b/big.txt\n(diff not shown: the change was too large to compare in time, so +900 −800 may overcount)\n";
+    app.on_agent_event(AgentEvent::ToolStart { call_id: "c1".into(), name: "write_file".into(), args: serde_json::json!({"path": "big.txt"}) });
+    app.on_agent_event(AgentEvent::Diff { call_id: "c1".into(), path: "big.txt".into(), diff: big.into(), added: 900, removed: 800 });
+    app.on_agent_event(AgentEvent::ToolEnd {
+        call_id: "c1".into(),
+        ok: true,
+        output: "wrote big.txt (+900 −800) · counts are an upper bound".into(),
+        duration_ms: None,
+    });
+    finish_tool(&mut app, "c2", "write_file", serde_json::json!({"path": "same.txt"}), Some(("same.txt", "", 0, 0)));
+    finish_tool(&mut app, "c3", "write_file", serde_json::json!({"path": "same.txt"}), Some(("same.txt", "", 0, 0)));
+    app.handle_submit("/diff".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("+900 −800  big.txt · counts are an upper bound"), "{shown}");
+    assert!(shown.contains("written with no line changed: same.txt\n"), "{shown}");
+    assert!(shown.contains("1 file, at most +900 −800"), "{shown}");
+    assert!(!shown.contains("same.txt (2 changes)"), "{shown}");
+    app.handle_submit("/diff all".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("may overcount") && shown.ends_with("written with no line changed: same.txt\n> /diff lists edit and write tools only; git diff shows what shell commands changed\n"), "{shown}");
+    let _ = std::fs::remove_dir_all(dir);
+}

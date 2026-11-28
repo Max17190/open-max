@@ -433,6 +433,9 @@ pub struct FileChange {
     pub added: usize,
     pub removed: usize,
     pub diff_kept: bool,
+    /// The diff was cut off at its deadline, so the counts may include
+    /// unchanged lines, as the tool's result says.
+    pub upper_bound: bool,
 }
 
 #[derive(Default)]

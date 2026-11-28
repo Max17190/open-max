@@ -991,7 +991,13 @@ impl App {
                                 Some(change) => self.transcript.push_file_change(
                                     compact,
                                     content.to_string(),
-                                    FileChange { path: change.path, added: change.added, removed: change.removed, diff_kept: false },
+                                    FileChange {
+                                        path: change.path,
+                                        added: change.added,
+                                        removed: change.removed,
+                                        diff_kept: false,
+                                        upper_bound: counts_are_an_upper_bound(content),
+                                    },
                                 ),
                                 None => self.transcript.push_tool(compact, content.to_string(), ok),
                             }
@@ -3062,7 +3068,8 @@ impl App {
                 match diff.filter(|_| ok) {
                     Some(DiffText { path, diff, added, removed }) => {
                         self.last_tool_output = Some(diff.clone());
-                        let change = FileChange { path, added, removed, diff_kept: true };
+                        let upper_bound = counts_are_an_upper_bound(&output);
+                        let change = FileChange { path, added, removed, diff_kept: true, upper_bound };
                         self.transcript.push_file_change(compact, diff, change);
                     }
                     None => {
@@ -4479,6 +4486,12 @@ fn clip(s: &str, max: usize) -> String {
 /// Replay shows a short tool-output preview, not the full persisted payload.
 /// (+N −N) change counts from a persisted write/edit result, so a replayed
 /// card keeps its badge even though Diff events are not persisted.
+/// Whether a write or edit result says its counts may overcount: the diff
+/// behind them was cut off at its deadline.
+fn counts_are_an_upper_bound(content: &str) -> bool {
+    content.lines().next().is_some_and(|line| line.ends_with(" · counts are an upper bound"))
+}
+
 /// The path a write or edit result names: `wrote <path> (+N −M)`, in the
 /// form the live diff event carries.
 fn changed_path(content: &str) -> Option<&str> {
