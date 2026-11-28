@@ -834,6 +834,7 @@ async fn run_loop(
                     // Spend room and raises before trying the reserve, but a vendor's own server that refused a raise keeps the last limit it accepted; content repairs keep the smaller limit.
                     if endpoint.chatgpt.is_none() && limit > endpoint.reply_reserve && (length || matches!(status, Some(400 | 422))) && iteration + 1 < max_iterations {
                         if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
+                        if let Some(lower) = roomy.is_none().then(|| cs.step_down(&mut endpoint, used_real, limit, accepted)).flatten() { client.reply_bounds.0 = client.reply_bounds.0.min(lower); continue 'turns; }
                         if endpoint.reports_cuts && cs.raise > 0 && (endpoint.max_tokens..limit).contains(&accepted) { (endpoint.reply_ceiling, client.reply_bounds.0, no_room, cs.base_raise) = (accepted, accepted, true, 0); continue 'turns; }
                         let usual = endpoint.reply_limit(used_real);
                         at_reserve = !(endpoint.reply_reserve < usual && usual < limit && (roomy.is_some() || cs.raise > 0));

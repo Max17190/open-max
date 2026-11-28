@@ -176,17 +176,16 @@ async fn a_refused_raise_keeps_the_last_accepted_limit_for_the_rest_of_the_turn(
         let t = turn(wire, 400_000, u64::MAX / 4, 64_000).await;
         assert_eq!(t.limits, [4096, 4096, 16384, 32768, 65536, 32768, 32768, 32768, 32768], "{wire}");
         assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 188_416, "length"));
-        // Refused at the first raise: the last accepted limit is the first ask.
+        // Refused at the 4x jump: tries the skipped 8192, then keeps the last accepted limit.
         let t = turn(wire, 131_072, u64::MAX / 4, 6_000).await;
-        assert_eq!(t.limits, [4096, 4096, 16384, 4096, 4096, 4096, 4096], "{wire}");
-        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 24_576, "length"));
+        assert_eq!(t.limits, [4096, 4096, 16384, 8192, 4096, 4096, 4096, 4096], "{wire}");
+        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (2, 24_576, "length"));
     }
     // A notes request in that turn, cut before any text, is not asked again
     // above the limit the server refused (the turn helper counts each refusal).
-    // The fifth request is the notes request.
     let t = turn_as(Shape::Compacting, "anthropic", 60_000, u64::MAX / 4, 6_000).await;
-    assert_eq!((t.limits.len(), t.limits[0], t.limits[1], &t.limits[3..], t.refused_raises, t.stop.as_str()), (8, 4096, 4096, &[4096, 4096, 4096, 4096, 4096][..], 1, "length"));
-    assert!((6_001..=16_384).contains(&t.limits[2]), "{:?}", t.limits);
+    assert_eq!((t.limits.len(), t.limits[0], t.limits[1], &t.limits[4..], t.refused_raises, t.stop.as_str()), (8, 4096, 4096, &[4096, 4096, 4096, 4096][..], 2, "length"));
+    assert!((6_001..=16_384).contains(&t.limits[2]) && t.limits[3] == 8192, "{:?}", t.limits);
 }
 
 /// The subscription route sends no limit and is not a server this module's rules

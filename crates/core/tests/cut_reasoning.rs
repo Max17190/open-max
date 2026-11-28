@@ -238,3 +238,36 @@ async fn multi_cut_chain_raises_base_limit_for_later_rounds_while_single_cut_doe
     let limits: Vec<u64> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
     assert_eq!(limits, vec![4096, 4096, 16384, 16384]);
 }
+
+/// A server with an unknown cap between the base ask and the 4x jump refuses
+/// 16384; stepping down tries the skipped 8192 instead of locking the turn at
+/// 4096, keeps 8192 as the ceiling for later rounds, and never retries 16384.
+#[tokio::test]
+async fn refused_jump_tries_intermediate_raise_before_falling_back() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let (url, bodies) = common::recording_http_with(10, move |body| {
+        let limit = serde_json::from_str::<Value>(body).unwrap()["max_tokens"].as_u64().unwrap();
+        if limit > 10_000 {
+            return (400, "application/json", json!({"error":{"message":"max_tokens must be <= 10000"}}).to_string());
+        }
+        let reply = if limit < 8192 {
+            json!({"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"","reasoning_content":"thinking..."}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":limit,"completion_tokens_details":{"reasoning_tokens":limit - 1}}})
+        } else if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":50}})
+        } else {
+            json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":10,"completion_tokens":10}})
+        };
+        (200, "application/json", reply.to_string())
+    })
+    .await;
+    let scratch = Scratch::new(&url, "chat_completions");
+    std::fs::write(scratch.0.join("data/settings.json"), r#"{"provider":"test","model":"thinker","context_tokens":131072}"#).unwrap();
+    let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
+    let events = common::drive_turn(&core, &mut rx, "cap-10k", &scratch.0.join("project"), "go").await;
+    let limits: Vec<u64> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
+    assert_eq!(limits, vec![4096, 4096, 16384, 8192, 8192]);
+    assert!(matches!(events.last(), Some(AgentEvent::Done { stop_reason }) if stop_reason == "stop"), "{events:?}");
+}

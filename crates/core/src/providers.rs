@@ -233,6 +233,17 @@ impl CutState {
         capped && !no_room && (self.cuts > 1 || self.base_raise > 0 || self.floor > 0 && !thought)
     }
     pub fn on_refused(&mut self) { (self.raise, self.base_raise) = (0, 0); }
+    /// When a multi-step jump is refused, step down to an untried intermediate
+    /// raise before abandoning raised limits for the turn.
+    pub fn step_down(&mut self, endpoint: &mut ActiveEndpoint, prompt: usize, limit: usize, accepted: usize) -> Option<usize> {
+        let lower = (self.raise > 1).then(|| endpoint.raised_limit(prompt, self.raise - 1))?;
+        (lower < limit && lower > accepted.max(endpoint.reply_limit(prompt))).then(|| {
+            self.raise -= 1;
+            self.base_raise = self.base_raise.min(self.raise);
+            endpoint.reply_ceiling = endpoint.reply_ceiling.min(lower);
+            lower
+        })
+    }
 }
 
 pub fn providers_path(data_dir: &Path) -> PathBuf {
