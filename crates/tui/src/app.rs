@@ -49,9 +49,9 @@ const TICK: Duration = Duration::from_millis(120);
 /// relaxed tick suffices. Draws in that state are tail-only and sub-ms, so
 /// the cost is a fraction of a percent of one core, and only while waiting.
 const WAIT_TICK: Duration = Duration::from_millis(50);
-/// How long a model request may deliver nothing before the spinner says the
-/// server has gone silent.
-const SERVER_SILENT_AFTER: Duration = Duration::from_secs(15);
+/// How long a model request may stream no reply text before the spinner
+/// says so.
+const REPLY_QUIET_AFTER: Duration = Duration::from_secs(15);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
 
@@ -361,10 +361,11 @@ pub struct App {
     first_token: Option<Instant>,
     stream_chars: usize,
     running_tool: Option<(String, String)>,
-    /// Since when the model request in flight has delivered nothing: set as
-    /// a request goes out and on each delta, cleared once its reply is done,
-    /// a tool runs or a retry waits. Past [`SERVER_SILENT_AFTER`] the spinner
-    /// says so.
+    /// Since when the model request in flight has streamed no reply text or
+    /// thinking: set as a request goes out, on each delta and on a retry,
+    /// cleared once its reply is done or a tool runs. Past
+    /// [`REPLY_QUIET_AFTER`] the spinner says so. Streamed tool arguments
+    /// reach no frontend, so the notice names the text, not the server.
     reply_wait: Option<Instant>,
     /// Pending mutating-tool gate: id, tool name, summary, detail preview.
     pending_approval: Option<(String, String, String, String, Vec<String>)>,
@@ -3139,7 +3140,9 @@ impl App {
                 // to the attempt that failed; the fresh attempt starts its
                 // own. The reason can carry a backend body; the note is one line.
                 self.clear_live_tail();
-                self.reply_wait = None;
+                // Counted from the retry: its backoff streams no text either,
+                // and the next attempt can stall before its first token.
+                self.reply_wait = Some(Instant::now());
                 self.note(&format!("{}; retrying ({attempt} of {max_attempts})", open_max_core::text::one_line(&reason)));
                 self.dirty.mark_tail();
             }
@@ -3875,10 +3878,10 @@ impl App {
             let elapsed = self.turn_started.map(|t| t.elapsed()).unwrap_or_default();
             let toks = self.tok_per_sec();
             let mut meta = format!(" {}", elapsed_label(elapsed));
-            let silent = self.reply_wait.map(|since| since.elapsed()).filter(|quiet| *quiet >= SERVER_SILENT_AFTER);
+            let silent = self.reply_wait.map(|since| since.elapsed()).filter(|quiet| *quiet >= REPLY_QUIET_AFTER);
             if let Some(quiet) = silent {
                 // Rates and hints describe a reply that is flowing; this one is not.
-                meta.push_str(&format!(" · server silent for {}s", quiet.as_secs()));
+                meta.push_str(&format!(" · no reply text for {}s", quiet.as_secs()));
             } else if toks > 0.0 {
                 meta.push_str(&format!(" · {toks:.0} tok/s"));
             }
@@ -7760,29 +7763,36 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A model request that has delivered nothing for 15 seconds says so on
-    /// the spinner line, with how long and that esc cancels; a delta, a
-    /// finished reply or a running tool takes it back.
+    /// A model request that has streamed no reply text for 15 seconds says
+    /// so on the spinner line, with how long and that esc cancels; a delta,
+    /// a finished reply or a running tool takes it back, and a retry counts
+    /// it again from the retry.
     #[test]
-    fn a_silent_server_is_named_on_the_spinner_after_15_seconds() {
+    fn a_quiet_reply_is_named_on_the_spinner_after_15_seconds() {
         let (mut app, dir) = app_fixture();
+        let quiet = |app: &mut App| buffer_text(&render_app(app, 80, 16)).contains("no reply text");
         app.running = true;
         app.turn_started = Some(std::time::Instant::now() - Duration::from_secs(40));
         app.on_agent_event(AgentEvent::Budget { used_tokens: 10, context_tokens: 8000 });
-        assert!(!buffer_text(&render_app(&mut app, 80, 16)).contains("silent"), "a fresh request is not silent");
+        assert!(!quiet(&mut app), "a fresh request is not quiet");
         app.reply_wait = Some(std::time::Instant::now() - Duration::from_secs(23));
         for width in [60u16, 80, 120] {
             let text = buffer_text(&render_app(&mut app, width, 16));
-            assert!(text.contains("server silent for 23s · esc to cancel"), "{width}: {text}");
+            assert!(text.contains("no reply text for 23s · esc to cancel"), "{width}: {text}");
         }
         app.on_agent_event(AgentEvent::Token { text: "hel".into() });
-        assert!(!buffer_text(&render_app(&mut app, 80, 16)).contains("silent"), "a delta ends the silence");
+        assert!(!quiet(&mut app), "a delta ends the quiet");
         app.reply_wait = Some(std::time::Instant::now() - Duration::from_secs(16));
-        assert!(buffer_text(&render_app(&mut app, 80, 16)).contains("server silent for 16s"), "a stall mid-reply counts");
-        app.on_agent_event(AgentEvent::ToolStart { call_id: "c".into(), name: "bash".into(), args: json!({"command": "make"}) });
-        assert!(app.reply_wait.is_none(), "a running tool is not the server");
+        assert!(buffer_text(&render_app(&mut app, 80, 16)).contains("no reply text for 16s"), "a stall mid-reply counts");
         app.on_agent_event(AgentEvent::Retry { attempt: 2, max_attempts: 8, reason: "502".into() });
-        assert!(app.reply_wait.is_none(), "a retry's wait is not the server's silence");
+        let since = app.reply_wait.expect("a retry restarts the clock");
+        assert!(since.elapsed() < Duration::from_secs(5) && !quiet(&mut app), "counted from the retry");
+        app.reply_wait = Some(std::time::Instant::now() - Duration::from_secs(16));
+        app.on_agent_event(AgentEvent::ToolStart { call_id: "c".into(), name: "bash".into(), args: json!({"command": "make"}) });
+        assert!(app.reply_wait.is_none() && !quiet(&mut app), "a running tool is not the reply");
+        app.reply_wait = Some(std::time::Instant::now() - Duration::from_secs(16));
+        app.on_agent_event(AgentEvent::MessageDone { text: "done".into() });
+        assert!(app.reply_wait.is_none(), "a finished reply stops the clock");
         fs::remove_dir_all(dir).unwrap();
     }
 

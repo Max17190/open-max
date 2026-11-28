@@ -35,9 +35,11 @@ headless and stdio trust.
 | **Ctrl+R** | Search this project's prompt history (each project keeps its own) |
 | **Ctrl+C** | Clear the current prompt when idle; press again to quit. Typing another key or pasting resets the quit confirmation |
 
-When a model request has delivered nothing for 15 seconds, the spinner line
-says how long the server has been silent, so a stalled reply reads
-differently from a slow one; **Esc** cancels the turn.
+When a model request has streamed no reply text or thinking for 15 seconds,
+counted from the request or its latest retry, the spinner line says for how
+long, so a stalled reply reads differently from a slow one; **Esc** cancels
+the turn. A reply that streams only a tool call's arguments shows no text
+while it does.
 
 ## Slash commands
 
