@@ -1823,6 +1823,166 @@ mod first_frame {
         assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
     }
 
+    /// A reply that ends the turn with `text`.
+    fn said(text: &str) -> String {
+        serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": text,
+        }}]})
+        .to_string()
+    }
+
+    /// A project whose test fails until greet.sh prints hello, the
+    /// repository examples/done-gate tries the gate in.
+    fn greet_project(project: &Path) {
+        std::fs::write(project.join("greet.sh"), "echo hullo\n").unwrap();
+        std::fs::write(
+            project.join("test.sh"),
+            "test \"$(sh greet.sh)\" = hello || { echo \"expected hello, got $(sh greet.sh)\"; exit 1; }\n",
+        )
+        .unwrap();
+    }
+
+    fn settled(shown: &str, last: &str) -> bool {
+        shown.contains(last) && !shown.contains("esc cancel")
+    }
+
+    /// In auto, /gate writes the files of examples/done-gate with the check
+    /// it is given: an end while the check fails is refused with its output,
+    /// the model works on, and the end after the fix is verified, which /gate
+    /// then shows. /gate off removes both files.
+    #[test]
+    fn gate_refuses_an_end_while_its_check_fails_and_verifies_the_end_after_the_fix() {
+        let fix = serde_json::json!({"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": null, "tool_calls": [{"id": "call-1", "type": "function", "function": {
+                "name": "write_file", "arguments": serde_json::json!({"path": "greet.sh", "content": "echo hello\n"}).to_string(),
+            }}],
+        }}]});
+        let base_url = endpoint(vec![said("Done."), fix.to_string(), said("Fixed.")]);
+        let settings =
+            serde_json::json!({"base_url": base_url, "model": "stub-model", "context_tokens": 16384}).to_string();
+        let (cols, rows) = (80, 40);
+        let mut s = Session::spawn_with("gate-auto", cols as u16, rows as u16, &settings);
+        let project = s.dir.join("project");
+        greet_project(&project);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| panic!("no first frame: {}", s.context()));
+        s.write(ANSWER);
+        s.write(b"/gate sh test.sh\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("runs from the next"));
+        assert!(shown.contains("completion gate set") && shown.contains("in auto it runs from the next"), "{shown}");
+        let hooks = project.join(".openmax/hooks");
+        let manifest = std::fs::read_to_string(hooks.join("done-gate.toml")).unwrap();
+        assert!(manifest.contains(r#"args = [".openmax/hooks/done-gate.sh", "sh test.sh"]"#), "{manifest}");
+        let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/done-gate/done-gate.sh");
+        assert_eq!(std::fs::read(hooks.join("done-gate.sh")).unwrap(), std::fs::read(example).unwrap());
+        s.write(b"Make greet.sh print hello.\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "Fixed."));
+        assert!(settled(&shown, "Fixed."), "the turn did not settle:\n{shown}");
+        assert!(shown.contains("turn_end gate 'done-gate' refused completion"), "{shown}");
+        assert!(shown.contains("Not done: `sh test.sh` exits 1.") && shown.contains("expected hello, got hullo"), "{shown}");
+        assert_eq!(std::fs::read_to_string(project.join("greet.sh")).unwrap(), "echo hello\n");
+        s.write(b"/gate\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which was verified"));
+        assert!(shown.contains("which was verified") && shown.contains("ok: hook on blocking turn_end"), "{shown}");
+        s.write(b"/gate off\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("gate removed"));
+        assert!(shown.contains("removed .openmax/hooks/done-gate.toml and done-gate.sh"), "{shown}");
+        assert!(!hooks.join("done-gate.toml").exists() && !hooks.join("done-gate.sh").exists());
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+    }
+
+    /// In ask, a hook runs only once a person approves its exact content.
+    /// /gate typed at the terminal is that act, as `openmax --approve` is:
+    /// the gate refuses each failing end until its three refusals are spent
+    /// and the turn ends unverified, and once a person fixes the code the
+    /// next end is verified. /gate off will not delete an approved gate, which
+    /// would fail every tool call closed, and names the command that retires
+    /// its approval first.
+    #[test]
+    fn in_ask_a_gate_typed_at_the_terminal_is_approved_and_judges_the_next_turn() {
+        let base_url = endpoint((0..5).map(|_| said("Done.")).collect());
+        let (cols, rows) = (120, 40);
+        let mut s = Session::spawn_home("gate-ask", cols as u16, rows as u16, |home, cmd, _, _| {
+            let settings = serde_json::json!({"base_url": base_url, "model": "stub-model", "context_tokens": 16384});
+            std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+            cmd.args(["--trust-project", "--permissions", "ask"]);
+        });
+        let project = s.dir.join("project");
+        greet_project(&project);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| panic!("no first frame: {}", s.context()));
+        s.write(ANSWER);
+        s.write(b"/gate sh test.sh\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("approved its exact"));
+        assert!(shown.contains("approved its exact content, as openmax --approve would"), "{shown}");
+        s.write(b"Make greet.sh print hello.\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "ended unverified"));
+        assert!(settled(&shown, "ended unverified") && shown.contains("refusal 3 of this turn"), "{shown}");
+        assert!(shown.contains("expected hello, got hullo"), "{shown}");
+        s.write(b"/gate\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which then ended"));
+        assert!(shown.contains("which then ended unverified"), "{shown}");
+        std::fs::write(project.join("greet.sh"), "echo hello\n").unwrap();
+        s.write(b"Check again.\r");
+        let answered = |shown: &str| shown.split_once("Check again.").is_some_and(|(_, after)| settled(after, "Done."));
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), answered);
+        assert!(answered(&shown), "{shown}");
+        s.write(b"/gate\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which was verified"));
+        assert!(shown.contains("which was verified") && shown.contains("ok: hook on blocking turn_end"), "{shown}");
+        s.write(b"/gate off\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("--forget .openmax/hooks/done-gate.toml"));
+        assert!(shown.contains("openmax --forget .openmax/hooks/done-gate.toml"), "{shown}");
+        assert!(project.join(".openmax/hooks/done-gate.toml").exists(), "an approved gate was deleted");
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+    }
+
+    /// A terminal UI an agent session started carries its marker, and there
+    /// /gate approves nothing, as `openmax --approve` refuses there: in ask
+    /// the gate is written, stays inert, and the note names the command a
+    /// person runs to approve it.
+    #[test]
+    fn a_gate_set_from_a_session_an_agent_started_is_not_approved() {
+        let base_url = endpoint(vec![said("Done.")]);
+        let (cols, rows) = (60, 40);
+        let mut s = Session::spawn_home("gate-agent", cols as u16, rows as u16, |home, cmd, _, _| {
+            let settings = serde_json::json!({"base_url": base_url, "model": "stub-model", "context_tokens": 16384});
+            std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+            let project = home.parent().unwrap().parent().unwrap().join("project");
+            let grant = Command::new(env!("CARGO_BIN_EXE_openmax"))
+                .args(["--trust-project", "--permissions", "ask"])
+                .current_dir(&project)
+                .env("HOME", home.parent().unwrap())
+                .env_remove("OPENMAX_SESSION")
+                .env("OPENMAX_HUMAN_ATTEST", "1")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(grant.status.success(), "{grant:?}");
+            cmd.env("OPENMAX_SESSION", "parent-session");
+        });
+        let project = s.dir.join("project");
+        greet_project(&project);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| panic!("no first frame: {}", s.context()));
+        s.write(ANSWER);
+        s.write(b"/gate sh test.sh\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("not approved"));
+        assert!(shown.contains("not approved") && shown.contains("agent session"), "{shown}");
+        assert!(shown.contains("openmax --approve"), "{shown}");
+        assert!(project.join(".openmax/hooks/done-gate.toml").exists());
+        s.write(b"Make greet.sh print hello.\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "Done."));
+        assert!(settled(&shown, "Done.") && !shown.contains("refused completion"), "{shown}");
+        s.write(b"/gate\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("reports it as"));
+        assert!(shown.contains("err: inert"), "{shown}");
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+    }
+
     /// A tool that lands between turns (through a pull, or written by a turn
     /// that was cancelled before its refreeze) becomes callable, with no card
     /// in auto, at the next turn start, or on `/reload` if that runs first.

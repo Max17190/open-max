@@ -338,6 +338,9 @@ pub struct App {
     /// Whether the session replayed was compacted, so edits from before
     /// the compaction reach no tool block and /diff cannot list them.
     compacted_before_replay: bool,
+    /// How the completion gate /gate installs judged this session's latest
+    /// end of a turn, for /gate to show; None until it judged one.
+    gate_verdict: Option<&'static str>,
     /// Messages typed while the agent works, shown in the strip above the
     /// composer. The oldest `steered` were sent to the running turn and leave
     /// on its SteerAccepted; the rest (typed during a compaction, or after
@@ -782,6 +785,7 @@ impl App {
             file_index_pending: false,
             templates: Vec::new(),
             compacted_before_replay: false,
+            gate_verdict: None,
             queued: Vec::new(),
             steered: 0,
             flush_queue: false,
@@ -1060,6 +1064,7 @@ impl App {
         self.model_picker = None;
         self.pending_diffs.clear();
         self.compacted_before_replay = false;
+        self.gate_verdict = None;
         self.tool_meta.clear();
         self.last_tool_output = None;
         self.last_assistant_response = None;
@@ -2292,7 +2297,7 @@ impl App {
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
             let builtin = head == "exit" || completion::shadows_templates(head);
-            // Built-ins win, /diff aside; anything else may be a prompt template, whose
+            // Built-ins win, TEMPLATE_WINS aside; anything else may be a prompt template, whose
             // expansion submits as a normal user message. The expansion itself
             // is the same helper --print and --stdio submit through, so the
             // three front ends cannot drift.
@@ -2808,6 +2813,27 @@ impl App {
                 self.transcript.show_latest_from_start();
                 self.dirty.mark_chat();
             }
+            "gate" => {
+                let arg = raw_rest.trim();
+                // A running turn's tools could rewrite the files between
+                // their write and their approval, and the gate would judge
+                // an end whose turn it did not see start.
+                if self.running && !arg.is_empty() {
+                    return self.note("finish or cancel the turn before /gate changes the gate; /gate alone shows it");
+                }
+                let ctx = crate::gate::Context {
+                    project: self.project.clone(),
+                    data_dir: self.core.data_dir.clone(),
+                    mode: self.approval_mode(),
+                    session: self.session_id.clone(),
+                    human: crate::require_human("approving a completion gate", &crate::gate::approve_command(&self.project)),
+                    last: self.gate_verdict,
+                };
+                let arg = arg.to_string();
+                self.spawn_listing(async move {
+                    tokio::task::spawn_blocking(move || crate::gate::run(&ctx, &arg)).await.unwrap_or_default()
+                });
+            }
             "quit" | "exit" => self.should_quit = true,
             other => match HABITS.iter().find(|(names, _)| names.contains(&other)) {
                 Some((_, pointer)) => self.note(&format!("/{other} is not a command here; {pointer}")),
@@ -2888,7 +2914,11 @@ impl App {
             self.flush_queue = false;
             if !self.running && self.pending_approval.is_none() && !self.queued.is_empty() {
                 let text = self.queued.remove(0);
-                let _ = self.handle_submit(text.clone()).await;
+                // A queued entry already went through handle_submit, which
+                // expanded any template, so it is a prompt: a body that
+                // starts with `/` is not dispatched again as a command.
+                self.refresh_project_root();
+                self.submit_prompt(text.clone());
                 if !self.running {
                     // The turn never started (server stopped, start error):
                     // nothing will drain the rest, so hand it all back.
@@ -3227,6 +3257,9 @@ impl App {
                 self.note(&format!("hook '{hook}' failed on {event}: {detail}"));
             }
             AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
+                if hook == crate::gate::NAME {
+                    self.gate_verdict = Some(GATE_REFUSED);
+                }
                 // The refusal is already a user message on disk, so a resumed
                 // session replays it as one; pushing the same block live keeps
                 // the view being watched and the view being replayed the same
@@ -3243,7 +3276,11 @@ impl App {
                 self.refilter_scroll_search_live();
             }
             // A record for callers (the event log, `--json`, stdio), not a line on every turn's end.
-            AgentEvent::TurnVerified { .. } => {}
+            AgentEvent::TurnVerified { hooks } => {
+                if hooks.iter().any(|hook| hook == crate::gate::NAME) {
+                    self.gate_verdict = Some("it passed the latest end of a turn in this session, which was verified");
+                }
+            }
             AgentEvent::SteerAccepted { text } => {
                 // The steer leaves the queue strip for its place in the
                 // transcript, the one a resumed session replays it at.
@@ -3288,9 +3325,14 @@ impl App {
                     "budget_exhausted" => self.note(
                         "stopped: reached the token budget for one turn (send a follow-up to continue)",
                     ),
-                    "unverified" => self.note(
-                        "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
-                    ),
+                    "unverified" => {
+                        if self.gate_verdict == Some(GATE_REFUSED) {
+                            self.gate_verdict = Some("it refused the latest end of a turn in this session, which then ended unverified");
+                        }
+                        self.note(
+                            "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
+                        )
+                    }
                     "error" => {}
                     "blocked" => {
                         // Core never accepted the text: drop the optimistic
@@ -4136,12 +4178,16 @@ fn note_body(text: &str) -> &str {
     text.strip_prefix('[').and_then(|body| body.strip_suffix(']')).unwrap_or(text)
 }
 
+/// What /gate says after the gate it installs refused an end of a turn.
+const GATE_REFUSED: &str = "it refused the latest end of a turn in this session";
+
 /// Commands habit from other terminal agents suggests, each with where the
 /// same thing lives here, so typing one gets a pointer, not "unknown command".
 const HABITS: &[(&[&str], &str)] = &[
     (&["undo"], "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files, to the end of a turn"),
     (&["sessions", "history"], "/resume lists this project's sessions"),
     (&["config", "settings"], "settings live in ~/.openmax/settings.json, and openmax --spec settings describes each one"),
+    (&["hooks"], "hooks are files in .openmax/hooks/ (openmax --check lists them); /gate <check> installs a completion gate there"),
 ];
 
 /// Single source of truth for `/help` and onboarding copy.
@@ -5022,6 +5068,7 @@ mod tests {
             ("undo", "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files"),
             ("sessions", "/resume lists"),
             ("settings", "settings live in ~/.openmax/settings.json"),
+            ("hooks", "hooks are files in .openmax/hooks/ (openmax --check lists them); /gate <check> installs a completion gate there"),
         ] {
             app.handle_submit(format!("/{typed}")).await.unwrap();
             let shown = app.transcript.export_text();
@@ -7719,6 +7766,29 @@ mod tests {
         assert!(app.flush_queue, "the entry behind the blocked steer goes out after the turn");
         assert_eq!(app.queued, vec!["after".to_string()], "and only that entry");
         assert_eq!(app.composer.text(), "steer\ndraft", "the blocked steer stays the user's to edit");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// /gate changes no gate while a turn runs, where the turn's tools could
+    /// rewrite its files between their write and their approval. And only a
+    /// line a person submits runs a command: an entry queued behind a turn
+    /// (a template's body among them) that begins with `/gate` goes out after
+    /// the turn as a prompt and writes no hook.
+    #[tokio::test]
+    async fn gate_waits_for_the_turn_and_a_queued_entry_never_runs_it() {
+        let (mut app, dir) = app_fixture();
+        let manifest = dir.join(".openmax/hooks/done-gate.toml");
+        app.running = true;
+        app.slash("gate cargo test").await;
+        assert!(app.transcript.export_text().contains("finish or cancel the turn before /gate changes the gate"));
+        app.running = false;
+        app.queued = vec!["/gate true".into()];
+        app.flush_queue = true;
+        let event = AgentEvent::Error { message: "unrelated".into() };
+        app.on_core_event(open_max_core::types::AgentEventEnvelope { session_id: "another".into(), event }).await;
+        assert!(app.queued.is_empty() || app.composer.text() == "/gate true", "the entry went out as a prompt or came back");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!manifest.exists(), "a queued entry ran /gate");
         fs::remove_dir_all(dir).unwrap();
     }
 

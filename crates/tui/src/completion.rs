@@ -83,6 +83,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     command("copy", "", "copy the latest assistant response", true),
     command("diff", "[all]", "files the edit and write tools changed · all: the combined diff", true),
+    command("gate", "[check|off]", "hold each turn's end to a check · alone: the gate's state · off: remove it", false),
     command(
         "export",
         "[path]",
@@ -124,8 +125,9 @@ pub const COMMANDS: &[CommandSpec] = &[
 
 /// Built-ins a prompt template of the same name takes over. /diff pointed to
 /// git diff before it was a command, and a template named diff ran in its
-/// place then, so it still does.
-pub const TEMPLATE_WINS: &[&str] = &["diff"];
+/// place then, so it still does; a template named gate ran before /gate
+/// was a command, so it does too.
+pub const TEMPLATE_WINS: &[&str] = &["diff", "gate"];
 
 /// Whether built-in `name` runs ahead of a prompt template with that name.
 pub fn shadows_templates(name: &str) -> bool {

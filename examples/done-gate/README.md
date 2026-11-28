@@ -8,7 +8,10 @@ the end stands.
 
 They are a completion gate, a `turn_end` hook with `blocking = true`
 ([hooks](../../docs/extending.md#hooks)). Nothing here is new to Open Max; this
-directory is the smallest set of files that turns the gate on.
+directory is the smallest set of files that turns the gate on. In the terminal
+UI, `/gate <check>` writes these two files into `.openmax/hooks/` with your
+check in place ([slash commands](../../docs/usage.md#slash-commands)), and
+`/gate off` removes them; copying them by hand, as below, gives the same gate.
 
 - `done-gate.toml`: the hook. Its `args` line names your check.
 - `done-gate.sh`: runs the check with `sh -c` in the project root, exits 0
@@ -44,6 +47,16 @@ same way.
 
 ## Use it on your project
 
+In the terminal UI, in the project:
+
+```text
+/gate npm test
+```
+
+`/gate` alone then shows the check, the state `openmax --check` reports for it
+and how it judged the session's latest end; `/gate off` removes it. Or copy the
+files yourself:
+
 ```sh
 mkdir -p .openmax/hooks
 cp ~/open-max/examples/done-gate/done-gate.toml ~/open-max/examples/done-gate/done-gate.sh .openmax/hooks/
@@ -71,7 +84,13 @@ openmax --approve .openmax/hooks/done-gate.toml
 ```
 
 That approves the manifest and the script it runs in one act and prints both
-hashes. An edit to either file revokes the approval, and an approved gate that
+hashes. `/gate <check>` typed in the terminal UI approves the files it writes
+the same way, through the same code, unless the session was started by an
+agent, where `openmax --approve` refuses too; then it names this command.
+`/gate off` leaves an approved gate in place and names `openmax --forget`,
+since deleting it would fail closed as below.
+
+An edit to either file revokes the approval, and an approved gate that
 changed fails closed: tool calls are refused and every turn ends `unverified`
 until the approved content is back or you approve the new content. So in `ask` an edit that swaps your check for one that passes
 turns every end `unverified` instead of passing. In `auto` no approval is
@@ -113,3 +132,9 @@ refused with the test's output, and the end after the fix is recorded as
 three refusals; and in `ask` the gate is inert until `openmax --approve`, then
 refuses, then verifies once a person fixes the code, and an edit to the
 approved hook makes the next end `unverified`.
+
+`cargo test -p openmax --test frame_io gate` drives `/gate` in the terminal UI
+the same way, on a pseudo-terminal: in `auto` a failing end is refused and the
+end after the fix is verified; in `ask` the gate typed there is approved,
+refuses until its refusals are spent, and verifies once the code is fixed; and
+in a session an agent started it is written but not approved.

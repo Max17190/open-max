@@ -133,7 +133,8 @@ The child is one session in a new git worktree of the repository at HEAD, truste
 
 Three drop-in examples add common habits with files you copy into a project,
 each with a README and a test: [done-gate](../examples/done-gate/README.md)
-refuses a turn's end while a command you name fails,
+refuses a turn's end while a command you name fails (`/gate <command>` in the
+terminal UI installs it for you),
 [mcp-tool](../examples/mcp-tool/README.md) adopts an MCP server as one tool and
 one skill, and [plan-template](../examples/plan-template/README.md) adds a
 `/plan` command that writes `PLAN.md` before any edit.

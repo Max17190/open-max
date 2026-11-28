@@ -96,8 +96,10 @@ terms. See [getting started](getting-started.md),
 
 Hold the end of every turn to your test command with a completion gate: while
 the command fails, Open Max refuses the end and sends the failure back to the
-model. [examples/done-gate](../examples/done-gate/README.md) is the two files
-to copy. For a script or CI job that must judge the result itself, see
+model. In the terminal UI, `/gate <command>` installs one for the project
+(`/gate make test`, say), and `/gate off` removes it; it writes the two files of
+[examples/done-gate](../examples/done-gate/README.md), which you can also copy
+by hand. For a script or CI job that must judge the result itself, see
 [hold a run to your own checks](verified-execution.md).
 
 ## How does it remember, and how do I see what it remembers?

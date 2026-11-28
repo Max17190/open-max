@@ -4,6 +4,7 @@ mod clipboard;
 mod chatgpt;
 mod setup;
 mod completion;
+mod gate;
 mod headless;
 mod input;
 mod leftover;
@@ -469,6 +470,75 @@ fn require_human(what: &str, repair: &str) -> Result<(), String> {
 /// failed on a path fragment (reproduced).
 fn approve_command(path: &std::path::Path) -> String {
     format!("openmax --approve {}", open_max_core::doctor::shell_quote(path))
+}
+
+/// One approval act on a capability file: `bytes`, the manifest as read, and
+/// the code it names, recorded together. `openmax --approve` and `/gate` both
+/// approve through here, so the terminal UI grants exactly what the command
+/// does. `vouched_code`, when given, is every hash the code must have: the
+/// caller wrote that code itself, and anything else on disk is refused, not
+/// approved. `session` records the act as one a person took in that session.
+/// Returns the lines that tell the person what was approved.
+fn approve_file(
+    data_dir: &std::path::Path,
+    project: &std::path::Path,
+    file: &std::path::Path,
+    bytes: &[u8],
+    vouched_code: Option<&[String]>,
+    session: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let path = file.display();
+    let sha = open_max_core::ledger::sha256_hex(bytes);
+    // A manifest is a pointer: the file it names is the code that runs,
+    // and it sits at an ordinary project path the agent writes freely. So
+    // approving the manifest approves that code in the same act - and
+    // prints it, because a human cannot bless bytes they were not shown.
+    // The code list comes from the bytes just hashed, not a second read:
+    // two reads are an interval a concurrent write can split, putting one
+    // file's hash on record next to another file's code.
+    let code = std::str::from_utf8(bytes)
+        .map(|text| open_max_core::ledger::manifest_code_source(file, text, project))
+        .unwrap_or_default();
+    let mut shas = vec![sha.clone()];
+    for entry in &code {
+        let Some(code_sha) = &entry.sha256 else {
+            return Err(format!(
+                "{path} runs {}, which cannot be read; create it first, then approve them together",
+                entry.path.display()
+            ));
+        };
+        shas.push(code_sha.clone());
+    }
+    if vouched_code.is_some_and(|vouched| vouched != &shas[1..]) {
+        return Err(format!("the code {path} runs is not the code just written; nothing was approved"));
+    }
+    match session {
+        Some(id) => open_max_core::ledger::approve_capability_in_session(data_dir, project, file, &shas, id),
+        None => open_max_core::ledger::approve_capability(data_dir, project, file, &shas),
+    }?;
+    // The one screen a human reads before vouching for bytes, so
+    // no path it lists may forge a line and claim a file the
+    // approval does not cover.
+    let mut lines = vec![open_max_core::text::one_line(&format!("approved {path} ({})", &sha[..12]))];
+    for entry in &code {
+        let code_sha = entry.sha256.clone().unwrap_or_default();
+        lines.push(open_max_core::text::one_line(&format!(
+            "  and the code it runs: {} ({})",
+            entry.path.display(),
+            &code_sha[..12.min(code_sha.len())]
+        )));
+    }
+    if !code.is_empty() {
+        lines.push("editing either revokes this approval; re-run --approve after any change".into());
+    }
+    // Absolute for the dir comparison: the hook-dir check
+    // matches parents against absolute discovery dirs, and the
+    // CLI accepts a project-relative path.
+    let shape_path = if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
+    if let Some(line) = open_max_core::hooks::approved_shape_line(&shape_path, project, data_dir, bytes) {
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 /// The one operation a command line names, None for the interactive
@@ -1328,59 +1398,9 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 std::process::exit(1);
             }
         };
-        let sha = open_max_core::ledger::sha256_hex(&bytes);
-        // A manifest is a pointer: the file it names is the code that runs,
-        // and it sits at an ordinary project path the agent writes freely. So
-        // approving the manifest approves that code in the same act - and
-        // prints it, because a human cannot bless bytes they were not shown.
-        // The code list comes from the bytes just hashed, not a second read:
-        // two reads are an interval a concurrent write can split, putting one
-        // file's hash on record next to another file's code.
-        let code = std::str::from_utf8(&bytes)
-            .map(|text| open_max_core::ledger::manifest_code_source(file, text, &project))
-            .unwrap_or_default();
-        let mut shas = vec![sha.clone()];
-        for entry in &code {
-            let Some(code_sha) = &entry.sha256 else {
-                eprintln!(
-                    "openmax: {path} runs {}, which cannot be read; create it first, then approve them together",
-                    entry.path.display()
-                );
-                std::process::exit(1);
-            };
-            shas.push(code_sha.clone());
-        }
-        match open_max_core::ledger::approve_capability(&data_dir, &project, file, &shas) {
-            Ok(()) => {
-                // The one screen a human reads before vouching for bytes, so
-                // no path it lists may forge a line and claim a file the
-                // approval does not cover.
-                println!(
-                    "{}",
-                    open_max_core::text::one_line(&format!("approved {path} ({})", &sha[..12]))
-                );
-                for entry in &code {
-                    let code_sha = entry.sha256.clone().unwrap_or_default();
-                    println!(
-                        "{}",
-                        open_max_core::text::one_line(&format!(
-                            "  and the code it runs: {} ({})",
-                            entry.path.display(),
-                            &code_sha[..12.min(code_sha.len())]
-                        ))
-                    );
-                }
-                if !code.is_empty() {
-                    println!("editing either revokes this approval; re-run --approve after any change");
-                }
-                // Absolute for the dir comparison: the hook-dir check
-                // matches parents against absolute discovery dirs, and the
-                // CLI accepts a project-relative path.
-                let shape_path =
-                    if file.is_absolute() { file.to_path_buf() } else { project.join(file) };
-                if let Some(line) =
-                    open_max_core::hooks::approved_shape_line(&shape_path, &project, &data_dir, &bytes)
-                {
+        match approve_file(&data_dir, &project, file, &bytes, None, None) {
+            Ok(lines) => {
+                for line in lines {
                     println!("{line}");
                 }
                 std::process::exit(0);
