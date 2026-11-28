@@ -130,9 +130,18 @@ fn install(ctx: &Context, check: &str) -> Result<Vec<String>, String> {
     // An approved gate whose bytes change fails closed outside auto, so it
     // is changed only where the change can be approved in the same act.
     let changes = current.as_deref().is_some_and(|current| current != text);
-    if let (Err(why), true) = (&ctx.human, ctx.mode != ApprovalMode::Auto && changes) {
-        if was_approved(ctx, &manifest_path)? {
-            return Err(format!("the gate here is approved and this process cannot approve a change to it, which would make every tool call fail closed; nothing was changed: {why}"));
+    let replaces_approved = ctx.mode != ApprovalMode::Auto && changes && was_approved(ctx, &manifest_path)?;
+    if let (Err(why), true) = (&ctx.human, replaces_approved) {
+        return Err(format!("the gate here is approved and this process cannot approve a change to it, which would make every tool call fail closed; nothing was changed: {why}"));
+    }
+    // Every file the check names must be readable to be approved with it,
+    // so a check that names one that is not is refused before anything is
+    // written, as `openmax --approve` would refuse it after.
+    if ctx.mode != ApprovalMode::Auto && ctx.human.is_ok() {
+        let code = open_max_core::ledger::manifest_code_source(&manifest_path, &text, &ctx.project);
+        let same = |at: &Path| at == script_path || at.canonicalize().ok() == script_path.canonicalize().ok();
+        if let Some(missing) = code.iter().find(|entry| entry.sha256.is_none() && !same(&entry.path)) {
+            return Err(format!("the check runs {}, which cannot be read; create it, then run /gate again; nothing was changed", missing.path.display()));
         }
     }
     let script = read(&script_path)?;
@@ -166,6 +175,15 @@ fn install(ctx: &Context, check: &str) -> Result<Vec<String>, String> {
         Ok(approved) => {
             lines.push("approved its exact content, as openmax --approve would; it runs from the next turn".into());
             lines.extend(approved);
+        }
+        // The approved gate it replaced stands again: the new bytes no one
+        // approved would otherwise fail every tool call closed.
+        Err(why) if replaces_approved => {
+            let restored = current.as_deref().map(|bytes| open_max_core::sessions::write_atomic(&manifest_path, bytes));
+            return Err(match restored {
+                Some(Ok(())) => format!("not approved: {why}; the approved gate was put back, so nothing changed"),
+                _ => format!("not approved: {why}; and the approved gate could not be put back, so tool calls fail closed until `{}` runs in a terminal", approve_command(&ctx.project)),
+            });
         }
         Err(why) => {
             lines.push(format!("not approved: {why}"));
@@ -375,6 +393,34 @@ mod tests {
         let bytes = std::fs::read(&manifest_path).unwrap();
         let refused = crate::approve_file(&ctx.data_dir, &ctx.project, &manifest_path, &bytes, vouched, None);
         assert!(refused.is_err_and(|why| why.contains("is not the file just written")));
+        std::fs::remove_dir_all(ctx.project.parent().unwrap()).unwrap();
+    }
+
+    /// Replacing an approved gate either approves the new check or leaves
+    /// the approved one standing: a check that runs a file that cannot be
+    /// read, or a ledger that cannot record the change, is refused before
+    /// anything is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_change_to_an_approved_gate_is_approved_or_undone() {
+        let mut ctx = context(ApprovalMode::Ask);
+        ctx.human = Ok(());
+        let manifest_path = ctx.project.join(MANIFEST);
+        assert!(text(&run(&ctx, "npm test")).contains("approved its exact content"));
+        let approved = std::fs::read(&manifest_path).unwrap();
+        let unreadable = ctx.project.join("check.sh");
+        std::fs::write(&unreadable, "exit 0\n").unwrap();
+        std::fs::set_permissions(&unreadable, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let shown = text(&run(&ctx, "./check.sh"));
+        assert!(shown.contains("the check runs ") && shown.contains("check.sh, which cannot be read"), "{shown}");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), approved);
+        // A ledger that cannot be read could not record the change either,
+        // so the approved gate is not touched.
+        let log = std::fs::read_dir(ctx.data_dir.join("ledger")).unwrap().next().unwrap().unwrap().path().join("log.jsonl");
+        std::fs::write(&log, "not a record\n").unwrap();
+        let shown = text(&run(&ctx, "make test"));
+        assert!(shown.contains("cannot read the capability ledger") && shown.contains("nothing was changed"), "{shown}");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), approved);
         std::fs::remove_dir_all(ctx.project.parent().unwrap()).unwrap();
     }
 }
