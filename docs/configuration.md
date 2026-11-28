@@ -220,8 +220,21 @@ and the run that writes a key already uses it.
   `max_tokens`, which is the model's longest reply. Declaring it keeps the
   default limit as each request's first ask. A `max_tokens` other than 4096 in
   settings.json is both the limit and a ceiling (within the entry's). With
-  neither, the ceiling is four times the default (16384). A limit at its
-  ceiling asks for no room, and a cut call is asked for in parts.
+  neither, the ceiling is four times the default (16384), except on two direct
+  connections: Responses at `https://api.openai.com` with an API key (not the
+  subscription route), and native Messages at `https://api.anthropic.com`.
+  These servers report every reply they cut and refuse a limit over the
+  model's own maximum, so their ceiling is the larger of 16384 and a quarter
+  of the window (the cap setup puts on a maximum a catalog reports), still
+  within the room the prompt leaves. Another server on the same protocol
+  keeps 16384, unless its provider entry declares
+  `"compat": { "reports_cuts": true }` (below), which gives it every rule this
+  page states for the two direct APIs. So with no `max_tokens` on the entry, a thought there that
+  never ends can bill up to about one and a half times the window in output
+  before the turn ends `length` (531,072 tokens in a 400,000-token window),
+  unless the server refuses a raise first; the entry's `max_tokens` bounds it
+  by the model's own maximum instead.
+  A limit at its ceiling asks for no room, and a cut call is asked for in parts.
 
   A reasoning model's reasoning counts toward the limit, so at 4096 a reply
   can be cut inside its reasoning, with no text and no call. A reply cut
@@ -250,17 +263,31 @@ and the run that writes a key already uses it.
   tool call, the limit doubles for each further one, up to the ceiling, and
   the note names the next limit; the first reply it does not cut returns it
   to its start. So a model that must think longer than the limit is not
-  stopped by the limit alone. A server that refuses a raised limit (HTTP 400
-  or 422) gets the request again at the usual limit, then at the reserve if
-  refused again above it, with no more raises in that turn. Once the limit cannot grow, after four such continuations a
-  fifth cut reply ends the turn with `length` (so does a cut on the turn's
+  stopped while the limit can still grow. If one of the two direct APIs
+  refuses a raised limit (HTTP 400 or 422), the request goes again at the
+  last limit that server accepted, and the rest of the turn stays there,
+  raised no further. Any other server that refuses a raise gets the request
+  again at the usual limit, then at the reserve if refused again above it,
+  with no more raises in that turn. Once the limit cannot grow, the fourth
+  cut reply in a row after that ends the turn with `length`: the fifth reply
+  cut at a limit that starts at its ceiling, the fourth at one a raise took
+  there (so does a cut on the turn's
   last iteration), and the terminal UI and print mode say which
   `max_tokens` cut it and where it is set (the cut note and the refused
   call name the limit that request carried). Send a follow-up to continue.
   A reply cut while writing its text gets a note that asks for the text to
   be continued from where it stopped. On a Responses connection a reply the
   server reports incomplete at its output limit is continued the same way;
-  a call in it is not kept.
+  a call in it is not kept. A server can also stop at the limit without
+  saying so, so on any server but the two direct APIs above and the
+  subscription route, a reply with no call that spends at least 70% of the
+  limit on reasoning (or output, if reasoning is not counted separately) is
+  read as a cut thought. On the two direct APIs, a reply the server reports
+  complete stands even at the limit, its calls included. One with no text
+  and no call is no answer however long its thought: it is asked for once
+  more, and the turn ends `empty` unless the replies after it stop past half
+  the limit within a token of where an earlier one did, which is read as a
+  cut the server did not report.
 
   When a complete reply looks like a tool call written as text, Open Max
   keeps the reply and asks the model to use the API only if the task requires
@@ -459,14 +486,16 @@ tokens. So the limit each request carries and the room held back from the
 input budget are two numbers: set to a model's longest reply, `max_tokens`
 no longer holds that much input back, and a model whose longest reply is as
 large as its window keeps seven eighths of it for input instead of about a
-thousand tokens. A reply that reaches the limit its request carried is cut as at any limit.
+thousand tokens. A reply that reaches the limit its request carried is read as at any limit.
 
 If a request carries a limit above the reserve and the
 server returns HTTP 400 or 422, Open Max tries once more at the reserve,
 regardless of the error text. A refusal that names a length problem can
 trigger the same retry with another status. A request that carried room
 after a cut call or text, or a raised limit, first goes again at the usual
-limit if that is lower. These retries count toward `max_agent_iterations`,
+limit if that is lower; a raise one of the two direct APIs refuses goes
+again at the last limit that server accepted instead, as described above.
+These retries count toward `max_agent_iterations`,
 and any reasoning or image repair follows them at the reduced limit if an
 iteration is left. If a status-only retry succeeds at the reserve, later
 requests in the same turn stay there. If recovery from a status-only refusal
@@ -733,6 +762,33 @@ unchanged structured reasoning blocks contain the same text. OpenRouter's Chat
 Completions endpoint uses this format automatically. Enable it for a proxy
 only if it accepts structured reasoning blocks on their own.
 
+`compat.reports_cuts: true` declares that a Responses or native Messages
+server behaves as the two direct APIs do: it reports every reply it cuts at
+the output limit (`response.incomplete` for `max_output_tokens`, or
+`stop_reason` `max_tokens`) and refuses a limit over the model's own maximum.
+A pass-through proxy in front of one of them does, such as a company gateway
+or a metering proxy that hands on the vendor's replies and errors unchanged.
+The entry then gets the reply limit rules of the two direct APIs: a reply the
+server reports complete is the answer however much of the limit it spent, the
+ceiling with no `max_tokens` on the model entry is a quarter of the window,
+and a refused raise keeps the last limit the server accepted. It defaults to
+false, which leaves each server the rule its host gives it: on only for
+`https://api.openai.com` (Responses with an API key) and
+`https://api.anthropic.com` (native Messages). Declare it only for a server
+you know reports its cuts: one that stops at the limit and calls the reply
+complete would have its cut text taken as the final answer. It has no effect
+on the subscription route, which sends no limit, or on Chat Completions.
+That protocol can report a cut (`finish_reason` `length`), but servers that
+implement it differ, and some stop at the limit and say `stop`, which is why
+a reply there with no call that spends 70% of the limit or more on its
+thought is read as cut. No server on that protocol is trusted by its host
+either, so the declaration has no host rule to extend there. `openmax --check`
+names the ceiling the declaration gives. For example:
+
+```json
+"compat": { "reports_cuts": true }
+```
+
 `wire_api` defaults to `chat_completions`, preserving existing requests.
 An explicit `responses` selects the Responses protocol. The ChatGPT setup
 command writes this field with `chatgpt_account`; other endpoints may use
@@ -916,8 +972,8 @@ catalog reports the model's output maximum (`max_completion_tokens`,
 setup writes the model entry's `max_tokens`: that maximum, capped at a
 quarter of the window (the cap is never under the 4096 default, so a model
 whose own maximum is lower gets that maximum). A catalog that reports no maximum gets no guess,
-and `openmax --check` then warns that the model runs at the default. Setup
-never replaces a `max_tokens` the entry already has. An endpoint without a
+and `openmax --check` then warns that the model runs at the default and
+names the most a raise can reach on that connection. Setup never replaces a `max_tokens` the entry already has. An endpoint without a
 model-list route can be configured with an exact model ID; setup reports
 that access was not verified.
 The selected model is added to the saved catalog, preserving its other models.

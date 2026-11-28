@@ -36,6 +36,8 @@ pub struct CompatFlags {
     pub omit_temperature: bool,
     /// Omit duplicate plaintext reasoning on compatible Chat Completions routes.
     pub prefer_reasoning_details: bool,
+    /// Declares that this Responses or native Messages server, such as a pass-through proxy, reports every cut like the vendor's own.
+    pub reports_cuts: bool,
 }
 
 // serde default for send_stream_options is false via Default; we want true when
@@ -47,6 +49,7 @@ struct CompatFlagsFile {
     send_stream_options: Option<bool>,
     omit_temperature: Option<bool>,
     prefer_reasoning_details: Option<bool>,
+    reports_cuts: Option<bool>,
 }
 
 impl From<CompatFlagsFile> for CompatFlags {
@@ -56,6 +59,7 @@ impl From<CompatFlagsFile> for CompatFlags {
             send_stream_options: f.send_stream_options.unwrap_or(true),
             omit_temperature: f.omit_temperature.unwrap_or(false),
             prefer_reasoning_details: f.prefer_reasoning_details.unwrap_or(false),
+            reports_cuts: f.reports_cuts.unwrap_or(false),
         }
     }
 }
@@ -68,6 +72,11 @@ pub enum WireApi {
     ChatCompletions,
     Responses,
     Anthropic,
+}
+
+impl WireApi {
+    /// Whether `base` is this wire's vendor's own server, which reports every reply it cuts and refuses a limit over the model's, or one `declared` to behave so; never on Chat Completions, where some servers stop at the limit silently.
+    fn reports_cuts(self, base: &str, declared: bool) -> bool { (declared && self != Self::ChatCompletions) || same_server(base, match self { Self::Responses => crate::chatgpt::API, Self::Anthropic => "https://api.anthropic.com", Self::ChatCompletions => return false }) }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,6 +163,7 @@ pub struct ActiveEndpoint {
     pub reply_room: usize,
     /// The longest reply a request may ask for: the most that replies cut in a row raise the limit to (see `reply_asks`).
     pub reply_ceiling: usize,
+    pub(crate) reports_cuts: bool, // Set off the subscription route by `WireApi::reports_cuts`.
     /// Compaction ceiling in real tokens, before the window cap and calibration.
     pub compaction_tokens: usize,
     pub temperature: Option<f32>,
@@ -177,21 +187,12 @@ pub(crate) fn reply_limits(context: usize, max_tokens: usize) -> (usize, usize) 
     (limit, limit.min((context / 8).max(4096)))
 }
 
-/// The reply limit a request starts at, the reserve, the room after a cut call or text, and the ceiling, for a
-/// `context`-token window. The model entry's `max_tokens` is the model's longest reply: a ceiling, not the first ask,
-/// so declaring it keeps the default limit. A `max_tokens` chosen in settings is both the ask and a ceiling. With
-/// neither, the ceiling is four times the default, which bounds thinking on a model whose longest reply is unknown.
-/// The room after a cut call or text is four times the ask, within the ceiling.
-fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>) -> (usize, usize, usize, usize) {
+/// First ask, reserve, room after a cut call or text (four times the ask, within the ceiling) and ceiling, each within what a `context`-token window leaves (`reply_limits`). The entry's `max_tokens`, the model's longest reply, is the ceiling, and the first ask only where under settings'; one chosen in settings is both, within the entry's.
+/// With neither, the ceiling bounds a thought that never ends: four times the default, or on a vendor's own server a quarter of the window if larger (setup's cap on a maximum a catalog reports).
+fn reply_asks(context: usize, settings: &Settings, entry: Option<usize>, validated: bool) -> (usize, usize, usize, usize) {
     let default = Settings::default().max_tokens;
-    let chosen = (settings.max_tokens != default).then_some(settings.max_tokens);
-    let ceiling = match (chosen, entry) {
-        (Some(chosen), entry) => entry.map_or(chosen, |entry| entry.min(chosen)),
-        (None, Some(entry)) => entry,
-        (None, None) => default * 4,
-    };
-    let (ask, reserve) = reply_limits(context, entry.map_or(settings.max_tokens, |entry| entry.min(settings.max_tokens)));
-    let ceiling = reply_limits(context, ceiling).0.max(ask);
+    let (ask, reserve) = reply_limits(context, settings.max_tokens.min(entry.unwrap_or(settings.max_tokens)));
+    let ceiling = if settings.max_tokens == default { reply_limits(context, entry.unwrap_or(if validated { (context / 4).max(default * 4) } else { default * 4 })).0 } else { ask };
     (ask, reserve, ceiling.min(ask.saturating_mul(4)), ceiling)
 }
 
@@ -408,7 +409,7 @@ fn unknown_key_warnings(text: &str) -> Vec<String> {
         if let Some(compat) = provider.get("compat").and_then(|v| v.as_object()) {
             unknown_keys(
                 compat,
-                &["use_max_completion_tokens", "send_stream_options", "omit_temperature", "prefer_reasoning_details"],
+                &["use_max_completion_tokens", "send_stream_options", "omit_temperature", "prefer_reasoning_details", "reports_cuts"],
                 &format!("in provider '{name}' compat"),
                 &mut out,
             );
@@ -678,7 +679,8 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
             .or(settings.context_tokens)
             .ok_or(ResolveError::MissingContextTokens)?
             .max(1);
-        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens));
+        let reports_cuts = chatgpt.is_none() && p.wire_api.reports_cuts(base_url, p.compat.reports_cuts);
+        let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, model_entry.and_then(|m| m.max_tokens), reports_cuts);
         // The settings key was configured for settings.base_url: a provider
         // with no key of its own inherits it only when it is that server.
         // Sent anywhere else, it hands one server's credential to another.
@@ -707,7 +709,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
             max_tokens,
             reply_reserve,
             reply_room,
-            reply_ceiling,
+            reply_ceiling, reports_cuts,
             compaction_tokens: settings.compaction_tokens
                 .or_else(|| model_entry.and_then(|m| m.compaction_tokens))
                 .unwrap_or_else(|| default_compaction_tokens(context_tokens)),
@@ -739,7 +741,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
         .context_tokens
         .ok_or(ResolveError::MissingContextTokens)?
         .max(1);
-    let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, None);
+    let (max_tokens, reply_reserve, reply_room, reply_ceiling) = reply_asks(context_tokens, settings, None, false);
     Ok(ActiveEndpoint {
         wire_api: WireApi::ChatCompletions,
         chatgpt: None,
@@ -752,7 +754,7 @@ pub fn resolve_endpoint(settings: &Settings, data_dir: &Path) -> Result<ActiveEn
         max_tokens,
         reply_reserve,
         reply_room,
-        reply_ceiling,
+        reply_ceiling, reports_cuts: false,
         compaction_tokens: settings
             .compaction_tokens
             .unwrap_or_else(|| default_compaction_tokens(context_tokens)),

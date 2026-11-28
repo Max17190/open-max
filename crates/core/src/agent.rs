@@ -644,7 +644,7 @@ async fn run_loop(
     // Resolve named provider (or flat base_url) once per turn so settings edits
     // apply without restarting the process. An explicit but unknown provider
     // fails closed rather than silently hitting flat base_url.
-    let endpoint = match crate::providers::resolve(&settings, &core.data_dir) {
+    let mut endpoint = match crate::providers::resolve(&settings, &core.data_dir) {
         Ok(ep) => ep,
         Err(e) => {
             core.send_agent(session_id, AgentEvent::Error { message: e.to_string() });
@@ -659,7 +659,8 @@ async fn run_loop(
             return "error".into();
         }
     };
-    let client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    let mut client = ChatClient::from_endpoint(&endpoint).for_conversation(&sessions::conversation_root(core, session_id));
+    #[cfg(test)] reply_limit_tests::to_fixture(&mut client);
     // The prompt, still last, records the effort and route its turn runs at (`ChatClient::effort_plan`).
     if let Some(prompt) = guard.messages().last_mut() { prompt.effort = Some(client.effort_stamp()); }
     // Frozen wire form: every request of the session injects the same tool
@@ -714,7 +715,7 @@ async fn run_loop(
     // A reply cut inside a call or its text gets room once. A refusal or spent room means asking for the rest in parts.
     let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
     let mut soft_spent = None::<usize>; // After a cut without notes, the size it was asked at: the next waits until the history grows a quarter of the trigger past it (at most what a cut keeps), then cuts on the digest if notes fail again; a cut clears it.
-    let mut image_refusal: Option<String> = None;
+    let (mut image_refusal, mut accepted) = (None::<String>, 0); // And the last limit a reply came back at.
     let mut size_steps = SizeSteps::default(); // A request refused for its size (413): the steps it has taken.
 
     'turns: for iteration in 0..max_iterations {
@@ -824,16 +825,17 @@ async fn run_loop(
             break 'turns;
         }
         let result = match result {
-            Ok(r) => { reserve_only |= limit == endpoint.reply_reserve && reserve_refusal.is_some(); (image_refusal, size_steps, at_reserve, reserve_refusal) = (None, SizeSteps::default(), false, None); r }
+            Ok(r) => { accepted = limit; reserve_only |= limit == endpoint.reply_reserve && reserve_refusal.is_some(); (image_refusal, size_steps, at_reserve, reserve_refusal) = (None, SizeSteps::default(), false, None); r }
             Err(mut message) => {
                 if image_refusal.is_none() {
                     let status = message.strip_prefix("backend returned ").and_then(|m| m.get(..3)?.parse::<u16>().ok());
                     let length = crate::compaction::refused_for_length(&message);
-                    // Spend room and raises before trying the reserve; content repairs keep the smaller limit.
+                    // Spend room and raises before trying the reserve, but a vendor's own server that refused a raise keeps the last limit it accepted; content repairs keep the smaller limit.
                     if endpoint.chatgpt.is_none() && limit > endpoint.reply_reserve && (length || matches!(status, Some(400 | 422))) && iteration + 1 < max_iterations {
+                        if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
+                        if endpoint.reports_cuts && raise > 0 && (endpoint.max_tokens..limit).contains(&accepted) { (endpoint.reply_ceiling, client.reply_bounds.0, no_room) = (accepted, accepted, true); continue 'turns; }
                         let usual = endpoint.reply_limit(used_real);
                         at_reserve = !(endpoint.reply_reserve < usual && usual < limit && (roomy.is_some() || raise > 0));
-                        if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
                         (no_room, raise) = (true, 0); continue 'turns;
                     }
                     // Only an explicit representation error authorizes withholding a saved thought.
@@ -891,10 +893,11 @@ async fn run_loop(
         // reasoning, so the continuation resumes the thought instead of
         // starting it over; the wire skips it wherever the reasoning does
         // not go back (another endpoint, a path that does not replay it).
-        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). One with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not). A refusal is its own end, never a cut.
+        // An empty reply where an earlier one stopped met an unreported cap; any other is no answer (it exited 0). A vendor's own server reports each cut, so a reply it finished, calls and all, may spend the whole limit. Elsewhere, one with no call that ended on its own after 70% of the limit or more went to its thought (reasoning, else output) was stopped by the budget, not done: a cut thought, where the route sends the limit (subscription Responses does not). A refusal is its own end, never a cut.
         let (silent, repeated) = (content.trim().is_empty() && tool_calls.is_empty(), result.repeats_a_stop(&mut stops, limit));
-        let near = endpoint.chatgpt.is_none() && tool_calls.is_empty() && !result.hit_output_cap(limit) && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED) && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
-        let capped = result.finish_reason != "refusal" && (result.hit_output_cap(limit) || (silent && repeated) || near);
+        let hit = result.hit_output_cap(if endpoint.reports_cuts { usize::MAX } else { limit });
+        let near = !endpoint.reports_cuts && endpoint.chatgpt.is_none() && tool_calls.is_empty() && !hit && !matches!(result.finish_reason.as_str(), "cancelled" | TRUNCATED) && result.usage.is_some_and(|u| u.reasoning_tokens.unwrap_or(u.completion_tokens) * 10 >= limit as u64 * 7);
+        let capped = result.finish_reason != "refusal" && (hit || (silent && repeated) || near);
         let cut_thought = capped
             && (result.reasoning_content.is_some() || result.reasoning.is_some() || result.reasoning_details.is_some());
         if !content.is_empty() || !tool_calls.is_empty() || cut_thought {
@@ -1785,6 +1788,10 @@ fn approval_detail(args: &Value) -> String {
         raw.chars().take(160).collect()
     }
 }
+
+#[cfg(test)]
+#[path = "reply_limit_tests.rs"]
+mod reply_limit_tests;
 
 #[cfg(test)]
 mod tests {
