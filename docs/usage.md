@@ -64,7 +64,7 @@ while it does.
 | `/diff` · `/diff all` | The files this session's `write_file` and `edit_file` calls changed, each with its lines added and removed · their combined diff, in the order the tools made them. It reads the diffs the transcript holds, so it covers the file tools only: what a shell command changed is not in it, and `git diff` shows that. Counts a tool gave as an upper bound, for a change too large to compare in time, are marked so, and a file written with no line changed is named apart from the list. An edit replayed from a resumed session keeps its counts but not its diff, and edits from before a compaction of a resumed session are not listed, which `/diff` says. A prompt template named `diff` runs instead |
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
-| `/status` | Endpoint, cache, token totals, performance, privacy, and network details |
+| `/status` | Endpoint, cache, token totals, performance, privacy, and network details, and the processes commands left running |
 | `/usage` · `/cost` | What this session has spent in tokens: tokens in, of which cached, and tokens out, summed from the usage the provider reported for each request. Resuming a session restores its totals from the usage record the session keeps, and `/new` starts them again. A provider that reports no usage shows "not reported", not zero. Tokens only: Open Max has no price table, so it shows no prices |
 | `/update` | Update to the latest release, then resume this session in it |
 | `/quit` · `/exit` | Exit |

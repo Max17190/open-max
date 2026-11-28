@@ -2774,6 +2774,11 @@ impl App {
                     kv("  updates", &crate::update::status()),
                 ]);
                 self.transcript.push(block);
+                // Reading every process off the loop; nothing shows when none is left.
+                self.spawn_listing(async {
+                    let left = tokio::task::spawn_blocking(crate::leftover::still_running).await.unwrap_or_default();
+                    leftover_block(&left)
+                });
             }
             "update" if self.running => self.note("finish or cancel the turn before /update"),
             "update" => match Box::pin(crate::update::prepare()).await {
@@ -2858,7 +2863,7 @@ impl App {
     }
 
     fn on_listing(&mut self, generation: u64, lines: Vec<Line<'static>>) {
-        if generation != self.transcript_gen {
+        if generation != self.transcript_gen || lines.is_empty() {
             return;
         }
         self.transcript.push(lines);
@@ -4470,6 +4475,18 @@ fn home_shortened(path: &str, home: Option<&str>) -> String {
 
 fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+/// `/status`'s rows for the processes this run's commands started that
+/// still run, a call in progress included: none when there are none.
+fn leftover_block(left: &[crate::leftover::Left]) -> Vec<Line<'static>> {
+    if left.is_empty() {
+        return Vec::new();
+    }
+    let mut block = vec![Line::from(Span::styled("  still running, started by this run's commands".to_string(), theme::ACCENT_BOLD))];
+    block.extend(left.iter().map(|p| kv(&format!("  {}", p.pid), &crate::leftover::describe(p))));
+    block.push(kv("  stop", &crate::leftover::stop_command(left)));
+    block
 }
 
 fn kv(k: &str, v: &str) -> Line<'static> {
