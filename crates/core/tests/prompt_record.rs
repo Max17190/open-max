@@ -4,14 +4,17 @@
 //! session sends before anything of the project's own: the base rules of the
 //! system prompt, with the project path written as `{root}`, and the built-in
 //! tools array as the Chat Completions wire carries it, once as sent to an
-//! endpoint without image input and once as sent to one with it. The test
-//! fails when the code builds other bytes, so a change to them updates the
-//! record in the same pull request, where its diff shows what changed, and
+//! endpoint without image input and once as sent to one with it. The bash
+//! tool's description differs between Linux and macOS, so each has its own
+//! tools records, and the test on each checks its own. The test fails when
+//! the code builds other bytes, so a change to them updates the record in the
+//! same pull request, where its diff shows what changed, and
 //! `scripts/prompt-record.sh` compares the record between two releases for
 //! the release notes.
 //!
-//! To update the record after a deliberate change:
+//! To update this platform's records after a deliberate change:
 //! `OPENMAX_WRITE_PROMPT_RECORD=1 cargo test -p open-max-core --test prompt_record`.
+//! The failure prints the bytes it built, for the other platform's.
 //!
 //! This file is its own test binary because it sets `tools::IMAGE_INPUT`,
 //! a process-wide switch other tests read.
@@ -56,10 +59,11 @@ fn tools(images: bool) -> String {
 
 #[test]
 fn the_built_in_prompt_and_tools_match_their_committed_record() {
+    let platform = if cfg!(target_os = "linux") { "linux" } else { "macos" };
     let built = [
-        ("system.txt", base_rules()),
-        ("tools.json", tools(false)),
-        ("tools-image-input.json", tools(true)),
+        ("system.txt".to_string(), base_rules()),
+        (format!("tools-{platform}.json"), tools(false)),
+        (format!("tools-{platform}-image-input.json"), tools(true)),
     ];
     let dir = record_dir();
     if std::env::var_os(WRITE).is_some() {
@@ -72,7 +76,7 @@ fn the_built_in_prompt_and_tools_match_their_committed_record() {
     for (file, bytes) in &built {
         let recorded = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
         if &recorded != bytes {
-            stale.push(format!("{file}: recorded {} bytes, built {} bytes", recorded.len(), bytes.len()));
+            stale.push(format!("{file}: recorded {} bytes, built {} bytes:\n{bytes}", recorded.len(), bytes.len()));
         }
     }
     assert!(

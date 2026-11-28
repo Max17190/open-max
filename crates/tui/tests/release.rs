@@ -843,13 +843,13 @@ fn release_notes_say_whether_the_built_in_prompt_changed() {
             .unwrap();
         (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
     };
-    let (system, tools) = ("crates/core/tests/fixtures/built-in-prompt/system.txt", "crates/core/tests/fixtures/built-in-prompt/tools.json");
+    let (system, tools) = ("crates/core/tests/fixtures/built-in-prompt/system.txt", "crates/core/tests/fixtures/built-in-prompt/tools-linux.json");
     let root = "The system prompt's base rules write the project path as `{root}`; the rest of the prompt comes from the project.\n";
     git(&["init", "-q", "--template="]);
     commit("first", &[("README.md", "a\n")], Some("v2026.1.0"));
     commit("record", &[(system, "abc"), (tools, "[1]")], None);
     commit("release: 2026.1.1", &[], Some("v2026.1.1"));
-    let sizes = "system prompt base rules 3 bytes, built-in tools array 3 bytes";
+    let sizes = "system prompt base rules 3 bytes, built-in tools array on Linux 3 bytes";
     let expected = format!("### Built-in prompt\n\nv2026.1.0 has no record of its built-in prompt to compare with. Recorded here: {sizes}.\n\n{root}");
     assert_eq!(report(&["v2026.1.1"]), (Some(0), expected), "a release after one without a record");
     commit("docs", &[("README.md", "b\n")], None);

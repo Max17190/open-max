@@ -20,10 +20,6 @@
 # notes, and scripts/release.sh prints it before it asks to publish.
 set -euo pipefail
 
-# From a directory under the top, git would list only the entries under it.
-top=$(git rev-parse --show-toplevel) || exit 2
-cd "$top"
-
 RECORD=crates/core/tests/fixtures/built-in-prompt
 ref=HEAD
 since=
@@ -36,6 +32,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# From a directory under the top, git would list only the entries under it.
+top=$(git rev-parse --show-toplevel) || exit 2
+cd "$top"
+
 git rev-parse -q --verify "${ref}^{commit}" >/dev/null || { echo "error: no commit $ref" >&2; exit 2; }
 if [ -z "$since" ]; then
   since=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${ref}^" 2>/dev/null) || since=
@@ -46,8 +46,10 @@ fi
 label() {
   case "$1" in
     system.txt) echo "system prompt base rules" ;;
-    tools.json) echo "built-in tools array" ;;
-    tools-image-input.json) echo "built-in tools array with image input" ;;
+    tools-linux.json) echo "built-in tools array on Linux" ;;
+    tools-linux-image-input.json) echo "built-in tools array on Linux with image input" ;;
+    tools-macos.json) echo "built-in tools array on macOS" ;;
+    tools-macos-image-input.json) echo "built-in tools array on macOS with image input" ;;
     *) echo "$1" ;;
   esac
 }
