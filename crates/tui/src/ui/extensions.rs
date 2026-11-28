@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use open_max_core::ledger::UsageFile;
 use open_max_core::registry::{Registry, ToolKind};
 use open_max_core::skills::SkillSpec;
 use ratatui::style::Style;
@@ -99,7 +100,24 @@ pub fn short_model(model: &str) -> &str {
     model.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(model)
 }
 
-pub fn tools_block(registry: &Registry, frozen: bool) -> Vec<Line<'static>> {
+/// What this project's usage record holds for one extension: external tool
+/// calls with their failures, or skill body reads. Counts of observed use,
+/// so an extension nothing has called reads as such.
+fn recorded(usage: Option<&UsageFile>, tool: bool, name: &str) -> Option<String> {
+    let usage = usage?;
+    let entry = if tool { usage.tools.get(name) } else { usage.skills.get(name) };
+    let calls = entry.map_or(0, |e| e.calls);
+    Some(match (tool, calls) {
+        (true, 0) => "no calls recorded".into(),
+        (true, n) => format!("{n} call{} · {} failed", if n == 1 { "" } else { "s" }, entry.map_or(0, |e| e.err)),
+        (false, 0) => "body never read".into(),
+        (false, n) => format!("{n} body read{}", if n == 1 { "" } else { "s" }),
+    })
+}
+
+const USE_FOOTER: &str = "  use: what this project recorded across sessions, not a rating · openmax --spec usage";
+
+pub fn tools_block(registry: &Registry, frozen: bool, usage: Option<&UsageFile>) -> Vec<Line<'static>> {
     let mut lines = vec![aside(if frozen {
         "tools (loaded now; the frozen tools array takes a new one at /reload)"
     } else {
@@ -111,18 +129,30 @@ pub fn tools_block(registry: &Registry, frozen: bool) -> Vec<Line<'static>> {
             ToolKind::External(_) => "external",
         };
         let flags = if spec.mutating { format!("{kind} · mut") } else { kind.to_string() };
-        lines.push(entry(&spec.name, 14, &flags, 16, &spec.description, 60));
+        let used = match spec.kind {
+            ToolKind::External(_) => recorded(usage, true, &spec.name),
+            ToolKind::Builtin => None,
+        };
+        lines.push(entry(&spec.name, 14, &flags, 16, used, &spec.description, 60));
     }
     let external_n = registry.tools.iter().filter(|t| !matches!(t.kind, ToolKind::Builtin)).count();
     lines.push(aside(format!(
         "  {} tools · {external_n} external · drop TOML in .openmax/tools/ or ~/.openmax/tools/",
         registry.tools.len(),
     )));
+    if external_n > 0 && usage.is_some() {
+        lines.push(aside(USE_FOOTER));
+    }
     lines.push(aside("  token cost: /context"));
     lines
 }
 
-pub fn skills_block(skills: &[SkillSpec], project_root: &Path, frozen: bool) -> Vec<Line<'static>> {
+pub fn skills_block(
+    skills: &[SkillSpec],
+    project_root: &Path,
+    frozen: bool,
+    usage: Option<&UsageFile>,
+) -> Vec<Line<'static>> {
     let mut lines = vec![aside(if frozen {
         "skills (loaded now; the frozen prompt takes a new one at /reload)"
     } else {
@@ -134,29 +164,45 @@ pub fn skills_block(skills: &[SkillSpec], project_root: &Path, frozen: bool) -> 
     let project_skills = project_root.join(".agents").join("skills");
     for skill in skills {
         let scope = if skill.path.starts_with(&project_skills) { "project" } else { "global" };
-        lines.push(entry(&skill.name, 16, scope, 9, &skill.description, 56));
+        let used = recorded(usage, false, &skill.name);
+        lines.push(entry(&skill.name, 16, scope, 9, used, &skill.description, 56));
     }
     lines.push(aside(format!(
         "  {} skills · SKILL.md under .agents/skills/ or ~/.openmax/skills/",
         skills.len()
     )));
+    if !skills.is_empty() && usage.is_some() {
+        lines.push(aside(USE_FOOTER));
+    }
     lines.push(aside("  token cost: /context"));
     lines
 }
 
 /// A listing's dim italic line: its header, an empty state, its footer.
-fn aside(text: impl Into<String>) -> Line<'static> {
+pub(super) fn aside(text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(text.into(), theme::DIM_ITALIC))
 }
 
 /// A listing's row: the name padded to `name_w`, a tag padded to `tag_w`,
-/// and the description clipped to `max`.
-fn entry(name: &str, name_w: usize, tag: &str, tag_w: usize, description: &str, max: usize) -> Line<'static> {
-    Line::from(vec![
+/// any recorded use, and the description clipped to `max`.
+fn entry(
+    name: &str,
+    name_w: usize,
+    tag: &str,
+    tag_w: usize,
+    used: Option<String>,
+    description: &str,
+    max: usize,
+) -> Line<'static> {
+    let mut spans = vec![
         Span::styled(format!("  {}", super::text::pad_right(name, name_w)), theme::ACCENT_BOLD),
         Span::styled(format!("{tag:<tag_w$}"), Style::default().fg(theme::DIM)),
-        Span::styled(clip(description, max), Style::default().fg(theme::DIM)),
-    ])
+    ];
+    if let Some(used) = used {
+        spans.push(Span::raw(format!("{used:<19} ")));
+    }
+    spans.push(Span::styled(clip(description, max), Style::default().fg(theme::DIM)));
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -216,7 +262,7 @@ mod tests {
     #[test]
     fn tools_block_lists_builtins() {
         let reg = Registry::builtin_only();
-        let lines = tools_block(&reg, false);
+        let lines = tools_block(&reg, false, None);
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -230,7 +276,7 @@ mod tests {
 
     #[test]
     fn skills_block_empty_is_quiet() {
-        let lines = skills_block(&[], Path::new("/tmp/proj"), true);
+        let lines = skills_block(&[], Path::new("/tmp/proj"), true, None);
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))

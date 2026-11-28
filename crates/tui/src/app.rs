@@ -2567,9 +2567,16 @@ impl App {
                 ));
             }
             "tools" | "skills" => {
+                // Recorded use rides beside each of the user's own
+                // extensions; a record that cannot be read shows none.
+                let (data_dir, project) = (self.core.data_dir.clone(), self.project.clone());
+                let usage = tokio::task::spawn_blocking(move || open_max_core::ledger::load_usage(&data_dir, &project).ok())
+                    .await
+                    .ok()
+                    .flatten();
                 let block = |registry: &registry::Registry, frozen| match head {
-                    "tools" => extensions::tools_block(registry, frozen),
-                    _ => extensions::skills_block(&registry.skills, &self.project, frozen),
+                    "tools" => extensions::tools_block(registry, frozen, usage.as_ref()),
+                    _ => extensions::skills_block(&registry.skills, &self.project, frozen, usage.as_ref()),
                 };
                 // Hold the sessions lock only long enough to format a frozen
                 // registry. Disk preview runs after the lock is released so a
@@ -2583,6 +2590,17 @@ impl App {
                     None => block(&self.preview_registry().await, false),
                 };
                 self.transcript.push(lines);
+            }
+            "memory" => {
+                // Off the event loop, like the registry preview: the scan
+                // reads every memory file and the access log.
+                let project = self.project.clone();
+                let scan = tokio::task::spawn_blocking(move || {
+                    open_max_core::memory::scan(&project, open_max_core::memory::unix_now())
+                })
+                .await
+                .unwrap_or_default();
+                self.transcript.push(crate::ui::memory::memory_block(&scan));
             }
             "status" => {
                 let s = self.core.settings.lock().unwrap().clone();
@@ -9045,6 +9063,72 @@ mod tests {
         assert!(shown.contains("context (preview of the next new session)"), "{shown}");
         assert!(!shown.contains("tools (0 built-in)"), "{shown}");
         assert!(!shown.contains("unknown command"), "{shown}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// /memory lists what the agent wrote with how often the file tools used
+    /// it and whether a new session indexes it, and /tools and /skills show
+    /// the use this project recorded for the user's own extensions, unused
+    /// ones included. Each block stays whole when wrapped at 60, 80 and 120
+    /// columns.
+    #[tokio::test]
+    async fn memory_tools_and_skills_show_recorded_use() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/memory".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("(none yet) the agent writes one fact per file under .openmax/memory/"), "{shown}");
+        assert!(shown.contains("openmax --recall"), "{shown}");
+
+        let memory = dir.join(".openmax/memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("deploy-port.md"), "# The staging deploy port is 7443\nSee infra.\n").unwrap();
+        fs::write(memory.join("old-host.md"), "The old build host was ci-3\n").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(40 * 86_400);
+        fs::File::options().write(true).open(memory.join("old-host.md")).unwrap().set_modified(old).unwrap();
+        let reads = [("deploy-port".to_string(), "read".to_string()), ("deploy-port".to_string(), "write".to_string())];
+        open_max_core::memory::record_accesses(&dir, &reads);
+        app.handle_submit("/memory".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        let row = |name: &str| shown.lines().find(|l| l.contains(name)).unwrap_or_default().to_string();
+        assert!(row("deploy-port").contains("indexed") && row("deploy-port").contains("2 uses"), "{shown}");
+        assert!(row("deploy-port").contains("<2h ago") && row("deploy-port").contains("The staging deploy port is 7443"), "{shown}");
+        assert!(row("old-host").contains("faded") && row("old-host").contains("0 uses") && row("old-host").contains("40d ago"), "{shown}");
+        assert!(shown.contains("2 on disk · 1 indexed · 1 faded (unused for 21 days; still on disk)"), "{shown}");
+
+        let tools = dir.join(".openmax/tools");
+        fs::create_dir_all(&tools).unwrap();
+        for name in ["deploy", "lint"] {
+            fs::write(
+                tools.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\ndescription = \"Run {name}\"\ncommand = \"true\"\n[params]\ntype = \"object\"\n"),
+            )
+            .unwrap();
+        }
+        let skill = dir.join(".agents/skills/release");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: release\ndescription: How to cut a release\n---\nSteps\n").unwrap();
+        let delta = open_max_core::ledger::UsageDelta {
+            tools: vec![("deploy".into(), true), ("deploy".into(), false), ("deploy".into(), true)],
+            skills: vec!["release".into()],
+        };
+        open_max_core::ledger::record_usage(&app.core.data_dir, &dir, &delta).unwrap();
+        app.handle_submit("/tools".into()).await.unwrap();
+        app.handle_submit("/skills".into()).await.unwrap();
+        let shown = app.transcript.export_text();
+        let row = |name: &str| shown.lines().find(|l| l.contains(&format!("  {name} "))).unwrap_or_default().to_string();
+        assert!(row("deploy").contains("3 calls · 1 failed"), "{shown}");
+        assert!(row("lint").contains("no calls recorded"), "{shown}");
+        assert!(row("release").contains("1 body read"), "{shown}");
+        assert!(!row("read_file").contains("calls"), "built-ins carry no record: {shown}");
+        assert!(shown.contains("not a rating · openmax --spec usage"), "{shown}");
+
+        for width in [60u16, 80, 120] {
+            app.transcript.set_width(width);
+            let painted = buffer_text(&render_app(&mut app, width, 200));
+            for text in ["release", "1 body read", "faded", "old-host"] {
+                assert!(painted.contains(text), "{text} at {width} columns:\n{painted}");
+            }
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
