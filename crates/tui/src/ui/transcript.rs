@@ -52,6 +52,9 @@ struct Block {
     folded: bool,
     /// Full tool output for expand / copy.
     full_output: Option<String>,
+    /// The file a write or edit tool changed, read by /diff, whose diff
+    /// is this block's `full_output` when `diff_kept` says so.
+    change: Option<FileChange>,
     /// Lowercase plain text for find, built once at push: the find bar
     /// filters on every keystroke and previews on every list rebuild, and
     /// rebuilding + lowercasing every block's text made both O(session)
@@ -196,6 +199,7 @@ impl Block {
             compact: None,
             folded: false,
             full_output: None,
+            change: None,
             search_lower,
             height: 0,
             cache_width: 0,
@@ -234,6 +238,7 @@ impl Block {
             compact: Some(compact),
             folded: true,
             full_output: Some(full_output),
+            change: None,
             search_lower,
             height: 0,
             cache_width: 0,
@@ -419,6 +424,20 @@ impl RowIndex {
     }
 }
 
+/// What one finished write or edit changed: its path and line counts, and
+/// whether its block's output is the diff. A replayed edit keeps only the
+/// counts its result text carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    pub diff_kept: bool,
+    /// The diff was cut off at its deadline, so the counts may include
+    /// unchanged lines, as the tool's result says.
+    pub upper_bound: bool,
+}
+
 #[derive(Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
@@ -576,6 +595,22 @@ impl Transcript {
     /// `ok` picks the initial fold state; see [`Block::tool`].
     pub fn push_tool(&mut self, compact: Vec<Line<'static>>, full_output: String, ok: bool) {
         self.push_block(Block::tool(compact, full_output, ok));
+    }
+
+    /// A tool block for a finished write or edit, which /diff lists.
+    pub fn push_file_change(&mut self, compact: Vec<Line<'static>>, full_output: String, change: FileChange) {
+        let mut block = Block::tool(compact, full_output, true);
+        block.change = Some(change);
+        self.push_block(block);
+    }
+
+    /// Each file change in the transcript, oldest first, with its diff
+    /// where the block holds one: borrowed from the blocks, never copied.
+    pub fn file_changes(&self) -> impl Iterator<Item = (&FileChange, Option<&str>)> {
+        self.blocks.iter().filter_map(|block| {
+            let change = block.change.as_ref()?;
+            Some((change, block.full_output.as_deref().filter(|_| change.diff_kept)))
+        })
     }
 
     /// Re-measure every block for a new width. Blocks keep whatever they

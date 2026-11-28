@@ -1770,6 +1770,59 @@ mod first_frame {
         assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
     }
 
+    /// In auto, /diff is the review of what a turn changed: the files the
+    /// write and edit tools changed, with their counts, then their combined
+    /// diff. A file a shell command wrote is not in it, and the list says
+    /// that git diff shows those.
+    #[test]
+    fn diff_lists_what_the_file_tools_changed_and_opens_the_combined_diff() {
+        let call = |id: &str, name: &str, args: serde_json::Value| {
+            serde_json::json!({"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": null, "tool_calls": [{"id": id, "type": "function", "function": {
+                    "name": name, "arguments": args.to_string(),
+                }}],
+            }}]})
+            .to_string()
+        };
+        let done = serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": "changes made",
+        }}]});
+        let base_url = endpoint(vec![
+            call("call-1", "write_file", serde_json::json!({"path": "notes.md", "content": "first\nsecond\n"})),
+            call("call-2", "edit_file", serde_json::json!({"path": "notes.md", "old_string": "second", "new_string": "2nd"})),
+            call("call-3", "bash", serde_json::json!({"command": "echo shell > shell-made.txt"})),
+            done.to_string(),
+        ]);
+        let settings =
+            serde_json::json!({"base_url": base_url, "model": "stub-model", "context_tokens": 16384}).to_string();
+        let (cols, rows) = (80, 30);
+        let mut s = Session::spawn_with("diff", cols as u16, rows as u16, &settings);
+        s.wait_for(FRAME_END, 0, Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("no first frame: {}", s.context()));
+        s.write(ANSWER);
+        s.write(b"make the changes\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| {
+            shown.contains("changes made") && !shown.contains("esc cancel")
+        });
+        assert!(shown.contains("changes made") && !shown.contains("esc cancel"), "the turn did not settle:\n{shown}");
+        assert!(s.dir.join("project/shell-made.txt").exists(), "the shell command ran:\n{shown}");
+        s.write(b"/diff\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| {
+            shown.contains("Files the edit and write tools changed")
+        });
+        let list = &shown[shown.find("Files the edit and write tools changed").expect(&shown)..];
+        assert!(list.contains("+3 −1  notes.md (2 changes)"), "{list}");
+        assert!(list.contains("1 file, +3 −1 · /diff all opens the combined diff"), "{list}");
+        assert!(list.contains("git diff shows what shell commands changed"), "{list}");
+        assert!(!list.contains("shell-made.txt"), "{list}");
+        s.write(b"/diff all\r");
+        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("+2nd"));
+        assert!(shown.contains("-second") && shown.contains("+2nd") && shown.contains("+first"), "{shown}");
+        s.write(CTRL_C_TWICE);
+        let status = s.wait_exit(Duration::from_secs(10));
+        assert!(status.is_some_and(|e| e.success()), "{status:?}: {}", s.context());
+    }
+
     /// A tool that lands between turns (through a pull, or written by a turn
     /// that was cancelled before its refreeze) becomes callable, with no card
     /// in auto, at the next turn start, or on `/reload` if that runs first.

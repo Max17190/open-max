@@ -82,6 +82,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         true,
     ),
     command("copy", "", "copy the latest assistant response", true),
+    command("diff", "[all]", "files the edit and write tools changed · all: the combined diff", true),
     command(
         "export",
         "[path]",
@@ -120,6 +121,22 @@ pub const COMMANDS: &[CommandSpec] = &[
     command("update", "", "update to the latest release and resume this session", true),
     command("quit", "", "exit (/exit does the same)", true),
 ];
+
+/// Built-ins a prompt template of the same name takes over. /diff pointed to
+/// git diff before it was a command, and a template named diff ran in its
+/// place then, so it still does.
+pub const TEMPLATE_WINS: &[&str] = &["diff"];
+
+/// Whether built-in `name` runs ahead of a prompt template with that name.
+pub fn shadows_templates(name: &str) -> bool {
+    COMMANDS.iter().any(|spec| spec.name == name) && !TEMPLATE_WINS.contains(&name)
+}
+
+/// Whether one of `templates` takes built-in `name` over, so completion and
+/// /help show the template and not the built-in.
+pub fn taken_by_template(name: &str, templates: &[(String, String)]) -> bool {
+    TEMPLATE_WINS.contains(&name) && templates.iter().any(|(template, _)| template == name)
+}
 
 impl CommandSpec {
     pub fn usage(self) -> String {
@@ -229,12 +246,13 @@ pub fn trigger(line: &str, col: usize, first_row: bool) -> Option<(Kind, usize, 
 /// user authored, and the popup shows only MAX_VISIBLE rows, so listing the
 /// thirteen memorizable built-ins first made every template invisible until
 /// its name was already known. A template that shadows a built-in name is
-/// dropped; built-ins always win at dispatch too.
+/// dropped, as built-ins win at dispatch too, except where the template
+/// takes the built-in over (`TEMPLATE_WINS`): then the built-in is dropped.
 pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
     let mut items: Vec<Item> = templates
         .iter()
         .filter(|(name, _)| {
-            name.starts_with(query) && !COMMANDS.iter().any(|spec| spec.name == *name)
+            name.starts_with(query) && !shadows_templates(name)
         })
         .map(|(name, desc)| Item {
             // Templates may take arguments, so accepting never auto-submits.
@@ -251,7 +269,7 @@ pub fn slash_items(query: &str, templates: &[(String, String)]) -> Vec<Item> {
     items.extend(
         COMMANDS
             .iter()
-            .filter(|spec| spec.name.starts_with(query))
+            .filter(|spec| spec.name.starts_with(query) && !taken_by_template(spec.name, templates))
             .map(|spec| Item {
                 insert: if spec.submits {
                     format!("/{}", spec.name)

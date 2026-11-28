@@ -28,10 +28,11 @@ use crate::completion;
 use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::sessions as sessions_ui;
+use crate::ui::diff as diff_ui;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::text::paint_line;
 use crate::ui::transcript::{
-    wrap_lines, RowRef, Term, Transcript,
+    wrap_lines, FileChange, RowRef, Term, Transcript,
 };
 use crate::ui::{context, extensions, markdown, model_picker, usage};
 
@@ -334,6 +335,9 @@ pub struct App {
     file_index_pending: bool,
     /// Prompt templates as (name, description); rescanned when a fresh `/` opens.
     templates: Vec<(String, String)>,
+    /// Whether the session replayed was compacted, so edits from before
+    /// the compaction reach no tool block and /diff cannot list them.
+    compacted_before_replay: bool,
     /// Messages typed while the agent works, shown in the strip above the
     /// composer. The oldest `steered` were sent to the running turn and leave
     /// on its SteerAccepted; the rest (typed during a compaction, or after
@@ -777,6 +781,7 @@ impl App {
             file_index: None,
             file_index_pending: false,
             templates: Vec::new(),
+            compacted_before_replay: false,
             queued: Vec::new(),
             steered: 0,
             flush_queue: false,
@@ -877,6 +882,12 @@ impl App {
         // fresh start.
         let has_manifest = sessions::load_manifest(&self.core, session_id).is_some();
         self.resumed_awaiting_hydration = has_manifest;
+        // A compaction moves the messages it drops into the archive, which
+        // replay does not draw, and records itself in the compaction log,
+        // which a fork copies with the compacted history.
+        let exists = |path: String| std::path::Path::new(&path).exists();
+        self.compacted_before_replay = exists(sessions::archive_display(&self.core, session_id))
+            || exists(sessions::compaction_display(&self.core, session_id));
         if let Err(e) = sessions::attach(&self.core, session_id) {
             self.error(&e);
             return;
@@ -953,7 +964,10 @@ impl App {
                                 call.function.name.as_str(),
                                 "write_file" | "edit_file"
                             );
-                            let path = args["path"].as_str().unwrap_or("");
+                            // The result names the path as the live diff
+                            // does, relative to the project; the argument
+                            // may have spelled it another way.
+                            let path = changed_path(content).unwrap_or_else(|| args["path"].as_str().unwrap_or(""));
                             let badge = if !mutating || path.is_empty() {
                                 None
                             } else {
@@ -973,7 +987,20 @@ impl App {
                                 &truncate_replay_output(content),
                                 badge.as_ref(),
                             );
-                            self.transcript.push_tool(compact, content.to_string(), ok);
+                            match badge.filter(|_| ok) {
+                                Some(change) => self.transcript.push_file_change(
+                                    compact,
+                                    content.to_string(),
+                                    FileChange {
+                                        path: change.path,
+                                        added: change.added,
+                                        removed: change.removed,
+                                        diff_kept: false,
+                                        upper_bound: counts_are_an_upper_bound(content),
+                                    },
+                                ),
+                                None => self.transcript.push_tool(compact, content.to_string(), ok),
+                            }
                             self.last_tool_output = Some(content.to_string());
                         }
                     }
@@ -1032,6 +1059,7 @@ impl App {
         self.pending_approval = None;
         self.model_picker = None;
         self.pending_diffs.clear();
+        self.compacted_before_replay = false;
         self.tool_meta.clear();
         self.last_tool_output = None;
         self.last_assistant_response = None;
@@ -2102,10 +2130,7 @@ impl App {
                 if kind == completion::Kind::Slash && self.completion.is_none() {
                     // A fresh `/` rescans templates (two small dirs) so one
                     // the agent just wrote shows up immediately.
-                    self.templates = open_max_core::templates::discover(&self.core.data_dir, &self.project)
-                        .into_iter()
-                        .map(|t| (t.name, t.description))
-                        .collect();
+                    self.rescan_templates();
                 }
                 let (items, total_matches) = match kind {
                     completion::Kind::Slash => {
@@ -2266,9 +2291,8 @@ impl App {
         self.refresh_project_root();
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
-            let builtin = head == "exit"
-                || completion::COMMANDS.iter().any(|spec| spec.name == head);
-            // Built-ins win; anything else may be a prompt template, whose
+            let builtin = head == "exit" || completion::shadows_templates(head);
+            // Built-ins win, /diff aside; anything else may be a prompt template, whose
             // expansion submits as a normal user message. The expansion itself
             // is the same helper --print and --stdio submit through, so the
             // three front ends cannot drift.
@@ -2364,6 +2388,23 @@ impl App {
         }
     }
 
+    /// The prompt templates completion and /help list. Discovery keeps the
+    /// first fifty by name, and a template named diff past them still runs
+    /// in place of /diff, so it is added whenever dispatch would find it.
+    fn rescan_templates(&mut self) {
+        let (data, project) = (&self.core.data_dir, &self.project);
+        self.templates = open_max_core::templates::discover(data, project)
+            .into_iter()
+            .map(|t| (t.name, t.description))
+            .collect();
+        for name in completion::TEMPLATE_WINS {
+            let listed = self.templates.iter().any(|(template, _)| template == name);
+            if !listed && open_max_core::templates::expand_slash_line(data, project, &format!("/{name}")).is_some() {
+                self.templates.push((name.to_string(), String::new()));
+            }
+        }
+    }
+
     async fn slash(&mut self, cmd: &str) {
         let (head, raw_rest) = command_parts(cmd);
         let rest: Vec<&str> = raw_rest.split_whitespace().collect();
@@ -2376,6 +2417,7 @@ impl App {
                 block.extend(
                     completion::COMMANDS
                         .iter()
+                        .filter(|spec| !completion::taken_by_template(spec.name, &self.templates))
                         .map(|spec| help_line(&spec.usage(), spec.description)),
                 );
                 // The user's own templates are commands too; a help screen
@@ -2386,7 +2428,7 @@ impl App {
                 let templates: Vec<_> = self
                     .templates
                     .iter()
-                    .filter(|(name, _)| !completion::COMMANDS.iter().any(|spec| spec.name == *name))
+                    .filter(|(name, _)| !completion::shadows_templates(name))
                     .map(|(name, desc)| help_line(&format!("/{name}"), if desc.is_empty() { "prompt template" } else { desc }))
                     .collect();
                 if !templates.is_empty() {
@@ -2751,6 +2793,16 @@ impl App {
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
+            "diff" => {
+                let block = match raw_rest.trim() {
+                    "" => diff_ui::summary(self.transcript.file_changes(), self.compacted_before_replay),
+                    "all" => diff_ui::combined(self.transcript.file_changes(), self.compacted_before_replay),
+                    _ => return self.note("usage: /diff lists the changed files · /diff all opens the combined diff"),
+                };
+                self.transcript.push(block);
+                self.transcript.show_latest_from_start();
+                self.dirty.mark_chat();
+            }
             "quit" | "exit" => self.should_quit = true,
             other => match HABITS.iter().find(|(names, _)| names.contains(&other)) {
                 Some((_, pointer)) => self.note(&format!("/{other} is not a command here; {pointer}")),
@@ -3013,12 +3065,18 @@ impl App {
                     diff.as_ref(),
                     Some(duration),
                 );
-                let expanded = diff
-                    .as_ref()
-                    .map(|change| change.diff.clone())
-                    .unwrap_or_else(|| output.clone());
-                self.transcript.push_tool(compact, expanded.clone(), ok);
-                self.last_tool_output = Some(expanded);
+                match diff.filter(|_| ok) {
+                    Some(DiffText { path, diff, added, removed }) => {
+                        self.last_tool_output = Some(diff.clone());
+                        let upper_bound = counts_are_an_upper_bound(&output);
+                        let change = FileChange { path, added, removed, diff_kept: true, upper_bound };
+                        self.transcript.push_file_change(compact, diff, change);
+                    }
+                    None => {
+                        self.transcript.push_tool(compact, output.clone(), ok);
+                        self.last_tool_output = Some(output);
+                    }
+                }
                 self.running_tool = None;
                 self.refilter_scroll_search_live();
                 self.dirty.mark_chat();
@@ -4076,10 +4134,9 @@ fn note_body(text: &str) -> &str {
 /// Commands habit from other terminal agents suggests, each with where the
 /// same thing lives here, so typing one gets a pointer, not "unknown command".
 const HABITS: &[(&[&str], &str)] = &[
-    (&["undo"], "/rewind <turn> rewinds the conversation, not files, to the end of a turn; /rewind alone lists the turns"),
+    (&["undo"], "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files, to the end of a turn"),
     (&["sessions", "history"], "/resume lists this project's sessions"),
     (&["config", "settings"], "settings live in ~/.openmax/settings.json, and openmax --spec settings describes each one"),
-    (&["diff"], "run git diff in a shell to see what changed"),
 ];
 
 /// Single source of truth for `/help` and onboarding copy.
@@ -4429,6 +4486,20 @@ fn clip(s: &str, max: usize) -> String {
 /// Replay shows a short tool-output preview, not the full persisted payload.
 /// (+N −N) change counts from a persisted write/edit result, so a replayed
 /// card keeps its badge even though Diff events are not persisted.
+/// Whether a write or edit result says its counts may overcount: the diff
+/// behind them was cut off at its deadline.
+fn counts_are_an_upper_bound(content: &str) -> bool {
+    content.lines().next().is_some_and(|line| line.ends_with(" · counts are an upper bound"))
+}
+
+/// The path a write or edit result names: `wrote <path> (+N −M)`, in the
+/// form the live diff event carries.
+fn changed_path(content: &str) -> Option<&str> {
+    let line = content.lines().next()?;
+    let rest = line.strip_prefix("wrote ").or_else(|| line.strip_prefix("edited "))?;
+    Some(&rest[..rest.rfind(" (+")?]).filter(|path| !path.is_empty())
+}
+
 fn parse_change_counts(content: &str) -> Option<(usize, usize)> {
     // The counts close the first line; an edit's excerpt of the changed
     // lines follows it and may hold text of the same shape.
@@ -4931,10 +5002,9 @@ mod tests {
         app.handle_submit("/clear".into()).await.unwrap();
         assert_eq!(app.session_id, None, "/clear starts a fresh session");
         for (typed, pointer) in [
-            ("undo", "/rewind <turn> rewinds the conversation, not files"),
+            ("undo", "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files"),
             ("sessions", "/resume lists"),
             ("settings", "settings live in ~/.openmax/settings.json"),
-            ("diff", "run git diff in a shell"),
         ] {
             app.handle_submit(format!("/{typed}")).await.unwrap();
             let shown = app.transcript.export_text();
@@ -7437,8 +7507,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn replay_keeps_diff_badges_and_marks_sittings() {
+    #[tokio::test]
+    async fn replay_keeps_diff_badges_and_marks_sittings() {
         let (mut app, dir) = app_fixture();
         let meta = open_max_core::sessions::create(
             &app.core,
@@ -7455,7 +7525,8 @@ mod tests {
                     kind: "function".into(),
                     function: open_max_core::types::ToolCallFunction {
                         name: "write_file".into(),
-                        arguments: "{\"path\":\"notes.md\",\"content\":\"x\"}".into(),
+                        // Spelled another way than the result names it.
+                        arguments: "{\"path\":\"./notes.md\",\"content\":\"x\"}".into(),
                     },
                     extra_content: None,
                 }]),
@@ -7490,6 +7561,8 @@ mod tests {
         open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
         // An earlier sitting ended after the first two messages.
         open_max_core::sessions::record_resume_point(&app.core, &meta.id, 2);
+        // A compaction archived earlier messages, which replay does not draw.
+        fs::write(open_max_core::sessions::archive_display(&app.core, &meta.id), "").unwrap();
 
         app.replay(&meta.id);
         let text = buffer_text(&render_app(&mut app, 100, 30));
@@ -7499,6 +7572,23 @@ mod tests {
         assert!(text.contains("−0"), "{text}");
         // The sitting boundary renders as a divider.
         assert!(text.contains("• resumed"), "{text}");
+        // /diff lists it from the counts the result carried, and says the
+        // diff itself did not survive the resume.
+        // It is listed by the path the result names, as a live edit of the
+        // same file would be, and the edits the compaction dropped are
+        // named as missing.
+        app.slash("diff").await;
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("+3 −0  notes.md") && !shown.contains("./notes.md"), "{shown}");
+        assert!(shown.contains("edits from before this session's compaction are not listed"), "{shown}");
+        app.on_agent_event(AgentEvent::ToolStart { call_id: "c2".into(), name: "edit_file".into(), args: serde_json::json!({"path": "./notes.md"}) });
+        app.on_agent_event(AgentEvent::Diff { call_id: "c2".into(), path: "notes.md".into(), diff: "+y\n".into(), added: 1, removed: 0 });
+        app.on_agent_event(AgentEvent::ToolEnd { call_id: "c2".into(), ok: true, output: "edited notes.md (+1 −0)".into(), duration_ms: None });
+        app.slash("diff").await;
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("+4 −0  notes.md (2 changes)") && shown.contains("1 file, +4 −0"), "{shown}");
+        app.slash("diff all").await;
+        assert!(app.transcript.export_text().contains("notes.md: +3 −0, diff not kept across a resume"));
         fs::remove_dir_all(dir).unwrap();
     }
 
