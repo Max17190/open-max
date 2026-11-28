@@ -2252,7 +2252,7 @@ fn a_refused_reply_limit_gets_one_retry_at_the_reserve() {
         ("length wording", 8192, vec![refusal("413 Payload Too Large", "maximum context length exceeded"), ok.clone()], &[8192, 4096], None),
         ("both fail", 8192, vec![refusal("400 Bad Request", "invalid request field"), still_invalid.clone(), ok.clone()], &[8192, 4096], Some(invalid)),
         ("already at reserve", 4096, vec![refusal("400 Bad Request", "invalid request field"), ok.clone()], &[4096], Some(invalid)),
-        ("raised", 4096, vec![cut.clone(), cut.clone(), too_large.clone(), ok.clone()], &[4096, 4096, 8192, 4096], None),
+        ("raised", 4096, vec![cut.clone(), cut.clone(), too_large.clone(), too_large.clone(), ok.clone()], &[4096, 4096, 16384, 8192, 4096], None),
         ("repair then continue at reserve", 8192, vec![cut.clone(), too_large, thought_requires_text, cut, ok], &[8192, 8192, 4096, 4096, 4096], None),
     ] {
         let (project, home) = fresh_dirs("reserve-retry");
@@ -2469,7 +2469,7 @@ fn a_model_that_thinks_past_the_limit_finishes_with_its_longest_reply_declared()
     for file in ["a.txt", "b.txt"] {
         assert_eq!(std::fs::read_to_string(project.join(file)).ok().as_deref(), Some("done\n"), "{file}: {stderr}");
     }
-    assert_eq!(*asked.lock().unwrap(), [4096, 4096, 8192, 4096, 4096, 8192, 16384, 32768, 4096], "{stderr}");
+    assert_eq!(*asked.lock().unwrap(), [4096, 4096, 16384, 16384, 32768, 16384], "{stderr}");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 

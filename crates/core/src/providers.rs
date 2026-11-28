@@ -206,6 +206,44 @@ impl ActiveEndpoint {
     }
     /// The limit of the one request after a reply the limit cut inside a tool call or its text: the room, within what a `prompt`-token prompt leaves.
     pub(crate) fn reply_room(&self, prompt: usize) -> usize { self.context_tokens.saturating_sub(1024 + prompt).clamp(self.reply_limit(prompt), self.reply_room.max(self.max_tokens)) }
+    /// Next doubling exponent after a cut reply: on a second consecutive cut from the base ask, jump straight to `reply_room`.
+    pub(crate) fn next_raise(&self, prompt: usize, raise: u32, cuts: usize, floor: usize, thought: bool) -> Option<u32> {
+        let mut min = self.raised_limit(prompt, raise).max(if thought { 0 } else { floor });
+        if raise == 0 && cuts > 1 { min = min.max(self.reply_room(prompt).saturating_sub(1)); }
+        (raise + 1..raise + 32).find(|&r| self.raised_limit(prompt, r) > min)
+    }
+}
+
+/// Turn-scoped state for reply-limit cuts and adaptive escalation.
+#[derive(Default)]
+pub(crate) struct CutState {
+    pub cuts: usize,
+    pub stalled: usize,
+    pub raise: u32,
+    pub base_raise: u32,
+    pub floor: usize,
+}
+
+impl CutState {
+    pub fn on_uncut(&mut self) {
+        if self.cuts > 1 { self.base_raise = self.base_raise.max(self.raise.min(2)); }
+        (self.cuts, self.stalled, self.raise, self.floor) = (0, 0, self.base_raise, 0);
+    }
+    pub fn should_raise(&self, capped: bool, thought: bool, no_room: bool) -> bool {
+        capped && !no_room && (self.cuts > 1 || self.base_raise > 0 || self.floor > 0 && !thought)
+    }
+    pub fn on_refused(&mut self) { (self.raise, self.base_raise) = (0, 0); }
+    /// When a multi-step jump is refused, step down to an untried intermediate
+    /// raise before abandoning raised limits for the turn.
+    pub fn step_down(&mut self, endpoint: &mut ActiveEndpoint, prompt: usize, limit: usize, accepted: usize) -> Option<usize> {
+        let lower = (self.raise > 1).then(|| endpoint.raised_limit(prompt, self.raise - 1))?;
+        (lower < limit && lower > accepted.max(endpoint.reply_limit(prompt))).then(|| {
+            self.raise -= 1;
+            self.base_raise = self.base_raise.min(self.raise);
+            endpoint.reply_ceiling = endpoint.reply_ceiling.min(lower);
+            lower
+        })
+    }
 }
 
 pub fn providers_path(data_dir: &Path) -> PathBuf {

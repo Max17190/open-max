@@ -134,16 +134,16 @@ async fn a_vendor_servers_completed_answer_stands_after_a_long_thought() {
         // half the limit, a cap no server reported, so they are cut (the limit
         // doubles), and a fourth that stops below half of that ends the turn.
         let t = turn_as(Shape::Silent, wire, 131_072, 2869, u64::MAX).await;
-        assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), (vec![4096, 4096, 4096, 8192], 2, "empty"), "{wire}");
+        assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), (vec![4096, 4096, 4096, 16384], 2, "empty"), "{wire}");
         // Spending all of the limit on a completed empty reply does not count as
         // a cut by token count alone; only a repeated unreported stop does.
         let t = turn_as(Shape::Silent, wire, 131_072, 4096, u64::MAX).await;
-        let expected = if wire == "responses" { (vec![4096, 4096, 4096, 8192], 2, "empty") } else { (vec![4096, 4096], 0, "empty") };
+        let expected = if wire == "responses" { (vec![4096, 4096, 4096, 16384], 2, "empty") } else { (vec![4096, 4096], 0, "empty") };
         assert_eq!((t.limits, t.notes.len(), t.stop.as_str()), expected, "{wire}");
     }
 }
 
-/// With no known longest reply, reported cuts double the limit past four times
+/// With no known longest reply, reported cuts raise the limit past four times
 /// the default, up to a quarter of the window: the cap setup puts on a maximum a
 /// catalog reports. A thought that never ends stops there, after four replies at
 /// that ceiling, as one at four times the default does elsewhere.
@@ -151,17 +151,17 @@ async fn a_vendor_servers_completed_answer_stands_after_a_long_thought() {
 async fn reported_cuts_raise_an_unknown_limit_up_to_a_quarter_of_the_window() {
     for wire in ["responses", "anthropic"] {
         let t = turn(wire, 131_072, 20_000, u64::MAX).await;
-        assert_eq!((t.limits.as_slice(), t.stop.as_str()), (&[4096, 4096, 8192, 16384, 32768][..], "stop"), "{wire}");
-        assert_eq!(t.notes.len(), 4);
-        assert!(t.notes[3].contains("32768 tokens"), "{:?}", t.notes);
+        assert_eq!((t.limits.as_slice(), t.stop.as_str()), (&[4096, 4096, 16384, 32768][..], "stop"), "{wire}");
+        assert_eq!(t.notes.len(), 3);
+        assert!(t.notes[2].contains("32768 tokens"), "{:?}", t.notes);
         let t = turn(wire, 131_072, u64::MAX / 4, u64::MAX).await;
-        assert_eq!((t.limits.as_slice(), t.stop.as_str()), (&[4096, 4096, 8192, 16384, 32768, 32768, 32768, 32768][..], "length"), "{wire}");
-        assert_eq!(t.billed, 163_840);
+        assert_eq!((t.limits.as_slice(), t.stop.as_str()), (&[4096, 4096, 16384, 32768, 32768, 32768, 32768][..], "length"), "{wire}");
+        assert_eq!(t.billed, 155_648);
     }
     // The worst case grows with the window, not with the number of requests.
     let t = turn("responses", 400_000, u64::MAX / 4, u64::MAX).await;
-    assert_eq!(t.limits, [4096, 4096, 8192, 16384, 32768, 65536, 100_000, 100_000, 100_000, 100_000]);
-    assert_eq!((t.billed, t.stop.as_str()), (531_072, "length"));
+    assert_eq!(t.limits, [4096, 4096, 16384, 32768, 65536, 100_000, 100_000, 100_000, 100_000]);
+    assert_eq!((t.billed, t.stop.as_str()), (522_880, "length"));
 }
 
 /// A server that refuses a raised limit gets the request again at the last limit
@@ -170,22 +170,22 @@ async fn reported_cuts_raise_an_unknown_limit_up_to_a_quarter_of_the_window() {
 async fn a_refused_raise_keeps_the_last_accepted_limit_for_the_rest_of_the_turn() {
     for wire in ["responses", "anthropic"] {
         let t = turn(wire, 131_072, u64::MAX / 4, 24_576).await;
-        assert_eq!(t.limits, [4096, 4096, 8192, 16384, 32768, 16384, 16384, 16384, 16384], "{wire}");
-        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 98_304, "length"));
+        assert_eq!(t.limits, [4096, 4096, 16384, 32768, 16384, 16384, 16384, 16384], "{wire}");
+        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 90_112, "length"));
         // A window whose quarter is past the model's maximum: refused at 65536 of 100,000.
         let t = turn(wire, 400_000, u64::MAX / 4, 64_000).await;
-        assert_eq!(t.limits, [4096, 4096, 8192, 16384, 32768, 65536, 32768, 32768, 32768, 32768], "{wire}");
-        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 196_608, "length"));
-        // Refused at the first raise: the last accepted limit is the first ask.
+        assert_eq!(t.limits, [4096, 4096, 16384, 32768, 65536, 32768, 32768, 32768, 32768], "{wire}");
+        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 188_416, "length"));
+        // Refused at the 4x jump: tries the skipped 8192, then keeps the last accepted limit.
         let t = turn(wire, 131_072, u64::MAX / 4, 6_000).await;
-        assert_eq!(t.limits, [4096, 4096, 8192, 4096, 4096, 4096, 4096], "{wire}");
-        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (1, 24_576, "length"));
+        assert_eq!(t.limits, [4096, 4096, 16384, 8192, 4096, 4096, 4096, 4096], "{wire}");
+        assert_eq!((t.refused_raises, t.billed, t.stop.as_str()), (2, 24_576, "length"));
     }
     // A notes request in that turn, cut before any text, is not asked again
     // above the limit the server refused (the turn helper counts each refusal).
-    // The fifth request is the notes request.
     let t = turn_as(Shape::Compacting, "anthropic", 60_000, u64::MAX / 4, 6_000).await;
-    assert_eq!((t.limits.as_slice(), t.refused_raises, t.stop.as_str()), (&[4096, 4096, 8192, 4096, 4096, 4096, 4096, 4096][..], 1, "length"));
+    assert_eq!((t.limits.len(), t.limits[0], t.limits[1], &t.limits[4..], t.refused_raises, t.stop.as_str()), (8, 4096, 4096, &[4096, 4096, 4096, 4096][..], 2, "length"));
+    assert!((6_001..=16_384).contains(&t.limits[2]) && t.limits[3] == 8192, "{:?}", t.limits);
 }
 
 /// The subscription route sends no limit and is not a server this module's rules

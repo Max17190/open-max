@@ -709,8 +709,8 @@ async fn run_loop(
     if let Some(budget) = request_budget { insert_startup_note(core, session_id, guard.messages(), crate::notes::request_budget_start_note(budget, 0, &mut budget_noted)); }
     let mut repeats = RepeatTracker::default();
     let mut text_calls = 0;
-    // Cut replies with no call since the last uncut reply, those the limit could not grow after (and cut calls once the room is spent), its doublings, the spent room a raise must pass, and a silent reply asked again.
-    let (mut cuts, mut stalled, mut raise, mut floor, mut stops, mut asked) = (0usize, 0usize, 0u32, 0usize, Vec::new(), false);
+    // Cut replies with no call since the last uncut reply, and a silent reply asked again.
+    let (mut cs, mut stops, mut asked) = (crate::providers::CutState::default(), Vec::new(), false);
     let (mut at_reserve, mut reserve_only, mut reserve_refusal) = (false, false, None);
     // A reply cut inside a call or its text gets room once. A refusal or spent room means asking for the rest in parts.
     let (mut room, mut no_room, mut spent) = (None::<usize>, false, false);
@@ -786,7 +786,7 @@ async fn run_loop(
         core.send_agent(session_id, AgentEvent::Budget { used_tokens: used_real, context_tokens });
 
         let roomy = room.take();
-        let mut limit = if at_reserve || reserve_only { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, raise))) };
+        let mut limit = if at_reserve || reserve_only { endpoint.reply_reserve } else { roomy.map_or(endpoint.raised_limit(used_real, cs.raise), |room| room.min(endpoint.reply_room(used_real)).max(endpoint.raised_limit(used_real, cs.raise))) };
         let batcher = Arc::new(StdMutex::new(TokenBatcher::new(core.clone(), session_id.to_string())));
         let messages = guard.messages().as_slice();
         let stream = |limit| {
@@ -834,10 +834,11 @@ async fn run_loop(
                     // Spend room and raises before trying the reserve, but a vendor's own server that refused a raise keeps the last limit it accepted; content repairs keep the smaller limit.
                     if endpoint.chatgpt.is_none() && limit > endpoint.reply_reserve && (length || matches!(status, Some(400 | 422))) && iteration + 1 < max_iterations {
                         if !length && reserve_refusal.is_none() { reserve_refusal = Some(message); }
-                        if endpoint.reports_cuts && raise > 0 && (endpoint.max_tokens..limit).contains(&accepted) { (endpoint.reply_ceiling, client.reply_bounds.0, no_room) = (accepted, accepted, true); continue 'turns; }
+                        if let Some(lower) = roomy.is_none().then(|| cs.step_down(&mut endpoint, used_real, limit, accepted)).flatten() { client.reply_bounds.0 = client.reply_bounds.0.min(lower); continue 'turns; }
+                        if endpoint.reports_cuts && cs.raise > 0 && (endpoint.max_tokens..limit).contains(&accepted) { (endpoint.reply_ceiling, client.reply_bounds.0, no_room, cs.base_raise) = (accepted, accepted, true, 0); continue 'turns; }
                         let usual = endpoint.reply_limit(used_real);
-                        at_reserve = !(endpoint.reply_reserve < usual && usual < limit && (roomy.is_some() || raise > 0));
-                        (no_room, raise) = (true, 0); continue 'turns;
+                        at_reserve = !(endpoint.reply_reserve < usual && usual < limit && (roomy.is_some() || cs.raise > 0));
+                        no_room = true; cs.on_refused(); continue 'turns;
                     }
                     // Only an explicit representation error authorizes withholding a saved thought.
                     let lone = guard.messages().iter_mut().filter(|m| crate::client::blank_on_wire(m, false) && m.reasoning_origin.as_deref() == Some(origin.as_str()));
@@ -967,9 +968,9 @@ async fn run_loop(
         // model can split the work. The client keeps its raw arguments even
         // when the cut lands before the first byte. Then the room the next request may carry, when this reply was cut and was not itself the one given room.
         let kind = if near { crate::notes::CutKind::Thought } else { crate::notes::cut_kind(limit, &result) };
-        if !capped { (cuts, stalled, raise, floor) = (0, 0, 0, 0) } else if roomy.is_some() && (!tool_calls.is_empty() || kind != crate::notes::CutKind::Thought) { (spent, floor) = (true, floor.max(limit)) }
+        if !capped { cs.on_uncut(); } else if roomy.is_some() && (!tool_calls.is_empty() || kind != crate::notes::CutKind::Thought) { (spent, cs.floor) = (true, cs.floor.max(limit)) }
         let grant = (capped && roomy.is_none() && !no_room && !spent && iteration + 1 < max_iterations).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
-        if !tool_calls.is_empty() { room = grant; stalled += usize::from(capped && spent); }
+        if !tool_calls.is_empty() { room = grant; cs.stalled += usize::from(capped && spent); }
         if tool_calls.is_empty() {
             // A reply with no calls ends the run of identical iterations, even
             // when a turn_end refusal below sends the loop round again.
@@ -990,13 +991,14 @@ async fn run_loop(
             // iteration, which has no request left to carry the note. A second cut in a row doubles the limit, so the
             // limit alone never ends a turn while it can grow; past a spent room, to the first doubling above it, but a cut thought plainly. A silent reply below the limit is asked again once per turn.
             let next = to_real(schema_tokens + guard.messages().iter().map(&estimate).sum::<usize>(), factor);
-            cuts += usize::from(capped);
-            let up = (raise + 1..raise + 32).find(|&r| endpoint.raised_limit(next, r) > endpoint.raised_limit(next, raise).max(if kind == crate::notes::CutKind::Thought { 0 } else { floor })).filter(|_| capped && (cuts > 1 || floor > 0 && kind != crate::notes::CutKind::Thought) && !no_room);
-            if let Some(up) = up { raise = up } else if capped && cuts > 1 { stalled += 1 }
-            if (capped && stalled < MAX_CUT_CONTINUATIONS || silent && !capped && !asked) && iteration + 1 < max_iterations {
+            cs.cuts += usize::from(capped);
+            let thought = kind == crate::notes::CutKind::Thought;
+            let up = cs.should_raise(capped, thought, no_room).then(|| endpoint.next_raise(next, cs.raise, cs.cuts, cs.floor, thought)).flatten();
+            if let Some(up) = up { cs.raise = up } else if capped && cs.cuts > 1 { cs.stalled += 1 }
+            if (capped && cs.stalled < MAX_CUT_CONTINUATIONS || silent && !capped && !asked) && iteration + 1 < max_iterations {
                 let at = guard.messages().len();
                 room = grant.filter(|_| kind != crate::notes::CutKind::Thought);
-                let ask = room.into_iter().chain(up.map(|_| endpoint.raised_limit(next, raise))).max();
+                let ask = room.into_iter().chain(up.map(|_| endpoint.raised_limit(next, cs.raise))).max();
                 let note = if capped { crate::notes::reply_cut_note(limit, kind, ask) } else { asked = true; "[empty reply: it had no text and no tool call. Continue the task: call a tool, or give the final answer.]".into() };
                 insert_note(core, session_id, guard.messages(), at, note);
                 save_messages(core, session_id, guard.messages(), false).await; continue 'turns;
@@ -1497,7 +1499,7 @@ async fn run_loop(
         // receipt's, before the save that writes that result.
         store_note(guard.messages(), note.as_deref());
         save_messages(core, session_id, guard.messages(), false).await;
-        if capped && spent && stalled >= MAX_CUT_CONTINUATIONS { stop_reason = "length".into(); break 'turns; }
+        if capped && spent && cs.stalled >= MAX_CUT_CONTINUATIONS { stop_reason = "length".into(); break 'turns; }
     }
 
     // A turn can end with the last assistant's tool_calls persisted but never
@@ -5341,15 +5343,15 @@ mod tests {
                 + "data: [DONE]\n\n"
         }
         const NOTE: &str = "[reply cut: it reached max_tokens (4096) before any tool call; continue from where it stopped: think briefly, then act.]";
-        const RAISED: &str = "[reply cut: it reached max_tokens (4096) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]";
-        const RAISED_AGAIN: &str = "[reply cut: it reached max_tokens (8192) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]";
+        const RAISED: &str = "[reply cut: it reached max_tokens (4096) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]";
+        const RAISED_AGAIN: &str = "[reply cut: it reached max_tokens (16384) before any tool call; continue from where it stopped: think briefly, then act.]";
         let gave_up = final_sse("I can't complete this task.", 3100, Some(3080));
         let at_share = final_sse("I can't complete this task.", 2868, Some(2868));
         let output_only = final_sse("Done.", 3000, None);
         let answer = final_sse("Done: a.txt says hello.", 60, Some(40));
         let below = final_sse("Done: a.txt says hello.", 2900, Some(2800));
-        // Near the raised limit of 8,192 too.
-        let gave_up_raised = final_sse("I can't complete this task.", 6000, Some(5900));
+        // Near the raised limit of 16,384 too.
+        let gave_up_raised = final_sse("I can't complete this task.", 12000, Some(11800));
         // At a 1,024 limit in a 16,384 window, where the limit cannot grow.
         let gave_up_small = final_sse("I can't complete this task.", 1000, Some(990));
         // A case: the replies in order (the last repeats), the window and limit, the stop reason, the requests, and
@@ -5725,10 +5727,10 @@ mod tests {
         let cases: [Case; 3] = [
             ("no longer reply declared: parts at once", vec![LOST], None, "length", &[4096, 16384, 4096, 4096, 4096],
                 &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while", SPLIT, SPLIT]),
-            ("a longer reply declared: the first doubling above the room", vec![LOST, LOST, &whole, STOP_SSE], Some(393_216), "stop", &[4096, 16384, 32768, 4096],
+            ("a longer reply declared: the first doubling above the room", vec![LOST, LOST, &whole, STOP_SSE], Some(393_216), "stop", &[4096, 16384, 32768, 16384],
                 &["(4096) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 16384 tokens", "(16384) while writing something that did not arrive here, most likely one tool call larger than the limit; nothing of it ran. The next reply alone may be up to 32768 tokens"]),
-            ("a thought cut in the room keeps the doubling", vec![LOST, CUT_SSE, STOP_SSE], None, "stop", &[4096, 16384, 8192],
-                &["The next reply alone may be up to 16384 tokens", "[reply cut: it reached max_tokens (16384) before any tool call; the next reply may be up to 8192 tokens: continue from where it stopped, then act.]"]),
+            ("a thought cut in the room keeps reply_room", vec![LOST, CUT_SSE, STOP_SSE], None, "stop", &[4096, 16384, 16384],
+                &["The next reply alone may be up to 16384 tokens", "[reply cut: it reached max_tokens (16384) before any tool call; the next reply may be up to 16384 tokens: continue from where it stopped, then act.]"]),
         ];
         for (case, streams, ceiling, want, limits, says) in cases {
             let (stop, sent, said) = cut_recovery_turn(&streams, ceiling).await;
