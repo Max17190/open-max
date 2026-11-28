@@ -1660,10 +1660,11 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         // leading line-number prefix only when the stripped text matches
         // unambiguously (or all occurrences under `replace_all`).
         if count == 0 {
-            if let Some(stripped_old) = strip_line_number_prefixes(old_string) {
+            if let Some((stripped_old, first_line, delim)) = strip_line_number_prefixes(old_string, None) {
                 let stripped_count = old.matches(stripped_old.as_str()).count();
                 if stripped_count == 1 || (*replace_all && stripped_count > 0) {
-                    let stripped_new = strip_line_number_prefixes(new_string).unwrap_or_else(|| new_string.clone());
+                    let stripped_new = strip_line_number_prefixes(new_string, Some((first_line, delim)))
+                        .map_or_else(|| new_string.clone(), |(s, _, _)| s);
                     if stripped_old != stripped_new {
                         *old_string = stripped_old;
                         *new_string = stripped_new;
@@ -1735,12 +1736,17 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     outcome
 }
 
-/// Strip uniform `read_file` or `grep` line-number prefixes (`12 `, `12: `,
-/// `12| `) from every non-empty line, returning `None` if any non-empty line
-/// lacks one. Used only as an unambiguous exact-match fallback in `edit_file`.
-fn strip_line_number_prefixes(text: &str) -> Option<String> {
+/// Strip uniform consecutive `read_file` or `grep` line-number prefixes
+/// (`12 `, `12: `, `12| `) from every non-empty line, returning the stripped
+/// text plus its first line number and delimiter. Rejects empty stripped text.
+/// When `expected` is provided, only strips if every non-empty line uses the
+/// same delimiter and starts consecutively from the expected first line number.
+fn strip_line_number_prefixes(text: &str, expected: Option<(usize, &str)>) -> Option<(String, usize, &'static str)> {
+    const DELIMS: [&str; 6] = [": ", "| ", " ", "\t", ":", "|"];
     let mut out = String::with_capacity(text.len());
-    let mut stripped_any = false;
+    let mut first_num: Option<usize> = None;
+    let mut prev_num: Option<usize> = None;
+    let mut delim: Option<&'static str> = None;
     for chunk in text.split_inclusive('\n') {
         let (line, end) = match chunk.strip_suffix("\r\n") {
             Some(l) => (l, "\r\n"),
@@ -1758,19 +1764,29 @@ fn strip_line_number_prefixes(text: &str) -> Option<String> {
         if !(1..=6).contains(&digits) {
             return None;
         }
+        let num: usize = trimmed[..digits].parse().ok()?;
         let rest = &trimmed[digits..];
-        let body = rest
-            .strip_prefix(": ")
-            .or_else(|| rest.strip_prefix("| "))
-            .or_else(|| rest.strip_prefix(' '))
-            .or_else(|| rest.strip_prefix('\t'))
-            .or_else(|| rest.strip_prefix(':'))
-            .or_else(|| rest.strip_prefix('|'))?;
-        stripped_any = true;
+        let (matched_delim, body) = if let Some(d) = delim {
+            (d, rest.strip_prefix(d)?)
+        } else if let Some((_, want_d)) = expected {
+            let &d = DELIMS.iter().find(|&&cand| cand == want_d)?;
+            (d, rest.strip_prefix(d)?)
+        } else {
+            DELIMS.iter().find_map(|&d| rest.strip_prefix(d).map(|b| (d, b)))?
+        };
+        if expected.is_some_and(|(want_first, _)| first_num.is_none() && num != want_first)
+            || prev_num.is_some_and(|prev| num != prev.saturating_add(1))
+        {
+            return None;
+        }
+        first_num.get_or_insert(num);
+        prev_num = Some(num);
+        delim = Some(matched_delim);
         out.push_str(body);
         out.push_str(end);
     }
-    stripped_any.then_some(out)
+    let (first, d) = (first_num?, delim?);
+    (!out.is_empty()).then_some((out, first, d))
 }
 
 /// The walk glob and grep share, from `walk_root` in the project whose
@@ -5917,6 +5933,30 @@ mod tests {
         );
         assert!(out2.ok, "{}", out2.output);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() {\n    let x = 3;\n    println!(\"{x}\");\n}\n");
+        // Empty stripped old_string is rejected even under replace_all.
+        let empty = super::edit_file(
+            &root,
+            &json!({
+                "path": "sample.rs",
+                "old_string": "1 ",
+                "new_string": "X",
+                "replace_all": true
+            }),
+        );
+        assert!(!empty.ok, "{}", empty.output);
+        // Unnumbered replacement starting with a real number preserves that number.
+        let report = root.join("report.txt");
+        std::fs::write(&report, "old\n").unwrap();
+        let out3 = super::edit_file(
+            &root,
+            &json!({
+                "path": "report.txt",
+                "old_string": "1: old",
+                "new_string": "2026 report"
+            }),
+        );
+        assert!(out3.ok, "{}", out3.output);
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "2026 report\n");
         let _ = std::fs::remove_dir_all(root);
     }
 }
