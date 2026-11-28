@@ -371,6 +371,9 @@ const MAX_TOOL_CALLS: usize = 128;
 /// held the turn forever.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long a Chat Completions stream is waited for after its finish, for the usage chunk and `[DONE]`.
+const FINISHED_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Reads what is left of a body after the reply's last event, beside the turn and for at most a second. A body read
 /// to its end gives its connection back for the next request; one dropped unread closes it, and the next opens a new one.
 fn drain(mut stream: impl futures_util::Stream + Send + Unpin + 'static) {
@@ -1126,8 +1129,11 @@ async fn read_sse(
     let mut unfinished: Option<Unfinished> = None;
 
     'outer: loop {
+        // After the finish only the usage chunk and `[DONE]` are due, and they come at once: a server that sends
+        // neither and holds the stream open is waited for briefly, not for the whole idle interval.
+        let wait = if saw_terminator { idle.min(FINISHED_GRACE) } else { idle };
         let next = tokio::select! {
-            c = tokio::time::timeout(idle, stream.next()) => c,
+            c = tokio::time::timeout(wait, stream.next()) => c,
             _ = cancelled.cancelled() => {
                 finish_reason = "cancelled".into();
                 break;
@@ -1219,8 +1225,15 @@ async fn read_sse(
                 unfinished = Some(error.map_or_else(bare, |error| Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data)))));
                 break 'outer;
             }
-            // The usage-bearing final chunk has an empty choices array.
-            let Some(choice) = choice else { continue };
+            // The usage-bearing final chunk has an empty choices array. After the finish it ends the reply: only
+            // `[DONE]` may follow, and a server that holds the stream open without it would hold the turn.
+            let Some(choice) = choice else {
+                if saw_terminator && chunk.usage.is_some_and(|u| u.is_object()) {
+                    drain(stream);
+                    break 'outer;
+                }
+                continue;
+            };
             // A one-shot reply read as a stream. Before anything has streamed,
             // it is parsed as the labeled body would be, so each call in it
             // stays its own: read as deltas, calls with no ids join when the
@@ -3853,6 +3866,26 @@ pub(crate) mod tests {
         let result = result.expect("a finished reply");
         assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
         assert_eq!(served, 1);
+    }
+
+    /// The bug this guards: a server that sent its finish, then held the stream open with neither `[DONE]` nor the
+    /// body's end, held the request for the whole idle interval (600 seconds by default) before the finished reply
+    /// stood. The usage chunk after the finish is the reply's last, so the reply ends there; with no usage chunk,
+    /// the reply ends a short grace after its finish.
+    #[tokio::test]
+    async fn a_finished_reply_does_not_wait_for_done() {
+        let finish = "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n";
+        for (stream, usage, within) in [(format!("{finish}{usage}"), Some((10, 3)), 1), (finish.to_string(), None, FINISHED_GRACE.as_secs() + 1)] {
+            let started = std::time::Instant::now();
+            // The second body is never served: the server waits for it, holding the first stream open.
+            let held = try_stream_sequence_idle(vec![format!("STALL:{stream}"), FINISHED.into()], IDLE_TIMEOUT);
+            let (result, _, served) = tokio::time::timeout(std::time::Duration::from_secs(30), held).await.expect("the finished reply does not wait out the idle interval");
+            let result = result.expect("a finished reply");
+            assert_eq!((result.content.as_str(), result.finish_reason.as_str(), served), ("all of it", "stop", 1));
+            assert_eq!(result.usage.map(|u| (u.prompt_tokens, u.completion_tokens)), usage);
+            assert!(started.elapsed() < std::time::Duration::from_secs(within), "{:?}", started.elapsed());
+        }
     }
 
     /// Any byte is activity, an SSE comment too: a server that keeps its
