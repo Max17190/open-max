@@ -56,7 +56,7 @@ async fn run_and_look(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<Agen
     if args.second_look {
         return crate::check::run(core, core_rx, args).await;
     }
-    run_session(&core, &mut core_rx, &args, &mut None).await
+    run_session(&core, &mut core_rx, &args, None).await
 }
 
 /// Run one or more agent turns and exit when the last finishes. Approvals in
@@ -68,7 +68,7 @@ pub(crate) async fn run_session(
     core: &Arc<Core>,
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,
     args: &HeadlessArgs,
-    opened: &mut Option<String>,
+    opened: Option<&mut Option<String>>,
 ) -> i32 {
     let project_key = args.project.display().to_string();
 
@@ -82,7 +82,9 @@ pub(crate) async fn run_session(
         return crate::quit_status();
     };
     let session_id = match session { Ok(session_id) => session_id, Err(code) => return code };
-    *opened = Some(session_id.clone());
+    if let Some(slot) = opened {
+        *slot = Some(session_id.clone());
+    }
 
     // A signal that landed while the session opened leaves no turn to run.
     let code = if stop_by.is_some() {

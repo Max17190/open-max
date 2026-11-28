@@ -436,8 +436,7 @@ fn changes(root: &Path, start: &Start, end: &Tree) -> (Vec<String>, String) {
         let new = std::fs::read(root.join(rel)).ok().and_then(|b| String::from_utf8(b).ok()).filter(|t| !t.contains('\0'));
         let name = rel.display().to_string();
         diff.push_str(&match (old, new) {
-            (Some(old), Some(new)) => similar::TextDiff::configure().deadline(std::time::Instant::now() + Duration::from_millis(200))
-                .diff_lines(old, &new).unified_diff().context_radius(3).header(&format!("a/{name}"), &format!("b/{name}")).to_string(),
+            (Some(old), Some(new)) => line_diff(&name, old, &new),
             (None, Some(_)) => format!("{name}: changed; its earlier text was not kept\n"),
             _ => format!("{name}: not text\n"),
         });
@@ -449,6 +448,45 @@ fn changes(root: &Path, start: &Start, end: &Tree) -> (Vec<String>, String) {
         paths.push(format!("and {git} under .git"));
     }
     (paths, cut(&diff, SHOWN_BYTES))
+}
+
+/// Compact line diff between `old` and `new` with up to 3 lines of surrounding
+/// context, trimmed at common prefix and suffix without linking `similar` into
+/// the TUI binary.
+#[cold]
+#[inline(never)]
+fn line_diff(name: &str, old: &str, new: &str) -> String {
+    let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    if pre == a.len() && pre == b.len() {
+        return String::new();
+    }
+    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let (a_end, b_end) = (a.len() - suf, b.len() - suf);
+    let ctx_pre = pre.saturating_sub(3);
+    let ctx_suf = suf.min(3);
+    let mut out = format!("--- a/{name}\n+++ b/{name}\n@@ -{},{} +{},{} @@\n", ctx_pre + 1, a_end - ctx_pre + ctx_suf, ctx_pre + 1, b_end - ctx_pre + ctx_suf);
+    for line in &a[ctx_pre..pre] {
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &a[pre..a_end] {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &b[pre..b_end] {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &a[a_end..a_end + ctx_suf] {
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// `text` cut at `max` bytes, on a character boundary, saying it was cut.
@@ -679,7 +717,7 @@ async fn run_inner(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEn
     let (authors, checkers) = (Mark::new(&kept, format!("{id}-author")), Mark::new(&kept, id.clone()));
     let held = begun.as_ref().and_then(|_| std::fs::create_dir_all(&kept).ok()).and_then(|()| authors.hold());
     let mut author = None;
-    let code = run_session(&core, &mut rx, &args, &mut author).await;
+    let code = run_session(&core, &mut rx, &args, Some(&mut author)).await;
     Mark::release(held);
     let (Some(author), true) = (author, code == 0 && !crate::signalled()) else { return code };
     let Some(begun) = begun else {
@@ -712,13 +750,13 @@ async fn run_inner(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEn
     let held = checkers.hold();
     let (was, mut checker) = (hold_requests(&core, PLAN_REQUESTS), None);
     let plan = turn(&args, format!("{}{}", PLAN.replace("{dir}", &shown), left.task), None);
-    let planned = run_session(&core, &mut rx, &plan, &mut checker).await;
+    let planned = run_session(&core, &mut rx, &plan, Some(&mut checker)).await;
     let _ = copy_file(&dir.join("plan.md"), &kept.join("plan.md"));
     if let (Some(session), 0 | 4, false) = (&checker, planned, crate::signalled()) {
         hold_requests(&core, RUN_REQUESTS);
         let paths = if left.paths.is_empty() { "(none)".to_string() } else { left.paths.join("\n") };
         let text = RUN.replace("{dir}", &shown).replace("{paths}", &paths).replace("{diff}", left.diff.trim_end()).replace("{message}", left.message.trim_end());
-        run_session(&core, &mut rx, &turn(&args, text, Some(session.clone())), &mut None).await;
+        run_session(&core, &mut rx, &turn(&args, text, Some(session.clone())), None).await;
     }
     core.settings.lock().unwrap().max_agent_iterations = was;
     Mark::release(held);
@@ -759,7 +797,7 @@ async fn run_inner(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEn
     let message = handback(&failures, &readings, &ended);
     eprintln!("openmax: check: handing {} objection{} back to the author", failures.len(), if failures.len() == 1 { "" } else { "s" });
     record["handed_back"] = json!(message);
-    let second = run_session(&core, &mut rx, &turn(&args, message, Some(author.clone())), &mut None).await;
+    let second = run_session(&core, &mut rx, &turn(&args, message, Some(author.clone())), None).await;
     if !crate::signalled() && !failures.is_empty() {
         last_look(&project, &skip, &checkers, &kept, &failures, &args.quit, &mut record).await;
     }

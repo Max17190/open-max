@@ -913,7 +913,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "similar",
  "tokio",
  "toml",
  "unicode-segmentation",
