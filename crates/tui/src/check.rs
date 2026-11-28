@@ -283,6 +283,8 @@ fn remove(path: &Path) {
 /// directory's place; then everything the snapshot lacks goes, and every
 /// file or link whose bytes, mode, time or target differ is written back.
 /// The paths it changed, and those it could not put back.
+#[cold]
+#[inline(never)]
 fn restore(root: &Path, snap: &Snapshot, skip: &[PathBuf]) -> (Vec<String>, Vec<String>) {
     let (mut fixed, mut failed) = (BTreeSet::new(), Vec::new());
     let shown = |rel: &Path| rel.display().to_string();
@@ -335,12 +337,12 @@ fn restore(root: &Path, snap: &Snapshot, skip: &[PathBuf]) -> (Vec<String>, Vec<
                 if held {
                     continue;
                 }
-                if !meta.as_ref().is_some_and(|m| m.is_file()) || copy_file_mode(&from, &path, *was).is_err() {
-                    remove(&path);
-                    if copy_file_mode(&from, &path, *was).is_err() {
-                        failed.push(shown(rel));
-                        continue;
-                    }
+                // Unlink first so a checker-replaced hard link is replaced with
+                // a fresh file rather than truncating the outside linked target.
+                remove(&path);
+                if copy_file_mode(&from, &path, *was).is_err() {
+                    failed.push(shown(rel));
+                    continue;
                 }
                 fixed.insert(shown(rel));
             }
@@ -614,6 +616,8 @@ enum Ran {
 
 /// Read at most `cap` head bytes and `cap` tail bytes from `path` without
 /// loading an arbitrarily large output file into memory.
+#[cold]
+#[inline(never)]
 fn read_head_tail(path: &Path, cap: usize) -> String {
     let Ok(mut file) = std::fs::File::open(path) else { return String::new() };
     let len = file.metadata().map_or(0, |m| m.len());
@@ -632,6 +636,8 @@ fn read_head_tail(path: &Path, cap: usize) -> String {
 
 /// Apply the same environment defaults as the `bash` tool so rerun commands see
 /// `EMAIL`, Cargo cleanup defaults, `OPENMAX_BIN`, and `openmax` on `PATH`.
+#[cold]
+#[inline(never)]
 fn apply_rerun_env(run: &mut tokio::process::Command, out: &Path) {
     for (name, fallback) in [("EMAIL", "openmax@localhost"), ("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never")] {
         if std::env::var_os(name).is_none() {
@@ -704,8 +710,11 @@ fn reproduced(ran: &Ran, observed: &str) -> bool {
 }
 
 /// Whether the project's permission rules and `pre_tool_use` hooks let the
-/// command run as a bash call, as the checker's own would have had to.
-async fn allowed(core: &Core, project: &Path, session: &str, command: &str) -> bool {
+/// command run as a bash call, as the checker's own would have had to. Runs
+/// hooks under `mark` and forwards stop signals via `cancel`.
+#[cold]
+#[inline(never)]
+async fn allowed(core: &Core, project: &Path, session: &str, command: &str, mark: &Mark, quit: &Arc<Notify>) -> bool {
     use open_max_core::{hooks, permissions};
     let args = json!({ "command": command });
     let rules = permissions::Permissions::discover_for_mode(project, &core.data_dir, ApprovalMode::Auto);
@@ -714,7 +723,22 @@ async fn allowed(core: &Core, project: &Path, session: &str, command: &str) -> b
     }
     let gates = hooks::Hooks::discover_for_mode(project, &core.data_dir, ApprovalMode::Auto);
     let cancel = Arc::new(open_max_core::state::CancelToken::default());
-    matches!(gates.pre_tool_use(session, "bash", &args, project, &cancel).await, hooks::PreToolResult::Allow)
+    if crate::signalled() {
+        cancel.cancel();
+        return false;
+    }
+    let held = mark.hold();
+    let watch = {
+        let (quit, cancel) = (quit.clone(), cancel.clone());
+        tokio::spawn(async move {
+            quit.notified().await;
+            cancel.cancel();
+        })
+    };
+    let res = gates.pre_tool_use(session, "bash", &args, project, &cancel).await;
+    watch.abort();
+    Mark::release(held);
+    !crate::signalled() && matches!(res, hooks::PreToolResult::Allow)
 }
 
 /// A print run's settings held for one checker turn: at most `requests`.
@@ -951,8 +975,10 @@ type Failure = (Value, Option<i32>, String);
 /// readings aside; stops processes and restores the tree after every command so
 /// checks never pollute later checks. Each verdict goes to the record.
 #[allow(clippy::too_many_arguments)]
-async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, snap: &Arc<Snapshot>, skip: &[PathBuf], task: &str, lines: &str, kept: &Path, quit: &Notify, record: &mut Value) -> (Vec<Failure>, Vec<Value>) {
-    let (mut failures, mut readings, mut verdicts, mut reruns) = (Vec::new(), Vec::new(), Vec::new(), 0);
+#[cold]
+#[inline(never)]
+async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, snap: &Arc<Snapshot>, skip: &[PathBuf], task: &str, lines: &str, kept: &Path, quit: &Arc<Notify>, record: &mut Value) -> (Vec<Failure>, Vec<Value>) {
+    let (mut failures, mut readings, mut verdicts, mut reruns, mut guarded) = (Vec::new(), Vec::new(), Vec::new(), 0, false);
     let (mut all_stopped, mut all_fixed, mut all_failed) = (Vec::new(), BTreeSet::new(), BTreeSet::new());
     for line in lines.lines().filter(|l| !l.trim().is_empty()) {
         let objection: Value = serde_json::from_str(line).unwrap_or(Value::Null);
@@ -967,19 +993,26 @@ async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, snap: &A
             "reading" => "dropped: past the readings kept".into(),
             "fails" | "missing" | "unrequested" if command.trim().is_empty() || command.contains('\n') => "dropped: its command is not one line".into(),
             "fails" | "missing" | "unrequested" if failures.len() >= KEPT || reruns >= RERUNS => "dropped: past the commands run again".into(),
-            "fails" | "missing" | "unrequested" if !allowed(core, project, author, &command).await => "dropped: a permission rule or hook refuses its command".into(),
             "fails" | "missing" | "unrequested" => {
-                reruns += 1;
-                let ran = rerun(project, &command, mark, &kept.join(format!("rerun-{reruns}.out")), quit).await;
+                let ok = allowed(core, project, author, &command, mark, quit).await;
+                let ran = if ok {
+                    reruns += 1;
+                    Some(rerun(project, &command, mark, &kept.join(format!("rerun-{reruns}.out")), quit).await)
+                } else {
+                    None
+                };
+                guarded = true;
                 let (s, fx, fl) = guard_once(mark, project, snap, skip, "re-run").await;
                 all_stopped.extend(s);
                 all_fixed.extend(fx);
                 all_failed.extend(fl);
                 match ran {
-                    Ran::Stopped => break,
-                    Ran::TimedOut => "dropped: its command did not finish".into(),
-                    Ran::Exited(..) if !reproduced(&ran, &field(&objection, "observed")) => "dropped: its command passed".into(),
-                    Ran::Exited(status, output) => {
+                    None if crate::signalled() => break,
+                    None => "dropped: a permission rule or hook refuses its command".into(),
+                    Some(Ran::Stopped) => break,
+                    Some(Ran::TimedOut) => "dropped: its command did not finish".into(),
+                    Some(ran @ Ran::Exited(..)) if !reproduced(&ran, &field(&objection, "observed")) => "dropped: its command passed".into(),
+                    Some(Ran::Exited(status, output)) => {
                         failures.push((objection.clone(), status, output));
                         "kept".into()
                     }
@@ -989,7 +1022,7 @@ async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, snap: &A
         };
         verdicts.push(json!({ "objection": objection, "verdict": verdict }));
     }
-    if reruns > 0 {
+    if guarded {
         record["re-run"] = json!({
             "stopped": all_stopped,
             "put_back": all_fixed.into_iter().collect::<Vec<_>>(),
@@ -1044,6 +1077,8 @@ fn final_passed(ran: &Ran, observed: &str) -> bool {
 /// At the author's second end, run the handed-back commands once more and
 /// record which now pass, then put the tree back as the author left it.
 #[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
 async fn last_look(core: &Core, project: &Path, author: &str, skip: &[PathBuf], mark: &Mark, kept: &Path, failures: &[Failure], quit: &Arc<Notify>, record: &mut Value) {
     let take = {
         let (root, skip, copy) = (project.to_path_buf(), skip.to_vec(), kept.join("second-end"));
@@ -1058,20 +1093,25 @@ async fn last_look(core: &Core, project: &Path, author: &str, skip: &[PathBuf], 
     let (mut all_stopped, mut all_fixed, mut all_failed) = (Vec::new(), BTreeSet::new(), BTreeSet::new());
     for (n, (objection, ..)) in failures.iter().enumerate() {
         let command = field(objection, "command");
-        if !allowed(core, project, author, &command).await {
-            passing.push(json!({ "command": command, "passes": false, "skipped": "refused by permission rule or hook" }));
-            continue;
-        }
-        let ran = rerun(project, &command, mark, &kept.join(format!("final-{}.out", n + 1)), quit).await;
+        let ok = allowed(core, project, author, &command, mark, quit).await;
+        let ran = if ok {
+            Some(rerun(project, &command, mark, &kept.join(format!("final-{}.out", n + 1)), quit).await)
+        } else {
+            None
+        };
         let (s, fx, fl) = guard_once(mark, project, &snap, skip, "last re-run").await;
         all_stopped.extend(s);
         all_fixed.extend(fx);
         all_failed.extend(fl);
-        if matches!(ran, Ran::Stopped) {
-            break;
+        match ran {
+            None if crate::signalled() => break,
+            None => passing.push(json!({ "command": command, "passes": false, "skipped": "refused by permission rule or hook" })),
+            Some(Ran::Stopped) => break,
+            Some(ran) => {
+                let passes = final_passed(&ran, &field(objection, "observed"));
+                passing.push(json!({ "command": command, "passes": passes, "timed_out": matches!(ran, Ran::TimedOut) }));
+            }
         }
-        let passes = final_passed(&ran, &field(objection, "observed"));
-        passing.push(json!({ "command": command, "passes": passes, "timed_out": matches!(ran, Ran::TimedOut) }));
     }
     record["last re-run"] = json!({
         "stopped": all_stopped,
