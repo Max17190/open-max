@@ -57,7 +57,8 @@ headless and stdio trust.
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
-| `/status` | Endpoint, cache, performance, privacy, and network details |
+| `/status` | Endpoint, cache, token totals, performance, privacy, and network details |
+| `/usage` · `/cost` | What this session has spent in tokens: tokens in, of which cached, and tokens out, summed from the usage the provider reported for each request. Resuming a session restores its totals from the usage record the session keeps, and `/new` starts them again. A provider that reports no usage shows "not reported", not zero. Tokens only: Open Max has no price table, so it shows no prices |
 | `/update` | Update to the latest release, then resume this session in it |
 | `/quit` · `/exit` | Exit |
 
@@ -69,7 +70,7 @@ version, is in [the stdio protocol](stdio-protocol.md), whose `rewind`
 counts the same way.
 
 Some common command names print a pointer instead of running an action:
-`/undo` points to `/rewind`, `/cost` and `/usage` to `/status`, `/sessions`
+`/undo` points to `/rewind`, `/sessions`
 and `/history` to `/resume`, `/config` and `/settings` to
 `openmax --spec settings`, and `/diff` to `git diff`. A prompt template with one
 of those names runs instead.
@@ -490,6 +491,8 @@ setting.
 The persistent status line stays short so the transcript remains readable.
 On its right are the model (with the requested reasoning effort, if any),
 context use, the share of prompt tokens served from cache once the provider
-reports it, and the approval mode. On its left are the keys for the moment:
+reports it, the session's tokens in and out (`in 1.2M out 34k`) once the
+provider reports usage, and the approval mode. The cache share and the token
+totals show at 100 columns and wider. On its left are the keys for the moment:
 while nothing else is going on, it points to `/help`, which lists every key
 and command. `/status` is where the full runtime detail lives.

@@ -33,7 +33,7 @@ use crate::ui::text::paint_line;
 use crate::ui::transcript::{
     wrap_lines, RowRef, Term, Transcript,
 };
-use crate::ui::{context, extensions, markdown, model_picker};
+use crate::ui::{context, extensions, markdown, model_picker, usage};
 
 /// Where keyboard focus lives in chat mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -367,6 +367,9 @@ pub struct App {
     budget: Option<(usize, usize)>,
     /// Prompt-cache hit rate of the last completion, from server usage.
     cache_pct: Option<u8>,
+    /// Tokens this session has spent: restored from its usage record on
+    /// resume, then summed from each usage event; reset on /new.
+    tokens: usage::Totals,
     quit_armed: bool,
     spinner_i: usize,
     tick_i: u64,
@@ -785,6 +788,7 @@ impl App {
             last_assistant_response: None,
             budget: None,
             cache_pct: None,
+            tokens: usage::Totals::default(),
             quit_armed: false,
             spinner_i: 0,
             tick_i: 0,
@@ -867,6 +871,9 @@ impl App {
             self.error(&e);
             return;
         }
+        // The core appends a record for every usage event it sends, so the
+        // record is what this session spent before this sitting.
+        self.tokens = usage::Totals::from_records(&sessions::load_usage(&self.core, session_id));
         let messages = match sessions::load_messages(&self.core, session_id) {
             Ok(Some(messages)) => messages,
             Ok(None) => return,
@@ -1019,6 +1026,7 @@ impl App {
         self.last_assistant_response = None;
         self.budget = None;
         self.cache_pct = None;
+        self.tokens = usage::Totals::default();
         self.completion = None;
         self.history_search = None;
         self.scroll_search = None;
@@ -2140,6 +2148,9 @@ impl App {
                         panel.selected = panel.selected.min(panel.items.len().saturating_sub(1));
                         if self.session_id.as_deref() == Some(id.as_str()) {
                             self.session_id = None;
+                            // The next prompt starts a new session, which
+                            // has spent nothing yet.
+                            self.tokens = usage::Totals::default();
                             self.core.reset_session_effort();
                             self.created_session = false;
                             self.resumed_awaiting_hydration = false;
@@ -2678,7 +2689,7 @@ impl App {
                         s.context_tokens.unwrap_or(0),
                     ),
                 };
-                let block = vec![
+                let mut block = vec![
                     kv("provider", &provider),
                     kv("model", &model),
                     kv("endpoint", &endpoint),
@@ -2693,6 +2704,9 @@ impl App {
                         },
                     ),
                     kv("cache", &cache),
+                ];
+                block.extend(self.tokens.rows().iter().map(|(label, value)| kv(label, value)));
+                block.extend([
                     kv("ttft", &ttft),
                     kv("throughput", &throughput),
                     kv("session", self.session_id.as_deref().unwrap_or("none yet")),
@@ -2705,7 +2719,7 @@ impl App {
                         "no telemetry · sessions stay local · external tools may use the network",
                     ),
                     kv("  updates", &crate::update::status()),
-                ];
+                ]);
                 self.transcript.push(block);
             }
             "update" if self.running => self.note("finish or cancel the turn before /update"),
@@ -2716,6 +2730,16 @@ impl App {
                 }
                 Err(why) => self.note(&why),
             },
+            "usage" | "cost" => {
+                let mut block: Vec<Line<'static>> =
+                    self.tokens.rows().iter().map(|(label, value)| kv(label, value)).collect();
+                block.push(Line::from(Span::styled(
+                    "  summed from the usage the provider reported for each request of this session; no prices, since Open Max has no price table",
+                    Style::default().fg(theme::DIM),
+                )));
+                self.transcript.push(block);
+                self.dirty.mark_chat();
+            }
             "quit" | "exit" => self.should_quit = true,
             other => match HABITS.iter().find(|(names, _)| names.contains(&other)) {
                 Some((_, pointer)) => self.note(&format!("/{other} is not a command here; {pointer}")),
@@ -2924,7 +2948,8 @@ impl App {
                 self.budget = Some((used_tokens, context_tokens));
                 self.dirty.mark_chrome();
             }
-            AgentEvent::Usage { prompt_tokens, cached_tokens, .. } => {
+            AgentEvent::Usage { prompt_tokens, completion_tokens, cached_tokens } => {
+                self.tokens.add(prompt_tokens, completion_tokens, cached_tokens);
                 self.cache_pct = match cached_tokens {
                     Some(c) if prompt_tokens > 0 => {
                         Some(((c as f64 / prompt_tokens as f64) * 100.0).round() as u8)
@@ -3892,6 +3917,7 @@ impl App {
                     short_model,
                     self.budget,
                     self.cache_pct,
+                    self.tokens.status_segment().as_deref(),
                     &approvals,
                     width,
                 )
@@ -4025,7 +4051,6 @@ fn note_body(text: &str) -> &str {
 /// same thing lives here, so typing one gets a pointer, not "unknown command".
 const HABITS: &[(&[&str], &str)] = &[
     (&["undo"], "/rewind <turn> rewinds the conversation, not files, to the end of a turn; /rewind alone lists the turns"),
-    (&["cost", "usage"], "/status shows this session's context and prompt cache use"),
     (&["sessions", "history"], "/resume lists this project's sessions"),
     (&["config", "settings"], "settings live in ~/.openmax/settings.json, and openmax --spec settings describes each one"),
     (&["diff"], "run git diff in a shell to see what changed"),
@@ -4072,11 +4097,13 @@ enum Presence {
 /// The widest status tier: the labeled metrics and the approval mode are the
 /// point of the tier, so the tail is built first and the model id gives way,
 /// clipped to the width the tail leaves over. Rendering the full id let a
-/// long model name push ctx, cache, and the approval mode off the row.
+/// long model name push ctx, cache, the session's token totals, and the
+/// approval mode off the row.
 fn wide_status_right(
     short_model: &str,
     budget: Option<(usize, usize)>,
     cache_pct: Option<u8>,
+    tokens: Option<&str>,
     approvals: &str,
     width: usize,
 ) -> String {
@@ -4087,6 +4114,9 @@ fn wide_status_right(
     }
     if let Some(cache) = cache_pct {
         tail.push_str(&format!("  cache {cache}%"));
+    }
+    if let Some(tokens) = tokens {
+        tail.push_str(&format!("  {tokens}"));
     }
     tail.push_str(&format!("  {approvals} "));
     let model_max = width.saturating_sub(crate::ui::text::width(&tail));
@@ -4876,7 +4906,6 @@ mod tests {
         assert_eq!(app.session_id, None, "/clear starts a fresh session");
         for (typed, pointer) in [
             ("undo", "/rewind <turn> rewinds the conversation, not files"),
-            ("usage", "/status shows this session's context"),
             ("sessions", "/resume lists"),
             ("settings", "settings live in ~/.openmax/settings.json"),
             ("diff", "run git diff in a shell"),
@@ -8411,14 +8440,14 @@ mod tests {
         let long =
             "org/some-preview-model-with-an-extremely-long-identifier-2026-08-26-instruct";
         let right =
-            wide_status_right(long, Some((50_000, 100_000)), Some(93), "auto", 100);
+            wide_status_right(long, Some((50_000, 100_000)), Some(93), Some("in 1.2M out 34k"), "auto", 100);
         assert!(crate::ui::text::width(&right) <= 100, "fits the row: {right}");
-        for label in ["ctx 50%", "cache 93%", "auto"] {
+        for label in ["ctx 50%", "cache 93%", "in 1.2M out 34k", "auto"] {
             assert!(right.contains(label), "{label} survives: {right}");
         }
         // A short id is untouched: the tier's historical shape holds.
         let short =
-            wide_status_right("gpt-x", Some((50_000, 100_000)), Some(93), "auto", 100);
+            wide_status_right("gpt-x", Some((50_000, 100_000)), Some(93), None, "auto", 100);
         assert!(short.starts_with("gpt-x  ctx 50%"), "{short}");
     }
 
@@ -8438,7 +8467,7 @@ mod tests {
         let status = rows(&buffer).into_iter().rev().find(|r| r.contains("ctx")).unwrap();
         assert!(status.contains("ctx 25%"), "status: {status}");
         assert!(status.contains("cache 87%"), "status: {status}");
-        assert!(!status.contains("out "), "status: {status}");
+        assert!(status.contains("in 10k out 16.8k"), "status: {status}");
         // A second usage report moves the cache meter.
         app.on_agent_event(AgentEvent::Usage {
             prompt_tokens: 12_000,
@@ -8448,10 +8477,11 @@ mod tests {
         let buffer = render_app(&mut app, 120, 12);
         let status = rows(&buffer).into_iter().rev().find(|r| r.contains("ctx")).unwrap();
         assert!(status.contains("cache 100%"), "status: {status}");
+        assert!(status.contains("in 22k out 17k"), "the totals sum both reports: {status}");
         // The historical 78-column tier keeps its unlabeled shape.
         let buffer = render_app(&mut app, 80, 12);
         let narrow = rows(&buffer).concat();
-        assert!(!narrow.contains("cache"), "narrow: {narrow}");
+        assert!(!narrow.contains("cache") && !narrow.contains("out "), "narrow: {narrow}");
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -606,10 +606,13 @@ async fn sessions_panel_moves_deletes_and_closes() {
     press(&mut app, key(KeyCode::Char('k'))).await;
     assert_eq!(at(&app), 0);
 
-    // Deleting the open session leaves the app without one.
+    // Deleting the open session leaves the app without one, and without
+    // the tokens it spent, so the next session's totals start from nothing.
     let doomed = app.sessions_panel.as_ref().unwrap().items[0].id.clone();
     let kept = app.sessions_panel.as_ref().unwrap().items[1].id.clone();
     app.session_id = Some(doomed.clone());
+    app.on_agent_event(AgentEvent::Usage { prompt_tokens: 900, completion_tokens: 40, cached_tokens: None });
+    assert!(app.tokens.status_segment().is_some());
     press(&mut app, key(KeyCode::Char('x'))).await;
     assert_eq!(app.sessions_panel.as_ref().unwrap().confirm_delete.as_deref(), Some(doomed.as_str()));
     press(&mut app, key(KeyCode::Char('y'))).await;
@@ -618,6 +621,8 @@ async fn sessions_panel_moves_deletes_and_closes() {
     assert_eq!(left.len(), 2);
     assert!(!left.contains(&doomed) && left.iter().all(|id| ids.contains(id)));
     assert_eq!(app.session_id, None);
+    assert_eq!(app.tokens.status_segment(), None, "the deleted session's tokens are gone");
+    assert!(app.tokens.rows().iter().all(|(_, value)| value == "not reported"));
 
     // Deleting another session keeps the open one.
     app.session_id = Some(kept.clone());
@@ -928,7 +933,7 @@ fn small_pure_rules_hold_at_their_edges() {
     assert!(!rect_contains(rect, 1, 3) && !rect_contains(rect, 2, 2));
     assert_eq!(elapsed_label(Duration::from_millis(9_940)), "9.9s");
     assert_eq!(elapsed_label(Duration::from_secs(10)), "10s");
-    assert_eq!(wide_status_right("model", None, None, "ask", 100), "model  ask ");
+    assert_eq!(wide_status_right("model", None, None, None, "ask", 100), "model  ask ");
 }
 
 #[test]
@@ -1214,6 +1219,45 @@ async fn a_resumed_session_replays_its_prompts_and_leaves_nothing_to_discard() {
     let shown = app.transcript.export_text();
     assert!(shown.contains("the first question") && shown.contains("the first answer"), "{shown}");
     assert_eq!(app.left_running, ["another"], "resumed, it is no longer the app's to discard");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What a session spent shows in /usage, /cost and /status: restored from
+/// the session's usage record on resume, summed with each usage event after
+/// it, and back to "not reported" on /new.
+#[tokio::test]
+async fn session_token_totals_survive_resume_and_reset_on_new() {
+    use open_max_core::sessions::{self, TokenUsage};
+    use open_max_core::types::ChatMessage;
+    let (mut app, dir) = app_fixture();
+    let core = app.core.clone();
+    let id = sessions::create(&core, dir.display().to_string()).unwrap().id;
+    sessions::attach(&core, &id).unwrap();
+    let history = vec![ChatMessage::system("rules"), ChatMessage::user("a question")];
+    assert!(sessions::save_messages(&core, &id, &history, &mut 0, true));
+    sessions::end_turn(&core, &id, &history);
+    for (prompt, completion, cached) in [(9_000, 400, Some(6_000)), (11_000, 600, None)] {
+        let record = TokenUsage { ts: 1, prompt_tokens: prompt, completion_tokens: completion, cached_tokens: cached, ..Default::default() };
+        sessions::append_usage(&core, &id, &record);
+    }
+    sessions::detach(&core, &id).unwrap();
+    app.handle_submit("/resume".into()).await.unwrap();
+    press(&mut app, key(KeyCode::Enter)).await;
+    assert_eq!(app.session_id.as_deref(), Some(id.as_str()));
+    app.handle_submit("/usage".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("tokens in  20,000 over 2 requests"), "{shown}");
+    assert!(shown.contains("6,000 (67%), reported by 1 of 2 requests"), "{shown}");
+    assert!(shown.contains("tokens out 1,000") && shown.contains("no price table"), "{shown}");
+    assert!(!shown.contains("not a command"), "{shown}");
+    app.on_agent_event(AgentEvent::Usage { prompt_tokens: 5_000, completion_tokens: 25, cached_tokens: Some(5_000) });
+    app.handle_submit("/status".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("tokens in  25,000 over 3 requests") && shown.contains("tokens out 1,025"), "{shown}");
+    app.handle_submit("/new".into()).await.unwrap();
+    app.handle_submit("/cost".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("tokens in  not reported") && shown.contains("tokens out not reported"), "{shown}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
