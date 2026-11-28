@@ -1,0 +1,19 @@
+They report the work done. Run your planned checks against it now, then any check that what changed suggests.
+
+For each check that fails, append one line of JSON to {dir}/objections.jsonl with these keys:
+- "quote": the exact words of the request the check rests on;
+- "command": one shell command, on one line, that shows the failure when run from the project directory;
+- "expected": what the request's words call for;
+- "observed": what the command printed instead;
+- "kind": "fails" (it runs and gives a wrong result), "missing" (the request asks for something that is not there), "unrequested" (they did something the request did not ask for) or "reading" (you read the request differently from them, and its words allow both).
+
+Change nothing of theirs: write only inside {dir}, and stop anything you start before you end. If nothing fails, write nothing. End your turn with one line that says how many objections you wrote.
+
+The paths they created, changed or removed:
+{paths}
+
+What changed in their text files, cut short where long:
+{diff}
+
+Their final message:
+{message}

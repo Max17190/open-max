@@ -5,6 +5,7 @@ mod chatgpt;
 mod setup;
 mod completion;
 mod gate;
+mod check;
 mod headless;
 mod input;
 mod leftover;
@@ -66,9 +67,10 @@ options:
                          for more turns. Piped or redirected stdin supplies the
                          first prompt or follows it after a blank line. Use
                          </dev/null to skip stdin.
-      --second-look      with --print and one prompt: a run that ends with status 0 within
-                         10,000 output tokens is checked by a new session; status unchanged
-                         unless that session declines an approval (3)
+      --second-look      with --print and one prompt, in auto: a run that ends with status 0
+                         is checked by a new session that may not change it; objections
+                         the harness reproduces go back to the run's session once; the
+                         exit status is that session's
       --json             with --print, --replay or --subagent, emit AgentEvent envelopes
                          as JSONL; with --check, emit every finding as one JSON array
       --replay <file> --json
@@ -1647,7 +1649,6 @@ async fn run(mut cli: CliArgs) -> std::io::Result<std::process::ExitCode> {
                 session: cli.session,
                 json: cli.json,
                 second_look: cli.second_look,
-                written: Default::default(),
                 quit: quit.clone(),
             };
             headless::run(core, core_rx, args).await

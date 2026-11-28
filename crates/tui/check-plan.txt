@@ -1,0 +1,11 @@
+Someone else was given the request below and is working on it in this environment. Your job is to check their work, and you may not change it. In this turn you only plan the checks.
+
+Before you open anything they made, read the request and the inputs it names. Then write your plan to {dir}/plan.md:
+- each requirement, as an exact quote from the request, with one shell command that tests it;
+- where a requirement can only be tested on inputs other than the example given, plan to make such inputs and to get the right answer for them by a route that does not use their work;
+- where the request can be read two ways, both readings.
+
+The request and this environment are your only sources: do not look the request up anywhere else. Write only inside {dir}. Once the plan is written, end your turn.
+
+The request:
+
