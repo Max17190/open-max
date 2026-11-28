@@ -883,9 +883,11 @@ impl App {
         let has_manifest = sessions::load_manifest(&self.core, session_id).is_some();
         self.resumed_awaiting_hydration = has_manifest;
         // A compaction moves the messages it drops into the archive, which
-        // replay does not draw.
-        self.compacted_before_replay =
-            std::path::Path::new(&sessions::archive_display(&self.core, session_id)).exists();
+        // replay does not draw, and records itself in the compaction log,
+        // which a fork copies with the compacted history.
+        let exists = |path: String| std::path::Path::new(&path).exists();
+        self.compacted_before_replay = exists(sessions::archive_display(&self.core, session_id))
+            || exists(sessions::compaction_display(&self.core, session_id));
         if let Err(e) = sessions::attach(&self.core, session_id) {
             self.error(&e);
             return;

@@ -1625,3 +1625,33 @@ async fn a_template_named_diff_past_the_discovery_cap_is_still_offered() {
     assert!(app.transcript.export_text().contains("Review the staged diff"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A branch of a compacted session carries the compacted history and the
+/// compaction log, not the archive: /diff on it still says the edits from
+/// before the compaction are not listed.
+#[tokio::test]
+async fn diff_on_a_branch_of_a_compacted_session_names_what_it_cannot_list() {
+    use open_max_core::sessions;
+    use open_max_core::types::ChatMessage;
+    let (mut app, dir) = app_fixture();
+    let core = app.core.clone();
+    let parent = sessions::create(&core, dir.display().to_string()).unwrap().id;
+    sessions::attach(&core, &parent).unwrap();
+    let history = vec![ChatMessage::system("rules"), ChatMessage::user("a question")];
+    assert!(sessions::save_messages(&core, &parent, &history, &mut 0, true));
+    sessions::end_turn(&core, &parent, &history);
+    std::fs::write(sessions::compaction_display(&core, &parent), "").unwrap();
+    std::fs::write(sessions::archive_display(&core, &parent), "").unwrap();
+    sessions::detach(&core, &parent).unwrap();
+    let child = sessions::fork(&core, &parent, sessions::ForkAt::End).unwrap().id;
+    assert!(!std::path::Path::new(&sessions::archive_display(&core, &child)).exists());
+    assert!(app.switch_to_session(child));
+    app.handle_submit("/diff".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("edits from before this session's compaction are not listed"), "{shown}");
+    app.handle_submit("/new".into()).await.unwrap();
+    app.handle_submit("/diff".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.ends_with("> no file changes in this session yet. /diff lists edit and write tools only; git diff shows what shell commands changed\n"), "{shown}");
+    let _ = std::fs::remove_dir_all(dir);
+}
