@@ -61,6 +61,7 @@ while it does.
 | `/tools` · `/skills` · `/context` | Session tools, skills, token budget. Your own tools show the calls and failures this project recorded, your skills how often their body was read |
 | `/memory` | This project's memories under `.openmax/memory/`, which the agent writes: each one's description, how many reads and writes the file tools logged, how long since the last, and whether a new session's index carries it or it has faded (still on disk; `openmax --recall` searches it) |
 | `/compact` | Compact the context now instead of waiting for the budget to force it |
+| `/diff` · `/diff all` | The files this session's `write_file` and `edit_file` calls changed, each with its lines added and removed · their combined diff, in the order the tools made them. It reads the diffs the transcript holds, so it covers the file tools only: what a shell command changed is not in it, and `git diff` shows that. An edit replayed from a resumed session keeps its counts but not its diff. A prompt template named `diff` runs instead |
 | `/export [path]` | Write the transcript as markdown (default `openmax-<session>.md` in the project) |
 | `/<template> [args]` | Run a prompt template from `.agents/prompts/` |
 | `/status` | Endpoint, cache, token totals, performance, privacy, and network details |
@@ -76,10 +77,10 @@ version, is in [the stdio protocol](stdio-protocol.md), whose `rewind`
 counts the same way.
 
 Some common command names print a pointer instead of running an action:
-`/undo` points to `/rewind`, `/sessions`
-and `/history` to `/resume`, `/config` and `/settings` to
-`openmax --spec settings`, and `/diff` to `git diff`. A prompt template with one
-of those names runs instead.
+`/undo` points to `/diff` and `/rewind`, `/sessions`
+and `/history` to `/resume`, and `/config` and `/settings` to
+`openmax --spec settings`. A prompt template with one of those names runs
+instead.
 
 ## Command line
 

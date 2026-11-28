@@ -1515,3 +1515,93 @@ async fn a_compact_approval_card_sits_on_the_bottom_row() {
     assert_eq!(turn.try_recv(), Ok(true));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// One finished tool call, as the core reports it: a write or an edit
+/// carries the diff it made, a shell command carries only its output.
+fn finish_tool(app: &mut App, call: &str, name: &str, args: serde_json::Value, diff: Option<(&str, &str, usize, usize)>) {
+    app.on_agent_event(AgentEvent::ToolStart { call_id: call.into(), name: name.into(), args });
+    if let Some((path, diff, added, removed)) = diff {
+        app.on_agent_event(AgentEvent::Diff { call_id: call.into(), path: path.into(), diff: diff.into(), added, removed });
+    }
+    app.on_agent_event(AgentEvent::ToolEnd { call_id: call.into(), ok: true, output: "done".into(), duration_ms: None });
+}
+
+/// /diff lists each file the edit and write tools changed, with its lines
+/// added and removed summed over its changes, at every width the TUI meets;
+/// /diff all opens their combined diff, read from the tool blocks; a shell
+/// command's changes are named as out of reach, with git diff for them.
+#[tokio::test]
+async fn diff_lists_the_files_the_tools_changed_and_opens_their_combined_diff() {
+    let (mut app, dir) = app_fixture();
+    app.handle_submit("/diff".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    assert!(shown.contains("no file changes in this session yet"), "{shown}");
+    assert!(shown.contains("edit and write tools only; git diff shows what shell commands changed"), "{shown}");
+
+    let created = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1,2 @@\n+pub fn one() {}\n+pub fn two() {}\n";
+    let edited = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-pub fn one() {}\n+pub fn uno() {}\n pub fn two() {}\n";
+    let readme = "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # demo\n+a line\n";
+    finish_tool(&mut app, "c1", "write_file", serde_json::json!({"path": "src/lib.rs"}), Some(("src/lib.rs", created, 2, 0)));
+    finish_tool(&mut app, "c2", "bash", serde_json::json!({"command": "touch made-by-shell"}), None);
+    finish_tool(&mut app, "c3", "edit_file", serde_json::json!({"path": "src/lib.rs"}), Some(("src/lib.rs", edited, 1, 1)));
+    finish_tool(&mut app, "c4", "edit_file", serde_json::json!({"path": "README.md"}), Some(("README.md", readme, 1, 0)));
+    // A failed edit changed nothing, so it is not listed.
+    app.on_agent_event(AgentEvent::ToolStart { call_id: "c5".into(), name: "edit_file".into(), args: serde_json::json!({"path": "gone.rs"}) });
+    app.on_agent_event(AgentEvent::ToolEnd { call_id: "c5".into(), ok: false, output: "Error: no match".into(), duration_ms: None });
+
+    app.handle_submit("/diff".into()).await.unwrap();
+    for width in [60, 80, 120] {
+        app.dirty = Dirty::default();
+        let (rows, _) = frame(&mut app, width, 24);
+        let screen = rows.join("\n");
+        assert!(screen.contains("Files the edit and write tools changed"), "{width}:\n{screen}");
+        assert!(screen.contains("+3 −1  src/lib.rs (2 changes)"), "{width}:\n{screen}");
+        assert!(screen.contains("+1 −0  README.md"), "{width}:\n{screen}");
+        assert!(screen.contains("2 files, +4 −1"), "{width}:\n{screen}");
+        assert!(screen.contains("/diff all opens the combined diff"), "{width}:\n{screen}");
+        let words = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("edit and write tools only; git diff shows what shell commands changed"), "{width}:\n{screen}");
+        assert!(rows.iter().all(|row| row.chars().count() == usize::from(width)), "{width}");
+        let list = &screen[screen.find("Files the edit and write tools changed").unwrap()..];
+        assert!(!list.contains("gone.rs") && !list.contains("made-by-shell"), "{width}:\n{list}");
+    }
+
+    app.handle_submit("/diff all".into()).await.unwrap();
+    let shown = app.transcript.export_text();
+    let combined = &shown[shown.rfind("> --- a/src/lib.rs\n> +++ b/src/lib.rs\n> @@ -0,0").expect("the combined diff")..];
+    let lib = combined.find("> +pub fn two() {}").unwrap();
+    let lib_edit = combined.find("> -pub fn one() {}\n> +pub fn uno() {}").unwrap();
+    let readme_at = combined.find("> +a line").unwrap();
+    assert!(lib < lib_edit && lib_edit < readme_at, "each file's diffs in the order made:\n{combined}");
+    assert!(!combined.contains("made-by-shell"), "{combined}");
+    app.handle_submit("/diff everything".into()).await.unwrap();
+    assert!(app.transcript.export_text().contains("usage: /diff lists the changed files"));
+
+    // A new session starts the list again.
+    app.handle_submit("/new".into()).await.unwrap();
+    app.handle_submit("/diff".into()).await.unwrap();
+    assert!(app.transcript.export_text().contains("no file changes in this session yet"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A prompt template named diff ran when /diff was only a pointer, and it
+/// still runs: completion and /help show it in place of the built-in.
+#[tokio::test]
+async fn a_template_named_diff_runs_instead_of_the_built_in() {
+    let (mut app, dir) = app_fixture();
+    app.handle_submit("/diff".into()).await.unwrap();
+    assert!(app.transcript.export_text().contains("no file changes in this session yet"));
+    let prompts = dir.join(".agents").join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(prompts.join("diff.md"), "Review the staged diff").unwrap();
+    app.templates = vec![("diff".to_string(), "review staged".to_string())];
+    let items = crate::completion::slash_items("dif", &app.templates);
+    assert_eq!(items.len(), 1, "{:?}", items.iter().map(|item| &item.detail).collect::<Vec<_>>());
+    assert!(items[0].detail.contains("template"));
+    app.handle_submit("/help".into()).await.unwrap();
+    let help = app.transcript.export_text();
+    assert!(help.contains("review staged") && !help.contains("files the edit and write tools changed"), "{help}");
+    app.handle_submit("/diff".into()).await.unwrap();
+    assert!(app.transcript.export_text().contains("Review the staged diff"), "the template expands into a prompt");
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -28,10 +28,11 @@ use crate::completion;
 use crate::input::{Composer, ComposerAction};
 use crate::theme;
 use crate::ui::sessions as sessions_ui;
+use crate::ui::diff as diff_ui;
 use crate::ui::tool_card::{self, DiffText};
 use crate::ui::text::paint_line;
 use crate::ui::transcript::{
-    wrap_lines, RowRef, Term, Transcript,
+    wrap_lines, FileChange, RowRef, Term, Transcript,
 };
 use crate::ui::{context, extensions, markdown, model_picker, usage};
 
@@ -973,7 +974,14 @@ impl App {
                                 &truncate_replay_output(content),
                                 badge.as_ref(),
                             );
-                            self.transcript.push_tool(compact, content.to_string(), ok);
+                            match badge.filter(|_| ok) {
+                                Some(change) => self.transcript.push_file_change(
+                                    compact,
+                                    content.to_string(),
+                                    FileChange { path: change.path, added: change.added, removed: change.removed, diff_kept: false },
+                                ),
+                                None => self.transcript.push_tool(compact, content.to_string(), ok),
+                            }
                             self.last_tool_output = Some(content.to_string());
                         }
                     }
@@ -2266,9 +2274,8 @@ impl App {
         self.refresh_project_root();
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
-            let builtin = head == "exit"
-                || completion::COMMANDS.iter().any(|spec| spec.name == head);
-            // Built-ins win; anything else may be a prompt template, whose
+            let builtin = head == "exit" || completion::shadows_templates(head);
+            // Built-ins win, /diff aside; anything else may be a prompt template, whose
             // expansion submits as a normal user message. The expansion itself
             // is the same helper --print and --stdio submit through, so the
             // three front ends cannot drift.
@@ -2376,6 +2383,7 @@ impl App {
                 block.extend(
                     completion::COMMANDS
                         .iter()
+                        .filter(|spec| !completion::taken_by_template(spec.name, &self.templates))
                         .map(|spec| help_line(&spec.usage(), spec.description)),
                 );
                 // The user's own templates are commands too; a help screen
@@ -2386,7 +2394,7 @@ impl App {
                 let templates: Vec<_> = self
                     .templates
                     .iter()
-                    .filter(|(name, _)| !completion::COMMANDS.iter().any(|spec| spec.name == *name))
+                    .filter(|(name, _)| !completion::shadows_templates(name))
                     .map(|(name, desc)| help_line(&format!("/{name}"), if desc.is_empty() { "prompt template" } else { desc }))
                     .collect();
                 if !templates.is_empty() {
@@ -2751,6 +2759,16 @@ impl App {
                 self.transcript.push(block);
                 self.dirty.mark_chat();
             }
+            "diff" => {
+                let block = match raw_rest.trim() {
+                    "" => diff_ui::summary(self.transcript.file_changes()),
+                    "all" => diff_ui::combined(self.transcript.file_changes()),
+                    _ => return self.note("usage: /diff lists the changed files · /diff all opens the combined diff"),
+                };
+                self.transcript.push(block);
+                self.transcript.show_latest_from_start();
+                self.dirty.mark_chat();
+            }
             "quit" | "exit" => self.should_quit = true,
             other => match HABITS.iter().find(|(names, _)| names.contains(&other)) {
                 Some((_, pointer)) => self.note(&format!("/{other} is not a command here; {pointer}")),
@@ -3013,12 +3031,17 @@ impl App {
                     diff.as_ref(),
                     Some(duration),
                 );
-                let expanded = diff
-                    .as_ref()
-                    .map(|change| change.diff.clone())
-                    .unwrap_or_else(|| output.clone());
-                self.transcript.push_tool(compact, expanded.clone(), ok);
-                self.last_tool_output = Some(expanded);
+                match diff.filter(|_| ok) {
+                    Some(DiffText { path, diff, added, removed }) => {
+                        self.last_tool_output = Some(diff.clone());
+                        let change = FileChange { path, added, removed, diff_kept: true };
+                        self.transcript.push_file_change(compact, diff, change);
+                    }
+                    None => {
+                        self.transcript.push_tool(compact, output.clone(), ok);
+                        self.last_tool_output = Some(output);
+                    }
+                }
                 self.running_tool = None;
                 self.refilter_scroll_search_live();
                 self.dirty.mark_chat();
@@ -4076,10 +4099,9 @@ fn note_body(text: &str) -> &str {
 /// Commands habit from other terminal agents suggests, each with where the
 /// same thing lives here, so typing one gets a pointer, not "unknown command".
 const HABITS: &[(&[&str], &str)] = &[
-    (&["undo"], "/rewind <turn> rewinds the conversation, not files, to the end of a turn; /rewind alone lists the turns"),
+    (&["undo"], "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files, to the end of a turn"),
     (&["sessions", "history"], "/resume lists this project's sessions"),
     (&["config", "settings"], "settings live in ~/.openmax/settings.json, and openmax --spec settings describes each one"),
-    (&["diff"], "run git diff in a shell to see what changed"),
 ];
 
 /// Single source of truth for `/help` and onboarding copy.
@@ -4931,10 +4953,9 @@ mod tests {
         app.handle_submit("/clear".into()).await.unwrap();
         assert_eq!(app.session_id, None, "/clear starts a fresh session");
         for (typed, pointer) in [
-            ("undo", "/rewind <turn> rewinds the conversation, not files"),
+            ("undo", "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files"),
             ("sessions", "/resume lists"),
             ("settings", "settings live in ~/.openmax/settings.json"),
-            ("diff", "run git diff in a shell"),
         ] {
             app.handle_submit(format!("/{typed}")).await.unwrap();
             let shown = app.transcript.export_text();
@@ -7437,8 +7458,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn replay_keeps_diff_badges_and_marks_sittings() {
+    #[tokio::test]
+    async fn replay_keeps_diff_badges_and_marks_sittings() {
         let (mut app, dir) = app_fixture();
         let meta = open_max_core::sessions::create(
             &app.core,
@@ -7499,6 +7520,12 @@ mod tests {
         assert!(text.contains("−0"), "{text}");
         // The sitting boundary renders as a divider.
         assert!(text.contains("• resumed"), "{text}");
+        // /diff lists it from the counts the result carried, and says the
+        // diff itself did not survive the resume.
+        app.slash("diff").await;
+        assert!(app.transcript.export_text().contains("+3 −0  notes.md"), "{}", app.transcript.export_text());
+        app.slash("diff all").await;
+        assert!(app.transcript.export_text().contains("notes.md: +3 −0, diff not kept across a resume"));
         fs::remove_dir_all(dir).unwrap();
     }
 
