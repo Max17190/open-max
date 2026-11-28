@@ -4501,8 +4501,8 @@ fn changed_path(content: &str) -> Option<&str> {
 }
 
 fn parse_change_counts(content: &str) -> Option<(usize, usize)> {
-    // The counts close the first line; an edit's excerpt of the changed
-    // lines follows it and may hold text of the same shape.
+    // The counts close the first line; a no-op note, or an excerpt saved by an
+    // earlier release, may follow it and hold text of the same shape.
     let content = content.lines().next()?;
     let open = content.rfind("(+")?;
     let rest = &content[open + 2..];
@@ -7499,8 +7499,8 @@ mod tests {
         );
         assert_eq!(parse_change_counts("hello world"), None);
         assert_eq!(parse_change_counts("odd (+x −1)"), None);
-        // An edit's excerpt follows its summary, and text in it shaped like
-        // the counts is not taken for them.
+        // An excerpt an earlier release saved after an edit's summary, and
+        // text in it shaped like the counts, is not taken for them.
         assert_eq!(
             parse_change_counts("edited a.rs (+1 −1)\n4 let badge = \"(+9 −9)\";\n"),
             Some((1, 1))

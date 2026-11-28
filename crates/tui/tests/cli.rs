@@ -8015,9 +8015,9 @@ fn a_refusal_for_length_lets_the_next_turn_compact_and_be_answered() {
 }
 
 /// One edit_file call carries several replacements through the whole loop:
-/// the file changes once, the model's next request holds the changed lines
-/// so it need not read them back, and a list with one bad replacement, or
-/// one a deny rule covers, writes nothing.
+/// the file changes once, the model's next request holds the edit's summary
+/// line and none of the file, and a list with one bad replacement, or one a
+/// deny rule covers, writes nothing.
 #[test]
 fn one_edit_call_carries_several_replacements_end_to_end() {
     let (project, home) = fresh_dirs("multi-edit");
@@ -8066,11 +8066,11 @@ fn one_edit_call_carries_several_replacements_end_to_end() {
         .map(|l| (l["ok"] == true, l["output"].as_str().unwrap_or_default().to_string()))
         .collect();
     assert_eq!(ends.len(), 3, "{stdout}");
-    assert!(ends[0].0 && ends[0].1.starts_with("edited app.toml (+3 −2)\n"), "{:?}", ends[0]);
+    assert!(ends[0].0 && ends[0].1 == "edited app.toml (+3 −2)", "{:?}", ends[0]);
     assert!(!ends[1].0 && ends[1].1.starts_with("edit 2 of 2: old_string not found"), "{:?}", ends[1]);
     assert!(!ends[2].0 && ends[2].1.contains("permission rule denied"), "the deny rule covers every replacement of the call: {:?}", ends[2]);
 
-    // The tool result the model reads next shows the edit in place.
+    // The tool result the model reads next counts the edit and resends none of the file.
     let second: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[1]).unwrap();
     let result = second["messages"]
         .as_array()
@@ -8081,8 +8081,9 @@ fn one_edit_call_carries_several_replacements_end_to_end() {
         .and_then(|m| m["content"].as_str())
         .unwrap_or_default()
         .to_string();
-    for line in ["2 port = 8080", "6 retries = 3", "7 timeout = 5"] {
-        assert!(result.contains(line), "the model sees {line:?} without a read: {result}");
+    assert!(result.starts_with("edited app.toml (+3 −2)"), "{result}");
+    for line in ["port = 8080", "retries = 3", "timeout = 5"] {
+        assert!(!result.contains(line), "the result resends none of the file, {line:?} included: {result}");
     }
 }
 

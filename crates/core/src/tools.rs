@@ -1583,8 +1583,8 @@ fn replacements(args: &Value) -> Result<Vec<(String, String, bool)>, String> {
 /// the file is written only when all match, so a failure changes nothing and
 /// names the one that failed. A replacement whose old and new text are the
 /// same changes nothing, so it is left out and named, and the call is refused
-/// only when every one is such. The result shows the changed lines in place,
-/// so the edit needs no read-back.
+/// only when every one is such. The result is the summary line, as
+/// write_file's is: it resends none of the file.
 fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
     let Some(rel) = file_path_arg(args) else {
         return ToolOutcome::err("missing required argument: path");
@@ -1688,27 +1688,17 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         return ToolOutcome::err(format!("{what} overlap in {rel}; merge them into one edit. Nothing was written."));
     }
 
-    // Splice every replacement in one pass, noting where each landed.
-    // The excerpt needs a record per changed line it can show, not per
-    // match: changes on one line share a record, and records stop once
-    // more lines than the excerpt's cap could hold have one.
+    // Splice every replacement in one pass.
     let (first, all) = (&list[0].0, list[0].2);
     let lone = old.match_indices(first.as_str()).take(if all { usize::MAX } else { 1 });
     let matches: Box<dyn Iterator<Item = (usize, usize, usize)>> = match total {
         1 => Box::new(lone.map(|(at, _)| (at, at + first.len(), 0))),
         _ => Box::new(spans.into_iter()),
     };
-    let (mut new, mut changed, mut at) = (String::with_capacity(old.len()), Vec::<(usize, usize)>::new(), 0);
+    let (mut new, mut at) = (String::with_capacity(old.len()), 0);
     for (start, end, i) in matches {
         new.push_str(&old[at..start]);
-        let landed = new.len();
         new.push_str(&list[i].1);
-        let full = changed.len() > EXCERPT_BYTES / 2;
-        match changed.last_mut() {
-            _ if full => {}
-            Some(last) if !new[last.1..landed].contains('\n') => last.1 = new.len(),
-            _ => changed.push((landed, new.len())),
-        }
         at = end;
     }
     new.push_str(&old[at..]);
@@ -1725,59 +1715,7 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
             n.join(", ")
         ));
     }
-    outcome.output.push_str(&edit_excerpt(&new, &changed));
     outcome
-}
-
-/// Most bytes an edit's excerpt adds to its result.
-const EXCERPT_BYTES: usize = 2_000;
-
-/// The lines of `new` that the byte ranges in `changed` touch, with two lines
-/// of context, numbered as read_file numbers them, so a model sees its edit
-/// in place without a read-back. A run of more than six changed lines shows
-/// its first and last three, since the model wrote them; the whole is cut at
-/// `EXCERPT_BYTES` and says so.
-fn edit_excerpt(new: &str, changed: &[(usize, usize)]) -> String {
-    let starts: Vec<usize> =
-        std::iter::once(0).chain(new.match_indices('\n').map(|(i, _)| i + 1)).filter(|&s| s < new.len()).collect();
-    let Some(last_line) = starts.len().checked_sub(1) else {
-        return String::new();
-    };
-    let line_of = |offset: usize| starts.partition_point(|&s| s <= offset.min(new.len() - 1)) - 1;
-    // Each line range to show, merged where ranges meet.
-    let mut shown: Vec<(usize, usize)> = Vec::new();
-    let mut show = |lo: usize, hi: usize| match shown.last_mut() {
-        Some(prev) if lo <= prev.1 + 1 => prev.1 = prev.1.max(hi),
-        _ => shown.push((lo, hi)),
-    };
-    for &(start, end) in changed {
-        let (first, last) = (line_of(start), line_of(end.max(start + 1) - 1));
-        let (lo, hi) = (first.saturating_sub(2), (last + 2).min(last_line));
-        if last - first >= 6 {
-            show(lo, first + 2);
-            show(last - 2, hi);
-        } else {
-            show(lo, hi);
-        }
-    }
-    let mut out = String::from("\n");
-    for (k, &(lo, hi)) in shown.iter().enumerate() {
-        if k > 0 {
-            let gap = lo - shown[k - 1].1 - 1;
-            out.push_str(&format!("[{gap} line{} not shown]\n", if gap == 1 { "" } else { "s" }));
-        }
-        for n in lo..=hi {
-            let text = &new[starts[n]..starts.get(n + 1).copied().unwrap_or(new.len())];
-            let text = text.strip_suffix('\n').map_or(text, |t| t.strip_suffix('\r').unwrap_or(t));
-            let text = numbered_line(n + 1, text, text.len());
-            if out.len() + text.len() > EXCERPT_BYTES {
-                out.push_str(&format!("[excerpt cut at {EXCERPT_BYTES} bytes; read_file shows the rest]\n"));
-                return out;
-            }
-            out.push_str(&text);
-        }
-    }
-    out
 }
 
 /// The walk glob and grep share, from `walk_root` in the project whose
@@ -3071,10 +3009,9 @@ mod tests {
     }
 
     /// Several replacements in one call land together, each matched against
-    /// the file as it was, and the result shows them in place with their
-    /// line numbers so the model need not read the file back.
+    /// the file as it was, and the result counts the lines they changed.
     #[test]
-    fn one_edit_call_applies_several_replacements_and_shows_them() {
+    fn one_edit_call_applies_several_replacements_together() {
         let root = temp_project();
         let original = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n    two();\n}\n\nfn c() {}\n";
         std::fs::write(root.join("lib.rs"), original).unwrap();
@@ -3088,12 +3025,10 @@ mod tests {
             std::fs::read_to_string(root.join("lib.rs")).unwrap(),
             "fn a() {\n    uno();\n}\n\nfn b() {\n    dos();\n    dos();\n}\n\nfn c() {\n    three();\n}\n"
         );
-        let mut lines = out.output.lines();
-        assert_eq!(lines.next(), Some("edited lib.rs (+6 −4)"), "{}", out.output);
-        let excerpt: Vec<&str> = lines.collect();
-        for shown in ["2     uno();", "6     dos();", "7     dos();", "10 fn c() {", "11     three();", "12 }"] {
-            assert!(excerpt.contains(&shown), "the excerpt shows {shown:?}:\n{}", out.output);
-        }
+        assert_eq!(out.output, "edited lib.rs (+6 −4)");
+        let diff = out.diff.as_ref().expect("edit_file emits DiffInfo for the UI");
+        assert_eq!((diff.path.as_str(), diff.added, diff.removed), ("lib.rs", 6, 4));
+        assert!(diff.diff.contains("+    uno();") && diff.diff.contains("+    three();"), "{}", diff.diff);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3142,11 +3077,9 @@ mod tests {
             {"old_string": "gamma", "new_string": "G"}]}));
         assert!(out.ok, "{}", out.output);
         assert_eq!(std::fs::read_to_string(root.join("n.txt")).unwrap(), "A\nbeta\nG\n");
-        let mut lines = out.output.lines();
-        assert_eq!(lines.next(), Some("edited n.txt (+2 −2)"), "{}", out.output);
         assert_eq!(
-            lines.next(),
-            Some("edits 2, 3 of 4 changed nothing (old_string and new_string are identical); the others were applied")
+            out.output,
+            "edited n.txt (+2 −2)\nedits 2, 3 of 4 changed nothing (old_string and new_string are identical); the others were applied"
         );
         // Errors of the others keep their place in the list.
         let out = edit_file(&root, &json!({"path": "n.txt", "edits": [
@@ -3186,37 +3119,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The excerpt is bounded however much an edit changes: a long run of
-    /// new lines shows its ends, and a replace_all across a large file stops
-    /// at the byte cap and says where it stopped.
+    /// An edit's result resends none of the file: however much it changes,
+    /// the result is the summary line, and the counts are by line.
     #[test]
-    fn the_edit_excerpt_is_capped_and_says_so() {
+    fn an_edit_result_is_its_summary_line_alone() {
         let root = temp_project();
         let body: String = (1..=12).map(|n| format!("line {n}\n")).collect();
         std::fs::write(root.join("run.txt"), "head\nmarker\ntail\n").unwrap();
         let out = edit_file(&root, &json!({"path": "run.txt", "old_string": "marker\n", "new_string": body}));
         assert!(out.ok, "{}", out.output);
-        assert!(out.output.contains("1 head\n2 line 1\n3 line 2\n4 line 3\n[6 lines not shown]\n11 line 10\n"), "{}", out.output);
-        assert!(out.output.ends_with("13 line 12\n14 tail\n"), "{}", out.output);
+        assert_eq!(out.output, "edited run.txt (+12 −1)");
+        assert!(out.diff.as_ref().is_some_and(|d| d.added == 12 && d.removed == 1 && d.diff.contains("+line 1")));
 
-        // Each change sits far enough from the next to be a hunk of its own.
-        // Matches on one line share one record of the excerpt.
         std::fs::write(root.join("same.txt"), "aaaa\nb\n").unwrap();
         let out = edit_file(&root, &json!({"path": "same.txt", "old_string": "a", "new_string": "x", "replace_all": true}));
-        assert_eq!(out.output, "edited same.txt (+1 −1)\n1 xxxx\n2 b\n");
+        assert_eq!(out.output, "edited same.txt (+1 −1)");
 
         let wide = format!("{}\n", "x".repeat(300));
         std::fs::write(root.join("wide.txt"), format!("{wide}keep\nkeep\nkeep\nkeep\nkeep\n").repeat(40)).unwrap();
         let out = edit_file(&root, &json!({"path": "wide.txt", "old_string": "x\n", "new_string": "y\n", "replace_all": true}));
         assert!(out.ok, "{}", out.output);
-        let excerpt = out.output.split_once('\n').unwrap().1;
-        assert!(excerpt.ends_with("[excerpt cut at 2000 bytes; read_file shows the rest]\n"), "{excerpt}");
-        assert!(excerpt.len() <= EXCERPT_BYTES + 80, "a {}-byte excerpt", excerpt.len());
+        assert_eq!(out.output, "edited wide.txt (+40 −40)");
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// The single form reads and writes as it always has: its summary line
-    /// and its errors are unchanged, and the excerpt follows the summary. A
+    /// and its errors are unchanged. A
     /// list may follow the top-level pair, and an empty pair beside a list
     /// is ignored, as is a list sent as a JSON string.
     #[test]
@@ -3225,7 +3153,7 @@ mod tests {
         std::fs::write(root.join("s.txt"), "a\nb\nc\n").unwrap();
         let out = edit_file(&root, &json!({"path": "s.txt", "old_string": "b", "new_string": "B"}));
         assert!(out.ok, "{}", out.output);
-        assert_eq!(out.output, "edited s.txt (+1 −1)\n1 a\n2 B\n3 c\n");
+        assert_eq!(out.output, "edited s.txt (+1 −1)");
         let out = edit_file(&root, &json!({"path": "s.txt", "old_string": "zzz", "new_string": "y"}));
         assert!(out.output.starts_with("old_string not found."), "{}", out.output);
         let out = edit_file(&root, &json!({"path": "s.txt"}));
@@ -3240,11 +3168,12 @@ mod tests {
         assert!(out.ok, "{}", out.output);
         assert_eq!(std::fs::read_to_string(root.join("s.txt")).unwrap(), "A\nb\nC\n");
 
-        // A list on a CRLF file keeps CRLF, and the excerpt shows no \r.
+        // A list on a CRLF file keeps CRLF.
         std::fs::write(root.join("w.txt"), "a\r\nb\r\nc\r\n").unwrap();
         let out = edit_file(&root, &json!({"path": "w.txt", "edits": [
             {"old_string": "a", "new_string": "A"}, {"old_string": "c", "new_string": "C\nD"}]}));
-        assert!(out.ok && out.output.ends_with("\n1 A\n2 b\n3 C\n4 D\n"), "{:?}", out.output);
+        assert!(out.ok, "{:?}", out.output);
+        assert_eq!(out.output, "edited w.txt (+3 −2)", "the summary line alone, with no \\r");
         assert_eq!(std::fs::read_to_string(root.join("w.txt")).unwrap(), "A\r\nb\r\nC\r\nD\r\n");
         let _ = std::fs::remove_dir_all(root);
     }
