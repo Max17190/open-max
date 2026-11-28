@@ -63,6 +63,7 @@ async fn run_and_look(core: Arc<Core>, mut core_rx: mpsc::UnboundedReceiver<Agen
 /// `ask` mode are declined so unattended runs never hang, and a turn that
 /// declined one exits 3 (`select_auto`). Multiple prompts reuse one session_id,
 /// which `opened` gets once the session is open.
+#[inline(never)]
 pub(crate) async fn run_session(
     core: &Arc<Core>,
     core_rx: &mut mpsc::UnboundedReceiver<AgentEventEnvelope>,

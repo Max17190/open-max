@@ -67,7 +67,7 @@ const MARKER: &str = "OPENMAX_CHECK";
 
 #[derive(Clone, PartialEq)]
 enum Kind {
-    File { size: u64, mtime: Option<SystemTime>, mode: u32 },
+    File { size: u64, mode: u32 },
     Link(PathBuf),
 }
 
@@ -107,7 +107,7 @@ fn scan(root: &Path, skip: &[PathBuf], limit: usize) -> Option<Tree> {
             } else if meta.file_type().is_symlink() {
                 tree.entries.insert(rel, Kind::Link(std::fs::read_link(&path).ok()?));
             } else {
-                tree.entries.insert(rel, Kind::File { size: meta.len(), mtime: meta.modified().ok(), mode: mode(&meta) });
+                tree.entries.insert(rel, Kind::File { size: meta.len(), mode: mode(&meta) });
             }
             if tree.entries.len() > limit {
                 return None;
@@ -146,6 +146,14 @@ struct Snapshot {
     copy: PathBuf,
 }
 
+/// Copy bytes without `std::fs::copy` (whose macOS copyfile/clonefile calls add
+/// five libSystem imports past the launch-shape cap).
+#[expect(clippy::disallowed_methods, reason = "copies into fresh snapshot paths or restores from the snapshot without copyfile imports")]
+fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::io::copy(&mut std::fs::File::open(from)?, &mut std::fs::File::create(to)?)?;
+    Ok(())
+}
+
 /// Copy every file of `tree` under `copy`, or say why the check cannot
 /// promise to put them back.
 fn snapshot(root: &Path, tree: Tree, copy: PathBuf) -> Result<Snapshot, String> {
@@ -157,7 +165,7 @@ fn snapshot(root: &Path, tree: Tree, copy: PathBuf) -> Result<Snapshot, String> 
         if let Kind::File { .. } = kind {
             let to = copy.join(rel);
             let made = to.parent().map_or(Ok(()), std::fs::create_dir_all);
-            if let Err(e) = made.and_then(|()| std::fs::copy(root.join(rel), &to).map(drop)) {
+            if let Err(e) = made.and_then(|()| copy_file(&root.join(rel), &to)) {
                 return Err(format!("{} could not be copied: {e}", rel.display()));
             }
         }
@@ -251,27 +259,24 @@ fn restore(root: &Path, snap: &Snapshot, skip: &[PathBuf]) -> (Vec<String>, Vec<
                     Err(_) => failed.push(shown(rel)),
                 }
             }
-            Kind::File { mtime, mode: was, .. } => {
+            Kind::File { mode: was, .. } => {
                 let from = snap.copy.join(rel);
                 let held = meta.as_ref().is_some_and(|m| m.is_file() && mode(m) == *was) && same_bytes(&path, &from);
-                if held && meta.as_ref().and_then(|m| m.modified().ok()) == *mtime {
+                if held {
                     continue;
                 }
-                if !held {
-                    if !meta.as_ref().is_some_and(|m| m.is_file()) || std::fs::copy(&from, &path).is_err() {
-                        remove(&path);
-                        if std::fs::copy(&from, &path).is_err() {
-                            failed.push(shown(rel));
-                            continue;
-                        }
+                if !meta.as_ref().is_some_and(|m| m.is_file()) || copy_file(&from, &path).is_err() {
+                    remove(&path);
+                    if copy_file(&from, &path).is_err() {
+                        failed.push(shown(rel));
+                        continue;
                     }
-                    #[cfg(unix)]
-                    let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(*was));
-                    fixed.insert(shown(rel));
                 }
-                if let Some(mtime) = mtime {
-                    let _ = std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(*mtime));
+                #[cfg(unix)]
+                if let Ok(file) = std::fs::File::open(&path) {
+                    let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(*was));
                 }
+                fixed.insert(shown(rel));
             }
         }
     }
@@ -510,7 +515,7 @@ async fn rerun(project: &Path, command: &str, mark: &Mark, out: &Path, quit: &No
     #[cfg(unix)]
     if let Some(pid) = pid {
         // SAFETY: the command's own process group, which it leads.
-        unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
     let _ = child.wait().await;
     match ran {
@@ -639,7 +644,21 @@ fn stopped(code: i32) -> i32 {
 }
 
 /// A print run with `--second-look`: the author's turn, then the check.
-pub(crate) async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
+/// Kept cold behind a boxed trait object so runs without `--second-look`
+/// never fault in the checker's future layout or poll code.
+#[cold]
+#[inline(never)]
+pub(crate) fn run(
+    core: Arc<Core>,
+    rx: mpsc::UnboundedReceiver<AgentEventEnvelope>,
+    args: HeadlessArgs,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32>>> {
+    Box::pin(run_inner(core, rx, args))
+}
+
+#[cold]
+#[inline(never)]
+async fn run_inner(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEnvelope>, args: HeadlessArgs) -> i32 {
     let project = args.project.clone();
     let checks = std::env::temp_dir().join("openmax-check");
     let skip = vec![core.data_dir.clone(), checks.clone()];
@@ -694,7 +713,7 @@ pub(crate) async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEv
     let (was, mut checker) = (hold_requests(&core, PLAN_REQUESTS), None);
     let plan = turn(&args, format!("{}{}", PLAN.replace("{dir}", &shown), left.task), None);
     let planned = run_session(&core, &mut rx, &plan, &mut checker).await;
-    let _ = std::fs::copy(dir.join("plan.md"), kept.join("plan.md"));
+    let _ = copy_file(&dir.join("plan.md"), &kept.join("plan.md"));
     if let (Some(session), 0 | 4, false) = (&checker, planned, crate::signalled()) {
         hold_requests(&core, RUN_REQUESTS);
         let paths = if left.paths.is_empty() { "(none)".to_string() } else { left.paths.join("\n") };
