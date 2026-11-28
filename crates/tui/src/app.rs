@@ -341,10 +341,15 @@ pub struct App {
     /// How the completion gate /gate installs judged this session's latest
     /// end of a turn, for /gate to show; None until it judged one.
     gate_verdict: Option<&'static str>,
-    /// Set while a /gate change is being written on a blocking thread: no
-    /// turn starts and no other change begins until it is on disk, so the
-    /// next turn is judged by the gate the person just set.
-    gate_change: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while a /gate change is being written on a blocking thread, and
+    /// cleared only by the event loop when its result arrives (`on_gate`):
+    /// no turn starts and no other change begins until then, so the next
+    /// turn is judged by the gate the person just set.
+    gate_change: bool,
+    /// Where a /gate change sends its result: the transcript generation it
+    /// was made in and the lines that report it.
+    gate_tx: mpsc::UnboundedSender<(u64, Vec<Line<'static>>)>,
+    gate_rx: Option<mpsc::UnboundedReceiver<(u64, Vec<Line<'static>>)>>,
     /// Messages typed while the agent works, shown in the strip above the
     /// composer. The oldest `steered` were sent to the running turn and leave
     /// on its SteerAccepted; the rest (typed during a compaction, or after
@@ -586,6 +591,7 @@ async fn event_loop(
 
     let mut input = TerminalInput::start();
     let mut listing_rx = app.listing_rx.take().expect("the event loop runs once per app");
+    let mut gate_rx = app.gate_rx.take().expect("the event loop runs once per app");
     // No frame is written while the probe waits, so none can cut into its
     // query or the flags pushed on its answer. Input has not started, so no
     // keypress waits on this.
@@ -633,6 +639,7 @@ async fn event_loop(
                 }
             }
             Some((generation, lines)) = listing_rx.recv() => app.on_listing(generation, lines),
+            Some((generation, lines)) = gate_rx.recv() => app.on_gate(generation, lines),
             Some(files) = files_rx.recv() => {
                 app.file_index = Some(Arc::new(files));
                 app.file_index_pending = false;
@@ -765,6 +772,7 @@ impl App {
         files_tx: mpsc::UnboundedSender<Vec<String>>,
     ) -> Self {
         let (listing_tx, listing_rx) = mpsc::unbounded_channel();
+        let (gate_tx, gate_rx) = mpsc::unbounded_channel();
         Self {
             composer: Composer::new(&core.data_dir, &project),
             core,
@@ -790,7 +798,9 @@ impl App {
             templates: Vec::new(),
             compacted_before_replay: false,
             gate_verdict: None,
-            gate_change: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gate_change: false,
+            gate_tx,
+            gate_rx: Some(gate_rx),
             queued: Vec::new(),
             steered: 0,
             flush_queue: false,
@@ -2328,7 +2338,7 @@ impl App {
     /// Whether a /gate change is still being written while no turn runs, so
     /// a turn started now could miss the gate the person just set.
     fn gate_change_pending(&self) -> bool {
-        !self.running && self.gate_change.load(std::sync::atomic::Ordering::Acquire)
+        !self.running && self.gate_change
     }
 
     fn submit_prompt(&mut self, text: String) {
@@ -2859,11 +2869,11 @@ impl App {
                 if (self.running || left_turn) && !arg.is_empty() {
                     return self.note("finish or cancel the turn before /gate changes the gate; /gate alone shows it");
                 }
-                let changing = self.gate_change.clone();
                 if !arg.is_empty() {
-                    if changing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    if self.gate_change {
                         return self.note("the last /gate change is still being written; run /gate again in a moment");
                     }
+                    self.gate_change = true;
                     // A verdict on the gate this replaces says nothing of the new one.
                     self.gate_verdict = None;
                 }
@@ -2876,10 +2886,14 @@ impl App {
                     last: self.gate_verdict,
                 };
                 let arg = arg.to_string();
-                self.spawn_listing(async move {
-                    let lines = tokio::task::spawn_blocking(move || crate::gate::run(&ctx, &arg)).await.unwrap_or_default();
-                    changing.store(false, std::sync::atomic::Ordering::Release);
-                    lines
+                let work = async move { tokio::task::spawn_blocking(move || crate::gate::run(&ctx, &arg)).await.unwrap_or_default() };
+                if !self.gate_change {
+                    // Showing the gate changes nothing, so it is a listing.
+                    return self.spawn_listing(work);
+                }
+                let (tx, generation) = (self.gate_tx.clone(), self.transcript_gen);
+                tokio::spawn(async move {
+                    let _ = tx.send((generation, work.await));
                 });
             }
             "quit" | "exit" => self.should_quit = true,
@@ -2936,13 +2950,17 @@ impl App {
         });
     }
 
-    fn on_listing(&mut self, generation: u64, lines: Vec<Line<'static>>) {
-        // A /gate change clears its flag before its listing is sent, so
-        // what was typed while it was written goes out now.
-        let gate_landed = !self.gate_change.load(std::sync::atomic::Ordering::Acquire);
-        if gate_landed && !self.running && self.pending_approval.is_none() && self.steered == 0 && !self.queued.is_empty() {
+    /// A /gate change is on disk: report it, and send what was typed while
+    /// it was written, in order.
+    fn on_gate(&mut self, generation: u64, lines: Vec<Line<'static>>) {
+        self.gate_change = false;
+        if !self.running && self.pending_approval.is_none() && self.steered == 0 && !self.queued.is_empty() {
             self.send_next_queued();
         }
+        self.on_listing(generation, lines);
+    }
+
+    fn on_listing(&mut self, generation: u64, lines: Vec<Line<'static>>) {
         if generation != self.transcript_gen || lines.is_empty() {
             return;
         }
@@ -7866,7 +7884,7 @@ mod tests {
         // in the queue and a second change waits for the first. Once the
         // change lands, the prompt goes out.
         (app.running, app.queued) = (false, Vec::new());
-        app.gate_change.store(true, std::sync::atomic::Ordering::Release);
+        app.gate_change = true;
         app.handle_submit("hello".into()).await.unwrap();
         assert!(!app.running && app.queued == ["hello"], "a turn started under a /gate change");
         app.slash("gate npm test").await;
@@ -7874,11 +7892,9 @@ mod tests {
         let generation = app.transcript_gen;
         app.on_listing(generation, Vec::new());
         assert!(!app.running && app.queued == ["hello"], "the prompt went out before the change landed");
-        app.gate_change.store(false, std::sync::atomic::Ordering::Release);
-        app.on_listing(generation, Vec::new());
-        assert!(app.running && app.queued.is_empty(), "the prompt did not go out once the change landed");
-        // A prompt sent after the change landed but before its listing
-        // reached the loop goes behind the one that waited, not ahead of it.
+        app.on_gate(generation, Vec::new());
+        assert!(!app.gate_change && app.running && app.queued.is_empty(), "the prompt did not go out once the change landed");
+        // A prompt sent while an older one still waits goes behind it.
         (app.running, app.queued, app.session_id) = (false, vec!["waited".into()], None);
         app.handle_submit("newer".into()).await.unwrap();
         assert!(app.running && app.pending_submit.as_deref() == Some("waited"), "the newer prompt ran first");
