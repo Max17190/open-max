@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/demo.svg" width="780" alt="Terminal demo: Open Max fixes a failing test, then writes and runs a tool that searches the docs.">
+  <img src="docs/assets/demo.svg" width="780" alt="Terminal demo: Open Max writes a loadtest tool on the fly to profile a slow checkout endpoint, fixes an N+1 query, and verifies the 44x speedup.">
 </p>
 
 Open Max is one Rust binary: an agent loop, seven tools, a terminal UI that streams every step, and a core that keeps the trust decisions. Your own `AGENTS.md`, skills, memories and tools add to the built-in prompt, and `/context` shows what each one costs. When it needs a new capability, the agent writes it as a file, such as a [tool](docs/extending.md) or a skill, and can call a tool it wrote on its very next step. Within 100 ms of a `kill -9`, no process in the process groups of its tools is still running ([how](docs/execution.md)); a process that starts a session of its own (`setsid`) is out of reach, and a named tmux session is the way to keep work running on purpose.
