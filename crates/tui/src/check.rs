@@ -69,6 +69,7 @@ const MARKER: &str = "OPENMAX_CHECK";
 enum Kind {
     File { size: u64, mode: u32 },
     Link(PathBuf),
+    Other,
 }
 
 /// Every file, link and directory under a root, by path relative to it.
@@ -89,9 +90,10 @@ fn mode(_: &std::fs::Metadata) -> u32 {
 }
 
 /// The tree under `root`, `.git` included and `skip` left out; None past
-/// `limit` files or when a directory or entry cannot be read. Links are
-/// recorded, never followed.
-fn scan(root: &Path, skip: &[PathBuf], limit: usize) -> Option<Tree> {
+/// `limit` files or when a directory or entry cannot be read. When `strict` is
+/// true, unsupported file types (named pipes, sockets) return None; when false
+/// (cleanup walk), they are recorded as `Kind::Other` so restore removes them.
+fn scan_walk(root: &Path, skip: &[PathBuf], limit: usize, strict: bool) -> Option<Tree> {
     let (mut tree, mut todo) = (Tree::default(), vec![root.to_path_buf()]);
     while let Some(dir) = todo.pop() {
         for entry in std::fs::read_dir(&dir).ok()? {
@@ -108,8 +110,10 @@ fn scan(root: &Path, skip: &[PathBuf], limit: usize) -> Option<Tree> {
                 tree.entries.insert(rel, Kind::Link(std::fs::read_link(&path).ok()?));
             } else if meta.file_type().is_file() {
                 tree.entries.insert(rel, Kind::File { size: meta.len(), mode: mode(&meta) });
-            } else {
+            } else if strict {
                 return None;
+            } else {
+                tree.entries.insert(rel, Kind::Other);
             }
             if tree.entries.len() > limit {
                 return None;
@@ -117,6 +121,10 @@ fn scan(root: &Path, skip: &[PathBuf], limit: usize) -> Option<Tree> {
         }
     }
     Some(tree)
+}
+
+fn scan(root: &Path, skip: &[PathBuf], limit: usize) -> Option<Tree> {
+    scan_walk(root, skip, limit, true)
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -177,7 +185,8 @@ struct Snapshot {
 }
 
 /// Create `dir` with owner-only (`0700`) permissions on Unix before anything is
-/// written inside it.
+/// written inside it. Uses `File::set_permissions` (`fchmod`) rather than
+/// `fs::set_permissions` (`chmod`) to stay within the macOS libSystem import cap.
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
@@ -188,7 +197,9 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)?;
     #[cfg(unix)]
-    std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    if let Ok(file) = std::fs::File::open(dir) {
+        let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    }
     Ok(())
 }
 
@@ -287,8 +298,9 @@ fn restore(root: &Path, snap: &Snapshot, skip: &[PathBuf]) -> (Vec<String>, Vec<
         }
     }
     // A listing that fails leaves what the check added, but every file the
-    // author left is still compared and written back.
-    let now = scan(root, skip, usize::MAX).unwrap_or_default();
+    // author left is still compared and written back. Cleanup walk records
+    // unsupported entries (sockets, pipes) instead of aborting the listing.
+    let now = scan_walk(root, skip, usize::MAX, false).unwrap_or_default();
     for rel in now.entries.keys().filter(|rel| !snap.tree.entries.contains_key(*rel)) {
         remove(&root.join(rel));
         fixed.insert(shown(rel));
@@ -332,6 +344,7 @@ fn restore(root: &Path, snap: &Snapshot, skip: &[PathBuf]) -> (Vec<String>, Vec<
                 }
                 fixed.insert(shown(rel));
             }
+            Kind::Other => {}
         }
     }
     (fixed.into_iter().collect(), failed)
@@ -498,11 +511,15 @@ fn changes(root: &Path, start: &Start, end: &Tree) -> (Vec<String>, String) {
             "created" => Some(""),
             _ => start.text.get(rel).map(String::as_str),
         };
-        let new = std::fs::read(root.join(rel)).ok().and_then(|b| String::from_utf8(b).ok()).filter(|t| !t.contains('\0'));
+        let mut buf = Vec::new();
+        let read_ok = std::fs::File::open(root.join(rel)).and_then(|f| f.take(TEXT_FILE + 1).read_to_end(&mut buf)).is_ok();
+        let too_large = read_ok && buf.len() as u64 > TEXT_FILE;
+        let new = (read_ok && !too_large).then(|| String::from_utf8(buf).ok().filter(|t| !t.contains('\0'))).flatten();
         let name = rel.display().to_string();
-        diff.push_str(&match (old, new) {
-            (Some(old), Some(new)) => line_diff(&name, old, &new),
-            (None, Some(_)) => format!("{name}: changed; its earlier text was not kept\n"),
+        diff.push_str(&match (old, new, too_large) {
+            (_, _, true) => format!("{name}: changed; over {} KiB\n", TEXT_FILE >> 10),
+            (Some(old), Some(new), false) => line_diff(&name, old, &new),
+            (None, Some(_), false) => format!("{name}: changed; its earlier text was not kept\n"),
             _ => format!("{name}: not text\n"),
         });
     }
@@ -649,8 +666,8 @@ async fn rerun(project: &Path, command: &str, mark: &Mark, out: &Path, quit: &No
     let Ok(file) = std::fs::OpenOptions::new().create_new(true).write(true).open(out) else { return Ran::Exited(None, "the harness could not record the output".into()) };
     let Ok(err) = file.try_clone() else { return Ran::Exited(None, "the harness could not record the output".into()) };
     let mut run = tokio::process::Command::new("bash");
-    run.args(["-c", command]).current_dir(project).stdin(std::process::Stdio::null()).stdout(file).stderr(err)
-        .env(MARKER, &mark.tag).env("OPENMAX_SESSION", "1").env("GIT_TERMINAL_PROMPT", "0").env_remove("OPENMAX_HUMAN_ATTEST").kill_on_drop(true);
+    run.args(["-c", r#"eval "unset OPENMAX_COMMAND; $OPENMAX_COMMAND""#]).current_dir(project).stdin(std::process::Stdio::null()).stdout(file).stderr(err)
+        .env("OPENMAX_COMMAND", command).env(MARKER, &mark.tag).env("OPENMAX_SESSION", "1").env("GIT_TERMINAL_PROMPT", "0").env_remove("OPENMAX_HUMAN_ATTEST").kill_on_drop(true);
     apply_rerun_env(&mut run, out);
     #[cfg(unix)]
     run.process_group(0);
@@ -732,11 +749,10 @@ struct End {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn end(core: &Core, root: &Path, skip: &[PathBuf], start: &Start, mark: &Mark, author: &str, prompt: &str, copy: PathBuf) -> Result<End, String> {
+fn end(core: &Core, root: &Path, skip: &[PathBuf], start: &Start, mark: &Mark, author: &str, task: String, copy: PathBuf) -> Result<End, String> {
     let tree = scan(root, skip, MAX_FILES).ok_or(format!("the project holds more than {MAX_FILES} files, or one of its directories could not be read"))?;
-    let (paths, diff) = changes(root, start, &tree);
     let snap = Arc::new(snapshot(root, tree, copy)?);
-    let task = open_max_core::templates::expand_user_input(&core.data_dir, root, prompt);
+    let (paths, diff) = changes(root, start, &snap.tree);
     let messages = open_max_core::sessions::load_messages(core, author).ok().flatten().unwrap_or_default();
     let last = messages.iter().rev().find(|m| m.role == "assistant" && m.content.as_deref().is_some_and(|c| !c.trim().is_empty()));
     let message = cut(last.and_then(|m| m.content.as_deref()).unwrap_or(""), SHOWN_BYTES);
@@ -761,7 +777,7 @@ fn urls(core: &Core, id: &str) -> Vec<String> {
 
 /// Stop what the check started and put the project back, to the end
 /// whatever stops the run: this is what the check promises.
-async fn guard(mark: &Mark, root: &Path, snap: &Arc<Snapshot>, skip: &[PathBuf], record: &mut Value, step: &str) {
+async fn guard_once(mark: &Mark, root: &Path, snap: &Arc<Snapshot>, skip: &[PathBuf], step: &str) -> (Vec<i32>, Vec<String>, Vec<String>) {
     let (mark, root, snap, skip) = (mark.clone(), root.to_path_buf(), snap.clone(), skip.to_vec());
     let (stopped, (fixed, failed)) = tokio::task::spawn_blocking(move || (mark.stop(), restore(&root, &snap, &skip))).await.unwrap_or_default();
     if !stopped.is_empty() {
@@ -773,6 +789,11 @@ async fn guard(mark: &Mark, root: &Path, snap: &Arc<Snapshot>, skip: &[PathBuf],
     for path in &failed {
         eprintln!("openmax: check: could not put back {path}");
     }
+    (stopped, fixed, failed)
+}
+
+async fn guard(mark: &Mark, root: &Path, snap: &Arc<Snapshot>, skip: &[PathBuf], record: &mut Value, step: &str) {
+    let (stopped, fixed, failed) = guard_once(mark, root, snap, skip, step).await;
     record[step] = json!({ "stopped": stopped, "put_back": fixed, "not_put_back": failed });
 }
 
@@ -820,6 +841,8 @@ async fn run_inner(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEn
     let id = format!("{}-{nanos}", std::process::id());
     let (dir, kept) = (checks.join(&id), core.data_dir.join("checks").join(&id));
     let (authors, checkers) = (Mark::new(&kept, format!("{id}-author")), Mark::new(&kept, id.clone()));
+    let raw_prompt = args.prompts.concat();
+    let expanded_task = open_max_core::templates::expand_user_input(&core.data_dir, &project, &raw_prompt);
     let held = begun.as_ref().and_then(|_| ensure_private_dir(&kept).ok()).and_then(|()| authors.hold());
     let mut author = None;
     let code = run_session(&core, &mut rx, &args, Some(&mut author)).await;
@@ -834,8 +857,8 @@ async fn run_inner(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEn
     };
 
     let read = {
-        let (core, root, skip, mark, author, prompt, copy) = (core.clone(), project.clone(), skip.clone(), authors.clone(), author.clone(), args.prompts.concat(), kept.join("author-end"));
-        move || end(&core, &root, &skip, &begun, &mark, &author, &prompt, copy)
+        let (core, root, skip, mark, author, task, copy) = (core.clone(), project.clone(), skip.clone(), authors.clone(), author.clone(), expanded_task, kept.join("author-end"));
+        move || end(&core, &root, &skip, &begun, &mark, &author, task, copy)
     };
     let left = match crate::until_stopped(args.quit.notified(), &mut None, read).await {
         Some(_) | None if crate::signalled() => return stopped(code),
@@ -892,10 +915,7 @@ async fn run_inner(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<AgentEventEn
     }
 
     let objections = std::fs::read_to_string(dir.join("objections.jsonl")).unwrap_or_default();
-    let (failures, readings, reran) = filter(&core, &project, &author, &checkers, &left.task, &objections, &kept, &args.quit, &mut record).await;
-    if reran {
-        guard(&checkers, &project, &left.snap, &skip, &mut record, "re-run").await;
-    }
+    let (failures, readings) = filter(&core, &project, &author, &checkers, &left.snap, &skip, &left.task, &objections, &kept, &args.quit, &mut record).await;
     let ended: Vec<&(i32, String)> = left.running.iter().filter(|(pid, _)| !alive(*pid)).collect();
     record["ended_while_checked"] = json!(ended);
     if crate::signalled() {
@@ -928,10 +948,12 @@ type Failure = (Value, Option<i32>, String);
 
 /// Keep the objections in `lines` whose quote is the request's and whose
 /// command fails again in the harness's hands, at most `KEPT`, and the
-/// readings aside; each verdict goes to the record. Whether any command ran.
+/// readings aside; stops processes and restores the tree after every command so
+/// checks never pollute later checks. Each verdict goes to the record.
 #[allow(clippy::too_many_arguments)]
-async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, task: &str, lines: &str, kept: &Path, quit: &Notify, record: &mut Value) -> (Vec<Failure>, Vec<Value>, bool) {
+async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, snap: &Arc<Snapshot>, skip: &[PathBuf], task: &str, lines: &str, kept: &Path, quit: &Notify, record: &mut Value) -> (Vec<Failure>, Vec<Value>) {
     let (mut failures, mut readings, mut verdicts, mut reruns) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    let (mut all_stopped, mut all_fixed, mut all_failed) = (Vec::new(), BTreeSet::new(), BTreeSet::new());
     for line in lines.lines().filter(|l| !l.trim().is_empty()) {
         let objection: Value = serde_json::from_str(line).unwrap_or(Value::Null);
         let (quote, command, kind) = (field(&objection, "quote"), field(&objection, "command"), field(&objection, "kind"));
@@ -949,6 +971,10 @@ async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, task: &s
             "fails" | "missing" | "unrequested" => {
                 reruns += 1;
                 let ran = rerun(project, &command, mark, &kept.join(format!("rerun-{reruns}.out")), quit).await;
+                let (s, fx, fl) = guard_once(mark, project, snap, skip, "re-run").await;
+                all_stopped.extend(s);
+                all_fixed.extend(fx);
+                all_failed.extend(fl);
                 match ran {
                     Ran::Stopped => break,
                     Ran::TimedOut => "dropped: its command did not finish".into(),
@@ -963,9 +989,16 @@ async fn filter(core: &Core, project: &Path, author: &str, mark: &Mark, task: &s
         };
         verdicts.push(json!({ "objection": objection, "verdict": verdict }));
     }
+    if reruns > 0 {
+        record["re-run"] = json!({
+            "stopped": all_stopped,
+            "put_back": all_fixed.into_iter().collect::<Vec<_>>(),
+            "not_put_back": all_failed.into_iter().collect::<Vec<_>>(),
+        });
+    }
     eprintln!("openmax: check: {} of {} objection{} reproduced", failures.len(), verdicts.len(), if verdicts.len() == 1 { "" } else { "s" });
     record["objections"] = json!(verdicts);
-    (failures, readings, reruns > 0)
+    (failures, readings)
 }
 
 /// The one message the author gets: each reproduced objection with the
@@ -1022,6 +1055,7 @@ async fn last_look(core: &Core, project: &Path, author: &str, skip: &[PathBuf], 
         _ => return,
     };
     let mut passing = Vec::new();
+    let (mut all_stopped, mut all_fixed, mut all_failed) = (Vec::new(), BTreeSet::new(), BTreeSet::new());
     for (n, (objection, ..)) in failures.iter().enumerate() {
         let command = field(objection, "command");
         if !allowed(core, project, author, &command).await {
@@ -1029,13 +1063,21 @@ async fn last_look(core: &Core, project: &Path, author: &str, skip: &[PathBuf], 
             continue;
         }
         let ran = rerun(project, &command, mark, &kept.join(format!("final-{}.out", n + 1)), quit).await;
+        let (s, fx, fl) = guard_once(mark, project, &snap, skip, "last re-run").await;
+        all_stopped.extend(s);
+        all_fixed.extend(fx);
+        all_failed.extend(fl);
         if matches!(ran, Ran::Stopped) {
             break;
         }
         let passes = final_passed(&ran, &field(objection, "observed"));
         passing.push(json!({ "command": command, "passes": passes, "timed_out": matches!(ran, Ran::TimedOut) }));
     }
-    guard(mark, project, &snap, skip, record, "last re-run").await;
+    record["last re-run"] = json!({
+        "stopped": all_stopped,
+        "put_back": all_fixed.into_iter().collect::<Vec<_>>(),
+        "not_put_back": all_failed.into_iter().collect::<Vec<_>>(),
+    });
     let now = passing.iter().filter(|p| p["passes"] == true).count();
     eprintln!("openmax: check: after the author's second end, {now} of {} command{} pass", failures.len(), if failures.len() == 1 { "" } else { "s" });
     record["last_re_run"] = json!(passing);
@@ -1084,13 +1126,18 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let snap_dir = dir.join("snap");
-            let _snap = snapshot(&dir, after, snap_dir.clone()).unwrap();
+            let snap = snapshot(&dir, after, snap_dir.clone()).unwrap();
             assert_eq!(std::fs::metadata(&snap_dir).unwrap().permissions().mode() & 0o777, 0o700);
             assert_eq!(std::fs::metadata(snap_dir.join("flag.json")).unwrap().permissions().mode() & 0o777, 0o600);
             let fifo = dir.join("pipe");
             let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
             assert!(scan(&dir, &[], MAX_FILES).is_none(), "named pipe must be rejected");
+            // Cleanup walk still removes checker-created pipes and stray files.
+            std::fs::write(dir.join("stray.txt"), "x").unwrap();
+            let (fixed, failed) = restore(&dir, &snap, &[snap_dir]);
+            assert!(failed.is_empty(), "{failed:?}");
+            assert!(!fifo.exists() && !dir.join("stray.txt").exists(), "fixed={fixed:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
