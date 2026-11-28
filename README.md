@@ -5,11 +5,11 @@
   </picture>
 </p>
 
-<h3 align="center">Most powerful & token efficient harness for agents</h3>
+<h3 align="center">A high-performance, self-extensible coding agent harness in Rust, optimized for prompt caching</h3>
 
 <p align="center">
-  A coding agent for your terminal that works with any model. Its built-in prompt is under<br>
-  700 tokens, and each agent step in a session sends it as the same bytes, so providers can cache it.
+  One terminal binary that works with any OpenAI-compatible, Anthropic, or local model.<br>
+  Keep the core small, write new tools and skills as files, and call them on the next step.
 </p>
 
 <p align="center">
