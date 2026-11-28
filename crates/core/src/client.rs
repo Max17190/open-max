@@ -465,6 +465,9 @@ pub struct Usage {
     pub cached_tokens: Option<u64>,
     /// The reasoning inside `output_tokens`, when the server reports it.
     pub reasoning_tokens: Option<u64>,
+    /// The prompt written to the cache, inside `prompt_tokens`, when the server reports it: priced apart from both
+    /// fresh and cached input, so it is kept apart too.
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Streaming client for Chat Completions, Responses, and native Messages APIs,
@@ -530,7 +533,8 @@ struct StreamChunk {
 /// `input_tokens`, so those are added back. Cache hits come as
 /// `prompt_tokens_details.cached_tokens`, a top-level
 /// `prompt_cache_hit_tokens`, `input_tokens_details.cached_tokens`, or
-/// `cache_read_input_tokens`, the first one present counting. Each count is
+/// `cache_read_input_tokens`, the first one present counting; cache writes as
+/// `cache_creation_input_tokens` or `prompt_tokens_details.cache_write_tokens`. Each count is
 /// read on its own, so a value of a shape this client does not expect under
 /// one key costs nothing under the others: a count that is not a whole
 /// number (a string, a fraction, a negative) reads as not reported, and a
@@ -555,6 +559,7 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
         cached_tokens: ["/prompt_tokens_details/cached_tokens", "/prompt_cache_hit_tokens", "/input_tokens_details/cached_tokens", input[2]]
             .iter().find_map(|k| count(k)),
         reasoning_tokens,
+        cache_write_tokens: count(input[1]).or_else(|| count("/prompt_tokens_details/cache_write_tokens")),
     })
 }
 
@@ -4906,6 +4911,12 @@ pub(crate) mod tests {
             assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), counts, "{usage}");
             assert_eq!(u.output_tokens, u.completion_tokens, "{usage}");
         }
+        // A cache write stays inside the prompt and is counted apart as well, on Messages and in a routed
+        // Chat Completions' details; a server that names none reports none.
+        let writes = |usage: Value| parse_usage(&usage).map(|u| (u.prompt_tokens, u.cache_write_tokens));
+        assert_eq!(writes(json!({"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":4})), Some((17, Some(3))));
+        assert_eq!(writes(json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":60,"cache_write_tokens":30}})), Some((100, Some(30))));
+        assert_eq!(writes(json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":60}})), Some((100, None)));
         assert!(parse_usage(&Value::Null).is_none());
     }
 

@@ -412,6 +412,7 @@ impl RequestSpend {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.output_tokens,
             cached_tokens: u.cached_tokens,
+            cache_write_tokens: u.cache_write_tokens,
         });
         core.send_agent(session_id, AgentEvent::Usage {
             prompt_tokens: u.prompt_tokens,
