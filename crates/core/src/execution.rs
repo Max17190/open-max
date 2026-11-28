@@ -1140,8 +1140,8 @@ async fn supervise_child(
         _ = tokio::time::sleep(timeout) => Termination::TimedOut,
         (idle, running) = stuck => Termination::Stuck { idle, running, after_memory_kill: idle_watch == IdleWatch::AfterMemoryKill },
     };
-    if matches!(termination, Termination::TimedOut | Termination::Stuck { .. }) {
-        flush_trailing_filter(pid, cancel).await;
+    if let (Some(leader), Termination::TimedOut | Termination::Stuck { .. }) = (pid, &termination) {
+        flush_trailing_filter(leader, cancel).await;
     }
     terminate_process_group(child, pid).await?;
     Ok((termination, None))
@@ -1234,15 +1234,16 @@ fn timed_wait(line: &str) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn session_activity(_: u32) -> Activity { None }
 
-/// On a timeout or stuck kill, stop upstream producers before a trailing
-/// `tail` or `head` so the filter sees EOF and flushes its buffered lines.
+/// On a timeout or stuck kill, stop the leader shell and upstream producers
+/// before a trailing `tail` or `head` so the filter flushes without later
+/// shell commands running after the timeout.
 #[cfg(unix)]
-async fn flush_trailing_filter(pid: Option<u32>, cancel: &CancelToken) {
-    let Some(leader) = pid else { return };
+async fn flush_trailing_filter(leader: u32, cancel: &CancelToken) {
     let (filters, producers): (Vec<_>, Vec<_>) = tokio::task::spawn_blocking(move || group_members(leader)).await.unwrap_or_default().into_iter().partition(|m| m.2);
     if cancel.is_cancelled() || filters.is_empty() || producers.is_empty() { return; }
     let alive = |p: u32, was: Option<u64>| was.map_or_else(|| unsafe { libc::kill(p as libc::pid_t, 0) == 0 }, |t| started(p) == Some((t, false)));
     let signal = |sig| for &(p, was, _) in &producers { if alive(p, was) { unsafe { libc::kill(p as libc::pid_t, sig) }; } };
+    if !filters.iter().any(|&(p, _, _)| p == leader) { unsafe { libc::kill(leader as libc::pid_t, libc::SIGKILL) }; }
     signal(libc::SIGTERM);
     for (pids, ms, kill) in [(&producers, 100, true), (&filters, 150, false)] {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
@@ -1254,7 +1255,7 @@ async fn flush_trailing_filter(pid: Option<u32>, cancel: &CancelToken) {
 }
 
 #[cfg(not(unix))]
-async fn flush_trailing_filter(_: Option<u32>, _: &CancelToken) {}
+async fn flush_trailing_filter(_: u32, _: &CancelToken) {}
 
 #[cfg(unix)]
 fn group_members(leader: u32) -> Vec<(u32, Option<u64>, bool)> {
@@ -4484,12 +4485,13 @@ mod tests {
     async fn timeout_flushes_trailing_tail_and_head_output() {
         let dir = std::env::temp_dir().join(format!("openmax-flush-timeout-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        for cmd in [
-            "(echo found-tail; sleep 99) | tail -1",
-            "(echo found-head; sleep 99) | head -5",
-            "(trap '' TERM; echo found-stubborn; sleep 99) | tail -1",
+        let marker = dir.join("after-timeout");
+        for (cmd, expected) in [
+            ("(echo found-tail; sleep 99) | tail -1", "found-tail"),
+            ("(echo found-head; sleep 99) | head -5", "found-head"),
+            ("(trap '' TERM; echo found-stubborn; sleep 99) | tail -1", "found-stubborn"),
+            ("(echo found-after; sleep 99) | tail -1; touch after-timeout; sleep 99", "found-after"),
         ] {
-            let expected = if cmd.contains("found-tail") { "found-tail" } else if cmd.contains("found-head") { "found-head" } else { "found-stubborn" };
             let output = run_process(
                 ProcessRequest {
                     program: "bash".into(),
@@ -4518,6 +4520,7 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout.rendered_bytes()).into_owned();
             assert!(stdout.contains(expected), "{cmd}: expected {expected:?} in {stdout:?}");
         }
+        assert!(!marker.exists(), "command after timed-out pipeline must not run");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
