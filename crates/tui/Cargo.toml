@@ -1,6 +1,6 @@
 [package]
 name = "openmax"
-description = "Open Max: barebones high-performance agent harness TUI"
+description = "A high-performance, self-extensible coding agent harness in Rust, optimized for prompt caching"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ai", "agent", "coding-agent", "llm", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 
 # The npm package cannot be called `openmax`: that name belongs to an unrelated
 # 2015 media-library binding that is still published. The BINARY is unaffected
@@ -21,7 +24,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
-open-max-core = { path = "../core" }
+open-max-core.workspace = true
 # Only the crossterm backend. The defaults add the calendar widget (and the
 # `time` crate family behind it), ratatui-macros and a layout cache, none of
 # which the TUI calls; the crossterm backend still enables underline colors.

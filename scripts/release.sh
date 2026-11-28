@@ -57,8 +57,9 @@ printf 'This publishes a release to GitHub, the Homebrew tap and the install URL
 read -r reply
 [ "$reply" = "y" ] || [ "$reply" = "Y" ] || { echo "aborted."; exit 1; }
 
-# One version lives in [workspace.package]; both crates inherit it.
-perl -0pi -e "s/^version = \"[^\"]*\"/version = \"${version}\"/m" Cargo.toml
+# One version lives in [workspace.package]; both crates inherit it, and the
+# workspace dependency pin on open-max-core tracks the same version for crates.io.
+perl -0pi -e "s/^version = \"[^\"]*\"/version = \"${version}\"/m; s/^open-max-core = \{ version = \"[^\"]*\", path = \"crates\/core\" \}/open-max-core = { version = \"${version}\", path = \"crates\/core\" }/m" Cargo.toml
 cargo update -w --quiet
 
 git add Cargo.toml Cargo.lock

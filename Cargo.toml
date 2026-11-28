@@ -16,6 +16,7 @@ repository = "https://github.com/Max17190/open-max"
 homepage = "https://github.com/Max17190/open-max"
 
 [workspace.dependencies]
+open-max-core = { version = "2026.11.6", path = "crates/core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Only the runtime pieces the harness uses; "full" would drag in the rest.

@@ -8,6 +8,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../../README.md"
+keywords = ["ai", "agent", "coding-agent", "llm", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "open_max_core"
