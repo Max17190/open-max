@@ -358,3 +358,81 @@ async fn a_size_cut_drops_older_exchanges_under_the_usual_target() {
     assert!(resend.contains("read short.txt four times"), "the prompt stays");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// How many image parts each recorded request carried.
+fn images_per_request(bodies: &[String]) -> Vec<usize> {
+    bodies.iter().map(|body| body.matches("data:image/").count()).collect()
+}
+
+/// The messages a recorded Chat Completions request sent.
+fn sent_messages(body: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"].as_array().unwrap().clone()
+}
+
+/// The bug this guards: every image a tool returned went again, whole, with
+/// every later request, slowing each and growing the body until a server
+/// refused it. Past `image_bytes` (here 60,000 bytes of base64, a little over
+/// two of the 26,668-byte images) the oldest from before the latest reply
+/// become lines down to half of it, in one batch, so the request between two
+/// batches repeats the one before it and keeps its cached prefix. The image a
+/// tool has just returned always goes, and a reopened session sends the lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn images_past_the_budget_become_lines_a_batch_at_a_time() {
+    let mut replies: Vec<_> = (1..=5).map(|n| reply(json!({"role":"assistant","content":null,"tool_calls":[read(&format!("c{n}"), "a.png")]}), "tool_calls")).collect();
+    replies.extend([reply(json!({"role":"assistant","content":"done"}), "stop"), reply(json!({"role":"assistant","content":"done again"}), "stop")]);
+    let (url, bodies) = refusing(replies, |_| None).await;
+    let (dir, data, project) = sized_project(&url);
+    let mut settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.join("settings.json")).unwrap()).unwrap();
+    settings["image_bytes"] = json!(60_000);
+    std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
+    let (core, mut rx) = Core::new(data.clone()).unwrap();
+    let session = open_max_core::sessions::create(&core, project.display().to_string()).unwrap().id;
+    let events = common::drive_turn(&core, &mut rx, &session, &project, "look at a.png five times").await;
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+    let notes: Vec<_> = events.iter().filter_map(|e| match e { AgentEvent::HarnessNote { text, .. } if text.contains("older images are now lines") => Some(text.as_str()), _ => None }).collect();
+    assert_eq!(notes, ["2 older images are now lines: the images a request carries passed 60000 bytes"; 2]);
+    let line = "[image 1 of this result (20000 bytes) not shown: a request carries at most 60000 bytes of images, the oldest going first; read the file again to see it]";
+    {
+        let sent = bodies.lock().unwrap();
+        assert_eq!(images_per_request(&sent), [0, 1, 2, 1, 2, 1], "a third image drops the two before it, down to half the budget");
+        assert_eq!(sent[3].matches(line).count(), 2, "each image gone is a line where it was");
+        assert!(sent[5].contains(line) && sent[5].matches(line).count() == 4);
+        let (fourth, fifth) = (sent_messages(&sent[3]), sent_messages(&sent[4]));
+        assert_eq!(fourth[..], fifth[..fourth.len()], "between two batches a request repeats the one before it");
+        let last = sent_messages(&sent[5]);
+        let newest = last.iter().rposition(|m| m["role"] == "tool").unwrap();
+        assert!(!last[newest]["content"].as_str().unwrap().contains("not shown"), "the image a tool has just returned goes");
+    }
+
+    common::close(&core, &session).await;
+    drop(core);
+    let (core, mut rx) = Core::new(data).unwrap();
+    let events = common::drive_turn(&core, &mut rx, &session, &project, "again").await;
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+    let sent = bodies.lock().unwrap();
+    assert_eq!(images_per_request(&sent)[6], 1, "reopened, the lines and the newest image");
+    assert_eq!(sent[6].matches(line).count(), 4);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A request refused for its size teaches the session what the route takes:
+/// after the first refusal, later requests carry at most half the image bytes
+/// the refused one did, so a session that keeps reading images is not
+/// refused again (here a 40,000-byte limit and two 26,668-byte images).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_for_size_lowers_the_image_bytes_for_the_session() {
+    let mut replies: Vec<_> = (1..=3).map(|n| reply(json!({"role":"assistant","content":null,"tool_calls":[read(&format!("c{n}"), "a.png")]}), "tool_calls")).collect();
+    replies.push(reply(json!({"role":"assistant","content":"done"}), "stop"));
+    let (url, bodies) = refusing(replies, over_the_limit).await;
+    let (dir, data, project) = sized_project(&url);
+    let (core, mut rx) = Core::new(data).unwrap();
+    let session = open_max_core::sessions::create(&core, project.display().to_string()).unwrap().id;
+    let events = common::drive_turn(&core, &mut rx, &session, &project, "look at a.png three times").await;
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+    assert_eq!(size_steps(&events), ["each image from before the latest reply is now a line"], "one refusal, no second");
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::HarnessNote { text, .. } if text == "1 older images are now lines: the images a request carries passed 26668 bytes")), "{events:?}");
+    let sent = bodies.lock().unwrap();
+    assert_eq!(images_per_request(&sent), [0, 1, 2, 1, 1]);
+    assert_eq!(sent.iter().filter(|body| body.len() > BODY_LIMIT).count(), 1, "refused once");
+    let _ = std::fs::remove_dir_all(dir);
+}

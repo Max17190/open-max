@@ -449,6 +449,22 @@ and the run that writes a key already uses it.
   which nothing resizes, so a provider that scales it down costs less. Set it only for a model that takes images: one that does not
   refuses the request. Off, no request changes.
 
+- `image_bytes` (default 8 MiB, 8,388,608): the base64 bytes of images one
+  request carries. Every image a tool returned stays in the history and goes
+  with each later request, which slows each one's first token and can grow
+  the body past what a server takes. Before a request whose images would
+  pass this, the oldest tool results from before the latest reply have
+  their images turned into lines, oldest first, until the images left are
+  at most half of it. Each line names the image's place in its result and
+  its bytes, and says to read the file again to see it; the result's own
+  first line still names the file. Images a tool has just returned are
+  never turned into lines this way. Dropping down to half, not just under
+  the limit, makes the prompt cache start again from the first image
+  changed once per batch of images rather than on every new one. A request
+  refused for its size (HTTP 413) that carried images lowers this, for the
+  rest of the session, to half what it carried. The `harness_note` event
+  says how many images became lines and at what size.
+
 - `max_agent_iterations` (default 300): tool-call rounds one turn may take.
   A turn that reaches it stops and says so; a follow-up message (or
   `openmax --continue -p "<follow-up>"`) carries on from there. Settings are

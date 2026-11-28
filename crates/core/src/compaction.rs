@@ -665,12 +665,63 @@ pub(crate) fn drop_images(messages: &mut [ChatMessage], refusal: &str, older: bo
     let start = messages.iter().rposition(|m| m.role == "assistant").map_or(0, |i| i + 1);
     let reason = crate::client::truncate(refusal.split_once(": ").map_or(refusal, |(_, said)| said), 200);
     let why = if older { "the provider refused a request this large" } else { "the provider refused it" };
-    let line = |(n, image): (usize, crate::types::Image)| format!("\n[image {} of this result ({} bytes) not shown: {why}: {reason}]", n + 1, image.data.len() / 4 * 3 - image.data.bytes().rev().take_while(|&b| b == b'=').count());
     let (before, after) = messages.split_at_mut(start);
     let mut new = if older { before } else { after }.iter_mut().filter(|m| m.role == "tool" && m.images.is_some()).peekable();
     let dropped = new.peek().is_some();
-    new.for_each(|m| { let lines: String = m.images.take().into_iter().flatten().enumerate().map(line).collect(); m.content.get_or_insert_with(String::new).push_str(&lines) });
+    new.for_each(|m| images_as_lines(m, &format!("{why}: {reason}")));
     dropped
+}
+
+/// Turns each image of a tool result into a line saying which it was, its bytes and `why` it is not shown.
+fn images_as_lines(m: &mut ChatMessage, why: &str) {
+    let line = |(n, image): (usize, crate::types::Image)| format!("\n[image {} of this result ({} bytes) not shown: {why}]", n + 1, image.data.len() / 4 * 3 - image.data.bytes().rev().take_while(|&b| b == b'=').count());
+    let lines: String = m.images.take().into_iter().flatten().enumerate().map(line).collect();
+    m.content.get_or_insert_with(String::new).push_str(&lines);
+}
+
+/// The base64 bytes of images a request carries before the oldest become lines, unless settings' `image_bytes` says
+/// otherwise. Each byte is sent again with every later request and slows its first token; a body past a server's
+/// limit is refused whole.
+pub const IMAGE_BYTES: usize = 8 << 20;
+
+/// The base64 bytes of the images `messages` carry.
+pub(crate) fn image_bytes(messages: &[ChatMessage]) -> usize {
+    messages.iter().flat_map(|m| m.images.iter().flatten()).map(|image| image.data.len()).sum()
+}
+
+/// Bounds the images the next request carries by settings' `image_bytes`, or by less once a request refused for its
+/// size showed what the route takes (`learn_image_bytes`). Past it, the oldest results a tool returned before the latest
+/// reply have their images turned into lines until at most half of it is left, so the prefix a cache holds breaks once a
+/// batch and not on every image; what a tool has just returned stays. It says how many, and the next save writes the
+/// file whole, so a reopened session sends the lines.
+pub(crate) async fn bound_session_images(core: &Core, session_id: &str, messages: &mut [ChatMessage], setting: Option<usize>) {
+    let mut sessions = core.sessions.lock().await;
+    let Some(data) = sessions.get_mut(session_id) else { return };
+    let budget = data.image_bytes.unwrap_or(usize::MAX).min(setting.unwrap_or(IMAGE_BYTES));
+    let (start, mut left, mut bounded) = (messages.iter().rposition(|m| m.role == "assistant").map_or(0, |i| i + 1), image_bytes(messages), 0);
+    let why = format!("a request carries at most {budget} bytes of images, the oldest going first; read the file again to see it");
+    for m in messages[..start].iter_mut().filter(|m| m.role == "tool" && m.images.is_some()) {
+        if left <= budget / 2 || bounded == 0 && left <= budget {
+            break;
+        }
+        left -= image_bytes(std::slice::from_ref(m));
+        bounded += m.images.as_ref().map_or(0, Vec::len);
+        images_as_lines(m, &why);
+    }
+    if bounded > 0 {
+        data.persisted_count = sessions::PERSISTED_STALE;
+        drop(sessions);
+        let text = format!("{bounded} older images are now lines: the images a request carries passed {budget} bytes");
+        core.send_agent(session_id, AgentEvent::HarnessNote { call_id: String::new(), text });
+    }
+}
+
+/// After a request refused for its size, later requests of the session carry at most half the image bytes it did.
+pub(crate) async fn learn_image_bytes(core: &Core, session_id: &str, messages: &[ChatMessage]) {
+    let carried = image_bytes(messages);
+    if let Some(data) = core.sessions.lock().await.get_mut(session_id).filter(|_| carried > 0) {
+        data.image_bytes = Some(data.image_bytes.unwrap_or(usize::MAX).min(carried / 2));
+    }
 }
 
 /// The prompt a cut puts back after its note for the turn in progress: the

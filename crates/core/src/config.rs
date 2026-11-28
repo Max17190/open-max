@@ -120,6 +120,11 @@ pub struct Settings {
     /// the model as an image. Unset follows the model entry's `image_input`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_input: Option<bool>,
+    /// Base64 bytes of images one request carries: past it, the oldest a tool
+    /// returned before the latest reply become lines, down to half of it.
+    /// Unset is 8 MiB (`compaction::IMAGE_BYTES`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_bytes: Option<usize>,
     /// Global compaction ceiling for transcript plus frozen tool schemas.
     /// Unset uses the active model's ceiling or the built-in default.
     /// The ceiling is floored at 20,000 tokens, capped by the window budget,
@@ -193,6 +198,7 @@ impl Default for Settings {
             reasoning_effort: None,
             max_output_bytes: None,
             image_input: None,
+            image_bytes: None,
             compaction_tokens: None,
             compaction_keep_tokens: None,
             max_agent_tokens: None,
