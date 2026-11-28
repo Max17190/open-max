@@ -505,6 +505,9 @@ pub struct TokenUsage {
     /// measurement the harness invented.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
+    /// Prompt tokens written to the cache, already inside `prompt_tokens`; `None` when the endpoint said nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Append one request's accounting. Best-effort and silent on failure: usage
@@ -2307,21 +2310,28 @@ mod tests {
             prompt_tokens: 1000,
             completion_tokens: 50,
             cached_tokens: Some(900),
+            ..Default::default()
         });
         append_usage(&core, id, &TokenUsage {
             ts: 2,
             prompt_tokens: 1200,
             completion_tokens: 60,
             cached_tokens: Some(1100),
+            ..Default::default()
         });
         append_usage(&core, id, &TokenUsage {
             ts: 3,
             prompt_tokens: 5000,
             completion_tokens: 10,
             cached_tokens: None,
+            ..Default::default()
         });
         let records = load_usage(&core, id);
         assert_eq!(records.len(), 3, "append-only, oldest first");
+        assert!(!std::fs::read_to_string(usage_path(&core, id)).unwrap().contains("cache_write"), "said nothing, so nothing written");
+        let written = TokenUsage { ts: 4, prompt_tokens: 10, cached_tokens: Some(4), cache_write_tokens: Some(3), ..Default::default() };
+        let line = serde_json::to_string(&written).unwrap();
+        assert_eq!(serde_json::from_str::<TokenUsage>(&line).unwrap(), written, "{line}");
         assert_eq!(records[0].prompt_tokens, 1000);
         // The unreported request contributes to neither side: counting its
         // 5000 prompt tokens as a miss would report the server's silence as
@@ -2382,6 +2392,7 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 1,
             cached_tokens: Some(1),
+            ..Default::default()
         });
         append_compaction(&core, &running.id, &CompactionRecord {
             ts: 9,
@@ -2476,6 +2487,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     cached_tokens: Some(1),
+                    ..Default::default()
                 });
             })
         };
@@ -2579,6 +2591,7 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 1,
             cached_tokens: None,
+            ..Default::default()
         });
         assert_eq!(load_usage(&core_b, &sibling_meta.id).len(), 1);
         let _ = std::fs::remove_dir_all(dir);
@@ -3366,7 +3379,7 @@ mod tests {
         let read = || INDEX_BYTES_READ.with(|read| read.replace(0));
         read();
 
-        let usage = |ts| TokenUsage { ts, prompt_tokens: 10, completion_tokens: 1, cached_tokens: None };
+        let usage = |ts| TokenUsage { ts, prompt_tokens: 10, completion_tokens: 1, ..Default::default() };
         let mut messages = vec![ChatMessage::system("rules"), ChatMessage::user("first")];
         let mut persisted = 0usize;
         assert!(save_messages(&core, &id, &messages, &mut persisted, false));

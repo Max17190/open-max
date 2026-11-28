@@ -371,6 +371,15 @@ const MAX_TOOL_CALLS: usize = 128;
 /// held the turn forever.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long a Chat Completions stream is waited for after its finish, for the usage chunk and `[DONE]`.
+const FINISHED_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Reads what is left of a body after the reply's last event, beside the turn and for at most a second. A body read
+/// to its end gives its connection back for the next request; one dropped unread closes it, and the next opens a new one.
+fn drain(mut stream: impl futures_util::Stream + Send + Unpin + 'static) {
+    tokio::spawn(tokio::time::timeout(std::time::Duration::from_secs(1), async move { while stream.next().await.is_some() {} }));
+}
+
 #[derive(Default)]
 pub struct CompletionResult {
     pub content: String,
@@ -456,6 +465,9 @@ pub struct Usage {
     pub cached_tokens: Option<u64>,
     /// The reasoning inside `output_tokens`, when the server reports it.
     pub reasoning_tokens: Option<u64>,
+    /// The prompt written to the cache, inside `prompt_tokens`, when the server reports it: priced apart from both
+    /// fresh and cached input, so it is kept apart too.
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Streaming client for Chat Completions, Responses, and native Messages APIs,
@@ -521,7 +533,8 @@ struct StreamChunk {
 /// `input_tokens`, so those are added back. Cache hits come as
 /// `prompt_tokens_details.cached_tokens`, a top-level
 /// `prompt_cache_hit_tokens`, `input_tokens_details.cached_tokens`, or
-/// `cache_read_input_tokens`, the first one present counting. Each count is
+/// `cache_read_input_tokens`, the first one present counting; cache writes as
+/// `cache_creation_input_tokens` or `prompt_tokens_details.cache_write_tokens`. Each count is
 /// read on its own, so a value of a shape this client does not expect under
 /// one key costs nothing under the others: a count that is not a whole
 /// number (a string, a fraction, a negative) reads as not reported, and a
@@ -546,6 +559,7 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
         cached_tokens: ["/prompt_tokens_details/cached_tokens", "/prompt_cache_hit_tokens", "/input_tokens_details/cached_tokens", input[2]]
             .iter().find_map(|k| count(k)),
         reasoning_tokens,
+        cache_write_tokens: count(input[1]).or_else(|| count("/prompt_tokens_details/cache_write_tokens")),
     })
 }
 
@@ -1107,6 +1121,7 @@ async fn read_sse(
     // finish_reason chunk)? Without one, the stream ending means the
     // connection dropped mid-answer, not that the model finished.
     let mut saw_terminator = false;
+    let mut finish_deadline: Option<tokio::time::Instant> = None;
     let mut usage: Option<Usage> = None;
     // Byte buffer: chunks can split multi-byte UTF-8 sequences, so text
     // conversion only happens on complete lines ('\n' is never part of a
@@ -1120,8 +1135,18 @@ async fn read_sse(
     let mut unfinished: Option<Unfinished> = None;
 
     'outer: loop {
+        // After the finish only the usage chunk and `[DONE]` are due, and they come at once: a server that sends
+        // neither and holds the stream open (even with keepalive comments) is waited for until one fixed deadline,
+        // not for the whole idle interval.
+        let wait = match finish_deadline {
+            Some(deadline) => match deadline.checked_duration_since(tokio::time::Instant::now()) {
+                Some(left) if !left.is_zero() => left,
+                _ => break,
+            },
+            None => idle,
+        };
         let next = tokio::select! {
-            c = tokio::time::timeout(idle, stream.next()) => c,
+            c = tokio::time::timeout(wait, stream.next()) => c,
             _ = cancelled.cancelled() => {
                 finish_reason = "cancelled".into();
                 break;
@@ -1181,6 +1206,7 @@ async fn read_sse(
             let Some(data) = data_line(line) else { continue };
             if data == b"[DONE]" {
                 saw_terminator = true;
+                drain(stream);
                 break 'outer;
             }
             let chunk = match serde_json::from_slice::<StreamChunk>(data) {
@@ -1212,8 +1238,15 @@ async fn read_sse(
                 unfinished = Some(error.map_or_else(bare, |error| Unfinished::Failed(server_failure(&error, &String::from_utf8_lossy(data)))));
                 break 'outer;
             }
-            // The usage-bearing final chunk has an empty choices array.
-            let Some(choice) = choice else { continue };
+            // The usage-bearing final chunk has an empty choices array. After the finish it ends the reply: only
+            // `[DONE]` may follow, and a server that holds the stream open without it would hold the turn.
+            let Some(choice) = choice else {
+                if saw_terminator && chunk.usage.is_some_and(|u| u.is_object()) {
+                    drain(stream);
+                    break 'outer;
+                }
+                continue;
+            };
             // A one-shot reply read as a stream. Before anything has streamed,
             // it is parsed as the labeled body would be, so each call in it
             // stays its own: read as deltas, calls with no ids join when the
@@ -1235,6 +1268,7 @@ async fn read_sse(
                 // Servers that end a stream here and never send `[DONE]`
                 // are still finished: this is a terminator too.
                 saw_terminator = true;
+                finish_deadline.get_or_insert_with(|| tokio::time::Instant::now() + idle.min(FINISHED_GRACE));
                 finish_reason = reason;
             }
             let delta = choice.delta.unwrap_or_default();
@@ -3848,6 +3882,56 @@ pub(crate) mod tests {
         assert_eq!(served, 1);
     }
 
+    /// The bug this guards: a server that sent its finish, then held the stream open with neither `[DONE]` nor the
+    /// body's end, held the request for the whole idle interval (600 seconds by default) before the finished reply
+    /// stood. The usage chunk after the finish is the reply's last, so the reply ends there; with no usage chunk,
+    /// the reply ends a short grace after its finish.
+    #[tokio::test]
+    async fn a_finished_reply_does_not_wait_for_done() {
+        let finish = "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n";
+        for (stream, usage, within) in [(format!("{finish}{usage}"), Some((10, 3)), 1), (finish.to_string(), None, FINISHED_GRACE.as_secs() + 1)] {
+            let started = std::time::Instant::now();
+            // The second body is never served: the server waits for it, holding the first stream open.
+            let held = try_stream_sequence_idle(vec![format!("STALL:{stream}"), FINISHED.into()], IDLE_TIMEOUT);
+            let (result, _, served) = tokio::time::timeout(std::time::Duration::from_secs(30), held).await.expect("the finished reply does not wait out the idle interval");
+            let result = result.expect("a finished reply");
+            assert_eq!((result.content.as_str(), result.finish_reason.as_str(), served), ("all of it", "stop", 1));
+            assert_eq!(result.usage.map(|u| (u.prompt_tokens, u.completion_tokens)), usage);
+            assert!(started.elapsed() < std::time::Duration::from_secs(within), "{:?}", started.elapsed());
+        }
+        // SSE keepalive comments arriving after finish must not restart the grace deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio::io::BufReader::new(socket);
+            let (mut line, mut length) = (String::new(), 0);
+            while socket.read_line(&mut line).await.unwrap_or(0) > 0 && line != "\r\n" {
+                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = n.trim().parse().unwrap(); }
+                line.clear();
+            }
+            socket.read_exact(&mut vec![0; length]).await.unwrap();
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(format!("{head}{finish}").as_bytes()).await;
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                if socket.write_all(b": ping\n\n").await.is_err() { break; }
+            }
+        });
+        let mut client = ChatClient::new(url, Some("key".into()), "fixture".into(), None, 64);
+        client.idle_timeout = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.stream_chat(&[ChatMessage::user("go")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}),
+        ).await.expect("keepalive comments after finish must not hold the stream open").unwrap();
+        server.abort();
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
     /// Any byte is activity, an SSE comment too: a server that keeps its
     /// stream alive with comments through a long prompt is waited for, however
     /// long that takes in all.
@@ -4866,6 +4950,12 @@ pub(crate) mod tests {
             assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), counts, "{usage}");
             assert_eq!(u.output_tokens, u.completion_tokens, "{usage}");
         }
+        // A cache write stays inside the prompt and is counted apart as well, on Messages and in a routed
+        // Chat Completions' details; a server that names none reports none.
+        let writes = |usage: Value| parse_usage(&usage).map(|u| (u.prompt_tokens, u.cache_write_tokens));
+        assert_eq!(writes(json!({"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":4})), Some((17, Some(3))));
+        assert_eq!(writes(json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":60,"cache_write_tokens":30}})), Some((100, Some(30))));
+        assert_eq!(writes(json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":60}})), Some((100, None)));
         assert!(parse_usage(&Value::Null).is_none());
     }
 
@@ -4981,6 +5071,64 @@ pub(crate) mod tests {
             for name in ["x-grok-conv-id", "modal-routing-affinity-key"] {
                 assert_eq!(head.contains(&format!("{name}: {key}")), routed == Some(name), "{model}: {head}");
             }
+        }
+    }
+
+    /// The bug this guards: a reply was taken at its last event and the rest of its body dropped unread, so the
+    /// connection closed and every request opened a new one (on a remote endpoint, a new TLS handshake each). A
+    /// server that ends each body a moment after its last event, as one behind a proxy does, then serves three
+    /// requests on every wire over the connection the first one opened.
+    #[tokio::test]
+    async fn a_finished_reply_gives_its_connection_back_on_every_wire() {
+        use crate::providers::WireApi;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let replies = [
+            (WireApi::ChatCompletions, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
+            (WireApi::Responses, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"),
+            (WireApi::Responses, "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"),
+            (WireApi::Anthropic, concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n")),
+        ];
+        for (wire, reply) in replies {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = ChatClient::new(format!("http://{}", listener.local_addr().unwrap()), Some("key".into()), "fixture".into(), None, 64);
+            client.wire_api = wire;
+            let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = accepted.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut socket = tokio::io::BufReader::new(socket);
+                        loop {
+                            let (mut line, mut length) = (String::new(), 0);
+                            while socket.read_line(&mut line).await.unwrap_or(0) > 0 && line != "\r\n" {
+                                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = n.trim().parse().unwrap(); }
+                                line.clear();
+                            }
+                            if line.is_empty() { return; }
+                            socket.read_exact(&mut vec![0; length]).await.unwrap();
+                            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                            let _ = socket.write_all(format!("{head}{:x}\r\n{reply}\r\n", reply.len()).as_bytes()).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            let _ = socket.write_all(b"0\r\n\r\n").await;
+                        }
+                    });
+                }
+            });
+            for _ in 0..3 {
+                let result = client.stream_chat(&[ChatMessage::user("go")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}).await.unwrap();
+                assert_eq!(result.content, "ok", "{wire:?}");
+                // The tool a reply calls runs before the next request.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            server.abort();
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "{wire:?}");
         }
     }
 }

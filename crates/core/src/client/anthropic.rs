@@ -460,6 +460,7 @@ pub(super) async fn read(
                 if !started || blocks.iter().any(|b| !b.closed) {
                     return (reply, failed("Messages stopped before blocks completed".into()));
                 }
+                drain(stream);
                 return match complete(
                     blocks.into_iter().map(|b| b.value).collect(),
                     reason.as_deref().unwrap_or(""),
