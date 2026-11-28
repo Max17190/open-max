@@ -188,7 +188,8 @@ of its refusals were honored in a turn, its next one ends the turn
 end that every gate passed is recorded as a `turn_verified` event naming them
 ([stdio protocol](stdio-protocol.md)). [examples/done-gate](../examples/done-gate/README.md)
 is a gate to copy into a project: two files that hold every turn to one
-command you name. While
+command you name, which `/gate <command>` in the terminal UI writes for you
+([slash commands](usage.md#slash-commands)). While
 a hook file fails closed (below), every turn's end is reported and ends
 `unverified` without a refusal, until a turn repairs it: that turn's end is
 judged by the hooks on disk then. Each

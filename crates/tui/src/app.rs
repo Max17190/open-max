@@ -338,6 +338,18 @@ pub struct App {
     /// Whether the session replayed was compacted, so edits from before
     /// the compaction reach no tool block and /diff cannot list them.
     compacted_before_replay: bool,
+    /// How the completion gate /gate installs judged this session's latest
+    /// end of a turn, for /gate to show; None until it judged one.
+    gate_verdict: Option<&'static str>,
+    /// Set while a /gate change is being written on a blocking thread, and
+    /// cleared only by the event loop when its result arrives (`on_gate`):
+    /// no turn starts and no other change begins until then, so the next
+    /// turn is judged by the gate the person just set.
+    gate_change: bool,
+    /// Where a /gate change sends its result: the transcript generation it
+    /// was made in and the lines that report it.
+    gate_tx: mpsc::UnboundedSender<(u64, Vec<Line<'static>>)>,
+    gate_rx: Option<mpsc::UnboundedReceiver<(u64, Vec<Line<'static>>)>>,
     /// Messages typed while the agent works, shown in the strip above the
     /// composer. The oldest `steered` were sent to the running turn and leave
     /// on its SteerAccepted; the rest (typed during a compaction, or after
@@ -579,6 +591,7 @@ async fn event_loop(
 
     let mut input = TerminalInput::start();
     let mut listing_rx = app.listing_rx.take().expect("the event loop runs once per app");
+    let mut gate_rx = app.gate_rx.take().expect("the event loop runs once per app");
     // No frame is written while the probe waits, so none can cut into its
     // query or the flags pushed on its answer. Input has not started, so no
     // keypress waits on this.
@@ -626,6 +639,7 @@ async fn event_loop(
                 }
             }
             Some((generation, lines)) = listing_rx.recv() => app.on_listing(generation, lines),
+            Some((generation, lines)) = gate_rx.recv() => app.on_gate(generation, lines),
             Some(files) = files_rx.recv() => {
                 app.file_index = Some(Arc::new(files));
                 app.file_index_pending = false;
@@ -758,6 +772,7 @@ impl App {
         files_tx: mpsc::UnboundedSender<Vec<String>>,
     ) -> Self {
         let (listing_tx, listing_rx) = mpsc::unbounded_channel();
+        let (gate_tx, gate_rx) = mpsc::unbounded_channel();
         Self {
             composer: Composer::new(&core.data_dir, &project),
             core,
@@ -782,6 +797,10 @@ impl App {
             file_index_pending: false,
             templates: Vec::new(),
             compacted_before_replay: false,
+            gate_verdict: None,
+            gate_change: false,
+            gate_tx,
+            gate_rx: Some(gate_rx),
             queued: Vec::new(),
             steered: 0,
             flush_queue: false,
@@ -1060,6 +1079,7 @@ impl App {
         self.model_picker = None;
         self.pending_diffs.clear();
         self.compacted_before_replay = false;
+        self.gate_verdict = None;
         self.tool_meta.clear();
         self.last_tool_output = None;
         self.last_assistant_response = None;
@@ -2292,7 +2312,7 @@ impl App {
         let text = if let Some(cmd) = text.strip_prefix('/') {
             let head = cmd.split_whitespace().next().unwrap_or("");
             let builtin = head == "exit" || completion::shadows_templates(head);
-            // Built-ins win, /diff aside; anything else may be a prompt template, whose
+            // Built-ins win, TEMPLATE_WINS aside; anything else may be a prompt template, whose
             // expansion submits as a normal user message. The expansion itself
             // is the same helper --print and --stdio submit through, so the
             // three front ends cannot drift.
@@ -2315,7 +2335,35 @@ impl App {
         Ok(())
     }
 
+    /// Whether a /gate change is still being written while no turn runs, so
+    /// a turn started now could miss the gate the person just set.
+    fn gate_change_pending(&self) -> bool {
+        !self.running && self.gate_change
+    }
+
     fn submit_prompt(&mut self, text: String) {
+        if self.gate_change_pending() {
+            // It waits in the queue strip and goes out once the change is
+            // on disk (on_listing), so its turn is judged by the new gate.
+            self.queued.push(text);
+            self.transcript.follow();
+            self.dirty.mark_chat();
+            self.dirty.mark_chrome();
+            return;
+        }
+        if !self.running && self.steered == 0 && !self.queued.is_empty() {
+            // Entries still wait from before (typed during a /gate change
+            // whose listing has not reached the loop yet): this one goes
+            // behind them, and the oldest goes out first.
+            self.queued.push(text);
+            return self.send_next_queued();
+        }
+        self.submit_now(text);
+    }
+
+    /// Start a turn with `text`, or steer the running one, with nothing
+    /// waiting ahead of it.
+    fn submit_now(&mut self, text: String) {
         if self.running {
             // A running turn takes the message at its next iteration
             // boundary, where SteerAccepted paints it; until then it waits
@@ -2369,6 +2417,8 @@ impl App {
         ) {
             Ok(()) => {
                 self.running = true;
+                // The verdict /gate shows is the latest turn's alone.
+                self.gate_verdict = None;
                 self.set_presence(Presence::Working);
                 self.pending_submit = Some(text);
                 self.turn_started = Some(Instant::now());
@@ -2808,6 +2858,44 @@ impl App {
                 self.transcript.show_latest_from_start();
                 self.dirty.mark_chat();
             }
+            "gate" => {
+                let arg = raw_rest.trim();
+                // A running turn's tools could rewrite the files between
+                // their write and their approval, and the gate would judge
+                // an end whose turn it did not see start. That holds for a
+                // session left by /new or /resume while its turn winds down
+                // too: a cancelled turn's end is still judged by the gate.
+                let left_turn = self.left_running.iter().any(|id| self.core.is_running(id));
+                if (self.running || left_turn) && !arg.is_empty() {
+                    return self.note("finish or cancel the turn before /gate changes the gate; /gate alone shows it");
+                }
+                if !arg.is_empty() {
+                    if self.gate_change {
+                        return self.note("the last /gate change is still being written; run /gate again in a moment");
+                    }
+                    self.gate_change = true;
+                    // A verdict on the gate this replaces says nothing of the new one.
+                    self.gate_verdict = None;
+                }
+                let ctx = crate::gate::Context {
+                    project: self.project.clone(),
+                    data_dir: self.core.data_dir.clone(),
+                    mode: self.approval_mode(),
+                    session: self.session_id.clone(),
+                    human: crate::require_human("approving a completion gate", &crate::gate::approve_command(&self.project)),
+                    last: self.gate_verdict,
+                };
+                let arg = arg.to_string();
+                let work = async move { tokio::task::spawn_blocking(move || crate::gate::run(&ctx, &arg)).await.unwrap_or_default() };
+                if !self.gate_change {
+                    // Showing the gate changes nothing, so it is a listing.
+                    return self.spawn_listing(work);
+                }
+                let (tx, generation) = (self.gate_tx.clone(), self.transcript_gen);
+                tokio::spawn(async move {
+                    let _ = tx.send((generation, work.await));
+                });
+            }
             "quit" | "exit" => self.should_quit = true,
             other => match HABITS.iter().find(|(names, _)| names.contains(&other)) {
                 Some((_, pointer)) => self.note(&format!("/{other} is not a command here; {pointer}")),
@@ -2862,6 +2950,16 @@ impl App {
         });
     }
 
+    /// A /gate change is on disk: report it, and send what was typed while
+    /// it was written, in order.
+    fn on_gate(&mut self, generation: u64, lines: Vec<Line<'static>>) {
+        self.gate_change = false;
+        if !self.running && self.pending_approval.is_none() && self.steered == 0 && !self.queued.is_empty() {
+            self.send_next_queued();
+        }
+        self.on_listing(generation, lines);
+    }
+
     fn on_listing(&mut self, generation: u64, lines: Vec<Line<'static>>) {
         if generation != self.transcript_gen || lines.is_empty() {
             return;
@@ -2887,15 +2985,28 @@ impl App {
         if self.flush_queue {
             self.flush_queue = false;
             if !self.running && self.pending_approval.is_none() && !self.queued.is_empty() {
-                let text = self.queued.remove(0);
-                let _ = self.handle_submit(text.clone()).await;
-                if !self.running {
-                    // The turn never started (server stopped, start error):
-                    // nothing will drain the rest, so hand it all back.
-                    self.queued.insert(0, text);
-                    self.return_queue_to_composer();
-                }
+                self.send_next_queued();
             }
+        }
+    }
+
+    /// Start a turn with the oldest queued entry.
+    fn send_next_queued(&mut self) {
+        let text = self.queued.remove(0);
+        // A queued entry already went through handle_submit, which
+        // expanded any template, so it is a prompt: a body that
+        // starts with `/` is not dispatched again as a command.
+        self.refresh_project_root();
+        if self.gate_change_pending() {
+            // Still waiting on a /gate change, which sends it when it lands.
+            return self.queued.insert(0, text);
+        }
+        self.submit_now(text.clone());
+        if !self.running {
+            // The turn never started (server stopped, start error):
+            // nothing will drain the rest, so hand it all back.
+            self.queued.insert(0, text);
+            self.return_queue_to_composer();
         }
     }
 
@@ -3227,6 +3338,9 @@ impl App {
                 self.note(&format!("hook '{hook}' failed on {event}: {detail}"));
             }
             AgentEvent::TurnRefused { hook, reason, continuation, continuations_left } => {
+                if hook == crate::gate::NAME {
+                    self.gate_verdict = Some(GATE_REFUSED);
+                }
                 // The refusal is already a user message on disk, so a resumed
                 // session replays it as one; pushing the same block live keeps
                 // the view being watched and the view being replayed the same
@@ -3243,7 +3357,11 @@ impl App {
                 self.refilter_scroll_search_live();
             }
             // A record for callers (the event log, `--json`, stdio), not a line on every turn's end.
-            AgentEvent::TurnVerified { .. } => {}
+            AgentEvent::TurnVerified { hooks } => {
+                if hooks.iter().any(|hook| hook == crate::gate::NAME) {
+                    self.gate_verdict = Some("it passed the latest end of a turn in this session, which was verified");
+                }
+            }
             AgentEvent::SteerAccepted { text } => {
                 // The steer leaves the queue strip for its place in the
                 // transcript, the one a resumed session replays it at.
@@ -3288,9 +3406,14 @@ impl App {
                     "budget_exhausted" => self.note(
                         "stopped: reached the token budget for one turn (send a follow-up to continue)",
                     ),
-                    "unverified" => self.note(
-                        "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
-                    ),
+                    "unverified" => {
+                        if self.gate_verdict == Some(GATE_REFUSED) {
+                            self.gate_verdict = Some("it refused the latest end of a turn in this session, which then ended unverified");
+                        }
+                        self.note(
+                            "stopped: a blocking turn_end hook did not pass this answer, so the turn ended unverified (see openmax --check)",
+                        )
+                    }
                     "error" => {}
                     "blocked" => {
                         // Core never accepted the text: drop the optimistic
@@ -4136,12 +4259,16 @@ fn note_body(text: &str) -> &str {
     text.strip_prefix('[').and_then(|body| body.strip_suffix(']')).unwrap_or(text)
 }
 
+/// What /gate says after the gate it installs refused an end of a turn.
+const GATE_REFUSED: &str = "it refused the latest end of a turn in this session";
+
 /// Commands habit from other terminal agents suggests, each with where the
 /// same thing lives here, so typing one gets a pointer, not "unknown command".
 const HABITS: &[(&[&str], &str)] = &[
     (&["undo"], "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files, to the end of a turn"),
     (&["sessions", "history"], "/resume lists this project's sessions"),
     (&["config", "settings"], "settings live in ~/.openmax/settings.json, and openmax --spec settings describes each one"),
+    (&["hooks"], "hooks are files in .openmax/hooks/ (openmax --check lists them); /gate <check> installs a completion gate there"),
 ];
 
 /// Single source of truth for `/help` and onboarding copy.
@@ -5022,6 +5149,7 @@ mod tests {
             ("undo", "/diff lists the files the edit and write tools changed; /rewind <turn> rewinds the conversation, not files"),
             ("sessions", "/resume lists"),
             ("settings", "settings live in ~/.openmax/settings.json"),
+            ("hooks", "hooks are files in .openmax/hooks/ (openmax --check lists them); /gate <check> installs a completion gate there"),
         ] {
             app.handle_submit(format!("/{typed}")).await.unwrap();
             let shown = app.transcript.export_text();
@@ -7719,6 +7847,58 @@ mod tests {
         assert!(app.flush_queue, "the entry behind the blocked steer goes out after the turn");
         assert_eq!(app.queued, vec!["after".to_string()], "and only that entry");
         assert_eq!(app.composer.text(), "steer\ndraft", "the blocked steer stays the user's to edit");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// /gate changes no gate while a turn runs, where the turn's tools could
+    /// rewrite its files between their write and their approval. And only a
+    /// line a person submits runs a command: an entry queued behind a turn
+    /// (a template's body among them) that begins with `/gate` goes out after
+    /// the turn as a prompt and writes no hook.
+    #[tokio::test]
+    async fn gate_waits_for_the_turn_and_a_queued_entry_never_runs_it() {
+        let (mut app, dir) = app_fixture();
+        let manifest = dir.join(".openmax/hooks/done-gate.toml");
+        app.running = true;
+        app.slash("gate cargo test").await;
+        assert!(app.transcript.export_text().contains("finish or cancel the turn before /gate changes the gate"));
+        app.running = false;
+        // A session left by /new while its turn still winds down holds it too.
+        app.left_running = vec!["left".into()];
+        app.core.running.lock().unwrap().insert("left".into());
+        app.transcript = Transcript::new();
+        app.slash("gate cargo test").await;
+        assert!(app.transcript.export_text().contains("finish or cancel the turn before /gate changes the gate"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!manifest.exists(), "/gate wrote a gate while a left turn ran");
+        app.core.running.lock().unwrap().clear();
+        app.left_running.clear();
+        app.queued = vec!["/gate true".into()];
+        app.flush_queue = true;
+        let event = AgentEvent::Error { message: "unrelated".into() };
+        app.on_core_event(open_max_core::types::AgentEventEnvelope { session_id: "another".into(), event }).await;
+        assert!(app.queued.is_empty() || app.composer.text() == "/gate true", "the entry went out as a prompt or came back");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!manifest.exists(), "a queued entry ran /gate");
+        // While a change is being written no turn starts: the prompt waits
+        // in the queue and a second change waits for the first. Once the
+        // change lands, the prompt goes out.
+        (app.running, app.queued) = (false, Vec::new());
+        app.gate_change = true;
+        app.handle_submit("hello".into()).await.unwrap();
+        assert!(!app.running && app.queued == ["hello"], "a turn started under a /gate change");
+        app.slash("gate npm test").await;
+        assert!(app.transcript.export_text().contains("the last /gate change is still being written"));
+        let generation = app.transcript_gen;
+        app.on_listing(generation, Vec::new());
+        assert!(!app.running && app.queued == ["hello"], "the prompt went out before the change landed");
+        app.on_gate(generation, Vec::new());
+        assert!(!app.gate_change && app.running && app.queued.is_empty(), "the prompt did not go out once the change landed");
+        // A prompt sent while an older one still waits goes behind it.
+        (app.running, app.queued, app.session_id) = (false, vec!["waited".into()], None);
+        app.handle_submit("newer".into()).await.unwrap();
+        assert!(app.running && app.pending_submit.as_deref() == Some("waited"), "the newer prompt ran first");
+        assert_eq!(app.queued, ["newer"]);
         fs::remove_dir_all(dir).unwrap();
     }
 
