@@ -2341,6 +2341,19 @@ impl App {
             self.dirty.mark_chrome();
             return;
         }
+        if !self.running && self.steered == 0 && !self.queued.is_empty() {
+            // Entries still wait from before (typed during a /gate change
+            // whose listing has not reached the loop yet): this one goes
+            // behind them, and the oldest goes out first.
+            self.queued.push(text);
+            return self.send_next_queued();
+        }
+        self.submit_now(text);
+    }
+
+    /// Start a turn with `text`, or steer the running one, with nothing
+    /// waiting ahead of it.
+    fn submit_now(&mut self, text: String) {
         if self.running {
             // A running turn takes the message at its next iteration
             // boundary, where SteerAccepted paints it; until then it waits
@@ -2970,7 +2983,7 @@ impl App {
             // Still waiting on a /gate change, which sends it when it lands.
             return self.queued.insert(0, text);
         }
-        self.submit_prompt(text.clone());
+        self.submit_now(text.clone());
         if !self.running {
             // The turn never started (server stopped, start error):
             // nothing will drain the rest, so hand it all back.
@@ -7864,6 +7877,12 @@ mod tests {
         app.gate_change.store(false, std::sync::atomic::Ordering::Release);
         app.on_listing(generation, Vec::new());
         assert!(app.running && app.queued.is_empty(), "the prompt did not go out once the change landed");
+        // A prompt sent after the change landed but before its listing
+        // reached the loop goes behind the one that waited, not ahead of it.
+        (app.running, app.queued, app.session_id) = (false, vec!["waited".into()], None);
+        app.handle_submit("newer".into()).await.unwrap();
+        assert!(app.running && app.pending_submit.as_deref() == Some("waited"), "the newer prompt ran first");
+        assert_eq!(app.queued, ["newer"]);
         fs::remove_dir_all(dir).unwrap();
     }
 
