@@ -299,6 +299,7 @@ pub(super) async fn read(
                 Some("error") => return (result, failed(&event)),
                 Some("response.incomplete") if event["response"]["incomplete_details"]["reason"] == "max_output_tokens" => {
                     let items = if event["response"]["output"].as_array().is_none_or(Vec::is_empty) { output.into_values().collect() } else { event["response"]["output"].take() };
+                    drain(stream);
                     return (cut(items, result.content, &event["response"]["usage"]), None);
                 }
                 Some("response.incomplete") => return (result, None),

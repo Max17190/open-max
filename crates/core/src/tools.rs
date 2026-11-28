@@ -2119,19 +2119,28 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
                     }
                 };
                 let rel = rel_display(root, path);
-                let mut file_hits = Vec::new();
+                let (mut file_found, mut file_hits) = (0usize, Vec::new());
                 for (i, line) in text.lines().enumerate() {
                     if re.is_match(line) {
-                        file_hits.push((rel.clone(), i + 1, truncate(line.trim(), 300)));
+                        file_found += 1;
+                        if file_hits.len() < MAX_GREP_RESULTS {
+                            file_hits.push((rel.clone(), i + 1, truncate(line.trim(), 300)));
+                        }
                     }
                 }
-                if !file_hits.is_empty() {
-                    found.fetch_add(file_hits.len(), Ordering::Relaxed);
+                if file_found > 0 {
+                    found.fetch_add(file_found, Ordering::Relaxed);
                     files.fetch_add(1, Ordering::Relaxed);
                     let mut kept = hits.lock().unwrap();
-                    kept.extend(file_hits);
-                    while kept.len() > MAX_GREP_RESULTS {
-                        kept.pop_last();
+                    for hit in file_hits {
+                        if kept.len() < MAX_GREP_RESULTS {
+                            kept.insert(hit);
+                        } else if kept.last().is_some_and(|last| &hit < last) {
+                            kept.pop_last();
+                            kept.insert(hit);
+                        } else {
+                            break;
+                        }
                     }
                 }
                 WalkState::Continue

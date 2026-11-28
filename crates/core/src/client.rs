@@ -1121,6 +1121,7 @@ async fn read_sse(
     // finish_reason chunk)? Without one, the stream ending means the
     // connection dropped mid-answer, not that the model finished.
     let mut saw_terminator = false;
+    let mut finish_deadline: Option<tokio::time::Instant> = None;
     let mut usage: Option<Usage> = None;
     // Byte buffer: chunks can split multi-byte UTF-8 sequences, so text
     // conversion only happens on complete lines ('\n' is never part of a
@@ -1135,8 +1136,15 @@ async fn read_sse(
 
     'outer: loop {
         // After the finish only the usage chunk and `[DONE]` are due, and they come at once: a server that sends
-        // neither and holds the stream open is waited for briefly, not for the whole idle interval.
-        let wait = if saw_terminator { idle.min(FINISHED_GRACE) } else { idle };
+        // neither and holds the stream open (even with keepalive comments) is waited for until one fixed deadline,
+        // not for the whole idle interval.
+        let wait = match finish_deadline {
+            Some(deadline) => match deadline.checked_duration_since(tokio::time::Instant::now()) {
+                Some(left) if !left.is_zero() => left,
+                _ => break,
+            },
+            None => idle,
+        };
         let next = tokio::select! {
             c = tokio::time::timeout(wait, stream.next()) => c,
             _ = cancelled.cancelled() => {
@@ -1260,6 +1268,7 @@ async fn read_sse(
                 // Servers that end a stream here and never send `[DONE]`
                 // are still finished: this is a terminator too.
                 saw_terminator = true;
+                finish_deadline.get_or_insert_with(|| tokio::time::Instant::now() + idle.min(FINISHED_GRACE));
                 finish_reason = reason;
             }
             let delta = choice.delta.unwrap_or_default();
@@ -3891,6 +3900,36 @@ pub(crate) mod tests {
             assert_eq!(result.usage.map(|u| (u.prompt_tokens, u.completion_tokens)), usage);
             assert!(started.elapsed() < std::time::Duration::from_secs(within), "{:?}", started.elapsed());
         }
+        // SSE keepalive comments arriving after finish must not restart the grace deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio::io::BufReader::new(socket);
+            let (mut line, mut length) = (String::new(), 0);
+            while socket.read_line(&mut line).await.unwrap_or(0) > 0 && line != "\r\n" {
+                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = n.trim().parse().unwrap(); }
+                line.clear();
+            }
+            socket.read_exact(&mut vec![0; length]).await.unwrap();
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(format!("{head}{finish}").as_bytes()).await;
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                if socket.write_all(b": ping\n\n").await.is_err() { break; }
+            }
+        });
+        let mut client = ChatClient::new(url, Some("key".into()), "fixture".into(), None, 64);
+        client.idle_timeout = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.stream_chat(&[ChatMessage::user("go")], 64, "[]", Arc::new(crate::state::CancelToken::default()), |_| {}),
+        ).await.expect("keepalive comments after finish must not hold the stream open").unwrap();
+        server.abort();
+        assert_eq!((result.content.as_str(), result.finish_reason.as_str()), ("all of it", "stop"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     /// Any byte is activity, an SSE comment too: a server that keeps its
@@ -5046,6 +5085,7 @@ pub(crate) mod tests {
         let replies = [
             (WireApi::ChatCompletions, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
             (WireApi::Responses, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"),
+            (WireApi::Responses, "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"),
             (WireApi::Anthropic, concat!(
                 "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n",
                 "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n",
