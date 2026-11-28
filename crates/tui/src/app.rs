@@ -335,6 +335,9 @@ pub struct App {
     file_index_pending: bool,
     /// Prompt templates as (name, description); rescanned when a fresh `/` opens.
     templates: Vec<(String, String)>,
+    /// Whether the session replayed was compacted, so edits from before
+    /// the compaction reach no tool block and /diff cannot list them.
+    compacted_before_replay: bool,
     /// Messages typed while the agent works, shown in the strip above the
     /// composer. The oldest `steered` were sent to the running turn and leave
     /// on its SteerAccepted; the rest (typed during a compaction, or after
@@ -778,6 +781,7 @@ impl App {
             file_index: None,
             file_index_pending: false,
             templates: Vec::new(),
+            compacted_before_replay: false,
             queued: Vec::new(),
             steered: 0,
             flush_queue: false,
@@ -878,6 +882,10 @@ impl App {
         // fresh start.
         let has_manifest = sessions::load_manifest(&self.core, session_id).is_some();
         self.resumed_awaiting_hydration = has_manifest;
+        // A compaction moves the messages it drops into the archive, which
+        // replay does not draw.
+        self.compacted_before_replay =
+            std::path::Path::new(&sessions::archive_display(&self.core, session_id)).exists();
         if let Err(e) = sessions::attach(&self.core, session_id) {
             self.error(&e);
             return;
@@ -954,7 +962,10 @@ impl App {
                                 call.function.name.as_str(),
                                 "write_file" | "edit_file"
                             );
-                            let path = args["path"].as_str().unwrap_or("");
+                            // The result names the path as the live diff
+                            // does, relative to the project; the argument
+                            // may have spelled it another way.
+                            let path = changed_path(content).unwrap_or_else(|| args["path"].as_str().unwrap_or(""));
                             let badge = if !mutating || path.is_empty() {
                                 None
                             } else {
@@ -1040,6 +1051,7 @@ impl App {
         self.pending_approval = None;
         self.model_picker = None;
         self.pending_diffs.clear();
+        self.compacted_before_replay = false;
         self.tool_meta.clear();
         self.last_tool_output = None;
         self.last_assistant_response = None;
@@ -2110,10 +2122,7 @@ impl App {
                 if kind == completion::Kind::Slash && self.completion.is_none() {
                     // A fresh `/` rescans templates (two small dirs) so one
                     // the agent just wrote shows up immediately.
-                    self.templates = open_max_core::templates::discover(&self.core.data_dir, &self.project)
-                        .into_iter()
-                        .map(|t| (t.name, t.description))
-                        .collect();
+                    self.rescan_templates();
                 }
                 let (items, total_matches) = match kind {
                     completion::Kind::Slash => {
@@ -2367,6 +2376,23 @@ impl App {
                 // changed them, so its matches and previews must rebuild.
                 self.refilter_scroll_search_live();
                 self.error(&e);
+            }
+        }
+    }
+
+    /// The prompt templates completion and /help list. Discovery keeps the
+    /// first fifty by name, and a template named diff past them still runs
+    /// in place of /diff, so it is added whenever dispatch would find it.
+    fn rescan_templates(&mut self) {
+        let (data, project) = (&self.core.data_dir, &self.project);
+        self.templates = open_max_core::templates::discover(data, project)
+            .into_iter()
+            .map(|t| (t.name, t.description))
+            .collect();
+        for name in completion::TEMPLATE_WINS {
+            let listed = self.templates.iter().any(|(template, _)| template == name);
+            if !listed && open_max_core::templates::expand_slash_line(data, project, &format!("/{name}")).is_some() {
+                self.templates.push((name.to_string(), String::new()));
             }
         }
     }
@@ -2761,8 +2787,8 @@ impl App {
             }
             "diff" => {
                 let block = match raw_rest.trim() {
-                    "" => diff_ui::summary(self.transcript.file_changes()),
-                    "all" => diff_ui::combined(self.transcript.file_changes()),
+                    "" => diff_ui::summary(self.transcript.file_changes(), self.compacted_before_replay),
+                    "all" => diff_ui::combined(self.transcript.file_changes(), self.compacted_before_replay),
                     _ => return self.note("usage: /diff lists the changed files · /diff all opens the combined diff"),
                 };
                 self.transcript.push(block);
@@ -4451,6 +4477,14 @@ fn clip(s: &str, max: usize) -> String {
 /// Replay shows a short tool-output preview, not the full persisted payload.
 /// (+N −N) change counts from a persisted write/edit result, so a replayed
 /// card keeps its badge even though Diff events are not persisted.
+/// The path a write or edit result names: `wrote <path> (+N −M)`, in the
+/// form the live diff event carries.
+fn changed_path(content: &str) -> Option<&str> {
+    let line = content.lines().next()?;
+    let rest = line.strip_prefix("wrote ").or_else(|| line.strip_prefix("edited "))?;
+    Some(&rest[..rest.rfind(" (+")?]).filter(|path| !path.is_empty())
+}
+
 fn parse_change_counts(content: &str) -> Option<(usize, usize)> {
     // The counts close the first line; an edit's excerpt of the changed
     // lines follows it and may hold text of the same shape.
@@ -7476,7 +7510,8 @@ mod tests {
                     kind: "function".into(),
                     function: open_max_core::types::ToolCallFunction {
                         name: "write_file".into(),
-                        arguments: "{\"path\":\"notes.md\",\"content\":\"x\"}".into(),
+                        // Spelled another way than the result names it.
+                        arguments: "{\"path\":\"./notes.md\",\"content\":\"x\"}".into(),
                     },
                     extra_content: None,
                 }]),
@@ -7511,6 +7546,8 @@ mod tests {
         open_max_core::sessions::save_messages(&app.core, &meta.id, &messages, &mut persisted, false);
         // An earlier sitting ended after the first two messages.
         open_max_core::sessions::record_resume_point(&app.core, &meta.id, 2);
+        // A compaction archived earlier messages, which replay does not draw.
+        fs::write(open_max_core::sessions::archive_display(&app.core, &meta.id), "").unwrap();
 
         app.replay(&meta.id);
         let text = buffer_text(&render_app(&mut app, 100, 30));
@@ -7522,8 +7559,19 @@ mod tests {
         assert!(text.contains("• resumed"), "{text}");
         // /diff lists it from the counts the result carried, and says the
         // diff itself did not survive the resume.
+        // It is listed by the path the result names, as a live edit of the
+        // same file would be, and the edits the compaction dropped are
+        // named as missing.
         app.slash("diff").await;
-        assert!(app.transcript.export_text().contains("+3 −0  notes.md"), "{}", app.transcript.export_text());
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("+3 −0  notes.md") && !shown.contains("./notes.md"), "{shown}");
+        assert!(shown.contains("edits from before this session's compaction are not listed"), "{shown}");
+        app.on_agent_event(AgentEvent::ToolStart { call_id: "c2".into(), name: "edit_file".into(), args: serde_json::json!({"path": "./notes.md"}) });
+        app.on_agent_event(AgentEvent::Diff { call_id: "c2".into(), path: "notes.md".into(), diff: "+y\n".into(), added: 1, removed: 0 });
+        app.on_agent_event(AgentEvent::ToolEnd { call_id: "c2".into(), ok: true, output: "edited notes.md (+1 −0)".into(), duration_ms: None });
+        app.slash("diff").await;
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("+4 −0  notes.md (2 changes)") && shown.contains("1 file, +4 −0"), "{shown}");
         app.slash("diff all").await;
         assert!(app.transcript.export_text().contains("notes.md: +3 −0, diff not kept across a resume"));
         fs::remove_dir_all(dir).unwrap();

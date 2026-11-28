@@ -125,7 +125,7 @@ pub const COMMANDS: &[CommandSpec] = &[
 /// Built-ins a prompt template of the same name takes over. /diff pointed to
 /// git diff before it was a command, and a template named diff ran in its
 /// place then, so it still does.
-const TEMPLATE_WINS: &[&str] = &["diff"];
+pub const TEMPLATE_WINS: &[&str] = &["diff"];
 
 /// Whether built-in `name` runs ahead of a prompt template with that name.
 pub fn shadows_templates(name: &str) -> bool {

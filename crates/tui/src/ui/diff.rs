@@ -44,10 +44,13 @@ fn dim(text: String) -> Line<'static> {
 
 /// The list `/diff` prints: each file with its added and removed lines,
 /// counts first so a long path wraps alone at a narrow width.
-pub fn summary<'a>(changes: impl Iterator<Item = (&'a FileChange, Option<&'a str>)>) -> Vec<Line<'static>> {
+pub fn summary<'a>(
+    changes: impl Iterator<Item = (&'a FileChange, Option<&'a str>)>,
+    compacted: bool,
+) -> Vec<Line<'static>> {
     let files = by_file(changes);
     if files.is_empty() {
-        return vec![dim(format!("no file changes in this session yet. /diff lists {LIMIT}"))];
+        return none_yet(compacted);
     }
     let added_width = files.iter().map(|f| f.added.to_string().len()).max().unwrap_or(1);
     let removed_width = files.iter().map(|f| f.removed.to_string().len()).max().unwrap_or(1);
@@ -70,15 +73,33 @@ pub fn summary<'a>(changes: impl Iterator<Item = (&'a FileChange, Option<&'a str
     let noun = if files.len() == 1 { "file" } else { "files" };
     lines.push(dim(format!("  {} {noun}, +{added} −{removed} · /diff all opens the combined diff", files.len())));
     lines.push(dim(format!("  {LIMIT}")));
+    if compacted {
+        lines.push(dim(format!("  {COMPACTED}")));
+    }
+    lines
+}
+
+/// Said when the session was compacted before it was resumed: the edits
+/// the compaction dropped left no tool block to read.
+const COMPACTED: &str = "edits from before this session's compaction are not listed";
+
+fn none_yet(compacted: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![dim(format!("no file changes in this session yet. /diff lists {LIMIT}"))];
+    if compacted {
+        lines = vec![dim(format!("no file changes listed. /diff lists {LIMIT}")), dim(COMPACTED.to_string())];
+    }
     lines
 }
 
 /// The combined diff `/diff all` prints: each file's diffs in the order the
 /// tools made them, unindented so a copy of the block is the diff itself.
-pub fn combined<'a>(changes: impl Iterator<Item = (&'a FileChange, Option<&'a str>)>) -> Vec<Line<'static>> {
+pub fn combined<'a>(
+    changes: impl Iterator<Item = (&'a FileChange, Option<&'a str>)>,
+    compacted: bool,
+) -> Vec<Line<'static>> {
     let files = by_file(changes);
     if files.is_empty() {
-        return vec![dim(format!("no file changes in this session yet. /diff lists {LIMIT}"))];
+        return none_yet(compacted);
     }
     let mut lines = Vec::new();
     for file in &files {
@@ -93,6 +114,9 @@ pub fn combined<'a>(changes: impl Iterator<Item = (&'a FileChange, Option<&'a st
         }
     }
     lines.push(dim(format!("/diff lists {LIMIT}")));
+    if compacted {
+        lines.push(dim(COMPACTED.to_string()));
+    }
     lines
 }
 

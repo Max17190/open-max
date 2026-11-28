@@ -1605,3 +1605,23 @@ async fn a_template_named_diff_runs_instead_of_the_built_in() {
     assert!(app.transcript.export_text().contains("Review the staged diff"), "the template expands into a prompt");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Discovery lists the first fifty templates by name, and a template named
+/// diff past them still runs: completion offers it, not the built-in.
+#[tokio::test]
+async fn a_template_named_diff_past_the_discovery_cap_is_still_offered() {
+    let (mut app, dir) = app_fixture();
+    let prompts = dir.join(".agents").join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    for i in 0..open_max_core::templates::MAX_TEMPLATES {
+        std::fs::write(prompts.join(format!("a{i:02}.md")), "filler").unwrap();
+    }
+    std::fs::write(prompts.join("diff.md"), "Review the staged diff").unwrap();
+    app.rescan_templates();
+    let items = crate::completion::slash_items("dif", &app.templates);
+    assert_eq!(items.len(), 1);
+    assert!(items[0].detail.contains("template"), "{}", items[0].detail);
+    app.handle_submit("/diff".into()).await.unwrap();
+    assert!(app.transcript.export_text().contains("Review the staged diff"));
+    let _ = std::fs::remove_dir_all(dir);
+}
