@@ -620,10 +620,75 @@ pub fn image_size(b: &[u8]) -> Option<(u32, u32)> {
     Some(size).filter(|&(w, h)| w > 0 && h > 0)
 }
 
-/// What one call may show: this many bytes of images in all, counted before
-/// base64, and at most `MAX_IMAGES` of them, the first in order.
+/// Per-call image budget (5 MiB raw, 8 images) after downscaling to `MAX_IMAGE_DIM`.
 const IMAGE_BUDGET: u64 = 5 * 1024 * 1024;
 const MAX_IMAGES: usize = 8;
+const MAX_IMAGE_DIM: u32 = 1568;
+const MAX_IMAGE_FILE_BYTES: u64 = 25 * 1024 * 1024;
+
+#[cold]
+#[inline(never)]
+fn downscale_image(mime: &str, bytes: &[u8], max: u32) -> Option<(Vec<u8>, [u32; 4])> {
+    use image::{codecs::*, imageops::*, ColorType as C, ImageEncoder as _, ImageFormat as Fmt};
+    let fmt = match mime {
+        "image/png" if max > MAX_IMAGE_DIM => Fmt::Png,
+        "image/jpeg" if max > MAX_IMAGE_DIM => Fmt::Jpeg,
+        _ => return None,
+    };
+    let img = image::load_from_memory_with_format(bytes, fmt).ok()?;
+    let (w, h) = (img.width(), img.height());
+    (w > 0 && h > 0 && w.max(h) > MAX_IMAGE_DIM).then_some(())?;
+    let l = u64::from(w.max(h));
+    let has_alpha = fmt == Fmt::Png && img.color().has_alpha();
+    let fit = |n| ((u64::from(n) * u64::from(MAX_IMAGE_DIM) + l / 2) / l).max(1) as u32;
+    let mut b = resize(&img.into_rgba8(), fit(w), fit(h), Triangle);
+    let mut orient = 1u32;
+    if fmt == Fmt::Jpeg {
+        let (mut p, mut t) = (2, &[][..]);
+        while let Some(&[0xFF, m, a, b0]) = bytes.get(p..p + 4) {
+            let n = usize::from(u16::from_be_bytes([a, b0]));
+            match m {
+                0xFF => p += 1,
+                m if matches!(m, 0xD9 | 0xDA) || n < 2 => break,
+                0xE1 if n >= 8 && bytes.get(p + 4..p + 10) == Some(b"Exif\0\0") => {
+                    t = &bytes[p + 10..(p + 2 + n).min(bytes.len())];
+                    break;
+                }
+                _ => p += 2 + n,
+            }
+        }
+        let le = t.starts_with(b"II");
+        let u = |o, k| -> Option<u32> {
+            let at = |i| t.get(o + if le { k - 1 - i } else { i }).copied();
+            (0..k).try_fold(0, |v, i| Some(v << 8 | u32::from(at(i)?)))
+        };
+        let ok = (le || t.starts_with(b"MM")) && u(2, 2) == Some(42);
+        let ifd = ok.then(|| u(4, 4)).flatten().unwrap_or(0) as usize;
+        let n = (ifd >= 8 && ifd < t.len()).then(|| u(ifd, 2)).flatten().unwrap_or(0) as usize;
+        orient = (0..n.min(t.len() / 12))
+            .map(|k| ifd + 2 + k * 12)
+            .find_map(|e| u(e + 8, 2).filter(|v| u(e, 2) == Some(0x0112) && (1..=8).contains(v)))
+            .unwrap_or(1);
+        b = match orient {
+            3 | 4 => rotate180(&b),
+            5 | 6 => rotate90(&b),
+            7 | 8 => rotate270(&b),
+            _ => b,
+        };
+        if matches!(orient, 2 | 4 | 5 | 7) {
+            flip_horizontal_in_place(&mut b);
+        }
+    }
+    let ((bw, bh), mut out) = (b.dimensions(), Vec::new());
+    let rgb = || b.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>();
+    let res = match (fmt, has_alpha) {
+        (Fmt::Png, true) => png::PngEncoder::new(&mut out).write_image(&b, bw, bh, C::Rgba8),
+        (Fmt::Png, false) => png::PngEncoder::new(&mut out).write_image(&rgb(), bw, bh, C::Rgb8),
+        _ => jpeg::JpegEncoder::new_with_quality(&mut out, 85).write_image(&rgb(), bw, bh, C::Rgb8),
+    };
+    let (ow, oh) = if orient >= 5 { (h, w) } else { (w, h) };
+    res.ok().map(|()| (out, [bw, bh, ow, oh]))
+}
 
 /// The variable naming the folder an external tool may put images in, set
 /// only when `image_input` is on. Each file there, in name order, reaches the
@@ -632,36 +697,40 @@ const MAX_IMAGES: usize = 8;
 /// extra round. The MCP bridge writes a server's image results there.
 pub const IMAGE_DIR_ENV: &str = "OPENMAX_IMAGE_DIR";
 
-/// The one step every image takes before it enters the history: read_file
-/// and an external tool's folder both come here. Each file, in the order
-/// given, is sniffed, sized from its header and held to the call's budget;
-/// one left out gets a line saying why. A resize to fit the model would go
-/// between the size and the budget, so the budget counts what is sent.
-pub(crate) fn prepare_images(files: &[(String, PathBuf)]) -> (Vec<crate::types::Image>, Vec<String>) {
+/// Sniff, downscale oversized PNG/JPEG images to `MAX_IMAGE_DIM`, and hold to 5 MiB.
+#[cold]
+#[inline(never)]
+pub(crate) fn prepare_images(files: &[(String, PathBuf)], orig: &mut Option<(u32, u32)>) -> (Vec<crate::types::Image>, Vec<String>) {
     use base64::Engine;
     let (mut images, mut omitted, mut spent) = (Vec::new(), Vec::new(), 0u64);
+    let (cap, over) = (MAX_IMAGE_FILE_BYTES, "over the 25 MiB source limit for an image");
     for (name, path) in files {
-        let len = std::fs::metadata(path).map_or(0, |m| m.len());
+        let mut len = std::fs::metadata(path).map_or(0, |m| m.len());
         let why = if images.len() == MAX_IMAGES {
             format!("one call shows at most {MAX_IMAGES} images")
-        } else if spent + len > IMAGE_BUDGET {
-            format!("over the 5 MiB of images one call shows, {} bytes of it left", IMAGE_BUDGET - spent)
+        } else if len > cap {
+            over.into()
         } else {
-            // Read no more than the budget left, plus a byte to tell a file
-            // that grew since its size was taken.
             let mut bytes = Vec::new();
-            let left = IMAGE_BUDGET - spent;
-            match std::fs::File::open(path).and_then(|file| std::io::Read::read_to_end(&mut std::io::Read::take(file, left + 1), &mut bytes)) {
+            match std::fs::File::open(path).and_then(|f| std::io::Read::read_to_end(&mut std::io::Read::take(f, cap + 1), &mut bytes)) {
                 Err(e) => format!("unreadable: {e}"),
-                Ok(_) if bytes.len() as u64 > left => format!("over the 5 MiB of images one call shows, {left} bytes of it left"),
+                Ok(_) if bytes.len() as u64 > cap => over.into(),
                 Ok(_) => match (image_mime(&bytes), image_size(&bytes)) {
                     (None, _) => "not a PNG, JPEG, GIF or WebP image".into(),
                     (Some(mime), None) => format!("{mime} whose header gives no size"),
-                    (Some(mime), Some((width, height))) => {
-                        spent += bytes.len() as u64;
-                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        images.push(crate::types::Image { mime: mime.into(), data, width, height });
-                        continue;
+                    (Some(mime), Some((mut w, mut h))) => {
+                        if let Some((b, [nw, nh, ow, oh])) = downscale_image(mime, &bytes, w.max(h)) {
+                            (len, bytes, w, h, *orig) = (b.len() as u64, b, nw, nh, Some((ow, oh)));
+                        }
+                        let left = IMAGE_BUDGET - spent;
+                        if bytes.len() as u64 > left {
+                            format!("over the 5 MiB of images one call shows, {left} bytes of it left")
+                        } else {
+                            spent += bytes.len() as u64;
+                            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            images.push(crate::types::Image { mime: mime.into(), data, width: w, height: h });
+                            continue;
+                        }
                     }
                 },
             }
@@ -678,7 +747,7 @@ pub(crate) fn take_tool_images(dir: &Path) -> (Vec<crate::types::Image>, Vec<Str
     let mut entries: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.path())).collect();
     entries.sort();
     let (files, links): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, p)| p.symlink_metadata().is_ok_and(|m| m.is_file()));
-    let (images, mut omitted) = prepare_images(&files);
+    let (images, mut omitted) = prepare_images(&files, &mut None);
     omitted.extend(links.iter().map(|(name, _)| format!("[image {name} not shown: not a regular file]")));
     let _ = std::fs::remove_dir_all(dir);
     (images, omitted)
@@ -716,10 +785,16 @@ fn read_file(root: &Path, args: &Value, caps: OutputCaps, cancel: &CancelToken) 
         }
         Err(e) => return ToolOutcome::err(e.message(rel)),
     };
-    let mut head = [0u8; 12];
+    let (mut orig, mut head) = (None, [0u8; 12]);
     if caps.images && std::fs::File::open(&path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && image_mime(&head).is_some() {
-        let (images, omitted) = prepare_images(&[(rel.to_string(), path)]);
-        let output = images.first().map_or_else(|| omitted.concat(), |i| format!("{rel}: {}, {}x{}, {} bytes, shown to you as an image", i.mime, i.width, i.height, meta.len()));
+        let (images, omitted) = prepare_images(&[(rel.to_string(), path)], &mut orig);
+        let output = if let Some(i) = images.first() {
+            let from = orig.map_or_else(String::new, |(w, h)| format!(" (resized from {w}x{h})"));
+            let n = i.data.len() / 4 * 3 - i.data.bytes().rev().take_while(|&b| b == b'=').count();
+            format!("{rel}: {}, {}x{}{from}, {n} bytes, shown to you as an image", i.mime, i.width, i.height)
+        } else {
+            omitted.concat()
+        };
         return ToolOutcome { ok: !images.is_empty(), output, images, ..ToolOutcome::default() };
     }
     // The cap keeps a whole-file read of a huge file out of memory. A
@@ -4922,16 +4997,242 @@ mod tests {
             file("d.txt", b"not an image".to_vec()),
             file("e.png", png(10, 10, mib - 100)),
         ];
-        let (images, omitted) = prepare_images(&files);
+        let (images, omitted) = prepare_images(&files, &mut None);
         assert_eq!(images.len(), 3, "a, b and e fit; c would pass 5 MiB");
         assert_eq!(omitted, [
             format!("[image c.png ({} bytes) not shown: over the 5 MiB of images one call shows, {mib} bytes of it left]", 2 * mib),
             "[image d.txt (12 bytes) not shown: not a PNG, JPEG, GIF or WebP image]".to_string(),
         ]);
         let many: Vec<_> = (0..10).map(|i| file(&format!("{i}.png"), png(10 + i, 10, 100))).collect();
-        let (images, omitted) = prepare_images(&many);
+        let (images, omitted) = prepare_images(&many, &mut None);
         assert_eq!(images.iter().map(|i| i.width).collect::<Vec<_>>(), (10..18).collect::<Vec<_>>(), "the first eight in order");
         assert_eq!(omitted, ["[image 8.png (100 bytes) not shown: one call shows at most 8 images]", "[image 9.png (100 bytes) not shown: one call shows at most 8 images]"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn synthetic_rgb(w: u32, h: u32) -> image::RgbImage {
+        image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([
+                ((x * 5 + y * 3) % 256) as u8,
+                ((x * 3 + y * 7 + (x ^ y) % 19) % 256) as u8,
+                ((x + y * 11 + (x & y) % 23) % 256) as u8,
+            ])
+        })
+    }
+
+    fn encode_png_rgb(img: &image::RgbImage) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(img, img.width(), img.height(), image::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    fn encode_jpeg_rgb(img: &image::RgbImage, quality: u8) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .write_image(img, img.width(), img.height(), image::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    /// Images within MAX_IMAGE_DIM pass through byte-for-byte untouched without
+    /// re-encoding, and read_file reports their dimensions without a resize note.
+    #[test]
+    fn small_png_and_jpeg_pass_through_byte_for_byte() {
+        use base64::Engine;
+        let root = temp_project();
+        let small = synthetic_rgb(400, 300);
+        let small_png = encode_png_rgb(&small);
+        let small_jpg = encode_jpeg_rgb(&small, 90);
+        std::fs::write(root.join("small.png"), &small_png).unwrap();
+        std::fs::write(root.join("small.jpg"), &small_jpg).unwrap();
+        let on = OutputCaps { images: true, ..OutputCaps::default() };
+
+        for (name, mime, raw) in [
+            ("small.png", "image/png", &small_png),
+            ("small.jpg", "image/jpeg", &small_jpg),
+        ] {
+            let out = super::read_file(&root, &json!({"path": name}), on, &CancelToken::default());
+            assert!(out.ok, "{name}: {}", out.output);
+            assert_eq!(out.images.len(), 1);
+            assert_eq!((out.images[0].mime.as_str(), out.images[0].width, out.images[0].height), (mime, 400, 300));
+            let decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
+            assert_eq!(decoded, *raw, "{name} should pass through byte-identical");
+            assert_eq!(
+                out.output,
+                format!("{name}: {mime}, 400x300, {} bytes, shown to you as an image", raw.len())
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Oversized PNG and JPEG images downscale proportionally so the longest
+    /// edge is MAX_IMAGE_DIM, shrink in bytes, and report both resized and
+    /// original dimensions in read_file output.
+    #[test]
+    fn large_png_and_jpeg_downscale_to_max_dim_and_report_original_size() {
+        use base64::Engine;
+        let root = temp_project();
+        let large = synthetic_rgb(3200, 2400);
+        let large_png = encode_png_rgb(&large);
+        let large_jpg = encode_jpeg_rgb(&large, 85);
+        std::fs::write(root.join("large.png"), &large_png).unwrap();
+        std::fs::write(root.join("large.jpg"), &large_jpg).unwrap();
+        let on = OutputCaps { images: true, ..OutputCaps::default() };
+
+        for (name, mime, orig_bytes) in [
+            ("large.png", "image/png", &large_png),
+            ("large.jpg", "image/jpeg", &large_jpg),
+        ] {
+            let out = super::read_file(&root, &json!({"path": name}), on, &CancelToken::default());
+            assert!(out.ok, "{name}: {}", out.output);
+            assert_eq!(out.images.len(), 1);
+            assert_eq!((out.images[0].mime.as_str(), out.images[0].width, out.images[0].height), (mime, 1568, 1176));
+            let decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
+            assert_eq!(image_mime(&decoded), Some(mime));
+            assert_eq!(image_size(&decoded), Some((1568, 1176)));
+            assert!(decoded.len() < orig_bytes.len(), "{name}: {} not < {}", decoded.len(), orig_bytes.len());
+            assert_eq!(
+                out.output,
+                format!(
+                    "{name}: {mime}, 1568x1176 (resized from 3200x2400), {} bytes, shown to you as an image",
+                    decoded.len()
+                )
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Portrait images cap their height at MAX_IMAGE_DIM, EXIF orientation 6
+    /// rotates upright while downscaling, RGBA PNGs keep transparency, and
+    /// oversized source files above 5 MiB succeed when their downscaled bytes fit.
+    #[test]
+    fn portrait_alpha_and_over_five_mib_source_images_downscale_cleanly() {
+        use base64::Engine;
+        let root = temp_project();
+        let on = OutputCaps { images: true, ..OutputCaps::default() };
+
+        let portrait = synthetic_rgb(1200, 1600);
+        let portrait_jpg = encode_jpeg_rgb(&portrait, 85);
+        std::fs::write(root.join("portrait.jpg"), &portrait_jpg).unwrap();
+        let out = super::read_file(&root, &json!({"path": "portrait.jpg"}), on, &CancelToken::default());
+        assert!(out.ok, "{}", out.output);
+        assert_eq!((out.images[0].width, out.images[0].height), (1176, 1568));
+        assert!(out.output.contains("1176x1568 (resized from 1200x1600)"), "{}", out.output);
+
+        // EXIF orientation 6 (Rotate90 CW): a raw 1600x1200 image whose top-left
+        // quadrant is red becomes 1176x1568 upright with red in the top-right.
+        let rot_src = image::RgbImage::from_fn(1600, 1200, |x, y| {
+            if x < 800 && y < 600 { image::Rgb([240, 10, 10]) } else { image::Rgb([20, 20, 20]) }
+        });
+        let plain_jpg = encode_jpeg_rgb(&rot_src, 85);
+        let exif: &[u8] = &[
+            b'E', b'x', b'i', b'f', 0, 0,
+            b'I', b'I', 42, 0, 8, 0, 0, 0,
+            1, 0,
+            0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let seg_len = (exif.len() + 2) as u16;
+        let rot_jpg = [&plain_jpg[..2], &[0xFF, 0xE1], &seg_len.to_be_bytes(), exif, &plain_jpg[2..]].concat();
+        std::fs::write(root.join("rotated.jpg"), &rot_jpg).unwrap();
+        let out = super::read_file(&root, &json!({"path": "rotated.jpg"}), on, &CancelToken::default());
+        assert!(out.ok, "{}", out.output);
+        assert_eq!((out.images[0].width, out.images[0].height), (1176, 1568));
+        assert!(out.output.contains("1176x1568 (resized from 1200x1600)"), "{}", out.output);
+        let rot_decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
+        let loaded_rot = image::load_from_memory(&rot_decoded).unwrap().into_rgb8();
+        let top_right = loaded_rot.get_pixel(1000, 100);
+        let top_left = loaded_rot.get_pixel(100, 100);
+        assert!(top_right[0] > 200 && top_right[1] < 40, "top-right should be red: {top_right:?}");
+        assert!(top_left[0] < 60, "top-left should stay dark: {top_left:?}");
+
+        let rgba = image::RgbaImage::from_fn(1600, 1200, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 180])
+        });
+        let mut alpha_png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut alpha_png),
+            &rgba,
+            1600,
+            1200,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+        std::fs::write(root.join("alpha.png"), &alpha_png).unwrap();
+        let out = super::read_file(&root, &json!({"path": "alpha.png"}), on, &CancelToken::default());
+        assert!(out.ok, "{}", out.output);
+        assert_eq!((out.images[0].mime.as_str(), out.images[0].width, out.images[0].height), ("image/png", 1568, 1176));
+        let decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
+        let loaded = image::load_from_memory(&decoded).unwrap();
+        assert!(loaded.color().has_alpha(), "alpha channel preserved");
+
+        let raw_img = image::RgbImage::from_fn(2400, 1800, |x, y| {
+            let h = x.wrapping_mul(2654435761) ^ y.wrapping_mul(2246822519);
+            image::Rgb([(h >> 16) as u8, (h >> 8) as u8, h as u8])
+        });
+        let over_five_mib = encode_jpeg_rgb(&raw_img, 100);
+        assert!(over_five_mib.len() as u64 > IMAGE_BUDGET, "fixture must exceed 5 MiB wire budget");
+        std::fs::write(root.join("raw.jpg"), &over_five_mib).unwrap();
+        let out = super::read_file(&root, &json!({"path": "raw.jpg"}), on, &CancelToken::default());
+        assert!(out.ok, "{}", out.output);
+        assert_eq!((out.images[0].width, out.images[0].height), (1568, 1176));
+        let sent = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
+        assert!((sent.len() as u64) < IMAGE_BUDGET);
+        assert!(out.output.contains("1568x1176 (resized from 2400x1800)"), "{}", out.output);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Corrupt or un-decodable oversized images never panic: they fall back to
+    /// original bytes if within the 5 MiB call budget, are refused if over it,
+    /// and files past the 25 MiB source limit are refused before reading.
+    #[test]
+    fn corrupt_oversized_images_fall_back_safely_and_source_cap_holds() {
+        use base64::Engine;
+        use std::io::Write;
+        let root = temp_project();
+        let on = OutputCaps { images: true, ..OutputCaps::default() };
+
+        let bad_png = png(3200, 2400, 128);
+        std::fs::write(root.join("bad.png"), &bad_png).unwrap();
+        let out = super::read_file(&root, &json!({"path": "bad.png"}), on, &CancelToken::default());
+        assert!(out.ok, "{}", out.output);
+        assert_eq!((out.images[0].width, out.images[0].height), (3200, 2400));
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap(), bad_png);
+        assert_eq!(out.output, "bad.png: image/png, 3200x2400, 128 bytes, shown to you as an image");
+
+        let bad_jpg = [
+            &[0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xFF, 0xC0, 0, 17, 8][..],
+            &2400u16.to_be_bytes(),
+            &3200u16.to_be_bytes(),
+            &[0u8; 32],
+        ]
+        .concat();
+        std::fs::write(root.join("bad.jpg"), &bad_jpg).unwrap();
+        let out = super::read_file(&root, &json!({"path": "bad.jpg"}), on, &CancelToken::default());
+        assert!(out.ok, "{}", out.output);
+        assert_eq!((out.images[0].width, out.images[0].height), (3200, 2400));
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap(), bad_jpg);
+        assert!(!out.output.contains("resized from"), "{}", out.output);
+
+        let bad_huge = png(3200, 2400, 5 * 1024 * 1024 + 1);
+        std::fs::write(root.join("bad_huge.png"), &bad_huge).unwrap();
+        let out = super::read_file(&root, &json!({"path": "bad_huge.png"}), on, &CancelToken::default());
+        assert_eq!((out.ok, out.images.len()), (false, 0));
+        assert!(out.output.contains("over the 5 MiB of images one call shows"), "{}", out.output);
+
+        let too_big_path = root.join("too_big.png");
+        {
+            let mut f = std::fs::File::create(&too_big_path).unwrap();
+            f.write_all(&png(3200, 2400, 32)).unwrap();
+            f.set_len(MAX_IMAGE_FILE_BYTES + 1).unwrap();
+        }
+        let out = super::read_file(&root, &json!({"path": "too_big.png"}), on, &CancelToken::default());
+        assert_eq!((out.ok, out.images.len()), (false, 0));
+        assert!(out.output.contains("over the 25 MiB source limit for an image"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
