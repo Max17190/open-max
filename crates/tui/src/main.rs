@@ -475,16 +475,17 @@ fn approve_command(path: &std::path::Path) -> String {
 /// One approval act on a capability file: `bytes`, the manifest as read, and
 /// the code it names, recorded together. `openmax --approve` and `/gate` both
 /// approve through here, so the terminal UI grants exactly what the command
-/// does. `vouched_code`, when given, is every hash the code must have: the
-/// caller wrote that code itself, and anything else on disk is refused, not
-/// approved. `session` records the act as one a person took in that session.
+/// does. `vouched_code`, when given, is a file the code must include with
+/// that hash: the caller wrote it itself, and other bytes there are refused,
+/// not approved. `session` records the act as one a person took in that
+/// session.
 /// Returns the lines that tell the person what was approved.
 fn approve_file(
     data_dir: &std::path::Path,
     project: &std::path::Path,
     file: &std::path::Path,
     bytes: &[u8],
-    vouched_code: Option<&[String]>,
+    vouched_code: Option<(&std::path::Path, &str)>,
     session: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let path = file.display();
@@ -509,8 +510,11 @@ fn approve_file(
         };
         shas.push(code_sha.clone());
     }
-    if vouched_code.is_some_and(|vouched| vouched != &shas[1..]) {
-        return Err(format!("the code {path} runs is not the code just written; nothing was approved"));
+    if let Some((vouched, vouched_sha)) = vouched_code {
+        let same = |at: &std::path::Path| at == vouched || at.canonicalize().ok() == vouched.canonicalize().ok();
+        if !code.iter().any(|entry| same(&entry.path) && entry.sha256.as_deref() == Some(vouched_sha)) {
+            return Err(format!("{} is not the file just written; nothing was approved", vouched.display()));
+        }
     }
     match session {
         Some(id) => open_max_core::ledger::approve_capability_in_session(data_dir, project, file, &shas, id),

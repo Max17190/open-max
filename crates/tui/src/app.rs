@@ -341,6 +341,10 @@ pub struct App {
     /// How the completion gate /gate installs judged this session's latest
     /// end of a turn, for /gate to show; None until it judged one.
     gate_verdict: Option<&'static str>,
+    /// Set while a /gate change is being written on a blocking thread: no
+    /// turn starts and no other change begins until it is on disk, so the
+    /// next turn is judged by the gate the person just set.
+    gate_change: Arc<std::sync::atomic::AtomicBool>,
     /// Messages typed while the agent works, shown in the strip above the
     /// composer. The oldest `steered` were sent to the running turn and leave
     /// on its SteerAccepted; the rest (typed during a compaction, or after
@@ -786,6 +790,7 @@ impl App {
             templates: Vec::new(),
             compacted_before_replay: false,
             gate_verdict: None,
+            gate_change: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queued: Vec::new(),
             steered: 0,
             flush_queue: false,
@@ -2316,11 +2321,23 @@ impl App {
         } else {
             text
         };
+        if self.gate_change_pending() {
+            self.composer.load(&text);
+        }
         self.submit_prompt(text);
         Ok(())
     }
 
+    /// Whether a /gate change is still being written while no turn runs, so
+    /// a turn started now could miss the gate the person just set.
+    fn gate_change_pending(&self) -> bool {
+        !self.running && self.gate_change.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn submit_prompt(&mut self, text: String) {
+        if self.gate_change_pending() {
+            return self.note("a /gate change is still being written, so no turn starts until it is; send the prompt again in a moment");
+        }
         if self.running {
             // A running turn takes the message at its next iteration
             // boundary, where SteerAccepted paints it; until then it waits
@@ -2374,6 +2391,8 @@ impl App {
         ) {
             Ok(()) => {
                 self.running = true;
+                // The verdict /gate shows is the latest turn's alone.
+                self.gate_verdict = None;
                 self.set_presence(Presence::Working);
                 self.pending_submit = Some(text);
                 self.turn_started = Some(Instant::now());
@@ -2821,6 +2840,14 @@ impl App {
                 if self.running && !arg.is_empty() {
                     return self.note("finish or cancel the turn before /gate changes the gate; /gate alone shows it");
                 }
+                let changing = self.gate_change.clone();
+                if !arg.is_empty() {
+                    if changing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        return self.note("the last /gate change is still being written; run /gate again in a moment");
+                    }
+                    // A verdict on the gate this replaces says nothing of the new one.
+                    self.gate_verdict = None;
+                }
                 let ctx = crate::gate::Context {
                     project: self.project.clone(),
                     data_dir: self.core.data_dir.clone(),
@@ -2831,7 +2858,9 @@ impl App {
                 };
                 let arg = arg.to_string();
                 self.spawn_listing(async move {
-                    tokio::task::spawn_blocking(move || crate::gate::run(&ctx, &arg)).await.unwrap_or_default()
+                    let lines = tokio::task::spawn_blocking(move || crate::gate::run(&ctx, &arg)).await.unwrap_or_default();
+                    changing.store(false, std::sync::atomic::Ordering::Release);
+                    lines
                 });
             }
             "quit" | "exit" => self.should_quit = true,
@@ -7789,6 +7818,16 @@ mod tests {
         assert!(app.queued.is_empty() || app.composer.text() == "/gate true", "the entry went out as a prompt or came back");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!manifest.exists(), "a queued entry ran /gate");
+        // While a change is being written no turn starts: the prompt stays
+        // in the composer, and a second change waits for the first.
+        (app.running, app.queued) = (false, Vec::new());
+        app.composer.load("");
+        app.gate_change.store(true, std::sync::atomic::Ordering::Release);
+        app.handle_submit("hello".into()).await.unwrap();
+        assert!(!app.running && app.composer.text() == "hello", "a turn started under a /gate change");
+        app.slash("gate npm test").await;
+        let shown = app.transcript.export_text();
+        assert!(shown.contains("no turn starts until it is") && shown.contains("the last /gate change is still being written"), "{shown}");
         fs::remove_dir_all(dir).unwrap();
     }
 

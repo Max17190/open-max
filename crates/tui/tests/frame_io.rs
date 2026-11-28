@@ -1842,6 +1842,14 @@ mod first_frame {
         .unwrap();
     }
 
+    /// The screen with each run of whitespace as one space, so a phrase
+    /// reads the same wherever the terminal width and a path's length
+    /// wrapped it.
+    fn flat(s: &mut Session, cols: usize, rows: usize, within: Duration, done: impl Fn(&str) -> bool) -> String {
+        let shown = screen_when(s, cols, rows, within, |shown| done(&shown.split_whitespace().collect::<Vec<_>>().join(" ")));
+        shown.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     fn settled(shown: &str, last: &str) -> bool {
         shown.contains(last) && !shown.contains("esc cancel")
     }
@@ -1867,7 +1875,7 @@ mod first_frame {
         s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| panic!("no first frame: {}", s.context()));
         s.write(ANSWER);
         s.write(b"/gate sh test.sh\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("runs from the next"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("runs from the next"));
         assert!(shown.contains("completion gate set") && shown.contains("in auto it runs from the next"), "{shown}");
         let hooks = project.join(".openmax/hooks");
         let manifest = std::fs::read_to_string(hooks.join("done-gate.toml")).unwrap();
@@ -1875,16 +1883,16 @@ mod first_frame {
         let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/done-gate/done-gate.sh");
         assert_eq!(std::fs::read(hooks.join("done-gate.sh")).unwrap(), std::fs::read(example).unwrap());
         s.write(b"Make greet.sh print hello.\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "Fixed."));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "Fixed."));
         assert!(settled(&shown, "Fixed."), "the turn did not settle:\n{shown}");
         assert!(shown.contains("turn_end gate 'done-gate' refused completion"), "{shown}");
         assert!(shown.contains("Not done: `sh test.sh` exits 1.") && shown.contains("expected hello, got hullo"), "{shown}");
         assert_eq!(std::fs::read_to_string(project.join("greet.sh")).unwrap(), "echo hello\n");
         s.write(b"/gate\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which was verified"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which was verified"));
         assert!(shown.contains("which was verified") && shown.contains("ok: hook on blocking turn_end"), "{shown}");
         s.write(b"/gate off\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("gate removed"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("gate removed"));
         assert!(shown.contains("removed .openmax/hooks/done-gate.toml and done-gate.sh"), "{shown}");
         assert!(!hooks.join("done-gate.toml").exists() && !hooks.join("done-gate.sh").exists());
         s.write(CTRL_C_TWICE);
@@ -1913,25 +1921,25 @@ mod first_frame {
         s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| panic!("no first frame: {}", s.context()));
         s.write(ANSWER);
         s.write(b"/gate sh test.sh\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("approved its exact"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("approved its exact"));
         assert!(shown.contains("approved its exact content, as openmax --approve would"), "{shown}");
         s.write(b"Make greet.sh print hello.\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "ended unverified"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "ended unverified"));
         assert!(settled(&shown, "ended unverified") && shown.contains("refusal 3 of this turn"), "{shown}");
         assert!(shown.contains("expected hello, got hullo"), "{shown}");
         s.write(b"/gate\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which then ended"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which then ended"));
         assert!(shown.contains("which then ended unverified"), "{shown}");
         std::fs::write(project.join("greet.sh"), "echo hello\n").unwrap();
         s.write(b"Check again.\r");
         let answered = |shown: &str| shown.split_once("Check again.").is_some_and(|(_, after)| settled(after, "Done."));
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), answered);
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(30), answered);
         assert!(answered(&shown), "{shown}");
         s.write(b"/gate\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which was verified"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("which was verified"));
         assert!(shown.contains("which was verified") && shown.contains("ok: hook on blocking turn_end"), "{shown}");
         s.write(b"/gate off\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("--forget .openmax/hooks/done-gate.toml"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("--forget .openmax/hooks/done-gate.toml"));
         assert!(shown.contains("openmax --forget .openmax/hooks/done-gate.toml"), "{shown}");
         assert!(project.join(".openmax/hooks/done-gate.toml").exists(), "an approved gate was deleted");
         s.write(CTRL_C_TWICE);
@@ -1968,15 +1976,15 @@ mod first_frame {
         s.wait_for(FRAME_END, 0, Duration::from_secs(10)).unwrap_or_else(|| panic!("no first frame: {}", s.context()));
         s.write(ANSWER);
         s.write(b"/gate sh test.sh\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("not approved"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("not approved"));
         assert!(shown.contains("not approved") && shown.contains("agent session"), "{shown}");
         assert!(shown.contains("openmax --approve"), "{shown}");
         assert!(project.join(".openmax/hooks/done-gate.toml").exists());
         s.write(b"Make greet.sh print hello.\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "Done."));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(30), |shown| settled(shown, "Done."));
         assert!(settled(&shown, "Done.") && !shown.contains("refused completion"), "{shown}");
         s.write(b"/gate\r");
-        let shown = screen_when(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("reports it as"));
+        let shown = flat(&mut s, cols, rows, Duration::from_secs(10), |shown| shown.contains("reports it as"));
         assert!(shown.contains("err: inert"), "{shown}");
         s.write(CTRL_C_TWICE);
         let status = s.wait_exit(Duration::from_secs(10));

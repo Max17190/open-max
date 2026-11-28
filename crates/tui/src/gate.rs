@@ -158,8 +158,9 @@ fn install(ctx: &Context, check: &str) -> Result<Vec<String>, String> {
     // /gate here is that act when `openmax --approve` would take it as one,
     // and the approval goes through the same code.
     let approved = ctx.human.clone().and_then(|()| {
-        let vouched = [open_max_core::ledger::sha256_hex(SCRIPT.as_bytes())];
-        crate::approve_file(&ctx.data_dir, &ctx.project, &manifest_path, text.as_bytes(), Some(&vouched), ctx.session.as_deref())
+        let script = open_max_core::ledger::sha256_hex(SCRIPT.as_bytes());
+        let vouched = Some((script_path.as_path(), script.as_str()));
+        crate::approve_file(&ctx.data_dir, &ctx.project, &manifest_path, text.as_bytes(), vouched, ctx.session.as_deref())
     });
     match approved {
         Ok(approved) => {
@@ -195,9 +196,12 @@ fn off(ctx: &Context) -> Result<Vec<String>, String> {
     }
     std::fs::remove_file(&manifest_path).map_err(|e| format!("cannot remove {MANIFEST}: {e}"))?;
     let mut lines = vec![format!("completion gate removed: turns from the next one end without `{check}`")];
-    // The script goes too unless another hook here still runs it.
-    let named_elsewhere = std::fs::read_dir(manifest_path.parent().unwrap_or(&ctx.project))
-        .into_iter()
+    // The script goes too unless another hook, in the project or global,
+    // still runs it.
+    let hook_dirs = [manifest_path.parent().unwrap_or(&ctx.project).to_path_buf(), ctx.data_dir.join("hooks")];
+    let named_elsewhere = hook_dirs
+        .iter()
+        .flat_map(std::fs::read_dir)
         .flatten()
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
@@ -309,11 +313,17 @@ mod tests {
         let hooks = ctx.project.join(".openmax/hooks");
         assert!(text(&run(&ctx, "npm test")).contains("completion gate set"));
         let other = "event = \"turn_end\"\nblocking = true\ncommand = \"sh\"\nargs = [\".openmax/hooks/done-gate.sh\", \"make lint\"]\n";
-        open_max_core::sessions::write_atomic(&hooks.join("lint-gate.toml"), other).unwrap();
+        let global = ctx.data_dir.join("hooks");
+        std::fs::create_dir_all(&global).unwrap();
+        open_max_core::sessions::write_atomic(&global.join("lint-gate.toml"), other).unwrap();
         let shown = text(&run(&ctx, "off"));
         assert!(shown.contains("done-gate.sh stays, since another hook runs it"), "{shown}");
         assert!(!hooks.join("done-gate.toml").exists() && hooks.join("done-gate.sh").exists());
         assert!(text(&run(&ctx, "off")).contains("nothing was removed"));
+        std::fs::remove_file(global.join("lint-gate.toml")).unwrap();
+        assert!(text(&run(&ctx, "npm test")).contains("completion gate set"));
+        assert!(text(&run(&ctx, "off")).contains("removed .openmax/hooks/done-gate.toml and done-gate.sh"));
+        assert!(!hooks.join("done-gate.sh").exists());
         std::fs::remove_dir_all(ctx.project.parent().unwrap()).unwrap();
     }
 
@@ -342,6 +352,29 @@ mod tests {
         let shown = text(&run(&ctx, "off"));
         assert!(shown.contains("retire it first with `cd ") && shown.contains("openmax --forget .openmax/hooks/done-gate.toml"), "{shown}");
         assert!(manifest_path.exists());
+        std::fs::remove_dir_all(ctx.project.parent().unwrap()).unwrap();
+    }
+
+    /// Where a person may approve, a check that is a project file is
+    /// approved with the gate, as `openmax --approve` binds every file a
+    /// manifest runs, and the gate's own script is held to the bytes the
+    /// command wrote: other bytes there are refused, not approved.
+    #[test]
+    fn a_person_approves_the_gate_with_the_check_file_it_runs() {
+        let mut ctx = context(ApprovalMode::Ask);
+        ctx.human = Ok(());
+        std::fs::write(ctx.project.join("test.sh"), "exit 0\n").unwrap();
+        let shown = text(&run(&ctx, "./test.sh"));
+        assert!(shown.contains("approved its exact content, as openmax --approve would"), "{shown}");
+        assert!(shown.contains("and the code it runs: ") && shown.contains("test.sh ("), "{shown}");
+        let manifest_path = ctx.project.join(MANIFEST);
+        let approvals = open_max_core::ledger::approvals(&ctx.data_dir, &ctx.project).unwrap();
+        assert!(approvals.was_live(&manifest_path));
+        // A script that is not the example's is never approved in its place.
+        let vouched = Some((Path::new("/nonexistent/done-gate.sh"), "0"));
+        let bytes = std::fs::read(&manifest_path).unwrap();
+        let refused = crate::approve_file(&ctx.data_dir, &ctx.project, &manifest_path, &bytes, vouched, None);
+        assert!(refused.is_err_and(|why| why.contains("is not the file just written")));
         std::fs::remove_dir_all(ctx.project.parent().unwrap()).unwrap();
     }
 }
