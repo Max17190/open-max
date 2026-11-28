@@ -4530,8 +4530,20 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn child_commands_reset_ignored_sigint_and_sigquit_to_default() {
-        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
         const CHILD: &str = "OPENMAX_TEST_IGNORED_SIGNALS";
+        const RAISE: &str = "OPENMAX_TEST_RAISE_SIGNAL";
+        if let Ok(sig) = std::env::var(RAISE) {
+            let num = match sig.as_str() {
+                "INT" => libc::SIGINT,
+                "QUIT" => libc::SIGQUIT,
+                _ => unreachable!(),
+            };
+            // SAFETY: raising SIGINT/SIGQUIT on self tests the inherited disposition directly.
+            unsafe { libc::raise(num) };
+            println!("survived");
+            return;
+        }
         if std::env::var_os(CHILD).is_none() {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", "execution::tests::child_commands_reset_ignored_sigint_and_sigquit_to_default"])
@@ -4555,11 +4567,15 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("openmax-sigdfl-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        for sig in ["INT", "QUIT"] {
+        let exe = std::env::current_exe().unwrap();
+        for (sig, expected) in [("INT", libc::SIGINT), ("QUIT", libc::SIGQUIT)] {
             let output = run_process(
                 ProcessRequest {
-                    program: "sh".into(),
-                    args: vec!["-c".into(), format!("kill -{sig} $$; echo survived").into()],
+                    program: exe.as_os_str().to_os_string(),
+                    args: vec![
+                        "--exact".into(),
+                        "execution::tests::child_commands_reset_ignored_sigint_and_sigquit_to_default".into(),
+                    ],
                     cwd: dir.clone(),
                     stdin: StdinMode::Null,
                     timeout: Duration::from_secs(5),
@@ -4574,7 +4590,7 @@ mod tests {
                     sandbox: None,
                     env_allowlist: None,
                     self_link: false,
-                    env: Vec::new(),
+                    env: vec![(RAISE.into(), sig.into())],
                 },
                 Arc::new(CancelToken::default()),
             )
@@ -4583,8 +4599,8 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout.rendered_bytes()).into_owned();
             assert!(!stdout.contains("survived"), "SIG{sig} was still ignored in child: {stdout:?}");
             assert!(
-                matches!(output.termination, Termination::Exited(s) if !s.success()),
-                "SIG{sig} must terminate child non-zero"
+                matches!(output.termination, Termination::Exited(s) if s.signal() == Some(expected)),
+                "SIG{sig} must terminate child with signal {expected}"
             );
         }
         let _ = std::fs::remove_dir_all(dir);
