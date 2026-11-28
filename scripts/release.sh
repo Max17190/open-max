@@ -45,6 +45,12 @@ git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1 && {
 echo "  version: ${version}   (was $(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2))"
 echo "  tag:     ${tag}"
 echo "  commit:  $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
+# The section the release workflow adds to the notes. The tag goes on a child
+# of this commit, so the release before it is the latest one this commit
+# descends from.
+echo
+previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null) || previous=
+scripts/prompt-record.sh ${previous:+--since "$previous"} HEAD
 
 if $DRY_RUN; then
   echo

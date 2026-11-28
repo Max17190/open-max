@@ -28,12 +28,24 @@ serving them. A tool, skill or memory written during the session rides a note
 in the conversation instead, and an edit to `AGENTS.md` waits for `/reload` or
 the next session. See [freezing and re-freezing](extending.md#freezing-and-re-freezing).
 
+## Does a release change the built-in prompt?
+
+Sometimes, and its notes say so. The repository keeps a record of the built-in
+prompt's bytes (the base rules and the built-in tools array), and a test that
+gates every pull request fails when the code builds other bytes, so a change
+updates the record in the same pull request. Each release's notes on GitHub
+then say whether the record changed since the previous release, with each
+file's size before and after and how many bytes differ. If you pin a version,
+read them before you update: changed bytes mean a provider's cache from the old
+version no longer matches from the first changed byte on. See
+[development](development.md).
+
 ## What keeps the built-in prompt small between releases?
 
 A test that gates every pull request, `frozen_prefix_is_under_700_tokens`,
 holds the built-in prompt and tool schemas to a 3,036-byte cap set from the
-700-token target. [Development](development.md) gives the current size and the
-method.
+700-token target, and the record above makes any change to those bytes
+visible. [Development](development.md) gives the current size and the method.
 
 ## What does it leave running, and what can it not stop?
 

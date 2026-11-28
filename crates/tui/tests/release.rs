@@ -774,3 +774,97 @@ fn the_installer_checks_the_archive_with_sha256sum_or_shasum() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Each release's notes say whether the built-in prompt changed since the
+/// release before it, and by how many bytes. The release workflow runs
+/// scripts/prompt-record.sh on the tag, over the whole history, before it
+/// uploads anything, and appends what it printed to the notes it creates the
+/// release with. The script, run on a history of releases, reports a release
+/// before the record existed, one whose record is unchanged, and one whose
+/// record changed, with the sizes and the bytes that differ.
+#[test]
+fn release_notes_say_whether_the_built_in_prompt_changed() {
+    let job = workflow_job(".github/workflows/release.yml", "host");
+    let at = |what: &str, wanted: &dyn Fn(&str) -> bool| {
+        job.iter().position(|line| wanted(line.trim())).unwrap_or_else(|| panic!("release.yml's host job has no {what}"))
+    };
+    let history = at("checkout of the whole history", &|line| line == "fetch-depth: 0");
+    let section = r#"run: scripts/prompt-record.sh "${{ needs.plan.outputs.tag }}" > "$RUNNER_TEMP/prompt-record.md""#;
+    let record = at("step that runs scripts/prompt-record.sh on the tag", &|line| line == section);
+    let upload = at("upload", &|line| line.starts_with("dist host "));
+    let append = at("append to the notes", &|line| {
+        line == r#"{ echo; cat "$RUNNER_TEMP/prompt-record.md"; } >> $RUNNER_TEMP/notes.txt"#
+    });
+    let create = at("release", &|line| line.starts_with("gh release create ") && line.contains("--notes-file \"$RUNNER_TEMP/notes.txt\""));
+    assert!(
+        history < record && record < upload && upload < append && append < create,
+        "the host job does not fetch the history (line {history}), write the section (line {record}) before it uploads \
+         (line {upload}), and append it (line {append}) to the notes it creates the release with (line {create})"
+    );
+    assert!(read("scripts/release.sh").contains("scripts/prompt-record.sh"), "scripts/release.sh does not print the section");
+
+    let dir = std::env::temp_dir().join(format!("openmax-prompt-record-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "a")
+            .env("GIT_AUTHOR_EMAIL", "a@example.com")
+            .env("GIT_COMMITTER_NAME", "a")
+            .env("GIT_COMMITTER_EMAIL", "a@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let record = dir.join("crates/core/tests/fixtures/built-in-prompt");
+    let commit = |message: &str, files: &[(&str, &str)], tag: Option<&str>| {
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "--allow-empty", "-m", message]);
+        if let Some(tag) = tag {
+            git(&["tag", "-a", tag, "-m", tag]);
+        }
+    };
+    let report = |args: &[&str]| {
+        let out = Command::new(repo().join("scripts/prompt-record.sh"))
+            .args(args)
+            .current_dir(record.parent().unwrap())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+    };
+    let (system, tools) = ("crates/core/tests/fixtures/built-in-prompt/system.txt", "crates/core/tests/fixtures/built-in-prompt/tools-linux.json");
+    let root = "The system prompt's base rules write the project path as `{root}`; the rest of the prompt comes from the project.\n";
+    git(&["init", "-q", "--template="]);
+    commit("first", &[("README.md", "a\n")], Some("v2026.1.0"));
+    commit("record", &[(system, "abc"), (tools, "[1]")], None);
+    commit("release: 2026.1.1", &[], Some("v2026.1.1"));
+    let sizes = "system prompt base rules 3 bytes, built-in tools array on Linux 3 bytes";
+    let expected = format!("### Built-in prompt\n\nv2026.1.0 has no record of its built-in prompt to compare with. Recorded here: {sizes}.\n\n{root}");
+    assert_eq!(report(&["v2026.1.1"]), (Some(0), expected), "a release after one without a record");
+    commit("docs", &[("README.md", "b\n")], None);
+    let unchanged = format!("### Built-in prompt\n\nUnchanged since v2026.1.1: the same bytes, {sizes}.\n\n{root}");
+    assert_eq!(report(&[]), (Some(0), unchanged), "a commit whose record is the last release's");
+    commit("prompt", &[(system, "aXcd")], None);
+    commit("release: 2026.1.2", &[], Some("v2026.1.2"));
+    let changed = "### Built-in prompt\n\nChanged since v2026.1.1:\n\n- system prompt base rules: 3 -> 4 bytes (+1), 2 bytes differ\n\n\
+                   `git diff v2026.1.1 v2026.1.2 -- crates/core/tests/fixtures/built-in-prompt` shows each change.\n\n";
+    assert_eq!(report(&["v2026.1.2"]), (Some(0), format!("{changed}{root}")), "a release whose record changed");
+    let shrunk = "- system prompt base rules: 4 -> 3 bytes (-1), 2 bytes differ";
+    assert!(report(&["--since", "v2026.1.2", "v2026.1.1"]).1.contains(shrunk), "a record that shrank");
+    let (code, out) = report(&["v2026.1.0"]);
+    assert_eq!(code, Some(1), "a commit without a record is not refused: {out}");
+    let (code, out) = report(&["no-such-ref"]);
+    assert_eq!(code, Some(2), "a ref that names no commit is not refused: {out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

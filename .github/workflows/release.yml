@@ -287,6 +287,17 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          # LOCAL EDIT, not generated; see the note on the "Install dist" step
+          # in `plan`. The next step reads the previous release's tag and the
+          # record of the built-in prompt at it from the history.
+          fetch-depth: 0
+      - name: Say whether the built-in prompt changed
+        # LOCAL EDIT, not generated; see the note on the "Install dist" step in
+        # `plan`. It runs before anything is uploaded, so a failure here
+        # publishes nothing; "Create GitHub Release" appends what it wrote to
+        # the notes.
+        shell: bash
+        run: scripts/prompt-record.sh "${{ needs.plan.outputs.tag }}" > "$RUNNER_TEMP/prompt-record.md"
       - name: Install cached dist
         uses: actions/download-artifact@v8
         with:
@@ -333,6 +344,8 @@ jobs:
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          # LOCAL EDIT, not generated: the built-in prompt's section.
+          { echo; cat "$RUNNER_TEMP/prompt-record.md"; } >> $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 

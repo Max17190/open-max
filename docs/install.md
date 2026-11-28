@@ -84,6 +84,10 @@ Both run the update command for how you installed: `brew upgrade openmax`,
 install script again into the same directory. You can run that command
 yourself instead.
 
+Each release's notes on GitHub say whether its built-in prompt (the base rules
+and the built-in tools array) changed since the release before it, and by how
+many bytes. See the [FAQ](faq.md#does-a-release-change-the-built-in-prompt).
+
 An interactive session checks for a newer release at most once a day, in the
 background, and names it at the start of the next session. It never installs
 anything on its own, so a version only changes when you update. Print, stdio,
