@@ -375,9 +375,12 @@ pub struct App {
     files_tx: mpsc::UnboundedSender<Vec<String>>,
     /// Listings (/tools, /skills, /memory) built off the event loop: their
     /// disk reads finish on a task and the block arrives here, so a slow
-    /// tree never holds a frame or a key. The loop takes the receiver.
-    listing_tx: mpsc::UnboundedSender<Vec<Line<'static>>>,
-    listing_rx: Option<mpsc::UnboundedReceiver<Vec<Line<'static>>>>,
+    /// tree never holds a frame or a key. The loop takes the receiver. Each
+    /// carries the transcript generation it was asked in, so one that lands
+    /// after /new, /clear or a switch of session is dropped.
+    listing_tx: mpsc::UnboundedSender<(u64, Vec<Line<'static>>)>,
+    listing_rx: Option<mpsc::UnboundedReceiver<(u64, Vec<Line<'static>>)>>,
+    transcript_gen: u64,
     should_quit: bool,
     setup_request: Option<(crate::setup::Action, Option<String>)>,
     dirty: Dirty,
@@ -606,7 +609,7 @@ async fn event_loop(
                     None => app.should_quit = true,
                 }
             }
-            Some(lines) = listing_rx.recv() => app.on_listing(lines),
+            Some((generation, lines)) = listing_rx.recv() => app.on_listing(generation, lines),
             Some(files) = files_rx.recv() => {
                 app.file_index = Some(Arc::new(files));
                 app.file_index_pending = false;
@@ -789,6 +792,7 @@ impl App {
             files_tx,
             listing_tx,
             listing_rx: Some(listing_rx),
+            transcript_gen: 0,
             should_quit: false,
             setup_request: None,
             dirty: Dirty::all(),
@@ -996,6 +1000,7 @@ impl App {
         self.created_session = false;
         self.resumed_awaiting_hydration = false;
         self.transcript = Transcript::new();
+        self.transcript_gen += 1;
         self.running = false;
         // Session-scoped like `running`: the old session's receipt is
         // filtered out once the id changes, so a flag left armed here would
@@ -2759,14 +2764,18 @@ impl App {
 
     /// Build a listing on a task; the event loop pushes it when it is done.
     fn spawn_listing(&self, build: impl std::future::Future<Output = Vec<Line<'static>>> + Send + 'static) {
-        let tx = self.listing_tx.clone();
+        let (tx, generation) = (self.listing_tx.clone(), self.transcript_gen);
         tokio::spawn(async move {
-            let _ = tx.send(build.await);
+            let _ = tx.send((generation, build.await));
         });
     }
 
-    fn on_listing(&mut self, lines: Vec<Line<'static>>) {
+    fn on_listing(&mut self, generation: u64, lines: Vec<Line<'static>>) {
+        if generation != self.transcript_gen {
+            return;
+        }
         self.transcript.push(lines);
+        self.refilter_scroll_search_live();
         self.dirty.mark_chat();
         self.dirty.mark_chrome();
     }
@@ -9084,8 +9093,8 @@ mod tests {
     /// event loop as it would in a running session.
     async fn list(app: &mut App, command: &str) {
         app.handle_submit(command.into()).await.unwrap();
-        let lines = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
-        app.on_listing(lines);
+        let (generation, lines) = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
+        app.on_listing(generation, lines);
     }
 
     /// /tools and /skills list what the next new session would load when no
@@ -9186,6 +9195,30 @@ mod tests {
                 assert!(words.contains(description), "{description} at {width} columns:\n{painted}");
             }
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A listing that lands after /new belongs to the conversation it was
+    /// asked in and is dropped; one that lands under an open find bar joins
+    /// its matches.
+    #[tokio::test]
+    async fn a_late_listing_stays_with_its_conversation_and_joins_the_find_bar() {
+        let (mut app, dir) = app_fixture();
+        app.handle_submit("/memory".into()).await.unwrap();
+        let late = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
+        app.handle_submit("/new".into()).await.unwrap();
+        app.on_listing(late.0, late.1);
+        assert!(!app.transcript.export_text().contains("(none yet)"), "{}", app.transcript.export_text());
+
+        app.transcript.push_user(vec![Line::from("hay")]);
+        app.handle_submit("/memory".into()).await.unwrap();
+        let (generation, lines) = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)).await.unwrap();
+        let typed: Vec<KeyEvent> = "none yet".chars().map(|c| press(KeyCode::Char(c))).collect();
+        type_keys(&mut app, &typed).await;
+        assert!(app.scroll_search.as_ref().unwrap().2.is_empty());
+        app.on_listing(generation, lines);
+        assert_eq!(app.scroll_search.as_ref().unwrap().2.len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
