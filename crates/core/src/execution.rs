@@ -1140,6 +1140,9 @@ async fn supervise_child(
         _ = tokio::time::sleep(timeout) => Termination::TimedOut,
         (idle, running) = stuck => Termination::Stuck { idle, running, after_memory_kill: idle_watch == IdleWatch::AfterMemoryKill },
     };
+    if matches!(termination, Termination::TimedOut | Termination::Stuck { .. }) {
+        flush_trailing_filter(pid, cancel).await;
+    }
     terminate_process_group(child, pid).await?;
     Ok((termination, None))
 }
@@ -1230,6 +1233,49 @@ fn timed_wait(line: &str) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn session_activity(_: u32) -> Activity { None }
+
+/// On a timeout or stuck kill, stop upstream producers before a trailing
+/// `tail` or `head` so the filter sees EOF and flushes its buffered lines.
+#[cfg(unix)]
+async fn flush_trailing_filter(pid: Option<u32>, cancel: &CancelToken) {
+    let Some(leader) = pid else { return };
+    let (filters, producers): (Vec<_>, Vec<_>) = tokio::task::spawn_blocking(move || group_members(leader)).await.unwrap_or_default().into_iter().partition(|m| m.2);
+    if cancel.is_cancelled() || filters.is_empty() || producers.is_empty() { return; }
+    let alive = |p: u32, was: Option<u64>| was.map_or_else(|| unsafe { libc::kill(p as libc::pid_t, 0) == 0 }, |t| started(p) == Some((t, false)));
+    let signal = |sig| for &(p, was, _) in &producers { if alive(p, was) { unsafe { libc::kill(p as libc::pid_t, sig) }; } };
+    signal(libc::SIGTERM);
+    for (pids, ms, kill) in [(&producers, 100, true), (&filters, 150, false)] {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        while pids.iter().any(|&(p, was, _)| alive(p, was)) && !cancel.is_cancelled() {
+            if tokio::time::Instant::now() >= deadline { if kill { signal(libc::SIGKILL); } break; }
+            tokio::time::sleep(GROUP_EXIT_POLL).await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn flush_trailing_filter(_: Option<u32>, _: &CancelToken) {}
+
+#[cfg(unix)]
+fn group_members(leader: u32) -> Vec<(u32, Option<u64>, bool)> {
+    let filter = |n: &str| matches!(n, "tail" | "head");
+    if cfg!(target_os = "linux") {
+        std::fs::read_dir("/proc").into_iter().flatten().flatten()
+            .filter_map(|e| proc_stat(&e.path()))
+            .filter(|p| !p.2 && (p.4 == leader || p.5 == leader) && (p.0 != leader || filter(&p.1)))
+            .map(|p| (p.0, start_time(p.0), filter(&p.1))).collect()
+    } else {
+        let text = std::process::Command::new("ps").args(["-axo", "pid=,pgid=,comm="]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        text.lines().filter_map(|l| {
+            let (p, rest) = l.trim().split_once(char::is_whitespace)?;
+            let (g, comm) = rest.trim_start().split_once(char::is_whitespace)?;
+            let (p, g) = (p.parse().ok()?, g.parse::<u32>().ok()?);
+            let f = filter(Path::new(comm.trim()).file_name()?.to_str()?);
+            (g == leader && (p != leader || f) && !started(p).is_some_and(|(_, z)| z)).then(|| (p, start_time(p), f))
+        }).collect()
+    }
+}
 
 async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> Result<(), ProcessError> {
     stop_group(Some(child), pid, false);
@@ -4428,5 +4474,50 @@ mod tests {
             .open(path)
             .unwrap();
         (controller, terminal)
+    }
+
+    /// A command piped into `tail` or `head` that times out returns what the
+    /// producer already wrote instead of empty output, including when the
+    /// producer ignores SIGTERM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_flushes_trailing_tail_and_head_output() {
+        let dir = std::env::temp_dir().join(format!("openmax-flush-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for cmd in [
+            "(echo found-tail; sleep 99) | tail -1",
+            "(echo found-head; sleep 99) | head -5",
+            "(trap '' TERM; echo found-stubborn; sleep 99) | tail -1",
+        ] {
+            let expected = if cmd.contains("found-tail") { "found-tail" } else if cmd.contains("found-head") { "found-head" } else { "found-stubborn" };
+            let output = run_process(
+                ProcessRequest {
+                    program: "bash".into(),
+                    args: vec!["-c".into(), cmd.into()],
+                    cwd: dir.clone(),
+                    stdin: StdinMode::Null,
+                    timeout: Duration::from_millis(400),
+                    idle_watch: IdleWatch::Off,
+                    capture: CaptureSpec {
+                        head_bytes: 4096,
+                        tail_bytes: 4096,
+                        spill_dir: None,
+                        spill_bytes_per_stream: 0,
+                        redraws: false,
+                    },
+                    sandbox: None,
+                    env_allowlist: None,
+                    self_link: false,
+                    env: Vec::new(),
+                },
+                Arc::new(CancelToken::default()),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(output.termination, Termination::TimedOut), "{cmd}");
+            let stdout = String::from_utf8_lossy(&output.stdout.rendered_bytes()).into_owned();
+            assert!(stdout.contains(expected), "{cmd}: expected {expected:?} in {stdout:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
