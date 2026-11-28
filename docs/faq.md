@@ -15,7 +15,10 @@ conversation comes after it.
 `/context` lists each part of the prompt and the tools with its cost. Its
 "total per request" row sums those parts only; its "context used" row counts the
 whole conversation as well, the notes in it included. Once the provider reports it, it
-also shows the share served from its cache. See [usage](usage.md#slash-commands).
+also shows the share served from its cache. `/usage` shows what the session
+has spent so far: the tokens it sent, of which cached, and the tokens it
+received, as the provider reported them (no prices). See
+[usage](usage.md#slash-commands).
 
 ## Why does the prompt not change under me within a session?
 

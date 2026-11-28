@@ -112,9 +112,11 @@ pub const COMMANDS: &[CommandSpec] = &[
     command(
         "status",
         "",
-        "endpoint, cache, performance, privacy, and network details",
+        "endpoint, cache, tokens, performance, privacy, and network details",
         true,
     ),
+    command("usage", "", "tokens this session sent, of which cached, and received", true),
+    command("cost", "", "alias for /usage (tokens only, no prices)", true),
     command("update", "", "update to the latest release and resume this session", true),
     command("quit", "", "exit (/exit does the same)", true),
 ];
