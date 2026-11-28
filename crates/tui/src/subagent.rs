@@ -124,7 +124,7 @@ pub async fn run(
     };
     eprintln!("openmax: {}", one_line(&line));
     drop(quit);
-    if crate::signalled() {
+    if crate::stopped_by_a_signal() {
         crate::quit_status()
     } else if !kept && code == 0 {
         1

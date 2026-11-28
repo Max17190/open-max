@@ -65,6 +65,26 @@ that wait: it runs on after openmax has exited. On Linux a process that only
 moves to another group of its tool's session, as GNU `timeout` moves its
 command, is stopped with the rest.
 
+A print run (`-p`, with or without `--json`) whose stdout's reader is gone
+stops as a signal stops it: the reader of its pipe or socket exits or dies,
+or its terminal hangs up while SIGHUP is ignored. It finds out from the
+operating system as the reader goes, at any point of the run, even while it
+writes nothing or waits on the session index, and again before each turn
+starts, or from a write that fails with a broken pipe, a reset or
+unconnected socket, or, on a terminal, an I/O error. It says `openmax:
+stdout was closed; stopping the work left` on stderr, cancels the turn, which
+stops its tools and saves the session for `--continue`, starts no later
+prompt, and exits 141 (128 plus SIGPIPE's number), the status a shell
+reports for a job a closed pipe ended. A turn that finished its work but
+whose last output found the reader gone exits 141 too, since that output
+was not delivered. A run that wrote all of its output exits with its own
+status even if its reader leaves before the process exits, as `grep -q`
+does; the work left, such as a `--second-look` session, is stopped all the
+same. Output to a file or to /dev/null is never stopped: a
+write it refuses for any other reason, such as a full disk, is dropped and
+the run goes on. A `--stdio` session's client that closes stdin ends it as
+its protocol says: the running turn finishes first.
+
 While a consumer that stopped reading holds stdout full, the run cannot act on
 the first signal, and only a second one ends it. A signal the run inherited as
 ignored, as under `nohup`, stays ignored.
