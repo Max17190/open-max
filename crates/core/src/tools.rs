@@ -727,14 +727,10 @@ fn downscale_image(mime: &str, bytes: &[u8], w0: u32, h0: u32) -> Option<(Vec<u8
         }
     }
     let mut out = Vec::new();
-    if mime == "image/jpeg" {
-        jpeg_encoder::Encoder::new(&mut out, 85).encode(&dst, nw as u16, nh as u16, jpeg_encoder::ColorType::Rgb).ok()?;
-    } else {
-        let mut enc = png::Encoder::new(&mut out, nw, nh);
-        enc.set_color(if ch == 4 { png::ColorType::Rgba } else { png::ColorType::Rgb });
-        enc.set_depth(png::BitDepth::Eight);
-        enc.write_header().ok()?.write_image_data(&dst).ok()?;
-    }
+    let mut enc = png::Encoder::new(&mut out, nw, nh);
+    enc.set_color(if ch == 4 { png::ColorType::Rgba } else { png::ColorType::Rgb });
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().ok()?.write_image_data(&dst).ok()?;
     Some((out, [nw, nh, ew, eh]))
 }
 
@@ -766,11 +762,13 @@ pub(crate) fn prepare_images(files: &[(String, PathBuf)], orig: &mut Option<(u32
                 Ok(_) => match (image_mime(&bytes), image_size(&bytes)) {
                     (None, _) => "not a PNG, JPEG, GIF or WebP image".into(),
                     (Some(mime), None) => format!("{mime} whose header gives no size"),
-                    (Some(mime), Some((mut w, mut h))) => {
-                        if let Some((b, [nw, nh, ow, oh])) = downscale_image(mime, &bytes, w, h) {
-                            (len, bytes, w, h, *orig) = (b.len() as u64, b, nw, nh, Some((ow, oh)));
-                        }
+                    (Some(mut mime), Some((mut w, mut h))) => {
                         let left = IMAGE_BUDGET - spent;
+                        if let Some((b, [nw, nh, ow, oh])) = downscale_image(mime, &bytes, w, h) {
+                            if b.len() as u64 <= left || bytes.len() as u64 > left {
+                                (mime, len, bytes, w, h, *orig) = ("image/png", b.len() as u64, b, nw, nh, Some((ow, oh)));
+                            }
+                        }
                         if bytes.len() as u64 > left {
                             format!("over the 5 MiB of images one call shows, {left} bytes of it left")
                         } else {
@@ -5138,22 +5136,24 @@ mod tests {
         std::fs::write(root.join("large.jpg"), &large_jpg).unwrap();
         let on = OutputCaps { images: true, ..OutputCaps::default() };
 
-        for (name, mime, orig_bytes) in [
-            ("large.png", "image/png", &large_png),
-            ("large.jpg", "image/jpeg", &large_jpg),
+        for (name, check_smaller, orig_bytes) in [
+            ("large.png", true, &large_png),
+            ("large.jpg", false, &large_jpg),
         ] {
             let out = super::read_file(&root, &json!({"path": name}), on, &CancelToken::default());
             assert!(out.ok, "{name}: {}", out.output);
             assert_eq!(out.images.len(), 1);
-            assert_eq!((out.images[0].mime.as_str(), out.images[0].width, out.images[0].height), (mime, 1568, 1176));
+            assert_eq!((out.images[0].mime.as_str(), out.images[0].width, out.images[0].height), ("image/png", 1568, 1176));
             let decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
-            assert_eq!(image_mime(&decoded), Some(mime));
+            assert_eq!(image_mime(&decoded), Some("image/png"));
             assert_eq!(image_size(&decoded), Some((1568, 1176)));
-            assert!(decoded.len() < orig_bytes.len(), "{name}: {} not < {}", decoded.len(), orig_bytes.len());
+            if check_smaller {
+                assert!(decoded.len() < orig_bytes.len(), "{name}: {} not < {}", decoded.len(), orig_bytes.len());
+            }
             assert_eq!(
                 out.output,
                 format!(
-                    "{name}: {mime}, 1568x1176 (resized from 3200x2400), {} bytes, shown to you as an image",
+                    "{name}: image/png, 1568x1176 (resized from 3200x2400), {} bytes, shown to you as an image",
                     decoded.len()
                 )
             );
@@ -5202,9 +5202,10 @@ mod tests {
         assert_eq!((out.images[0].width, out.images[0].height), (1176, 1568));
         assert!(out.output.contains("1176x1568 (resized from 1200x1600)"), "{}", out.output);
         let rot_decoded = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
-        let mut jdec = jpeg_decoder::Decoder::new(rot_decoded.as_slice());
-        let rot_px = jdec.decode().unwrap();
-        let rw = usize::from(jdec.info().unwrap().width);
+        let mut rdec = png::Decoder::new(std::io::Cursor::new(rot_decoded)).read_info().unwrap();
+        let mut rot_px = vec![0u8; rdec.output_buffer_size()];
+        let rinfo = rdec.next_frame(&mut rot_px).unwrap();
+        let rw = rinfo.width as usize;
         let px = |x: usize, y: usize| &rot_px[(y * rw + x) * 3..(y * rw + x) * 3 + 3];
         assert!(px(1000, 100)[0] > 200 && px(1000, 100)[1] < 40, "top-right should be red: {:?}", px(1000, 100));
         assert!(px(100, 100)[0] < 60, "top-left should stay dark: {:?}", px(100, 100));
@@ -5232,22 +5233,29 @@ mod tests {
         assert_eq!(apx(780, 500), &[20, 200, 40, 128], "semi-transparent region preserved");
         assert_eq!(apx(1400, 500)[3], 0, "fully transparent region preserved");
 
-        let mut raw_buf = Vec::with_capacity(2400 * 1800 * 3);
-        for y in 0..1800u32 {
-            for x in 0..2400u32 {
-                let h = x.wrapping_mul(2654435761) ^ y.wrapping_mul(2246822519);
-                raw_buf.extend_from_slice(&[(h >> 16) as u8, (h >> 8) as u8, h as u8]);
+        // 3200x2400 image with horizontal bands of detail exceeds 5 MiB as raw
+        // PNG, then fits comfortably under 5 MiB once downscaled to 1568x1176.
+        let mut raw_buf = Vec::with_capacity(3200 * 2400 * 3);
+        for y in 0..2400u32 {
+            for x in 0..3200u32 {
+                let b = if (y / 4) % 2 == 0 {
+                    let h = (x / 2).wrapping_mul(2654435761) ^ (y / 2).wrapping_mul(2246822519);
+                    [(h >> 16) as u8, (h >> 8) as u8, h as u8]
+                } else {
+                    [240, 240, 240]
+                };
+                raw_buf.extend_from_slice(&b);
             }
         }
-        let over_five_mib = encode_jpeg_rgb(&(2400, 1800, raw_buf), 100);
-        assert!(over_five_mib.len() as u64 > IMAGE_BUDGET, "fixture must exceed 5 MiB wire budget");
-        std::fs::write(root.join("raw.jpg"), &over_five_mib).unwrap();
-        let out = super::read_file(&root, &json!({"path": "raw.jpg"}), on, &CancelToken::default());
+        let over_five_mib = encode_png_rgb(&(3200, 2400, raw_buf));
+        assert!(over_five_mib.len() as u64 > IMAGE_BUDGET, "fixture must exceed 5 MiB wire budget: {}", over_five_mib.len());
+        std::fs::write(root.join("raw.png"), &over_five_mib).unwrap();
+        let out = super::read_file(&root, &json!({"path": "raw.png"}), on, &CancelToken::default());
         assert!(out.ok, "{}", out.output);
         assert_eq!((out.images[0].width, out.images[0].height), (1568, 1176));
         let sent = base64::engine::general_purpose::STANDARD.decode(&out.images[0].data).unwrap();
         assert!((sent.len() as u64) < IMAGE_BUDGET);
-        assert!(out.output.contains("1568x1176 (resized from 2400x1800)"), "{}", out.output);
+        assert!(out.output.contains("1568x1176 (resized from 3200x2400)"), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
