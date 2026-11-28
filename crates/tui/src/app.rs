@@ -373,6 +373,11 @@ pub struct App {
     page_h: u16,
 
     files_tx: mpsc::UnboundedSender<Vec<String>>,
+    /// Listings (/tools, /skills, /memory) built off the event loop: their
+    /// disk reads finish on a task and the block arrives here, so a slow
+    /// tree never holds a frame or a key. The loop takes the receiver.
+    listing_tx: mpsc::UnboundedSender<Vec<Line<'static>>>,
+    listing_rx: Option<mpsc::UnboundedReceiver<Vec<Line<'static>>>>,
     should_quit: bool,
     setup_request: Option<(crate::setup::Action, Option<String>)>,
     dirty: Dirty,
@@ -554,6 +559,7 @@ async fn event_loop(
     app.emit_presence_title();
 
     let mut input = TerminalInput::start();
+    let mut listing_rx = app.listing_rx.take().expect("the event loop runs once per app");
     // No frame is written while the probe waits, so none can cut into its
     // query or the flags pushed on its answer. Input has not started, so no
     // keypress waits on this.
@@ -600,6 +606,7 @@ async fn event_loop(
                     None => app.should_quit = true,
                 }
             }
+            Some(lines) = listing_rx.recv() => app.on_listing(lines),
             Some(files) = files_rx.recv() => {
                 app.file_index = Some(Arc::new(files));
                 app.file_index_pending = false;
@@ -680,6 +687,14 @@ async fn event_loop(
     Ok(())
 }
 
+/// What the next new session would load, built off the event loop.
+async fn preview_registry(core: &Core, project: &std::path::Path) -> registry::Registry {
+    let (data_dir, project) = (core.data_dir.clone(), project.to_path_buf());
+    tokio::task::spawn_blocking(move || registry::Registry::build(&data_dir, &project))
+        .await
+        .unwrap_or_else(|_| registry::Registry::builtin_only())
+}
+
 /// One frame, wrapped in a synchronized update so the terminal applies it
 /// atomically: no half-painted frames under tmux or slow connections. The
 /// writer holds ratatui's own flushes until the update is closed, so a frame
@@ -723,6 +738,7 @@ impl App {
         project: PathBuf,
         files_tx: mpsc::UnboundedSender<Vec<String>>,
     ) -> Self {
+        let (listing_tx, listing_rx) = mpsc::unbounded_channel();
         Self {
             composer: Composer::new(&core.data_dir, &project),
             core,
@@ -771,6 +787,8 @@ impl App {
             tick_i: 0,
             page_h: 10,
             files_tx,
+            listing_tx,
+            listing_rx: Some(listing_rx),
             should_quit: false,
             setup_request: None,
             dirty: Dirty::all(),
@@ -2567,40 +2585,46 @@ impl App {
                 ));
             }
             "tools" | "skills" => {
-                // Recorded use rides beside each of the user's own
-                // extensions; a record that cannot be read shows none.
-                let (data_dir, project) = (self.core.data_dir.clone(), self.project.clone());
-                let usage = tokio::task::spawn_blocking(move || open_max_core::ledger::load_usage(&data_dir, &project).ok())
-                    .await
-                    .ok()
-                    .flatten();
-                let block = |registry: &registry::Registry, frozen| match head {
-                    "tools" => extensions::tools_block(registry, frozen, usage.as_ref()),
-                    _ => extensions::skills_block(&registry.skills, &self.project, frozen, usage.as_ref()),
-                };
-                // Hold the sessions lock only long enough to format a frozen
-                // registry. Disk preview runs after the lock is released so a
-                // slow tools/skills tree cannot stall other session access.
-                let frozen = {
-                    let sessions = self.core.sessions.lock().await;
-                    self.session_id.as_ref().and_then(|id| sessions.get(id)).map(|data| block(&data.registry, true))
-                };
-                let lines = match frozen {
-                    Some(lines) => lines,
-                    None => block(&self.preview_registry().await, false),
-                };
-                self.transcript.push(lines);
+                let (core, project) = (self.core.clone(), self.project.clone());
+                let session_id = self.session_id.clone();
+                let tools = head == "tools";
+                self.spawn_listing(async move {
+                    // Recorded use rides beside each of the user's own
+                    // extensions; a record that cannot be read shows none.
+                    let (data_dir, root) = (core.data_dir.clone(), project.clone());
+                    let usage = tokio::task::spawn_blocking(move || open_max_core::ledger::load_usage(&data_dir, &root).ok())
+                        .await
+                        .ok()
+                        .flatten();
+                    let block = |registry: &registry::Registry, frozen| match tools {
+                        true => extensions::tools_block(registry, frozen, usage.as_ref()),
+                        false => extensions::skills_block(&registry.skills, &project, frozen, usage.as_ref()),
+                    };
+                    // Hold the sessions lock only long enough to format a
+                    // frozen registry. Disk preview runs after the lock is
+                    // released so a slow tools/skills tree cannot stall
+                    // other session access.
+                    let frozen = {
+                        let sessions = core.sessions.lock().await;
+                        session_id.as_ref().and_then(|id| sessions.get(id)).map(|data| block(&data.registry, true))
+                    };
+                    match frozen {
+                        Some(lines) => lines,
+                        None => block(&preview_registry(&core, &project).await, false),
+                    }
+                });
             }
             "memory" => {
-                // Off the event loop, like the registry preview: the scan
-                // reads every memory file and the access log.
+                // The scan reads every memory file and the access log.
                 let project = self.project.clone();
-                let scan = tokio::task::spawn_blocking(move || {
-                    open_max_core::memory::scan(&project, open_max_core::memory::unix_now())
-                })
-                .await
-                .unwrap_or_default();
-                self.transcript.push(crate::ui::memory::memory_block(&scan));
+                self.spawn_listing(async move {
+                    let scan = tokio::task::spawn_blocking(move || {
+                        open_max_core::memory::scan(&project, open_max_core::memory::unix_now())
+                    })
+                    .await
+                    .unwrap_or_default();
+                    crate::ui::memory::memory_block(&scan)
+                });
             }
             "status" => {
                 let s = self.core.settings.lock().unwrap().clone();
@@ -2730,10 +2754,21 @@ impl App {
     /// The registry the next new session would freeze from today's config,
     /// built on a blocking thread so a slow tree cannot stall the loop.
     async fn preview_registry(&self) -> registry::Registry {
-        let (data_dir, project) = (self.core.data_dir.clone(), self.project.clone());
-        tokio::task::spawn_blocking(move || registry::Registry::build(&data_dir, &project))
-            .await
-            .unwrap_or_else(|_| registry::Registry::builtin_only())
+        preview_registry(&self.core, &self.project).await
+    }
+
+    /// Build a listing on a task; the event loop pushes it when it is done.
+    fn spawn_listing(&self, build: impl std::future::Future<Output = Vec<Line<'static>>> + Send + 'static) {
+        let tx = self.listing_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(build.await);
+        });
+    }
+
+    fn on_listing(&mut self, lines: Vec<Line<'static>>) {
+        self.transcript.push(lines);
+        self.dirty.mark_chat();
+        self.dirty.mark_chrome();
     }
 
     async fn on_core_event(&mut self, env: AgentEventEnvelope) {
@@ -9045,16 +9080,24 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Run a listing command and push its block, which arrives off the
+    /// event loop as it would in a running session.
+    async fn list(app: &mut App, command: &str) {
+        app.handle_submit(command.into()).await.unwrap();
+        let lines = app.listing_rx.as_mut().unwrap().recv().await.unwrap();
+        app.on_listing(lines);
+    }
+
     /// /tools and /skills list what the next new session would load when no
     /// session has frozen its own, and /context counts the same tools.
     #[tokio::test]
     async fn tools_skills_and_context_preview_the_next_session() {
         let (mut app, dir) = app_fixture();
-        app.handle_submit("/tools".into()).await.unwrap();
+        list(&mut app, "/tools").await;
         let shown = app.transcript.export_text();
         assert!(shown.contains("tools (preview of the next new session)"), "{shown}");
         assert!(shown.contains("read_file") && shown.contains("built-in"), "{shown}");
-        app.handle_submit("/skills".into()).await.unwrap();
+        list(&mut app, "/skills").await;
         let shown = app.transcript.export_text();
         assert!(shown.contains("skills (preview of the next new session)"), "{shown}");
         assert!(shown.contains("(none loaded)") && shown.contains("0 skills"), "{shown}");
@@ -9074,7 +9117,7 @@ mod tests {
     #[tokio::test]
     async fn memory_tools_and_skills_show_recorded_use() {
         let (mut app, dir) = app_fixture();
-        app.handle_submit("/memory".into()).await.unwrap();
+        list(&mut app, "/memory").await;
         let shown = app.transcript.export_text();
         assert!(shown.contains("(none yet) the agent writes one fact per file under .openmax/memory/"), "{shown}");
         assert!(shown.contains("openmax --recall"), "{shown}");
@@ -9087,7 +9130,7 @@ mod tests {
         fs::File::options().write(true).open(memory.join("old-host.md")).unwrap().set_modified(old).unwrap();
         let reads = [("deploy-port".to_string(), "read".to_string()), ("deploy-port".to_string(), "write".to_string())];
         open_max_core::memory::record_accesses(&dir, &reads);
-        app.handle_submit("/memory".into()).await.unwrap();
+        list(&mut app, "/memory").await;
         let shown = app.transcript.export_text();
         let row = |name: &str| shown.lines().find(|l| l.contains(name)).unwrap_or_default().to_string();
         assert!(row("deploy-port").contains("indexed") && row("deploy-port").contains("2 uses"), "{shown}");
@@ -9112,8 +9155,8 @@ mod tests {
             skills: vec!["release".into()],
         };
         open_max_core::ledger::record_usage(&app.core.data_dir, &dir, &delta).unwrap();
-        app.handle_submit("/tools".into()).await.unwrap();
-        app.handle_submit("/skills".into()).await.unwrap();
+        list(&mut app, "/tools").await;
+        list(&mut app, "/skills").await;
         let shown = app.transcript.export_text();
         let row = |name: &str| shown.lines().find(|l| l.contains(&format!("  {name} "))).unwrap_or_default().to_string();
         assert!(row("deploy").contains("3 calls · 1 failed"), "{shown}");
@@ -9125,8 +9168,22 @@ mod tests {
         for width in [60u16, 80, 120] {
             app.transcript.set_width(width);
             let painted = buffer_text(&render_app(&mut app, width, 200));
-            for text in ["release", "1 body read", "faded", "old-host"] {
-                assert!(painted.contains(text), "{text} at {width} columns:\n{painted}");
+            for (name, shows) in [
+                ("deploy-port", &["indexed", "2 uses", "<2h ago"][..]),
+                ("old-host", &["faded", "0 uses", "40d ago"]),
+                ("deploy", &["external", "3 calls · 1 failed"]),
+                ("lint", &["external", "no calls recorded"]),
+                ("release", &["project", "1 body read"]),
+            ] {
+                let row = painted.lines().find(|l| l.starts_with(&format!("  {name} "))).unwrap_or_default();
+                for text in shows {
+                    assert!(row.contains(text), "{name} row lacks {text} at {width} columns:\n{painted}");
+                }
+            }
+            // A description may wrap; read the frame's words in order.
+            let words = painted.split_whitespace().collect::<Vec<_>>().join(" ");
+            for description in ["The staging deploy port is 7443", "The old build host was ci-3", "Run deploy", "Run lint", "How to cut a release"] {
+                assert!(words.contains(description), "{description} at {width} columns:\n{painted}");
             }
         }
         fs::remove_dir_all(dir).unwrap();
