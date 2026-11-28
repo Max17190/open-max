@@ -2093,9 +2093,13 @@ fn grep_tool(root: &Path, args: &Value) -> ToolOutcome {
             None => "no matches".into(),
         });
     }
-    let mut out = String::new();
+    let (mut out, mut current) = (String::new(), String::new());
     for (rel, line_no, line) in hits {
-        out.push_str(&format!("{rel}:{line_no}: {line}\n"));
+        if rel != current {
+            out.push_str(&format!("{rel}:\n"));
+            current = rel;
+        }
+        out.push_str(&format!("{line_no}: {line}\n"));
     }
     let (found, files) = (found.into_inner(), files.into_inner());
     if found > MAX_GREP_RESULTS {
@@ -3271,7 +3275,7 @@ mod tests {
         let out = glob_tool(&root, &json!({"pattern": "/src/*.rs"}));
         assert!(out.ok && out.output.contains("src/a.rs"), "{}", out.output);
         let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "./src/*.rs"}));
-        assert!(out.ok && out.output.contains("src/a.rs:1:"), "{}", out.output);
+        assert!(out.ok && out.output.contains("src/a.rs:\n1: "), "{}", out.output);
         // Normalization happens before the .git refusal, not instead of it.
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git/config"), "x\n").unwrap();
@@ -3300,12 +3304,11 @@ mod tests {
         let root = temp_project();
         let out = grep_tool(&root, &json!({"pattern": "alpha"}));
         assert!(out.ok);
-        let lines: Vec<&str> = out.output.lines().collect();
-        assert_eq!(lines.len(), 4, "{}", out.output);
-        let mut sorted = lines.clone();
-        sorted.sort();
-        assert_eq!(lines, sorted, "results must be deterministic (path, line) order");
-        assert!(lines[0].starts_with("docs/c.md:1:"), "{}", out.output);
+        assert_eq!(
+            out.output,
+            "docs/c.md:\n1: alpha in prose\nsrc/a.rs:\n1: fn alpha() {}\n2: fn alpha_two() {}\nsrc/deep/b.rs:\n1: fn alpha_three() {}\n",
+            "results must be grouped by file in deterministic (path, line) order"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3334,12 +3337,12 @@ mod tests {
         assert!(out.ok, "{}", out.output);
         assert_eq!(
             out.output,
-            "src/needle.rs:1: // needle\n… not searched: 1 file over 1.5 MB, 2 files not UTF-8 text\n"
+            "src/needle.rs:\n1: // needle\n… not searched: 1 file over 1.5 MB, 2 files not UTF-8 text\n"
         );
 
         // A search that read every candidate carries no note.
         let out = grep_tool(&root, &json!({"pattern": "needle", "path": "src"}));
-        assert_eq!(out.output, "src/needle.rs:1: // needle\n");
+        assert_eq!(out.output, "src/needle.rs:\n1: // needle\n");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3359,7 +3362,7 @@ mod tests {
         let out = glob_tool(&root, &json!({"pattern": "**/*.js"}));
         assert_eq!(out.output, "src/app.js", "ignored directories are not listed");
         let out = grep_tool(&root, &json!({"pattern": "alpha_vendored"}));
-        assert_eq!(out.output, "src/app.js:1: alpha_vendored\n", "ignored directories are not searched");
+        assert_eq!(out.output, "src/app.js:\n1: alpha_vendored\n", "ignored directories are not searched");
 
         // A walk that starts below the root still applies the root's rules,
         // and a path named outright is searched even though they ignore it.
@@ -3368,9 +3371,9 @@ mod tests {
         let out = glob_tool(&root, &json!({"pattern": "src/**/*.js"}));
         assert_eq!(out.output, "src/app.js", "a scoped glob applies the root's .gitignore");
         let out = grep_tool(&root, &json!({"pattern": "alpha_vendored", "path": "src"}));
-        assert_eq!(out.output, "src/app.js:1: alpha_vendored\n", "a scoped grep applies the root's .gitignore");
+        assert_eq!(out.output, "src/app.js:\n1: alpha_vendored\n", "a scoped grep applies the root's .gitignore");
         let out = grep_tool(&root, &json!({"pattern": "alpha_vendored", "path": "build"}));
-        assert_eq!(out.output, "build/out.js:1: alpha_vendored\n", "a named path is searched");
+        assert_eq!(out.output, "build/out.js:\n1: alpha_vendored\n", "a named path is searched");
 
         // Inside a repository the rules stop at its root as before: a
         // .gitignore above it, such as a home directory's "*", must not hide
@@ -3385,7 +3388,7 @@ mod tests {
         let out = glob_tool(&project, &json!({"pattern": "**/*.rs"}));
         assert_eq!(out.output, "src/lib.rs");
         let out = grep_tool(&project, &json!({"pattern": "alpha"}));
-        assert_eq!(out.output, "src/lib.rs:1: fn alpha() {}\n");
+        assert_eq!(out.output, "src/lib.rs:\n1: fn alpha() {}\n");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outer);
     }
@@ -3412,7 +3415,7 @@ mod tests {
         }
         for path in [".", "src"] {
             let out = grep_tool(&project, &json!({"pattern": "alpha", "path": path}));
-            assert_eq!(out.output, "src/lib.rs:1: fn alpha() {}\n", "grep in {path}");
+            assert_eq!(out.output, "src/lib.rs:\n1: fn alpha() {}\n", "grep in {path}");
         }
         let _ = std::fs::remove_dir_all(outer);
     }
@@ -3442,7 +3445,7 @@ mod tests {
         }
         for path in [".", "src", "src/gen"] {
             let out = grep_tool(&project, &json!({"pattern": "needle", "path": path}));
-            assert_eq!(out.output, "src/gen/keep.gen:1: needle\n", "grep in {path}");
+            assert_eq!(out.output, "src/gen/keep.gen:\n1: needle\n", "grep in {path}");
         }
         let _ = std::fs::remove_dir_all(outer);
     }
@@ -3471,7 +3474,7 @@ mod tests {
             }
             for path in [".", "src"] {
                 let out = grep_tool(&project, &json!({"pattern": format!("^(keep|drop)\\.{ext}$"), "path": path}));
-                assert_eq!(out.output, format!("src/keep.{ext}:1: keep.{ext}\n"), "grep {ext} in {path}");
+                assert_eq!(out.output, format!("src/keep.{ext}:\n1: keep.{ext}\n"), "grep {ext} in {path}");
             }
         }
         let _ = std::fs::remove_dir_all(outer);
@@ -3514,7 +3517,7 @@ mod tests {
         let out = glob_tool(&project, &json!({"pattern": "**/*.log"}));
         assert_eq!(out.output, "notes.log", "glob outside a repository");
         let out = grep_tool(&project, &json!({"pattern": "alpha"}));
-        assert_eq!(out.output, "notes.log:1: alpha\n", "grep outside a repository");
+        assert_eq!(out.output, "notes.log:\n1: alpha\n", "grep outside a repository");
         // Inside one they apply, as git applies them.
         std::fs::create_dir_all(project.join(".git")).unwrap();
         let out = glob_tool(&project, &json!({"pattern": "**/*.log"}));
@@ -3539,12 +3542,13 @@ mod tests {
             "{}",
             out.output
         );
-        let hits = out.output.lines().filter(|l| l.contains("big.txt")).count();
+        let hits = out.output.lines().filter(|l| l.contains("alpha line")).count();
         assert_eq!(hits, MAX_GREP_RESULTS, "{}", out.output);
+        assert_eq!(out.output.lines().filter(|&l| l == "big.txt:").count(), 1, "{}", out.output);
         // Exactly as many hits as the cap cuts nothing, so nothing says so.
         std::fs::write(root.join("big.txt"), "alpha\n".repeat(MAX_GREP_RESULTS)).unwrap();
         let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "*.txt"}));
-        assert_eq!(out.output.lines().count(), MAX_GREP_RESULTS, "{}", out.output);
+        assert_eq!(out.output.lines().count(), MAX_GREP_RESULTS + 1, "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3560,9 +3564,10 @@ mod tests {
             }
         }
         let first = grep_tool(&root, &json!({"pattern": "beta"})).output;
-        assert!(first.starts_with("d0/f00.txt:1: beta\nd0/f00.txt:3: beta\n"), "{first}");
+        assert!(first.starts_with("d0/f00.txt:\n1: beta\n3: beta\n"), "{first}");
         // 40 hits a file: all of the first, then the first 10 of the second.
-        assert!(first.contains("d0/f01.txt:15: beta\n") && !first.contains("d0/f01.txt:16:"), "{first}");
+        let second = first.split_once("d0/f01.txt:\n").expect("second file header").1;
+        assert!(second.contains("\n15: beta\n") && !second.contains("\n16: beta\n"), "{first}");
         assert!(first.ends_with("the first 50 of 12800 matches in 320 files, by path; narrow it with path, glob or a more specific pattern\n"), "{first}");
         for _ in 0..20 {
             assert_eq!(grep_tool(&root, &json!({"pattern": "beta"})).output, first);
@@ -3591,7 +3596,7 @@ mod tests {
         assert!(!out.output.contains(".git/"), "{}", out.output);
 
         let out = grep_tool(&root, &json!({"pattern": "fetch_page"}));
-        assert!(out.output.contains(".openmax/tools/fetch.toml:1:"), "{}", out.output);
+        assert!(out.output.contains(".openmax/tools/fetch.toml:\n1: "), "{}", out.output);
         assert!(!out.output.contains(".git/config"), "{}", out.output);
 
         // Scoping a search at or under .git must not sidestep the walker's
@@ -3725,9 +3730,9 @@ mod tests {
         let out = glob_tool(&root, &json!({"pattern": "*.rs"}));
         assert!(out.ok && out.output.contains("a_link.rs"), "{}", out.output);
         let out = grep_tool(&root, &json!({"pattern": "alpha_two"}));
-        assert!(out.ok && out.output.contains("a_link.rs:2:"), "{}", out.output);
+        assert!(out.ok && out.output.contains("a_link.rs:\n2: "), "{}", out.output);
         let out = grep_tool(&root, &json!({"pattern": "alpha_three", "path": "alias"}));
-        assert!(out.ok && out.output.contains("deep/b.rs:1:"), "{}", out.output);
+        assert!(out.ok && out.output.contains("deep/b.rs:\n1: "), "{}", out.output);
         let out = list_dir(&root, &json!({"path": "alias"}));
         assert!(out.ok && out.output.contains("a.rs"), "{}", out.output);
         let out = read_file(&root, &json!({"path": "a_link.rs"}));
@@ -3773,7 +3778,7 @@ mod tests {
         let out = list_dir(&root, &json!({"path": "src/"}));
         assert!(out.ok && out.output.contains("a.rs"), "{}", out.output);
         let out = grep_tool(&root, &json!({"pattern": "alpha_three", "path": "src/deep/."}));
-        assert!(out.ok && out.output.contains("b.rs:1:"), "{}", out.output);
+        assert!(out.ok && out.output.contains("b.rs:\n1: "), "{}", out.output);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5435,7 +5440,7 @@ mod tests {
         let out = read_file(&root, &json!({"path": "docs/cap.log"}));
         assert!(out.ok && out.output.starts_with("1 needle"), "{}", out.output.lines().next().unwrap_or_default());
         let out = grep_tool(&root, &json!({"pattern": "needle", "path": "docs"}));
-        assert_eq!(out.output, format!("docs/cap.log:1: needle{}\n", "x".repeat(93)));
+        assert_eq!(out.output, format!("docs/cap.log:\n1: needle{}\n", "x".repeat(93)));
 
         text.push('\n');
         std::fs::write(root.join("docs/cap.log"), &text).unwrap();
@@ -5602,7 +5607,7 @@ mod tests {
         let out = grep_tool(&root, &json!({"pattern": "alpha", "glob": "*.rs"}));
         assert!(out.ok, "{}", out.output);
         let hits: Vec<&str> = out.output.lines().collect();
-        assert_eq!(hits, ["src/a.rs:1: fn alpha() {}", "src/a.rs:2: fn alpha_two() {}", "src/deep/b.rs:1: fn alpha_three() {}"]);
+        assert_eq!(hits, ["src/a.rs:", "1: fn alpha() {}", "2: fn alpha_two() {}", "src/deep/b.rs:", "1: fn alpha_three() {}"]);
         let _ = std::fs::remove_dir_all(root);
     }
 
