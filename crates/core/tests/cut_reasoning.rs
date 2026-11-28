@@ -271,3 +271,20 @@ async fn refused_jump_tries_intermediate_raise_before_falling_back() {
     assert_eq!(limits, vec![4096, 4096, 16384, 8192, 8192]);
     assert!(matches!(events.last(), Some(AgentEvent::Done { stop_reason }) if stop_reason == "stop"), "{events:?}");
 }
+
+/// Two non-consecutive cuts across separate tool rounds in the same turn raise
+/// the base reply limit to 8192 so later rounds do not keep snapping back to 4096.
+#[tokio::test]
+async fn non_consecutive_cuts_in_a_turn_raise_base_limit_without_breaking_single_cut() {
+    let cut_reply = json!({"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"","reasoning_content":"thinking..."}}],"usage":{"prompt_tokens":10,"completion_tokens":4096,"completion_tokens_details":{"reasoning_tokens":4095}}});
+    let call_reply = json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":50}});
+    let call_reply_2 = json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c2","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":50}});
+    let done_reply = json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":10,"completion_tokens":10}});
+    let (url, bodies) = common::recording_endpoint(vec![cut_reply.clone(), call_reply, cut_reply, call_reply_2, done_reply]).await;
+    let scratch = Scratch::new(&url, "chat_completions");
+    std::fs::write(scratch.0.join("data/settings.json"), r#"{"provider":"test","model":"thinker","context_tokens":131072}"#).unwrap();
+    let (core, mut rx) = Core::new(scratch.0.join("data")).unwrap();
+    common::drive_turn(&core, &mut rx, "non-consec", &scratch.0.join("project"), "go").await;
+    let limits: Vec<u64> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["max_tokens"].as_u64().unwrap()).collect();
+    assert_eq!(limits, vec![4096, 4096, 4096, 4096, 8192]);
+}

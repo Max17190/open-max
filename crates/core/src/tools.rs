@@ -1641,7 +1641,7 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
 
     // Every match as (start, end, replacement), in the file as read.
     let mut spans = Vec::new();
-    for (i, (old_string, new_string, replace_all)) in list.iter().enumerate() {
+    for (i, (old_string, new_string, replace_all)) in list.iter_mut().enumerate() {
         if noops.contains(&(i + 1)) {
             continue;
         }
@@ -1654,8 +1654,25 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
                 label(i)
             ));
         }
-        let count = old.matches(old_string.as_str()).count();
-        if count > 1 && !replace_all {
+        let mut count = old.matches(old_string.as_str()).count();
+        // Models sometimes copy `read_file` or `grep` line-number prefixes into
+        // `old_string` (and `new_string`). On an exact miss, strip a uniform
+        // leading line-number prefix only when the stripped text matches
+        // unambiguously (or all occurrences under `replace_all`).
+        if count == 0 {
+            if let Some(stripped_old) = strip_line_number_prefixes(old_string) {
+                let stripped_count = old.matches(stripped_old.as_str()).count();
+                if stripped_count == 1 || (*replace_all && stripped_count > 0) {
+                    let stripped_new = strip_line_number_prefixes(new_string).unwrap_or_else(|| new_string.clone());
+                    if stripped_old != stripped_new {
+                        *old_string = stripped_old;
+                        *new_string = stripped_new;
+                        count = stripped_count;
+                    }
+                }
+            }
+        }
+        if count > 1 && !*replace_all {
             return ToolOutcome::err(format!(
                 "{}old_string matches {count} times; provide a longer unique string or set replace_all to true",
                 label(i)
@@ -1716,6 +1733,44 @@ fn edit_file(root: &Path, args: &Value) -> ToolOutcome {
         ));
     }
     outcome
+}
+
+/// Strip uniform `read_file` or `grep` line-number prefixes (`12 `, `12: `,
+/// `12| `) from every non-empty line, returning `None` if any non-empty line
+/// lacks one. Used only as an unambiguous exact-match fallback in `edit_file`.
+fn strip_line_number_prefixes(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut stripped_any = false;
+    for chunk in text.split_inclusive('\n') {
+        let (line, end) = match chunk.strip_suffix("\r\n") {
+            Some(l) => (l, "\r\n"),
+            None => match chunk.strip_suffix('\n') {
+                Some(l) => (l, "\n"),
+                None => (chunk, ""),
+            },
+        };
+        if line.is_empty() {
+            out.push_str(end);
+            continue;
+        }
+        let trimmed = line.trim_start_matches(' ');
+        let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if !(1..=6).contains(&digits) {
+            return None;
+        }
+        let rest = &trimmed[digits..];
+        let body = rest
+            .strip_prefix(": ")
+            .or_else(|| rest.strip_prefix("| "))
+            .or_else(|| rest.strip_prefix(' '))
+            .or_else(|| rest.strip_prefix('\t'))
+            .or_else(|| rest.strip_prefix(':'))
+            .or_else(|| rest.strip_prefix('|'))?;
+        stripped_any = true;
+        out.push_str(body);
+        out.push_str(end);
+    }
+    stripped_any.then_some(out)
 }
 
 /// The walk glob and grep share, from `walk_root` in the project whose
@@ -5833,5 +5888,35 @@ mod tests {
         }
         let status = std::process::ExitStatus::from_raw(libc::SIGBUS);
         assert_eq!(describe_exit(&status), format!("killed by signal {}", libc::SIGBUS));
+    }
+
+    #[test]
+    fn edit_file_strips_copied_line_number_prefixes_when_exact_match_misses() {
+        let root = temp_project();
+        let file = root.join("sample.rs");
+        std::fs::write(&file, "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n").unwrap();
+        // Model copies `read_file` numbered lines into both old_string and new_string.
+        let out = super::edit_file(
+            &root,
+            &json!({
+                "path": "sample.rs",
+                "old_string": "1 fn main() {\n2     let x = 1;\n3     println!(\"{x}\");",
+                "new_string": "1 fn main() {\n2     let x = 2;\n3     println!(\"{x}\");"
+            }),
+        );
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() {\n    let x = 2;\n    println!(\"{x}\");\n}\n");
+        // Also works with `grep`-style `N: ` prefixes when new_string has no prefixes.
+        let out2 = super::edit_file(
+            &root,
+            &json!({
+                "path": "sample.rs",
+                "old_string": "2:     let x = 2;",
+                "new_string": "    let x = 3;"
+            }),
+        );
+        assert!(out2.ok, "{}", out2.output);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() {\n    let x = 3;\n    println!(\"{x}\");\n}\n");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

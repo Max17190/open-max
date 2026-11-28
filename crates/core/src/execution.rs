@@ -822,7 +822,12 @@ fn path_with_self_link(dir: &Path, inherited: &std::ffi::OsStr) -> Option<OsStri
 
 #[inline(never)]
 fn command_defaults(command: &mut Command) {
-    for (name, fallback) in [("EMAIL", "openmax@localhost"), ("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never")] {
+    for (name, fallback) in [
+        ("EMAIL", "openmax@localhost"),
+        ("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never"),
+        ("PYTHONUNBUFFERED", "1"),
+        ("DEBIAN_FRONTEND", "noninteractive"),
+    ] {
         if std::env::var_os(name).is_none() {
             command.env(name, fallback);
         }

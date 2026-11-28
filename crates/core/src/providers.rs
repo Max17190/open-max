@@ -220,6 +220,7 @@ impl ActiveEndpoint {
 #[derive(Default)]
 pub(crate) struct CutState {
     pub cuts: usize,
+    pub total_cuts: usize,
     pub stalled: usize,
     pub raise: u32,
     pub base_raise: u32,
@@ -227,8 +228,12 @@ pub(crate) struct CutState {
 }
 
 impl CutState {
-    pub fn on_uncut(&mut self) {
-        if self.cuts > 1 { self.base_raise = self.base_raise.max(self.raise.min(2)); }
+    pub fn on_cut(&mut self) { self.total_cuts += 1; }
+    pub fn on_uncut(&mut self, no_room: bool) {
+        if !no_room {
+            if self.cuts > 1 || self.total_cuts >= 3 { self.base_raise = self.base_raise.max(2); }
+            else if self.total_cuts >= 2 { self.base_raise = self.base_raise.max(1); }
+        }
         (self.cuts, self.stalled, self.raise, self.floor) = (0, 0, self.base_raise, 0);
     }
     pub fn should_raise(&self, capped: bool, thought: bool, no_room: bool) -> bool {

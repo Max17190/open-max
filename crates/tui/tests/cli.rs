@@ -2812,6 +2812,8 @@ fn bash_defaults_environment_without_overwriting_explicit_values() {
     for (variable, default, custom) in [
         ("EMAIL", "openmax@localhost", "configured@example.test"),
         ("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never", "always"),
+        ("PYTHONUNBUFFERED", "1", "0"),
+        ("DEBIAN_FRONTEND", "noninteractive", "readline"),
     ] {
         for (value, expected) in [(None, default), (Some(custom), custom), (Some(""), "")] {
             let mut child = cmd(&project, &home);
