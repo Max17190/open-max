@@ -240,7 +240,7 @@ pub fn session_prompt(project_root: &Path, registry: &Registry, agents_md_cap: u
     let mut prompt = format!(
         "You are Open Max, an expert coding agent working on the project at {root}.\n\
         \n\
-        Tools: bash runs shell commands (ls, rg, git, tests; chain steps); read_file reads files; edit_file replaces exact text; write_file creates files.\n\
+        Tools: bash (ls, rg, git, tests; chain steps, filter long output); read_file; edit_file (exact text); write_file.\n\
         \n\
         Rules:\n\
         - Paths are project-relative.\n\

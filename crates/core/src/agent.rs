@@ -965,7 +965,7 @@ async fn run_loop(
         // model can split the work. The client keeps its raw arguments even
         // when the cut lands before the first byte. Then the room the next request may carry, when this reply was cut and was not itself the one given room.
         let kind = if near { crate::notes::CutKind::Thought } else { crate::notes::cut_kind(limit, &result) };
-        if !capped { cs.on_uncut(); } else if roomy.is_some() && (!tool_calls.is_empty() || kind != crate::notes::CutKind::Thought) { (spent, cs.floor) = (true, cs.floor.max(limit)) }
+        if !capped { cs.on_uncut(no_room); } else { cs.on_cut(); if roomy.is_some() && (!tool_calls.is_empty() || kind != crate::notes::CutKind::Thought) { (spent, cs.floor) = (true, cs.floor.max(limit)) } }
         let grant = (capped && roomy.is_none() && !no_room && !spent && iteration + 1 < max_iterations).then(|| endpoint.reply_room(used_real + limit)).filter(|&room| room > limit);
         if !tool_calls.is_empty() { room = grant; cs.stalled += usize::from(capped && spent); }
         if tool_calls.is_empty() {
@@ -5471,7 +5471,7 @@ mod tests {
         type Case<'a> = (&'static str, Vec<&'a str>, Option<usize>, Option<usize>, &'static [u64], bool, &'static [&'static str]);
         let cases: [Case; 7] = [
             ("a cut call lands whole with room", vec![&cut, &whole, STOP_SSE], None, None, &[4096, 16384, 4096], true, &[WHOLE_ASK]),
-            ("cut again at the room, then in parts", vec![&cut, &cut, &whole, STOP_SSE], None, None, &[4096, 16384, 4096, 4096], true,
+            ("cut again at the room, then in parts", vec![&cut, &cut, &whole, STOP_SSE], None, None, &[4096, 16384, 4096, 8192], true,
                 &[WHOLE_ASK, "(max_tokens = 16384) while writing this call, so its arguments were cut off. Send large content in parts"]),
             ("a refused room is not asked for again", vec![&cut, &whole, &cut, STOP_SSE], Some(2), None, &[4096, 16384, 4096, 4096], false,
                 &[WHOLE_ASK, "(max_tokens = 4096) while writing this call, so its arguments were cut off. Send large content in parts"]),
@@ -5762,7 +5762,7 @@ mod tests {
         );
         let whole = raw_calls_sse(&[("c3", "write_file", r#"{"path":"big.txt","content":"Big\n"}"#)], "tool_calls", None);
         let (stop, sent, said) = cut_recovery_turn(&[&cut, LOST, &whole, STOP_SSE], Some(393_216)).await;
-        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[4096u64, 16384, 32768, 4096][..]), "{said:#?}");
+        assert_eq!((stop.as_str(), sent.as_slice()), ("stop", &[4096u64, 16384, 32768, 8192][..]), "{said:#?}");
     }
 
     /// The bug this guards: a reply the output cap cut before any call ran
