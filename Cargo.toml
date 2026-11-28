@@ -39,6 +39,11 @@ uuid = { version = "1", features = ["v4"] }
 # hashes (with the CPU's SHA instructions), OAuth PKCE and ID-token validation.
 ring = "0.17"
 base64 = "0.22"
+# Pure-Rust JPEG and PNG decode and re-encode for oversized tool images;
+# default features off so no rayon, C codecs or extra formats enter the binary.
+jpeg-decoder = { version = "0.3", default-features = false }
+jpeg-encoder = { version = "0.7", default-features = false, features = ["std"] }
+png = { version = "0.17", default-features = false }
 # Hand-authored external-tool configs (.openmax/tools/*.toml); parse only.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 libc = "0.2"
