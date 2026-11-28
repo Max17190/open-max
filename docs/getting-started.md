@@ -130,3 +130,10 @@ openmax --subagent "make the flaky retry test deterministic" --worktree
 ```
 
 The child is one session in a new git worktree of the repository at HEAD, trusted because the project is, in the project's approval mode or a stricter one. Its events print as `-p` prints them. When it ends, or a signal stops it, its tools are stopped, its changes are committed to a branch of their own, the worktree is removed, and the last line names the branch with a diffstat, or says the child changed nothing. The flag adds nothing to any request. See [sub-agents](usage.md#sub-agents).
+
+Three drop-in examples add common habits with files you copy into a project,
+each with a README and a test: [done-gate](../examples/done-gate/README.md)
+refuses a turn's end while a command you name fails,
+[mcp-tool](../examples/mcp-tool/README.md) adopts an MCP server as one tool and
+one skill, and [plan-template](../examples/plan-template/README.md) adds a
+`/plan` command that writes `PLAN.md` before any edit.
